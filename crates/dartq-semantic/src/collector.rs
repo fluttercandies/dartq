@@ -111,6 +111,38 @@ pub(crate) const DUP_SETTER: u8 = 2;
 pub(crate) const DUP_OTHER: u8 = 4;
 pub(crate) const DUP_PAIR: u8 = DUP_GETTER | DUP_SETTER;
 
+/// The `decls` name-claim precedence of one top-level declaration kind —
+/// the addition order of the oracle's `LibraryDeclarations` constructor
+/// (upstream Dart SDK source, pkg/analyzer
+/// lib/src/dart/element/scope.dart:317-326): every getter (real ones and
+/// every variable's induced getter, scope's `library.getters`) claims the
+/// getter map first, then enums, extensions, extension types, top-level
+/// functions, type aliases, mixins, and finally classes; setters feed a
+/// separate map. `_getters[id] ??=` keeps the FIRST add (scope.dart:880-885),
+/// so a name colliding across kinds resolves to the earliest tier —
+/// never to the first declaration in source order. A lower number claims
+/// the `decls` slot; equal tiers keep the sitting declaration (one
+/// upstream kind list is element-ordered, matching the unit's source
+/// order). The duplicate report is independent of the winner: the second
+/// declaration in SOURCE order always reports, as upstream's `checkUnit`
+/// first-wins-per-unit scope does
+/// (duplicate_definition_verifier.dart:116-342).
+const TIER_ACCESSOR: u8 = 0;
+/// See [`TIER_ACCESSOR`].
+const TIER_ENUM: u8 = 1;
+/// See [`TIER_ACCESSOR`].
+const TIER_EXTENSION: u8 = 2;
+/// See [`TIER_ACCESSOR`].
+const TIER_EXTENSION_TYPE: u8 = 3;
+/// See [`TIER_ACCESSOR`].
+const TIER_FUNCTION: u8 = 4;
+/// See [`TIER_ACCESSOR`].
+const TIER_TYPE_ALIAS: u8 = 5;
+/// See [`TIER_ACCESSOR`].
+const TIER_MIXIN: u8 = 6;
+/// See [`TIER_ACCESSOR`].
+const TIER_CLASS: u8 = 7;
+
 /// An open container on the capture stack.
 #[expect(
     clippy::struct_excessive_bools,
@@ -1024,7 +1056,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// reported — `int x; int x;` is one upstream row, and the second
     /// variable's induced `x=` never joins `definedSetters`). The
     /// setter-side caller reads the flag to skip that second claim.
-    fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) -> bool {
+    fn declare_top(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        decl: TopDecl,
+        tier: u8,
+    ) -> bool {
         // The `augment` head comes first: it neither claims a vacant slot
         // nor displaces a type parameter's declaration-scoped placeholder.
         if self.declaring_augment {
@@ -1043,14 +1081,59 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // surface is `top_setters` (`definedSetters`), which already
             // reported — `decls` stays the model face only.
             Entry::Occupied(_) if setter_spelling => false,
-            Entry::Occupied(_) => {
+            Entry::Occupied(existing) => {
+                // Read the sitting declaration's tier facts before the
+                // duplicate log's `&mut self` borrow: the kind word and
+                // the getter/formals bit are the whole probe.
+                let sitting_kind = existing.kind;
+                let sitting_getter = existing.formals.is_none();
                 self.record_duplicate(name, range);
+                // The slot answers the oracle's `LibraryDeclarations`
+                // ownership, not first-in-file: the scope adds whole kind
+                // lists in a fixed order and `_getters[id] ??=` keeps the
+                // first add, so the earlier TIER wins regardless of source
+                // position (`var M` then `mixin M` resolves `M` to the
+                // variable — its induced getter is added with the getters,
+                // long before the mixins). An equal or later tier keeps the
+                // sitting declaration.
+                if tier < self.existing_tier(name, sitting_kind, sitting_getter) {
+                    self.decls.insert(name, decl);
+                }
                 true
             }
             Entry::Vacant(slot) => {
                 slot.insert(decl);
                 false
             }
+        }
+    }
+
+    /// The claim tier of the declaration already sitting in the slot — the
+    /// same order [`declare_top`] callers pass for the incoming declaration.
+    /// Derived, never stored: a getter reads as `TopLevelFn` with no formal
+    /// group (`formals.is_none()` — a function always latches its group), and
+    /// an `Extension` decl's container row — sealed at its close, which every
+    /// later claim follows — splits `extension` from `extension type` by its
+    /// `ContainerKind` (the containers claim obeys the same tiers, so the row
+    /// under a colliding name is always the winner's own).
+    fn existing_tier(&self, name: StringId, kind: MicroKind, getter: bool) -> u8 {
+        match kind {
+            MicroKind::TopLevelVar => TIER_ACCESSOR,
+            MicroKind::TopLevelFn if getter => TIER_ACCESSOR,
+            MicroKind::TopLevelFn => TIER_FUNCTION,
+            MicroKind::Enum => TIER_ENUM,
+            MicroKind::Extension => match self.named_containers.get(&name) {
+                Some(container) if container.kind == ContainerKind::ExtensionType => {
+                    TIER_EXTENSION_TYPE
+                }
+                _ => TIER_EXTENSION,
+            },
+            MicroKind::TypeAlias => TIER_TYPE_ALIAS,
+            MicroKind::Mixin => TIER_MIXIN,
+            MicroKind::Class => TIER_CLASS,
+            // `Prefix` never enters `decls`; `TypeParam` occupants take the
+            // earlier arm. A defensive fallback would only hide a real bug.
+            MicroKind::TypeParam | MicroKind::Prefix => u8::MAX,
         }
     }
 
@@ -1890,7 +1973,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         tag: MicroKind,
     ) {
         if let Some((name, range)) = name {
-            let _ = self.declare_top(name, range, TopDecl::bare(tag));
+            let _ = self.declare_top(name, range, TopDecl::bare(tag), container_tier(kind));
         }
         // The declaration's metadata star closed before this open (the
         // parser fires it first); it belongs to this container.
@@ -2127,44 +2210,68 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // `constructors`.
             let has_unnamed_constructor =
                 open.ctor_has_unnamed || (open.ctor_named.is_empty() && open.ctor_declared == 0);
-            // Keep-first: the element's own row is the FIRST declaration's
-            // face, so a later `augment` head of the same name never
-            // displaces it — and the row it wrote for itself is the
-            // fragment face the library-wide merge reads
-            // (`library::ElementFragments`). An `augment` closing onto a
-            // row another declaration already claimed contributes nothing
-            // here: its members live only on its own (dropped) face, the
-            // same-unit residual the merge cannot reach without a
-            // per-fragment column on the model.
-            self.named_containers.or_insert_with(name, || Container {
-                kind: open.kind,
-                is_abstract: open.is_abstract,
-                is_base: open.is_base,
-                is_final: open.is_final,
-                is_interface: open.is_interface,
-                is_mixin_class: open.is_mixin_class,
-                superclass: open.superclass,
-                members: members.finish(),
-                type_params: open.type_params,
-                type_param_names,
-                type_param_bounds,
-                sealed: open.sealed,
-                // The clause columns seal at exact length here — the
-                // push-grown staging Vecs shed their growth slack by
-                // construction, and the finished container never grows.
-                with_clause: open.with_clause.into_boxed_slice(),
-                implements_clause: open.implements_clause.into_boxed_slice(),
-                on_clause: open.on_clause.into_boxed_slice(),
-                header_residue: open.header_residue.into_boxed_slice(),
-                primary_formals: open.primary_formals.into_boxed_slice(),
-                enum_constants: open.enum_constants.into_boxed_slice(),
-                constructors: open.ctor_named.into_boxed_slice(),
-                has_unnamed_constructor,
-                has_const_constructor: open.ctor_const,
-                ctor_formals: open.ctor_formals.finish(),
-                factory_formals: open.factory_formals.finish(),
-                annotations: open.annotations.into_boxed_slice(),
-            });
+            // Keep-first within a tier — and an `augment` head NEVER
+            // claims: the element's own row is its introduction's face, so
+            // a later `augment` of the same name never displaces it, and the
+            // row it wrote for itself is the fragment face the library-wide
+            // merge reads (`library::ElementFragments`). An `augment`
+            // closing onto a row another declaration already claimed
+            // contributes nothing here: its members live only on its own
+            // (dropped) face, the same-unit residual the merge cannot reach
+            // without a per-fragment column on the model.
+            //
+            // Two INTRODUCTIONS of one name are two upstream elements, and
+            // the name resolves to the earlier claim tier
+            // (`LibraryDeclarations` adds enums → extensions → extension
+            // types → mixins → classes, `_getters[id] ??=`, scope.dart
+            // :317-326/:880-885) — `class C {} mixin C {}` resolves `C` to
+            // the MIXIN element, so the earlier-tier introduction's row
+            // displaces the sitting face just like `decls` does in
+            // [`Builder::declare_top`]. Keeping the containers claim on the
+            // same rule is also what makes `existing_tier`'s
+            // extension-type probe honest: the row under a colliding name
+            // is always the claim winner's, never a displaced loser's.
+            let claims = match self.named_containers.get(&name) {
+                Some(existing) => {
+                    open.augment_kw.is_none()
+                        && container_tier(open.kind) < container_tier(existing.kind)
+                }
+                // A vacant slot inserts whatever closed — an `augment`
+                // keeps the keep-first write too: its own row is the
+                // same-unit residual the element merge can read.
+                None => true,
+            };
+            if claims {
+                self.named_containers.insert(name, Container {
+                    kind: open.kind,
+                    is_abstract: open.is_abstract,
+                    is_base: open.is_base,
+                    is_final: open.is_final,
+                    is_interface: open.is_interface,
+                    is_mixin_class: open.is_mixin_class,
+                    superclass: open.superclass,
+                    members: members.finish(),
+                    type_params: open.type_params,
+                    type_param_names,
+                    type_param_bounds,
+                    sealed: open.sealed,
+                    // The clause columns seal at exact length here — the
+                    // push-grown staging Vecs shed their growth slack by
+                    // construction, and the finished container never grows.
+                    with_clause: open.with_clause.into_boxed_slice(),
+                    implements_clause: open.implements_clause.into_boxed_slice(),
+                    on_clause: open.on_clause.into_boxed_slice(),
+                    header_residue: open.header_residue.into_boxed_slice(),
+                    primary_formals: open.primary_formals.into_boxed_slice(),
+                    enum_constants: open.enum_constants.into_boxed_slice(),
+                    constructors: open.ctor_named.into_boxed_slice(),
+                    has_unnamed_constructor,
+                    has_const_constructor: open.ctor_const,
+                    ctor_formals: open.ctor_formals.finish(),
+                    factory_formals: open.factory_formals.finish(),
+                    annotations: open.annotations.into_boxed_slice(),
+                });
+            }
         }
         // The member-claim scope rows stay in `member_scopes` past this
         // close: the oracle's scopes live on the merged element (its first
@@ -2605,6 +2712,20 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             library_annotations: self.library_annotations.into_boxed_slice(),
             type_args: self.type_args,
         }
+    }
+}
+
+/// The claim tier of a named container kind — the container slice of the
+/// `TIER_*` order [`Builder::declare_top`] applies (upstream Dart SDK
+/// source, `LibraryDeclarations`, scope.dart:317-326: enums → extensions →
+/// extension types → mixins → classes).
+fn container_tier(kind: ContainerKind) -> u8 {
+    match kind {
+        ContainerKind::Enum => TIER_ENUM,
+        ContainerKind::Extension => TIER_EXTENSION,
+        ContainerKind::ExtensionType => TIER_EXTENSION_TYPE,
+        ContainerKind::Mixin => TIER_MIXIN,
+        ContainerKind::Class => TIER_CLASS,
     }
 }
 
@@ -3796,6 +3917,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 // reporter reads it off the decl row.
                                 annotations: builder.field_annotations.clone().into_boxed_slice(),
                             },
+                            // A variable claims through its induced getter —
+                            // the oracle's `library.getters` tier, ahead of
+                            // every container kind.
+                            TIER_ACCESSOR,
                         );
                         // The induced setter joins `definedSetters` — a
                         // non-final top-level variable claims `name=` so a
@@ -4680,6 +4805,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     formals: pending.formals,
                     annotations: pending.annotations.into_boxed_slice(),
                 },
+                // A getter joins the oracle's `library.getters` tier with
+                // the variables' induced accessors; a function claims with
+                // `topLevelFunctions`, four tiers later. A `name=` spelling
+                // never reaches the tier arm (the setter map is upstream's
+                // separate surface), so the setter's value is inert.
+                if !setter && get_or_set.is_some() {
+                    TIER_ACCESSOR
+                } else {
+                    TIER_FUNCTION
+                },
             );
             // The setter-scope claim `definedSetters` sees (a getter or
             // method claims only `decls`). `set f` reports its own
@@ -5352,6 +5487,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     formals: None,
                     annotations: pending.annotations.into_boxed_slice(),
                 },
+                TIER_TYPE_ALIAS,
             );
         }
     }
@@ -7463,6 +7599,244 @@ mod tests {
             "Map<String, List<int>>"
         );
         assert_eq!(restored.type_args().len(), 2);
+    }
+
+    // ── #3483: the `decls` name claim follows the oracle's
+    // `LibraryDeclarations` kind order, not source order ──────────────
+    // Upstream adds whole kind lists in a fixed sequence —
+    // getters (real + variable-induced) → enums → extensions →
+    // extension types → top-level functions → type aliases → mixins →
+    // classes — and `_getters[id] ??=` keeps the FIRST add
+    // (scope.dart:317-326, :880-885). A cross-kind collision therefore
+    // resolves to the earliest TIER, never to the first declaration in
+    // the file. The duplicate report stays source-ordered
+    // (`checkUnit`'s own first-wins scope, duplicate_definition_verifier
+    // .dart:116-342), so the second declaration always reports
+    // regardless of which side wins the claim.
+
+    /// `kind` of the name claim winner under `name`.
+    fn winner(elements: &FileElements, strings: &StringTable, name: &str) -> MicroKind {
+        elements
+            .decl(id(strings, name))
+            .unwrap_or_else(|| panic!("{name} declares nothing"))
+            .kind
+    }
+
+    /// The ticket's measured shape: a variable and a mixin share `M` —
+    /// the variable's induced getter is added with `library.getters`,
+    /// tiers before the mixin list, so `M` resolves to the variable in
+    /// either source order (the `illegal_syntax_test` shape where
+    /// parser recovery writes `var M` beside `mixin M`).
+    #[test]
+    fn ticket_3483_variable_beats_mixin_in_either_order() {
+        let strings = StringTable::new();
+        for source in ["var M = 0; mixin M {}", "mixin M {} var M = 0;"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "M"),
+                MicroKind::TopLevelVar,
+                "{source:?}: the getter tier claims ahead of the mixin tier"
+            );
+        }
+    }
+
+    /// The same getter-tier claim against the class tier — the tail of
+    /// upstream's addition order.
+    #[test]
+    fn ticket_3483_variable_beats_class_in_either_order() {
+        let strings = StringTable::new();
+        for source in ["var C = 0; class C {}", "class C {} var C = 0;"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "C"),
+                MicroKind::TopLevelVar,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// Two declarations of one tier keep first-in-file: `??=` within a
+    /// single upstream list.
+    #[test]
+    fn ticket_3483_same_tier_keeps_first_declared() {
+        let strings = StringTable::new();
+        let elements = build("int x = 0; double x = 1; class D {} class D {}", &strings);
+        assert_eq!(winner(&elements, &strings, "x"), MicroKind::TopLevelVar);
+        assert_eq!(winner(&elements, &strings, "D"), MicroKind::Class);
+        // And the variable's claim still carries the FIRST declarator's
+        // type, not the second's — the winner is the first element.
+        assert_eq!(
+            elements
+                .decl(id(&strings, "x"))
+                .expect("x")
+                .var_ty
+                .render(&strings, elements.type_args()),
+            "int"
+        );
+    }
+
+    /// A top-level function claims at `topLevelFunctions` — between the
+    /// extension types and the type aliases — so a variable's induced
+    /// getter still outranks it, and a function outranks a mixin.
+    #[test]
+    fn ticket_3483_function_tier() {
+        let strings = StringTable::new();
+        // Variable outranks the function in either order.
+        for source in ["var f = 0; void f() {}", "void f() {} var f = 0;"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "f"),
+                MicroKind::TopLevelVar,
+                "{source:?}"
+            );
+        }
+        // The function outranks the mixin in either order.
+        for source in ["void g() {} mixin g {}", "mixin g {} void g() {}"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "g"),
+                MicroKind::TopLevelFn,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A real getter joins `library.getters` — the same tier as a
+    /// variable's induced getter, ahead of every function and container.
+    #[test]
+    fn ticket_3483_getter_tier() {
+        let strings = StringTable::new();
+        // The getter outranks the function in either order (the model
+        // tags both `TopLevelFn` — the claim cannot read the tag).
+        for source in [
+            "int get h => 0; void h() {}",
+            "void h() {} int get h => 0;",
+        ] {
+            let elements = build(source, &strings);
+            let decl = elements.decl(id(&strings, "h")).expect("h");
+            assert_eq!(decl.kind, MicroKind::TopLevelFn, "{source:?}");
+            assert!(
+                decl.formals.is_none(),
+                "{source:?}: the getter's formals-less row is the winner"
+            );
+        }
+        // And the getter outranks a class in either order.
+        for source in ["class H {} int get H => 0;", "int get H => 0; class H {}"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "H"),
+                MicroKind::TopLevelFn,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// Enum claims at tier 1, ahead of the whole rest — `class E` loses
+    /// in either order.
+    #[test]
+    fn ticket_3483_enum_beats_class() {
+        let strings = StringTable::new();
+        for source in ["enum E { a } class E {}", "class E {} enum E { a }"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "E"),
+                MicroKind::Enum,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// Mixin (tier 6) outranks class (tier 7) — `class C {} mixin C {}`
+    /// resolves `C` to the MIXIN element upstream.
+    #[test]
+    fn ticket_3483_mixin_beats_class() {
+        let strings = StringTable::new();
+        for source in ["mixin C {} class C {}", "class C {} mixin C {}"] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "C"),
+                MicroKind::Mixin,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// Type alias (tier 5) outranks mixin and class, loses to enum and
+    /// the accessor tier.
+    #[test]
+    fn ticket_3483_typedef_tier() {
+        let strings = StringTable::new();
+        for source in [
+            "typedef T = int; class T {}",
+            "class T {} typedef T = int;",
+        ] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "T"),
+                MicroKind::TypeAlias,
+                "{source:?}"
+            );
+        }
+        for source in [
+            "enum U { a } typedef U = int;",
+            "typedef U = int; enum U { a }",
+        ] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "U"),
+                MicroKind::Enum,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// Extension (tier 2) outranks extension type (tier 3) — upstream
+    /// adds `library.extensions` before `library.extensionTypes`.
+    #[test]
+    fn ticket_3483_extension_beats_extension_type() {
+        let strings = StringTable::new();
+        for source in [
+            "extension X on int {} extension type X(int i) {}",
+            "extension type X(int i) {} extension X on int {}",
+        ] {
+            let elements = build(source, &strings);
+            assert_eq!(
+                winner(&elements, &strings, "X"),
+                MicroKind::Extension,
+                "{source:?}"
+            );
+            let container = elements.container(id(&strings, "X")).expect("X container");
+            assert_eq!(
+                container.kind,
+                ContainerKind::Extension,
+                "{source:?}: the containers claim follows the same tiers"
+            );
+        }
+    }
+
+    /// The control: the duplicate REPORT stays source-ordered — the
+    /// second declaration reports at ITS name span regardless of which
+    /// side wins the claim, so the emission range does not move.
+    #[test]
+    fn ticket_3483_duplicate_report_stays_at_second_declaration() {
+        let strings = StringTable::new();
+        // `mixin M` first: `var M` reports at its own name — and the
+        // VARIABLE still wins the claim.
+        let source = "mixin M {} var M = 0;";
+        let elements = build(source, &strings);
+        let at = source.find("M = 0").expect("declarator") as u32;
+        assert_eq!(elements.duplicates().len(), 1);
+        assert_eq!(elements.duplicates()[0].name, id(&strings, "M"));
+        assert_eq!(elements.duplicates()[0].range.offset, at);
+        assert_eq!(winner(&elements, &strings, "M"), MicroKind::TopLevelVar);
+        // `var M` first: `mixin M` reports at ITS name — and the
+        // variable keeps the claim.
+        let source = "var M = 0; mixin M {}";
+        let elements = build(source, &strings);
+        let at = source.find("M {}").expect("mixin name") as u32;
+        assert_eq!(elements.duplicates().len(), 1);
+        assert_eq!(elements.duplicates()[0].range.offset, at);
+        assert_eq!(winner(&elements, &strings, "M"), MicroKind::TopLevelVar);
     }
 }
 
