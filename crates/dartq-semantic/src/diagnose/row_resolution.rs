@@ -6582,10 +6582,6 @@ impl<'a> Engine<'a> {
                                         && members.contains(&setter_text)))
                         })
                         || (bound_text == "Function" && member_text == "call");
-                    if bound_core_member {
-                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-                        return;
-                    }
                     // A bound name the model cannot walk (unresolvable,
                     // or another parameter spelling): the miss stays
                     // under-report rather than inventing a verdict.
@@ -6632,6 +6628,24 @@ impl<'a> Engine<'a> {
                         return;
                     }
                     if own_param_armed {
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    // A bound spelling a core interface/type-table head
+                    // answers its frozen members the same way
+                    // `check_core_type_member` does — the rig's stub
+                    // classes declare nothing, so `num.abs`, `int.sign`,
+                    // `Function.call` resolve off the static face
+                    // (`class num {}` walks no members; the table carries
+                    // the names-only SDK answer upstream's bound walk
+                    // finds). Ordered AFTER the nullable verdict: a member
+                    // the bound owns still reports
+                    // `unchecked_use_of_nullable_value` on a nullable
+                    // receiver (`t.isEven` over `T extends int?`), never
+                    // silence. `write` reads the setter spelling's
+                    // membership the same as the getter's — the frozen
+                    // face declares no setter, so a miss stays a miss.
+                    if bound_core_member {
                         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                         return;
                     }
