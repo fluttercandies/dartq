@@ -40,11 +40,24 @@
 //! `Object`-owned inherited conflict on an extension type, 4 are
 //! constructor-name captures — shapes 1-2 silence all of them, and the
 //! duplicate contract silences the first. The remaining 190 occurrences
-//! are augmenting-fragment shapes: `fold_fragment` merges an `augment`
-//! container's members into the merged container with no instance-scope
-//! filter, so the emitter cannot tell a fragment from an introduction.
-//! That repair belongs to the collector (the fragment model), and the two
-//! `#[ignore]`d pins below state the oracle truth for it.
+//! are augmenting-fragment shapes. #3585 traced them: the collector is NOT
+//! on this path — `fold_fragment` already drops a member carrying its own
+//! `augment` keyword from the merged member map (collector.rs, the
+//! `is_augment` filter), and the invalid-`augment` shape never folds at
+//! all (a plain `class` head takes the claim arm, not the fragment arm).
+//! The own-scope arm reads the engine's flat declaration sites instead:
+//! `note_decl_site` (unused_finalization.rs) sets `DeclSite::is_augment`
+//! from the constructor latch only, so a method/field site never carries
+//! the member's own `augment` keyword even though the listener already
+//! latches it (`open_exec_augment` at the method head, `group_augment` at
+//! the field group head), and `check_conflicting_static_and_instance`
+//! (overrides.rs) builds `instance_names` from those sites with no
+//! `is_augment` filter. The repair is engine-side (set the bit on member
+//! sites, filter the instance set), and the two `#[ignore]`d pins below
+//! state the oracle truth for it. The #3585 positive controls
+//! (`ticket_3585_tests.rs`) hold the other half fixed: a member WITHOUT
+//! the keyword inside an `augment` body is an introduction that still
+//! claims and still reports.
 
 use super::test_rig::{report_ops, report_ops_experiments_with};
 use super::FileReport;
@@ -185,15 +198,18 @@ fn enum_factory_constructor_name_is_not_an_instance_member() {
 /// instance scope, so the introductory static member stays silent
 /// (oracle a1: `augmentation_without_declaration` only).
 ///
-/// Ignored: the residual is the collector's fragment folding
-/// (`fold_fragment` merges an `augment` container's members into the
-/// merged container with no instance-scope filter), which lives in
-/// `collector.rs` — the emitter reads only flat declaration sites and
-/// cannot tell an augmenting fragment from an introduction. The pin
-/// states the oracle truth so the fragment-model repair lands against a
-/// failing witness.
+/// Ignored: the own-scope arm builds its instance set from the engine's
+/// flat declaration sites (`check_conflicting_static_and_instance`,
+/// overrides.rs), and a member site never carries the member's own
+/// `augment` keyword — `note_decl_site` (unused_finalization.rs) sets
+/// `DeclSite::is_augment` from the constructor latch only — so the
+/// emitter cannot tell this augmenting fragment from an introduction. The
+/// collector's merged member map already excludes it (`fold_fragment`'s
+/// `is_augment` filter) and is not what this arm reads. The pin states
+/// the oracle truth so the engine-side repair lands against a failing
+/// witness.
 #[test]
-#[ignore = "augmenting members still join the merged instance scope (collector fragment folding)"]
+#[ignore = "member decl sites never carry the member's own augment keyword (engine note_decl_site + overrides instance_names filter)"]
 fn augment_without_target_does_not_collide() {
     let rows = conflicts_augmented(
         "class A {\n\
@@ -229,11 +245,14 @@ fn augment_static_member_with_target_still_reports() {
 /// never become declarations of the container (oracle
 /// `parser-fe/augmentation/member_declarations`: zero such rows).
 ///
-/// Ignored for the same reason as
-/// [`augment_without_target_does_not_collide`]: the recovery path records
-/// the two `augment`-shaped members as an ordinary instance/static pair.
+/// Ignored for the same engine-side reason as
+/// [`augment_without_target_does_not_collide`]: the two `augment`-shaped
+/// members reach the declaration-site capture as an ordinary
+/// instance/static pair. This shape is also the direct disproof of a
+/// collector attribution — a plain `class` head takes the claim arm of
+/// `close_container`, so `fold_fragment` never runs here at all.
 #[test]
-#[ignore = "augmenting members still join the merged instance scope (collector fragment folding)"]
+#[ignore = "member decl sites never carry the member's own augment keyword (engine note_decl_site + overrides instance_names filter)"]
 fn augment_members_in_non_augment_container_are_silent() {
     let rows = conflicts_augmented(
         "class C {\n\

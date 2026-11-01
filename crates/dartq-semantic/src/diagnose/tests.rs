@@ -23066,3 +23066,11 @@ mod ticket_3558_tests;
 #[cfg(test)]
 #[path = "ticket_3583_tests.rs"]
 mod ticket_3583_tests;
+
+#[cfg(test)]
+#[path = "ticket_3581_tests.rs"]
+mod ticket_3581_tests;
+
+#[cfg(test)]
+#[path = "ticket_3585_tests.rs"]
+mod ticket_3585_tests;
