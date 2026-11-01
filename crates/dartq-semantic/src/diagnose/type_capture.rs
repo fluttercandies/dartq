@@ -421,69 +421,106 @@ impl<'a> Engine<'a> {
                 && matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
         });
         // `member_duplicate_definition_verifier.dart`'s constructor pass:
-        // per container, constructor names dedupe by selector — the unnamed
-        // spelling keys as `new` (`member.name?.lexeme ?? 'new'`), a named
-        // spelling by its selector — and every second-and-later declaration
-        // of a key reports `duplicate_constructor` at its own name span.
-        // The pass runs per class ELEMENT (one declaration): a duplicate
-        // class name declares a fresh constructor set, so same-named
-        // earlier declarations' sites stay out (the oracle reports
-        // `duplicate_definition` on the class name and never a
-        // cross-declaration `duplicate_constructor`). The current
-        // declaration is the last container site of the name; its
-        // constructors all start at or after its name token.
+        // per container ELEMENT, constructor names dedupe by selector —
+        // `member.name?.lexeme ?? 'new'` — and every second-and-later
+        // declaration of a key reports `duplicate_constructor` at its
+        // `errorRange` (`ConstructorDeclarationImpl`: the type name through
+        // the selector, or `newKeyword`/`factoryKeyword` through the name
+        // for a `new`-head/bare-factory spelling). The element's context
+        // spans every `augment` fragment — the constructor set seeds across
+        // fragments in declaration order — while a same-named plain
+        // redeclaration is a fresh element (its `duplicate_definition` row
+        // is another face's business, so earlier declarations' sites stay
+        // out).
         {
-            let decl_start = self
-                .decl_sites
-                .iter()
-                .rev()
-                .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
-                .map(|site| site.range.offset);
             let new_name = self.intern("new");
-            // `errorRange` (`ConstructorDeclaration`): the type name through
-            // the selector for a named head, the type name alone otherwise.
-            let mut ctor_keys: Vec<(StringId, SourceRange)> = self
+            // The element chain ends at the declaration currently closing:
+            // the last container site of the name, extended backwards —
+            // a fragment joins the previous element's context only while
+            // it is itself an `augment` declaration.
+            let container_sites: Vec<usize> = self
                 .decl_sites
                 .iter()
                 .enumerate()
                 .filter(|(_, site)| {
-                    // An augment constructor merges into the introductory
-                    // element's fragment chain (upstream
-                    // `member.name?.lexeme ?? 'new'` keys per element) —
-                    // never a second declaration of the selector.
-                    !site.is_augment
-                        && matches!(
-                            site.kind,
-                            DeclKind::Constructor { container: c } if c == container
-                        )
+                    matches!(site.kind, DeclKind::Container) && site.name == container
                 })
-                .filter(|(_, site)| decl_start.is_none_or(|start| site.range.offset >= start))
-                .map(|(index, site)| {
-                    if site.name == container {
-                        return (new_name, site.range);
-                    }
-                    let head = self
-                        .ctor_head_anchors
-                        .get(&index)
-                        .or_else(|| self.factory_head_anchors.get(&index))
-                        .filter(|head| head.offset < site.range.offset);
-                    let range = head.map_or(site.range, |head| SourceRange {
-                        offset: head.offset,
-                        length: site.range.end() - head.offset,
-                    });
-                    (site.name, range)
-                })
+                .map(|(index, _)| index)
                 .collect();
+            let mut first = container_sites.len().saturating_sub(1);
+            while first > 0
+                && self.decl_head_is_augment(self.decl_sites[container_sites[first]].range)
+            {
+                first -= 1;
+            }
+            let chain_start = container_sites
+                .get(first)
+                .map(|&index| self.decl_sites[index].range.offset);
+            let in_chain = |offset: u32| chain_start.is_none_or(|start| offset >= start);
+            // Seeds — claims that never report: upstream adds the primary
+            // constructor's element name before the member walk. A class or
+            // enum primary already rides its own Constructor decl site (the
+            // member walk's first arm claims it in offset order); an
+            // extension type's representation primary registers no site, so
+            // its key reads off the header's post-name tokens — `(` keys
+            // `new`, `.name` the selector (`.new` the unnamed face again).
+            let mut seen_ctors: FxHashSet<StringId> = FxHashSet::default();
+            let extension_type = self
+                .index
+                .get(self.file)
+                .and_then(|elements| elements.container(container))
+                .is_some_and(|decl| decl.kind == ContainerKind::ExtensionType);
+            if extension_type {
+                for &index in &container_sites[first..] {
+                    if let Some(key) = self.header_primary_key(self.decl_sites[index].range) {
+                        seen_ctors.insert(key);
+                        break;
+                    }
+                }
+            }
+            // The member entries in declaration order: every constructor
+            // site and bare-factory head of the chain, keyed and spanned by
+            // the upstream head-shape rules (see `dup_ctor_entry` /
+            // `dup_factory_entry`). An `augment` member merges into the
+            // introductory element — never a second declaration.
+            let mut ctor_keys: Vec<(StringId, SourceRange)> = Vec::new();
+            for site in &self.decl_sites {
+                if site.is_augment
+                    || !matches!(
+                        site.kind,
+                        DeclKind::Constructor { container: c } if c == container
+                    )
+                    || !in_chain(site.range.offset)
+                {
+                    continue;
+                }
+                if let Some(entry) = self.dup_ctor_entry(site, container, new_name) {
+                    ctor_keys.push(entry);
+                }
+            }
             ctor_keys.extend(
                 self.unnamed_factory_heads
                     .iter()
-                    .filter(|(c, _, range)| {
-                        *c == container && decl_start.is_none_or(|start| range.offset >= start)
-                    })
-                    .map(|&(_, key, range)| (key, range)),
+                    .filter(|(c, _, range)| *c == container && in_chain(range.offset))
+                    .filter_map(|entry| self.dup_factory_entry(*entry)),
             );
+            // The bare `factory (` head (primary-constructor syntax) fires no
+            // identifier event — it registers neither a decl site nor an
+            // `unnamed_factory_heads` tuple — so the pass finds it on the
+            // token stream: `factory`+`(` at member level whose modifier run
+            // reaches a member boundary claims the unnamed face at the
+            // `factory` keyword (the `errorRange` for a nameless factory
+            // head — `typeName ?? (newKeyword ?? factoryKeyword)` alone).
+            if let Some(name_range) = container_name
+                && in_chain(name_range.offset)
+            {
+                ctor_keys.extend(
+                    self.bare_factory_heads(name_range)
+                        .into_iter()
+                        .map(|range| (new_name, range)),
+                );
+            }
             ctor_keys.sort_by_key(|(_, range)| range.offset);
-            let mut seen_ctors: FxHashSet<StringId> = FxHashSet::default();
             for (key, range) in ctor_keys {
                 if !seen_ctors.insert(key) {
                     let arg = if key == new_name {
@@ -780,6 +817,359 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    /// The token immediately BEFORE the one starting at `offset` (UTF-16) —
+    /// the `duplicate_constructor` head-shape walk's step.
+    fn dup_token_before(&self, offset: u32) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < offset);
+        let token = tokens.get(at.checked_sub(1)?)?;
+        Some(SourceRange {
+            offset: token.utf16_offset,
+            length: self.utf16_of((token.byte_offset + token.byte_len) as usize)
+                - token.utf16_offset,
+        })
+    }
+
+    /// The first token starting at or after `offset` (UTF-16).
+    fn dup_token_at(&self, offset: u32) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < offset);
+        let token = tokens.get(at)?;
+        Some(SourceRange {
+            offset: token.utf16_offset,
+            length: self.utf16_of((token.byte_offset + token.byte_len) as usize)
+                - token.utf16_offset,
+        })
+    }
+
+    /// Whether the container declaration whose name sits at `name_range` is
+    /// an `augment` fragment: the header keywords scan backwards to the
+    /// declaration boundary — `augment` is the only latch the
+    /// `duplicate_constructor` element-chain needs (upstream keys the
+    /// context on `element.firstFragment`, shared by every fragment).
+    fn decl_head_is_augment(&self, name_range: SourceRange) -> bool {
+        let mut offset = name_range.offset;
+        loop {
+            let Some(prev) = self.dup_token_before(offset) else {
+                return false;
+            };
+            match self.lexeme_at(prev.offset) {
+                Some("augment") => return true,
+                Some(
+                    "class" | "mixin" | "enum" | "extension" | "type" | "abstract"
+                    | "base" | "final" | "interface" | "sealed",
+                ) => offset = prev.offset,
+                _ => return false,
+            }
+        }
+    }
+
+    /// The primary constructor's `duplicate_constructor` key for the
+    /// container header whose name sits at `name_range`: `new` for an
+    /// unnamed or `.new` head, the selector's interned name for a `.named`
+    /// one — `None` when the header carries no primary (an `augment`
+    /// fragment or a formals-less plain header). Upstream reads
+    /// `primaryConstructor.declaredFragment!.element.name`, which is
+    /// exactly the header's post-name `(`/`.selector` shape.
+    fn header_primary_key(&self, name_range: SourceRange) -> Option<StringId> {
+        let new_name = self.intern("new");
+        let mut head = self.dup_token_at(name_range.end())?;
+        if self.lexeme_at(head.offset) == Some("<") {
+            // Skip the written type-parameter group to its matching `>`.
+            let mut depth = 0usize;
+            let mut offset = head.offset;
+            loop {
+                let token = self.dup_token_at(offset)?;
+                for ch in self.lexeme_at(token.offset).unwrap_or("").chars() {
+                    match ch {
+                        '<' => depth += 1,
+                        '>' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                offset = token.end();
+                if depth == 0 {
+                    break;
+                }
+            }
+            head = self.dup_token_at(offset)?;
+        }
+        match self.lexeme_at(head.offset) {
+            Some("(") => Some(new_name),
+            Some(".") => {
+                let selector = self.token_after(head.offset)?;
+                match self.lexeme_at(selector.offset) {
+                    Some("new") | None => Some(new_name),
+                    Some(text) => Some(self.intern(text)),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// One constructor site's `duplicate_constructor` entry — `(key,
+    /// errorRange)` — or `None` when upstream's pass skips the member
+    /// outright (`typeName` is present and is not the enclosing class's
+    /// name: `A.foo` inside `B`, `new.named`, `factory.someName`).
+    ///
+    /// The site slot only records the written name token, so the head's
+    /// shape is re-read off the token stream: the token before it decides
+    /// the arm — `.` a type-name selector head, `new` a `new`-keyword head,
+    /// anything else a plain head (which must then spell the container
+    /// itself, else the upstream typeName gate skips it).
+    fn dup_ctor_entry(
+        &self,
+        site: &DeclSite,
+        container: StringId,
+        new_name: StringId,
+    ) -> Option<(StringId, SourceRange)> {
+        let at = site.range;
+        let lexeme = self.lexeme_at(at.offset);
+        // The header primary (`class C(...)`, `enum E.named(...)`): the
+        // site's own range is the `(`/`.` token — it claims the element
+        // name (upstream's `constructorNames.add(element.name)`), never a
+        // row of its own.
+        if site.name == container {
+            match lexeme {
+                Some("(") => return Some((new_name, at)),
+                Some(".") => {
+                    let key = self
+                        .token_after(at.offset)
+                        .and_then(|sel| self.lexeme_at(sel.offset))
+                        .map_or(new_name, |text| {
+                            if text == "new" {
+                                new_name
+                            } else {
+                                self.intern(text)
+                            }
+                        });
+                    return Some((key, at));
+                }
+                _ => {}
+            }
+        }
+        // Recovery debris (`this.new = e`, `this.x = e`, `new = e`): the
+        // recovered member upstream names the identifier before `=` — the
+        // `new` spelling keys the unnamed face, any other identifier its
+        // own name; the report range is that identifier alone.
+        if lexeme == Some("=") {
+            let prev = self.dup_token_before(at.offset)?;
+            let text = self.lexeme_at(prev.offset)?;
+            let key = if text == "new" {
+                new_name
+            } else {
+                self.intern(text)
+            };
+            return Some((key, prev));
+        }
+        let prev = self.dup_token_before(at.offset)?;
+        match self.lexeme_at(prev.offset) {
+            // `T.name` — the type name must be the enclosing class (the
+            // upstream `typeName != firstFragment.name` skip); the range
+            // is the type name through the selector.
+            Some(".") => {
+                let tname = self.dup_token_before(prev.offset)?;
+                if self.lexeme_at(tname.offset) != Some(self.strings.resolve(container)) {
+                    return None;
+                }
+                let key = if lexeme == Some("new") {
+                    new_name
+                } else {
+                    site.name
+                };
+                Some((
+                    key,
+                    SourceRange {
+                        offset: tname.offset,
+                        length: at.end().saturating_sub(tname.offset),
+                    },
+                ))
+            }
+            // The `new`-keyword head (`new()`, `new named()`, `new new()`):
+            // `errorRange` is `newKeyword` through the name — the name
+            // slot's `(` spelling keys the unnamed face exactly like a
+            // null name upstream; a `new` name still spells `new new`.
+            // The `new.name` recovery's site sits on the `.` slot when the
+            // selector is a plain identifier (the `.` arm above drops it as
+            // a `new`-spelled typeName); a `new` selector lands here as a
+            // `(`-slot site whose `prev` is the NAME token — a `.` before
+            // it means the head is `new.new` (newKeyword through name).
+            Some("new") => {
+                if lexeme == Some(".") {
+                    return None;
+                }
+                let key = if lexeme == Some("(") {
+                    new_name
+                } else {
+                    site.name
+                };
+                let range = if lexeme == Some("(") {
+                    match self
+                        .dup_token_before(prev.offset)
+                        .and_then(|dot| (self.lexeme_at(dot.offset) == Some(".")).then_some(dot))
+                        .and_then(|dot| self.dup_token_before(dot.offset))
+                    {
+                        // `new.new()` — the keyword is the `new` ahead of
+                        // the dot, the name is the `new` ahead of `(`.
+                        Some(kw) if self.lexeme_at(kw.offset) == Some("new") => SourceRange {
+                            offset: kw.offset,
+                            length: prev.end().saturating_sub(kw.offset),
+                        },
+                        // `new()` — a null name upstream; the keyword alone.
+                        _ => prev,
+                    }
+                } else {
+                    SourceRange {
+                        offset: prev.offset,
+                        length: at.end().saturating_sub(prev.offset),
+                    }
+                };
+                Some((key, range))
+            }
+            // A plain head: `C()` spells the enclosing class and keys the
+            // unnamed face; any other identifier is a wrong typeName
+            // (upstream skips) or a non-constructor member the recovery
+            // captured (`get`/`set` heads).
+            _ => {
+                if site.name == container {
+                    Some((new_name, site.range))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// One bare-factory head's `duplicate_constructor` entry — the same
+    /// `(key, errorRange)` as [`Self::dup_ctor_entry`]. `None` when the
+    /// declaration is an `augment factory` (the member merges into the
+    /// introductory element) or the head anchor cannot be attributed.
+    ///
+    /// Upstream reads the head off the AST: `factory C()` spells a
+    /// typeName so the range is `C` alone; `factory new()` names the
+    /// constructor `new` so the range is `factory` through it;
+    /// `factory()` has neither, the `factory` keyword alone;
+    /// `factory name()` spans `factory name`.
+    fn dup_factory_entry(
+        &self,
+        (container, key, head): (StringId, StringId, SourceRange),
+    ) -> Option<(StringId, SourceRange)> {
+        let new_name = self.intern("new");
+        let prev = self.dup_token_before(head.offset)?;
+        if self.lexeme_at(prev.offset) != Some("factory") {
+            // A head anchor the `factory`-adjacent shape cannot explain —
+            // keep the captured verdict rather than invent a span.
+            return Some((key, head));
+        }
+        // `augment` before `factory` (through `external`/`const`): the
+        // member merges into the introductory element — never a
+        // declaration of the selector.
+        let mut at = prev.offset;
+        while let Some(before) = self.dup_token_before(at) {
+            match self.lexeme_at(before.offset) {
+                Some("const") | Some("external") => at = before.offset,
+                Some("augment") => return None,
+                _ => break,
+            }
+        }
+        let head_text = self.lexeme_at(head.offset)?;
+        let joined = |end: SourceRange| SourceRange {
+            offset: prev.offset,
+            length: end.end().saturating_sub(prev.offset),
+        };
+        if head_text == self.strings.resolve(container) {
+            Some((new_name, head))
+        } else if head_text == "(" {
+            Some((new_name, prev))
+        } else if head_text == "new" {
+            Some((new_name, joined(head)))
+        } else {
+            Some((self.intern(head_text), joined(head)))
+        }
+    }
+
+    /// The `duplicate_constructor` ranges of the declaration's bare
+    /// `factory (` heads — the primary-constructor-syntax unnamed factory.
+    /// The parser's unnamed-factory arm fires `handle_no_identifier` (no
+    /// name event reaches the engine), so no decl site and no
+    /// `unnamed_factory_heads` tuple ever records the shape; the pass
+    /// re-derives it from the token stream: a `factory` whose follower is
+    /// `(` and whose modifier run walks back to a member boundary
+    /// (`{`, `}`, `;` through `external`/`const`) at member depth. The
+    /// return is the `factory` keyword's own range — the upstream
+    /// `errorRange` for a nameless factory head.
+    fn bare_factory_heads(&self, name_range: SourceRange) -> Vec<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        // The declaration body's `{`: `(...)`/`<...>` groups in the header
+        // never fake it, and a `;` header (no body) ends the scan.
+        let mut index = tokens.partition_point(|token| token.utf16_offset < name_range.end());
+        let body_open = loop {
+            let Some(_) = tokens.get(index) else {
+                return Vec::new();
+            };
+            match self.tokens.lexeme(self.source, index) {
+                "{" => break index,
+                "(" | "[" | "<" => {
+                    index = self
+                        .tokens
+                        .matching_end(index)
+                        .map_or(index + 1, |end| end + 1);
+                }
+                ";" => return Vec::new(),
+                _ => index += 1,
+            }
+        };
+        let body_close = self
+            .tokens
+            .matching_end(body_open)
+            .unwrap_or(tokens.len().saturating_sub(1));
+        let mut heads = Vec::new();
+        let mut depth = 0usize;
+        let mut i = body_open + 1;
+        while i < body_close {
+            match self.tokens.lexeme(self.source, i) {
+                // Literal/expression braces at member level only raise the
+                // bar for the `factory (` head — expression positions never
+                // declare constructors.
+                "{" => depth += 1,
+                "}" => depth = depth.saturating_sub(1),
+                "factory" if depth == 0 => {
+                    let follower_is_formals = tokens
+                        .get(i + 1)
+                        .is_some_and(|_| self.tokens.lexeme(self.source, i + 1) == "(");
+                    if follower_is_formals {
+                        // The member-start verdict: `external`/`const` ride
+                        // along (`external const factory ()`), an `augment`
+                        // or any non-modifier head answers NO (a typed
+                        // `T factory()` is a method, `static factory()` the
+                        // identifier shape the parser's gate rejects).
+                        let mut at = tokens[i].utf16_offset;
+                        let declares = loop {
+                            let Some(prev) = self.dup_token_before(at) else {
+                                break false;
+                            };
+                            match self.lexeme_at(prev.offset) {
+                                Some("external") | Some("const") => at = prev.offset,
+                                Some("augment") => break false,
+                                Some("{") | Some("}") | Some(";") => break true,
+                                _ => break false,
+                            }
+                        };
+                        if declares {
+                            heads.push(SourceRange {
+                                offset: tokens[i].utf16_offset,
+                                length: 7,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        heads
     }
 
     /// #1314 FAM14: attributes the header-clause entries to their clause
@@ -2362,6 +2752,13 @@ impl<'a> Engine<'a> {
         })
     }
 }
+
+// The #3464 pins (the `duplicate_constructor` head-shape pass). Registered
+// here, in the face's own file, via `#[path]`: the module stays inside the
+// `diagnose` subtree so the test rig's `pub(super)` items remain visible.
+#[cfg(test)]
+#[path = "ticket_3464_tests.rs"]
+mod ticket_3464_tests;
 
 #[cfg(test)]
 mod exec_bounds_pairing_tests {
