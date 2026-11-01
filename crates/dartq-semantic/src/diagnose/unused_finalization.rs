@@ -3905,11 +3905,76 @@ impl<'a> Engine<'a> {
         // receiver's access resolving nothing still released the row.
         self.used_names = element_used;
         self.credit_forward_references();
+        self.retire_joined_case_binders();
         self.report_pattern_assignment_binders();
         self.drop_pre_feature_underscore_locals();
         self.suppress_same_line_ignored_usage();
         self.report_unused_imports();
         self.report_deprecated_sdk_libraries();
+    }
+
+    /// The case-head binder joins (#3558): a pattern variable of a switch
+    /// case head, an if-case head or a switch-expression arm reports only
+    /// while its upstream ELEMENT is unread, and two same-named binders of
+    /// one head are one element in two shapes:
+    ///
+    /// - across a logical-or (`int a || [int a]`) the branches join into one
+    ///   `JoinPatternVariableElement`, and a read of any spelling — the
+    ///   `when` guard's included — marks every branch's binder used
+    ///   (`UsedLocalElements.addElement`'s `transitiveVariables`);
+    /// - inside one conjunction or collection (`[var v] && [var v, …]`) the
+    ///   repeat is a duplicate the verifier never visits (`isDuplicate`),
+    ///   and the spelling's reads bind the first binder.
+    ///
+    /// The frame close credits a read to ONE same-named row, so the staged
+    /// verdicts are re-decided over the head's token span: a row drops when
+    /// a same-named binder of its head staged no row (that element was
+    /// read), and a duplicate's row drops outright. A chain nobody reads
+    /// keeps one row per branch — upstream reports every binder.
+    fn retire_joined_case_binders(&mut self) {
+        use dartq_scanner::TokenKind;
+        let local = SemanticCode::UnusedLocalVariable.code_info();
+        let staged: FxHashSet<u32> = self
+            .report
+            .usage
+            .iter()
+            .filter(|row| row.code == local)
+            .map(|row| row.range.offset)
+            .collect();
+        if staged.is_empty() {
+            return;
+        }
+        let tokens = self.tokens.as_slice();
+        let spelling = |i: usize| self.source.get(tokens[i].byte_range());
+        let mut retired: FxHashSet<u32> = FxHashSet::default();
+        for (x, token) in tokens.iter().enumerate() {
+            if token.kind != TokenKind::Identifier || !staged.contains(&token.utf16_offset) {
+                continue;
+            }
+            // A nameless recovery row (`<unnamed>`) is never a binder.
+            let name = spelling(x).filter(|text| !text.is_empty());
+            if name.is_none() {
+                continue;
+            }
+            let Some((start, end)) = case_pattern_extent(self.tokens, x) else {
+                continue;
+            };
+            let shared = (start..end).any(|y| {
+                y != x
+                    && binder_like(tokens, y)
+                    && spelling(y) == name
+                    && (!staged.contains(&tokens[y].utf16_offset)
+                        || (y < x && !or_joined(tokens, y, x)))
+            });
+            if shared {
+                retired.insert(token.utf16_offset);
+            }
+        }
+        if !retired.is_empty() {
+            self.report
+                .usage
+                .retain(|row| row.code != local || !retired.contains(&row.range.offset));
+        }
     }
 
     /// The assignment-pattern declaring binder face (#3302): a variable
@@ -3930,13 +3995,19 @@ impl<'a> Engine<'a> {
     /// but registers no local (that arm is the bare-identifier pattern,
     /// which declares nothing), so this face re-derives its population
     /// from the token stream. A plain `=` whose shortest balanced left
-    /// suffix is one bracket expression is a pattern assignment (an
-    /// initializer list's `:`, a `for` head's unterminated group and a
-    /// declaration's own `var (…)` head all fail the balance or the
-    /// declaration-head guard), and inside that span a `var`/`final` head
-    /// or a written-type run at a pattern-element position declares the
-    /// name it introduces. A repeated spelling inside one pattern reports
-    /// once (the first binder — the duplicate already reports
+    /// suffix is one bracket group is a pattern assignment only when the
+    /// whole pattern — the group plus an object pattern's `Type` /
+    /// `prefix.Type` head or a typed collection's `<…>` arguments — starts
+    /// where an expression may start ([`assignment_pattern_context`]). A
+    /// declaration's own head (`var (…) = …`, `var Square(…) = …`,
+    /// `final <int>[…] = …`), a redirecting factory's formal list
+    /// (`factory A.f(int a) = A;` — #3558), a function-typed formal's
+    /// default (`String this.f(int x) = g`) and a `for` head's
+    /// unterminated group all fail the balance or the context. Inside the
+    /// span a `var`/`final` head or a written-type run at a
+    /// pattern-element position declares the name it introduces. A
+    /// repeated spelling inside one pattern reports once (the first
+    /// binder — the duplicate already reports
     /// `duplicate_variable_pattern`).
     fn report_pattern_assignment_binders(&mut self) {
         let local = SemanticCode::UnusedLocalVariable;
@@ -3958,9 +4029,13 @@ impl<'a> Engine<'a> {
                 continue;
             };
             if start >= end
-                || start
-                    .checked_sub(1)
-                    .is_some_and(|at| declaration_head(tokens[at].kind))
+                || !matches!(
+                    tokens[start].kind,
+                    dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare
+                        | dartq_scanner::TokenKind::OpenCurly
+                )
+                || !assignment_pattern_context(tokens, pattern_head_start(tokens, start))
             {
                 continue;
             }
@@ -3996,12 +4071,14 @@ impl<'a> Engine<'a> {
 
     /// The declaring binder introduced at token `at` inside the pattern
     /// span `start..`: `var a` / `final a` (the keyword declares the next
-    /// identifier) or a written-type leaf (`int a`, `List<int> a`). The
-    /// head must sit at a pattern-element position — right after a
-    /// sub-pattern opener, a field/positional separator, or a
-    /// logical-and/or junction — so an ordinary `a b` adjacency (a named
-    /// field's value, a call's arguments) never reads as a declaration.
-    /// A bare identifier is an ASSIGNED variable, never a binder.
+    /// identifier, or the one after a written type — `final int a`
+    /// anchors on `a`, never on the type token) or a written-type leaf
+    /// (`int a`, `List<int>? a`). The head must sit at a pattern-element
+    /// position — right after a sub-pattern opener, a field/positional
+    /// separator, or a logical-and/or junction — so an ordinary `a b`
+    /// adjacency (a named field's value, a call's arguments) never reads
+    /// as a declaration. A bare identifier is an ASSIGNED variable, never
+    /// a binder.
     fn declaring_binder_at(
         &self,
         tokens: &[dartq_scanner::Token],
@@ -4013,45 +4090,19 @@ impl<'a> Engine<'a> {
         if !pattern_element_position(tokens[previous].kind) {
             return None;
         }
+        let is_identifier = |i: usize| tokens.get(i).map(|t| t.kind) == Some(TokenKind::Identifier);
         let name_at = match tokens[at].kind {
-            TokenKind::Keyword(Keyword::Var | Keyword::Final) => at + 1,
-            TokenKind::Identifier => {
-                // `int a` / `List<int> a`: the written type's run ends at
-                // the declared name. A name that is not an identifier
-                // (another operator, a call's `(`) is a type use, not a
-                // variable pattern.
-                let mut cursor = at + 1;
-                if tokens.get(cursor).map(|t| t.kind) == Some(TokenKind::Lt) {
-                    let mut depth = 0i32;
-                    while let Some(token) = tokens.get(cursor) {
-                        match token.kind {
-                            TokenKind::Lt => depth += 1,
-                            TokenKind::Gt => {
-                                depth -= 1;
-                                cursor += 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                                continue;
-                            }
-                            TokenKind::GtGt => {
-                                depth -= 2;
-                                cursor += 1;
-                                if depth <= 0 {
-                                    break;
-                                }
-                                continue;
-                            }
-                            _ => {}
-                        }
-                        cursor += 1;
-                    }
-                }
-                cursor
-            }
+            TokenKind::Keyword(Keyword::Var | Keyword::Final) => type_run_end(tokens, at + 1)
+                .filter(|&end| is_identifier(end))
+                .unwrap_or(at + 1),
+            // `int a` / `List<int> a`: the written type's run ends at the
+            // declared name. A name that is not an identifier (another
+            // operator, a call's `(`) is a type use, not a variable
+            // pattern.
+            TokenKind::Identifier => type_run_end(tokens, at)?,
             _ => return None,
         };
-        if tokens.get(name_at).map(|t| t.kind) != Some(TokenKind::Identifier) {
+        if !is_identifier(name_at) {
             return None;
         }
         let name = self.source.get(tokens[name_at].byte_range());
@@ -7578,25 +7629,351 @@ fn pattern_element_position(kind: dartq_scanner::TokenKind) -> bool {
     )
 }
 
-/// Whether the token immediately preceding the candidate span makes the
-/// group a DECLARATION pattern's head (`var (a, b) = …`, `final […] = …`)
-/// — those bind through the frame close and the all-or-nothing pattern
-/// group, never through the assignment face. Only the declaration
-/// keywords qualify: a constructor-pattern head (`Square(…) = …`) is an
-/// identifier and belongs to the assignment face like any other pattern.
-fn declaration_head(kind: dartq_scanner::TokenKind) -> bool {
+/// The first token of the pattern whose bracket group opens at `open`: a
+/// typed collection's `<…>` arguments and an object pattern's `Type` /
+/// `prefix.Type` name precede the group (`<int>[…]`, `Square<int>(…)`,
+/// `p.Square(…)`); a bare group heads itself.
+fn pattern_head_start(tokens: &[dartq_scanner::Token], open: usize) -> usize {
+    use dartq_scanner::TokenKind;
+    let mut head = open
+        .checked_sub(1)
+        .and_then(|close| type_arguments_start(tokens, close))
+        .unwrap_or(open);
+    if tokens[open].kind == TokenKind::OpenParen
+        && head
+            .checked_sub(1)
+            .is_some_and(|at| tokens[at].kind == TokenKind::Identifier)
+    {
+        head -= 1;
+        if head >= 2
+            && tokens[head - 1].kind == TokenKind::Period
+            && tokens[head - 2].kind == TokenKind::Identifier
+        {
+            head -= 2;
+        }
+    }
+    head
+}
+
+/// The `<` opening the type-argument list that closes at `close` (a `>`,
+/// or the `>>`/`>>>` nested lists fuse into). Only type-argument tokens
+/// may sit inside; anything else — or no balancing `<` within the bound —
+/// means `close` is no type-argument closer.
+fn type_arguments_start(tokens: &[dartq_scanner::Token], close: usize) -> Option<usize> {
+    use dartq_scanner::TokenKind;
+    // A written type argument list never spans more tokens than this.
+    const TYPE_ARGUMENTS_CAP: usize = 256;
+    let mut depth: u32 = match tokens[close].kind {
+        TokenKind::Gt => 1,
+        TokenKind::GtGt => 2,
+        TokenKind::GtGtGt => 3,
+        _ => return None,
+    };
+    let floor = close.saturating_sub(TYPE_ARGUMENTS_CAP);
+    let mut at = close;
+    while at > floor {
+        at -= 1;
+        match tokens[at].kind {
+            TokenKind::Lt => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            TokenKind::Gt => depth += 1,
+            TokenKind::GtGt => depth += 2,
+            TokenKind::GtGtGt => depth += 3,
+            TokenKind::Identifier
+            | TokenKind::Keyword(_)
+            | TokenKind::Comma
+            | TokenKind::Period
+            | TokenKind::Question
+            | TokenKind::OpenParen
+            | TokenKind::CloseParen => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether a pattern whose first token is `head` stands where an
+/// expression may start — the only place a pattern assignment can: after
+/// a statement boundary or a control head (`;`, `{`, `}`, `)`, `else`,
+/// `do`), as an operand (`=`, `=>`, `return`, `throw`, `yield`, `?`,
+/// `:`), or as an element or argument (`(`, `[`, `,`). Everything else
+/// heads a non-assignment group: a declaration keyword (`var Square(…) =
+/// …`), `factory` (a redirecting factory's formals, #3558), a type or a
+/// member name (`String f(int x) = g`, `this.f(int x) = g`).
+fn assignment_pattern_context(tokens: &[dartq_scanner::Token], head: usize) -> bool {
     use dartq_scanner::{Keyword, TokenKind};
-    matches!(
-        kind,
-        TokenKind::Keyword(
-            Keyword::Var
-                | Keyword::Final
-                | Keyword::Const
-                | Keyword::Late
-                | Keyword::External
-                | Keyword::Covariant
+    head.checked_sub(1).is_some_and(|at| {
+        matches!(
+            tokens[at].kind,
+            TokenKind::Semicolon
+                | TokenKind::OpenCurly
+                | TokenKind::CloseCurly
+                | TokenKind::OpenParen
+                | TokenKind::CloseParen
+                | TokenKind::OpenSquare
+                | TokenKind::Comma
+                | TokenKind::Colon
+                | TokenKind::Question
+                | TokenKind::Eq
+                | TokenKind::Function
+                | TokenKind::Keyword(
+                    Keyword::Return | Keyword::Throw | Keyword::Yield | Keyword::Else | Keyword::Do
+                )
         )
-    )
+    })
+}
+
+/// The index just past the written type starting at `at`: an identifier,
+/// an optional `.name` (a prefixed type), optional `<…>` arguments and an
+/// optional `?`. `None` when `at` is no identifier or the arguments run
+/// into a token no type argument list carries.
+fn type_run_end(tokens: &[dartq_scanner::Token], at: usize) -> Option<usize> {
+    use dartq_scanner::TokenKind;
+    let kind = |i: usize| tokens.get(i).map(|t| t.kind);
+    if kind(at) != Some(TokenKind::Identifier) {
+        return None;
+    }
+    let mut cursor = at + 1;
+    if kind(cursor) == Some(TokenKind::Period) && kind(cursor + 1) == Some(TokenKind::Identifier) {
+        cursor += 2;
+    }
+    if kind(cursor) == Some(TokenKind::Lt) {
+        let mut depth = 0i32;
+        loop {
+            match kind(cursor)? {
+                TokenKind::Lt => depth += 1,
+                TokenKind::Gt => depth -= 1,
+                TokenKind::GtGt => depth -= 2,
+                TokenKind::GtGtGt => depth -= 3,
+                TokenKind::Identifier
+                | TokenKind::Keyword(_)
+                | TokenKind::Comma
+                | TokenKind::Period
+                | TokenKind::Question
+                | TokenKind::OpenParen
+                | TokenKind::CloseParen => {}
+                _ => return None,
+            }
+            cursor += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+    }
+    if kind(cursor) == Some(TokenKind::Question) {
+        cursor += 1;
+    }
+    Some(cursor)
+}
+
+/// The token span `start..end` of the case pattern holding token `x` — a
+/// switch or if-case head (`case P when …:`, `case P)`) or a
+/// switch-expression arm (`P when … => …`) — or `None` when `x` sits in
+/// no such pattern. The walk back stops at the enclosing `case` keyword
+/// or switch-expression body (a statement boundary first means no case
+/// pattern); the pattern then has to reach past `x` before its own end, so
+/// a case BODY never reads as its head.
+fn case_pattern_extent(table: &dartq_scanner::TokenTable, x: usize) -> Option<(usize, usize)> {
+    use dartq_scanner::{Keyword, TokenKind};
+    // A case pattern never spans more tokens than this.
+    const BACKWARD_CAP: usize = 4096;
+    let tokens = table.as_slice();
+    let floor = x.saturating_sub(BACKWARD_CAP);
+    let mut depth = 0i32;
+    let mut at = x;
+    let start = loop {
+        if at <= floor {
+            return None;
+        }
+        at -= 1;
+        match tokens[at].kind {
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => depth += 1,
+            TokenKind::OpenParen | TokenKind::OpenSquare => depth -= 1,
+            TokenKind::OpenCurly => {
+                depth -= 1;
+                if depth < 0 && switch_expression_body(tokens, at) {
+                    break arm_start(table, at, x)?;
+                }
+            }
+            TokenKind::Keyword(Keyword::Case) if depth <= 0 => break at + 1,
+            TokenKind::Semicolon if depth <= 0 => return None,
+            _ => {}
+        }
+    };
+    let end = pattern_end(table, start)?;
+    (x < end).then_some((start, end))
+}
+
+/// Whether the `{` at `open` opens a switch EXPRESSION's arm list:
+/// `switch (…) {` whose first member is no statement-case label.
+fn switch_expression_body(tokens: &[dartq_scanner::Token], open: usize) -> bool {
+    use dartq_scanner::{Keyword, TokenKind};
+    // A scrutinee never spans more tokens than this.
+    const SCRUTINEE_CAP: usize = 4096;
+    let Some(close) = open
+        .checked_sub(1)
+        .filter(|&at| tokens[at].kind == TokenKind::CloseParen)
+    else {
+        return false;
+    };
+    let floor = close.saturating_sub(SCRUTINEE_CAP);
+    let mut depth = 0i32;
+    let mut at = close;
+    let scrutinee = loop {
+        match tokens[at].kind {
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => depth += 1,
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                depth -= 1;
+                if depth == 0 {
+                    break at;
+                }
+            }
+            _ => {}
+        }
+        if at <= floor {
+            return false;
+        }
+        at -= 1;
+    };
+    scrutinee
+        .checked_sub(1)
+        .is_some_and(|at| tokens[at].kind == TokenKind::Keyword(Keyword::Switch))
+        && !tokens
+            .get(open + 1)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Case | Keyword::Default)))
+}
+
+/// The first token of the switch-expression arm (body opened at `open`)
+/// that holds token `x`: the token after the last top-level `,` before
+/// `x`, or the body's first token.
+fn arm_start(table: &dartq_scanner::TokenTable, open: usize, x: usize) -> Option<usize> {
+    use dartq_scanner::TokenKind;
+    let tokens = table.as_slice();
+    let mut start = open + 1;
+    let mut at = open + 1;
+    while at < x {
+        match tokens[at].kind {
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                let close = table.matching_end(at)?;
+                if close >= x {
+                    break;
+                }
+                at = close + 1;
+                continue;
+            }
+            TokenKind::Comma => start = at + 1,
+            _ => {}
+        }
+        at += 1;
+    }
+    Some(start)
+}
+
+/// The end (exclusive) of the case pattern starting at `start`: the first
+/// top-level `when`, `:`, `=>`, `,` or `;`, or the closer of the enclosing
+/// group (an if-case's `)`).
+fn pattern_end(table: &dartq_scanner::TokenTable, start: usize) -> Option<usize> {
+    use dartq_scanner::{Keyword, TokenKind};
+    let tokens = table.as_slice();
+    let mut at = start;
+    while let Some(token) = tokens.get(at) {
+        match token.kind {
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                at = table.matching_end(at)? + 1;
+                continue;
+            }
+            TokenKind::Keyword(Keyword::When)
+            | TokenKind::Colon
+            | TokenKind::Function
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::CloseParen
+            | TokenKind::CloseSquare
+            | TokenKind::CloseCurly => return Some(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    Some(at)
+}
+
+/// Whether the identifier at `at` is a pattern variable's declared name:
+/// a `var`/`final` head or a written type right before it (`var a`,
+/// `final a`, `int a`, `List<int>? a`), and nothing continuing an
+/// expression or naming a field after it (`a(…)`, `a.b`, `a<…>`, `a:`). A
+/// relational operand (`> a`) or a constant reference stays out.
+fn binder_like(tokens: &[dartq_scanner::Token], at: usize) -> bool {
+    use dartq_scanner::{Keyword, TokenKind};
+    if tokens[at].kind != TokenKind::Identifier
+        || tokens.get(at + 1).is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::OpenParen
+                    | TokenKind::Period
+                    | TokenKind::QuestionPeriod
+                    | TokenKind::Lt
+                    | TokenKind::Colon
+            )
+        })
+    {
+        return false;
+    }
+    let Some(previous) = at.checked_sub(1) else {
+        return false;
+    };
+    match tokens[previous].kind {
+        TokenKind::Keyword(Keyword::Var | Keyword::Final) | TokenKind::Identifier => true,
+        // A written type's closer or nullable marker (`List<int> a`,
+        // `int? a`) — never a relational operator, whose left neighbor is
+        // a pattern position, not a type.
+        TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt | TokenKind::Question => {
+            previous.checked_sub(1).is_some_and(|before| {
+                matches!(
+                    tokens[before].kind,
+                    TokenKind::Identifier
+                        | TokenKind::Gt
+                        | TokenKind::GtGt
+                        | TokenKind::GtGtGt
+                        | TokenKind::CloseParen
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Whether the binders at `a < b` of one pattern sit in different
+/// operands of a logical-or. The lowest nesting level the tokens between
+/// them reach holds their common ancestor: a logical-or exactly when that
+/// level carries a `||` and no element separator (`&&` binds tighter, a
+/// `,` makes them siblings of one collection).
+fn or_joined(tokens: &[dartq_scanner::Token], a: usize, b: usize) -> bool {
+    use dartq_scanner::TokenKind;
+    let mut depth = 0i32;
+    let mut floor = 0i32;
+    let mut or_at_floor = false;
+    let mut comma_at_floor = false;
+    for token in &tokens[a + 1..b] {
+        match token.kind {
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth -= 1;
+                if depth < floor {
+                    floor = depth;
+                    or_at_floor = false;
+                    comma_at_floor = false;
+                }
+            }
+            TokenKind::BarBar if depth == floor => or_at_floor = true,
+            TokenKind::Comma if depth == floor => comma_at_floor = true,
+            _ => {}
+        }
+    }
+    or_at_floor && !comma_at_floor
 }
 
 #[cfg(test)]
