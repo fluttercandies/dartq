@@ -91,6 +91,7 @@ use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
 use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{StringId, StringTable};
+use rustc_hash::FxHashMap;
 
 use dartq_source::SourceRange;
 
@@ -251,6 +252,24 @@ struct MemberScope {
     instance: NameMapBuilder<u8>,
     /// The static-member claims (the oracle's `staticScope`).
     statics: NameMapBuilder<u8>,
+}
+
+/// One element's constructor declarations across the fragments collected so
+/// far: the count (the implicit default's gate) and whether an explicit
+/// unnamed constructor is among them. Copied off the open container at every
+/// fragment's close and summed per element by [`Builder::fold_fragment`] —
+/// the finished [`Container`] cannot answer either question once collapsed
+/// into `has_unnamed_constructor` (an explicit `C()` and an implicit default
+/// both read `true` with an empty selector list, yet only the first survives
+/// an augmentation's named constructor).
+#[derive(Clone, Copy, Default)]
+struct CtorFacts {
+    /// Declarations seen, mismatched-name factories included
+    /// (`OpenContainer::ctor_declared`).
+    declared: u32,
+    /// An EXPLICIT unnamed constructor is among them
+    /// (`OpenContainer::ctor_has_unnamed`).
+    explicit_unnamed: bool,
 }
 
 /// The open constructor's capture: the named selectors it declares plus
@@ -465,8 +484,23 @@ struct Builder<'src, 'tab> {
     top_const_group: bool,
     /// Named containers closed so far; sealed into the model's
     /// `FileElements::containers` at [`Builder::finish`] (the open
-    /// containers live on [`Builder::containers`]).
+    /// containers live on [`Builder::containers`]). One row per ELEMENT and
+    /// unit: an `augment` fragment folds into the row its element already
+    /// claimed here ([`Builder::fold_fragment`]).
     named_containers: NameMapBuilder<Container>,
+    /// Each claimed row's constructor declarations across its fragments.
+    /// The finished [`Container`] keeps only the DERIVED
+    /// `has_unnamed_constructor`, while a fragment folding into the element
+    /// must add its own declarations to the element's count before that flag
+    /// is re-derived: the implicit default exists only when NO fragment
+    /// declares a constructor (`class C {} augment class C {C.named();}`
+    /// leaves `C()` undefined). Upstream builds the merged element's
+    /// constructor list from every fragment and synthesizes the default off
+    /// that list (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/element.dart`
+    /// `ClassElementImpl.constructors`). Every row insert writes the entry,
+    /// so a fold always finds its element's facts.
+    element_ctors: FxHashMap<StringId, CtorFacts>,
     containers: Vec<OpenContainer>,
     /// Every declared container's member-claim scope, in declaration order
     /// (the open container indexes it through [`OpenContainer::scope`]).
@@ -805,6 +839,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             const_creations: NameMapBuilder::default(),
             top_const_group: false,
             named_containers: NameMapBuilder::default(),
+            element_ctors: FxHashMap::default(),
             containers: Vec::new(),
             member_scopes: Vec::new(),
             top_setters: NameMapBuilder::default(),
@@ -2210,15 +2245,64 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // `constructors`.
             let has_unnamed_constructor =
                 open.ctor_has_unnamed || (open.ctor_named.is_empty() && open.ctor_declared == 0);
+            let ctor_facts = CtorFacts {
+                declared: open.ctor_declared,
+                explicit_unnamed: open.ctor_has_unnamed,
+            };
+            let closed = Container {
+                kind: open.kind,
+                is_abstract: open.is_abstract,
+                is_base: open.is_base,
+                is_final: open.is_final,
+                is_interface: open.is_interface,
+                is_mixin_class: open.is_mixin_class,
+                superclass: open.superclass,
+                members: members.finish(),
+                type_params: open.type_params,
+                type_param_names,
+                type_param_bounds,
+                sealed: open.sealed,
+                // The clause columns seal at exact length here — the
+                // push-grown staging Vecs shed their growth slack by
+                // construction, and the finished container never grows.
+                with_clause: open.with_clause.into_boxed_slice(),
+                implements_clause: open.implements_clause.into_boxed_slice(),
+                on_clause: open.on_clause.into_boxed_slice(),
+                header_residue: open.header_residue.into_boxed_slice(),
+                primary_formals: open.primary_formals.into_boxed_slice(),
+                enum_constants: open.enum_constants.into_boxed_slice(),
+                constructors: open.ctor_named.into_boxed_slice(),
+                has_unnamed_constructor,
+                has_const_constructor: open.ctor_const,
+                ctor_formals: open.ctor_formals.finish(),
+                factory_formals: open.factory_formals.finish(),
+                annotations: open.annotations.into_boxed_slice(),
+            };
+            let sitting_kind = self.named_containers.get(&name).map(|sitting| sitting.kind);
+            // An `augment` head is a FRAGMENT of the element its
+            // introduction declares (`fragment.element.firstFragment`,
+            // upstream Dart SDK source, `pkg/analyzer/lib/src/dart/element/
+            // element.dart`: an element's members, enum constants and
+            // constructors are the union over its fragments), so a fragment
+            // closing onto a row this unit already claimed FOLDS into that
+            // row instead of living on a face of its own. One element, one
+            // face: member lookup, the override and unused faces, and the
+            // library-wide fragment merge (`library::ElementFragments`) all
+            // read the union without a per-consumer patch.
+            //
+            // A fragment whose kind differs from the row it names augments
+            // no such element (`augmentation_of_different_declaration_kind`),
+            // so it folds into nothing and claims nothing.
+            if open.augment_kw.is_some() && sitting_kind == Some(open.kind) {
+                self.fold_fragment(name, &closed, ctor_facts);
+                return;
+            }
             // Keep-first within a tier — and an `augment` head NEVER
             // claims: the element's own row is its introduction's face, so
-            // a later `augment` of the same name never displaces it, and the
-            // row it wrote for itself is the fragment face the library-wide
-            // merge reads (`library::ElementFragments`). An `augment`
-            // closing onto a row another declaration already claimed
-            // contributes nothing here: its members live only on its own
-            // (dropped) face, the same-unit residual the merge cannot reach
-            // without a per-fragment column on the model.
+            // a later `augment` of the same name never displaces it, and a
+            // row it opened itself (no introduction in this unit) is the
+            // fragment face the library-wide merge reads
+            // (`library::ElementFragments`).
             //
             // Two INTRODUCTIONS of one name are two upstream elements, and
             // the name resolves to the earlier claim tier
@@ -2231,46 +2315,18 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // same rule is also what makes `existing_tier`'s
             // extension-type probe honest: the row under a colliding name
             // is always the claim winner's, never a displaced loser's.
-            let claims = match self.named_containers.get(&name) {
-                Some(existing) => {
-                    open.augment_kw.is_none()
-                        && container_tier(open.kind) < container_tier(existing.kind)
+            let claims = match sitting_kind {
+                Some(kind) => {
+                    open.augment_kw.is_none() && container_tier(open.kind) < container_tier(kind)
                 }
                 // A vacant slot inserts whatever closed — an `augment`
                 // keeps the keep-first write too: its own row is the
-                // same-unit residual the element merge can read.
+                // fragment face the element merge reads.
                 None => true,
             };
             if claims {
-                self.named_containers.insert(name, Container {
-                    kind: open.kind,
-                    is_abstract: open.is_abstract,
-                    is_base: open.is_base,
-                    is_final: open.is_final,
-                    is_interface: open.is_interface,
-                    is_mixin_class: open.is_mixin_class,
-                    superclass: open.superclass,
-                    members: members.finish(),
-                    type_params: open.type_params,
-                    type_param_names,
-                    type_param_bounds,
-                    sealed: open.sealed,
-                    // The clause columns seal at exact length here — the
-                    // push-grown staging Vecs shed their growth slack by
-                    // construction, and the finished container never grows.
-                    with_clause: open.with_clause.into_boxed_slice(),
-                    implements_clause: open.implements_clause.into_boxed_slice(),
-                    on_clause: open.on_clause.into_boxed_slice(),
-                    header_residue: open.header_residue.into_boxed_slice(),
-                    primary_formals: open.primary_formals.into_boxed_slice(),
-                    enum_constants: open.enum_constants.into_boxed_slice(),
-                    constructors: open.ctor_named.into_boxed_slice(),
-                    has_unnamed_constructor,
-                    has_const_constructor: open.ctor_const,
-                    ctor_formals: open.ctor_formals.finish(),
-                    factory_formals: open.factory_formals.finish(),
-                    annotations: open.annotations.into_boxed_slice(),
-                });
+                self.named_containers.insert(name, closed);
+                self.element_ctors.insert(name, ctor_facts);
             }
         }
         // The member-claim scope rows stay in `member_scopes` past this
@@ -2280,6 +2336,67 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // capture no residue (their window's types latch through
         // `note_header_reference`, not the clause buffer), so nothing else
         // to commit here.
+    }
+
+    /// Folds `fragment` — an `augment` head's just-closed face — into the
+    /// element row this unit already claimed for `name`
+    /// (`close_container`'s fragment arm; the caller proved the row exists
+    /// and that the kinds match).
+    ///
+    /// The columns an augmentation can grow take the fragment's
+    /// declarations; the ones the introduction owns alone (kind, modifiers,
+    /// type parameters, metadata) keep the element's. A spelling the element
+    /// already has keeps ITS row — the repeat is `duplicate_definition`'s
+    /// business (`member_dup_claim`), and the library-wide fragment merge
+    /// applies the same keep-first rule (`library::ElementFragments`).
+    fn fold_fragment(&mut self, name: StringId, fragment: &Container, fragment_ctors: CtorFacts) {
+        let Some(mut sitting) = self.named_containers.get(&name).cloned() else {
+            return;
+        };
+        sitting.members = sitting
+            .members
+            .iter()
+            .chain(fragment.members.iter())
+            .cloned()
+            .collect();
+        // Declaration order: the element's constants first, then every
+        // fragment's (upstream `EnumElementImpl.constants` is the merged
+        // field list filtered by `isEnumConstant`). A repeated spelling is a
+        // duplicate the member claim already reported — the witness list
+        // keeps one.
+        sitting.enum_constants = union(&sitting.enum_constants, &fragment.enum_constants);
+        sitting.constructors = union(&sitting.constructors, &fragment.constructors);
+        sitting.ctor_formals = sitting
+            .ctor_formals
+            .iter()
+            .chain(fragment.ctor_formals.iter())
+            .cloned()
+            .collect();
+        sitting.factory_formals = sitting
+            .factory_formals
+            .iter()
+            .chain(fragment.factory_formals.iter())
+            .cloned()
+            .collect();
+        sitting.has_const_constructor |= fragment.has_const_constructor;
+        // `extends` is one edge: the introduction's superclass stands, a
+        // fragment's fills the gap. `with`/`implements`/`on` are lists the
+        // fragment adds to (`augment class C with M {}` makes `C().m()`
+        // resolve).
+        sitting.superclass = sitting.superclass.or(fragment.superclass);
+        sitting.with_clause = union(&sitting.with_clause, &fragment.with_clause);
+        sitting.implements_clause =
+            union(&sitting.implements_clause, &fragment.implements_clause);
+        sitting.on_clause = union(&sitting.on_clause, &fragment.on_clause);
+        // The implicit default's gate is the ELEMENT's declaration count, so
+        // the fragment's declarations join the element's before the flag is
+        // re-derived (`class C {} augment class C {C.named();}` has no
+        // `C()`; `class C {C();} augment class C {C.named();}` keeps it).
+        let facts = self.element_ctors.entry(name).or_default();
+        facts.declared += fragment_ctors.declared;
+        facts.explicit_unnamed |= fragment_ctors.explicit_unnamed;
+        sitting.has_unnamed_constructor = facts.explicit_unnamed || facts.declared == 0;
+        self.named_containers.insert(name, sitting);
     }
 
     /// Marks the open container `sealed` (the `sealed` modifier event).
@@ -2727,6 +2844,21 @@ fn container_tier(kind: ContainerKind) -> u8 {
         ContainerKind::Mixin => TIER_MIXIN,
         ContainerKind::Class => TIER_CLASS,
     }
+}
+
+/// `base` followed by every spelling of `add` it lacks — a fragment's
+/// declaration-order list joined onto its element's (enum constants,
+/// constructor selectors, clause edges). Order is the element's: the
+/// introduction first, then each fragment as it closes
+/// ([`Builder::fold_fragment`]).
+fn union(base: &[StringId], add: &[StringId]) -> Box<[StringId]> {
+    let mut names: Vec<StringId> = base.to_vec();
+    for name in add {
+        if !names.contains(name) {
+            names.push(*name);
+        }
+    }
+    names.into_boxed_slice()
 }
 
 /// Seals a nested owner-keyed builder (`name → name → value`) into the

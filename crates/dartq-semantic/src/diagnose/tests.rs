@@ -22599,6 +22599,17 @@ mod ticket_3438_tests;
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3434 —— an `augment` fragment's members join the merged element face
+// —— of the declaration it augments: the introduction's body reads the
+// —— fragment's fields/methods/statics, enum constants join the witness set,
+// —— constructors, `with` edges and the implicit-default gate follow the
+// —— union, and the override face sees the fragment's member. Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3434_tests.rs"]
+mod ticket_3434_tests;
+
 // —— #3475 —— the displayed-type boundary: `ty_display` fills
 // —— instantiate-to-bounds at every nesting depth (named arguments,
 // —— function return/formals, record fields), and the type-argument bounds
