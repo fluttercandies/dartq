@@ -2147,9 +2147,13 @@ impl Interp<'_> {
                     self.cast_tail_row(then_begin.range.offset, *then_end);
                 }
                 // The then arm ended: rejoin its open null-shorting before
-                // the state swap.
+                // the state swap. The then value STAYS on the expression
+                // stack under the else arm's own pushes — `CondEnd` reads
+                // its `(ty, args)` pair for the official
+                // `leastUpperBound(thenType, elseType)` result
+                // (static_type_analyzer.dart:87); popping it here left only
+                // the else arm's face to type the whole conditional.
                 self.flush_null_shorts_above(self.consumer_base(1));
-                let then_expr = self.pop_value();
                 if let Some(Frame::Cond {
                     branch,
                     then_state,
@@ -2169,9 +2173,6 @@ impl Interp<'_> {
                         self.arm_dead_depth += 1;
                     }
                 }
-                let _ = then_expr;
-                // The then value is replaced by the whole conditional's
-                // value at CondEnd.
             }
             Ev::CondEnd {
                 else_begin,
@@ -2206,6 +2207,7 @@ impl Interp<'_> {
                 // the arm join.
                 self.flush_null_shorts_above(self.consumer_base(1));
                 let else_expr = self.pop_value();
+                let then_expr = self.pop_value();
                 let Some(Frame::Cond { then_state, .. }) = self.stack.pop() else {
                     // A frame-less close (unbalanced recovery buffer): the
                     // conditional still nets one value for its consumer.
@@ -2214,12 +2216,30 @@ impl Interp<'_> {
                 };
                 let joined = self.join(then_state, Some(self.current.clone()));
                 self.current = joined;
-                let ty = if else_expr.ty == Ty::UNKNOWN {
-                    Ty::UNKNOWN
+                // The conditional's static type is the official
+                // `leastUpperBound(thenType, elseType)`
+                // (static_type_analyzer.dart:87), through the same
+                // [`Interp::name_lub`] join the `??` arm and the literal
+                // element fold use: a subtype-ordered pair lands on its
+                // spelled supertype, an unordered name pair on the unknown
+                // face the resolved back-end's real hierarchy answers, and
+                // an unspellable arm (the opaque unknown face) joins to the
+                // spelled side exactly like `LUB(InvalidType, X) = X`.
+                let ty = self.name_lub(then_expr.ty, else_expr.ty);
+                // The written-argument tree rides the winning arm's row —
+                // `LUB(List<num>, List<int>)` lands on a `Name(List)` head
+                // whose message text still needs its `<num>` arguments;
+                // an unordered join to the unknown face carries none.
+                let args = if ty == else_expr.ty {
+                    else_expr.args
+                } else if ty == then_expr.ty {
+                    then_expr.args
                 } else {
-                    else_expr.ty
+                    crate::ty::EMPTY_ARGS
                 };
-                self.exprs.push(Expr::trivial(ty));
+                let mut expr = Expr::trivial(ty);
+                expr.args = args;
+                self.exprs.push(expr);
             }
             Ev::NullAwareIndexOperandBegin { operand } => {
                 // The `?[` selector's split (official
