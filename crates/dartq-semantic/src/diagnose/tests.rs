@@ -22500,6 +22500,15 @@ mod ticket_3379_tests;
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3479 —— writes counted as reads: statement-position `++`/compound,
+// —— constructor-initializer LHS, and initializing-formal writes carried
+// —— read credit into the unused-field pools the oracle never records.
+// —— Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3479_tests.rs"]
+mod ticket_3479_tests;
+
 // —— #3508 —— the three `finalize_usage` arms that iterated the drained
 // —— `self.rows`: the missing-write setter/top-level credit, the
 // —— `_isReadIdentifier` write-offsets gate, and the shorthand-ctor
@@ -22507,6 +22516,16 @@ mod ticket_3379_tests;
 // —— Registered here via `#[path]`; the module stays inside the
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
+
+// —— #3508 —— the three `finalize_usage` arms that iterated the drained
+// —— `self.rows`: the missing-write setter/top-level credit, the
+// —— `_isReadIdentifier` write-offsets gate, and the shorthand-ctor
+// —— selector credit re-derive from `refs`/`member_refs`/`member_reads`.
+// —— Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3508_tests.rs"]
+mod ticket_3508_tests;
 
 // —— #3455 —— the `undefined_*` code-choice faces: a `foo<int>` generic
 // —— instantiation head reports `undefined_method` naming `this`'s type

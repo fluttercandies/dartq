@@ -52,10 +52,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let text = &self.source[start..end];
-            let head_end = text
-                .find(['<', '?'])
-                .map(|i| start + i)
-                .unwrap_or(end);
+            let head_end = text.find(['<', '?']).map(|i| start + i).unwrap_or(end);
             let head = self.intern(&self.source[start..head_end]);
             // A dotted spelling (`p.C`) resolves the leaf through the
             // prefix's own table — the bare-scope walk would answer the
@@ -204,8 +201,8 @@ impl<'a> Engine<'a> {
                     if nullable {
                         let object_hit = getter == self.intern("==")
                             || self.members.object_members.contains(&getter);
-                        let ext_hit = !object_hit
-                            && self.function_extension_face(folded, getter).is_some();
+                        let ext_hit =
+                            !object_hit && self.function_extension_face(folded, getter).is_some();
                         if object_hit || ext_hit {
                             self.read_names.insert(getter);
                             if ext_hit {
@@ -226,8 +223,7 @@ impl<'a> Engine<'a> {
                         self.credit_record_extension_use(folded, getter, at.offset);
                         continue;
                     }
-                    if getter == self.intern("==")
-                        || self.members.object_members.contains(&getter)
+                    if getter == self.intern("==") || self.members.object_members.contains(&getter)
                     {
                         self.read_names.insert(getter);
                         continue;
@@ -810,6 +806,51 @@ impl<'a> Engine<'a> {
         false
     }
 
+    /// The enclosing top-level extension's `on` head, read backward from
+    /// the reference's source position: `Some(head)` when the reference
+    /// sits inside an extension body (the `on` type's spelling, stripped
+    /// of generic arguments and nullability), `None` for a class/mixin/
+    /// enum body or top level. A sibling face on another `on` type never
+    /// resolves an implicit-`this` read inside the body.
+    fn enclosing_extension_on(&self, offset: u32) -> Option<String> {
+        let bytes = self.source.as_bytes();
+        let mut end = self.byte_of(offset).min(bytes.len());
+        loop {
+            let start = bytes[..end]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |p| p + 1);
+            let line = &self.source[start..end];
+            // A top-level declaration header starts in column 0.
+            if !line.is_empty() && !line.starts_with([' ', '\t', '}', '/', '*', ')']) {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                if words.contains(&"extension") {
+                    let head = words
+                        .iter()
+                        .position(|w| *w == "on")
+                        .and_then(|at| words.get(at + 1))
+                        .map(|w| {
+                            w.trim_end_matches(|c: char| {
+                                !(c.is_alphanumeric() || c == '_' || c == '$')
+                            })
+                        })
+                        .map(|w| w.split(['<', '?']).next().unwrap_or(w).to_string());
+                    return Some(head.unwrap_or_default());
+                }
+                if words
+                    .iter()
+                    .any(|w| matches!(*w, "class" | "mixin" | "enum"))
+                {
+                    return None;
+                }
+            }
+            if start == 0 {
+                return None;
+            }
+            end = start - 1;
+        }
+    }
+
     fn credit_derived_extension_uses(&mut self) {
         let Some(elements) = self.index.get(self.file) else {
             return;
@@ -882,52 +923,8 @@ impl<'a> Engine<'a> {
         // looks up on that extension's own `on` type, never a sibling
         // face — only class/mixin/enum bodies (a subclass of the face's
         // `on` type) carry the pool resolution.
-        // The enclosing top-level extension's `on` head, read backward from
-        // the reference: an implicit-`this` read inside an EXTENSION body
-        // looks up on that extension's own `on` type, so only a face on the
-        // same head resolves it (a sibling face on another type never
-        // does). `None` = not inside an extension body (a class/mixin/enum
-        // body — a subclass of the face's `on` type — or top level).
-        let enclosing_extension_on = |offset: u32| -> Option<&str> {
-            let bytes = self.source.as_bytes();
-            let mut end = self.byte_of(offset).min(bytes.len());
-            loop {
-                let start = bytes[..end]
-                    .iter()
-                    .rposition(|b| *b == b'\n')
-                    .map_or(0, |p| p + 1);
-                let line = &self.source[start..end];
-                // A top-level declaration header starts in column 0.
-                if !line.is_empty() && !line.starts_with([' ', '\t', '}', '/', '*', ')']) {
-                    let words: Vec<&str> = line.split_whitespace().collect();
-                    if words.contains(&"extension") {
-                        let head = words
-                            .iter()
-                            .position(|w| *w == "on")
-                            .and_then(|at| words.get(at + 1))
-                            .map(|w| {
-                                w.trim_end_matches(|c: char| {
-                                    !(c.is_alphanumeric() || c == '_' || c == '$')
-                                })
-                            })
-                            .map(|w| w.split(['<', '?']).next().unwrap_or(w));
-                        return Some(head.unwrap_or(""));
-                    }
-                    if words
-                        .iter()
-                        .any(|w| matches!(*w, "class" | "mixin" | "enum"))
-                    {
-                        return None;
-                    }
-                }
-                if start == 0 {
-                    return None;
-                }
-                end = start - 1;
-            }
-        };
         let in_extension_body = |offset: u32, index: u32| -> bool {
-            let Some(head) = enclosing_extension_on(offset) else {
+            let Some(head) = self.enclosing_extension_on(offset) else {
                 return false;
             };
             let face_head = faces
@@ -938,10 +935,10 @@ impl<'a> Engine<'a> {
             // subtype of it (`ClassElement` reaching an `InterfaceElement`
             // face); an unresolvable head keeps the pool credit.
             let foreign = match face_head {
-                Some(face_head) if face_head != head => {
-                    let sub = Ty::named(self.intern(head));
+                Some(face_head) if face_head != head.as_str() => {
+                    let sub = Ty::named(self.intern(&head));
                     let sup = Ty::named(self.intern(face_head));
-                    self.type_resolution(self.intern(head)).0 != TypeResolution::Missing
+                    self.type_resolution(self.intern(&head)).0 != TypeResolution::Missing
                         && !self.name_subtype(sub, sup)
                 }
                 _ => false,
@@ -1390,6 +1387,1115 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        // The read-record-driven arm (#3477): the byte-scan arms above
+        // answer the receiver's head only for the literal/`Function`/`Type`
+        // shapes — every other resolved application never joins
+        // `extension_member_used`, so the unnamed/private face loop
+        // reported the member as unused. The row stack is drained by
+        // finalize (`resolve_rows` takes it), so the re-derivation reads
+        // the surviving records instead: `refs` for the bare operands
+        // (`f += 1` over `extension on void Function<T>(T)`, `a + 0` over
+        // `on (String,)`, `~"hello"` over `on String`, `a()`'s `call`
+        // sugar) and `member_reads` for the member-target writes
+        // (`x.p ??= v`, `x.f += 1`, `x.f++`). The intent the drained row
+        // carried re-derives from the ADJACENT token — a `??=`/compound/
+        // `++`/`--` suffix or a `~`/`-`/`++`/`--` prefix — and the
+        // operand's `Ty` from the read-type tables, the flow-blind
+        // initializer derivations, and the member's declared face. The
+        // same ambiguity guard every other arm runs gates the credit:
+        // exactly one accessible face declares the spelling and the face's
+        // `on` shape admits the receiver.
+        let read_count2 = self.member_reads.len();
+        for read_index in 0..read_count2 {
+            let read = self.member_reads[read_index];
+            let promoted = self.promoted_receiver(read.offset, read.recv);
+            let receiver = match promoted {
+                Receiver::Typed { ty, .. } => Some(ty),
+                Receiver::This { container, kind } => Some(self.this_static_ty(container, kind)),
+                Receiver::Created { ty: Some(ty), .. } => Some(ty),
+                Receiver::Created { name, .. } => Some(Ty::named(name)),
+                _ => None,
+            };
+            // `x.p ??= v` / `x.p += v` / `x.f++`: the member the write
+            // targets credits its getter+setter pair on the RECEIVER's
+            // type (the oracle's `writeElement`/`readElement` join —
+            // `accept_setter`'s resolve-side latch).
+            let name_units = self.member_name_units(read.name);
+            if let Some(member) = self.adjacent_write_member_at(read.offset, name_units)
+                && let Some(receiver) = receiver
+            {
+                self.credit_face_member_ty(&faces, &declarers, member, receiver);
+                let setter = self.setter_spelling(member);
+                self.credit_face_member_ty(&faces, &declarers, setter, receiver);
+            }
+            // The operator half (`x.f += 1`/`x.f++`): the application
+            // resolves `operator<op>` on the member's DECLARED value type,
+            // never on the receiver's container.
+            if let Some(op) = self.adjacent_operator_at(read.offset, name_units) {
+                let operand = self
+                    .member_read_value_ty(&read)
+                    .or(receiver)
+                    .unwrap_or(Ty::UNKNOWN);
+                self.credit_face_member_ty(&faces, &declarers, op, operand);
+            }
+        }
+        // The bare-record arm: `refs` carries every bare identifier the
+        // push resolved — local operands, implicit-this members, extension
+        // `Opaque` hits, top-levels. The adjacent token re-derives the
+        // same write/operator/`call` applications on the operand's own
+        // type; the operand's face answers through the read-type tables
+        // first, the declaration model's shape next.
+        let mut ref_index = 0usize;
+        let ref_count = self.refs.len();
+        while ref_index < ref_count {
+            let unit_ref = self.refs[ref_index];
+            ref_index += 1;
+            // A prefix/selector token is a member access's middle segment —
+            // its own adjacent token is the `.`, never an application.
+            if matches!(unit_ref.target, RefTarget::Prefix | RefTarget::This) {
+                continue;
+            }
+            let name_units = self.member_name_units(unit_ref.name);
+            // The write half: an implicit-this member's `??=`/compound/
+            // increment credits the accessor pair on the enclosing `on`/
+            // container type (`this.p ??= v` inside `extension on String`
+            // resolves both). A local or top-level write credits nothing —
+            // the member arms own the element credit.
+            if let Some(member) = self.adjacent_write_member_at(unit_ref.range.offset, name_units) {
+                let owner_ty = match unit_ref.target {
+                    RefTarget::Member { container } => Some(Ty::named(container)),
+                    // `RefTarget::Opaque` inside an extension body is the
+                    // `on`-face member scope's anonymous resolution (the
+                    // mixin constraint / enum-synth / extension `has_extension_member`
+                    // miss — `resolve_bare`'s Opaque family). `container_context()`
+                    // reads dead frames at finalize, so the enclosing container
+                    // re-derives from the source: the backward extension-header
+                    // scan already defined above answers the `on` head the
+                    // write's receiver type is.
+                    RefTarget::Opaque => self
+                        .enclosing_extension_on(unit_ref.range.offset)
+                        .map(|head| Ty::named(self.intern(&head))),
+                    _ => None,
+                };
+                if let Some(receiver) = owner_ty {
+                    self.credit_face_member_ty(&faces, &declarers, member, receiver);
+                    let setter = self.setter_spelling(member);
+                    self.credit_face_member_ty(&faces, &declarers, setter, receiver);
+                }
+            }
+            if let Some(op) = self.adjacent_operator_at(unit_ref.range.offset, name_units)
+                && let Some(operand) = self.operand_ty_of_ref(&unit_ref)
+            {
+                self.credit_face_member_ty(&faces, &declarers, op, operand);
+            }
+            // The implicit-`call` arm (`visitFunctionExpressionInvocation`,
+            // unused_local_elements_verifier.dart:175-180): a bare callee
+            // the tables type record or function resolves `call` through
+            // the shape face — `a()` over `extension on (String,)`.
+            if self.byte_at(self.skip_whitespace(unit_ref.range.end())) == Some(b'(')
+                && let Some(operand) = self.operand_ty_of_ref(&unit_ref)
+                && matches!(operand, Ty::Record { .. } | Ty::Function { .. })
+            {
+                self.credit_face_member_ty(&faces, &declarers, call_spelling, operand);
+            }
+        }
+        // The literal-prefix arm: a unary `~`/`-`/`++`/`--` ahead of a
+        // literal operand resolves `operator` on the literal's own type
+        // (`~"hello"` → `String`, `-1` → `int`). The bare-ref arm covers
+        // only identifier operands — a literal carries no `refs` entry, so
+        // the token stream re-derives this one family directly.
+        self.credit_prefix_literal_operators(&faces, &declarers);
+    }
+
+    /// The member spelling a `??=`/compound/`++`/`--` write credits beside
+    /// the operator: the write's own target name (the getter whose write
+    /// the `visitCompoundAssignmentExpression`/`visitIfNullAssignment`
+    /// records — `p ??= v` reads `p`, writes `p=`). `offset` is the name
+    /// token's UTF-16 offset, `name_units` its UTF-16 length; `None` when
+    /// the adjacent token is not an assignment-operator face (a plain `=`
+    /// — pure write, no read half; a read-position access — nothing to
+    /// double-credit).
+    fn adjacent_write_member_at(&mut self, offset: u32, name_units: u32) -> Option<StringId> {
+        let tokens = self.tokens.as_slice();
+        let end = offset + name_units;
+        let name = self
+            .tokens
+            .as_slice()
+            .iter()
+            .find(|token| token.utf16_offset == offset)
+            .map(|token| self.intern(&self.source[token.byte_range()]))?;
+        let at = tokens.partition_point(|token| token.utf16_offset < end);
+        let suffix = tokens.get(at).map(|token| &self.source[token.byte_range()]);
+        match suffix {
+            // `??=` and every compound/`++`/`--` suffix run the
+            // read-plus-write resolution — the member's getter and setter
+            // both credit.
+            Some(
+                "??=" | "++" | "--" | "+=" | "-=" | "*=" | "/=" | "%=" | "~/=" | "&=" | "|=" | "^="
+                | "<<=" | ">>=" | ">>>=",
+            ) => Some(name),
+            // A `++`/`--` prefix is the same read-write (the operand's own
+            // name credits the pair the postfix face does).
+            _ => tokens
+                .iter()
+                .rposition(|token| token.utf16_offset < offset)
+                .map(|index| &self.source[tokens[index].byte_range()])
+                .filter(|before| matches!(*before, "++" | "--"))
+                .map(|_| name),
+        }
+    }
+
+    /// The `operator` member spelling an adjacent-token access resolves
+    /// on the operand's type — the row model stages no `Intent` marker for
+    /// the family. The suffix decides compounds, postfix increments,
+    /// plain binary operators, and index applications; the token before
+    /// the name decides prefixes (`~x`, `-x`, `++x`, `--x`) — `unary-` is
+    /// the analyzer's member spelling for the negation. `??=` is not an
+    /// operator member (the `ifNull` resolution credits no `operator`).
+    /// `==`/`!=` resolve through `Object.==`, never an extension member.
+    fn adjacent_operator_at(&mut self, offset: u32, name_units: u32) -> Option<StringId> {
+        let tokens = self.tokens.as_slice();
+        let end = offset + name_units;
+        let at = tokens.partition_point(|token| token.utf16_offset < end);
+        let suffix = tokens.get(at).map(|token| &self.source[token.byte_range()]);
+        let member = match suffix {
+            Some("+=" | "++") => Some("+"),
+            Some("-=" | "--") => Some("-"),
+            Some("*=") => Some("*"),
+            Some("/=") => Some("/"),
+            Some("%=") => Some("%"),
+            Some("~/=") => Some("~/"),
+            Some("&=") => Some("&"),
+            Some("|=") => Some("|"),
+            Some("^=") => Some("^"),
+            Some("<<=") => Some("<<"),
+            Some(">>=") => Some(">>"),
+            Some(">>>=") => Some(">>>"),
+            _ => None,
+        };
+        if member.is_some() {
+            return member.map(|op| self.intern(op));
+        }
+        // The plain binary / index face: `a + 0` / `a[i]` — the name's own
+        // operand joins the extension face's operator member. `==`/`!=` are
+        // `Object` members, never extension; `<`/`>` need whitespace before
+        // the angle (a glued `<` after an identifier is a generic
+        // instantiation, never `operator<`). `&&`/`||`/`??` are built-in
+        // lazies, not operator members.
+        match suffix {
+            Some("+" | "-" | "*" | "/" | "%" | "~/" | "&" | "|" | "^" | "<<" | ">>") => {
+                return suffix.map(|op| self.intern(op));
+            }
+            Some("<" | ">" | "<=" | ">=") => {
+                // Spaced-gate: `a < b` is `operator<`/`operator<=` but
+                // `List<int>` has no whitespace before the `<` — the token
+                // before the suffix is the name itself, so the whitespace
+                // between the name and the operator decides. `<=`/`>=`
+                // never follow an identifier without space in valid code.
+                let name_end_byte = self.byte_of(end);
+                let suffix_start_byte =
+                    self.byte_of(tokens.get(at).map_or(end, |token| token.utf16_offset));
+                if suffix_start_byte > name_end_byte {
+                    return suffix.map(|op| self.intern(op));
+                }
+            }
+            Some("[") => {
+                // `a[i]` → `[]`, `a[i] = v` → `[]=` — the token after the
+                // matching `]` decides.
+                let member = if tokens
+                    .get(at)
+                    .is_some_and(|token| self.index_write_after(token.byte_offset as usize))
+                {
+                    "[]="
+                } else {
+                    "[]"
+                };
+                return Some(self.intern(member));
+            }
+            _ => {}
+        }
+        // The prefix face: `~`/`-`/`++`/`--` immediately before the name —
+        // a binary `-` before it reads as the left operand's own minus,
+        // so only the unary forms count (`++`/`--`/`~` are unambiguous,
+        // `-` takes the `unary-` spelling only when the token before IT
+        // is not an operand-ending token).
+        let before = tokens
+            .iter()
+            .rposition(|token| token.utf16_offset < offset)
+            .map(|index| (index, &self.source[tokens[index].byte_range()]));
+        match before {
+            Some((_, "~")) => Some(self.intern("~")),
+            Some((index, "-")) => {
+                // `-x` vs `y - x`: the token before the `-` ends an
+                // operand (an identifier, literal, `)`, `]`, `}`) it's the
+                // binary minus; a prefix position (`(`, `=`, `,`, `return`,
+                // a statement boundary) spells `unary-`.
+                let prior = index
+                    .checked_sub(1)
+                    .and_then(|prior| tokens.get(prior))
+                    .map(|token| &self.source[token.byte_range()]);
+                let unary = prior.is_none_or(|text| {
+                    matches!(
+                        text,
+                        "(" | "["
+                            | "{"
+                            | ","
+                            | "="
+                            | "=="
+                            | "!="
+                            | "=>"
+                            | "return"
+                            | "case"
+                            | ";"
+                            | ":"
+                            | "?"
+                            | "&&"
+                            | "||"
+                            | "??"
+                            | "??="
+                    )
+                });
+                unary.then(|| self.intern("unary-"))
+            }
+            Some((_, "++")) => Some(self.intern("+")),
+            Some((_, "--")) => Some(self.intern("-")),
+            _ => None,
+        }
+    }
+
+    /// The `Ty`-shaped twin of [`Self::credit_face_member`]: the head-
+    /// spelled guard chain plus the `on`-shape admission the generic
+    /// function/record/type-parameter faces need (a bare `on` head match
+    /// cannot see `void Function<T>(T)` apply to a `void Function(int)`
+    /// receiver, or `(String,)` apply to a record literal). The
+    /// `member_found` pre-gate keeps the real-container priority — a
+    /// member the receiver's own class declares takes the use before any
+    /// extension face does.
+    fn credit_face_member_ty(
+        &mut self,
+        faces: &[(&ExtensionFace, FileId)],
+        declarers: &FxHashMap<StringId, u32>,
+        member: StringId,
+        receiver: Ty,
+    ) -> bool {
+        if declarers.get(&member).copied() != Some(1) {
+            return false;
+        }
+        if let Ty::Named { name, .. } = receiver
+            && self.member_found(name, member, false)
+        {
+            return false;
+        }
+        let Some(&(face, face_file)) = faces.iter().find(|(face, _)| {
+            face.members.contains_key(&member) && self.extension_on_admits(face, receiver)
+        }) else {
+            return false;
+        };
+        if let Some(face_index) = self
+            .index
+            .get(face_file)
+            .and_then(|elements| {
+                elements
+                    .extension_faces()
+                    .iter()
+                    .position(|entry| std::ptr::eq(entry, face))
+            })
+            .and_then(|index| u32::try_from(index).ok())
+        {
+            self.extension_member_used
+                .insert((face_file, face_index, member));
+            self.credit_extension_import(face, face_file);
+            return true;
+        }
+        false
+    }
+
+    /// Whether the face's `on` type admits a receiver of `ty`: the
+    /// `extension_application` applicability the row-driven arm replays.
+    /// A `Named` `on` head answers by named-head equality or the type-
+    /// parameter-bound arm (`extension<T> on T` admits any receiver whose
+    /// type satisfies the bound — the universal arm's shape at row level);
+    /// a `Record` `on` admits a record receiver of the same interned
+    /// shape; a `Function` `on` admits a function-typed receiver or a
+    /// `Named` head the alias fold unwraps to a function shape
+    /// (`on Function` itself stays `Named` — the bare head never lands
+    /// here).
+    fn extension_on_admits(&self, face: &ExtensionFace, ty: Ty) -> bool {
+        match (face.on_ty, ty) {
+            (Ty::Named { name: on_name, .. }, Ty::Named { name, .. }) => {
+                if on_name == name {
+                    return true;
+                }
+                // `extension<T> on T` / `on T?`: the parameter's bound is
+                // the admitting type (an unbounded parameter admits every
+                // type — the universal arm). `named_sub` settles the
+                // receiver against the bound.
+                if face.type_param_names.contains(&on_name) {
+                    let bound = face
+                        .type_param_names
+                        .iter()
+                        .position(|p| *p == on_name)
+                        .and_then(|index| face.type_param_bounds.get(index).copied())
+                        .unwrap_or(Ty::Dynamic);
+                    return matches!(bound, Ty::Dynamic)
+                        || self.name_world().named_sub(name, {
+                            match bound {
+                                Ty::Named {
+                                    name: bound_name, ..
+                                } => bound_name,
+                                _ => return false,
+                            }
+                        });
+                }
+                false
+            }
+            // A record `on` admits the same interned record shape.
+            (
+                Ty::Record {
+                    shape: on_shape, ..
+                },
+                Ty::Record { shape, .. },
+            ) => on_shape == shape,
+            // A function `on` admits a function-typed receiver only when
+            // the signatures unify — `on void Function<T>(T)` applies to a
+            // `void Function(int)` value (the oracle's `applicableTo`
+            // instantiates T), never to `Function(bool, bool)`. The
+            // unification the arm replays is name-level: same positional
+            // arity and named set, each `on` formal slot either a face
+            // type parameter (binds the receiver's slot) or the same `Ty`.
+            (
+                Ty::Function {
+                    shape: on_shape, ..
+                },
+                Ty::Function { shape, .. },
+            ) => self.fn_on_admits(face, on_shape, shape),
+            // `on void Function(T)` written through a type parameter or an
+            // alias head: the folded receiver type decides — the same
+            // signature gate runs against the folded shape, so a
+            // `typedef F = void Function(int)` receiver admits `on
+            // Function<T>(T)` exactly as the written form does.
+            (
+                Ty::Function {
+                    shape: on_shape, ..
+                },
+                _,
+            ) => match self.fold_alias_ty(ty) {
+                Ty::Function { shape, .. } => self.fn_on_admits(face, on_shape, shape),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The function-`on` unification the row-driven arm replays:
+    /// `on R Function<T>(A, {B b})` applies to a `R Function(A, {B b})`
+    /// receiver when the signatures match slot-for-slot — same positional
+    /// arity and named set — with each `on` formal either a face type
+    /// parameter (the oracle instantiates it to the receiver's type) or
+    /// the same interned `Ty`. Return-type drift is the established
+    /// under-report the arm keeps (the oracle's return covariance is a
+    /// wider gate the name-level shape cannot fully replay).
+    fn fn_on_admits(
+        &self,
+        face: &ExtensionFace,
+        on: crate::model::FnShapeId,
+        got: crate::model::FnShapeId,
+    ) -> bool {
+        let is_face_param = |ty: &Ty| match ty {
+            Ty::Named { name, .. } => face.type_param_names.contains(name),
+            _ => false,
+        };
+        let pool = self.boundary.pool();
+        let on = pool.function_shape(on);
+        let got = pool.function_shape(got);
+        on.positional.len() == got.positional.len()
+            && on.named.len() == got.named.len()
+            && (is_face_param(&on.return_ty) || on.return_ty == got.return_ty)
+            && on
+                .positional
+                .iter()
+                .zip(got.positional.iter())
+                .all(|(on, got)| is_face_param(on) || on == got)
+            && on
+                .named
+                .iter()
+                .zip(got.named.iter())
+                .all(|((on_name, on), (got_name, got))| {
+                    on_name == got_name && (is_face_param(on) || on == got)
+                })
+    }
+
+    /// The operand's `Ty` for a `member_reads` record's own value — the
+    /// accessor's declared face on the receiver's container (`x.f += 1`
+    /// reads `f`'s `void Function(int)`, not `x`'s `C`). The receiver's
+    /// re-derived expression type names the walk's container; the member
+    /// table's `var_ty`/`return_ty` answers the value.
+    fn member_read_value_ty(&self, read: &super::types::MemberRead) -> Option<Ty> {
+        // The unknown-receiver side table holds the receiver's own shape
+        // (record/function) — for THAT face the member's value is not a
+        // container lookup at all; the chain face's record field or
+        // `call` shape is outside the name-level model (under-report).
+        let recv_ty = self
+            .recv_expression_ty(read.recv_span)
+            .or(match read.recv {
+                Receiver::Typed { ty, .. } => Some(ty),
+                Receiver::This { container, kind } => Some(self.this_static_ty(container, kind)),
+                Receiver::Created { ty: Some(ty), .. } => Some(ty),
+                Receiver::Created { ty: None, name, .. } => Some(Ty::named(name)),
+                _ => None,
+            })?;
+        let Ty::Named { name, .. } = self.fold_alias_ty(recv_ty) else {
+            return None;
+        };
+        let ty = self.member_declared_ty(name, read.name);
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
+    /// The operand `Ty` a bare `refs` entry carries — the flow read type
+    /// first (the promoted/captured static face), then the declaration
+    /// model's shape: a local's derived initializer face, a top-level
+    /// function's signature, an implicit-this member's declared face, a
+    /// type alias folded to a record or function shape.
+    fn operand_ty_of_ref(&self, unit_ref: &UnitRef) -> Option<Ty> {
+        if let Some(ty) = self
+            .read_type_at(unit_ref.range)
+            .filter(|ty| *ty != Ty::UNKNOWN)
+        {
+            return Some(ty);
+        }
+        if let Some(&decl) = self.local_decl_at_read.get(&unit_ref.range.offset)
+            && let Some(ty) = self.init_derived_types.borrow().get(&decl).copied()
+            && ty != Ty::UNKNOWN
+        {
+            return Some(ty);
+        }
+        match unit_ref.target {
+            RefTarget::Decl { .. } => {
+                let decl = self.top_level_decl(unit_ref.name)?;
+                let ty = if matches!(decl.kind, MicroKind::TopLevelFn) {
+                    decl.formals.as_deref().map(|formals| {
+                        let sig = FnVarSig {
+                            params: Box::default(),
+                            required_positional: u16::try_from(
+                                formals.positional.iter().filter(|f| f.required).count(),
+                            )
+                            .unwrap_or(u16::MAX),
+                            positional: formals
+                                .positional
+                                .iter()
+                                .map(|f| f.ty)
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
+                            named: formals
+                                .named
+                                .iter()
+                                .map(|f| (f.name, f.ty, f.required))
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
+                            return_ty: decl.return_ty,
+                        };
+                        self.fn_sig_ty(&sig)
+                    })
+                } else {
+                    Some(decl.var_ty)
+                }?;
+                (ty != Ty::UNKNOWN).then_some(self.fold_alias_ty(ty))
+            }
+            RefTarget::Member { container } => {
+                let ty = self.member_declared_ty(container, unit_ref.name);
+                (ty != Ty::UNKNOWN).then_some(ty)
+            }
+            RefTarget::Local => {
+                // Post-walk derivation — the frame roster is gone by
+                // finalize, so `local_fn_sig`/`local_declared_ty` cannot
+                // answer. `local_decl_at_read` maps the read to the
+                // declarator's name-token offset; the byte after it and
+                // the type-use rows ending before it re-derive the face
+                // (the same legs the resolution side's `Local` arm runs):
+                // `name(` is a local function, `name = (` an inferred
+                // closure, otherwise the last type annotation ending
+                // ahead of the name is the declared face — a record
+                // (`(String,) a`), a function (`void Function<T>(T) f`),
+                // or a type parameter whose bound carries the shape.
+                let decl_offset = *self.local_decl_at_read.get(&unit_ref.range.offset)?;
+                let name_len = self.strings.resolve(unit_ref.name).len() as u32;
+                let bytes = self.source.as_bytes();
+                let mut at = self.byte_of(decl_offset + name_len);
+                while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                    at += 1;
+                }
+                match bytes.get(at) {
+                    Some(b'(') => {
+                        let sig_ty = self.closure_init_ty(bytes, at);
+                        let Ty::Function { shape, .. } = sig_ty else {
+                            return None;
+                        };
+                        let (type_params, positional, named) = {
+                            let pool = self.boundary.pool();
+                            let shape = pool.function_shape(shape);
+                            (
+                                shape.type_params,
+                                shape.positional.to_vec(),
+                                shape.named.to_vec(),
+                            )
+                        };
+                        let decl_byte = self.byte_of(decl_offset);
+                        let Some(ret) = self
+                            .type_uses
+                            .iter()
+                            .filter(|(range, _)| range.end() <= decl_offset)
+                            .filter(|(range, _)| {
+                                bytes[self.byte_of(range.end())..decl_byte]
+                                    .iter()
+                                    .all(u8::is_ascii_whitespace)
+                            })
+                            .last()
+                            .map(|(_, name)| Ty::named(*name))
+                        else {
+                            return Some(sig_ty);
+                        };
+                        Some(self.boundary.intern_function_ty(
+                            type_params,
+                            ret,
+                            &positional,
+                            &named,
+                            false,
+                        ))
+                    }
+                    Some(b'=') => {
+                        let mut init = at + 1;
+                        while bytes.get(init).is_some_and(|b| b.is_ascii_whitespace()) {
+                            init += 1;
+                        }
+                        if bytes.get(init) == Some(&b'(') {
+                            let ty = self.closure_init_ty(bytes, init);
+                            return (ty != Ty::UNKNOWN).then_some(ty);
+                        }
+                        None
+                    }
+                    _ => {
+                        let decl_byte = self.byte_of(decl_offset);
+                        let annotation = self
+                            .type_uses
+                            .iter()
+                            .filter(|(range, _)| range.end() <= decl_offset)
+                            .filter(|(range, _)| {
+                                bytes[self.byte_of(range.end())..decl_byte]
+                                    .iter()
+                                    .all(u8::is_ascii_whitespace)
+                            })
+                            .last()
+                            .map(|(_, name)| *name)?;
+                        let folded = self.fold_alias_ty(Ty::named(annotation));
+                        if matches!(folded, Ty::Record { .. } | Ty::Function { .. }) {
+                            return Some(folded);
+                        }
+                        // A type-parameter spelling (`T extends int
+                        // Function(int)`): the bound's shape decides the
+                        // operator/call face.
+                        if let Ty::Named { name, .. } = folded
+                            && let Some(bound) = self.param_bound_of(name)
+                        {
+                            let bound = self.fold_alias_ty(bound);
+                            if matches!(bound, Ty::Record { .. } | Ty::Function { .. }) {
+                                return Some(bound);
+                            }
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The literal-operand prefix arm (`~"hello"`, `-1`, `--x`): a unary
+    /// `~`/`-`/`++`/`--` immediately before a literal token resolves the
+    /// operator member on the literal's own head — the one operand shape
+    /// no `refs`/`member_reads` record carries.
+    fn credit_prefix_literal_operators(
+        &mut self,
+        faces: &[(&ExtensionFace, FileId)],
+        declarers: &FxHashMap<StringId, u32>,
+    ) {
+        let tokens = self.tokens.as_slice();
+        let mut index = 0usize;
+        while index + 1 < tokens.len() {
+            let text = &self.source[tokens[index].byte_range()];
+            let op = match text {
+                "~" => Some("~"),
+                "-" => {
+                    // Unary only — the token before must not end an operand.
+                    let prior = index
+                        .checked_sub(1)
+                        .and_then(|prior| tokens.get(prior))
+                        .map(|token| &self.source[token.byte_range()]);
+                    prior
+                        .is_none_or(|text| {
+                            matches!(
+                                text,
+                                "(" | "["
+                                    | "{"
+                                    | ","
+                                    | "="
+                                    | "=="
+                                    | "!="
+                                    | "=>"
+                                    | "return"
+                                    | "case"
+                                    | ";"
+                                    | ":"
+                                    | "?"
+                                    | "&&"
+                                    | "||"
+                                    | "??"
+                                    | "??="
+                            )
+                        })
+                        .then_some("unary-")
+                }
+                "++" => Some("+"),
+                "--" => Some("-"),
+                _ => None,
+            };
+            let Some(op) = op else {
+                index += 1;
+                continue;
+            };
+            let operand = &tokens[index + 1];
+            let head = match operand.kind {
+                dartq_scanner::TokenKind::String
+                | dartq_scanner::TokenKind::StringInterpolationIdentifier => {
+                    Some(self.intern("String"))
+                }
+                dartq_scanner::TokenKind::Int | dartq_scanner::TokenKind::Hexadecimal => {
+                    Some(self.intern("int"))
+                }
+                dartq_scanner::TokenKind::Double => Some(self.intern("double")),
+                _ => None,
+            };
+            if let Some(head) = head {
+                self.credit_face_member_ty(faces, declarers, self.intern(op), Ty::named(head));
+            }
+            index += 1;
+        }
+    }
+
+    /// The #3479 correction: strip the read credit a write-position access
+    /// carried into the pools. Three shapes land here:
+    ///
+    /// - A MEMBER-target read/compound the expression statement discarded
+    ///   (`a._f += 1;`, `a._f++;`, `!a._f;`, `-a._f;`, `a._f!;`): the
+    ///   walk's `statement_discarded_rows` gates bare rows only (the
+    ///   receiver's own credit stands either way), so the member's
+    ///   `member_read_owners`/`read_names` entries ride a read the oracle
+    ///   never recorded (`_isReadIdentifier`'s `ExpressionStatement`
+    ///   gate, unused_local_elements_verifier.dart:418-440). The token
+    ///   probe re-decides the same shapes: a postfix `++`/`--`/`!` or a
+    ///   compound assign right after the member spelling, or a prefix
+    ///   `++`/`--`/`-`/`~`/`!` right before the receiver, discards the
+    ///   member's read when the whole thing sits at statement root —
+    ///   nested positions (`x = a._f += 1`, `return a._f++`) keep it.
+    /// - A bare `refs`-member target in the same discarded window: the
+    ///   `statement_discarded_rows` set already keys its offset, the
+    ///   `field_read_rows` join supplies the owner the member walk would
+    ///   have recorded.
+    /// - An initializing-formal read bound to the field: `C({this._x}) :
+    ///   _y = _x` — the `_x` reference resolves the `this._x` formal
+    ///   upstream, never the field. The field's `member_read_owners`
+    ///   credit came from the member-target join; the owner container's
+    ///   constructor declaring `this._x` proves the formal bound the
+    ///   name, so the read belongs to the parameter.
+    ///
+    /// The pools are corrected in place (`read_names`,
+    /// `member_read_owners`): a name keeps its credit while any
+    /// non-discarded evidence remains — the under-report direction.
+    fn discard_write_position_reads(&mut self) {
+        if self.member_read_owners.is_empty() && self.read_names.is_empty() {
+            return;
+        }
+        // The self-read arm (#3478): `field_read_rows` latches a
+        // `Member{container}` resolution at push time — including the
+        // field's OWN declaration token (`int _f = 0`'s `_f`), which
+        // resolves `Member{A}` exactly like a read would but is a
+        // declaration, not a use. Its offset sits in `field_read_rows`
+        // and credits `member_read_owners` through `resolve_bare_row`'s
+        // owner join. `decl_sites` identifies the declaration: every
+        // `field_read_rows` offset that IS a decl-site anchor is the
+        // declaration's self-credit — strip it before the spare checks
+        // run. A `_f` read in `m(int _f)` — a local resolution — never
+        // reaches `field_read_rows` at all, so its `(0, A)` credit came
+        // from the declaration alone.
+        for (&offset, &container) in self.field_read_rows.clone().iter() {
+            let is_decl = self
+                .decl_sites
+                .iter()
+                .any(|site| site.range.offset == offset);
+            if !is_decl {
+                continue;
+            }
+            let Some(name) = self
+                .refs
+                .iter()
+                .find(|r| r.range.offset == offset)
+                .map(|r| r.name)
+            else {
+                continue;
+            };
+            if let Some(owners) = self.member_read_owners.get_mut(&name) {
+                owners.remove(&(self.file, container));
+            }
+        }
+        // The discarded member-read offsets: every `member_reads` entry
+        // whose finalized intent reads and whose statement-position probe
+        // fires. `member_reads` has no intent column — the row at the same
+        // offset answers it (a Write-intent row carries no read evidence
+        // to strip).
+        let mut discarded: FxHashSet<u32> = FxHashSet::default();
+        for read in &self.member_reads {
+            if self.member_read_discarded(read) {
+                discarded.insert(read.offset);
+            }
+        }
+        // The bare discarded set: the walk's own verdict plus the
+        // increment operands the member-target probe cannot see (a bare
+        // `_f++` already sits in `statement_discarded_rows`; a bare
+        // `_f` used as a formal write — `this._x = _x`'s RHS — is the
+        // initializing-formal arm below).
+        let statement_discarded: FxHashSet<u32> = self
+            .statement_discarded_rows
+            .iter()
+            .copied()
+            .chain(discarded.iter().copied())
+            .collect();
+        if statement_discarded.is_empty() && self.ctor_formals_init.is_empty() {
+            return;
+        }
+        // The member owner a discarded read recorded — the same handle
+        // `note_member_read` keys on, re-derived from the receiver (the
+        // frames are gone; `This`'s extension arm resolves the `on` type
+        // the read credits).
+        let discarded_owner_of = |engine: &Self,
+                                  read: &super::types::MemberRead|
+         -> Option<(FileId, StringId)> {
+            match read.recv {
+                Receiver::This { container, kind } if kind == ContainerKind::Extension => engine
+                    .enclosing_extension_on_type(container)
+                    .map(|on| (engine.file, on)),
+                Receiver::This { container, .. } | Receiver::Super { container, .. } => {
+                    Some((engine.file, container))
+                }
+                Receiver::Container { name, .. } => Some((engine.file, name)),
+                Receiver::Typed { type_name, .. } => resolve_container(
+                    engine.graph,
+                    engine.namespaces,
+                    engine.index,
+                    engine.lib,
+                    engine.file,
+                    type_name,
+                )
+                .map(|(_, owner)| (owner, type_name)),
+                _ => None,
+            }
+        };
+        // The pure-write member accesses (`a._f = 1`, `A() : _f = 0`'s
+        // LHS): the recorded read's owner credit is a write the oracle
+        // never ran — strip it the same way the discarded set does. The
+        // row stack is drained by finalize, so the intent re-derives from
+        // the surviving pools: `refs` `pure_write_at` probes (a `v = 3`
+        // write) joined with `member_refs` `Written` edges (the `_f = 0`
+        // initializer LHS, a bare `this`-implicit assignment).
+        let write_offsets: FxHashSet<u32> = self
+            .refs
+            .iter()
+            .filter(|r| self.pure_write_at(r.range.offset, r.range.end()))
+            .map(|r| r.range.offset)
+            .chain(
+                self.report
+                    .member_refs
+                    .iter()
+                    .filter(|edge| matches!(edge.kind, MemberRefKind::Written))
+                    .map(|edge| edge.range.offset),
+            )
+            .collect();
+        for read in &self.member_reads {
+            if !(discarded.contains(&read.offset) || write_offsets.contains(&read.offset)) {
+                continue;
+            }
+            if let Some(owner) = discarded_owner_of(self, read)
+                && let Some(owners) = self.member_read_owners.get_mut(&read.name)
+            {
+                owners.remove(&owner);
+            }
+        }
+        // The bare discarded rows: a `field_read_rows`-backed bare read
+        // the statement dropped credits the pushed container — the same
+        // (file, owner) the pass-2 read gate joined.
+        for (&offset, &container) in self.field_read_rows.clone().iter() {
+            if !self.statement_discarded_rows.contains(&offset) {
+                continue;
+            }
+            // The bare row's own spelling is the `refs` payload at the
+            // offset — `rows` is drained by `resolve_rows` before this
+            // pass runs, so `refs` is the surviving carrier; `field_read_rows`
+            // keys the field's declaring container, the name the row
+            // resolved.
+            let Some(name) = self
+                .refs
+                .iter()
+                .find(|r| r.range.offset == offset)
+                .map(|r| r.name)
+            else {
+                continue;
+            };
+            if let Some(owners) = self.member_read_owners.get_mut(&name) {
+                owners.remove(&(self.file, container));
+            }
+        }
+        // The shadowed-local arm (#3478): `field_read_rows` latched the
+        // field credit at push time on a name-match, blind to shadowing —
+        // a parameter or local of the same spelling resolves
+        // `RefTarget::Local`, so the read is the local's, never the
+        // field's. `local_decl_at_read` proves the local resolution:
+        // every `field_read_rows` offset that also has a local-decl
+        // entry strips its (file, container) owner credit.
+        for (&offset, &container) in self.field_read_rows.clone().iter() {
+            if !self.local_decl_at_read.contains_key(&offset) {
+                continue;
+            }
+            let Some(name) = self
+                .refs
+                .iter()
+                .find(|r| r.range.offset == offset)
+                .map(|r| r.name)
+            else {
+                continue;
+            };
+            if let Some(owners) = self.member_read_owners.get_mut(&name) {
+                owners.remove(&(self.file, container));
+            }
+        }
+        // The initializing-formal arm: a bare read inside a constructor
+        // initializer whose spelling matches one of that constructor's
+        // `this.` formals is the FORMAL's read, never the field's — strip
+        // every `member_read_owners` credit the member-bound join
+        // recorded for it. The site walks its own constructor's formals:
+        // the row sits inside the initializer list of the nearest
+        // preceding `Constructor` site of the owner container.
+        if !self.ctor_formals_init.is_empty() {
+            let formal_names: FxHashSet<StringId> = self
+                .ctor_formals_init
+                .iter()
+                .map(|(_, name)| *name)
+                .collect();
+            // A member read the formal shadowed: the row's container
+            // declares an initializing formal under the same spelling —
+            // drop the (file, owner) credit for every discarded formal
+            // name the owner's ctors recorded.
+            let formal_shadowed: FxHashSet<StringId> = formal_names
+                .iter()
+                .copied()
+                .filter(|name| {
+                    // The row stack is drained by finalize — the read
+                    // re-derives from `refs`: an `init_rows` offset whose
+                    // entry is not a pure write is the read the formal
+                    // bound (a `Intent::Read`/`ReadWrite` the drained row
+                    // recorded).
+                    self.refs.iter().any(|r| {
+                        r.name == *name
+                            && self.init_rows.contains_key(&r.range.offset)
+                            && !self.pure_write_at(r.range.offset, r.range.end())
+                    })
+                })
+                .collect();
+            for name in formal_shadowed {
+                // The container whose own ctor declared `this.name` keeps
+                // no credit — that read is the formal's. A DIFFERENT
+                // container's same-spelled field keeps its read. Resolved
+                // up front so the mutable borrow below stays flat.
+                let dead: FxHashSet<(FileId, StringId)> = self
+                    .member_read_owners
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|(_, container)| self.container_declares_init_formal(*container, name))
+                    .collect();
+                if dead.is_empty() {
+                    continue;
+                }
+                if let Some(owners) = self.member_read_owners.get_mut(&name) {
+                    owners.retain(|owner| !dead.contains(owner));
+                }
+            }
+        }
+        // The name-level pool: a name keeps its `read_names` entry while
+        // any non-discarded evidence remains — a member read outside the
+        // discarded set or a member-bound `refs` row outside it. Names
+        // whose every read was discarded drop out, so the `unresolved_
+        // read` arm's spelling fallback cannot rescue them either.
+        // Dead evidence = the discarded set PLUS every member-read offset
+        // whose row finalized a pure `Intent::Write` — a write-position
+        // access (`A() : _y = _x`'s LHS, `a._f = 1;`) recorded the member
+        // write but the getter never ran, so it dead-ends the name's read
+        // pool the same way a discarded statement does.
+        let mut shadowed_offsets: FxHashMap<StringId, Vec<u32>> = FxHashMap::default();
+        for (&offset, _) in self.field_read_rows.iter() {
+            if self.local_decl_at_read.contains_key(&offset)
+                && let Some(name) = self
+                    .refs
+                    .iter()
+                    .find(|r| r.range.offset == offset)
+                    .map(|r| r.name)
+            {
+                shadowed_offsets.entry(name).or_default().push(offset);
+            }
+        }
+        let names: Vec<StringId> = self.read_names.iter().copied().collect();
+        for name in names {
+            let mut total = 0usize;
+            let mut dead = 0usize;
+            for offset in self
+                .member_reads
+                .iter()
+                .filter(|read| read.name == name)
+                .map(|read| read.offset)
+                .chain(
+                    self.refs
+                        .iter()
+                        .filter(|r| r.name == name && matches!(r.target, RefTarget::Member { .. }))
+                        .map(|r| r.range.offset),
+                )
+                .chain(shadowed_offsets.get(&name).into_iter().flatten().copied())
+            {
+                total += 1;
+                if statement_discarded.contains(&offset)
+                    || write_offsets.contains(&offset)
+                    || shadowed_offsets
+                        .get(&name)
+                        .is_some_and(|offsets| offsets.contains(&offset))
+                {
+                    dead += 1;
+                }
+            }
+            let owners_empty = self
+                .member_read_owners
+                .get(&name)
+                .is_none_or(|owners| owners.is_empty());
+            if owners_empty && total > 0 && dead == total {
+                self.read_names.remove(&name);
+            }
+        }
+    }
+
+    /// Whether `container`'s constructors declare `name` as an
+    /// initializing formal (`this.name`) — the `ctor_formals_init` rows
+    /// keyed by decl-site index; the site belongs to the container when
+    /// its own `DeclKind::Constructor` names it.
+    fn container_declares_init_formal(&self, container: StringId, name: StringId) -> bool {
+        self.ctor_formals_init.iter().any(|(site, formal)| {
+            *formal == name
+                && self
+                    .decl_sites
+                    .get(*site)
+                    .is_some_and(|site| matches!(site.kind, DeclKind::Constructor { container: c } if c == container))
+        })
+    }
+
+    /// Whether a `member_reads` entry's read sat in a discarded statement
+    /// position: a postfix `++`/`--`/`!` or a compound assign (`+=`,
+    /// `-=`, `*=`, `/=`, `%=`, `~/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`,
+    /// `>>>=`) immediately after the member token, or a prefix
+    /// `++`/`--`/`-`/`~`/`!` immediately before the receiver's first
+    /// byte — with the whole expression rooted at an expression
+    /// statement (a nested position keeps the read: `x = a._f += 1` is
+    /// not discarded upstream either).
+    fn member_read_discarded(&self, read: &super::types::MemberRead) -> bool {
+        let tokens = self.tokens.as_slice();
+        let Some(member_index) = tokens
+            .iter()
+            .position(|token| token.utf16_offset == read.offset)
+        else {
+            return false;
+        };
+        // The postfix / compound-write arm: the token right after the
+        // member spelling decides. `!` discards ONLY at the expression's
+        // own tail — a `.`/`?.`/`[`/`(` after it keeps the member access
+        // going, so `_f` was read for its value (`a._f!.m()` reads
+        // `_f` the same way a plain read does).
+        let postfix = tokens.get(member_index + 1).is_some_and(|token| {
+            let text = &self.source[token.byte_range()];
+            if text == "!" {
+                return tokens.get(member_index + 2).is_none_or(|after| {
+                    !matches!(&self.source[after.byte_range()], "." | "?." | "[" | "(")
+                });
+            }
+            // `++`/`--` discard the operand's read upstream. Compound
+            // assigns (`+=`, `??=`, `*=`, …) are read+write — the read
+            // half credits the member (the oracle's `writeElement` /
+            // `readElement` join), so they keep the credit.
+            matches!(text, "++" | "--")
+        });
+        // The prefix arm: the token right before the receiver's first
+        // byte (`this._f` roots at `this`, `a.b._f` at `a`). A prefix
+        // `++`/`--`/`-`/`~`/`!` discards the read upstream; the same
+        // statement-root gate keeps the nested positions (`x = !a._f`).
+        let recv_start = if read.recv_span.length > 0 {
+            read.recv_span.offset
+        } else {
+            read.offset
+        };
+        let prefix_index = tokens
+            .iter()
+            .rposition(|token| token.utf16_offset < recv_start);
+        let prefix = prefix_index.is_some_and(|index| {
+            matches!(
+                &self.source[tokens[index].byte_range()],
+                "++" | "--" | "-" | "~" | "!"
+            ) && self.statement_rooted_at(tokens[index].utf16_offset)
+        });
+        if !(postfix || prefix) {
+            return false;
+        }
+        // The postfix arm's own statement check: the compound assign's
+        // right operand may carry reads (`a._f += i` reads `i`), so the
+        // boundary probe runs from the member expression's own start —
+        // a `(`/`=`/`=>` upstream is a nested context.
+        self.statement_rooted_at(recv_start)
+    }
+
+    /// Whether the expression starting at `offset` is rooted at an
+    /// expression statement: walk backward over the token stream with a
+    /// bracket depth — `)`/`]` deepen, `(`/`[` at depth 0 prove an open
+    /// group (a nested position), `;`/`{`/`}` at depth 0 confirm the
+    /// statement boundary, and every other depth-0 token (an operator,
+    /// `=`, `,`, `=>`, a keyword) is a larger construct the expression
+    /// nests inside — its read counts upstream.
+    fn statement_rooted_at(&self, offset: u32) -> bool {
+        let mut depth = 0u32;
+        for token in self
+            .tokens
+            .as_slice()
+            .iter()
+            .rev()
+            .filter(|token| token.utf16_offset < offset)
+        {
+            let text = &self.source[token.byte_range()];
+            match text {
+                ")" | "]" => depth += 1,
+                "(" | "[" => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                _ if depth == 0 => {
+                    return matches!(text, ";" | "{" | "}");
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// The shared operator/`call`/function-receiver credit path: the guard
@@ -1602,10 +2708,7 @@ impl<'a> Engine<'a> {
         while k < bytes.len() && bytes[k].is_ascii_whitespace() {
             k += 1;
         }
-        bytes.get(k) == Some(&b'=')
-            && bytes
-                .get(k + 1)
-                .is_none_or(|b| *b != b'=' && *b != b'>')
+        bytes.get(k) == Some(&b'=') && bytes.get(k + 1).is_none_or(|b| *b != b'=' && *b != b'>')
     }
 
     /// Whether the source spells an object pattern's field reading
@@ -1623,8 +2726,7 @@ impl<'a> Engine<'a> {
             return false;
         }
         let bytes = self.source.as_bytes();
-        let ident_byte =
-            |b: u8| matches!(b, b'_' | b'$' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+        let ident_byte = |b: u8| matches!(b, b'_' | b'$' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
         let mut from = 0usize;
         while let Some(rel) = self.source[from..].find(&container_text) {
             let hit = from + rel;
@@ -1702,6 +2804,16 @@ impl<'a> Engine<'a> {
     /// unmodelable corner suppresses (the under-report direction).
     pub(crate) fn finalize_usage(&mut self) {
         self.credit_derived_extension_uses();
+        // The #3479 write-position correction: the read pools the member
+        // verdicts join (`member_read_owners`, `read_names`,
+        // `field_read_rows`'s bare credits) carried three write shapes the
+        // oracle's `_isReadIdentifier` never records — a member access the
+        // expression statement discarded (`a._f += 1;`, `a._f++;`), a
+        // constructor initializer's LHS write (`A() : _f = 0`), and an
+        // initializing formal's field-typed read (`C({this._x}) : _y =
+        // _x` binds the FORMAL, never the field). Strip the credit before
+        // the decl-site walk reads the pools.
+        self.discard_write_position_reads();
         // The super-initialization pass: the invocation givens land in the
         // given sets the parameter face reads, and the resolved-target map
         // feeds the constructor corresponding-parameter face.
@@ -1774,27 +2886,36 @@ impl<'a> Engine<'a> {
         // `RefTarget::Missing` at push time (the plain-name `_s` is not in
         // `A.members` — only `_s=` is), and `bare_write_target_exists`
         // rescues the write silently without a `member_refs` edge. The
-        // write still credits the setter element — `rows` carries the
-        // `Missing` arm's `this_type` snapshot, and the setter's `name=`
-        // spelling is the `member_found` probe.
-        let missing_write_rows: Vec<(Option<StringId>, StringId)> = self
-            .rows
+        // write still credits the setter element — the `refs` pool's
+        // `Missing` arm re-derives it (the row stack is drained by
+        // finalize): a `RefTarget::Missing` entry in write position
+        // (`pure_write_at`) re-derives the `this_type` the drained row
+        // carried through `enclosing_container_at`, and the setter's
+        // `name=` spelling is the `member_found` probe.
+        let missing_write_candidates: Vec<(Option<StringId>, StringId)> = self
+            .refs
             .iter()
-            .filter(|row| matches!(row.intent, Intent::Write | Intent::ReadWrite))
-            .filter_map(|row| match &row.shape {
-                RowShape::Bare(BareInfo::Missing { this_type, .. }) => {
-                    Some((*this_type, row.name))
-                }
-                _ => None,
+            .filter(|r| {
+                matches!(r.target, RefTarget::Missing)
+                    && self.pure_write_at(r.range.offset, r.range.end())
+            })
+            .map(|r| {
+                let container = self.enclosing_container_at(r.range.offset);
+                (container, r.name)
             })
             .collect();
         let mut missing_write_setters: FxHashSet<(FileId, StringId, StringId)> =
             FxHashSet::default();
         let mut missing_write_top_levels: FxHashSet<StringId> = FxHashSet::default();
-        for (this_type, name) in missing_write_rows {
+        for (this_type, name) in missing_write_candidates {
             let setter = self.setter_spelling(name);
             match this_type {
-                Some(container) if self.member_found(container, setter, false) => {
+                Some(container)
+                    if self
+                        .container_kind_of(container)
+                        .is_some_and(|kind| kind != ContainerKind::Extension)
+                        && self.member_found(container, setter, false) =>
+                {
                     missing_write_setters.insert((self.file, container, setter));
                 }
                 // A top-level write's `this_type` is `None` — the setter's
@@ -1802,16 +2923,17 @@ impl<'a> Engine<'a> {
                 // (`resolve_bare` at push time already tried it and missed:
                 // `BareInfo::Missing` is the push-time result, not the
                 // write-upgraded second chance `bare_write_target_exists`
-                // ran). Re-resolve the setter spelling live: a `RefTarget::Decl`
-                // hit means the top-level setter exists and the write used it.
-                None if matches!(
-                    self.resolve_bare(setter).1,
-                    RefTarget::Decl { .. } | RefTarget::Member { .. }
-                ) =>
-                {
-                    missing_write_top_levels.insert(name);
+                // ran). A `RefTarget::Decl` hit means the top-level setter
+                // exists and the write used it. An extension body's
+                // `this_type` is `None` upstream (the `on` face carries
+                // the write), so it falls here too — the extension's
+                // `on` type setter resolves through the scope lookup the
+                // same way a top-level's does.
+                _ => {
+                    if matches!(self.resolve_bare(setter).1, RefTarget::Decl { .. }) {
+                        missing_write_top_levels.insert(name);
+                    }
                 }
-                _ => {}
             }
         }
         // `element_used`'s Member-arm view: names that resolved ONLY through
@@ -1859,8 +2981,7 @@ impl<'a> Engine<'a> {
                 }
             })
             .collect();
-        let mut setter_twin_uses: FxHashSet<(FileId, StringId, StringId)> =
-            FxHashSet::default();
+        let mut setter_twin_uses: FxHashSet<(FileId, StringId, StringId)> = FxHashSet::default();
         for (container, name, super_walk) in read_containers {
             if !self.member_found(container, name, super_walk) {
                 let setter = self.setter_spelling(name);
@@ -1874,14 +2995,72 @@ impl<'a> Engine<'a> {
         // `RefTarget::Missing` never reached `note_member_ref`; the
         // setter-only read resolved no getter), but the oracle's
         // `usedElements.members` carries the setter element.
-        let member_used_elements: FxHashSet<(FileId, StringId, StringId)> =
-            member_used_elements
-                .union(&missing_write_setters)
+        let member_used_elements: FxHashSet<(FileId, StringId, StringId)> = member_used_elements
+            .union(&missing_write_setters)
+            .copied()
+            .chain(setter_twin_uses.iter().copied())
+            .collect();
+        // `element_used`'s Member-arm view: names that resolved ONLY through
+        // a `RefTarget::Member` ref (a bare `_m1` inside `B`'s body binds
+        // `B._m1`, never `A._m1`) are element-attributed to their own
+        // container via `member_used_elements` — keeping the spelling in
+        // the name-level pool would spare every same-named member of a
+        // sibling class (#3478). A `Decl`/`TypeParam`/`type_use` path on the
+        // same spelling keeps it (a non-member resolution also credits the
+        // name).
+        let member_resolved_names: FxHashSet<StringId> = self
+            .refs
+            .iter()
+            .filter(|r| matches!(r.target, RefTarget::Member { .. }))
+            .map(|r| r.name)
+            .collect();
+        let non_member_paths: FxHashSet<StringId> = self
+            .refs
+            .iter()
+            .filter(|r| matches!(r.target, RefTarget::Decl { .. } | RefTarget::TypeParam))
+            .map(|r| r.name)
+            .chain(self.type_uses.iter().map(|(_, name)| *name))
+            .collect();
+        let member_only_resolved_names: FxHashSet<StringId> = member_resolved_names
+            .difference(&non_member_paths)
+            .copied()
+            .collect();
+        // The shadowed-local arm (#3478): a `_f` spelling that resolved
+        // ONLY through `RefTarget::Local`/`Missing`/`Opaque`/`Prefix` —
+        // never `Member`/`Decl`/`TypeParam`/`type_use` — is the local's
+        // credit, never the field's (`this._f`'s). `element_used` carries
+        // it because `used_names` marked the spelling at read time, but
+        // the member-level fallback must not let a parameter or for-in
+        // binder's read spare the same-named field. Names absent from
+        // `refs` entirely (credited through `read_names`/`import_used`/
+        // `extension_credit_names`) keep the credit — the filter only
+        // strips names the `refs` pool proves are local-bound.
+        let local_only_names: FxHashSet<StringId> = {
+            let resolved_paths: FxHashSet<StringId> = member_resolved_names
+                .iter()
+                .chain(&non_member_paths)
                 .copied()
-                .chain(setter_twin_uses.iter().copied())
                 .collect();
+            let referenced: FxHashSet<StringId> = self.refs.iter().map(|r| r.name).collect();
+            referenced.difference(&resolved_paths).copied().collect()
+        };
+        // The strict subset of `local_only_names` that resolved
+        // `RefTarget::Local` — the proven local read a parameter or
+        // binder owns. The `unresolved_read` member face excludes only
+        // this arm: a `Missing`/`Opaque`/`Prefix` miss stays unresolved
+        // (the `.member` resolution genuinely bound nothing), while a
+        // `Local` hit means the bare name belongs to a variable the
+        // field's credit must not claim.
+        let local_resolved_names: FxHashSet<StringId> = self
+            .refs
+            .iter()
+            .filter(|r| matches!(r.target, RefTarget::Local))
+            .map(|r| r.name)
+            .collect();
         let member_element_used: FxHashSet<StringId> = element_used
             .difference(&member_only_resolved)
+            .filter(|name| !member_only_resolved_names.contains(name))
+            .filter(|name| !local_only_names.contains(name))
             .copied()
             .collect();
         // `_isUsedElement` for top-level declarations is element-level: a
@@ -1900,11 +3079,25 @@ impl<'a> Engine<'a> {
         // identifier — the source bytes decide the intent (`v = 3` is a
         // pure write; `v == 3` compares and `v += 1` reads too, so both
         // keep the credit; `=>` belongs to a closure body).
+        // `_isReadIdentifier` (upstream :429): a write `v = 3` adds the
+        // SETTER element, never the variable — `v` reports `unused_element`
+        // unless a read also credits it. The row stack is drained by
+        // finalize, so the write offsets re-derive from the surviving
+        // pools: `refs` `pure_write_at` probes (a `v = 3` write) joined
+        // with `member_refs` `Written` edges (the `_f = 0` initializer
+        // LHS, a bare `this`-implicit assignment).
         let write_offsets: FxHashSet<u32> = self
-            .rows
+            .refs
             .iter()
-            .filter(|row| matches!(row.intent, Intent::Write))
-            .map(|row| row.range.offset)
+            .filter(|r| self.pure_write_at(r.range.offset, r.range.end()))
+            .map(|r| r.range.offset)
+            .chain(
+                self.report
+                    .member_refs
+                    .iter()
+                    .filter(|edge| matches!(edge.kind, MemberRefKind::Written))
+                    .map(|edge| edge.range.offset),
+            )
             .collect();
         let pure_write_refs: FxHashSet<u32> = self
             .refs
@@ -1920,6 +3113,7 @@ impl<'a> Engine<'a> {
                 matches!(r.target, RefTarget::Decl { .. })
                     && !write_offsets.contains(&r.range.offset)
                     && !pure_write_refs.contains(&r.range.offset)
+                    && !self.statement_discarded_rows.contains(&r.range.offset)
             })
             .map(|r| r.name)
             .chain(self.type_uses.iter().map(|(_, name)| *name))
@@ -1933,13 +3127,29 @@ impl<'a> Engine<'a> {
         // entry keys the same (container, spelling) element tuple the
         // member arms read, so those paths gain exactly the upstream
         // credit and nothing more (a write intent stays excluded).
+        // The write re-decision (#3479): the row stack is drained by
+        // finalize, so a `RefTarget::Member` ref's write form re-derives
+        // from its `member_refs` edge — `Written` is a pure write (the
+        // `_f = 0` constructor-initializer LHS, a bare `this`-implicit
+        // assignment) the read join excludes, while `ReadWritten` is a
+        // real compound read the oracle credits.
+        let written_ref_offsets: FxHashSet<u32> = self
+            .report
+            .member_refs
+            .iter()
+            .filter(|edge| matches!(edge.kind, MemberRefKind::Written))
+            .map(|edge| edge.range.offset)
+            .collect();
         let ref_member_reads: FxHashSet<(StringId, StringId)> = self
             .refs
             .iter()
             .filter_map(|r| match &r.target {
                 RefTarget::Member { container }
                     if !write_offsets.contains(&r.range.offset)
-                        && !pure_write_refs.contains(&r.range.offset) =>
+                        && !pure_write_refs.contains(&r.range.offset)
+                        && !written_ref_offsets.contains(&r.range.offset)
+                        && !self.pure_write_at(r.range.offset, r.range.end())
+                        && !self.statement_discarded_rows.contains(&r.range.offset) =>
                 {
                     Some((*container, r.name))
                 }
@@ -2009,14 +3219,14 @@ impl<'a> Engine<'a> {
         // selector on a sibling class shares the credit (the
         // under-report direction every spelling-level corner keeps).
         let shorthand_ctor_refs: FxHashSet<StringId> = self
-            .rows
+            .refs
             .iter()
-            .filter(|row| {
-                self.dot_shorthand_context(row.range.offset)
-                    && !self.byte_before_dot_is_question(row.range.offset)
-                    && self.byte_at(row.range.end()) == Some(b'(')
+            .filter(|r| {
+                self.dot_shorthand_context(r.range.offset)
+                    && !self.byte_before_dot_is_question(r.range.offset)
+                    && self.byte_at(r.range.end()) == Some(b'(')
             })
-            .map(|row| row.name)
+            .map(|r| r.name)
             .collect();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
@@ -2164,9 +3374,7 @@ impl<'a> Engine<'a> {
                             .get(self.file)
                             .and_then(|f| f.container(site.name))
                             .is_some_and(|c| {
-                                c.constructors.len()
-                                    + usize::from(c.has_unnamed_constructor)
-                                    > 0
+                                c.constructors.len() + usize::from(c.has_unnamed_constructor) > 0
                             });
                     // The `@JS` metadata gate spares the CLASS element
                     // (`visitClassDeclaration` adds it to
@@ -2249,8 +3457,15 @@ impl<'a> Engine<'a> {
                     // bare `_f` inside `B` resolves `B._f` via
                     // `RefTarget::Member`) is NOT unresolved — its owner
                     // resolution lives in `refs`, not `member_read_owners`.
+                    // A LOCAL resolution is not unresolved either — a
+                    // parameter or for-in binder's `_f` read binds the
+                    // local, not the field (#3478: the member-level
+                    // unresolved set is `.member` accesses only, upstream
+                    // `visitPrefixedIdentifier`/`visitPropertyAccess` —
+                    // a bare local read never lands there).
                     let unresolved_read = self.read_names.contains(&bare)
                         && !non_member_resolved.contains(&bare)
+                        && !local_resolved_names.contains(&bare)
                         && self
                             .member_read_owners
                             .get(&bare)
@@ -2374,7 +3589,8 @@ impl<'a> Engine<'a> {
                         // `this._foo` with no `.` token — no `member_reads`/
                         // `member_refs` record; a `RefTarget::Decl`/`Member`
                         // ref credits the spelling).
-                        _ => member_used_elements
+                        _ => {
+                            member_used_elements
                             .contains(&(self.file, container, site.name))
                             || member_element_used.contains(&bare)
                             || ref_member_reads.contains(&(container, site.name))
@@ -2382,7 +3598,8 @@ impl<'a> Engine<'a> {
                             // The object-pattern field read (`C(_: 42)`)
                             // spares the getter the same way.
                             || (resolved.contains(&bare)
-                                && self.pattern_field_read_of(container, bare)),
+                                && self.pattern_field_read_of(container, bare))
+                        }
                     };
                     let spared = unnamed_face_owns
                         || pragma_spared
@@ -2469,12 +3686,7 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            self.report_optional_parameters(
-                site_index,
-                &site,
-                &super_ctor_targets,
-                &noncall_reads,
-            );
+            self.report_optional_parameters(site_index, &site, &super_ctor_targets, &noncall_reads);
         }
         // The recursive-constant-constructor face: a const constructor
         // whose own formal default values const-instantiate the SAME
@@ -3757,9 +4969,7 @@ impl<'a> Engine<'a> {
                 };
                 head_index = index;
                 match tokens[head_index].kind {
-                    dartq_scanner::TokenKind::Identifier => {
-                        break Some(tokens[head_index])
-                    }
+                    dartq_scanner::TokenKind::Identifier => break Some(tokens[head_index]),
                     dartq_scanner::TokenKind::Gt => {
                         // Backward `<…>` skip: a shallow depth walk — the
                         // group's own nested `<`/`>` pairs balance, and a
@@ -3793,10 +5003,7 @@ impl<'a> Engine<'a> {
                 continue;
             };
             let metadata = head_index > 0
-                && matches!(
-                    tokens[head_index - 1].kind,
-                    dartq_scanner::TokenKind::At
-                );
+                && matches!(tokens[head_index - 1].kind, dartq_scanner::TokenKind::At);
             // The call gate: `(` immediately after the selector is an
             // invocation (`C.sel(...)`, `new C.sel(...)`, `const C.sel(...)`)
             // — `_addParametersForArguments` owns its per-argument credit
@@ -3834,11 +5041,7 @@ impl<'a> Engine<'a> {
             // tear-off keeps its `=` but finds no `factory` behind it. The
             // backward depth scan reads closers as openers.
             let mut factory_target = false;
-            if head_index > 0
-                && matches!(
-                    tokens[head_index - 1].kind,
-                    dartq_scanner::TokenKind::Eq
-                )
+            if head_index > 0 && matches!(tokens[head_index - 1].kind, dartq_scanner::TokenKind::Eq)
             {
                 let mut depth = 0usize;
                 let mut k = head_index;
@@ -3852,9 +5055,7 @@ impl<'a> Engine<'a> {
                         | dartq_scanner::TokenKind::CloseSquare => depth += 1,
                         dartq_scanner::TokenKind::OpenCurly
                         | dartq_scanner::TokenKind::OpenParen
-                        | dartq_scanner::TokenKind::OpenSquare => {
-                            depth = depth.saturating_sub(1)
-                        }
+                        | dartq_scanner::TokenKind::OpenSquare => depth = depth.saturating_sub(1),
                         dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Colon
                             if depth == 0 =>
                         {
@@ -4143,9 +5344,7 @@ impl<'a> Engine<'a> {
         let tokens = self.tokens.as_slice();
         let index = tokens.partition_point(|t| t.utf16_offset < site.range.offset);
         let dot = tokens.get(index)?;
-        if dot.utf16_offset != site.range.offset
-            || dot.kind != dartq_scanner::TokenKind::Period
-        {
+        if dot.utf16_offset != site.range.offset || dot.kind != dartq_scanner::TokenKind::Period {
             return None;
         }
         let selector = tokens.get(index + 1)?;
@@ -4166,11 +5365,7 @@ impl<'a> Engine<'a> {
     /// the only positions a `=` can precede the target are the factory
     /// redirect's own (a default value's `=`/`:` sits inside the formal
     /// group's parens, balanced below the depth the scan reads).
-    fn redirect_formals_into(
-        &self,
-        container: StringId,
-        ctor_spelling: StringId,
-    ) -> Vec<Formals> {
+    fn redirect_formals_into(&self, container: StringId, ctor_spelling: StringId) -> Vec<Formals> {
         let tokens = self.tokens.as_slice();
         let mut out: Vec<Formals> = Vec::new();
         for site in &self.decl_sites {
@@ -4192,8 +5387,9 @@ impl<'a> Engine<'a> {
                     break None;
                 };
                 match t.kind {
-                    dartq_scanner::TokenKind::OpenParen
-                    | dartq_scanner::TokenKind::OpenSquare => depth += 1,
+                    dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                        depth += 1
+                    }
                     dartq_scanner::TokenKind::OpenCurly => {
                         if depth == 0 {
                             // The factory's own body opened — no redirect.
@@ -4224,9 +5420,10 @@ impl<'a> Engine<'a> {
                                 .get(index + 3)
                                 .filter(|t| {
                                     t.kind == dartq_scanner::TokenKind::Identifier
-                                        || (t.kind == dartq_scanner::TokenKind::Keyword(
-                                            dartq_scanner::Keyword::New,
-                                        ))
+                                        || (t.kind
+                                            == dartq_scanner::TokenKind::Keyword(
+                                                dartq_scanner::Keyword::New,
+                                            ))
                                 })
                                 .map(|t| self.token_text(t)),
                             _ => None,
@@ -4755,9 +5952,7 @@ impl<'a> Engine<'a> {
                 .is_some_and(|f| f.required);
             // `_matchParameters`' positional leg: a redirecting factory
             // carrying a formal at this index supplies the target's.
-            let spared_by_redirect = redirect_sources
-                .iter()
-                .any(|f| f.positional.len() > index);
+            let spared_by_redirect = redirect_sources.iter().any(|f| f.positional.len() > index);
             if spared_by_super
                 || spared_by_redirect
                 || self.override_parameter_spared(&overridden, bare, Some(index), formal.name)
@@ -5391,8 +6586,7 @@ impl<'a> Engine<'a> {
                 offset: anchor,
                 length: 0,
             };
-            let Some(promoted) =
-                self.promotable_field_substitution(props, anchor_range, from)
+            let Some(promoted) = self.promotable_field_substitution(props, anchor_range, from)
             else {
                 continue;
             };
@@ -5404,8 +6598,7 @@ impl<'a> Engine<'a> {
             // `?[`/`?..[` index sections stage elsewhere and are not the
             // promoted-PROPERTY receiver this pass re-decides.
             let question = self.skip_whitespace(recv_span.end());
-            if self.byte_at(question) != Some(b'?') || self.byte_at(question + 1) != Some(b'.')
-            {
+            if self.byte_at(question) != Some(b'?') || self.byte_at(question + 1) != Some(b'.') {
                 continue;
             }
             let (op_range, kind) = if self.byte_at(question + 2) == Some(b'.') {
@@ -5497,7 +6690,9 @@ impl<'a> Engine<'a> {
         // stages `target_range`): rows are offset-sorted and a receiver's
         // bare read can share the offset, so the bounded tail scan matches
         // the full range.
-        let start = self.rows.partition_point(|row| row.range.offset < read.offset);
+        let start = self
+            .rows
+            .partition_point(|row| row.range.offset < read.offset);
         let Some(row) = self.rows[start..]
             .iter()
             .rev()
@@ -5524,9 +6719,11 @@ impl<'a> Engine<'a> {
         let end = self
             .member_reads
             .partition_point(|member| member.offset < read.end());
-        let Some(anchor) = self.member_reads[..end].iter().rev().find_map(|member| {
-            (member.recv_span.offset >= read.offset).then_some(member.offset)
-        }) else {
+        let Some(anchor) = self.member_reads[..end]
+            .iter()
+            .rev()
+            .find_map(|member| (member.recv_span.offset >= read.offset).then_some(member.offset))
+        else {
             return false;
         };
         let Some((entry, _, _)) = self.member_read_resolution(anchor) else {
@@ -5536,9 +6733,7 @@ impl<'a> Engine<'a> {
             MemberKind::Field => entry.var_ty,
             _ => entry.return_ty,
         };
-        face != Ty::UNKNOWN
-            && !self.written_ty_invalid(face)
-            && self.strictly_non_nullable(face)
+        face != Ty::UNKNOWN && !self.written_ty_invalid(face) && self.strictly_non_nullable(face)
     }
 
     /// The enclosing executable's lookup spelling once its name has fired
