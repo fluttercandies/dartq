@@ -34,7 +34,7 @@
 //! spelled differently over the same instance (`E._(0x1)` vs `E._(1)`).
 
 use dartq_ast::{NodeKind, mod_flags};
-use dartq_scanner::{KeywordStyle, TokenKind};
+use dartq_scanner::{KeywordStyle, TokenKind, TokenTable};
 
 use super::{NONE_TOKEN, PayloadField, RuleSpec, first_child};
 use crate::engine::Check;
@@ -636,7 +636,7 @@ pub(super) fn segments<'a>(
             "." if current.is_none() && names.is_empty() => shorthand = true,
             "." => names.push(current.take()?),
             lex => {
-                if current.is_some() || !is_name_token(c, token) {
+                if current.is_some() || !is_name_token(c.unit.tokens, token) {
                     return None;
                 }
                 current = Some(lex);
@@ -649,13 +649,19 @@ pub(super) fn segments<'a>(
     (!names.is_empty()).then_some((shorthand, names))
 }
 
-/// Whether the token lexes as a plain name (an identifier, or a
-/// built-in keyword — a constant named `set` binds;
-/// `initialized_identifier_name`'s tolerance).
-fn is_name_token(c: &Check<'_>, token: u32) -> bool {
-    match c.unit.tokens.get(token as usize).map(|t| t.kind) {
+/// Whether the token lexes as a plain name (an identifier, or a keyword
+/// with identifier semantics): the official `ensureIdentifier` takes
+/// every `next.isIdentifier` token (`token.dart:794` — `isPseudo ||
+/// isBuiltIn`), so pseudo keywords name constants exactly like built-in
+/// ones — `static const show = ...` declares and `case E.show:` covers —
+/// while reserved words are the exclusion (`initialized_identifier_name`
+/// keeps the declared-name side aligned).
+fn is_name_token(tokens: &TokenTable, token: u32) -> bool {
+    match tokens.get(token as usize).map(|t| t.kind) {
         Some(TokenKind::Identifier) => true,
-        Some(TokenKind::Keyword(kw)) if kw.style() == KeywordStyle::BuiltIn => true,
+        Some(TokenKind::Keyword(kw)) => {
+            matches!(kw.style(), KeywordStyle::BuiltIn | KeywordStyle::Pseudo)
+        }
         _ => false,
     }
 }
@@ -1829,5 +1835,59 @@ void f(_Priv e) {
             lints[0].message,
             "Missing case clauses for some constants in 'b'."
         );
+    }
+
+    // —— #3408: the name gate's pseudo/reserved split ——
+
+    /// `ensureIdentifier`'s `next.isIdentifier` (`token.dart:794`) takes
+    /// every pseudo keyword as a name, so a case head spelled with one
+    /// (`case E.show:`) covers like any identifier head — before the gate
+    /// widened it covered nothing and the value reported missing.
+    #[test]
+    fn ticket_3408_pseudo_keyword_head_covers() {
+        assert!(
+            run(r"
+class E {
+  final int i;
+  const E._(this.i);
+
+  static const e = E._(1);
+  static const show = E._(2);
+  static const g = E._(3);
+}
+
+void f(E x) {
+  switch (x) {
+    case E.e:
+      break;
+    case E.show:
+      break;
+    case E.g:
+      break;
+  }
+}
+")
+            .is_empty()
+        );
+    }
+
+    /// The gate's reserved-word exclusion, pinned at the predicate:
+    /// pseudo keywords lex as names (a constant named `show` declares and
+    /// its references alias), reserved spellings never do, and only
+    /// identifier-shaped tokens qualify.
+    #[test]
+    fn ticket_3408_name_gate_takes_pseudo_and_refuses_reserved() {
+        let f = Fixture::parse("class C { void f() { var show = 0, on = 1; } }");
+        let name = |needle: &str| is_name_token(&f.tokens, tok(&f.source, &f.tokens, needle, 0));
+        // Pseudo keywords name constants (`static const show = ...`).
+        assert!(name("show"));
+        assert!(name("on"));
+        // Plain identifiers stay.
+        assert!(name("C"));
+        assert!(name("f"));
+        // Reserved words are the exclusion — never alias faces.
+        assert!(!name("class"));
+        assert!(!name("void"));
+        assert!(!name("var"));
     }
 }

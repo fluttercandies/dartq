@@ -562,13 +562,20 @@ fn kind_at(tokens: &TokenTable, i: usize) -> Option<TokenKind> {
     tokens.get(i).map(|token| token.kind)
 }
 
-/// Whether `kind` can spell part of an annotation name: identifiers and
-/// built-in identifiers (`dynamic`) only — reserved/pseudo keywords would
-/// swallow the next declaration.
+/// Whether `kind` can spell a name in a directive name slot: identifiers,
+/// built-in identifiers (`dynamic`), and pseudo keywords (`show`, `hide`,
+/// `async` — `ensureIdentifier`'s `next.isIdentifier` takes them in every
+/// identifier context, `identifier_context_impl.dart:130-165`, including
+/// the metadata and library/`part of` name slots this walk skips).
+/// Reserved words are the exclusion: a reserved word in a name slot is
+/// where the official splices a synthetic name. No next-declaration head
+/// is a pseudo keyword, so the widened gate cannot mask one.
 fn is_name_token(kind: TokenKind) -> bool {
     match kind {
         TokenKind::Identifier => true,
-        TokenKind::Keyword(keyword) => keyword.style() == KeywordStyle::BuiltIn,
+        TokenKind::Keyword(keyword) => {
+            matches!(keyword.style(), KeywordStyle::BuiltIn | KeywordStyle::Pseudo)
+        }
         _ => false,
     }
 }
@@ -1691,5 +1698,76 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // —— #3408: the directive name gate's pseudo/reserved split ——
+
+    /// The directive-region name gate mirrors the engine twin's widened
+    /// predicate (a15c31e4): upstream `ensureIdentifier` takes every
+    /// `next.isIdentifier` token (`identifier_context_impl.dart:130-165`,
+    /// `token.dart:794` — `isPseudo || isBuiltIn`), so pseudo keywords
+    /// spell annotation and library/`part of` names like any identifier;
+    /// reserved words stay the exclusion.
+    #[test]
+    fn ticket_3408_name_gate_takes_pseudo_and_refuses_reserved() {
+        for keyword in [
+            Keyword::Show,
+            Keyword::Hide,
+            Keyword::Async,
+            Keyword::On,
+            Keyword::When,
+            Keyword::Sync,
+            Keyword::Await,
+            Keyword::Yield,
+            Keyword::Base,
+            Keyword::Sealed,
+        ] {
+            assert!(
+                is_name_token(TokenKind::Keyword(keyword)),
+                "{keyword:?} must spell a directive name"
+            );
+        }
+        // Built-in identifiers (`dynamic`) and plain identifiers stay.
+        assert!(is_name_token(TokenKind::Keyword(Keyword::Dynamic)));
+        assert!(is_name_token(TokenKind::Identifier));
+        // Reserved words are the exclusion — a reserved word in a name
+        // slot is where the official splices a synthetic name.
+        for keyword in [
+            Keyword::Class,
+            Keyword::If,
+            Keyword::Return,
+            Keyword::New,
+            Keyword::Var,
+            Keyword::Void,
+        ] {
+            assert!(
+                !is_name_token(TokenKind::Keyword(keyword)),
+                "{keyword:?} must not spell a directive name"
+            );
+        }
+        // Non-name kinds never spell a name.
+        assert!(!is_name_token(TokenKind::String));
+        assert!(!is_name_token(TokenKind::Period));
+        assert!(!is_name_token(TokenKind::At));
+    }
+
+    /// A pseudo-keyword dotted name (`library show.hide;`) is consumed to
+    /// its `;` like any name, so the following import's URI still harvests
+    /// and reports `uri_does_not_exist`. (Before the gate widened, the
+    /// name walk broke at `show` and the rest of the directive region —
+    /// the import's URI harvest included — went silent.)
+    #[test]
+    fn ticket_3408_pseudo_library_name_survives_the_region_walk() {
+        let source = "library show.hide;\nimport 'missing.dart';\n";
+        let mut set = FileSet::default();
+        let file = set.push(source, Path::new("/c/lib/a.dart"));
+        let diags = analyze_file(source, Path::new("/c/lib"), file);
+        let uri = diags
+            .iter()
+            .find(|d| d.code.name == "uri_does_not_exist")
+            .expect("the pseudo-keyword library name consumed; the import harvested");
+        assert_eq!(uri.message, "Target of URI doesn't exist: 'missing.dart'.");
+        assert_eq!(uri.range.offset, 26, "the URI literal, quotes included");
+        assert_eq!(uri.range.length, 14);
     }
 }
