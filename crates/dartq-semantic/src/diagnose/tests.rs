@@ -19682,6 +19682,19 @@ mod ticket_3374_tests;
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// The #3384 residual pins (recon bucket A2's display face): a written
+// function type's own type-parameter group displays in DECLARATION order
+// with each bound's explicit type arguments spelled (`void Function<X
+// extends int, Y extends String>()`, `void Function<Z extends
+// A<dynamic>>()` — the official `FunctionType` display form). The render
+// half is pinned active; the end-to-end capture pins carry the
+// oracle-true strings under `#[ignore]` until the capture fix (#3410)
+// lands. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3384_tests.rs"]
+mod ticket_3384_tests;
+
 // The #3392 pins (the equality/type-check operand faces over top-level
 // bare reads and completed sends): the verdicts already resolve both
 // operand shapes, and the invariant-null-comparison row anchors at the
