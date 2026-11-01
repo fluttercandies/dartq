@@ -319,7 +319,7 @@ pub(super) fn augmentation_diagnostics(
         FxHashMap::default();
     for &unit in graph.unit_files(lib) {
         if let Some(elements) = index.get(unit) {
-            populate(&mut table, unit, elements, strings);
+            populate(&mut table, graph, index, lib, unit, elements, strings);
         }
     }
     for (aug_index, aug) in own.augmentations().iter().enumerate() {
@@ -797,6 +797,9 @@ fn check_member_shape(
 /// real library carries.
 fn populate(
     table: &mut FxHashMap<(Option<StringId>, StringId, Space), Vec<Entry>>,
+    graph: &LibraryGraph,
+    index: &ElementIndex,
+    lib: LibraryId,
     unit: FileId,
     elements: &FileElements,
     strings: &StringTable,
@@ -809,37 +812,13 @@ fn populate(
         .filter(|target| target.is_mixin_application)
         .map(|target| target.name)
         .collect();
-    // An augment head commits its own container scope (its members attach
-    // there), indistinguishable per name from an introductory commit — the
-    // name map keeps the first. A name whose commit count never exceeds its
-    // header-augment count was only ever declared through `augment` heads:
-    // every commit is a shell, and the augment's own row is its only chain
-    // face.
-    let mut order_counts: FxHashMap<StringId, usize> = FxHashMap::default();
+    // A unit's container row is an `augment` head's own face when the
+    // element introduces the name somewhere else: the chain-table row of
+    // such a unit would claim an introduction that never happened, so the
+    // fragment index (the same one the container anchor merges through)
+    // answers the filter.
     for &name in elements.container_order() {
-        *order_counts.entry(name).or_default() += 1;
-    }
-    let mut shell_counts: FxHashMap<StringId, usize> = FxHashMap::default();
-    for aug in elements.augmentations().iter().filter(|aug| {
-        aug.container.is_none()
-            && matches!(
-                aug.kind,
-                AugKind::Class
-                    | AugKind::Mixin
-                    | AugKind::Enum
-                    | AugKind::Extension
-                    | AugKind::ExtensionType
-            )
-    }) {
-        *shell_counts.entry(aug.name).or_default() += 1;
-    }
-    let shells: FxHashSet<StringId> = shell_counts
-        .into_iter()
-        .filter(|(name, aug_count)| order_counts.get(name).copied().unwrap_or(0) <= *aug_count)
-        .map(|(name, _)| name)
-        .collect();
-    for &name in elements.container_order() {
-        if shells.contains(&name) {
+        if index.container_row_is_fragment(graph, lib, unit, name) {
             continue;
         }
         let Some(container) = elements.container(name) else {

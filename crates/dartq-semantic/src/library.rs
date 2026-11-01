@@ -56,18 +56,32 @@ use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEn
 use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use crate::model::{Container, ContainerKind, FileElements, MemberEntry, MicroKind, TopDecl};
+use crate::model::{
+    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, FileElements, FnShapeId, MemberEntry,
+    MicroKind, RecordShapeId, TopDecl, Ty,
+};
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
 ///
 /// Models are shared by [`Arc`]: inserting from a shared store is a refcount
 /// bump, so indexing beyond the diagnosing library — the cross-library
 /// member-walk face (#236's zero-clone design) — costs no deep clones.
+///
+/// The index also carries the augmentation-fragment layer (#3418): the
+/// per-library element faces the container anchor answers with, built from
+/// the collected models on first use (see [`ElementFragments`]).
 #[derive(Debug, Default)]
 pub struct ElementIndex {
     files: FxHashMap<FileId, Arc<FileElements>>,
+    /// Whether any indexed unit writes a container `augment` head — the gate
+    /// that keeps the fragment layer off every analysis that uses no
+    /// augmentations (one scan of the model set, once).
+    augmented: OnceLock<bool>,
+    /// One cell per `LibraryId::index`, holding that library's fragment sets;
+    /// `None` is a library whose containers are never augmented.
+    fragments: OnceLock<Vec<OnceLock<Option<Box<[ElementFragments]>>>>>,
 }
 
 impl ElementIndex {
@@ -75,6 +89,10 @@ impl ElementIndex {
     /// [`Arc`] clone shares the model; an owned value is taken.
     pub fn insert(&mut self, file: FileId, elements: impl Into<Arc<FileElements>>) {
         self.files.insert(file, elements.into());
+        // A new unit can introduce or fragment a container another library
+        // already resolved; both caches are pure functions of the model set.
+        self.augmented = OnceLock::new();
+        self.fragments = OnceLock::new();
     }
 
     /// The model of `file`, if analyzed.
@@ -82,6 +100,296 @@ impl ElementIndex {
     pub fn get(&self, file: FileId) -> Option<&FileElements> {
         self.files.get(&file).map(Arc::as_ref)
     }
+
+    /// The element face of the container `name` declared in `owner`, with the
+    /// file that owns it: the unit's own row when the library writes no
+    /// `augment` fragment of the name, else the merged fragment face
+    /// ([`ElementFragments`]). `None` when `owner` declares no such row.
+    fn element_face<'a>(
+        &'a self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        owner: FileId,
+        name: StringId,
+    ) -> Option<(&'a Container, FileId)> {
+        if let Some(face) = self.fragment_face(graph, lib, owner, name) {
+            return Some((face, owner));
+        }
+        Some((self.get(owner)?.container(name)?, owner))
+    }
+
+    /// The merged fragment face `owner` answers for `name`, if the library
+    /// augments that container and `owner` writes one of its fragments.
+    fn fragment_face<'a>(
+        &'a self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        owner: FileId,
+        name: StringId,
+    ) -> Option<&'a Container> {
+        if !self.has_augmented_containers() {
+            return None;
+        }
+        // The fragments live in the library that declares the element, which
+        // is not necessarily the library the spelling resolves in (a prefixed
+        // or imported anchor).
+        let lib = graph.library_of_file(owner).unwrap_or(lib);
+        let elements = self.library_fragments(graph, lib)?;
+        let element = &elements[elements.binary_search_by_key(&name, |e| e.name).ok()?];
+        let at = element.faces.binary_search_by_key(&owner, |(file, _)| *file).ok()?;
+        Some(&element.faces[at].1)
+    }
+
+    /// Whether `unit`'s container row for `name` is an `augment` fragment's
+    /// face rather than the element's own — the augmentation verifier's row
+    /// filter (`populate`): a fragment row never joins the chain table as an
+    /// introductory declaration. `false` for a name no unit augments.
+    pub(crate) fn container_row_is_fragment(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        unit: FileId,
+        name: StringId,
+    ) -> bool {
+        if !self.has_augmented_containers() {
+            return false;
+        }
+        let Some(elements) = self.library_fragments(graph, lib) else {
+            return false;
+        };
+        let Ok(at) = elements.binary_search_by_key(&name, |e| e.name) else {
+            return false;
+        };
+        let element = &elements[at];
+        element.intro != Some(unit) && element.fragments.contains(&unit)
+    }
+
+    /// Whether any indexed unit writes a container `augment` head.
+    fn has_augmented_containers(&self) -> bool {
+        *self.augmented.get_or_init(|| {
+            self.files
+                .values()
+                .any(|elements| elements.augmentations().iter().any(writes_container_fragment))
+        })
+    }
+
+    /// The library's fragment sets, built on first use: one pass over the
+    /// library's unit models, cached for the rest of the analysis.
+    fn library_fragments(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+    ) -> Option<&[ElementFragments]> {
+        let cells = self
+            .fragments
+            .get_or_init(|| (0..graph.len()).map(|_| OnceLock::new()).collect());
+        cells
+            .get(lib.index() as usize)?
+            .get_or_init(|| build_fragments(graph, self, lib))
+            .as_deref()
+    }
+}
+
+/// One augmented container's fragment set (#3418).
+///
+/// Upstream an `augment` head declares a FRAGMENT of the element its
+/// introduction declares (`element.firstFragment` is the introduction,
+/// upstream Dart SDK source, pkg/_fe_analyzer_shared augmentation
+/// handling), so the element's member face is the union of every fragment's
+/// members — whichever unit the spelling is written in. The units are
+/// collected independently, so the union cannot be a collection-time
+/// artifact: it is built once per library here, from the collected models.
+///
+/// # The cross-pool gate
+///
+/// A `Ty` carrying an argument-list/record/function slot is only meaningful
+/// in the pool of the unit that interned it ([`crate::model::ArgPool`]), and
+/// the diagnostic boundary re-interns a foreign entry through the pool of the
+/// file the walk resolved it in ([`ElementFragments`]'s faces are answered
+/// under that unit's file). A fragment member therefore joins another unit's
+/// face only when it carries no such slot ([`entry_is_portable`]); a
+/// pool-carrying fragment member stays on its own unit's face — the
+/// under-resolution #3418 records for the engine-side multi-face walk, never
+/// a foreign slot read (an out-of-range slot is a panic) or a wrong type.
+#[derive(Debug)]
+struct ElementFragments {
+    /// The container name.
+    name: StringId,
+    /// The introducing unit — the fragment whose container row is the
+    /// element's own face. `None` when every fragment is an `augment` head:
+    /// no element exists upstream, so nothing is merged
+    /// (`augmentation_without_declaration` owns that shape).
+    intro: Option<FileId>,
+    /// The units writing an `augment` head for this name, in library unit
+    /// order.
+    fragments: Box<[FileId]>,
+    /// One face per unit of the element, file-ordered: that unit's own row
+    /// with the other fragments' portable members folded in. Empty for an
+    /// introduction-less element.
+    faces: Box<[(FileId, Container)]>,
+}
+
+/// Whether `aug` declares a fragment of a named container (the class family;
+/// an executable or variable `augment` is a member fragment, and a member
+/// lookup reaches it through the container face or not at all).
+fn writes_container_fragment(aug: &AugmentDecl) -> bool {
+    aug.container.is_none()
+        && matches!(
+            aug.kind,
+            AugKind::Class
+                | AugKind::Mixin
+                | AugKind::Enum
+                | AugKind::Extension
+                | AugKind::ExtensionType
+        )
+}
+
+/// The per-library fragment sets: every container the library's units
+/// augment, with the introduction's identity and one merged face per unit.
+///
+/// Order is fixed by the library's unit order and each name's row order, so
+/// the build is independent of which unit triggered it and of the order the
+/// units were collected in (a fragment declaring first and one declaring
+/// last produce the same face).
+fn build_fragments(
+    graph: &LibraryGraph,
+    index: &ElementIndex,
+    lib: LibraryId,
+) -> Option<Box<[ElementFragments]>> {
+    let units = graph.unit_files(lib);
+    // name → (unit, that unit's `augment`-head commits) in library order.
+    let mut order: FxHashMap<StringId, Vec<(FileId, usize)>> = FxHashMap::default();
+    for &unit in units {
+        let Some(elements) = index.get(unit) else {
+            continue;
+        };
+        for aug in elements.augmentations() {
+            if !writes_container_fragment(aug) {
+                continue;
+            }
+            let writers = order.entry(aug.name).or_default();
+            match writers.last_mut() {
+                Some((last, commits)) if *last == unit => *commits += 1,
+                _ => writers.push((unit, 1)),
+            }
+        }
+    }
+    if order.is_empty() {
+        return None;
+    }
+    let mut elements: Vec<ElementFragments> = Vec::with_capacity(order.len());
+    for (name, writers) in order {
+        // The introduction: the first unit on the library's unit order whose
+        // row for the name is not an `augment` face — it commits the name
+        // more often than it writes `augment` heads of it.
+        let intro = units.iter().copied().find(|unit| {
+            let Some(unit_elements) = index.get(*unit) else {
+                return false;
+            };
+            if unit_elements.container(name).is_none() {
+                return false;
+            }
+            let commits = unit_elements
+                .container_order()
+                .iter()
+                .filter(|other| **other == name)
+                .count();
+            let augmenting = writers
+                .iter()
+                .find(|(writer, _)| writer == unit)
+                .map_or(0, |(_, count)| *count);
+            commits > augmenting
+        });
+        let mut faces: Vec<(FileId, Container)> = Vec::new();
+        if let Some(intro) = intro
+            && let Some(base) = index.get(intro).and_then(|e| e.container(name)).cloned()
+        {
+            let mut owners: Vec<FileId> = vec![intro];
+            owners.extend(
+                writers
+                    .iter()
+                    .map(|(unit, _)| *unit)
+                    .filter(|unit| *unit != intro),
+            );
+            for &owner in &owners {
+                let Some(own) = index.get(owner).and_then(|e| e.container(name)) else {
+                    continue;
+                };
+                // The owner's own rows keep their own pool; every other
+                // fragment contributes its portable rows only. `NameMap`'s
+                // from-iterator keeps the FIRST row of a duplicate spelling,
+                // so the owner's own declaration wins over a fragment's.
+                let mut rows: Vec<(StringId, MemberEntry)> = own.members.iter().cloned().collect();
+                for &other in &owners {
+                    if other == owner {
+                        continue;
+                    }
+                    let Some(face) = index.get(other).and_then(|e| e.container(name)) else {
+                        continue;
+                    };
+                    rows.extend(
+                        face.members
+                            .iter()
+                            .filter(|(_, entry)| entry_is_portable(entry))
+                            .map(|(member, entry)| (*member, entry.clone())),
+                    );
+                }
+                faces.push((
+                    owner,
+                    Container {
+                        members: rows.into_iter().collect(),
+                        ..base.clone()
+                    },
+                ));
+            }
+            faces.sort_by_key(|(file, _)| *file);
+        }
+        elements.push(ElementFragments {
+            name,
+            intro,
+            fragments: writers
+                .into_iter()
+                .map(|(unit, _)| unit)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            faces: faces.into_boxed_slice(),
+        });
+    }
+    elements.sort_by_key(|element| element.name);
+    Some(elements.into_boxed_slice())
+}
+
+/// Whether `ty` reads identically through every unit's argument pool: the
+/// reserved empty slots are pool-independent, so a value carrying no other
+/// slot can cross a unit boundary without re-interning.
+fn ty_is_pool_free(ty: Ty) -> bool {
+    match ty {
+        Ty::Named { args, .. } => args == ArgListId::EMPTY,
+        Ty::Record { shape, .. } => shape == RecordShapeId::EMPTY,
+        Ty::Function { shape, .. } => shape == FnShapeId::EMPTY,
+        _ => true,
+    }
+}
+
+/// Whether `entry` crosses a unit boundary intact — every declared type it
+/// carries is pool-free (see [`ty_is_pool_free`]). Names, spans, flags, and
+/// the interned default/annotation texts ride the shared string table, so
+/// they never block a merge.
+fn entry_is_portable(entry: &MemberEntry) -> bool {
+    ty_is_pool_free(entry.var_ty)
+        && ty_is_pool_free(entry.return_ty)
+        && entry
+            .type_param_bounds
+            .iter()
+            .copied()
+            .all(ty_is_pool_free)
+        && entry.formals.as_ref().is_none_or(|formals| {
+            formals
+                .positional
+                .iter()
+                .chain(formals.named.iter())
+                .all(|formal| ty_is_pool_free(formal.ty))
+        })
 }
 
 /// The kind tag of a name in a library face: a known [`MicroKind`], or
@@ -293,6 +601,13 @@ pub(crate) fn owner_library(
 /// library namespace. Returns the container and the file that owns it (for
 /// the superclass walk's next hop).
 ///
+/// An augmented container answers its merged fragment face on both arms
+/// (#3418): the element's members are the introduction's plus every
+/// fragment's, so a lookup written in any unit of the library — the
+/// introduction's or an `augment` head's — sees the same set
+/// ([`ElementFragments`], which also states the cross-pool gate the merge
+/// obeys).
+///
 /// Crate-visible so the diagnostic engine's member walk can tell a cleanly
 /// walked chain (member genuinely absent) from a broken one (a superclass
 /// name that resolves to nothing — suppression territory, never a report).
@@ -304,14 +619,11 @@ pub(crate) fn resolve_container<'a>(
     file: FileId,
     name: StringId,
 ) -> Option<(&'a Container, FileId)> {
-    if let Some(container) = index.get(file).and_then(|f| f.container(name)) {
-        return Some((container, file));
+    if let Some(face) = index.element_face(graph, lib, file, name) {
+        return Some(face);
     }
     match namespaces.lookup_in_file(graph, lib, Some(file), name) {
-        Lookup::Found(NamespaceEntry::Decl(owner)) => {
-            let container = index.get(owner).and_then(|f| f.container(name))?;
-            Some((container, owner))
-        }
+        Lookup::Found(NamespaceEntry::Decl(owner)) => index.element_face(graph, lib, owner, name),
         _ => None,
     }
 }
@@ -363,10 +675,7 @@ pub(crate) fn prefixed_container<'a>(
     name: StringId,
 ) -> Option<(&'a Container, FileId)> {
     match namespaces.lookup_prefixed(graph, lib, prefix, name) {
-        Lookup::Found(NamespaceEntry::Decl(owner)) => {
-            let container = index.get(owner).and_then(|f| f.container(name))?;
-            Some((container, owner))
-        }
+        Lookup::Found(NamespaceEntry::Decl(owner)) => index.element_face(graph, lib, owner, name),
         _ => None,
     }
 }

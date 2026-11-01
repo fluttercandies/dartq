@@ -19895,3 +19895,15 @@ mod ticket_3420_tests;
 #[cfg(test)]
 #[path = "ticket_3390_tests.rs"]
 mod ticket_3390_tests;
+
+// The #3418 pins (an augmented element's member face is the union of its
+// fragments'): `resolve_container` answers the merged face from either
+// anchor, so a member written in the introducing unit resolves inside an
+// `augment` body and vice versa, a member declared in neither still
+// reports, and the merge is independent of the library's unit order.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3418_tests.rs"]
+mod ticket_3418_tests;

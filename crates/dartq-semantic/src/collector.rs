@@ -2127,6 +2127,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // `constructors`.
             let has_unnamed_constructor =
                 open.ctor_has_unnamed || (open.ctor_named.is_empty() && open.ctor_declared == 0);
+            // Keep-first: the element's own row is the FIRST declaration's
+            // face, so a later `augment` head of the same name never
+            // displaces it — and the row it wrote for itself is the
+            // fragment face the library-wide merge reads
+            // (`library::ElementFragments`). An `augment` closing onto a
+            // row another declaration already claimed contributes nothing
+            // here: its members live only on its own (dropped) face, the
+            // same-unit residual the merge cannot reach without a
+            // per-fragment column on the model.
             self.named_containers.or_insert_with(name, || Container {
                 kind: open.kind,
                 is_abstract: open.is_abstract,
