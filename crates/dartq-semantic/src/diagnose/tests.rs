@@ -19881,3 +19881,17 @@ mod ticket_3420_tests;
 // resolves `p.dynamic`. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
+
+// The #3390 pins (the `??=` staged flush's non-local target arm): a pair
+// the local promotion table missed re-decides through the target row's
+// declared read face — upstream's `readType` answers a member target with
+// the getter/field's DECLARED return, promotion-free (`setReadElement`,
+// resolver.dart:1754-1792; `visitAssignmentExpression` feeds it to
+// `_checkForDeadNullCoalesce`, error_verifier.dart:444-449), so the
+// member/`this`/`super` shapes anchor the dead value the same face the
+// locals anchor through their promotion rows. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3390_tests.rs"]
+mod ticket_3390_tests;
