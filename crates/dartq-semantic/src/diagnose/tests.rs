@@ -19907,3 +19907,15 @@ mod ticket_3390_tests;
 #[cfg(test)]
 #[path = "ticket_3418_tests.rs"]
 mod ticket_3418_tests;
+
+// The #3417 pins (cluster C4/C7): the `Type` instance's member face is the
+// `Object` face plus every APPLICABLE extension of the import closure, a
+// cascade section's target is only the literal when it is written bare
+// (`C..foo()`), an interface-typed alias head resolves the ALIASED class's
+// statics, and a prefix whose own edge exports the built-in top type
+// resolves `p.dynamic`. Registered here via `#[path]`; the module stays
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3417_tests.rs"]
+mod ticket_3417_tests;

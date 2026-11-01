@@ -2186,12 +2186,13 @@ impl<'a> Engine<'a> {
                 {
                     let (read, write) = self.operator_spellings(row);
                     for spelling in [read, write].into_iter().flatten() {
-                        if spelling == self.intern("==")
-                            || self
-                                .index
-                                .get(self.file)
-                                .is_some_and(|f| f.has_extension_member(spelling))
-                        {
+                        // The `Type` instance's operator face: the `Object`
+                        // members plus the extensions of the whole import
+                        // closure ([`Self::type_literal_face_resolves`]).
+                        // Probing the diagnosing unit's own faces alone
+                        // reported `undefined_operator` for a literal whose
+                        // operator an IMPORTED extension declares.
+                        if self.type_literal_face_resolves(spelling) {
                             continue;
                         }
                         let op_text = self.strings.resolve(spelling).to_string();
@@ -2521,12 +2522,10 @@ impl<'a> Engine<'a> {
                         {
                             let (read, write) = self.operator_spellings(row);
                             for spelling in [read, write].into_iter().flatten() {
-                                if spelling == self.intern("==")
-                                    || self
-                                        .index
-                                        .get(self.file)
-                                        .is_some_and(|f| f.has_extension_member(spelling))
-                                {
+                                // The `Type` instance's operator face, over
+                                // the whole import closure's extensions —
+                                // [`Self::type_literal_face_resolves`].
+                                if self.type_literal_face_resolves(spelling) {
                                     continue;
                                 }
                                 let op_text = self.strings.resolve(spelling).to_string();
@@ -3217,6 +3216,15 @@ impl<'a> Engine<'a> {
                 self.record_miss(row.name, row.range, false, NameUse::Read);
             }
             TypeVerdict::Prefixed { prefix, local } => {
+                // `p.dynamic` — a prefix whose own import edge exports the
+                // builtin (`import 'dart:core' as core show dynamic;`):
+                // upstream resolves the builtin top type through the
+                // prefix's core namespace ([`Self::prefix_exports_dynamic`]),
+                // and the export scope never carries the synthetic element,
+                // so the push-time verdict reads a prefixed miss. Reporting
+                // here named a class that does not exist.
+                let builtin_top = row.name == self.intern("dynamic")
+                    && self.prefix_exports_dynamic(prefix);
                 // The local-prefix face: a prefix head that names a local
                 // or parameter element is not an import prefix — the
                 // oracle's prefixed lookup fails on the head and asks no
@@ -3228,6 +3236,7 @@ impl<'a> Engine<'a> {
                 // silent too — the official clause-parent guard defers
                 // the face.
                 if !local
+                    && !builtin_top
                     && !self.guard.ignore(Some(prefix), row.name)
                     && !Self::take_extension_clause_miss(
                         &mut self.extension_clause_miss,
@@ -4899,30 +4908,41 @@ impl<'a> Engine<'a> {
                 // stays silent. The static-container face never runs for a
                 // section.
                 if self.cascade_sections.contains(&row.range.offset) {
-                    if !self.members.object_members.contains(&row.name)
-                        && row.name != self.intern("==")
-                    {
-                        let name_text = self.strings.resolve(row.name);
-                        match row.intent {
-                            Intent::Invoke => self.emit(
-                                SemanticCode::UndefinedMethod,
-                                row.range,
-                                name_text,
-                                "Type",
-                            ),
-                            Intent::Read => self.emit(
-                                SemanticCode::UndefinedGetter,
-                                row.range,
-                                name_text,
-                                "Type",
-                            ),
-                            Intent::Write | Intent::ReadWrite => self.emit(
-                                SemanticCode::UndefinedSetter,
-                                row.range,
-                                name_text,
-                                "Type",
-                            ),
-                            Intent::Operator(..) => {}
+                    // Only a bare type-literal target (`C..foo()`) carries
+                    // the `Type` instance as its VALUE. A member or send
+                    // target (`C.new..foo()`, `Future.value(x)..foo()`,
+                    // `C.staticField..foo()`) denotes THAT expression's
+                    // value, which the row model cannot spell here — the
+                    // verdict stays silent ([`Self::cascade_target_is_bare_type_literal`]).
+                    if self.cascade_target_is_bare_type_literal(row.range) {
+                        let spelling = if matches!(row.intent, Intent::Write | Intent::ReadWrite) {
+                            self.setter_spelling(row.name)
+                        } else {
+                            row.name
+                        };
+                        if !self.type_literal_face_resolves(spelling) {
+                            let name_text = self.strings.resolve(row.name);
+                            match row.intent {
+                                Intent::Invoke => self.emit(
+                                    SemanticCode::UndefinedMethod,
+                                    row.range,
+                                    name_text,
+                                    "Type",
+                                ),
+                                Intent::Read => self.emit(
+                                    SemanticCode::UndefinedGetter,
+                                    row.range,
+                                    name_text,
+                                    "Type",
+                                ),
+                                Intent::Write | Intent::ReadWrite => self.emit(
+                                    SemanticCode::UndefinedSetter,
+                                    row.range,
+                                    name_text,
+                                    "Type",
+                                ),
+                                Intent::Operator(..) => {}
+                            }
                         }
                     }
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
@@ -5297,6 +5317,136 @@ impl<'a> Engine<'a> {
             })
     }
 
+    /// The `Type` instance's member face: `Object`'s members plus every
+    /// member an ACCESSIBLE extension declares on a top-shaped `on` type.
+    ///
+    /// A type-literal receiver's static type IS `Type` (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/ast/ast.dart
+    /// `TypeLiteral.staticType`), and the oracle resolves the member with
+    /// the ordinary property/invocation machinery — `Type`'s own interface
+    /// first, then every applicable extension of the whole import closure
+    /// (`extension_member_resolver.dart` `_getApplicable`). Reading
+    /// `Object`'s members alone reported `undefined_*` naming `Type` for
+    /// accesses an IMPORTED `extension E on Object?` resolves (the
+    /// `syntax_helper.dart` `expectStaticType` family), and for operators
+    /// the same gap reported `undefined_operator`.
+    ///
+    /// Only a face whose `on` head the `Type` receiver reaches suppresses:
+    /// `Object`/`Object?`, `dynamic`, `Type` itself, and an unbounded own
+    /// parameter (`on T`). A concrete `on` type declares the member for ITS
+    /// receivers and leaves the literal's miss standing.
+    fn type_literal_face_resolves(&mut self, member: StringId) -> bool {
+        if member == self.intern("==") || self.members.object_members.contains(&member) {
+            return true;
+        }
+        self.accessible_extension_faces();
+        let boundary = &self.boundary;
+        let object = self.intern("Object");
+        let type_head = self.intern("Type");
+        let applies = self
+            .accessible_extensions
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|(face, face_file)| {
+                // A `static` extension member never answers an instance
+                // access (`extension_member_resolver` instantiates the
+                // extension and looks the member up in the instance face).
+                if !face
+                    .members
+                    .get(&member)
+                    .is_some_and(|entry| !entry.is_static)
+                {
+                    return false;
+                }
+                match boundary.ty(*face_file, face.on_ty) {
+                    // `on dynamic`/`on O` with an unmodelled `O`: the
+                    // under-report direction.
+                    Ty::Dynamic | Ty::Unknown => true,
+                    Ty::Named { name, .. } => {
+                        name == object
+                            || name == type_head
+                            || face
+                                .type_param_names
+                                .iter()
+                                .position(|&param| param == name)
+                                .is_some_and(|index| {
+                                    matches!(
+                                        face.type_param_bounds.get(index).copied(),
+                                        None | Some(Ty::Dynamic) | Some(Ty::Unknown)
+                                    )
+                                })
+                    }
+                    _ => true,
+                }
+            });
+        // The application probe leaves its reference latch behind
+        // ([`Engine::extension_application`]'s contract); this face answers
+        // only whether the member resolves, so the latch must not leak to
+        // the next real application.
+        self.members.ext_ref.set(None);
+        applies
+    }
+
+    /// The interface a type alias names (`typedef A = C;` → `C`) when the
+    /// right-hand side is a NAMED type this compilation grounds.
+    ///
+    /// Upstream resolves an interface-typed alias head exactly like the
+    /// class it names — `_resolveTargetInterfaceElement`
+    /// (pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:
+    /// 507-517) and `_resolveReceiverTypeLiteral`
+    /// (method_invocation_resolver.dart:168-179) both hand the ALIASED
+    /// element to the static face — so such a head is never the `Type`
+    /// literal. A function/record right-hand side has no interface and
+    /// keeps the literal face; a named one this pass cannot ground (a
+    /// foreign alias whose private target is not in the diagnosing scope)
+    /// answers `None` and keeps the under-report.
+    fn alias_interface_head(&self, alias: StringId) -> Option<(&'a Container, FileId, StringId)> {
+        let (_, tree) = self.bounds.alias_named_shape(alias)?;
+        let head = tree.head;
+        let (container, owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        )?;
+        Some((container, owner, head))
+    }
+
+    /// Whether a cascade section's target is the BARE type literal itself —
+    /// the only target shape whose value is the `Type` instance.
+    ///
+    /// `C..foo()` writes `C`, `..`, `foo`: the target's last token is an
+    /// identifier with no member continuation before it. `C.new..foo()`,
+    /// `C.staticField..foo()`, and `Future.value(x)..foo()` all continue
+    /// past a `.` (or end in `)`/`]`), so the section's receiver is THAT
+    /// expression's value, never the literal — the Type-instance verdict
+    /// does not apply (`Future.value(C())..expectStaticType(…)` resolves
+    /// the extension member on the `Future` instance).
+    fn cascade_target_is_bare_type_literal(&self, selector: SourceRange) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < selector.offset);
+        // `tokens[at - 1]` is the section's `..`, `tokens[at - 2]` the
+        // target's last token (comments are trivia, never tokens).
+        if at < 2
+            || !matches!(
+                tokens[at - 1].kind,
+                dartq_scanner::TokenKind::PeriodPeriod
+                    | dartq_scanner::TokenKind::QuestionPeriodPeriod
+            )
+            || tokens[at - 2].kind != dartq_scanner::TokenKind::Identifier
+        {
+            return false;
+        }
+        !(at >= 3
+            && matches!(
+                tokens[at - 3].kind,
+                dartq_scanner::TokenKind::Period | dartq_scanner::TokenKind::QuestionPeriod
+            ))
+    }
+
     /// The type-literal receiver face: a receiver head that spells a TYPE —
     /// the `dynamic` keyword, `Never`, or an ungrounded type alias (a
     /// function or record target; upstream Dart SDK source,
@@ -5330,10 +5480,24 @@ impl<'a> Engine<'a> {
             self.top_level_decl(head).as_deref(),
             Some(decl) if decl.kind == MicroKind::TypeAlias
         );
+        if is_alias && let Some((container, owner, target)) = self.alias_interface_head(head) {
+            // An interface-typed alias head denotes the class it aliases,
+            // never the `Type` instance ([`Self::alias_interface_head`]):
+            // the aliased container's STATIC face owns the verdict, so
+            // `A.sm()` resolves `C`'s statics and a clean miss names `C`.
+            let kind = container.kind;
+            self.container_member_verdict(row, container, owner, target, kind);
+            return true;
+        }
         if !(is_alias || text == "dynamic" || text == "Never") {
             return false;
         }
-        if !self.members.object_members.contains(&row.name) && row.name != self.intern("==") {
+        let spelling = if matches!(row.intent, Intent::Write | Intent::ReadWrite) {
+            self.setter_spelling(row.name)
+        } else {
+            row.name
+        };
+        if !self.type_literal_face_resolves(spelling) {
             let name_text = self.strings.resolve(row.name);
             match row.intent {
                 // The alias invoke (`Cb.bar()`) is the invocation walk's
@@ -5391,7 +5555,7 @@ impl<'a> Engine<'a> {
         if !self.receiver_closes_type_arguments(row.range) {
             return false;
         }
-        if !self.members.object_members.contains(&row.name) && row.name != self.intern("==") {
+        if !self.type_literal_face_resolves(row.name) {
             let name_text = self.strings.resolve(row.name);
             self.emit(SemanticCode::UndefinedMethod, row.range, name_text, "Type");
         }
