@@ -513,11 +513,37 @@ pub(crate) fn in_const_context(c: &Check<'_>) -> bool {
                 return variables_decl_is_const(c, ancestor, member);
             }
             NodeKind::ConstExpression
-            | NodeKind::ConstLiteral
             | NodeKind::ListLiteral
             | NodeKind::SetOrMapLiteral
             | NodeKind::RecordLiteral => {
                 if const_keyword(c, ancestor).is_some() {
+                    return true;
+                }
+            }
+            // `const […]` tiles as a keyword-less shell over the literal row
+            // that carries the `ConstKeyword` payload (`parseConstExpression`
+            // opens the shell after consuming the keyword, so the shell's
+            // window starts at the bracket). The shell is the same official
+            // `TypedLiteral` node as its literal child: reached from that
+            // child it is transparent (`includeSelf: false` — the child's own
+            // arm answers for the node), reached from an inner element it
+            // answers through the child's payload.
+            NodeKind::ConstLiteral => {
+                let from = c.path.get(i + 1).copied();
+                let literal = {
+                    let kids = c.direct_children(ancestor);
+                    kids.iter().copied().find(|&row| {
+                        matches!(
+                            c.kind(row),
+                            NodeKind::ListLiteral
+                                | NodeKind::SetOrMapLiteral
+                                | NodeKind::RecordLiteral
+                        )
+                    })
+                };
+                if literal.is_some_and(|row| Some(row) == from) {
+                    // Same official node — keep walking.
+                } else if literal.is_some_and(|row| const_keyword(c, row).is_some()) {
                     return true;
                 }
             }
@@ -582,15 +608,14 @@ pub(crate) fn in_const_context(c: &Check<'_>) -> bool {
 }
 
 /// The explicit `const` keyword of a const-carrying expression node, or
-/// `None`. Const expressions/carry literals keep the keyword as a payload
-/// word (`LiteralListHandle`/`RecordLiteralEnd`/
-/// `LiteralSetOrMapHandle`/`ConstExpressionEnd` payloads); the keyword-less forms
-/// are transparent.
+/// `None`. Const expressions keep the keyword as the span head
+/// (`ConstExpressionEnd` payload); collection/record literals carry it in
+/// the `ConstKeyword` payload word. The keyword-less forms are transparent
+/// — including the `ConstLiteral` shell, whose window starts at the bracket
+/// and whose keyword lives on its literal child (the walk reads it there).
 pub(crate) fn const_keyword(c: &Check<'_>, node: u32) -> Option<u32> {
     match c.kind(node) {
-        NodeKind::ConstExpression | NodeKind::ConstLiteral => {
-            head_is_const(c, node).then(|| c.head_token(node))
-        }
+        NodeKind::ConstExpression => head_is_const(c, node).then(|| c.head_token(node)),
         NodeKind::ListLiteral | NodeKind::SetOrMapLiteral | NodeKind::RecordLiteral => {
             let keyword = c.field(node, PayloadField::ConstKeyword)?;
             (keyword != NONE_TOKEN).then_some(keyword)
