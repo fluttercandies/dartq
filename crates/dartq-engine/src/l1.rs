@@ -2003,6 +2003,90 @@ fn is_directive_head(kind: TokenKind) -> bool {
     )
 }
 
+/// `looksLikeStartOfNextTopLevelDeclaration` (`_fe_analyzer_shared`
+/// `identifier_context_impl.dart:1649`): the heads a name-position slot
+/// refuses as a name when the follower does not continue the slot's grammar
+/// (EOF counts as a follower below). Most of them — `import`, `export`,
+/// `part`, `library`, `typedef`, `extension`, `mixin`, `get`, `set`,
+/// `const`, `final`, `var`, `void` — are BUILT-IN identifiers, which is
+/// exactly why `is_name_token` alone cannot tell a name from the next
+/// directive's head: upstream `ensureIdentifier` splices a synthetic name in
+/// front of such a head (:130-155) and leaves the head for the next
+/// top-level parse, so the head's own directive keeps its whole face.
+fn is_top_level_declaration_head(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Keyword(
+            Keyword::Class
+                | Keyword::Const
+                | Keyword::Enum
+                | Keyword::Export
+                | Keyword::Extension
+                | Keyword::Final
+                | Keyword::Get
+                | Keyword::Import
+                | Keyword::Library
+                | Keyword::Mixin
+                | Keyword::Part
+                | Keyword::Set
+                | Keyword::Typedef
+                | Keyword::Var
+                | Keyword::Void
+        )
+    )
+}
+
+/// `show`/`hide` name list (`CombinatorIdentifierContext`,
+/// `identifier_context_impl.dart:953-957`) — one of the per-context
+/// `_isOneOfFollowingValues` keep-sets [`refuses_name`] gates names with.
+const COMBINATOR_NAME_FOLLOWERS: &[TokenKind] = &[
+    TokenKind::Semicolon,
+    TokenKind::Comma,
+    TokenKind::Keyword(Keyword::If),
+    TokenKind::Keyword(Keyword::As),
+    TokenKind::Keyword(Keyword::Show),
+    TokenKind::Keyword(Keyword::Hide),
+    TokenKind::Eof,
+];
+
+/// `as` prefix slot (`ImportPrefixDeclarationIdentifierContext`, :706-716).
+const PREFIX_NAME_FOLLOWERS: &[TokenKind] = &[
+    TokenKind::Semicolon,
+    TokenKind::Keyword(Keyword::If),
+    TokenKind::Keyword(Keyword::Show),
+    TokenKind::Keyword(Keyword::Hide),
+    TokenKind::Keyword(Keyword::Deferred),
+    TokenKind::Keyword(Keyword::As),
+    TokenKind::Eof,
+];
+
+/// `library`/`part of` qualified name (`LibraryIdentifierContext`, :947-951;
+/// the `.` continuation shares the set).
+const QUALIFIED_NAME_FOLLOWERS: &[TokenKind] =
+    &[TokenKind::Period, TokenKind::Semicolon, TokenKind::Eof];
+
+/// Conditional-uri dotted name (`DottedNameIdentifierContext`, :236-241).
+const DOTTED_NAME_FOLLOWERS: &[TokenKind] = &[
+    TokenKind::Period,
+    TokenKind::EqEq,
+    TokenKind::CloseParen,
+    TokenKind::Eof,
+];
+
+/// Whether the token at `i` must NOT be taken as the name of the slot whose
+/// keep-set is `followers`: a top-level-declaration head whose follower
+/// leaves the slot. `None` (end of stream) is the EOF member of every
+/// keep-set.
+fn refuses_name(tokens: &TokenTable, i: usize, followers: &[TokenKind]) -> bool {
+    if !kind_at(tokens, i).is_some_and(is_top_level_declaration_head) {
+        return false;
+    }
+    match kind_at(tokens, i + 1) {
+        Some(follower) => !followers.contains(&follower),
+        None => false,
+    }
+}
+
 /// Skips `@qualifiedName[(args)]` starting after the `@`.
 fn skip_annotation(tokens: &TokenTable, mut i: usize) -> usize {
     // The name head may itself be a built-in identifier (`@import`), and a
@@ -2048,11 +2132,13 @@ fn skip_annotation(tokens: &TokenTable, mut i: usize) -> usize {
 /// post-name position is therefore never part of this name —
 /// `library lib1 library lib2` is two `library` directives, and the second
 /// head must be handed back untouched so the caller's dispatch walks it
-/// instead of the first name swallowing it. A directive head in name
-/// position (the head, or right after a `.`) is still a legal name:
-/// `library` is a built-in identifier, so `library library;` names the
-/// library `library` (`parseQualified`'s `ensureIdentifier` takes built-in
-/// identifiers silently — token.dart:794 `isIdentifier`).
+/// instead of the first name swallowing it. A declaration head in name
+/// position (the head, or right after a `.`) is a legal name only when the
+/// follower is `.`/`;`/EOF — `library library;` names the library `library`
+/// (`parseQualified`'s `ensureIdentifier` takes built-in identifiers, and
+/// `LibraryIdentifierContext`'s keep-set holds the head there), while
+/// `library import 'a.dart';` splices a synthetic name and hands the head
+/// back (:947-1000).
 fn walk_dotted_name(text: &str, tokens: &TokenTable, mut i: usize) -> (Option<Box<str>>, usize) {
     let mut name = String::new();
     let mut in_name_position = true;
@@ -2060,6 +2146,16 @@ fn walk_dotted_name(text: &str, tokens: &TokenTable, mut i: usize) -> (Option<Bo
         match kind_at(tokens, i) {
             Some(TokenKind::Semicolon) | None => return (Some(name.into_boxed_str()), i + 1),
             Some(kind) if in_name_position && is_name_token(kind) => {
+                // A declaration head is a name only when its follower
+                // continues the name slot (`.` `;` EOF): upstream
+                // `LibraryIdentifierContext.ensureIdentifier` splices a
+                // synthetic name in front of every other head and leaves it
+                // for the next top-level parse, so `library import 'a.dart';`
+                // names nothing and hands the import back — and
+                // `library library;` still names the library `library`.
+                if refuses_name(tokens, i, QUALIFIED_NAME_FOLLOWERS) {
+                    return (Some(name.into_boxed_str()), i);
+                }
                 if !name.is_empty() {
                     name.push('.');
                 }
@@ -2162,6 +2258,16 @@ fn walk_import_export(
                 i += 1;
             }
             Some(TokenKind::Keyword(Keyword::As)) => {
+                // `ImportPrefixDeclarationIdentifierContext` (:706-716): the
+                // prefix slot takes an identifier-ish token, but a
+                // declaration head whose follower does not keep it there
+                // starts the NEXT top-level construct — upstream splices a
+                // synthetic prefix AND the directive's `;`, so `import
+                // 'a.dart' as class A {}` / `as import 'b.dart';` end this
+                // directive prefix-less at `as` and hand the head back.
+                if refuses_name(tokens, i + 1, PREFIX_NAME_FOLLOWERS) {
+                    break;
+                }
                 if let Some(next) = kind_at(tokens, i + 1)
                     && (is_name_token(next) || matches!(next, TokenKind::Keyword(_)))
                 {
@@ -2189,16 +2295,27 @@ fn walk_import_export(
                 // clause keyword or a comma, so the post-name position never
                 // takes another bare name: `export 'x' show y export 'a.dart';`
                 // ends the first directive at `export`. A built-in identifier
-                // IN name position is a name (`show export;` is a shown name,
-                // `ensureIdentifier` takes it silently), which keeps the
-                // directive-head boundary below from mistaking it for the next
-                // directive's head.
+                // IN name position is a name only when the keep-set holds it
+                // there (`show export;` — follower `;` — is a shown name),
+                // which keeps the directive-head boundary below from
+                // mistaking it for the next directive's head.
                 let mut expect_name = true;
                 while let Some(next) = kind_at(tokens, i) {
                     if next == TokenKind::Comma {
                         expect_name = true;
                         i += 1;
                     } else if expect_name && is_name_token(next) {
+                        // `CombinatorIdentifierContext.ensureIdentifier`
+                        // (:130-165): a declaration head the keep-set does
+                        // not hold in the name slot (follower not in `;` `,`
+                        // `if` `as` `show` `hide` EOF) starts the next
+                        // top-level construct — `import 'a.dart' show import
+                        // 'b.dart';` ends this directive after `show` (the
+                        // clause keeps its empty name list) and hands the
+                        // head back so the second import keeps its face.
+                        if refuses_name(tokens, i, COMBINATOR_NAME_FOLLOWERS) {
+                            break;
+                        }
                         let lexeme = tokens.lexeme(text, i);
                         names.push(strings.intern(lexeme));
                         // The written token's span rides with it — the
@@ -2317,8 +2434,24 @@ fn walk_conditional_uri(
         // dottedName: identifier ('.' identifier)* — a trailing or leading
         // period (a synthetic official name) leaves the clause malformed.
         let mut expect_name = true;
+        // The first name-position token the keep-set refuses: the `)` the
+        // official splices in front of it (`ensureToken(CLOSE_PAREN)`,
+        // parser_impl.dart:1130-1145) ends the clause there.
+        let mut refused_head = None;
         while let Some(kind) = kind_at(tokens, j) {
             if expect_name && is_name_token(kind) {
+                // `DottedNameIdentifierContext.ensureIdentifier` (:236-266):
+                // an identifier-headed name takes a declaration head only
+                // when the follower is `.` `==` `)` or EOF; any other
+                // follower means the head starts the next top-level
+                // construct, so `import 'a.dart' if ( import 'b.dart';`
+                // reads no clause name and leaves `import` to the directive
+                // loop (the clause contributes nothing, the same
+                // under-report the group-shape check applies).
+                if refuses_name(tokens, j, DOTTED_NAME_FOLLOWERS) {
+                    refused_head = Some(j);
+                    break;
+                }
                 if !name.is_empty() {
                     name.push('.');
                 }
@@ -2333,23 +2466,33 @@ fn walk_conditional_uri(
             }
         }
         clean &= !expect_name;
-        // Optional `== value`: the same literal read as the candidate URI
-        // (adjacent segments concatenate; interpolation stays shapeless).
-        if kind_at(tokens, j) == Some(TokenKind::EqEq) {
-            j += 1;
-            let (read, _, value_next) = read_uri(text, tokens, j);
-            match read {
-                Some(decoded) => {
-                    value = Some(decoded);
-                    j = value_next;
+        if let Some(head) = refused_head {
+            // An interior stopping at a refused head is an UNTERMINATED
+            // group: upstream splices the `)` right there, so the clause
+            // ends and the head stays for the next top-level parse. The
+            // scanner instead pairs the unmatched `(` with an APPENDED
+            // synthetic closer past the file's real tokens, so `close + 1`
+            // would swallow every directive behind the clause.
+            i = head;
+        } else {
+            // Optional `== value`: the same literal read as the candidate URI
+            // (adjacent segments concatenate; interpolation stays shapeless).
+            if kind_at(tokens, j) == Some(TokenKind::EqEq) {
+                j += 1;
+                let (read, _, value_next) = read_uri(text, tokens, j);
+                match read {
+                    Some(decoded) => {
+                        value = Some(decoded);
+                        j = value_next;
+                    }
+                    None => clean = false,
                 }
-                None => clean = false,
             }
+            // Garbage between the condition and the real closer: the clause
+            // shape is broken (the official reports and jumps to the group end).
+            clean &= j == interior_end;
+            i = close.map_or(interior_end, |end| end + 1);
         }
-        // Garbage between the condition and the real closer: the clause
-        // shape is broken (the official reports and jumps to the group end).
-        clean &= j == interior_end;
-        i = close.map_or(interior_end, |end| end + 1);
     } else {
         // Missing `(`: the official's insertParens (:1102-1109) stands in an
         // EMPTY synthetic condition name — a clause that can never match a

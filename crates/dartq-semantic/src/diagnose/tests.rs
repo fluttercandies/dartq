@@ -18069,3 +18069,5 @@ mod ticket_3327_tests;
 mod ticket_3316_tests;
 #[path = "ticket_3293_tests.rs"]
 mod ticket_3293_tests;
+#[path = "ticket_3321_tests.rs"]
+mod ticket_3321_tests;

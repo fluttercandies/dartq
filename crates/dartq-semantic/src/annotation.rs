@@ -54,8 +54,10 @@
 //! target's uri must itself be `package:meta/…`, not merely transitively
 //! export it.
 
-use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, Namespaces};
-use dartq_source::{SourceRange, StringId, StringTable};
+use dartq_resolution::{
+    LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces,
+};
+use dartq_source::{FileId, SourceRange, StringId, StringTable};
 
 use crate::model::Annotation;
 
@@ -282,9 +284,16 @@ fn is_meta_library(graph: &LibraryGraph, target: LibraryId) -> bool {
 // reads the message argument. The name-level mirror answers the same
 // question from the declaring library's scope faces: dart:core rides every
 // library as the lowest-priority implicit import, so a BARE `deprecated` /
-// `Deprecated` spelling the declaring library can resolve to nothing else
-// (no local declaration, no explicit-import hit — either shadows it) IS the
-// dart:core tag; every other spelling stays untagged.
+// `Deprecated` spelling whose scope-chain resolution lands on dart:core — the
+// tag itself — or on nothing at all IS the tag; every other spelling stays
+// untagged.
+//
+// The two resolution outcomes are both live shapes, not alternatives: the
+// engine's graph registers every `dart:` library as a node (generated
+// name-only face, or the loaded SDK units) and wires the implicit import
+// edge into every live library, so a bare spelling resolves INTO dart:core;
+// a rig with no `dart:core` node resolves it to nothing. Testing only the
+// miss shape silently turns the whole face off on the engine graph.
 
 /// Whether `annotation`'s spelling is a bare dart:core deprecation tag
 /// (`deprecated` getter or `Deprecated` class) that resolves to dart:core
@@ -339,14 +348,45 @@ pub fn is_core_deprecated_spelling(
     }
     let id = strings.intern(spelling);
     // A local declaration shadows the implicit dart:core import (the
-    // annotation would resolve to it, never to the tag).
-    if !matches!(graph.local(lib, id), LocalLookup::Absent) {
+    // annotation would resolve to it, never to the tag). The setter-only
+    // face shadows too, and the namespace walk cannot tell that apart from
+    // a miss (`LocalLookup::Shadowed` folds to `Lookup::NotFound` there).
+    if matches!(graph.local(lib, id), LocalLookup::Shadowed) {
         return false;
     }
-    // So does an explicit-import hit (dart:core is the lowest-priority
-    // import; the unprefixed namespace carries explicit hits only —
-    // `dart:` targets resolve to no analysis-set library).
-    matches!(namespaces.lookup(graph, lib, id), Lookup::NotFound)
+    match namespaces.lookup(graph, lib, id) {
+        // The engine posture: the SDK's `dart:core` registers as a node
+        // (generated face or loaded units) and every live library carries
+        // the implicit import edge to it, so the tag resolves — through
+        // that edge or an explicit `import 'dart:core'` — to dart:core's
+        // own `deprecated` getter / `Deprecated` class. A hit in any other
+        // library is a same-spelled declaration, not the tag.
+        Lookup::Found(NamespaceEntry::Decl(file)) => is_dart_core_file(graph, file),
+        Lookup::Found(NamespaceEntry::Prefix) | Lookup::Ambiguous(_) => false,
+        // Nothing in scope resolves the name. On a graph that carries
+        // `dart:core` that is a real miss — a `show`/`hide` (or an explicit
+        // `dart:core` import) filtered the tag out of the implicit edge, and
+        // an annotation that resolves to no element is no tag. On a graph
+        // with no `dart:core` node at all the implicit import is simply not
+        // modelled (the rig posture), so the spelling IS the tag.
+        Lookup::NotFound => !has_dart_core(graph),
+    }
+}
+
+/// Whether `file` belongs to the SDK's `dart:core` library. A file with no
+/// library row is not `dart:core`: the tag arm needs the declaring library's
+/// identity.
+fn is_dart_core_file(graph: &LibraryGraph, file: FileId) -> bool {
+    graph
+        .library_of_file(file)
+        .is_some_and(|target| graph.uri(target) == "dart:core")
+}
+
+/// Whether the graph carries a `dart:core` node — the engine registers one
+/// per `dart:` library, a hand-built rig usually registers none. Cold path:
+/// only a name that resolves nowhere asks.
+fn has_dart_core(graph: &LibraryGraph) -> bool {
+    graph.libraries().any(|lib| graph.uri(lib) == "dart:core")
 }
 
 /// The message face of a `@Deprecated` annotation: the cooked string of the
@@ -1046,6 +1086,250 @@ mod tests {
                 value: rig.strings.intern("p"),
                 span: SPAN,
             })
+        );
+    }
+
+    // —— the dart:core deprecation tag on the ENGINE graph (#3321) ——————
+
+    /// The engine's graph posture, which [`Rig`] does not model: a
+    /// `dart:core` node carrying its public face, plus the implicit import
+    /// edge every live library gets. A bare `@deprecated` therefore
+    /// RESOLVES into dart:core instead of missing the namespace — the shape
+    /// the tag test only ever saw as a miss, which silenced the whole
+    /// `deprecated_member_use` face on the engine graph.
+    struct CoreRig {
+        strings: StringTable,
+        graph: LibraryGraph,
+        namespaces: Namespaces,
+        lib: LibraryId,
+    }
+
+    impl CoreRig {
+        /// `core`: the `dart:core` node's declared face (`None` builds the
+        /// rig posture with no core node at all). `locals`: the analyzed
+        /// library's own top-level declarations. `declared`: extra libraries
+        /// `(uri, names)` the imports can reach. `imports`: explicit edges,
+        /// appended after the implicit core one when `core` is `Some` and
+        /// `suppress_implicit_core` is false — the engine drops the implicit
+        /// edge for a library that writes its own `dart:core` import.
+        fn build(
+            core: Option<&[&'static str]>,
+            locals: &[&'static str],
+            declared: &[(&'static str, &'static [&'static str])],
+            imports: &[Import],
+            suppress_implicit_core: bool,
+        ) -> Self {
+            let mut strings = StringTable::new();
+            let mut files = FileTable::new();
+            // Pre-intern every spelling while `strings` is still ours alone
+            // (the builder holds a shared borrow through `finish`).
+            let face: Vec<StringId> = core
+                .unwrap_or_default()
+                .iter()
+                .map(|n| strings.intern(n))
+                .collect();
+            let locals: Vec<StringId> = locals.iter().map(|n| strings.intern(n)).collect();
+            let declared: Vec<(StringId, Vec<StringId>)> = declared
+                .iter()
+                .map(|(uri, names)| {
+                    (
+                        strings.intern(uri),
+                        names.iter().map(|n| strings.intern(n)).collect(),
+                    )
+                })
+                .collect();
+            let edges: Vec<(&'static str, Option<StringId>, Combinators)> = imports
+                .iter()
+                .map(|import| {
+                    (
+                        import.uri,
+                        import.prefix.map(|p| strings.intern(p)),
+                        import.combinators(&mut strings),
+                    )
+                })
+                .collect();
+            let mut builder = LibraryGraphBuilder::new(&strings);
+            let core_node = core.map(|_| builder.intern("dart:core"));
+            if let Some(node) = core_node {
+                // The engine registers the SDK node's names-only face file as
+                // a unit: that `file -> library` row is what the tag arm's
+                // dart:core identity test reads.
+                let file = files.intern(Path::new("<dart:core>"));
+                builder.face_unit(node, file);
+                for name in face {
+                    builder.declare(node, name, file);
+                }
+            }
+            let lib = builder.intern("package:app/app.dart");
+            let app_file = files.intern(Path::new("lib/app.dart"));
+            for local in locals {
+                builder.declare(lib, local, app_file);
+            }
+            for (uri, names) in declared {
+                let uri_text = strings.resolve(uri);
+                let node = builder.intern(uri_text);
+                let file = files.intern(Path::new(uri_text));
+                for name in names {
+                    builder.declare(node, name, file);
+                }
+            }
+            if let Some(core) = core_node {
+                if !suppress_implicit_core {
+                    builder.import(
+                        lib,
+                        ImportEdge {
+                            target: Some(core),
+                            prefix: None,
+                            deferred: false,
+                            combinators: Combinators::unfiltered(),
+                        },
+                    );
+                }
+            }
+            for (uri, prefix, combinators) in edges {
+                let target = builder.intern(uri);
+                builder.import(
+                    lib,
+                    ImportEdge {
+                        target: Some(target),
+                        prefix,
+                        deferred: false,
+                        combinators,
+                    },
+                );
+            }
+            let graph = builder.finish();
+            let namespaces = Namespaces::build(&graph);
+            Self {
+                strings,
+                graph,
+                namespaces,
+                lib,
+            }
+        }
+
+        fn tag(&self, spelling: &str) -> bool {
+            is_core_deprecated_spelling(
+                spelling,
+                &self.strings,
+                &self.graph,
+                &self.namespaces,
+                self.lib,
+            )
+        }
+    }
+
+    /// The engine graph resolves a bare `@deprecated` / `@Deprecated` INTO
+    /// dart:core through the implicit import edge — the arm that used to be
+    /// unreachable (`Lookup::NotFound` only), leaving every
+    /// `deprecated_member_use` row unemitted.
+    #[test]
+    fn bare_deprecation_tag_resolves_into_the_core_node() {
+        let rig = CoreRig::build(Some(&["deprecated", "Deprecated"]), &[], &[], &[], false);
+        assert!(rig.tag("deprecated"), "const tag through the implicit edge");
+        assert!(rig.tag("Deprecated"), "class tag through the implicit edge");
+        assert!(!rig.tag("experimental"), "an untagged spelling stays silent");
+    }
+
+    /// The rig posture (no `dart:core` node): the implicit import is not
+    /// modelled, so the bare spelling still reads as the tag. Keeps the
+    /// hand-built-rig pins of the member-use faces green.
+    #[test]
+    fn bare_deprecation_tag_survives_a_graph_without_dart_core() {
+        let rig = CoreRig::build(None, &[], &[], &[], false);
+        assert!(rig.tag("deprecated"));
+    }
+
+    /// A local declaration shadows the tag — the annotation resolves to it,
+    /// never to dart:core (`element/scope.dart:419-433`).
+    #[test]
+    fn local_deprecation_spelling_shadows_the_core_tag() {
+        let rig = CoreRig::build(Some(&["deprecated", "Deprecated"]), &["deprecated"], &[], &[], false);
+        assert!(!rig.tag("deprecated"), "the local wins over the implicit import");
+        assert!(rig.tag("Deprecated"), "the other spelling is untouched");
+    }
+
+    /// A same-spelled declaration in an imported library is not the tag.
+    #[test]
+    fn imported_same_spelling_is_not_the_tag() {
+        let rig = CoreRig::build(
+            Some(&["deprecated", "Deprecated"]),
+            &[],
+            &[("package:other/other.dart", &["deprecated"])],
+            &[Import::unprefixed("package:other/other.dart")],
+            false,
+        );
+        assert!(!rig.tag("deprecated"));
+    }
+
+    /// An explicit `dart:core` import replaces the implicit edge; a `show`
+    /// that filters the tag out leaves it unresolvable, and an
+    /// unresolvable annotation is no tag.
+    #[test]
+    fn a_filtered_explicit_core_import_hides_the_tag() {
+        let rig = CoreRig::build(
+            Some(&["deprecated", "Deprecated", "String"]),
+            &[],
+            &[],
+            &[Import {
+                uri: "dart:core",
+                name: None,
+                prefix: None,
+                show: Some(&["String"]),
+                hide: None,
+            }],
+            true,
+        );
+        assert!(!rig.tag("deprecated"));
+    }
+
+    /// The prefixed face: `@core.deprecated` is the tag only under an
+    /// `import 'dart:core' as core;`.
+    #[test]
+    fn prefixed_deprecation_tag_follows_the_dart_core_import() {
+        let rig = CoreRig::build(
+            Some(&["deprecated", "Deprecated"]),
+            &[],
+            &[],
+            &[Import::prefixed("dart:core", "core")],
+            false,
+        );
+        assert!(rig.tag("core.deprecated"));
+        let other = CoreRig::build(
+            Some(&["deprecated", "Deprecated"]),
+            &[],
+            &[("package:other/other.dart", &["deprecated"])],
+            &[Import::prefixed("package:other/other.dart", "core")],
+            false,
+        );
+        assert!(!other.tag("core.deprecated"));
+    }
+
+    /// The message face: a positional / `message:` argument is normalized
+    /// the way the oracle presents it (`normalizeDeprecationMessage`), and a
+    /// bare `@deprecated` (no args) carries none.
+    #[test]
+    fn deprecation_message_normalizes_like_the_oracle() {
+        let mut strings = StringTable::new();
+        let args = |text: &'static str| Some(strings.intern(text));
+        assert_eq!(deprecation_message(None, &strings), None);
+        assert_eq!(deprecation_message(args("()"), &strings), None);
+        assert_eq!(deprecation_message(args("('.')"), &strings), None);
+        assert_eq!(
+            deprecation_message(args("('Use x')"), &strings),
+            Some("Use x.".to_owned())
+        );
+        assert_eq!(
+            deprecation_message(args("('Use x?')"), &strings),
+            Some("Use x?".to_owned())
+        );
+        assert_eq!(
+            deprecation_message(args("(message: 'Use x')"), &strings),
+            Some("Use x.".to_owned())
+        );
+        assert_eq!(
+            deprecation_message(args("(expires: '2024')"), &strings),
+            Some("2024.".to_owned())
         );
     }
 }

@@ -185,6 +185,19 @@ impl Interp<'_> {
                                 .vars
                                 .get(var as usize)
                                 .and_then(|meta| meta.const_bool);
+                            // The by-construction non-null face: an
+                            // implicitly typed local whose initializer can
+                            // never be null (`final x = 0;`) reads as
+                            // non-null like a written non-nullable
+                            // annotation, so `x ?? 1` kills the right
+                            // operand and `x?.m` kills the skip path. The
+                            // slot itself stays the opaque unknown face
+                            // (the #2243 guard), which is why the verdict
+                            // has to ride the expression.
+                            expr.non_null_literal = self
+                                .vars
+                                .get(var as usize)
+                                .is_some_and(|meta| meta.non_null);
                             self.exprs.push(expr);
                             // The bottom-typed read's own exit (official
                             // `recordStaticType`'s `handleExit` on
@@ -692,6 +705,10 @@ impl Interp<'_> {
                             ifnull_ty: None,
                             op_span: *span,
                             rhs_dead_entry,
+                            // The left operand's proven value, whether it
+                            // folded as a literal/constant or as a nested
+                            // short-circuit chain (`false && x && y`).
+                            lhs_bool: left.bool_value.or(left.proven_bool),
                         });
                         self.current = taken.clone();
                         // The official `checkUnreachableNode(rightOperand)`
@@ -786,6 +803,7 @@ impl Interp<'_> {
                             ifnull_ty: Some(result_ty),
                             op_span: *span,
                             rhs_dead_entry,
+                            lhs_bool: None,
                         });
                         // The `??` face of the dead-entry mark (the
                         // official `checkUnreachableNode(rightOperand)`
@@ -846,6 +864,7 @@ impl Interp<'_> {
                             ifnull_ty: None,
                             op_span: *span,
                             rhs_dead_entry,
+                            lhs_bool: None,
                         });
                     }
                 }
@@ -892,6 +911,7 @@ impl Interp<'_> {
                     let Some(Frame::Branch {
                         branch: other,
                         ifnull_ty: _,
+                        lhs_bool,
                         ..
                     }) = self.stack.pop()
                     else {
@@ -908,6 +928,26 @@ impl Interp<'_> {
                     self.current = if_true.clone();
                     let mut expr = Expr::trivial(Ty::UNKNOWN);
                     expr.branches = Some((if_true, if_false));
+                    // The short-circuit dominance: `false && x` and
+                    // `x && false` are `false` whichever way `x` runs,
+                    // `true || x` and `x || true` are `true`, and a chain of
+                    // two folded operands gives the operator's own value.
+                    // The verdict is a certainty about the whole condition —
+                    // an `if` over it has one provably dead arm — but the
+                    // official carries no `booleanLiteral` info for a logical
+                    // operator, so this face feeds the branch-fold marker
+                    // only (see [`Expr::proven_bool`]).
+                    expr.proven_bool = match (
+                        op,
+                        lhs_bool,
+                        right.bool_value.or(right.proven_bool),
+                    ) {
+                        (BinOp::And, Some(false), _) | (BinOp::And, _, Some(false)) => Some(false),
+                        (BinOp::Or, Some(true), _) | (BinOp::Or, _, Some(true)) => Some(true),
+                        (BinOp::And, Some(left), Some(right)) => Some(left && right),
+                        (BinOp::Or, Some(left), Some(right)) => Some(left || right),
+                        _ => None,
+                    };
                     // The `&&`/`||` arms carry the left operand's
                     // type-test split (the narrowed `current` stands in the
                     // taken arm): a value consumer drops the result and
@@ -3365,6 +3405,7 @@ impl Interp<'_> {
                         },
                     },
                     rhs_dead_entry: false,
+                    lhs_bool: None,
                 });
                 self.current = if_true;
                 // The element's arm bookkeeping: the then-element runs

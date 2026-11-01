@@ -52,6 +52,19 @@ pub(crate) struct VarMeta {
     /// the declared slot keeps it even when the annotation's spelling
     /// reduced to the unknown face.
     pub written: bool,
+    /// The local's value can never be null although its declared slot
+    /// stays the opaque unknown face: an implicitly typed declarator whose
+    /// initializer is non-null by construction (`final x = 0;`, `var s =
+    /// 'a';` — the official `_inferLocalVariable` types the variable with
+    /// the initializer's static type, which the #2243 guard deliberately
+    /// keeps out of the flow slot for non-nullable names). The reads carry
+    /// it as the expression's [`Expr::non_null_literal`] face, so the
+    /// guaranteed-non-null verdicts (`??`, `??=`, `?.`) fire exactly as
+    /// they do over a written non-nullable annotation. A written annotation
+    /// never sets it (the slot's own classification answers), and every
+    /// write clears it ([`Interp::apply_write`]), like the SSA node of a
+    /// mutable local.
+    pub non_null: bool,
 }
 
 /// One lexical scope frame: name id to variable id.
@@ -314,6 +327,10 @@ pub(crate) enum Frame {
         /// row fires at the construct's close. An operand that only ENDS
         /// unreachable (a `throw`/Never subexpression) is live.
         rhs_dead_entry: bool,
+        /// The left operand's proven boolean value ([`Expr::bool_value`] or
+        /// a nested chain's [`Expr::proven_bool`]), parked for the logical
+        /// close's short-circuit dominance.
+        lhs_bool: Option<bool>,
     },
     Cascade {
         exprs_base: usize,
@@ -614,6 +631,14 @@ pub(crate) struct Expr {
     pub this_recv: bool,
     /// Boolean literal truth.
     pub bool_value: Option<bool>,
+    /// The proven constant of a `&&`/`||` chain, from short-circuit
+    /// dominance: `false && x`, `x && false`, `true || x`, `x || true`, and
+    /// any chain whose operands both fold. The value is as certain as
+    /// [`Expr::bool_value`], but the official carries no `booleanLiteral`
+    /// `ExpressionInfo` for a logical operator — the fold rides the branch
+    /// pair, not a constant — so this face feeds the if-branch fold marker
+    /// ALONE and never the constant-local replay (`VarMeta::const_bool`).
+    pub proven_bool: Option<bool>,
     /// Non-trivial branch states (`ifTrue`/`ifFalse`); `None` = trivial.
     pub branches: Option<(State, State)>,
     /// The branches are a type-test/equality split whose fold also
@@ -693,6 +718,7 @@ impl Expr {
             prop: None,
             this_recv: false,
             bool_value: None,
+            proven_bool: None,
             branches: None,
             test_split: false,
             read_span: None,
@@ -715,6 +741,7 @@ impl Expr {
             prop: None,
             this_recv: false,
             bool_value: None,
+            proven_bool: None,
             branches: None,
             test_split: false,
             read_span: None,
@@ -1231,8 +1258,10 @@ pub(crate) struct Interp<'o> {
     /// the declared local.
     pub(crate) cond_split_var: Option<u32>,
     /// The open if's condition provably killed its then branch (a
-    /// pattern-disjoint kill or a constant condition): the branch's own
-    /// empty block is a polled node there and reports its braces.
+    /// pattern-disjoint kill, a constant condition, or a `&&`/`||` chain
+    /// whose dominance proves the verdict): the branch's own empty block is
+    /// a polled node there and reports its braces. Set at each plain-`if`
+    /// condition end, so it never carries over.
     pub(crate) if_branch_folded: bool,
     /// The condition variables (language#1274, official
     /// `restoreConditionVariableState`): a bool local bound from a
@@ -1983,6 +2012,10 @@ impl<'o> Interp<'o> {
         // cleared slot here is the mutable-variable contract.
         if let Some(meta) = self.vars.get_mut(var as usize) {
             meta.const_bool = None;
+            // A write may hand the local a nullable (or unknown) value, so
+            // the by-construction non-null face ends here too — the flow
+            // state's own promotion now owns the answer.
+            meta.non_null = false;
         }
         let (declared, declared_args) = match self.vars.get(var as usize) {
             Some(meta) => (meta.ty, meta.args),

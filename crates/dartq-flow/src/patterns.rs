@@ -239,13 +239,12 @@ impl Interp<'_> {
                             Some(PatternKind::IfCase | PatternKind::Decl)
                         ) {
                             // The then branch's empty block is itself a
-                            // polled node under this fold (the branch
-                            // marker the `IfBegin` split reads). The
-                            // context still carries the pre-adoption
-                            // `Decl` kind here — the `IfCaseCondition`
-                            // marker flips it a step later — so `Decl`
-                            // marks too: a declaration context never
-                            // feeds an if branch, and the next `IfBegin`
+                            // polled node under this fold (the branch marker
+                            // the `IfBegin` split reads). The context still
+                            // carries the pre-adoption `Decl` kind here — the
+                            // `IfCaseCondition` marker flips it a step later
+                            // — so `Decl` marks too: a declaration context
+                            // never feeds an if branch, and the next `IfBegin`
                             // resets the marker.
                             self.if_branch_folded = true;
                         }
@@ -520,6 +519,9 @@ impl Interp<'_> {
                     // Pattern binders never carry a proven constant: the
                     // matched value is a runtime extraction, not a fold.
                     const_bool: None,
+                    // Nor a by-construction non-null value: the matched
+                    // value comes from the scrutinee's runtime rows.
+                    non_null: false,
                 };
                 let shadowed = self.bound_var(*name);
                 // The stacked-head alias (official `switchStatement_

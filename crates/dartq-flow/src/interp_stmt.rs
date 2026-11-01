@@ -152,16 +152,18 @@ impl Interp<'_> {
                 self.condition_operand(&cond);
                 // The fold marker the branch's own empty block reads: a
                 // pattern-disjoint kill (`if (x case null) {}` over a
-                // non-nullable x, marked at `ConstantPatternEnd`) or a
-                // constant condition (`if (false) {}`) provably ends the
-                // iteration — the then-branch's empty block IS a polled
-                // node there (official `visitBlock`) and reports its
-                // braces. An `is!`-same-type fold keeps the old posture:
-                // its empty block stays silent (oracle-probed), so the
-                // marker resets here — this if's condition is a plain
-                // expression (the clause-adopting path returned above) —
-                // and rides only a literal condition.
-                self.if_branch_folded = cond.bool_value.is_some();
+                // non-nullable x, marked at `ConstantPatternEnd`), a
+                // constant condition (`if (false) {}`), or a `&&`/`||` chain
+                // whose short-circuit dominance proves the verdict
+                // (`if (x && false) {}` — no `bool_value`, so the chain
+                // carries its own proven face). The then-branch's empty
+                // block is a polled node there (official `visitBlock`) and
+                // reports its braces. The clause-adopting paths returned
+                // above, so a marker standing here belongs to this plain
+                // expression and must be reset (a stale one from an earlier
+                // condition would let a live branch's `{}` report).
+                self.if_branch_folded =
+                    cond.bool_value.is_some() || cond.proven_bool.is_some();
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::If {
                     branch: if_false,
@@ -1349,6 +1351,7 @@ impl Interp<'_> {
                     // `InitializerEnd` when the declaration is
                     // `final`/`const` and the fold carried one.
                     const_bool: None,
+                    non_null: false,
                 };
                 // The declaration's type slot closes with the first variable
                 // it declares. A later `Type` event inside the list belongs
@@ -1627,6 +1630,23 @@ impl Interp<'_> {
                     {
                         meta.const_bool = Some(value);
                     }
+                    // The by-construction non-null face (official
+                    // `_inferLocalVariable`: an implicitly typed declarator's
+                    // slot IS the initializer's static type). The #2243 guard
+                    // above keeps a non-nullable name face out of the flow
+                    // slot, so the non-nullability rides the variable instead
+                    // — the reads hand it to the `??`/`??=`/`?.` verdicts
+                    // (`Expr::non_null_literal`), exactly as a written
+                    // non-nullable annotation's classification answers. A
+                    // written annotation owns its slot (its classification
+                    // already answers), so the flag only lands on the
+                    // inferred face.
+                    if let Some(meta) = self.vars.get_mut(var as usize)
+                        && !meta.written
+                        && rhs.non_null_literal
+                    {
+                        meta.non_null = true;
+                    }
                 }
             }
             Ev::DeclFlowEnd { end } => {
@@ -1708,6 +1728,9 @@ impl Interp<'_> {
                     // A parameter carries no proven constant — its value
                     // arrives from the caller.
                     const_bool: None,
+                    // An inferred formal's value arrives from the caller
+                    // too: nothing here proves it non-null.
+                    non_null: false,
                 };
                 self.declare_var(*name, meta, true);
             }
@@ -1720,15 +1743,27 @@ impl Interp<'_> {
             }
             Ev::Block { kind, span } => {
                 // A statement block is itself a polled node (official
-                // `visitBlock`'s `checkUnreachableNode`): an if branch a
-                // provable fold killed (the pattern-disjoint or constant
-                // condition marker) reports even an empty `{}` — the row
-                // is the braces, closed by the branch's own
-                // `flowEnd(ifTrue)`. Other empty if-branch blocks keep the
-                // old posture (`if (x is! int) {}` stays silent,
-                // oracle-probed); a live branch's poll is a no-op (the
-                // reachability gate), and non-empty blocks keep the
-                // pre-existing poll.
+                // `visitBlock`'s `checkUnreachableNode`) and the official has
+                // no empty-block exemption for it: a branch the flow model
+                // reached unreachable reports even an empty `{}` — the row is
+                // the braces, closed by the branch's own `flowEnd(ifTrue)`.
+                // The official's only exemption is a dead constructor's empty
+                // body block (dead_code_verifier.dart:252-256), which is the
+                // separate `BlockBodyBegin` face below.
+                //
+                // The empty if-branch case still reads the fold marker: a
+                // branch state this layer reaches dead is not by itself the
+                // official's verdict (a same-type `is!` over a reference
+                // operand stays live upstream — official `isExpression_end`
+                // takes the promotion arm for a reference and never the
+                // `booleanLiteral` fold, while this layer's test split marks
+                // the then arm dead; the calibrated `if (x is! int) {}`
+                // silence in ticket_2850 records that divergence). So the
+                // marker says "the condition is provably constant" — a
+                // literal/fold face (`if (false) {}`), the pattern-disjoint
+                // kill, or a `&&`/`||` chain dominance proves
+                // (`Expr::proven_bool`) — and only those empty branches
+                // report. Non-empty blocks keep the pre-existing poll.
                 let empty = matches!(events.get(i + 1), Some(Ev::EndBlock { .. }));
                 if matches!(kind, BlockKind::Statement)
                     && (!matches!(self.stack.last(), Some(Frame::If { .. }))
