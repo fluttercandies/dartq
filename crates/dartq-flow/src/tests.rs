@@ -2097,14 +2097,19 @@ fn case_guard_cast_takes_the_expression_face() {
 #[test]
 fn case_head_state_carries_into_the_body() {
     // A never-true guard makes the group's combined state unreachable,
-    // but the body still opens on a control-flow split checkpoint:
-    // official `Reachability.split` passes locallyReachable=true
-    // (flow_analysis.dart:5607) and `switch_endAlternatives` splits the
-    // body's entry state (:8060-8066), so no dead code is reported
-    // inside the case body — the guard's false outcome lives only in
-    // the unmatched chain.
+    // and `switch_endAlternatives` splits that model for the body entry
+    // (`_current = combinedModel ?? unmatched`, flow_analysis.dart:6707,
+    // then `_current = _current.split()`, :6712). `Reachability.split`
+    // sets locallyReachable=true but KEEPS overallReachable
+    // (:4534, and overallReachable == locallyReachable &&
+    // parent.overallReachable, :4489-4491) — and the dead-code verifier
+    // reads `FlowModel.isReachable => reachable.overallReachable`
+    // (:5261). The split child of an unreachable model is therefore
+    // still overall-unreachable, and the body is the first dead node.
+    // Oracle 3.13.7: `dead_code` at the body (`1|53|2` on the one-line
+    // fixture).
     let source = "void f(Object? o) { switch (o) { case _ when false: 1; } }";
-    assert!(dead_snippets(source).is_empty());
+    assert_eq!(dead_snippets(source), ["1;"]);
     // Guard type-test promotion carries into the body: with `n`
     // promoted to `int` by the guard, the impossible `n is! int`
     // then-branch is dead (official tryPromoteForTypeCheck's bottom
