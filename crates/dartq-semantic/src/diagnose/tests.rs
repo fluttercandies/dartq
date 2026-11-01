@@ -20073,3 +20073,16 @@ mod ticket_3425_tests;
 #[cfg(test)]
 #[path = "ticket_3459_tests.rs"]
 mod ticket_3459_tests;
+
+// —— #3482 —— the clause-element-kind check's per-DECLARATION identity:
+// `scan_header_clauses` keys each header on its declaring name token's
+// offset instead of the name, so a repeated container name reports each
+// header's own clauses exactly once — never the last header's entry
+// re-emitted at every declaration (the corpus's `mixin_of_non_class` /
+// `implements_non_class` duplicate family). Registered here via `#[path]`;
+// the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3482_tests.rs"]
+mod ticket_3482_tests;

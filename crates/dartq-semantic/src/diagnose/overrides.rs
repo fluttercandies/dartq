@@ -162,6 +162,28 @@ struct HeaderClause {
     supers: Vec<SuperEntry>,
 }
 
+/// The current file's scanned header clauses. `by_offset` keys each entry
+/// on its declaring name token's UTF-16 offset — a per-declaration
+/// identity, so a repeated container name (`class C` written eighty times,
+/// the parser-fe recovery cases) still reports each header's own clauses
+/// exactly once. `last_of_name` maps the declaring name to the LAST
+/// declaration's offset — the element model collapses repeats into one
+/// container, so the name-keyed substitution faces (which read the model's
+/// collapsed decl) keep the scan's prior last-wins overwrite semantics.
+struct HeaderClauses {
+    by_offset: FxHashMap<u32, HeaderClause>,
+    last_of_name: FxHashMap<StringId, u32>,
+}
+
+impl HeaderClauses {
+    /// The clause facts of the declaration `name` resolves to in the
+    /// element model — the last declaration carrying that name (the
+    /// model's own collapse keeps one container per name).
+    fn for_name(&self, name: StringId) -> Option<&HeaderClause> {
+        self.by_offset.get(self.last_of_name.get(&name)?)
+    }
+}
+
 /// The clause a written supertype entry belongs to (upstream Dart SDK
 /// source, `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart`
 /// `_resolveType`'s clause switch :1209-1227 — the diagnostic code keys on
@@ -456,7 +478,7 @@ impl<'a> Engine<'a> {
         // scanner only covers `self.file`, so a foreign application class
         // (the `with M<Arg>` edge living in another unit) stays undecidable
         // and the raw entry passes through — the under-report direction.
-        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
+        let mut facts: Option<HeaderClauses> = None;
         // The unique-declaration re-anchor bypasses the seen gate once
         // (the anchor's spelling re-resolves in its declaring library).
         let mut retried = false;
@@ -1143,7 +1165,7 @@ impl<'a> Engine<'a> {
         // signature carrying free type parameters — and shared across the
         // face loop and the combined-signature inference (one token walk
         // per check).
-        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
+        let mut facts: Option<HeaderClauses> = None;
         // The combined-signature inference (upstream Dart SDK source,
         // `pkg/analyzer/lib/src/summary2/instance_member_inferrer.dart`
         // `_inferAccessorOrField`/`_inferExecutable`): an implicit type slot
@@ -1675,7 +1697,7 @@ impl<'a> Engine<'a> {
         // The written clause facts, built on first need — a mixin's own
         // signature carrying free type parameters — and shared across the
         // mixin loop (one token walk per check).
-        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
+        let mut facts: Option<HeaderClauses> = None;
         for (index, &mixin) in decl.with_clause.iter().enumerate() {
             // Resolve the mixin through the diagnosing file's library: the
             // with-entry spellings are written in this file and resolve
@@ -1895,7 +1917,7 @@ impl<'a> Engine<'a> {
         mixin: StringId,
         mixin_owner: FileId,
         member: &MemberEntry,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Instantiated {
         // The declaring container's parameters that occur anywhere in this
         // member's signature — bare heads AND nested type-argument slots
@@ -1925,7 +1947,7 @@ impl<'a> Engine<'a> {
         let written: Option<Vec<Ty>> = {
             let clause = facts.get_or_insert_with(|| self.scan_header_clauses());
             clause
-                .get(&container)
+                .for_name(container)
                 .and_then(|c| c.supers.iter().find(|entry| entry.head == mixin))
                 .and_then(|entry| self.face_args(&entry.args))
         };
@@ -1934,7 +1956,7 @@ impl<'a> Engine<'a> {
         };
         if mixin_owner == self.file {
             let clause = facts.get_or_insert_with(|| self.scan_header_clauses());
-            let Some(params) = clause.get(&mixin).map(|c| c.params.clone()) else {
+            let Some(params) = clause.for_name(mixin).map(|c| c.params.clone()) else {
                 return Instantiated::Undecidable;
             };
             if params.len() == written.len() {
@@ -3088,8 +3110,17 @@ impl<'a> Engine<'a> {
             if let Some(deferred) = deferred.as_ref() {
                 self.check_modifier_use_sites(container, deferred.name_range, &deferred.spans);
             }
+            // The declaration identity for the clause map: the armed
+            // deferred's name span, or the enum's own decl-site record when
+            // the header never armed (recovery paths).
+            let name_offset = deferred
+                .as_ref()
+                .map(|d| d.name_range.offset)
+                .or_else(|| self.enum_decl_site.map(|site| site.0.offset));
             self.deferred_modifier = deferred;
-            self.check_clause_element_kinds(container, &window);
+            if let Some(name_offset) = name_offset {
+                self.check_clause_element_kinds(container, name_offset, &window);
+            }
         }
     }
 
@@ -3173,7 +3204,7 @@ impl<'a> Engine<'a> {
                     // Already drained at the implements claim.
                 } else {
                     let window = Self::clause_window_offsets(&deferred.spans);
-                    self.check_clause_element_kinds(container, &window);
+                    self.check_clause_element_kinds(container, deferred.name_range.offset, &window);
                 }
             }
         }
@@ -3779,7 +3810,7 @@ impl<'a> Engine<'a> {
             } else if tail.len() >= count {
                 tail[tail.len() - count..].to_vec()
             } else {
-                self.header_with_entry_spans(container)
+                self.header_with_entry_spans(name_range.offset)
             }
         };
         for (index, name) in decl.with_clause.iter().enumerate() {
@@ -4198,7 +4229,8 @@ impl<'a> Engine<'a> {
             || decl.on_clause.iter().copied().any(gated)
     }
 
-    /// The written `with` entries' spans of `container`, read from the clause
+    /// The written `with` entries' spans of the declaration at `name_offset`
+    /// (the declaring name token's UTF-16 offset), read from the clause
     /// scanner ([`Self::scan_header_clauses`]) — the fallback anchor source
     /// for the sealed class-drive rows when the header window kept no buffer
     /// tail (a `with`-only header parks its first entry in the never-committed
@@ -4206,8 +4238,8 @@ impl<'a> Engine<'a> {
     /// feeds `class_used_as_mixin` never reaches
     /// [`HeaderClauseSpans`]). One bounded token walk, paid only by headers
     /// whose window channel came up short.
-    fn header_with_entry_spans(&self, container: StringId) -> Vec<SourceRange> {
-        let Some(facts) = self.scan_header_clauses().remove(&container) else {
+    fn header_with_entry_spans(&self, name_offset: u32) -> Vec<SourceRange> {
+        let Some(facts) = self.scan_header_clauses().by_offset.remove(&name_offset) else {
             return Vec::new();
         };
         facts
@@ -5748,7 +5780,7 @@ impl<'a> Engine<'a> {
         container: StringId,
         face: StringId,
         spelling: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<FaceHit<'a>> {
         self.face_member_in(
             self.file, container, self.lib, container, face, spelling, facts,
@@ -5773,7 +5805,7 @@ impl<'a> Engine<'a> {
         merge_container: StringId,
         face: StringId,
         spelling: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<FaceHit<'a>> {
         let mut name = face;
         let mut hop_writer = root_writer;
@@ -6119,7 +6151,7 @@ impl<'a> Engine<'a> {
         collected: Vec<FaceHit<'a>>,
         container: StringId,
         merged_name: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<FaceHit<'a>> {
         if collected.len() <= 1 {
             return collected.into_iter().next();
@@ -6151,7 +6183,7 @@ impl<'a> Engine<'a> {
         &self,
         collected: &[&FaceHit<'a>],
         container: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<usize> {
         match self.merge_candidates(collected, container, facts) {
             Merged::Candidate(index) => Some(index),
@@ -6180,7 +6212,7 @@ impl<'a> Engine<'a> {
         &self,
         collected: &[&FaceHit<'a>],
         container: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Merged {
         let mut substituted: Vec<MemberEntry> = Vec::with_capacity(collected.len());
         for (index, hit) in collected.iter().enumerate() {
@@ -6242,7 +6274,7 @@ impl<'a> Engine<'a> {
         &self,
         hit: &FaceHit<'a>,
         container: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<MemberEntry> {
         match self.instantiate_inherited(&hit.chain, hit.entry(), container, facts) {
             Instantiated::Unchanged => Some(hit.entry().clone()),
@@ -6461,12 +6493,12 @@ impl<'a> Engine<'a> {
         spelling: StringId,
         setter_name: StringId,
         faces: &[StringId],
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> (MemberEntry, bool) {
         if !has_implicit_slot(entry) {
             return (entry.clone(), false);
         }
-        let getter_candidates = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>| {
+        let getter_candidates = |facts: &mut Option<HeaderClauses>| {
             let mut hits: Vec<FaceHit<'a>> = Vec::new();
             for face in faces {
                 if let Some(hit) = self.override_face_member(container, *face, spelling, facts)
@@ -6477,7 +6509,7 @@ impl<'a> Engine<'a> {
             }
             hits
         };
-        let setter_candidates = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>| {
+        let setter_candidates = |facts: &mut Option<HeaderClauses>| {
             let mut hits: Vec<FaceHit<'a>> = Vec::new();
             for face in faces {
                 if let Some(hit) = self.override_face_member(container, *face, setter_name, facts)
@@ -6488,7 +6520,7 @@ impl<'a> Engine<'a> {
             }
             hits
         };
-        let getter_ty = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        let getter_ty = |facts: &mut Option<HeaderClauses>,
                          hits: &mut Vec<FaceHit<'a>>| {
             let combined = hits.len();
             let witness = self.combined_inherited(container, std::mem::take(hits), facts);
@@ -6505,7 +6537,7 @@ impl<'a> Engine<'a> {
                 None => Some(Ty::Dynamic),
             }
         };
-        let setter_ty = |facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        let setter_ty = |facts: &mut Option<HeaderClauses>,
                          hits: &mut Vec<FaceHit<'a>>| {
             let combined = hits.len();
             let witness = self.combined_inherited(container, std::mem::take(hits), facts);
@@ -6661,7 +6693,7 @@ impl<'a> Engine<'a> {
         &self,
         container: StringId,
         candidates: Vec<FaceHit<'a>>,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<MemberEntry> {
         if candidates.len() <= 1 {
             let hit = candidates.first()?;
@@ -6701,7 +6733,7 @@ impl<'a> Engine<'a> {
         container: StringId,
         spelling: StringId,
         faces: &[StringId],
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<String> {
         let mut candidates: Vec<FaceHit<'a>> = Vec::new();
         for face in faces {
@@ -6778,7 +6810,7 @@ impl<'a> Engine<'a> {
         chain: &[(StringId, FileId)],
         inherited: &MemberEntry,
         container: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Instantiated {
         let Some((hop_name, hop_owner)) = chain.last().copied() else {
             return Instantiated::Unchanged;
@@ -6792,8 +6824,8 @@ impl<'a> Engine<'a> {
         // never enter the walk).
         fn clause<'a>(
             self_: &Engine<'_>,
-            facts: &'a mut Option<FxHashMap<StringId, HeaderClause>>,
-        ) -> &'a mut FxHashMap<StringId, HeaderClause> {
+            facts: &'a mut Option<HeaderClauses>,
+        ) -> &'a mut HeaderClauses {
             facts.get_or_insert_with(|| self_.scan_header_clauses())
         }
         let mut env: Option<FxHashMap<StringId, Ty>> = Some(FxHashMap::default());
@@ -6803,7 +6835,7 @@ impl<'a> Engine<'a> {
             // lives in the previous hop's header — same-file headers only.
             let incoming: Option<Vec<Ty>> = if index == 0 {
                 clause(self, facts)
-                    .get(&container)
+                    .for_name(container)
                     .and_then(|c| c.supers.iter().find(|entry| entry.head == hop))
                     .and_then(|entry| self.face_args(&entry.args))
             } else {
@@ -6812,7 +6844,7 @@ impl<'a> Engine<'a> {
                     None
                 } else {
                     clause(self, facts)
-                        .get(&prev)
+                        .for_name(prev)
                         .and_then(|c| c.supers.iter().find(|entry| entry.head == hop))
                         .and_then(|entry| self.face_args(&entry.args))
                 }
@@ -6824,7 +6856,7 @@ impl<'a> Engine<'a> {
             // The hop's parameter names: same-file headers spell them;
             // foreign hops expose only the count.
             let hop_params: Option<Vec<StringId>> = if hop_file == self.file {
-                clause(self, facts).get(&hop).map(|c| c.params.clone())
+                clause(self, facts).for_name(hop).map(|c| c.params.clone())
             } else {
                 None
             };
@@ -6856,7 +6888,7 @@ impl<'a> Engine<'a> {
                 .is_some_and(|c| c.type_params == 1);
         if foreign_single && chain.len() == 1 && free.len() == 1 {
             let incoming = clause(self, facts)
-                .get(&container)
+                .for_name(container)
                 .and_then(|c| c.supers.iter().find(|entry| entry.head == hop_name))
                 .and_then(|entry| self.face_args(&entry.args));
             if let Some([arg]) = incoming.as_deref() {
@@ -7056,8 +7088,11 @@ impl<'a> Engine<'a> {
     /// strips clauses to names); it runs on first need — an inherited
     /// signature carrying free type parameters — and stays off the plain
     /// override path.
-    fn scan_header_clauses(&self) -> FxHashMap<StringId, HeaderClause> {
-        let mut map: FxHashMap<StringId, HeaderClause> = FxHashMap::default();
+    fn scan_header_clauses(&self) -> HeaderClauses {
+        let mut map = HeaderClauses {
+            by_offset: FxHashMap::default(),
+            last_of_name: FxHashMap::default(),
+        };
         let toks = self.tokens.as_slice();
         let mut i = 0;
         while i < toks.len() {
@@ -7080,7 +7115,7 @@ impl<'a> Engine<'a> {
         super_name: StringId,
     ) -> Option<Vec<Ty>> {
         self.scan_header_clauses()
-            .get(&container)?
+            .for_name(container)?
             .supers
             .iter()
             .find(|entry| entry.head == super_name)
@@ -7187,9 +7222,15 @@ impl<'a> Engine<'a> {
     fn check_clause_element_kinds(
         &mut self,
         container: StringId,
+        name_offset: u32,
         window: &[u32],
     ) {
-        let Some(facts) = self.scan_header_clauses().remove(&container) else {
+        // `name_offset` identifies THIS declaration: a repeated container
+        // name (`class C` written eighty times) carries one map entry per
+        // declaration, so each header reports its own clauses exactly once —
+        // name-keying would re-report the last declaration's clauses at
+        // every declaration.
+        let Some(facts) = self.scan_header_clauses().by_offset.remove(&name_offset) else {
             return;
         };
         let Some(kind) = self
@@ -7713,14 +7754,17 @@ impl<'a> Engine<'a> {
     /// clauses starting after the family keyword; returns the scan position
     /// past the header (`{` body skipped whole, `;` mixin application
     /// consumed). A header that does not parse faithfully records nothing.
-    fn scan_one_header(&self, start: usize, map: &mut FxHashMap<StringId, HeaderClause>) -> usize {
+    fn scan_one_header(&self, start: usize, map: &mut HeaderClauses) -> usize {
         let toks = self.tokens.as_slice();
         let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
         let mut i = start;
-        // The declaring name is the identifier right after the keyword.
+        // The declaring name is the identifier right after the keyword; its
+        // UTF-16 offset is the declaration's identity (`name_range.offset`
+        // at the listener's `arm_modifier_checks` site).
         if i >= toks.len() {
             return i;
         }
+        let name_offset = toks[i].utf16_offset;
         let Some(name) = self.intern_checked(i) else {
             return i;
         };
@@ -7808,7 +7852,9 @@ impl<'a> Engine<'a> {
             }
             return end;
         }
-        map.insert(name, HeaderClause { params, supers });
+        map.by_offset
+            .insert(name_offset, HeaderClause { params, supers });
+        map.last_of_name.insert(name, name_offset);
         if lex_at(end) == Some("{") {
             self.tokens.matching_end(end).map_or(toks.len(), |c| c + 1)
         } else {
@@ -8489,7 +8535,7 @@ impl<'a> Engine<'a> {
         container: StringId,
         spelling: StringId,
         face_kind: MemberKind,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Vec<(MemberEntry, StringId, FileId)> {
         if face_kind == MemberKind::Getter {
             // A getter face declares no parameter list: no covariant mark
@@ -8618,7 +8664,7 @@ impl<'a> Engine<'a> {
         entry: &MemberEntry,
         spelling: StringId,
         candidates: &[&FaceHit<'a>],
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<MemberEntry> {
         let formals = entry.formals.as_deref()?;
         let mut covariant_positional: Vec<usize> = Vec::new();
@@ -8681,7 +8727,7 @@ impl<'a> Engine<'a> {
         spelling: StringId,
         depth: usize,
         visited: &mut FxHashSet<(FileId, StringId)>,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
         covariant_positional: &mut Vec<usize>,
         covariant_named: &mut Vec<StringId>,
     ) {
@@ -8792,7 +8838,7 @@ impl<'a> Engine<'a> {
         &self,
         hit: &FaceHit<'a>,
         spelling: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> Option<MemberEntry> {
         let entry = hit.entry();
         if !has_implicit_slot(entry) || entry.kind == MemberKind::Field {
@@ -8949,7 +8995,7 @@ impl<'a> Engine<'a> {
         &self,
         hit: &FaceHit<'a>,
         spelling: StringId,
-        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+        facts: &mut Option<HeaderClauses>,
     ) -> bool {
         let mut positional: Vec<usize> = Vec::new();
         let mut named: Vec<StringId> = Vec::new();
