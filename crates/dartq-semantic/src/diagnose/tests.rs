@@ -19827,6 +19827,20 @@ mod ticket_3415_tests;
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// The #3420 pins (a member read off a created chain): the member merge's
+// non-`this`/`super`/`typed` receiver arm holds the receiver's STATIC TYPE
+// only, so a folded creation's declared accessor face was never consulted
+// and the merged row published `Unknown` — a `T?` slot read off
+// `Box<int>(1)` typed nothing at all. `record_field_ty` now answers a named
+// receiver type's declared field/getter instantiated with that type's
+// written arguments, so the read reaches `int?` and its consumers stage the
+// rows the oracle stages; an undecided instantiation keeps the under-report.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3420_tests.rs"]
+mod ticket_3420_tests;
+
 // The #3418 pins (an augmented element's member face is the union of its
 // fragments'): `resolve_container` answers the merged face from either
 // anchor, so a member written in the introducing unit resolves inside an
@@ -19834,4 +19848,36 @@ mod ticket_3415_tests;
 // reports, and the merge is independent of the library's unit order.
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3423 pins (a potentially nullable receiver's operator resolves
+// through the applicable extension before the nullability verdict): the fold
+// asks the covering `on ?` face first, so `extension on int? { int
+// operator +(Null o) }` over `int? x; x + null` stays silent instead of
+// reporting the head's member face, and its declared return is never
+// numerically refined. The compound twin's refinement ladder still lives in
+// `assignability.rs` and is recorded as an ignored pin there.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3390 pins (the `??=` staged flush's non-local target arm): a pair
+// the local promotion table missed re-decides through the target row's
+// declared read face — upstream's `readType` answers a member target with
+// the getter/field's DECLARED return, promotion-free (`setReadElement`,
+// resolver.dart:1754-1792; `visitAssignmentExpression` feeds it to
+// `_checkForDeadNullCoalesce`, error_verifier.dart:444-449), so the
+// member/`this`/`super` shapes anchor the dead value the same face the
+// locals anchor through their promotion rows. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3417 pins (cluster C4/C7): the `Type` instance's member face is the
+// `Object` face plus every APPLICABLE extension of the import closure, a
+// cascade section's target is only the literal when it is written bare
+// (`C..foo()`), an interface-typed alias head resolves the ALIASED class's
+// statics, and a prefix whose own edge exports the built-in top type
+// resolves `p.dynamic`. Registered here via `#[path]`; the module stays
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]

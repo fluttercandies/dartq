@@ -471,17 +471,31 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// A record field getter's static type (upstream Dart SDK source,
+    /// A receiver STATIC TYPE's declared read face for `field` — the member
+    /// the type carries, resolved without a receiver row.
+    ///
+    /// A record answers the shape's field getter (upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/element/type.dart `RecordTypeImpl`
     /// `namedField`/`positionalField` — the property-access resolver reads
     /// the field off the receiver's record type, `$1`-based positional
-    /// spellings included). `receiver` folds through a type alias first
-    /// (`typedef R = ({bool? strict}); r.strict`). A nullable record
-    /// receiver answers `None` unless the access is null-aware (a plain
-    /// access is the unchecked dereference face, not a field read; `r?.f`
-    /// reads the field off the promoted non-null record and the caller
-    /// joins the `?`), as does any non-record receiver, a
-    /// `$0`/out-of-range/non-numeric spelling, and an absent named field
+    /// spellings included). A NAMED class answers its declared field/getter
+    /// instantiated with the type's own written arguments (#3420): the
+    /// member merge's non-`this`/`super`/`typed` arm holds the receiver's
+    /// static type only (a folded creation's published instantiation
+    /// carries no `Receiver::Typed` row of its own), so this face restores
+    /// the declared type the read publishes — the official
+    /// `PropertyAccess.staticType` resolves the accessor on the receiver's
+    /// static type whatever expression produced it.
+    ///
+    /// `receiver` folds through a type alias first
+    /// (`typedef R = ({bool? strict}); r.strict`). A nullable receiver
+    /// answers `None` unless the access is null-aware (a plain access is
+    /// the unchecked dereference face, not a field read; `r?.f` reads the
+    /// field off the promoted non-null receiver and the caller joins the
+    /// `?`), as does a `$0`/out-of-range/non-numeric spelling, an absent
+    /// named field, an executable member (a method read is a tear-off the
+    /// name-level model does not render), a receiver whose class the
+    /// element model cannot instantiate, and every other receiver shape
     /// (the `Object` members stay unmodeled — under-report).
     pub(crate) fn record_field_ty(
         &self,
@@ -489,34 +503,62 @@ impl<'a> Engine<'a> {
         field: StringId,
         null_aware: bool,
     ) -> Option<Ty> {
-        let Ty::Record { shape, nullable } = self.fold_alias_ty(receiver) else {
-            return None;
-        };
-        if nullable && !null_aware {
-            return None;
-        }
-        let pool = self.boundary.pool();
-        let shape = pool.record_shape(shape);
-        let ty = match shape.named.iter().find(|(name, _)| *name == field) {
-            Some(&(_, ty)) => ty,
-            None => {
-                // Positional getters are `$1`, `$2`, … (1-based decimal, no
-                // sign and no leading zero — `$01` is not a field getter).
-                let index = self
-                    .strings
-                    .resolve(field)
-                    .strip_prefix('$')
-                    .filter(|digits| {
-                        !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
-                    })
-                    .and_then(|digits| digits.parse::<usize>().ok())?;
-                *shape.positional.get(index.checked_sub(1)?)?
+        let folded = self.fold_alias_ty(receiver);
+        match folded {
+            Ty::Record { shape, nullable } => {
+                if nullable && !null_aware {
+                    return None;
+                }
+                let pool = self.boundary.pool();
+                let shape = pool.record_shape(shape);
+                let ty = match shape.named.iter().find(|(name, _)| *name == field) {
+                    Some(&(_, ty)) => ty,
+                    None => {
+                        // Positional getters are `$1`, `$2`, … (1-based
+                        // decimal, no sign and no leading zero — `$01` is not
+                        // a field getter).
+                        let index = self
+                            .strings
+                            .resolve(field)
+                            .strip_prefix('$')
+                            .filter(|digits| {
+                                !digits.starts_with('0')
+                                    && digits.bytes().all(|b| b.is_ascii_digit())
+                            })
+                            .and_then(|digits| digits.parse::<usize>().ok())?;
+                        *shape.positional.get(index.checked_sub(1)?)?
+                    }
+                };
+                drop(pool);
+                // A field spelled through an alias reads as the aliased
+                // type, like every declared type the frames bind.
+                Some(self.fold_alias_ty(ty))
             }
-        };
-        drop(pool);
-        // A field spelled through an alias reads as the aliased type, like
-        // every declared type the frames bind.
-        Some(self.fold_alias_ty(ty))
+            // The declared face, then the receiver's substitution: the
+            // model's `var_ty`/`return_ty` spells the container's own
+            // parameter (`T?`), and the read's static type is that face
+            // instantiated with the written arguments (`G<int>.slot` reads
+            // `int?`, never the raw `T?`). A receiver the instantiation
+            // cannot decide (no written arguments, an arity the declaration
+            // rejects) keeps the under-report — the RAW schema must never
+            // leak as the read's static type.
+            Ty::Named { name, nullable, .. } => {
+                if nullable && !null_aware {
+                    return None;
+                }
+                let declared = self.member_declared_ty(name, field);
+                if declared == Ty::UNKNOWN {
+                    return None;
+                }
+                let recv = Receiver::Typed {
+                    type_name: name,
+                    ty: folded,
+                };
+                let ty = self.instantiate_accessor_static(name, &recv, declared);
+                (ty != Ty::UNKNOWN).then_some(ty)
+            }
+            _ => None,
+        }
     }
 
     /// The captured right-hand type of the non-parameterized type alias
