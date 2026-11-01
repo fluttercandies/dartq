@@ -383,6 +383,7 @@ mod collection_literal;
 mod const_eval_faces;
 mod creation_args;
 mod engine_core;
+mod enum_verifier;
 mod extension_types;
 mod ffi;
 mod index_result;
@@ -2027,6 +2028,11 @@ pub fn fold_unit_with_ops<'t>(
     // declaration sites and import directives walk the index, staging into
     // the report; the staged emissions merge source-ordered into the tail.
     engine.finalize_usage();
+    // The #3373 enum member-set and mixin-application faces run last: every
+    // container is closed and every member entry carries its kind,
+    // abstractness, and name span. The rows stage into the same usage tail
+    // (sorted by offset before the merge below).
+    engine.verify_enum_member_set();
     // The use-face extraction (#767): the per-file consumers have read
     // their sets; the sets re-home into the face for the caller's
     // per-library close.
