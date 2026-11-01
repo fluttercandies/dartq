@@ -17979,3 +17979,14 @@ mod ticket_3295_tests;
 #[cfg(test)]
 #[path = "ticket_3287_tests.rs"]
 mod ticket_3287_tests;
+
+// The #3297 pins (UNDEF binding tail): the `scopes_bodies` binding faces the
+// #3295 residual clustered — the wildcard type parameter (`<_>` declares
+// nothing under `wildcard-variables`, upstream `TypeParameterScope`) and the
+// pattern case scope (an if-case / switch-case binder reads in its guard and
+// its own arm, never in a later arm, the `else` branch, or after the
+// statement). Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3297_tests.rs"]
+mod ticket_3297_tests;

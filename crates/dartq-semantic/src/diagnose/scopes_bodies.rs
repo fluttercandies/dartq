@@ -5328,7 +5328,19 @@ impl<'a> Engine<'a> {
     /// re-scopes the signature type rows that resolved `Missing` before the
     /// parameter existed. Container headers parse their variables before
     /// `begin_*_declaration`, so those park for the frame that owns them.
+    ///
+    /// A wildcard type parameter (`f<_>`, `class C<_>`) enters neither
+    /// list: `TypeParameterScope` skips the `_` element under the feature
+    /// exactly like `LocalScope.add` does (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/scope.dart:944-960), so the
+    /// parameter is an undefined name in every reading plane — its body
+    /// reads fall through the lexical chain ([`Self::declares_nothing`]'s
+    /// gate, the same one `add_local` applies). Below 3.7 the gate is off
+    /// and `_` is an ordinary type parameter.
     pub(crate) fn push_type_parameter(&mut self, name: StringId) {
+        if self.declares_nothing(name) {
+            return;
+        }
         let Some(mark) = self.frames.last().map(|f| f.row_mark) else {
             self.pending_type_params.push(name);
             return;
