@@ -6475,6 +6475,7 @@ mod tests {
             | SemanticCode::ValuesDeclarationInEnum
             | SemanticCode::MixinApplicationNoConcreteSuperInvokedMember
             | SemanticCode::MixinApplicationNotImplementedInterface
+            | SemanticCode::AbstractSuperMemberReference(_)
             => code.code_info(),
         }
     }
