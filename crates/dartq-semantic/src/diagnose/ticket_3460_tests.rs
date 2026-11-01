@@ -139,10 +139,14 @@ fn already_complete_via_function_body_across_units() {
 }
 
 /// `declaration_already_complete` on the constructor chain: a complete
-/// `augment` constructor applied to a complete introductory one.
+/// `augment` constructor applied to a complete introductory one. The
+/// introduction must carry a real body — `A();` is incomplete upstream
+/// (`is_complete` is `external || nonEmptyBody`, and a semicolon body does
+/// not count), so the check is legitimately silent on that fixture; `{}`
+/// is a complete empty block.
 #[test]
 fn already_complete_via_constructor_body_across_units() {
-    let main = "class A { A(); }\n";
+    let main = "class A { A() {} }\n";
     let aug = "augment class A { augment A() {} }\n";
     let report = report_ops_augment(main, aug);
     let hits: Vec<_> = report

@@ -228,41 +228,37 @@ impl Face<'_> {
     }
 }
 
-/// The declaration space a lookup key resolves in (upstream keeps types,
-/// constructors, members, and top-level declarations in separate fragment
-/// maps — and within each map ONE `lastFragments[name]` slot covers every
-/// kind, so a method and a getter under the same name collide: the
-/// different-kind refusal reads that single slot's last fragment).
+/// The declaration space a lookup key resolves in. Upstream keeps THREE
+/// `lastFragments` maps, each keyed by name and covering every kind that
+/// lands in it — a method and a getter under one name collide, and the
+/// different-kind refusal reads that single slot's last fragment:
+/// `_buildTopFragments` shares one map across every top-level declaration
+/// (container heads and functions/variables/accessors alike), and
+/// `_buildInstanceElementMembers` splits container members into an
+/// instance map and a static map — constructors landing in the static one
+/// (`ConstructorFragmentImpl => true`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Space {
-    /// Container heads (`class`/`mixin`/`enum`/`extension`/extension type).
-    Type,
-    /// Constructors and factories (per-selector rows under the owner).
-    Ctor,
     /// Instance members (upstream `_instanceNamespace`).
     Member,
-    /// Static members (upstream `_staticNamespace`) — an `int foo` and a
-    /// `static int foo` never collide.
+    /// Static members AND constructors (upstream `_staticNamespace` —
+    /// `ConstructorFragmentImpl` lands there, so a `static m` and a `C.m`
+    /// collide under one name).
     StaticMember,
-    /// Top-level functions, accessors, and variables (one name slot).
+    /// Top-level declarations: container heads, functions, accessors, and
+    /// variables all share the one name slot.
     Top,
 }
 
 impl Space {
     /// The slot an `augment` declaration resolves into. A container
-    /// augmentation targets the declaration it spells — `augment class C`
-    /// keys under C itself (the container column is a member's owner and
-    /// is absent on top-level heads).
+    /// augmentation targets the top-level name it spells (`augment class C`
+    /// keys under C alongside every other top-level `C`); a member
+    /// augmentation resolves under its owner by static/instance.
     fn of(aug: &AugmentDecl) -> Space {
         match aug.kind {
-            AugKind::Class
-            | AugKind::Mixin
-            | AugKind::Enum
-            | AugKind::Extension
-            | AugKind::ExtensionType => Space::Type,
-            AugKind::Constructor => Space::Ctor,
             _ if aug.container.is_some() => {
-                if aug.is_static {
+                if aug.is_static || aug.kind == AugKind::Constructor {
                     Space::StaticMember
                 } else {
                     Space::Member
@@ -293,8 +289,7 @@ fn property_name(name: StringId, kind: AugKind, strings: &StringTable) -> String
 /// under, its property name, and its family's space.
 fn augment_key(aug: &AugmentDecl, strings: &StringTable) -> (Option<StringId>, StringId, Space) {
     let container = match Space::of(aug) {
-        Space::Type => Some(aug.name),
-        Space::Ctor | Space::Member | Space::StaticMember => aug.container,
+        Space::Member | Space::StaticMember => aug.container,
         Space::Top => None,
     };
     (
@@ -873,7 +868,10 @@ fn populate(
         push_entry(
             table,
             unit,
-            (Some(name), name, Space::Type),
+            // A container head joins the single top-level name slot —
+            // `augment class C` and `void C()` collide under `C` (upstream
+            // `_buildTopFragments` keys every kind by `fragment.name`).
+            (None, name, Space::Top),
             kind,
             false,
             0,
@@ -932,8 +930,11 @@ fn populate(
             // never joins a lookup chain (the augment early-continues).
             continue;
         }
+        // A constructor selector lands in its owner's static namespace
+        // (upstream `_staticNamespace`: `ConstructorFragmentImpl => true`),
+        // everything else in the single top-level slot.
         let space = match target.kind {
-            AugKind::Constructor => Space::Ctor,
+            AugKind::Constructor => Space::StaticMember,
             _ => Space::Top,
         };
         push_entry(
@@ -1470,7 +1471,7 @@ fn factory_body_diagnostics(
         let key = (
             target.container,
             property_name(target.name, target.kind, strings),
-            Space::Ctor,
+            Space::StaticMember,
         );
         let mut fragments = 0usize;
         let mut complete = false;
