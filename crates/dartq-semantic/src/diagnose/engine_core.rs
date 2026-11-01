@@ -3335,6 +3335,15 @@ impl<'a> Engine<'a> {
             self.ctor_tear_off_ty(operand)
                 .or_else(|| self.member_tear_off_ty(operand))
                 .or_else(|| self.value_operand_ty(operand))
+                // The untyped row's own static type (the `C is T` TypeLiteral
+                // face, the prefixed `p.C` read, the `this`/`super` keyword
+                // receiver): the row shape alone answers it — a `C()` send
+                // never reaches here (the Invoke arm owns it), and a `Value`
+                // row's literal faces already ran inside `value_operand_ty`.
+                .or_else(|| {
+                    let ty = self.untyped_operand_ty(operand);
+                    (ty != Ty::UNKNOWN).then_some(ty)
+                })
                 .unwrap_or(Ty::Unknown)
         }
     }
@@ -6624,10 +6633,17 @@ impl<'a> Engine<'a> {
         // A `?.`-merged member operand keeps the field's written type —
         // the null-aware `?` the merge could not join re-arms here from
         // the member's offset latch (`x?.f != null` reads `f?`).
+        // An untyped operand row still owns a static type the oracle answers
+        // (`leftNode.typeOrThrow`): the bare container literal (`C == null`)
+        // types `Type`, the `this`/`super` receivers their container face,
+        // the prefixed `p.C` TypeLiteral `Type` — the same row-shape read
+        // [`Self::type_check_operand_ty`] takes for the `is` twin.
         let operand_ty = if self.null_aware_members.contains(&operand.range.offset) {
             Self::nullable_form(operand.ty)
-        } else {
+        } else if operand.ty != Ty::UNKNOWN {
             operand.ty
+        } else {
+            self.untyped_operand_ty(operand)
         };
         // An invalid-typed operand suspends the nullability question: the
         // official's classification over `InvalidType` answers nothing —
