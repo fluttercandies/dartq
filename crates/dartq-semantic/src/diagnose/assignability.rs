@@ -6328,21 +6328,8 @@ impl<'a> Engine<'a> {
         if to_fn.is_none() {
             to_fn = self.function_shape_sig(to);
         }
-        if from_fn.is_none() {
-            from_fn = self.function_shape_sig(from);
-        }
-        if to_fn.is_none() {
-            to_fn = self.function_shape_sig(to);
-        }
         if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
-            let verdict = self.fn_shape_pair_verdict(from_fn, to_fn);
-            if std::env::var_os("DQ_PROBE").is_some() {
-                eprintln!(
-                    "DQ_PROBE folded-pair from={:?} to={:?} verdict={:?}",
-                    from, to, verdict
-                );
-            }
-            return verdict;
+            return self.fn_shape_pair_verdict(from_fn, to_fn);
         }
         // Right Bottom: no subtyping rule ever holds INTO `Never` but
         // reflexivity (upstream Dart SDK source, pkg/analyzer/lib/src/
