@@ -340,11 +340,7 @@ impl SwitchTracker {
                         // The value-precise constants the name level does
                         // express (`A(b: true)`, `A(e: E.a)`) narrow their
                         // column exactly like a type test, so the row keeps
-                        // its real shape. Anything else (a relational or
-                        // container sub-pattern's unknown leaf, an
-                        // unrepresentable constant) is no column constraint
-                        // this level can name — the whole pattern degrades
-                        // to the unknown space below.
+                        // its real shape.
                         Restriction::BoolValue(_) | Restriction::EnumValue(..) => {
                             if leaf_ty(leaf)
                                 .is_some_and(|leaf_ty| !world.is_subtype_of(&column, &leaf_ty))
@@ -352,6 +348,20 @@ impl SwitchTracker {
                                 carried.push((name, leaf.clone()));
                             }
                         }
+                        // An unexplorable leaf (a relational or container
+                        // sub-pattern's unknown, an unrepresentable
+                        // constant) is the official unknown space
+                        // (`createRelationalSpace` → `createUnknownSpace`,
+                        // shared.dart:624-627: the pattern "does not add to
+                        // the exhaustiveness coverage"). The COLUMN still
+                        // rides along as the empty sub-space, so the row
+                        // covers "the head whose column matches nothing" and
+                        // the gap witnesses the column at its own static type
+                        // (`Map(length: <= 0)` → `Map<bool, bool>(length:
+                        // int())`, co19 exhaustiveness_map_A01_t02). Only an
+                        // unnamed/unknown column still degrades the whole
+                        // pattern.
+                        Restriction::Unknown => carried.push((name, Restriction::Unknown)),
                         _ => {
                             expressible = false;
                             break;
@@ -1736,8 +1746,9 @@ impl<'a> NameWorld<'a> {
     }
 
     /// `isPotentiallyNullable` (`type_system.dart:1260`): everything except
-    /// the non-nullable shapes.
-    fn is_potentially_nullable(ty: &NameTy) -> bool {
+    /// the non-nullable shapes. The cast-pattern close reads it for the
+    /// `null` half of `createCastSpace` (shared.dart:731-735).
+    pub(crate) fn is_potentially_nullable(ty: &NameTy) -> bool {
         !matches!(
             ty,
             NameTy::Named(_, false)
@@ -1999,6 +2010,21 @@ impl<'a> NameWorld<'a> {
         }
     }
 
+    /// The written argument group of a `NamedArgs` static type in the
+    /// official display form (`<bool, bool>`, leading `<` included); `None`
+    /// when no fold window stands or the boundary pool cannot resolve the
+    /// slot — the caller then renders the bare head.
+    fn args_text(&self, args: ArgListId) -> Option<String> {
+        let engine = fold_engine()?;
+        // Copied out of the pool first: rendering re-borrows the same slots.
+        let list: Vec<Ty> = engine.boundary.pool().get(args).to_vec();
+        if list.is_empty() {
+            return None;
+        }
+        let rendered: Vec<String> = list.iter().map(|arg| engine.render_ty(*arg)).collect();
+        Some(format!("<{}>", rendered.join(", ")))
+    }
+
     /// The witness/diagnostic text for a static type.
     fn ty_text(&self, ty: &NameTy) -> String {
         match ty {
@@ -2014,14 +2040,21 @@ impl<'a> NameWorld<'a> {
                     text.to_string()
                 }
             }
-            // The witness text keeps the head spelling (the exhaustiveness
-            // witnesses never write arguments — the pre-#2462 text).
-            NameTy::NamedArgs(name, nullable, _) => {
-                let text = self.strings.resolve(*name);
+            // The official witness text is the static type's own display
+            // (`_BaseStaticType.typeToDart` → `typeToDart` writes the
+            // resolved type, arguments included, static_type.dart:214-239):
+            // a `Map<bool, bool>` scrutinee witnesses `Map<bool, bool>()`,
+            // never the bare head. A slot the boundary cannot project (no
+            // fold window) keeps the head alone — the under-report.
+            NameTy::NamedArgs(name, nullable, args) => {
+                let text = match self.args_text(*args) {
+                    Some(args) => format!("{}{args}", self.strings.resolve(*name)),
+                    None => self.strings.resolve(*name).to_string(),
+                };
                 if *nullable {
                     format!("{text}?")
                 } else {
-                    text.to_string()
+                    text
                 }
             }
             NameTy::EnumValue(enum_name, constant) => {
@@ -2442,6 +2475,32 @@ impl<'a> NameWorld<'a> {
         }
     }
 
+    /// `_isContainedIn(type, space)` (upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:490-500,
+    /// the cast-pattern containment test): every value of `ty` is matched by
+    /// `space`, where a type-free leaf covers the case's `context`. The
+    /// property columns of an object single are not walked here (a cast
+    /// whose sub-pattern constrains fields answers the conservative `false`,
+    /// so the row keeps the narrower space — never a false full coverage).
+    pub(crate) fn contained_in(
+        &self,
+        ty: NameTy,
+        space: &Restriction,
+        context: NameTy,
+    ) -> bool {
+        match space {
+            Restriction::NamedContext => self.is_subtype_of(&ty, &context),
+            Restriction::Union(parts) => parts
+                .iter()
+                .any(|part| self.contained_in(ty, part, context)),
+            Restriction::Null => matches!(ty, NameTy::Null),
+            Restriction::Object(name, _) => {
+                self.is_subtype_of(&ty, &NameTy::Named(*name, false))
+            }
+            _ => leaf_ty(space).is_some_and(|leaf| self.is_subtype_of(&ty, &leaf)),
+        }
+    }
+
     /// The closed subtype set of a sealed class or enum, in declaration
     /// order (types/sealed.dart, types/enum.dart).
     fn name_subtypes(&self, name: StringId, scrutinee: &NameTy) -> Vec<NameTy> {
@@ -2474,6 +2533,21 @@ impl<'a> NameWorld<'a> {
         if !container.sealed {
             return Vec::new();
         }
+        // The sealed split instantiates each subtype as a view of the
+        // scrutinee's OWN arguments (`getSubclassAsInstanceOf`,
+        // upstream Dart SDK source,
+        // pkg/_fe_analyzer_shared/lib/src/exhaustiveness/types/sealed.dart:
+        // 77-119 — `Face<num>` splits into `Jack<num>`, `Queen<num>`, …).
+        // A case written over one instantiation (`Queen<int>`) therefore
+        // never covers the sibling instantiations, which the bare-head split
+        // pretended it did. Only a subtype declaring exactly as many
+        // parameters as the argument list carries is instantiated this way
+        // (the identity-substitution shape `class Jack<T> extends Face<T>`);
+        // every other edge keeps its bare head — the under-report direction.
+        let args = match scrutinee {
+            NameTy::NamedArgs(_, _, args) => Some(*args),
+            _ => None,
+        };
         let mut subtypes = Vec::new();
         for (decl, declared) in self.scan_order(name) {
             // A well-founded closed set never contains its root: a
@@ -2486,10 +2560,28 @@ impl<'a> NameWorld<'a> {
                 || declared.with_clause.contains(&name)
                 || declared.implements_clause.contains(&name)
                 || declared.on_clause.contains(&name);
-            if edge {
-                subtypes.push(NameTy::Named(decl, false));
+            if !edge {
+                continue;
             }
+            let instantiated = args.filter(|args| self.same_arity(decl, *args));
+            subtypes.push(match instantiated {
+                Some(args) => NameTy::NamedArgs(decl, false, args),
+                None => NameTy::Named(decl, false),
+            });
         }
         subtypes
+    }
+
+    /// Whether `decl` declares exactly as many type parameters as the
+    /// argument list `args` carries — the identity substitution the sealed
+    /// split applies to it.
+    fn same_arity(&self, decl: StringId, args: ArgListId) -> bool {
+        let Some(container) = self.container(decl) else {
+            return false;
+        };
+        let Some(engine) = fold_engine() else {
+            return false;
+        };
+        usize::from(container.type_params) == engine.boundary.pool().get(args).len()
     }
 }

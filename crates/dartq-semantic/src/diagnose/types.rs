@@ -4789,6 +4789,9 @@ pub(crate) struct PendingSwitchCovering {
     pub(crate) ty_text: String,
     pub(crate) unmatched: String,
     pub(crate) suggested: String,
+    /// The private-enum template applies (the shared code under the private
+    /// problem text, messages.yaml's `nonExhaustiveSwitch*Private` rows).
+    pub(crate) private: bool,
     /// The case roots, re-decided against the refined value at teardown.
     pub(crate) spaces: Vec<crate::switch_tracker::Restriction>,
     pub(crate) guarded: Vec<bool>,
