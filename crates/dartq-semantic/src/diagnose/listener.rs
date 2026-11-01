@@ -4114,6 +4114,20 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         if let Some((head_name, head_range)) = head {
             engine.check_raw_type(head_name, head_range);
+            // #3296 — the same group-less head answers its boundedness
+            // verdict: a head with no `<...>` group opens no #610 site, so
+            // `check_named`'s instantiate-to-bounds arm never ran on it
+            // (`void f(G g)` over a bare bounded alias reports upstream).
+            // Two contexts own their heads elsewhere: the declaration
+            // windows (container clauses, bound annotations — `leaf` above
+            // routed into them) and an open `<...>` group, whose members
+            // ride the enclosing site's tree.
+            if engine.group_heads.is_empty()
+                && !engine.bounds.in_type_variables()
+                && engine.var_header.is_none()
+            {
+                engine.queue_bare_head_site(head_name, span);
+            }
         }
         // The written-signature and call-argument captures take the final
         // completion (the re-fired parameterized head carries its written
@@ -8651,6 +8665,13 @@ impl ParserListener for DiagnoseListener<'_> {
                     .filter(|(_, kind)| *kind == ContainerKind::Enum)
                     .map(|(name, _)| (name, token.range))
                     .or(head)
+            } else if head.is_none() {
+                // #3296 — the implicit creation's own group (`A<String>()`)
+                // arrives headless (the parser reports the callee as a
+                // constructor reference, never as a type head), so the
+                // oracle's `checkNamedType` face never ran on it. The callee
+                // head recovered from the reference re-opens the site.
+                engine.implicit_creation_head(token.range.offset).or(head)
             } else {
                 head
             };

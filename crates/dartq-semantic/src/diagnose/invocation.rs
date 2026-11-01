@@ -14367,6 +14367,72 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// #3296 — the callee head an implicit creation's type-argument group
+    /// applies to. `A<String>()` parses as a constructor reference, so its
+    /// group arrives headless: the #610 site capture never opened, and the
+    /// verdict the oracle runs at the creation's `NamedType`
+    /// (`checkNamedType`, type_arguments_verifier.dart:243-247) never ran.
+    /// The reference head is the last type use, and it names the group only
+    /// when it abuts the `<` across trivia and this file captured it (a
+    /// foreign head carries no bound facts). Three shapes stay headless:
+    /// a named-constructor selector (`A.named<String>`) owns the
+    /// `_constructor` face, a group outside a creation context is an
+    /// invocation's explicit type arguments (the callee's own face), and
+    /// the keyword spellings (`new A<String>()`, `const A<String>()`) keep
+    /// their #2890 creation bounds face
+    /// ([`Self::check_creation_ref_bounds`]).
+    pub(crate) fn implicit_creation_head(&self, open: u32) -> Option<(StringId, SourceRange)> {
+        if self.implicit_creation_depth == 0 || !self.arg_levels.is_empty() {
+            return None;
+        }
+        let (class, ctor) = self.creation_ref?;
+        if ctor.is_some() {
+            return None;
+        }
+        let &(range, name) = self.type_uses.last()?;
+        if name != class || !self.trivia_between(range.end(), open) {
+            return None;
+        }
+        self.bounds.has_capture(class).then_some((class, range))
+    }
+
+    /// #3296 — a group-less named-type head's bounds face. Upstream runs
+    /// `checkNamedType` at every `NamedType`, and a bare head answers its
+    /// instantiate-to-bounds verdict ([`crate::bounds::Bounds::check_named`]'s
+    /// `args.is_empty()` arm, the raw-type context row riding the report,
+    /// type_arguments_verifier.dart:441-446). The #610 site capture only
+    /// opens at a `<...>` group, so a head with no group reached no site;
+    /// the head token opens and closes one here. Reusing the capture's own
+    /// routing keeps every declaration window with its own face: inside a
+    /// container header or a bound-annotation window the pair folds into
+    /// that window's sink, and under a typedef RHS
+    /// ([`crate::bounds::Bounds::begin_group`]'s alias arm) it is a no-op —
+    /// `check_alias_rhs_sites` owns those heads. The caller delivers the
+    /// head only where no `<...>` group and no such window is open.
+    pub(crate) fn queue_bare_head_site(&mut self, head: StringId, range: SourceRange) {
+        // An in-scope type parameter shadows any container of the same
+        // name, and only a captured head carries bound facts.
+        if self.type_params.contains(&head)
+            || self.pending_type_params.contains(&head)
+            || !self.bounds.has_capture(head)
+        {
+            return;
+        }
+        self.bounds.begin_group(Some((head, range)), true);
+        let Some(mut roots) = self.bounds.end_group(range) else {
+            return;
+        };
+        let Some(tree) = roots.pop() else {
+            return;
+        };
+        self.pending_bounded_checks.push(PendingBoundedCheck::Site {
+            head: tree.head,
+            args: Vec::new(),
+            in_scope: self.type_params.clone(),
+            site: tree.range,
+        });
+    }
+
     /// #2831 P2 — the nested bounded heads of a captured annotation site:
     /// each in-file container argument head queues its own
     /// [`PendingBoundedCheck::Site`] (the whole subtree's span is the
