@@ -998,9 +998,22 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// Declares a top-level name, logging a duplicate when taken. An
-    /// `augment` declaration never logs one: augmenting an existing name is
-    /// the augmentation face's business (the oracle reports
-    /// `duplicate_definition` for same-name introductions only).
+    /// `augment` declaration never logs one **and never claims the name**:
+    /// augmenting an existing name is the augmentation face's business (the
+    /// oracle reports `duplicate_definition` for same-name introductions
+    /// only).
+    ///
+    /// The refusal to claim is the declaration-scope half of the
+    /// augmentation model: an `augment` fragment is a fragment of the
+    /// element the introduction declares (`element.firstFragment` is the
+    /// introduction, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared augmentation handling), so it introduces no
+    /// name of its own. Claiming a vacant slot would invent a unit-local
+    /// declaration for a target declared in a sibling unit of the library —
+    /// the name would then resolve to the augmenting unit's own (partial)
+    /// face instead of the introduction's, and an `augment` with no
+    /// introduction at all would read as defined when the oracle reports
+    /// `augmentation_without_declaration` and treats the name as undefined.
     ///
     /// Returns whether the name's token reported a duplicate — the
     /// `_reportedTokens` face of `checkUnit`'s
@@ -1012,7 +1025,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// variable's induced `x=` never joins `definedSetters`). The
     /// setter-side caller reads the flag to skip that second claim.
     fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) -> bool {
-        let augmenting = self.declaring_augment;
+        // The `augment` head comes first: it neither claims a vacant slot
+        // nor displaces a type parameter's declaration-scoped placeholder.
+        if self.declaring_augment {
+            return false;
+        }
         let setter_spelling = self.is_setter_spelling(name);
         match self.decls.entry(name) {
             // A type parameter's placeholder (declaration-scoped in truth)
@@ -1022,7 +1039,6 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 self.decls.insert(name, decl);
                 false
             }
-            Entry::Occupied(_) if augmenting => false,
             // A `name=` spelling is a top-level setter: its collision
             // surface is `top_setters` (`definedSetters`), which already
             // reported — `decls` stays the model face only.
