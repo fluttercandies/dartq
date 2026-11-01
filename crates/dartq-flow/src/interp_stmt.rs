@@ -2261,8 +2261,8 @@ impl Interp<'_> {
 
     /// Pops the switch frame at `SwitchBlockEnd`: the official `switch_end`
     /// (flow_analysis.dart:7979-8000). `isExhaustive` is the scrutinee's
-    /// always-exhaustive verdict ([`Interp::is_always_exhaustive`], the
-    /// `hasDefault` arm already covered — a default group's close marked
+    /// always-exhaustive verdict ([`Interp::switch_exhaustive_verdict`] —
+    /// the `hasDefault` arm already covered — a default group's close marked
     /// the unmatched chain unreachable): an exhaustive switch never joins
     /// the unmatched chain into the exit, and with no break/fall-through
     /// state at all the post-switch state is `previous` unreachable — the
@@ -2286,6 +2286,7 @@ impl Interp<'_> {
                 unmatched,
                 previous,
                 break_model,
+                scrutinee,
                 scrutinee_ty,
                 scrutinee_args,
                 ..
@@ -2293,7 +2294,7 @@ impl Interp<'_> {
                 unmatched.clone(),
                 previous.clone(),
                 break_model.clone(),
-                self.is_always_exhaustive(*scrutinee_ty, *scrutinee_args),
+                self.switch_exhaustive_verdict(*scrutinee, *scrutinee_ty, *scrutinee_args),
             ),
             _ => return,
         };

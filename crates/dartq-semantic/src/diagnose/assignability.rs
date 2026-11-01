@@ -58,6 +58,20 @@ impl Drop for AssignDepth {
     }
 }
 
+/// Whether a written type-argument segment spells exactly `void` around
+/// whitespace and a trailing group closer (the set/map segment scan keeps
+/// the `>` inside its last segment): a written `void` argument fires no
+/// type-use row (the parser routes the keyword through
+/// `handle_void_keyword`, never `handle_type`), so the segment is read
+/// from its own bytes (#3361).
+fn spells_void(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut inner = bytes[start..end].trim_ascii();
+    if let Some(stripped) = inner.strip_suffix(b">") {
+        inner = stripped.trim_ascii();
+    }
+    inner == b"void"
+}
+
 impl<'a> Engine<'a> {
     /// A literal `<…>` group's argument leaf as a [`Ty`]: `dynamic`/`Null`
     /// intern their dedicated faces — the same mapping the type
@@ -66,8 +80,9 @@ impl<'a> Engine<'a> {
     /// `Named{dynamic}` leaf answers every subtype question `Ty::Dynamic`
     /// decides (the covariant element rule's `dynamic <: int` rejection).
     /// Every other written head keeps its named shape. `void` never
-    /// reaches here (its type-use resolves Missing and the group stays
-    /// opaque), exactly like the completion table's.
+    /// reaches here — the keyword fires no type-use row at all (the
+    /// parser routes it through `handle_void_keyword`), and the literal
+    /// group paths answer it from their own bytes.
     fn literal_arg_leaf(&self, name: StringId, nullable: bool) -> Ty {
         match self.strings.resolve(name) {
             "dynamic" => Ty::Dynamic,
@@ -94,6 +109,18 @@ impl<'a> Engine<'a> {
         // nearest earlier type-use is a pattern head, not an element type.
         if cursor < 2 || bytes[cursor - 1] != b'>' || bytes[cursor - 2] == b'=' {
             return None;
+        }
+        // A written `void` argument fires no type-use row (the parser routes
+        // the keyword through `handle_void_keyword`, never `handle_type`), so
+        // the type-use find below never lands on it: the group's own bytes
+        // answer, and `<void>[]` carries the canonical `List<void>` element
+        // the `use_of_void_result` family reads (#3361).
+        let close = cursor - 1;
+        if let Some(open) = bytes[..close].iter().rposition(|&b| b == b'<')
+            && spells_void(bytes, open + 1, close)
+        {
+            let list = self.intern("List");
+            return Some(self.boundary.args.borrow_mut().named(list, false, &[Ty::Void]));
         }
         let (name_range, name) = self
             .type_uses
@@ -217,19 +244,29 @@ impl<'a> Engine<'a> {
             .map(|(start, end)| {
                 // Segment bounds are bytes; `type_uses` ranges are UTF-16.
                 let (start16, end16) = (self.utf16_of(*start), self.utf16_of(*end));
-                self.type_uses
+                match self
+                    .type_uses
                     .iter()
                     .rev()
                     .find(|(range, _)| range.offset >= start16 && range.end() <= end16)
                     .copied()
-            })
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .map(|(name_range, name)| {
-                if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
-                    return None;
+                {
+                    Some((name_range, name)) => {
+                        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+                            return None;
+                        }
+                        Some(self.literal_arg_leaf(
+                            name,
+                            self.written_nullable_suffix(name_range.end()),
+                        ))
+                    }
+                    // A written `void` argument fires no type-use row (the
+                    // parser routes the keyword through
+                    // `handle_void_keyword`, never `handle_type`): the
+                    // segment's own bytes answer (`<void>{}` → `Set<void>`,
+                    // `<int, void>{}` → `Map<int, void>` — #3361).
+                    None => spells_void(bytes, *start, *end).then_some(Ty::Void),
                 }
-                Some(self.literal_arg_leaf(name, self.written_nullable_suffix(name_range.end())))
             })
             .collect::<Option<Vec<_>>>()?;
         let (set, map) = (self.collection_heads[1], self.collection_heads[2]);

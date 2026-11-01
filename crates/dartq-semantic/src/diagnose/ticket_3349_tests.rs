@@ -102,15 +102,13 @@ fn ticket_3349_for_in_void_element_reports_at_the_iterable() {
     assert_eq!(void_spans(&report_ops(fixture)), vec![(offset, 2)]);
 }
 
-/// Residual 2's literal spelling `for (Object? o in <void>[])`: routed, not
-/// silent by design. The written group's leaf never folds `void` onto
-/// `Ty::Void` (`literal_arg_leaf` special-cases only `dynamic`/`Null`), so
-/// the literal keeps an opaque row and the element face has nothing to
-/// read. The emitter (`Engine::for_in_void_element`) already answers the
-/// annotated iterable above; this arm turns green once the literal's
-/// written argument spells `void`.
+/// Residual 2's literal spelling `for (Object? o in <void>[])`: the written
+/// group's `void` argument fires no type-use row (the parser routes the
+/// keyword through `handle_void_keyword`, never `handle_type`), so the
+/// literal face reads the group from its own bytes (`typed_list_literal_ty`'s
+/// `<void>` probe) and the emitter (`Engine::for_in_void_element`) sees the
+/// `List<void>` element — the same answer the annotated iterable above gets.
 #[test]
-#[ignore = "routed: literal_arg_leaf must spell `void` (assignability.rs, #3312's file)"]
 fn ticket_3349_for_in_void_literal_group_element() {
     let fixture = "void f() {\n  for (Object? o in <void>[]) {}\n}";
     assert_eq!(sole_void(fixture), span_of(fixture, "<void>[]"));

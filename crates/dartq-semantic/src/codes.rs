@@ -593,6 +593,17 @@ pub enum SemanticCode {
     /// the local declaration there — we keep the class-name anchor, a
     /// documented span divergence).
     InconsistentInheritanceGetterAndMethod,
+    // —— #3331: the combined-signature inference family (`COMPILE_TIME_ERROR`) ——
+    /// `Can't infer missing types in '{0}' from overridden methods: {1}.` —
+    /// a METHOD declaration carrying an implicit type slot whose
+    /// multi-candidate super-face set has no combined signature
+    /// (`instance_member_inferrer.dart` `_inferExecutable` records
+    /// `TopLevelInferenceErrorNoCombinedSuperSignature` when
+    /// `combineSignatureTypes` answers null; `inheritance_override.dart`
+    /// `_reportNoCombinedSuperSignature` prints it at the method name and
+    /// skips the member's declared-face override check); `{1}` is the
+    /// `Class.member (signature)` candidate list.
+    NoCombinedSuperSignature,
     // —— #504: the usage cluster (all `STATIC_WARNING`,
     //    `unused_local_elements_verifier.dart`) ————————————————————————————
     /// `The value of the local variable '{0}' isn't used.` — a local
@@ -2211,6 +2222,9 @@ impl SemanticCode {
                 "inconsistent_inheritance_getter_and_method",
                 "INCONSISTENT_INHERITANCE_GETTER_AND_METHOD",
             ),
+            Self::NoCombinedSuperSignature => {
+                ("no_combined_super_signature", "NO_COMBINED_SUPER_SIGNATURE")
+            }
             Self::UnusedLocalVariable => ("unused_local_variable", "UNUSED_LOCAL_VARIABLE"),
             Self::UnusedElement => ("unused_element", "UNUSED_ELEMENT"),
             Self::UnusedField => ("unused_field", "UNUSED_FIELD"),
@@ -3410,6 +3424,9 @@ impl SemanticCode {
             Self::InconsistentInheritance => {
                 format!("Superinterfaces don't have a valid override for '{a0}': {a1}.")
             }
+            Self::NoCombinedSuperSignature => format!(
+                "Can't infer missing types in '{a0}' from overridden methods: {a1}."
+            ),
             Self::InheritsAbstractMemberFour => self.message4(a0, a1, "", ""),
             Self::InheritsAbstractMemberFivePlus => self.message5(a0, a1, "", "", ""),
             // Registry-backed rows, same face as the setter row above.
@@ -5011,6 +5028,8 @@ mod tests {
             SemanticCode::OverrideOnNonOverridingGetter,
             SemanticCode::OverrideOnNonOverridingMethod,
             SemanticCode::OverrideOnNonOverridingSetter,
+            // The #3331 combined-signature inference row.
+            SemanticCode::NoCombinedSuperSignature,
             SemanticCode::DeadCode,
             SemanticCode::AmbiguousExtensionMemberTwo,
             SemanticCode::AmbiguousExtensionMemberThreeOrMore,
@@ -5925,6 +5944,9 @@ mod tests {
             | SemanticCode::MixinSuperClassConstraintNonInterface
             | SemanticCode::MixinWithNonClassSuperclass
             | SemanticCode::MustCallSuper
+            // The #3331 combined-signature inference row: not registry-backed
+            // (the inline `message` arm is the template source).
+            | SemanticCode::NoCombinedSuperSignature
             | SemanticCode::NonConstCallToLiteralConstructor
             | SemanticCode::NonConstantListElement
             | SemanticCode::NonConstantMapElement
@@ -6246,6 +6268,7 @@ mod tests {
             SemanticCode::MixinSuperClassConstraintNonInterface,
             SemanticCode::MixinWithNonClassSuperclass,
             SemanticCode::MustCallSuper,
+            SemanticCode::NoCombinedSuperSignature,
             SemanticCode::NonConstCallToLiteralConstructor,
             SemanticCode::NonConstantListElement,
             SemanticCode::NonConstantMapElement,

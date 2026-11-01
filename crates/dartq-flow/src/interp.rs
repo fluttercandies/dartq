@@ -3115,10 +3115,12 @@ impl<'o> Interp<'o> {
     /// parameter recurses into its bound (the official
     /// `TypeParameterTypeImpl` arm, :868-877) — `T extends St` over the
     /// enum `St` splits completely, so a full-coverage switch over `T`
-    /// leaves the post-switch state dead. The bound is the *declared* one
-    /// ([`crate::ty::Boundary::bound`]): the promoted-bound half of that
-    /// arm is not modelled, which keeps the verdict a conservative subset
-    /// (a promotion the level cannot see answers `false`). Extension types
+    /// leaves the post-switch state dead. The bound here is the *declared*
+    /// one ([`crate::ty::Boundary::bound`]): the arm's promotedBound face
+    /// rides the promotion chain head on a promoted read (this level
+    /// replaces the variable's type with the promoted type), and the
+    /// statement verdict re-adds the arm's declared-bound leg over it
+    /// ([`Self::switch_exhaustive_verdict`]). Extension types
     /// (erasure recursion), records, and function types stay undecidable
     /// at this level — `false`, the conservative arm: a missed verdict
     /// keeps the post-switch state live (the pre-mount behavior), never a
@@ -3128,6 +3130,52 @@ impl<'o> Interp<'o> {
     /// this gate's).
     pub(crate) fn is_always_exhaustive(&self, ty: Ty, args: u32) -> bool {
         self.exhaustive_within(ty, args, BOUND_RECURSION_LIMIT)
+    }
+
+    /// The `switch_end` verdict for a statement's latched scrutinee
+    /// (type_analyzer.dart:2332-2333, `isAlwaysExhaustiveType(scrutineeType)`):
+    /// the base always-exhaustive ask, plus the declared-bound leg of the
+    /// official `TypeParameterTypeImpl` arm (type_system.dart:836-847) when
+    /// the scrutinee is a promoted type-variable read. Upstream's promoted
+    /// type keeps the variable identity (`T & S` — `tryPromoteToType`'s
+    /// `TypeParameterType` arm, type_system.dart:1749-1758), so its verdict
+    /// is the disjunction `exhaustive(promotedBound) ||
+    /// exhaustive(declared bound)`; this level's promotion chain spells the
+    /// promoted head alone, which carries the promotedBound leg exactly —
+    /// the declared-bound leg re-enters here from the declaration capture
+    /// ([`crate::ty::Boundary`]). Exhaustiveness does not descend subtypes
+    /// (a subclass of a sealed type need not be sealed), so the leg is
+    /// invisible to the subtype questions the head already answers.
+    /// A non-reference scrutinee and an unpromoted one (head identical to
+    /// the declared spelling) are the base ask alone — the boundary arm
+    /// already recursed into the bound inside it.
+    pub(crate) fn switch_exhaustive_verdict(
+        &self,
+        scrutinee: Option<u32>,
+        ty: Ty,
+        args: u32,
+    ) -> bool {
+        if self.is_always_exhaustive(ty, args) {
+            return true;
+        }
+        let Some(var) = scrutinee else {
+            return false;
+        };
+        let Some(meta) = self.vars.get(var as usize) else {
+            return false;
+        };
+        let declared = meta.ty;
+        if declared == ty {
+            return false;
+        }
+        let Base::Name(id) = declared.base else {
+            return false;
+        };
+        let Some(boundary) = self.boundaries.get(id as usize).copied().flatten() else {
+            return false;
+        };
+        let (bound, bound_args) = boundary.bound;
+        self.exhaustive_within(bound, bound_args, BOUND_RECURSION_LIMIT)
     }
 
     /// [`Interp::is_always_exhaustive`] with a recursion budget. The

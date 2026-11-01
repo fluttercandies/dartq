@@ -210,8 +210,10 @@ fn a_conditional_uri_name_slot_refuses_an_import_head() {
 
 /// `export 'a.dart' hide A show export 'a.dart';` — the trailing `export`
 /// head ends the first directive after `show`, so `a.dart` reports twice and
-/// `multiple_combinators` spans the first directive's `hide A` only, never
-/// the trailing literal.
+/// `multiple_combinators` spans the whole combinator list: the `show` clause
+/// reads no name (the trailing head is refused in the name slot), so its
+/// `endToken` is the synthetic identifier spliced at the follower — the span
+/// runs through the follower's offset and never covers the trailing literal.
 #[test]
 fn an_export_combinator_list_hands_the_trailing_head_back() {
     const SOURCE: &str = "export 'a.dart' hide A show export 'a.dart';\n";
@@ -228,10 +230,11 @@ fn an_export_combinator_list_hands_the_trailing_head_back() {
     assert_eq!(faces[1].written, Vec::new());
     assert_eq!(
         run.rows_of("multiple_combinators"),
-        vec![(16, 6)],
-        "the warning spans `hide A`, not the trailing literal"
+        vec![(16, 12)],
+        "the warning spans `hide A show ` through the synthetic name at the \
+         trailing head, never the literal itself"
     );
-    assert_eq!(&SOURCE[16..22], "hide A");
+    assert_eq!(&SOURCE[16..28], "hide A show ");
 }
 
 /// Silent negative: `show export;` — the follower `;` is in the combinator
@@ -261,4 +264,61 @@ fn a_library_named_library_before_a_semicolon_stays_a_name() {
     assert_eq!(faces.len(), 1, "one library directive: {faces:?}");
     assert_eq!(faces[0].kind, DirectiveKind::Library);
     assert_eq!(faces[0].name.as_deref(), Some("library"));
+}
+
+/// The dup-export report order: two libraries exporting the same name report
+/// `ambiguous_export` at the repeating export's URI with `{1}` = the
+/// **earlier** export's declaring library and `{2}` = the repeat's — the
+/// oracle's `firstUri: prevElement.library!.uri` / `secondUri:
+/// element.library!.uri` argument order (`error_verifier.dart:2593-2621`
+/// `_checkForAmbiguousExport`). The pair is no `duplicate_export`: that
+/// family groups same-target directives only.
+#[test]
+fn an_ambiguous_export_names_the_earlier_library_first() {
+    const SOURCE: &str = "export 'a.dart' show X;\nexport 'b.dart' show X;\n";
+    let fixture = Fixture::new(&[
+        ("lib/main.dart", SOURCE),
+        ("lib/a.dart", "class X {}\n"),
+        ("lib/b.dart", "class X {}\n"),
+    ]);
+    let mut engine = fixture.engine();
+    engine.discover_workspace().expect("discover");
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("analyze");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|row| row.code.name != "duplicate_export"),
+        "distinct targets are no duplicate: {diagnostics:?}"
+    );
+    let rows: Vec<_> = diagnostics
+        .iter()
+        .filter(|row| row.code.name == "ambiguous_export")
+        .collect();
+    assert_eq!(rows.len(), 1, "one ambiguity at the repeat: {diagnostics:?}");
+    let row = rows[0];
+    assert_eq!(
+        (row.range.offset, row.range.length),
+        (31, 8),
+        "the repeat's own literal anchors the row: {diagnostics:?}"
+    );
+    // `{1}` leads with the earlier export's library, `{2}` trails with the
+    // repeat's — the byte-level order the oracle prints.
+    let body = row
+        .message
+        .strip_prefix("The name 'X' is defined in the libraries '")
+        .unwrap_or_else(|| panic!("oracle message shape: {:?}", row.message));
+    let (first, second) = body
+        .split_once("' and '")
+        .unwrap_or_else(|| panic!("two libraries in the message: {:?}", row.message));
+    let second = second.strip_suffix("'.").unwrap_or(second);
+    assert!(
+        first.ends_with("lib/a.dart"),
+        "first is the earlier export's library: {:?}", row.message
+    );
+    assert!(
+        second.ends_with("lib/b.dart"),
+        "second is the repeat's library: {:?}", row.message
+    );
 }

@@ -2750,17 +2750,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             self.skip_to_token(self.real_id(sep_pos));
                             self.cursor.advance();
                         } else {
-                            // #2024: the recovery row anchors on the token
-                            // the skip lands on — the switch expression's
-                            // closing `}` — not the blocker (the frozen
-                            // oracle anchors the separator recovery row on
-                            // the token following the recovery point).
+                            // Official anchors the row on the blocker `next`
+                            // — the token right after the case expression —
+                            // and only then jumps to the closer
+                            // (`parser_impl.dart:12484-12489`:
+                            // `reportRecoverableError(next, expectedButGot('}'))`
+                            // followed by `next = closingBracket`), so the
+                            // row never rides the closer the skip lands on.
+                            // Frozen oracle: `int() => 0 : 1` reports `}` on
+                            // the `:` (2:14 len 1), not on the line-follower
+                            // `}` (3:1).
                             let close = self.cursor.table_matching_end(begin_switch.id);
-                            let anchor = match close {
-                                Some(c) => self.span_of(c),
-                                None => self.peek_span(),
-                            };
-                            self.report(msg::expected_but_got("}"), anchor);
+                            self.report(msg::expected_but_got("}"), self.peek_span());
                             if let Some(c) = close {
                                 self.skip_to_token(c);
                             }

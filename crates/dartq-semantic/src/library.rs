@@ -43,14 +43,14 @@
 //!
 //! # The part/part-of seam
 //!
-//! The parser consumes directives diet-style and emits no `part` events
-//! yet, so this layer cannot assign files to libraries; callers pass the
-//! owning library and current file explicitly, and **sibling-part private
-//! names are not merged** (a part file's in-library lookup sees only its
-//! own declarations plus the public face). The `part`/`part-of` family
-//! codes ([`dartq_resolution::ResolutionCode`] `PartOf*`) are frozen in
-//! the resolution layer for the diagnostic tickets; when the directive
-//! milestone lands, the file→library fold moves behind this same API.
+//! The graph assigns files to libraries and carries the part tree, so a use
+//! site resolves in **its own file's** combined import scope: the locals
+//! layer is library-wide (every top-level declaration of every unit, privates
+//! included), while the imports and prefixes belong to the file that wrote
+//! them and chain up the part tree to the library file
+//! ([`Namespaces::lookup_in_file`], [`Namespaces::lookup_prefixed_in_file`]).
+//! Callers pass the owning library and the current file explicitly; a name a
+//! sibling part imported is not visible here.
 
 use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId, StringTable};
@@ -213,12 +213,18 @@ pub enum ScopedHit<'a> {
 }
 
 /// The in-library scope chain for `name`: the current file's declarations
-/// (private included), then the library's namespace. Use this for
+/// (private included), then `file`'s **combined import scope** — its own
+/// imports and prefixes, then each including file's up the part tree, then
+/// the library-wide rows ([`Namespaces::lookup_in_file`]). Use this for
 /// diagnostics **inside** the library; the public face
 /// ([`LibraryScopes`]) answers import-side checks.
 ///
-/// The part seam applies: sibling-part private names are not visible until
-/// the directive milestone lands (module docs).
+/// The per-file half is what the enhanced-parts rule requires: "each Dart
+/// file defines a combined import scope which extends the scope chain of the
+/// parent file's combined import scope with its own imports and import
+/// prefixes". A name a part file imports resolves in that part and its
+/// sub-parts only — never in a sibling part or in the library file, whose own
+/// scope the library-level [`Namespaces::lookup`] answers.
 #[must_use]
 pub fn lookup_scoped<'a>(
     graph: &LibraryGraph,
@@ -231,7 +237,7 @@ pub fn lookup_scoped<'a>(
     if let Some(decl) = index.get(file).and_then(|f| f.decl(name)) {
         return ScopedHit::Local(decl);
     }
-    match namespaces.lookup(graph, lib, name) {
+    match namespaces.lookup_in_file(graph, lib, Some(file), name) {
         Lookup::Found(entry) => ScopedHit::Found(entry),
         Lookup::Ambiguous(candidates) => ScopedHit::Ambiguous(candidates),
         Lookup::NotFound => ScopedHit::NotFound,
@@ -301,7 +307,7 @@ pub(crate) fn resolve_container<'a>(
     if let Some(container) = index.get(file).and_then(|f| f.container(name)) {
         return Some((container, file));
     }
-    match namespaces.lookup(graph, lib, name) {
+    match namespaces.lookup_in_file(graph, lib, Some(file), name) {
         Lookup::Found(NamespaceEntry::Decl(owner)) => {
             let container = index.get(owner).and_then(|f| f.container(name))?;
             Some((container, owner))

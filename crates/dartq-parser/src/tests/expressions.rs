@@ -1136,18 +1136,18 @@ fn keyword_blocker_inside_switch_expression_case() {
     // `switch (x) {if}` (oracle patterns/syntheticIdentifier_insideSwitchExpression):
     // the case pattern, the `=>` and the case body each meet the reserved
     // `if` without consuming it — missing_identifier for the pattern and the
-    // body (deduped), expected_token for the arrow. The arrow row anchors on
-    // the blocker; the case-separator recovery row anchors past it — on the
-    // switch expression's closing `}` the skip lands on (the #2024
-    // separator-anchor rule; frozen 0c9fda4b anchors the separator recovery
-    // row on the token following the recovery point).
+    // body, expected_token for the arrow and for the missing case separator.
+    // Every row anchors on the blocker `if` (`parser_impl.dart:12484-12489`
+    // reports the `}` row on `next`, the token after the case expression,
+    // before jumping to the closer), so the two expected_token rows share
+    // one span. Frozen oracle: `1:34 len 2`.
     let src = "void f(Object? x) => switch (x) {if};\n";
     assert_eq!(
         parse(src).error_rows,
         vec![
             ("missing_identifier".to_string(), 33, 2),
             ("expected_token".to_string(), 33, 2),
-            ("expected_token".to_string(), 35, 1),
+            ("expected_token".to_string(), 33, 2),
         ],
         "switch-expression case blocker: {src}"
     );
