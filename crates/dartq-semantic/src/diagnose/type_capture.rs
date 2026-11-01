@@ -1228,6 +1228,31 @@ impl<'a> Engine<'a> {
     /// function-typed formal (`void Function(int Function())`) records the
     /// nested shape as its parameter type.
     pub(crate) fn fn_capture_end(&mut self, nullable: bool) {
+        // The written `<T, U extends B>` group rebuilds from the bounds
+        // window latch when it is this capture's own (#3384): the parser
+        // completes the variables in REVERSE declaration order, so the
+        // captured slice spells the group backwards, and the shared
+        // armed slot loses each bound's explicit arguments (while the
+        // window is open `Bounds::end_group` routes the group to the
+        // bound window, so the completed-group side channel never arms
+        // and the head re-fires bare). The latch carries DECLARATION
+        // order (`Bounds::end_type_variables` reverses it back) with the
+        // full written bound trees, mapped through `tree_ty` exactly
+        // like `pair_exec_window`. The name guard's invariant: a NESTED
+        // group's close takes the `frames` branch in
+        // `Bounds::end_type_variables` and never touches `pending`, so
+        // the latch is either this capture's own window or an older
+        // declaration's stale one — names decide, and the fallback keeps
+        // today's completion-order slice behaviour-identical.
+        let type_params: Vec<(StringId, Option<Ty>)> = match self.fn_type_capture.last() {
+            Some(capture) => {
+                let names: Vec<StringId> =
+                    capture.params.iter().map(|(name, _)| *name).collect();
+                self.window_type_params(&names)
+                    .unwrap_or_else(|| capture.params.clone())
+            }
+            None => Vec::new(),
+        };
         let Some(capture) = self.fn_type_capture.pop() else {
             // No capture in this context (a function type inside a body or
             // a container header the sig face does not record): the written
@@ -1256,9 +1281,12 @@ impl<'a> Engine<'a> {
         let return_ty = capture.ret.map_or(Ty::Dynamic, |(ty, ..)| ty);
         // The written `<T, U extends B>` group rides the shape (#2878):
         // the message slots spell it back (`void Function<T>(T)`), the
-        // official `FunctionType` display form.
+        // official `FunctionType` display form. #3384: the group is the
+        // window-rebuilt slice (declaration order, bounds with their
+        // written arguments) when the latch matched, else the captured
+        // slice as before.
         let fn_ty = self.boundary.args.borrow_mut().function_generic(
-            &capture.params,
+            &type_params,
             return_ty,
             &capture.positional,
             &named,
@@ -1284,12 +1312,38 @@ impl<'a> Engine<'a> {
             return;
         }
         self.fn_type_stash = Some(Box::new(FnVarSig {
-            params: capture.params.into_boxed_slice(),
+            // #3384: the same rebuilt slice rides the stash —
+            // `fn_sig_display` spells the group from it, so the
+            // signature-display face inherits the declaration-order
+            // fix with the armed-slot face.
+            params: type_params.into_boxed_slice(),
             required_positional: capture.required_positional.min(u16::MAX as usize) as u16,
             positional: capture.positional.into_boxed_slice(),
             named: capture.named.into_boxed_slice(),
             return_ty,
         }));
+    }
+
+    /// The capture's own type-variable group rebuilt from the bounds
+    /// window latch: written order, each bound mapped through
+    /// [`Engine::tree_ty`] (`pair_exec_window`'s exact mapping — the
+    /// same recovery posture for a recovered bound tree). `None` = no
+    /// latch, or the latch names another group — the caller keeps its
+    /// captured slice.
+    fn window_type_params(&self, expected: &[StringId]) -> Option<Vec<(StringId, Option<Ty>)>> {
+        let window = self.bounds.pending_window()?;
+        // The latch carries written order; the capture pushed in parser
+        // completion order — the reverse.
+        let completion: Vec<StringId> = window.iter().rev().map(|(name, _, _)| *name).collect();
+        if completion != expected {
+            return None;
+        }
+        Some(
+            window
+                .iter()
+                .map(|(name, bound, _)| (*name, bound.as_ref().map(|tree| self.tree_ty(tree))))
+                .collect(),
+        )
     }
 
     /// A type completion inside the open capture: the formal section arms

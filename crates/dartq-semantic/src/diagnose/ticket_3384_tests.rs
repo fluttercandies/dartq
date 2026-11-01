@@ -24,9 +24,10 @@
 //!    reads bare (`A<dynamic>` displays `A`).
 //!
 //! The model-level render is already faithful — the first two pins lock
-//! that half (they must stay green through the upstream fix). The
-//! end-to-end pins carry the oracle-true strings; they are `#[ignore]`d
-//! until the capture fix (#3410) lands and must flip green with no edit.
+//! that half. The end-to-end pins carry the oracle-true strings through
+//! the capture, whose group now rebuilds from the bounds window latch
+//! (declaration order, bounds with their written arguments) in
+//! `fn_capture_end`.
 
 use super::FileReport;
 use super::test_rig::report_ops;
@@ -80,12 +81,12 @@ fn render_spells_a_bound_type_arguments() {
     );
 }
 
-// —— the end-to-end capture (oracle-true, blocked on #3410) ——————
+// —— the end-to-end capture (oracle-true) ————————————————————————
 
-/// The written group displays in DECLARATION order. dartq currently
-/// displays the completion order (`<Y extends String, X extends int>`).
+/// The written group displays in DECLARATION order. Before the fix the
+/// capture stored the parser's completion order and displayed
+/// `<Y extends String, X extends int>`.
 #[test]
-#[ignore = "blocked on listener.rs order+bound-args fix, ticket #3410"]
 fn written_group_displays_in_declaration_order() {
     let report = report_ops(
         "void t() {\n\
@@ -101,10 +102,9 @@ fn written_group_displays_in_declaration_order() {
     );
 }
 
-/// A written bound keeps its explicit type arguments. dartq currently
-/// displays the bare head (`<Z extends A>`).
+/// A written bound keeps its explicit type arguments. Before the fix the
+/// armed-slot path lost the bound's group and displayed `<Z extends A>`.
 #[test]
-#[ignore = "blocked on listener.rs order+bound-args fix, ticket #3410"]
 fn written_bound_keeps_its_type_arguments() {
     let report = report_ops(
         "class A<X> {}\n\
