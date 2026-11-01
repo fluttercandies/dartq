@@ -18026,3 +18026,14 @@ mod ticket_3313_tests;
 #[cfg(test)]
 #[path = "ticket_3306_tests.rs"]
 mod ticket_3306_tests;
+
+// The #3318 pins (`unused_import`'s site contract on the scopes side): one
+// import site per written directive — a non-string URI head (`import 5;`,
+// an unquoted experimental URI) keeps a text-empty, zero-length site at the
+// recovered head, so the pass's positional alignment against the library's
+// per-directive edges holds and the neighbouring imports keep their own
+// rows. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3318_tests.rs"]
+mod ticket_3318_tests;

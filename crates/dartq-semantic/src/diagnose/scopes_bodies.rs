@@ -266,16 +266,18 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// `begin_import`: one site per `import` directive whose URI starts
-    /// with a `String` token — the `unused_import` pass aligns `imports`
-    /// positionally against the library's import edges, and an import
-    /// element exists upstream for every written directive whatever its
-    /// URI shape (the interpolation arm still contributes a
-    /// `libraryImports[index]` and an edge with no target;
-    /// `imports_verifier.dart:232+` iterates the directive list, so a
-    /// dropped site here would misalign every following import against
-    /// the engine's per-directive `ImportEdge`, `file_state.dart`'s
-    /// `LibraryImport` construction).
+    /// `begin_import`: one site per written `import` directive — the
+    /// `unused_import` pass aligns `imports` positionally against the
+    /// library's import edges, and an import element exists upstream for
+    /// every written directive whatever its URI shape (the interpolation
+    /// arm still contributes a `libraryImports[index]` and an edge with no
+    /// target; `imports_verifier.dart:232+` iterates the directive list).
+    /// The engine registers exactly one `ImportEdge` per directive
+    /// (`DirectiveKind::Import` over `unit.facts.directives`), so a
+    /// dropped site here does not merely skip that directive: the count
+    /// gate (`edges.len() != imports.len()`) silences the whole file's
+    /// `unused_import`/`unused_shown_name` faces, whatever the other
+    /// directives look like.
     ///
     /// Only an honestly quoted single token carries `uri_text`: a string
     /// interpolation's first segment is a `String` token whose lexeme is
@@ -287,15 +289,42 @@ impl<'a> Engine<'a> {
     /// which never resolves and never reports on the import side.
     /// `uri_range` still anchors at the first URI token so
     /// `directive_range_around` can walk back to the `import` keyword.
-    /// A non-string URI head (`import 5;`) carries no site at all — the
-    /// same under-report posture as before, matching the directive walk's
-    /// own non-string URI arm.
+    ///
+    /// A non-string URI head (`import 5;`, an unquoted experimental URI as
+    /// the pinned parser recovers it) joins with an empty `uri_text` and a
+    /// zero-length `uri_range` at that head. The parser hands the AST a
+    /// synthetic `String` token for it, but a synthetic token's id sits
+    /// past the scanned table (`Cursor::insert_synthetic`), so the engine's
+    /// head read lands on the real token: the recovered URI's position is
+    /// where upstream's empty `relativeUriString` anchors, and the site
+    /// must exist for the count gate to hold.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn begin_import_site(&mut self, import_kw: Token) {
+        // `import` with no following token (end of file): the directive is
+        // still written, so the site must still exist — anchored on the
+        // keyword itself.
         let Some(uri) = self.tokens.get(import_kw.id as usize + 1) else {
+            self.imports.push(ImportSite {
+                uri_text: String::new(),
+                uri_range: SourceRange {
+                    offset: import_kw.range.offset,
+                    length: 0,
+                },
+                prefix: None,
+                shown: Vec::new(),
+            });
             return;
         };
         if uri.kind != dartq_scanner::TokenKind::String {
+            self.imports.push(ImportSite {
+                uri_text: String::new(),
+                uri_range: SourceRange {
+                    offset: uri.utf16_offset,
+                    length: 0,
+                },
+                prefix: None,
+                shown: Vec::new(),
+            });
             return;
         }
         let raw = &self.source[uri.byte_range()];
