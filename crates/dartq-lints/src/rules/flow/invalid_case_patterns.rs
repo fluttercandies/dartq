@@ -1,7 +1,7 @@
 use dartq_ast::NodeKind;
 use dartq_scanner::{Keyword, TokenKind};
 
-use super::{Check, PayloadField, RuleSpec};
+use super::{Check, RuleSpec};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/invalid_case_patterns.dart` — a legacy
@@ -15,20 +15,29 @@ use super::{Check, PayloadField, RuleSpec};
 /// creation (:78-81), and the bare `_` identifier (:82-87).
 ///
 /// Gate: the official registration bails WITH the feature (:41 — the
-/// lint exists for pre-3.0 libraries only); the same
-/// [`crate::engine::Features::patterns`] bit keys this rule's
-/// registration, so with patterns on the rule never runs.
+/// lint exists for pre-3.0 libraries only). The registration table keys
+/// the same bit ([`crate::registry`] `REGISTRATION_GATES`), so the rule
+/// never runs at a 3.0+ unit; the in-rule mirror below keeps the bail
+/// next to the code that depends on it. The gate therefore lives in the
+/// rule's own enablement — the one layer that sees the file's language
+/// version. The *parse* cannot carry it: the lint bridge parses every
+/// unit on the fixed Dart 3.15 surface ([`crate::bridge`]
+/// `PARSE_FEATURES`), so a 2.19 head is parsed as a *pattern* and the
+/// pattern grammar truncates the legacy expression surface (`case 1 + 2:`
+/// folds to the constant pattern `1`, the `+ 2` tail recovered). A gate
+/// derived from that shape would fire on modern code (whose heads are
+/// patterns by construction) and silence the legacy files the rule
+/// exists for.
 ///
-/// The head is classified from its TOKENS, not from the arena rows. The
-/// lint bridge parses every unit on the fixed Dart 3.15 surface
-/// ([`crate::bridge`] `PARSE_FEATURES`), so a 2.19 head is parsed as a
-/// *pattern*, and the pattern grammar truncates the legacy expression
-/// surface (`case 1 + 2:` folds to the constant pattern `1`, the `+ 2`
-/// tail recovered) — the rows cannot answer the official arms. The token
-/// run between `case` and the head's own `:` is exactly the surface the
-/// official expression parse consumed, so every arm reads off it; the
-/// report range is that run's extent (the official
-/// `reportAtNode(expression)`).
+/// The head is therefore classified from its TOKENS, never from the arena
+/// rows: the run between `case` and the head's own `:` is exactly the
+/// surface the official expression parse consumed, so every arm reads off
+/// it; the report range is that run's extent (the official
+/// `reportAtNode(expression)`). The whole switch block is walked once per
+/// statement (depth-tracked, so a nested switch's heads stay out and its
+/// own dispatch reports them), which keeps the face free of the case
+/// row's shape — the materialized children and their expression count are
+/// parse-posture artifacts, the token run is not.
 ///
 /// Boundaries: the `identical`/`length` membership faces are name-level
 /// (a user `identical`/`length` over-reports); the implicit-const
@@ -36,48 +45,66 @@ use super::{Check, PayloadField, RuleSpec};
 /// needs constructor resolution the rule context cannot reach and
 /// under-reports. Message: `diagnostic.g.dart` `invalidCasePatterns`.
 pub(crate) static SPEC: RuleSpec =
-    crate::spec!("invalid_case_patterns", &[NodeKind::SwitchCase], check,);
+    crate::spec!("invalid_case_patterns", &[NodeKind::SwitchStatement], check,);
 
 fn check(c: &mut Check<'_>) {
     // The registration bail (:41).
     if c.unit.features.patterns {
         return;
     }
-    // Expressions precede the statements (the `SwitchCase` row's
-    // `ExpressionCount` word counts them; the Label prefix reads off).
-    let count = c
-        .field(c.node(), PayloadField::ExpressionCount)
-        .unwrap_or(0) as usize;
-    if count == 0 {
+    let Some(block) = c
+        .collect_direct(c.node())
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::SwitchBlock)
+    else {
         return;
-    }
-    let kids = c.collect_direct(c.node());
-    let wrappers: Vec<u32> = kids
-        .iter()
-        .copied()
-        .filter(|&kid| c.kind(kid) != NodeKind::Label)
-        .take(count)
-        .collect();
-    for wrapper in wrappers {
-        let Some(head) = head_tokens(c, wrapper) else {
-            continue;
+    };
+    let span = c.unit.ast.token_range(block);
+    let mut depth = 0usize;
+    let mut index = span.start;
+    while index < span.end {
+        let Some(kind) = c.unit.tokens.get(index as usize).map(|token| token.kind) else {
+            break;
         };
-        let head = unparenthesized(c, &head);
-        if head.is_empty() || !is_invalid(c, head) {
-            continue;
+        match kind {
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+            }
+            // The block's own `{` sits at depth 1, so a head's `case`
+            // keyword is the only one read at that depth — a nested
+            // switch's block is one level deeper and dispatches itself.
+            TokenKind::Keyword(Keyword::Case) if depth == 1 => {
+                report_head(c, index, span.end);
+            }
+            _ => {}
         }
-        let (Some(start), Some(end)) = (
-            c.utf16_of_token(head[0]),
-            c.utf16_end_of_token(head[head.len() - 1]),
-        ) else {
-            continue;
-        };
-        c.report(start..end, &[]);
+        index += 1;
     }
 }
 
+/// Reports `case` head `case_token` when it matches one of the official
+/// arms.
+fn report_head(c: &mut Check<'_>, case_token: u32, limit: u32) {
+    let head = case_head(c, case_token, limit);
+    let head = unparenthesized(c, &head);
+    if head.is_empty() || !is_invalid(c, head) {
+        return;
+    }
+    let (Some(start), Some(end)) = (
+        c.utf16_of_token(head[0]),
+        c.utf16_end_of_token(head[head.len() - 1]),
+    ) else {
+        return;
+    };
+    c.report(start..end, &[]);
+}
+
 /// The head's token run: every token between the `case` keyword and the
-/// head's own `:`.
+/// head's own `:`, bounded by the switch block's end.
 ///
 /// The run is read off the token table (source order), never the arena:
 /// the parse recovers the legacy tail as junk (`expect_kind` splices a
@@ -86,17 +113,16 @@ fn check(c: &mut Check<'_>) {
 /// depth-0 `:` ends the head, a ternary's colon is consumed by its
 /// pending `?`, and a `when` clause (`when` is a 3.0 suffix, outside this
 /// rule's gate) ends it too.
-fn head_tokens(c: &Check<'_>, wrapper: u32) -> Option<Vec<u32>> {
-    let case_token = c.head_token(wrapper);
-    if c.token_is_synthetic(case_token) {
-        return None;
-    }
+fn case_head(c: &Check<'_>, case_token: u32, limit: u32) -> Vec<u32> {
     let tokens = c.unit.tokens;
     let mut run = Vec::new();
     let mut depth = 0usize;
     let mut ternary = 0usize;
     let mut index = case_token + 1;
-    while let Some(token) = tokens.get(index as usize) {
+    while index < limit {
+        let Some(token) = tokens.get(index as usize) else {
+            break;
+        };
         let kind = token.kind;
         if depth == 0 {
             match kind {
@@ -124,7 +150,7 @@ fn head_tokens(c: &Check<'_>, wrapper: u32) -> Option<Vec<u32>> {
         }
         index += 1;
     }
-    Some(run)
+    run
 }
 
 /// The official `unParenthesized` (:51): enclosing parenthesized groups
@@ -363,14 +389,27 @@ mod tests {
     use crate::engine::{Features, Unit};
     use crate::testsupport::one_rule;
 
-    /// The 2.19 posture: the bit gates the rule's registration (the
-    /// official `LanguageVersion219` corpus), while the grammar stays the
-    /// bridge's fixed 3.15 surface — the head is read off its tokens.
+    /// The 2.19 posture: a pre-3.0 unit (`@dart=2.19`, or a package whose
+    /// language version pins 2.19) carries `patterns: false`, which is the
+    /// rule's own registration input. The grammar stays the bridge's fixed
+    /// 3.15 surface — the head is read off its tokens.
     fn legacy(source: &str) -> Vec<crate::engine::Lint> {
-        let features = Features {
-            patterns: false,
-            ..Features::default()
-        };
+        run_with(
+            source,
+            Features {
+                patterns: false,
+                ..Features::default()
+            },
+        )
+    }
+
+    /// The 3.0+ posture (the default unit): the registration bail keeps the
+    /// rule silent, and the same source never reports.
+    fn modern(source: &str) -> Vec<crate::engine::Lint> {
+        run_with(source, Features::default())
+    }
+
+    fn run_with(source: &str, features: Features) -> Vec<crate::engine::Lint> {
         let parsed = crate::parse_unit(source, features);
         let unit = Unit {
             source: &parsed.source,
@@ -405,6 +444,48 @@ mod tests {
             lints[0].correction.as_deref(),
             Some("Try refactoring the expression to be valid in 3.0.")
         );
+    }
+
+    /// The gate's two polarities, side by side: the legacy unit reports the
+    /// head, and the same unit at the 3.0+ posture stays silent (the
+    /// official registration bail — a gate read off the parse shape would
+    /// invert both).
+    #[test]
+    fn the_language_version_gate_is_the_units_own_enablement() {
+        let source = "void f(Object o) {\n  switch (o) {\n    case 1 + 2:\n  }\n}\n";
+        assert_eq!(legacy(source).len(), 1);
+        assert!(modern(source).is_empty(), "a 3.0+ unit registers the rule off");
+        // A modern head (a valid constant pattern) is silent either way —
+        // the gate silences it, not the classification.
+        let valid = "void f(Object o) {\n  switch (o) {\n    case 1:\n  }\n}\n";
+        assert!(modern(valid).is_empty());
+        assert!(legacy(valid).is_empty());
+    }
+
+    /// Every head of one switch reports exactly once — the block walk is
+    /// depth-tracked, so a nested switch's head is left to that switch's
+    /// own dispatch (never double-reported) — and `default` never reports.
+    #[test]
+    fn every_head_of_the_block_reports_once_and_default_never_does() {
+        let source = concat!(
+            "void f(Object o, Object p) {\n",
+            "  switch (o) {\n",
+            "    case 1 + 2:\n",
+            "    case 3 is int:\n",
+            "    default:\n",
+            "      switch (p) {\n",
+            "        case 4 * 5:\n",
+            "      }\n",
+            "  }\n",
+            "}\n",
+        );
+        let lints = legacy(source);
+        assert_eq!(lints.len(), 3, "{lints:?}");
+        let heads: Vec<&str> = lints
+            .iter()
+            .map(|lint| &source[lint.range.start as usize..lint.range.end as usize])
+            .collect();
+        assert_eq!(heads, vec!["1 + 2", "3 is int", "4 * 5"]);
     }
 
     /// `test_binaryExpression_logicalAnd` / `test_conditionalExpression`
@@ -456,47 +537,10 @@ mod tests {
     #[test]
     fn parenthesized_form_reports_inside_the_parens() {
         let source = "void f(Object o) {\n  switch (o) {\n   case (({'k': 'v'})):\n  }\n}\n";
-        let parsed = crate::parse_unit(
-            source,
-            Features {
-                patterns: false,
-                ..Features::default()
-            },
-        );
-        let unit = Unit {
-            source: &parsed.source,
-            tokens: &parsed.tokens,
-            ast: &parsed.ast,
-            lines: &parsed.lines,
-            path: Some(std::path::Path::new("lint_fixture.dart")),
-            features: parsed.features,
-            version: None,
-            workspace: None,
-            reachability: None,
-            async_context_uses: None,
-            library_type_uses: None,
-        };
-        let lints = crate::engine::run(
-            &unit,
-            &one_rule("invalid_case_patterns"),
-            &FxHashSet::default(),
-        );
+        let lints = legacy(source);
         assert_eq!(lints.len(), 1, "{lints:?}");
-        // The third `{` token: the first opens the function body, the
-        // second the switch block, the third the case's map literal.
-        let brace = parsed
-            .tokens
-            .as_slice()
-            .iter()
-            .enumerate()
-            .filter(|(_, token)| parsed.source[token.byte_range().clone()] == *"{")
-            .nth(2)
-            .map(|(index, _)| index)
-            .expect("the literal brace");
-        assert_eq!(
-            lints[0].range.start,
-            parsed.tokens.as_slice()[brace].utf16_offset
-        );
+        let reported = &source[lints[0].range.start as usize..lints[0].range.end as usize];
+        assert_eq!(reported, "{'k': 'v'}");
     }
 
     /// `test_prefixedExpression_intLiteral_ok` / `test_unaryOperator_minus`
@@ -563,20 +607,14 @@ mod tests {
         );
     }
 
-    /// The gate (:41): with the feature on the rule is silent.
-    #[test]
-    fn patterns_feature_on_is_silent() {
-        let f = crate::testsupport::Fixture::parse(
-            "void f(Object o) {\n  switch (o) {\n    case 1 + 2:\n  }\n}\n",
-        );
-        assert!(f.run(&one_rule("invalid_case_patterns")).is_empty());
-    }
-
     /// A `const _ = 3;` shadow and plain constants never report.
     #[test]
     fn plain_constant_cases_are_silent() {
         assert_eq!(
-            legacy("void f(Object o) {\n  switch (o) {\n    case 1:\n    case 'x':\n    case true:\n  }\n}\n").len(),
+            legacy(
+                "void f(Object o) {\n  switch (o) {\n    case 1:\n    case 'x':\n    case true:\n  }\n}\n"
+            )
+            .len(),
             0
         );
     }

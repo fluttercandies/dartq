@@ -2951,15 +2951,16 @@ fn implicit_call_tearoffs_reports_local_declaration_target() {
 }
 
 /// `this is JSClass` / `this as JSClass` with a same-file `@JS`
-/// class under a `dart:js_interop` import reports; non-interop
-/// types, other receivers and files without the import stay silent.
+/// class under a `dart:js_interop` import reports, and so does a bare
+/// operand whose written type is a Dart type (`o is JS` — the
+/// `messages.yaml` `doc_bad_0` shape); a non-interop type stays silent.
 #[test]
 fn invalid_runtime_check_reports_dart_vs_js() {
     let f = Fixture::parse(
         "import 'dart:js_interop';\n\n@JS\nclass JS {\n  external JS();\n}\n\nclass Dart {\n  bool check() => this is JS;\n  Object cast() => this as JS;\n  bool plain(Object o) => o is JS;\n  bool self() => this is Dart;\n}",
     );
     let lints = f.run(&one_rule("invalid_runtime_check_with_js_interop_types"));
-    assert_eq!(lints.len(), 2, "{lints:?}");
+    assert_eq!(lints.len(), 3, "{lints:?}");
     assert_eq!(
         lints[0].message,
         "Runtime check between 'Dart' and 'JS' checks whether a Dart value is a JS interop type, which might not be platform-consistent."
@@ -2967,6 +2968,10 @@ fn invalid_runtime_check_reports_dart_vs_js() {
     assert_eq!(
         lints[1].message,
         "Cast from 'Dart' to 'JS' casts a Dart value to a JS interop type, which might not be platform-consistent."
+    );
+    assert_eq!(
+        lints[2].message,
+        "Runtime check between 'Object' and 'JS' checks whether a Dart value is a JS interop type, which might not be platform-consistent."
     );
 }
 
