@@ -3689,16 +3689,86 @@ impl Interp<'_> {
                         self.promoted_args_of(var, &model),
                     )
                 };
-                self.ops.try_promote_to_typed(
-                    tested,
-                    tested_args,
-                    previous,
-                    previous_args,
-                    self.args,
-                    self.names,
-                )
+                self.ops
+                    .try_promote_to_typed(
+                        tested,
+                        tested_args,
+                        previous,
+                        previous_args,
+                        self.args,
+                        self.names,
+                    )
+                    .or_else(|| {
+                        self.type_parameter_promotion(previous, tested, tested_args)
+                    })
             }
         }
+    }
+
+    /// The official `tryPromoteToType`'s type-parameter arm (upstream Dart
+    /// SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type_system.dart:1754-1768): for a
+    /// type variable `T extends U`, a tested type `S` with `S <: U`
+    /// promotes the variable to the intersection `T & S` — the analyzer
+    /// builds `TypeParameterTypeImpl(promotedBound: S)`, so the read's
+    /// static type carries `S`'s members and `S`'s nullability.
+    ///
+    /// The resolved seam's
+    /// [`crate::ty::TypeOps::try_promote_to_typed`] refuses that
+    /// step: `S <: T` is false for every proper `S` (a type variable
+    /// subtypes nothing below its bound), so the strict-subtype gate sees
+    /// no refinement. The declared bound is element data the seam does not
+    /// carry — the recorder's [`crate::ty::Boundary`] table does, which is
+    /// why the arm lives here beside the boundary-aware nullability faces
+    /// ([`Interp::classify`], [`Interp::promote_to_non_null`]).
+    ///
+    /// This lattice spells no promoted bound, and its chain head replaces
+    /// the variable's type outright ([`Interp::promoted_type_of`]), so the
+    /// intersection stands as its `S` head — the same spelling the chain
+    /// applies to every promoted read. Once the head is a spelled class the
+    /// variable is no longer recognisable as a parameter (no boundary row),
+    /// and the plain gate owns the question.
+    fn type_parameter_promotion(
+        &self,
+        from: Ty,
+        tested: Ty,
+        tested_args: u32,
+    ) -> Option<Ty> {
+        let Base::Name(id) = from.base else {
+            return None;
+        };
+        let boundary = self.boundaries.get(id as usize).copied().flatten()?;
+        let (bound, bound_args) = boundary.bound;
+        // `S <: U` — the official promotion gate (:1756-1757).
+        if !self
+            .ops
+            .is_subtype_typed(tested, tested_args, bound, bound_args, self.args, self.names)
+        {
+            return None;
+        }
+        // `isValidPromotionStep` (`flow_analysis.dart:5989-6007`): the
+        // intersection `T & S` subtypes `T` by construction, so the step
+        // stands unless the variable already satisfies the tested type
+        // (`T <: Object` over an `extends Object` bound).
+        if self.ops.is_subtype_typed(
+            from,
+            crate::ty::EMPTY_ARGS,
+            tested,
+            tested_args,
+            self.args,
+            self.names,
+        ) {
+            return None;
+        }
+        // The intersection's nullability (`type_system.dart:2100-2120`):
+        // nullable only when both the variable and the tested type are —
+        // a non-nullable variable's `is int?` still narrows to the
+        // non-null face.
+        Some(if from.nullable && tested.nullable {
+            tested
+        } else {
+            tested.non_null()
+        })
     }
 
     /// Routes a declared type to its consumer: the open variable
