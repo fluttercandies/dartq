@@ -15,10 +15,11 @@
 //!   every parse row in the merged report, so this layer never reports
 //!   them.
 //! * the *name-level* checks — representation-depends-on-itself,
-//!   `member_with_class_name`, `extension_type_declares_member_of_object`,
-//!   the disabled-arm `expected_representation_type` — read the surviving
-//!   single representation formal from the collected element model and live
-//!   here.
+//!   `member_with_class_name`, `extension_type_declares_member_of_object`
+//!   (the representation formal's own name and every method-shaped member's,
+//!   `error_verifier.dart:4788-4796` and `:4955-4966`), the disabled-arm
+//!   `expected_representation_type` — read the collected element model and
+//!   live here.
 //!
 //! The split is the established house posture (recorded here from
 //! overrides.rs in #2807): the collector does not carry the syntactic
@@ -32,6 +33,7 @@
 //! tokens the payload was captured from.
 
 use super::*;
+use crate::member_face::OBJECT_MEMBERS;
 use dartq_scanner::{Keyword, TokenKind};
 
 impl Engine<'_> {
@@ -66,10 +68,12 @@ impl Engine<'_> {
             return;
         };
         // The representation can't depend on itself
-        // (`error_verifier.dart:5343-5354`, anchored at the type name). M1
-        // name-level: a direct `E` reference; a generic `List<E>`-shaped
-        // dependency stays an under-report.
-        if rep.formal.ty == Ty::named(container) {
+        // (`error_verifier.dart:4890-4900` reads the linker's flag,
+        // `extension_type.dart:97-135`: every node of a representation-type
+        // cycle — a direct self-edge, a type-argument reference, or two
+        // declarations pointing at each other — carries it), anchored at the
+        // type name.
+        if self.representation_depends_on_itself(container, elements) {
             self.emit(
                 SemanticCode::ExtensionTypeRepresentationDependsOnItself,
                 name_range,
@@ -86,6 +90,29 @@ impl Engine<'_> {
             self.emit(
                 SemanticCode::ExtensionTypeDeclaresMemberOfObject,
                 rep.name_range,
+                "",
+                "",
+            );
+        }
+        // `_checkForExtensionDeclaresMemberOfObject`'s extension-type arm
+        // (`error_verifier.dart:4788-4796`): EVERY method-shaped member —
+        // getter, setter, method or operator, static or instance — reports
+        // at its own name when it shadows an `Object` member. Fields stay
+        // out: an instance field's row is `extension_type_declares_instance_field`
+        // (the parser's), and the representation formal (a `Field` row)
+        // keeps the name-check arm above.
+        for (name, member) in decl.members.iter() {
+            if member.kind == MemberKind::Field
+                || member.name_range == MemberEntry::MISSING_NAME_RANGE
+            {
+                continue;
+            }
+            if !self.is_object_member_name(*name, member.kind) {
+                continue;
+            }
+            self.emit(
+                SemanticCode::ExtensionTypeDeclaresMemberOfObject,
+                member.name_range,
                 "",
                 "",
             );
@@ -124,6 +151,83 @@ impl Engine<'_> {
         // (`extension_type_implements_not_supertype`) decides at the
         // file-tail bounds pass ([`Self::finalize_ext_faces`]): the faces'
         // type arguments name declarations the parse has not reached yet.
+    }
+
+    /// Whether the member keyed `name` (a setter's key carries the `=`
+    /// suffix, `MemberKind::Setter`) spells one of `dart:core` `Object`'s
+    /// member names — the oracle compares the name token's plain lexeme
+    /// (`error_verifier.dart:4791`, `_typeProvider.isObjectMember(node.name.lexeme)`).
+    fn is_object_member_name(&self, name: StringId, kind: MemberKind) -> bool {
+        let text = self.strings.resolve(name);
+        let plain = match kind {
+            MemberKind::Setter => text.strip_suffix('=').unwrap_or(text),
+            _ => text,
+        };
+        OBJECT_MEMBERS.contains(&plain)
+    }
+
+    /// Whether `container`'s representation type depends on the type itself
+    /// — a self-edge, a reference through a type argument, or a cycle
+    /// between extension types (`extension_type.dart:97-135`: the linker
+    /// marks every node of a representation-type cycle, and
+    /// `error_verifier.dart:4893-4900` reports that flag).
+    ///
+    /// The graph is this compilation unit's own extension types: the oracle
+    /// collects dependencies from the elements of the linking unit only
+    /// (`extension_type.dart:84-90`), and a cycle whose other leg lives in a
+    /// sibling unit stays an under-report here (the pass sees one file).
+    fn representation_depends_on_itself(
+        &self,
+        container: StringId,
+        elements: &FileElements,
+    ) -> bool {
+        let mut pending = self.representation_dependencies(container, elements);
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        while let Some(next) = pending.pop() {
+            if next == container {
+                return true;
+            }
+            if !seen.insert(next) {
+                continue;
+            }
+            pending.extend(self.representation_dependencies(next, elements));
+        }
+        false
+    }
+
+    /// The extension types `container`'s representation type mentions — the
+    /// head and every explicit type argument's heads, restricted to this
+    /// unit's extension-type declarations (a name resolving to anything else
+    /// is no graph edge).
+    ///
+    /// A record- or function-shaped representation (`(A,) it`,
+    /// `void Function(A) it`) keeps its own under-report: those shapes hide
+    /// their heads behind the shape pools the name level does not open.
+    fn representation_dependencies(
+        &self,
+        container: StringId,
+        elements: &FileElements,
+    ) -> Vec<StringId> {
+        let Some(decl) = elements.container(container) else {
+            return Vec::new();
+        };
+        if decl.kind != ContainerKind::ExtensionType {
+            return Vec::new();
+        }
+        let Some(rep) = decl.primary_formals.first() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        {
+            let args = self.boundary.args.borrow();
+            collect_named_heads(rep.formal.ty, &args, &mut out);
+        }
+        out.retain(|name| {
+            elements
+                .container(*name)
+                .is_some_and(|c| c.kind == ContainerKind::ExtensionType)
+        });
+        out
     }
 
     /// Whether the representation formal named at `name_range` carries a
@@ -281,6 +385,31 @@ impl Engine<'_> {
         None
     }
 }
+
+/// Pushes every named head reachable inside `ty` — the head itself and each
+/// explicit type argument's heads, recursively. This is the name-level
+/// reading of the oracle's `RecursiveTypeVisitor` dependency collector
+/// (`extension_type.dart:41-57`).
+fn collect_named_heads(ty: Ty, args: &ArgPool, out: &mut Vec<StringId>) {
+    if let Ty::Named {
+        name,
+        args: list,
+        ..
+    } = ty
+    {
+        out.push(name);
+        for arg in args.get(list) {
+            collect_named_heads(*arg, args, out);
+        }
+    }
+}
+
+// The #3309 pins — the declaration faces this module owns: the per-member
+// `extension_type_declares_member_of_object` scan and the representation
+// dependency cycle.
+#[cfg(test)]
+#[path = "ticket_3309_tests.rs"]
+mod ticket_3309_tests;
 
 // The #3195 pins — the representation-field verifier faces this module
 // owns (`expected_representation_type`, the trailing-comma row) at the
