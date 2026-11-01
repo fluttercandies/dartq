@@ -1984,13 +1984,20 @@ fn whole_literal_span(
     }
 }
 
-/// Whether `kind` can spell part of an annotation name: identifiers and
-/// built-in identifiers (`dynamic`) only — reserved/pseudo keywords would
-/// swallow the next declaration.
+/// Whether `kind` can spell a name in a directive name slot: identifiers,
+/// built-in identifiers (`dynamic`), and pseudo keywords (`show`, `hide`,
+/// `async` — `ensureIdentifier`'s `next.isIdentifier` takes them in every
+/// identifier context, `identifier_context_impl.dart:130-165`). Reserved
+/// words are the exclusion: a reserved word in a name slot is where the
+/// official splices a synthetic name. A next-declaration head is never
+/// masked by this gate — no declaration head is a pseudo keyword, so the
+/// refusal belongs to [`refuses_name`] alone.
 fn is_name_token(kind: TokenKind) -> bool {
     match kind {
         TokenKind::Identifier => true,
-        TokenKind::Keyword(keyword) => keyword.style() == KeywordStyle::BuiltIn,
+        TokenKind::Keyword(keyword) => {
+            matches!(keyword.style(), KeywordStyle::BuiltIn | KeywordStyle::Pseudo)
+        }
         _ => false,
     }
 }

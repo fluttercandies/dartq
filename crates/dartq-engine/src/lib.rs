@@ -2772,6 +2772,14 @@ mod ticket_3114_tests;
 #[path = "ticket_3146_tests.rs"]
 mod ticket_3146_tests;
 
+/// #3403 pins: pseudo keywords in directive name slots — `is_name_token`
+/// takes them like identifiers (upstream `ensureIdentifier`'s
+/// `next.isIdentifier`), so `show`/`hide` clauses read pseudo-keyword
+/// names instead of dropping them.
+#[cfg(test)]
+#[path = "ticket_3403_tests.rs"]
+mod ticket_3403_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
