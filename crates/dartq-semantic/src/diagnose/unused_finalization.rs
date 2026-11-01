@@ -3237,8 +3237,41 @@ impl<'a> Engine<'a> {
             })
             .map(|r| r.name)
             .collect();
+        // The augment-fragment skip: upstream's `_reportDiagnosticForElement`
+        // anchors every `unused_element`/`unused_element_parameter`/`unused_field`
+        // row at `element.firstFragment.nameOffset` — the introductory
+        // fragment's position (unused_local_elements_verifier.dart:1051-1067).
+        // An `augment` declaration's element merges into the same element the
+        // introductory declaration declares, so the merged verdict reports
+        // once — at the intro site — and never at the augmenting fragment's
+        // own offset. The `augmentations()` model row keys every `augment`
+        // fragment (container, top-level, member, constructor alike) on the
+        // name token's span — the same anchor `DeclSite::range` stores —
+        // letting this gate read membership without a new listener latch.
+        // A member declared inside an `augment` container without its own
+        // `augment` keyword is a NEW element (firstFragment IS the augment
+        // fragment), so it joins no row and still reports at its own site.
+        let augment_ranges: FxHashSet<(u32, u32)> = self
+            .index
+            .get(self.file)
+            .map(|f| {
+                f.augmentations()
+                    .iter()
+                    .map(|a| (a.name_range.offset, a.name_range.length))
+                    .collect()
+            })
+            .unwrap_or_default();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
+            // Skip both the element-face match below and the parameter-face
+            // tail — an augment fragment's own formals never carry the row
+            // (the introductory parameter's element owns the verdict and
+            // reports at its own site through its own site entry).
+            if site.is_augment
+                || augment_ranges.contains(&(site.range.offset, site.range.length))
+            {
+                continue;
+            }
             let bare = self.bare_name(site.name);
             // The nameless recovery face renders `<unnamed>` (`ElementImpl
             // .displayName`'s `name ?? '<unnamed>'`).
