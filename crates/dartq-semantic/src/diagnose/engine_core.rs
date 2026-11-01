@@ -4222,7 +4222,32 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|formal| self.fold_alias_ty(formal.ty))
                     .collect();
-                let return_ty = self.fold_alias_ty(entry.return_ty);
+                // The armed head a `p.T` return spelling keeps on the
+                // member table is the bare prefix (`core.List<core.int>
+                // m2` captures `Named{core}` — the same armed face
+                // `end_typedef`'s RHS head keeps); the declared face the
+                // `is`-verdict's signature legs compare lives only in the
+                // written annotation. `name_range` anchors the member's
+                // own name token and the backward scan recovers the
+                // spelling verbatim (`core.List<core.int>`), which
+                // `canonical_dotted_ty` then projects to the same
+                // element face the checked side spells.
+                let return_ty = match entry.return_ty {
+                    Ty::Named {
+                        name,
+                        args: ArgListId::EMPTY,
+                        ..
+                    } if !self.strings.resolve(name).contains('.')
+                        && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
+                        && entry.name_range != MemberEntry::MISSING_NAME_RANGE =>
+                    {
+                        self.backward_ty_text(entry.name_range.offset)
+                            .and_then(|text| self.parse_spelled_ty(&text))
+                            .map(|ty| self.fold_alias_ty(self.boundary.canonical_dotted_ty(ty)))
+                            .unwrap_or_else(|| self.fold_alias_ty(entry.return_ty))
+                    }
+                    _ => self.fold_alias_ty(entry.return_ty),
+                };
                 if entry.type_params == 0 {
                     return Some(self.boundary.intern_function_ty(
                         0,
@@ -4878,14 +4903,6 @@ impl<'a> Engine<'a> {
         // function-RHS alias's own file-side capture can answer — a named
         // RHS (`AliasRhs::Named`) or a head with no capture keeps the
         // caller's ordinary path.
-        if std::env::var("DQ_PROBE").is_ok() {
-            let t = self.strings.resolve(name);
-            eprintln!(
-                "DQ_PROBE paf name={t} args={args:?} fn_shape={} named_shape={}",
-                self.bounds.alias_fn_shape(name).is_some(),
-                self.bounds.alias_named_shape(name).is_some()
-            );
-        }
         let Some((params, ..)) = self.bounds.alias_fn_shape(name) else {
             return None;
         };
@@ -4933,6 +4950,107 @@ impl<'a> Engine<'a> {
             }
             _ => ty,
         }
+    }
+
+    /// The type annotation ending immediately before a declaration's name
+    /// token (`core.List<core.int> m2`, `async.A<int> x`): the armed head
+    /// a `p.T` spelling keeps on the declaration tables is the bare prefix
+    /// (`Named{core}` — `end_typedef`'s `take_armed` reads the same face for
+    /// the alias RHS's return head), so the declared face the verdict's
+    /// subtype ask needs lives only in the source. `name_offset` is the
+    /// name token's UTF-16 offset; the walk backs over balanced `<...>`
+    /// groups and the qualified head's `.` continuations and returns the
+    /// written slice verbatim (`Some` only when at least one name
+    /// character closed the scan — a keyword-only or empty prefix answers
+    /// `None`).
+    fn backward_ty_text(&self, name_offset: u32) -> Option<String> {
+        let bytes = self.source.as_bytes();
+        let mut end = self.byte_of(name_offset);
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return None;
+        }
+        let mut depth: u32 = 0;
+        let mut start = end;
+        while start > 0 {
+            let ch = bytes[start - 1];
+            match ch {
+                b'>' => {
+                    depth += 1;
+                    start -= 1;
+                }
+                b'<' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    start -= 1;
+                }
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$' | b'.' | b'?' | b','
+                    if depth > 0 || !matches!(ch, b',') =>
+                {
+                    start -= 1;
+                }
+                _ => break,
+            }
+        }
+        if start == end {
+            return None;
+        }
+        Some(self.source[start..end].to_string())
+    }
+
+    /// Parses the recovered written slice [`Self::backward_ty_text`]
+    /// returns into a [`Ty`]: a `p.T`-joined head (the interned dotted
+    /// spelling the armed face and `split_prefixed_spelling` spell alike),
+    /// an optional `<...>` argument group split at depth-0 commas, a
+    /// trailing `?`. Function/record spellings (`Function(...)` shapes)
+    /// decline — the declared heads this recovery feeds are named
+    /// interface faces (`p.T`, `C<args>`).
+    fn parse_spelled_ty(&self, text: &str) -> Option<Ty> {
+        let text = text.trim();
+        let (text, nullable) = text.strip_suffix('?').map_or((text, false), |t| (t, true));
+        let (head_text, args) = match text.find('<') {
+            Some(open) => {
+                if !text.ends_with('>') {
+                    return None;
+                }
+                let inner = &text[open + 1..text.len() - 1];
+                let mut depth: u32 = 0;
+                let mut parts: Vec<Ty> = Vec::new();
+                let mut piece_start = 0;
+                for (index, ch) in inner.char_indices() {
+                    match ch {
+                        '<' => depth += 1,
+                        '>' => depth = depth.saturating_sub(1),
+                        ',' if depth == 0 => {
+                            parts.push(self.parse_spelled_ty(&inner[piece_start..index])?);
+                            piece_start = index + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                parts.push(self.parse_spelled_ty(&inner[piece_start..])?);
+                let args = self.boundary.intern_list(&parts);
+                (&text[..open], args)
+            }
+            None => (text, ArgListId::EMPTY),
+        };
+        let head_text = head_text.trim();
+        if head_text.is_empty()
+            || !head_text
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
+        {
+            return None;
+        }
+        Some(Ty::Named {
+            name: self.intern(head_text),
+            nullable,
+            args,
+        })
     }
 
     /// already produced. `None` for a non-function or nullable face.
@@ -5612,6 +5730,7 @@ impl<'a> Engine<'a> {
         // fold records the written `?` on the use and the honest
         // required-positional count on the fresh shape.
         if let Some(folded) = self.parameterized_alias_fn_ty(checked) {
+            let folded = self.canonical_function_ty(folded);
             checked = self.normalized_never(self.official_fn_face(folded));
         }
         // A bare generic alias (`x is F0` over `typedef F0<T> = int
@@ -5623,6 +5742,126 @@ impl<'a> Engine<'a> {
         // captured signature the verdict's function rule answers (the
         // oracle's `instantiateTypeFormalsToBounds` face).
         checked = self.normalized_never(self.official_fn_face(self.fold_alias_ty(checked)));
+        // A written signature's `p.T` RETURN leaf truncates to the bare
+        // prefix inside the pooled shape (`is p.C<p.I> Function(...)`
+        // interns the `Function`'s `return_ty` as `Named{p}`): the same
+        // armed-prefix face the `Named` arm below recovers for the
+        // whole-type spelling, one level down. `armed_ty_span` rides the
+        // LAST type head inside the target (a formal's `C`, not the
+        // return's `p`), so the `p` anchor is re-derived from the verdict
+        // span: the first `{p}.` after the `is` keyword IS the signature's
+        // return head. The `.ident<args>` continuation spells the leaf,
+        // the pooled shape re-interns with the joined face — every OTHER
+        // leaf (`p.C` formals) truncates identically on the operand's
+        // declared face and self-equalizes in the slot walk.
+        if let Ty::Function { shape, nullable } = checked {
+            let (type_params, type_params_named, return_ty, positional, named) = {
+                let pool = self.boundary.pool();
+                let shape = pool.function_shape(shape);
+                (
+                    shape.type_params,
+                    shape.type_params_named.to_vec(),
+                    shape.return_ty,
+                    shape.positional.to_vec(),
+                    shape.named.to_vec(),
+                )
+            };
+            if let Ty::Named {
+                name,
+                args: ArgListId::EMPTY,
+                ..
+            } = return_ty
+                && !self.strings.resolve(name).contains('.')
+                && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
+            {
+                let at_text = &self.source[self.byte_of(at.offset)..self.byte_of(at.end())];
+                let head_text = format!("{}.", self.strings.resolve(name));
+                if let Some(is_at) = at_text.rfind(" is ").or_else(|| at_text.rfind(" is! "))
+                    && let Some(rel) = at_text[is_at..].find(&head_text)
+                {
+                    let end = self.byte_of(at.offset) + is_at + rel;
+                    let tail = &self.source[end..];
+                    let continuation_len = {
+                        let mut len = head_text.len();
+                        let bytes = tail.as_bytes();
+                        if tail.starts_with(&head_text) {
+                            while len < bytes.len()
+                                && matches!(bytes[len], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
+                            {
+                                len += 1;
+                            }
+                            if bytes[len..].starts_with(b"<") {
+                                let mut depth = 0u32;
+                                for (index, &byte) in bytes[len..].iter().enumerate() {
+                                    match byte {
+                                        b'<' => depth += 1,
+                                        b'>' => {
+                                            depth = depth.saturating_sub(1);
+                                            if depth == 0 {
+                                                len += index + 1;
+                                                break;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        len
+                    };
+                    if continuation_len > head_text.len() {
+                        let spelled = tail[..continuation_len].to_string();
+                        if let Some(recovered) = self.parse_spelled_ty(&spelled) {
+                            let recovered = self.boundary.canonical_dotted_ty(recovered);
+                            // A count-only `<...>` group keeps anonymous
+                            // entries — the same face `fn_face_sig`'s rebuild
+                            // carries for unwritten parameter spellings.
+                            let params: Vec<(StringId, Option<Ty>)> = if type_params_named.is_empty()
+                            {
+                                (0..usize::from(type_params))
+                                    .map(|_| (StringId::NONE, None))
+                                    .collect()
+                            } else {
+                                type_params_named
+                            };
+                            let rebuilt = self.boundary.args.borrow_mut().function_generic(
+                                &params,
+                                recovered,
+                                &positional,
+                                &named,
+                                nullable,
+                            );
+                            if let Ty::Function {
+                                shape: before,
+                                nullable: _,
+                            } = checked
+                                && let Ty::Function {
+                                    shape: after,
+                                    nullable,
+                                } = rebuilt
+                            {
+                                if let Some(required) = self
+                                    .fn_shape_required
+                                    .get(&before)
+                                    .copied()
+                                    .or_else(|| {
+                                        self.last_fn_seal.and_then(|(sealed, count)| {
+                                            (sealed == before).then_some(count)
+                                        })
+                                    })
+                                {
+                                    self.fn_shape_required.entry(after).or_insert(required);
+                                }
+                                checked = Ty::Function {
+                                    shape: after,
+                                    nullable,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // The listener's leaf-substitute keeps only the continuation of a
         // dot-joined checked head (`is p.T` arms `Named{T}` — the leaf
         // resolves the element but drops the import prefix the subtype
@@ -5653,6 +5892,75 @@ impl<'a> Engine<'a> {
                     nullable,
                     args,
                 };
+            } else if self.strings.resolve(name) == span_text
+                && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
+            {
+                // The armed head IS the bare prefix (`is p.T` armed
+                // `Named{p}` — the prefix-token face the declaration
+                // tables keep): the leaf and any argument group never
+                // interned, so the source continuation after the span
+                // spells them. `.ident` reads the qualified head; a
+                // trailing `<...>` group/`?` rides the recovered slice
+                // through `parse_spelled_ty`, the same face the operand's
+                // declared `p.T` keeps.
+                let tail = &self.source[end..];
+                let continuation_len = {
+                    let mut len = 0;
+                    let bytes = tail.as_bytes();
+                    if bytes.first() == Some(&b'.') {
+                        len = 1;
+                        while len < bytes.len()
+                            && matches!(bytes[len], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
+                        {
+                            len += 1;
+                        }
+                        if bytes[len..].starts_with(b"<") {
+                            let mut depth = 0u32;
+                            for (index, &byte) in bytes[len..].iter().enumerate() {
+                                match byte {
+                                    b'<' => depth += 1,
+                                    b'>' => {
+                                        depth = depth.saturating_sub(1);
+                                        if depth == 0 {
+                                            len += index + 1;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if bytes[len..].starts_with(b"?") {
+                            len += 1;
+                        }
+                    }
+                    len
+                };
+                if continuation_len > 1
+                    && let Some(recovered) = self.parse_spelled_ty(&format!(
+                        "{}{}",
+                        span_text,
+                        &self.source[end..end + continuation_len]
+                    ))
+                {
+                    // The joined `p.T` collapses through the same-element
+                    // face the operand's declared `p.T` keeps
+                    // (`canonical_dotted_ty` — `async.A` and `A` name one
+                    // element when the prefix's library also resolves
+                    // bare); the written `?` at the use site joins.
+                    checked = match self.boundary.canonical_dotted_ty(recovered) {
+                        Ty::Named {
+                            name,
+                            nullable: recovered_nullable,
+                            args,
+                        } => Ty::Named {
+                            name,
+                            nullable: recovered_nullable || nullable,
+                            args,
+                        },
+                        other => other,
+                    };
+                }
             }
         }
         // A prefixed `is p.T` arms the prefix token's name (the parser's
@@ -5696,6 +6004,36 @@ impl<'a> Engine<'a> {
             Some((ty, _)) => ty,
             None => self.type_check_operand_ty(),
         };
+        // The declared `p.T` face surfaces as the bare prefix
+        // (`Named{async}` for `async.A<int> x` — the armed head's
+        // prefix-token face): the prefix veto below must not read it as
+        // the `e is p` nonsense, whose operand is a bare prefix READ.
+        // The operand row's own local declaration anchors the name token
+        // — the backward scan recovers the written `p.T<args>` spelling
+        // and rejoins the declared face the strict ask needs.
+        let operand_decl_range = if let Ty::Named {
+            name,
+            args: ArgListId::EMPTY,
+            ..
+        } = operand_ty
+            && !self.strings.resolve(name).contains('.')
+            && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
+        {
+            self.operand_row()
+                .and_then(|row| {
+                    self.locals
+                        .iter()
+                        .rev()
+                        .find(|decl| decl.name == row.name && !decl.retired)
+                })
+                .map(|decl| decl.range.offset)
+        } else {
+            None
+        };
+        let operand_ty = operand_decl_range
+            .and_then(|offset| self.backward_ty_text(offset))
+            .and_then(|text| self.parse_spelled_ty(&text))
+            .unwrap_or(operand_ty);
         // The tear-off face over an unwritten-signature function (`void
         // topx(x,)` — a bare-read is-check's container-less operand,
         // #2813) reads the same official leaves as the checked side. The
@@ -5724,7 +6062,10 @@ impl<'a> Engine<'a> {
         // instead of stranding as (Named, Function).
         let operand_ty = self
             .parameterized_alias_fn_ty(operand_ty)
-            .map(|ty| self.normalized_never(self.official_fn_face(ty)))
+            .map(|ty| {
+                let ty = self.canonical_function_ty(ty);
+                self.normalized_never(self.official_fn_face(ty))
+            })
             .unwrap_or(operand_ty);
         let operand_ty =
             self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
@@ -5733,9 +6074,6 @@ impl<'a> Engine<'a> {
             || self.is_invalid_ty(operand_ty)
         {
             return;
-        }
-        if std::env::var("DQ_PROBE").is_ok() {
-            eprintln!("DQ_PROBE walk operand={operand_ty:?} checked={checked:?}");
         }
         let verdict =
             if checked == Ty::Dynamic {
@@ -6009,9 +6347,6 @@ impl<'a> Engine<'a> {
                     Some(true)
                 }
             };
-        if std::env::var("DQ_PROBE").is_ok() {
-            eprintln!("DQ_PROBE verdict={verdict:?} negated={negated}");
-        }
         let Some(constant_true) = verdict else { return };
         let code = match (constant_true, negated) {
             (true, false) | (false, true) => SemanticCode::UnnecessaryTypeCheckTrue,

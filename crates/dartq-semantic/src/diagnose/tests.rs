@@ -20110,16 +20110,73 @@ mod ticket_3464_tests;
 #[path = "ticket_3379_tests.rs"]
 mod ticket_3379_tests;
 
-// The #37 pins. Registered here via `#[path]`; the
-// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
-// resolves.
+// —— #3477 —— extension members get no use-credit on the shapes the
+// —— resolve side resolves but the finalize arm never records: operators
+// —— over generic function/`record`/`on` faces, prefix operators, `??=`
+// —— write setters, `call` sugar, and member-access arms the byte scans
+// —— miss. Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3477_tests.rs"]
+mod ticket_3477_tests;
+
+// —— #3478 —— element/field credit by BARE NAME instead of declaration at
+// —— the library close: `A._m`/`B._m` collided on the one `consumed.used`
+// —— spelling; the close now re-decides member rows against the
+// —— declaration-keyed `member_refs` edge pool. Registered here via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3478_tests.rs"]
+mod ticket_3478_tests;
+
+// —— #3479 —— writes counted as reads: statement-position `++`/compound,
+// —— constructor-initializer LHS, and initializing-formal writes carried
+// —— read credit into the unused-field pools the oracle never records.
+// —— Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3479_tests.rs"]
+mod ticket_3479_tests;
+
+// —— #3455 —— the `undefined_*` code-choice faces: a `foo<int>` generic
+// —— instantiation head reports `undefined_method` naming `this`'s type
+// —— (an extension answers its `on` type) and keeps `undefined_identifier`
+// —— only where no `this` exists; a `const` creation head resolving to a
+// —— non-type keeps `creation_with_non_type` at the head instead of the
+// —— requalified `undefined_identifier`-over-the-span. Registered here via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3455_tests.rs"]
+mod ticket_3455_tests;
+
+// —— #3456 —— the `super` face's two-stage lookup: concrete-dispatch
+// —— misses retry through the inherited interface and report
+// —— `abstract_super_member_reference`, while `super` inside
+// —— extension/extension-type bodies resolves against `InvalidType` and
+// —— never runs the member lookup at all. Registered here via `#[path]`;
+// —— the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3456_tests.rs"]
+mod ticket_3456_tests;
+
+// —— #3465 —— dead_code coverage for verdict-proven dead branches (the
+// semantic `unnecessary_type_check`/`unnecessary_null_comparison` row
+// decides the condition where the flow's fold never reaches — typedef
+// operands, catch-param reads, `this`-property tests) plus the two
+// emitted-row span-shape clamps (assignment-gated `;` trim, statement-
+// tail `;` extension). Registered here via `#[path]`; the module stays
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3465_tests.rs"]
+mod ticket_3465_tests;
+
 #[cfg(test)]
 #[path = "ticket_3437_tests.rs"]
 mod ticket_3437_tests;
 
-// The #38 pins. Registered here via `#[path]`; the
-// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
-// resolves.
 #[cfg(test)]
 #[path = "ticket_3438_tests.rs"]
 mod ticket_3438_tests;
