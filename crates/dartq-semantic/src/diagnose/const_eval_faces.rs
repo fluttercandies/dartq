@@ -431,6 +431,13 @@ impl<'a> Engine<'a> {
             return;
         }
         let root = self.const_capture.close_initializer();
+        // The decl-root dot shorthand with no written context type
+        // (`const a = .new();`, `const a = .id;`): the capture folds the
+        // selector to a bare name, so the root node's own shape names the
+        // shorthand — see [`Self::report_root_shorthand`].
+        if let Some(node) = &root {
+            self.report_root_shorthand(node);
+        }
         let verdict = root
             .as_ref()
             .map_or(Verdict::Constant, |node| eval(node, self));
@@ -1180,6 +1187,94 @@ impl<'a> Engine<'a> {
             // context.
             _ => true,
         }
+    }
+
+    /// The decl-root dot shorthand whose declaration writes no context type
+    /// (`const a = .new();`, `const a = .id;`). The capture folds a
+    /// shorthand's selector to a bare name and drops the `.`, so the root
+    /// node's span starts AT the selector token with only the dot before it
+    /// — [`Self::dot_shorthand_context`] recognises exactly that shape, and
+    /// requires the shorthand to be the initializer's first token (the first
+    /// node evaluated, so the failure anchors there). A nested or later
+    /// shorthand keeps the under-report the capture folds it to.
+    ///
+    /// Upstream resolves the shorthand against the declaration's context
+    /// type (`visitDotShorthandConstructorInvocation2` /
+    /// `visitDotShorthandNameExpression`, evaluation.dart:880-916); with no
+    /// written type the context is `dynamic`, so the evaluation is
+    /// known-invalid at the shorthand. The invocation face reports
+    /// `dot_shorthand_undefined_member` at the selector, the name-expression
+    /// face `dot_shorthand_missing_context` at the whole shorthand, and both
+    /// pair the site default at the whole shorthand span.
+    fn report_root_shorthand(&mut self, root: &crate::const_eval::Node) {
+        if !self.dot_shorthand_context(root.span.offset)
+            || self.pending_decl_ty.is_some()
+            || self.pending_decl_ty_unresolved
+        {
+            return;
+        }
+        let Some((whole, selector, call)) = self.shorthand_face(root.span) else {
+            return;
+        };
+        if call {
+            let selector_text = self.source_slice(selector).to_string();
+            self.emit(
+                SemanticCode::DotShorthandUndefinedMember,
+                selector,
+                &selector_text,
+                "dynamic",
+            );
+        } else {
+            self.emit(
+                SemanticCode::DotShorthandMissingContext,
+                whole,
+                "",
+                "",
+            );
+        }
+        self.emit(
+            SemanticCode::ConstInitializedWithNonConstantValue,
+            whole,
+            "",
+            "",
+        );
+    }
+
+    /// `(whole shorthand span, selector span, is-a-call)` for a leading-dot
+    /// shorthand whose capture span opens at the selector token: the span
+    /// walks back over trivia to the dot and forward through the selector,
+    /// its type arguments, and one argument list when a call follows.
+    fn shorthand_face(&self, span: SourceRange) -> Option<(SourceRange, SourceRange, bool)> {
+        let bytes = self.source.as_bytes();
+        let mut dot = self.byte_of(span.offset);
+        while dot > 0 && bytes[dot - 1].is_ascii_whitespace() {
+            dot -= 1;
+        }
+        if dot == 0 || bytes[dot - 1] != b'.' {
+            return None;
+        }
+        let mut token = self.byte_of(span.offset);
+        while let Some(&b) = bytes.get(token)
+            && (b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        {
+            token += 1;
+        }
+        let typed = skip_balanced(bytes, token, b'<');
+        let closed = skip_balanced(bytes, typed, b'(');
+        let call = closed != typed;
+        let end = if call { closed } else { typed };
+        let start = self.utf16_of(dot - 1);
+        Some((
+            SourceRange {
+                offset: start,
+                length: self.utf16_of(end).saturating_sub(start),
+            },
+            SourceRange {
+                offset: span.offset,
+                length: self.utf16_of(token).saturating_sub(span.offset),
+            },
+            call,
+        ))
     }
 
     /// The `C.named(...)` creation span — the receiver's head offset through

@@ -61,11 +61,22 @@
 //! `source.find` — no hand-counted offsets. Registered through
 //! `diagnose/tests.rs`'s `#[path]` block; the module stays inside the
 //! `diagnose` subtree so the parent rig resolves.
+//!
+//! Status: the three dot-shorthand pins and the non-const-creation pin are
+//! green (the shorthand face lives in `const_eval_faces.rs`'s
+//! `report_root_shorthand`, the creation rows in the deferred creation
+//! tail pass); the for-element pair and the wildcard pin stay `#[ignore]`d
+//! and routed to the listener lane — see each attribute's `routed:` note.
+//! Expected row vectors are written in [`oracle_rows`]' canonical order
+//! (code name, then offset): the helper sorts, so a semantic ordering
+//! ("primary row first") silently fails the equality.
 
 use super::*;
 
 /// `(code, offset, written text at the row)` — the span-exact projection:
 /// code + offset + text pin a row's code, anchor, and length together.
+/// The vector is sorted by `(code, offset, text)`, so expected rows are
+/// listed in code-name order.
 fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u32, &'a str)> {
     let mut rows: Vec<(&'static str, u32, &'a str)> = report
         .diagnostics
@@ -87,6 +98,10 @@ fn oracle_rows<'a>(report: &FileReport, source: &'a str) -> Vec<(&'static str, u
 /// a C-style `for` element in an implicitly const list reports at the whole
 /// for element and the site default at the literal.
 #[test]
+// routed: needs listener.rs span event (residual) — the parser's
+// `begin_ctl_element` carries no span, so the const capture cannot latch a
+// `for` element's extent; the listener must fire a span-bearing
+// ctl-element event into `const_capture` before this pin can turn green.
 #[ignore = "for-element face: needs the ctl-element span event + const_eval_for_element registration + literal-extent failed-value re-anchor"]
 fn for_element_reports_at_the_element_and_the_literal() {
     let source = "const x = [for (var i = 0; i < 3; i++) i];\n";
@@ -112,6 +127,8 @@ fn for_element_reports_at_the_element_and_the_literal() {
 /// for element wrapped in an if element reports at the for element ALONE
 /// (the if wrapper contributes nothing), site default at the literal.
 #[test]
+// routed: needs listener.rs span event (residual) — the same ctl-element
+// span event as the flat shape, plus the nested anchor's ctl-nesting order.
 #[ignore = "for-element face: same machinery gap as the flat shape, plus the ctl-nesting anchor"]
 fn nested_for_element_reports_at_the_for_element_alone() {
     let source = "const x = {if (true) for (final i in const []) i: null};\n";
@@ -142,7 +159,6 @@ fn nested_for_element_reports_at_the_for_element_alone() {
 /// shorthand (site default at `.new()`), beside the resolution face at the
 /// bare selector.
 #[test]
-#[ignore = "dot-shorthand face: the ciwncv half needs the context-type answer, the undefined-member row needs codes.rs registration"]
 fn shorthand_new_without_context_reports_at_the_shorthand() {
     let source = "const a = .new();\n";
     let shorthand = source.find(".new()").expect("fixture has the shorthand") as u32;
@@ -150,12 +166,12 @@ fn shorthand_new_without_context_reports_at_the_shorthand() {
     assert_eq!(
         oracle_rows(&rep, source),
         vec![
-            ("dot_shorthand_undefined_member", shorthand + 1, "new"),
             (
                 "const_initialized_with_non_constant_value",
                 shorthand,
                 ".new()",
             ),
+            ("dot_shorthand_undefined_member", shorthand + 1, "new"),
         ],
         "{:#?}",
         oracle_rows(&rep, source)
@@ -166,7 +182,6 @@ fn shorthand_new_without_context_reports_at_the_shorthand() {
 /// the property spelling reports the missing-context face at the whole
 /// shorthand and the site default on the same span.
 #[test]
-#[ignore = "dot-shorthand face: same context-type gap; the missing-context row needs codes.rs registration"]
 fn shorthand_property_without_context_reports_at_the_shorthand() {
     let source = "const a = .id;\n";
     let shorthand = source.find(".id").expect("fixture has the shorthand") as u32;
@@ -174,8 +189,8 @@ fn shorthand_property_without_context_reports_at_the_shorthand() {
     assert_eq!(
         oracle_rows(&rep, source),
         vec![
-            ("dot_shorthand_missing_context", shorthand, ".id"),
             ("const_initialized_with_non_constant_value", shorthand, ".id"),
+            ("dot_shorthand_missing_context", shorthand, ".id"),
         ],
         "{:#?}",
         oracle_rows(&rep, source)
@@ -186,7 +201,6 @@ fn shorthand_property_without_context_reports_at_the_shorthand() {
 /// the shorthand LHS of `==` fails first (left-to-right evaluation), so the
 /// site default anchors at the shorthand, not the binary.
 #[test]
-#[ignore = "dot-shorthand face: same context-type gap on the binary's LHS arm"]
 fn shorthand_lhs_of_equal_equal_reports_at_the_shorthand() {
     let source = "class A {\n  const A();\n}\n\nconst v = .new() == A();\n";
     let shorthand = source.find(".new()").expect("fixture has the shorthand") as u32;
@@ -194,12 +208,12 @@ fn shorthand_lhs_of_equal_equal_reports_at_the_shorthand() {
     assert_eq!(
         oracle_rows(&rep, source),
         vec![
-            ("dot_shorthand_undefined_member", shorthand + 1, "new"),
             (
                 "const_initialized_with_non_constant_value",
                 shorthand,
                 ".new()",
             ),
+            ("dot_shorthand_undefined_member", shorthand + 1, "new"),
         ],
         "{:#?}",
         oracle_rows(&rep, source)
@@ -211,7 +225,6 @@ fn shorthand_lhs_of_equal_equal_reports_at_the_shorthand() {
 /// at `A()` (the LHS failure passes through the binary untouched), and the
 /// shorthand RHS never reports.
 #[test]
-#[ignore = "dot-shorthand face: the creation-valid verdict must grade the initializer verdict at the creation's own span"]
 fn non_const_creation_lhs_reports_at_the_creation() {
     let source = "class A {\n  static A method() => A();\n}\n\nconst v = A() == .method();\n";
     let creation = source.find("A() ==").expect("fixture has the LHS creation") as u32;
@@ -219,8 +232,8 @@ fn non_const_creation_lhs_reports_at_the_creation() {
     assert_eq!(
         oracle_rows(&rep, source),
         vec![
-            ("const_with_non_const", creation, "A()"),
             ("const_initialized_with_non_constant_value", creation, "A()"),
+            ("const_with_non_const", creation, "A()"),
         ],
         "{:#?}",
         oracle_rows(&rep, source)
@@ -234,6 +247,11 @@ fn non_const_creation_lhs_reports_at_the_creation() {
 /// constant — `invalid_constant` at the field read, beside the
 /// implicit-this face on the same span.
 #[test]
+// routed: needs listener.rs span event (residual) — no declaration-time
+// scan of a field initializer's right-hand side exists (the const capture
+// stashes the tree for the creation-time walk only), so the listener must
+// run `collect_not_potentially_constant` over the initializer RHS at the
+// list's close, with `ctor_init_formals` not binding a wildcard formal.
 #[ignore = "wildcard face: the initializer walk must not bind a wildcard formal over the same-named instance field"]
 fn wildcard_field_read_in_initializer_list_reports_at_the_read() {
     let source = "class T {}\nclass A {\n  final T _;\n  final T y;\n  const A(this._): y = _;\n}\n";
