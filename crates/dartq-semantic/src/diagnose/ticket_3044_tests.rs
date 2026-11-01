@@ -64,10 +64,7 @@ fn positional_matrix() {
         vec![name_at("class _A {\n  _A([int? p]);\n}\n", "p", 0)],
     );
     // Used via call.
-    check(
-        "class _A {\n  _A([int? p]);\n}\nvar a = _A(1);\n",
-        vec![],
-    );
+    check("class _A {\n  _A([int? p]);\n}\nvar a = _A(1);\n", vec![]);
     // Field-formal read in body still reports (body resolves to field).
     check(
         "class _C {\n  int a = 0;\n  _C({this.a = 0}) { print(a); }\n}\nint f() => _C().a;\n",
@@ -80,7 +77,11 @@ fn positional_matrix() {
     // `new`/`const` keyword calls supply no arguments → still report.
     check(
         "class _A {\n  _A([int? a]);\n}\nvar b = new _A();\n",
-        vec![name_at("class _A {\n  _A([int? a]);\n}\nvar b = new _A();\n", "a", 0)],
+        vec![name_at(
+            "class _A {\n  _A([int? a]);\n}\nvar b = new _A();\n",
+            "a",
+            0,
+        )],
     );
     check(
         "class _A {\n  const _A([int? a]);\n}\nconst b = const _A();\nvar c = b;\n",
@@ -113,17 +114,29 @@ fn named_matrix() {
     );
     check(
         "class _A {\n  _A({int? p});\n}\nvar a = _A();\n",
-        vec![name_at("class _A {\n  _A({int? p});\n}\nvar a = _A();\n", "p", 0)],
+        vec![name_at(
+            "class _A {\n  _A({int? p});\n}\nvar a = _A();\n",
+            "p",
+            0,
+        )],
     );
     // A public primary-constructor name on a private class still reports
     // (the class itself is not publicly accessible).
     check(
         "class _A.named({int? a});\nf() => _A.named();\n",
-        vec![name_at("class _A.named({int? a});\nf() => _A.named();\n", "a", 0)],
+        vec![name_at(
+            "class _A.named({int? a});\nf() => _A.named();\n",
+            "a",
+            0,
+        )],
     );
     check(
         "class _A._named({int? a});\nf() => _A._named();\n",
-        vec![name_at("class _A._named({int? a});\nf() => _A._named();\n", "a", 0)],
+        vec![name_at(
+            "class _A._named({int? a});\nf() => _A._named();\n",
+            "a",
+            0,
+        )],
     );
 }
 
@@ -135,7 +148,11 @@ fn named_matrix() {
 fn field_formal_matrix() {
     check(
         "class _A {\n  final int? f;\n  _A([this.f]);\n}\n",
-        vec![name_at("class _A {\n  final int? f;\n  _A([this.f]);\n}\n", "f", 1)],
+        vec![name_at(
+            "class _A {\n  final int? f;\n  _A([this.f]);\n}\n",
+            "f",
+            1,
+        )],
     );
     check(
         "class _A {\n  final int? f;\n  _A([this.f]);\n}\nvar a = _A(1);\n",
@@ -227,10 +244,7 @@ fn tearoff_matrix() {
         "class _A {\n  _A._named([int? a]);\n}\nvar f = _A._named;\n",
         vec![],
     );
-    check(
-        "class _A {\n  _A([int? a]);\n}\nvar f = _A.new;\n",
-        vec![],
-    );
+    check("class _A {\n  _A([int? a]);\n}\nvar f = _A.new;\n", vec![]);
     check(
         "class _A {\n  _A.new2([int? a]);\n}\nvar f = _A.new2;\n",
         vec![],
@@ -243,7 +257,11 @@ fn tearoff_matrix() {
     // supplied arguments (zero → report).
     check(
         "class _A {\n  _A([int? a]);\n}\nvar b = _A.new();\n",
-        vec![name_at("class _A {\n  _A([int? a]);\n}\nvar b = _A.new();\n", "a", 0)],
+        vec![name_at(
+            "class _A {\n  _A([int? a]);\n}\nvar b = _A.new();\n",
+            "a",
+            0,
+        )],
     );
     check(
         "class _A {\n  _A._named([int? a]);\n}\nvar b = new _A._named();\n",
@@ -272,17 +290,22 @@ fn misc_oracle_matrix() {
     // Enum optional formals report.
     check(
         "enum _E {\n  v;\n  const _E({int a = 0});\n}\n",
-        vec![name_at("enum _E {\n  v;\n  const _E({int a = 0});\n}\n", "a", 0)],
+        vec![name_at(
+            "enum _E {\n  v;\n  const _E({int a = 0});\n}\n",
+            "a",
+            0,
+        )],
     );
     check(
         "enum _E {\n  v;\n  const _E([int a = 0]);\n}\n",
-        vec![name_at("enum _E {\n  v;\n  const _E([int a = 0]);\n}\n", "a", 0)],
+        vec![name_at(
+            "enum _E {\n  v;\n  const _E([int a = 0]);\n}\n",
+            "a",
+            0,
+        )],
     );
     // An enum constant's argument binds the parameter.
-    check(
-        "enum _E {\n  v(0);\n  const _E([int a = 0]);\n}\n",
-        vec![],
-    );
+    check("enum _E {\n  v(0);\n  const _E([int a = 0]);\n}\n", vec![]);
     // A generic-class constructor's formals are exempt (#47839).
     check(
         "class C<T> {\n  C._([int? x]);\n}\nvoid foo() {\n  C._(7);\n}\n",

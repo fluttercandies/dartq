@@ -62,20 +62,25 @@ fn ticket_3176_assignment_rhs_void_call() {
 
 /// A `void`-typed read on the assignment right operand anchors at the
 /// read's own expression span (the non-`MethodInvocation` arm,
-/// error_detection_helpers.dart:254 `.at(expression)`).
+/// error_detection_helpers.dart:254 `.at(expression)`). `var v = f()`
+/// reports nothing: the local's inferred `void` type is the write type,
+/// and `checkForAssignableExpressionAtType`'s `expectedStaticType is!
+/// VoidType` gate (variable_declaration_resolver.dart:104) skips the void
+/// use. The 3.13.7 oracle answers one row, `v` inside `x = v` (4:7,
+/// length 1).
 #[test]
 fn ticket_3176_assignment_rhs_void_read() {
     let fixture =
         "void main(void Function() f) {\n  var v = f();\n  Object x = Object();\n  x = v;\n}";
     let report = report_ops(fixture);
-    let names = code_names(&report);
-    // `var v = f()` itself reports (decl-init seam) and `x = v` reports the
-    // read — two void uses beside `v`'s own `unused_local_variable` if any.
-    let void_count = names
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v;").unwrap();
+    let voids: Vec<_> = report
+        .diagnostics
         .iter()
-        .filter(|name| **name == "use_of_void_result")
-        .count();
-    assert_eq!(void_count, 2, "{:?}", rows(&report));
+        .filter(|d| d.code.name == "use_of_void_result")
+        .map(|d| (d.range.offset as usize, d.range.length, d.message.as_str()))
+        .collect();
+    assert_eq!(voids, [(offset, 1, VOID_MSG)], "{:?}", rows(&report));
 }
 
 /// The declaration initializer (`var`/`Object x = v()` — upstream
@@ -265,40 +270,51 @@ fn ticket_3176_prefix_minus_void() {
     assert_eq!(void_row.range.offset as usize, offset, "{:?}", rows(&report));
 }
 
-/// A list element's `void` expression (`[v()]` —
-/// literal_element_verifier.dart:95 `checkElement` →
-/// `checkForUseOfVoidResult(element)`).
+/// An untyped list literal's `void` element (`[v()]`) stays silent: the
+/// literal infers `List<void>`, and `_verifyElement` runs the void use
+/// only into a non-`void` element type (literal_element_verifier.dart:94
+/// `elementType is! VoidType && checkForUseOfVoidResult(element)`). The
+/// 3.13.7 oracle reports only `unused_local_variable` on `l`; a written
+/// non-`void` element slot's row is pinned by
+/// `ticket_3349_collection_literal_element_gate`.
 #[test]
 fn ticket_3176_list_element_void() {
     let fixture = "void v() {}\nvoid main() {\n  var l = [v()];\n}";
     let report = report_ops(fixture);
-    let names = code_names(&report);
     assert!(
-        names.iter().any(|name| *name == "use_of_void_result"),
+        !code_names(&report)
+            .iter()
+            .any(|name| *name == "use_of_void_result"),
         "{:?}",
         rows(&report)
     );
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
-    let void_row = report
-        .diagnostics
-        .iter()
-        .find(|d| d.message == VOID_MSG)
-        .expect("use_of_void_result row");
-    assert_eq!(void_row.range.offset as usize, offset, "{:?}", rows(&report));
 }
 
-/// A map-entry `void` value (`{1: v()}` — literal_element_verifier.dart:
-/// 166/:171 `_verifyMapLiteralEntryValue` → `checkForUseOfVoidResult(
-/// entry.value)`).
+/// A map-entry `void` value reports only into a non-`void` value type
+/// (literal_element_verifier.dart:170 `mapValueType is! VoidType &&
+/// checkForUseOfVoidResult(entry.value)`): the untyped `{1: v()}` infers
+/// `Map<int, void>` and stays silent, while `<int, Object>{1: v()}`
+/// reports at the callee name. The 3.13.7 oracle: only
+/// `unused_local_variable` on the first, `use_of_void_result` at 3:28
+/// (length 1) on the second.
 #[test]
 fn ticket_3176_map_value_void() {
-    let fixture = "void v() {}\nvoid main() {\n  var m = {1: v()};\n}";
-    let report = report_ops(fixture);
-    let names = code_names(&report);
+    let untyped = report_ops("void v() {}\nvoid main() {\n  var m = {1: v()};\n}");
     assert!(
-        names.iter().any(|name| *name == "use_of_void_result"),
+        !code_names(&untyped)
+            .iter()
+            .any(|name| *name == "use_of_void_result"),
         "{:?}",
-        rows(&report)
+        rows(&untyped)
     );
+    let typed = "void v() {}\nvoid main() {\n  var m = <int, Object>{1: v()};\n}";
+    let report = report_ops(typed);
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + typed.rfind("v()").unwrap();
+    let voids: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "use_of_void_result")
+        .map(|d| (d.range.offset as usize, d.range.length))
+        .collect();
+    assert_eq!(voids, [(offset, 1)], "{:?}", rows(&report));
 }
