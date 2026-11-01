@@ -17969,3 +17969,13 @@ mod ticket_3294_tests;
 #[cfg(test)]
 #[path = "ticket_3295_tests.rs"]
 mod ticket_3295_tests;
+
+// The #3287 pins (the callable-class `call` tear-off arm of the
+// `invalid_assignment`/`argument_type_not_assignable` verdict — a generic
+// `call` in a non-generic function context instantiates toward the target
+// signature before the subtype ask). Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3287_tests.rs"]
+mod ticket_3287_tests;

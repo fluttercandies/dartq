@@ -4107,6 +4107,21 @@ impl<'a> Engine<'a> {
         if failed || bindings.is_empty() || candidates.iter().any(|c| !bindings.contains_key(c)) {
             return None;
         }
+        // A bound-violating solve is no instantiation the oracle accepts:
+        // `String Function(String) f = C()` over `T call<T extends num>(T)`
+        // would bind `T := String`, which `extends num` refuses — the
+        // tear-off falls back to `instantiateTypeFormalsToBounds` (`num
+        // Function(num)` is the reported face). `None` keeps that
+        // fallback open; `Some(false)` would wrongly hard-reject a pair
+        // the bounds face still assigns.
+        for (param, bound) in from.params.iter() {
+            if let (Some(bound_ty), Some(solved)) = (*bound, bindings.get(param)) {
+                match self.assignable(*solved, bound_ty, false) {
+                    Some(false) => return None,
+                    Some(true) | None => {}
+                }
+            }
+        }
         // The substituted signature re-runs the subtype checks: return
         // covariance (a `void` target is Right Top — skipped like
         // [`Engine::fn_sig_subtype`]'s own guard), the target's
@@ -6758,7 +6773,30 @@ impl<'a> Engine<'a> {
             nullable: false,
             args,
         }) else {
-            return None;
+            // A resolvable container with provably no `call` member
+            // rejects the written ask: upstream's `callMethodType` is
+            // null there, so `isAssignableTo` falls through to `false`
+            // (type_system.dart:910-915 — `String Function(String) f =
+            // C()` over `class C {}` reports). An EMPTY-args source is
+            // the only provable face — an instantiated `C<int>()`
+            // substitutes its arguments into a member lookup
+            // [`Engine::implicit_call_face`] cannot spell, so a miss
+            // there is not the no-`call` fact; an unresolvable head keeps
+            // the under-report `None` (the derived-ask residue this slot
+            // also receives).
+            if args != ArgListId::EMPTY {
+                return None;
+            }
+            return resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_some()
+            .then_some(false);
         };
         // A generic `call`'s type parameters ride the signature —
         // `acceptsFunctionType`'s `callMethodType` keeps them, and
@@ -6780,6 +6818,55 @@ impl<'a> Engine<'a> {
                 .map(|f| (f.name, f.ty, f.required))
                 .collect(),
             return_ty,
+        };
+        // A generic `call` in a non-generic context instantiates before the
+        // subtype ask (`getCallMethodType`, type_system.dart:528-535 —
+        // `instantiateTypeFormalsToBounds` fills each method type parameter
+        // with its written bound, `dynamic` unwritten). The first try is
+        // the same downward tear-off inference the `assignable` entry runs
+        // over two function-shaped written types — the context signature's
+        // structurally-paired types solve the parameters
+        // (`instantiated_fn_sig_subtype`): `int Function(int) f = C()` over
+        // `T call<T>(T)` solves `T := int` and accepts, which the
+        // `relateTypeParameters` count gate below would refuse outright.
+        // When the context cannot solve — an arity the instantiation can
+        // never bridge, an unbound parameter, a solution that contradicts
+        // the declared bound — the oracle's `callMethodType` falls back to
+        // the bounds face: `T call<T extends num>(T)` reads `num
+        // Function(num)` (the `String Function(String)` target's `T :=
+        // String` solve violates `extends num`, and the reported face is
+        // the bound `num`), `void Function() f = C()` reads `dynamic
+        // Function(dynamic)` (no positional pairs the context).
+        if !call_sig.params.is_empty() && to_fn.params.is_empty()
+            && let Some(verdict) = self.instantiated_fn_sig_subtype(&call_sig, to_fn)
+        {
+            return Some(verdict);
+        }
+        let call_sig = if call_sig.params.is_empty() {
+            call_sig
+        } else {
+            let bounds: FxHashMap<StringId, Ty> = call_sig
+                .params
+                .iter()
+                .map(|(name, bound)| (*name, bound.unwrap_or(Ty::Dynamic)))
+                .collect();
+            FnVarSig {
+                params: Box::default(),
+                required_positional: call_sig.required_positional,
+                positional: call_sig
+                    .positional
+                    .iter()
+                    .map(|ty| self.subst_ty(*ty, &bounds))
+                    .collect(),
+                named: call_sig
+                    .named
+                    .iter()
+                    .map(|(name, ty, required)| {
+                        (*name, self.subst_ty(*ty, &bounds), *required)
+                    })
+                    .collect(),
+                return_ty: self.subst_ty(call_sig.return_ty, &bounds),
+            }
         };
         self.fn_sig_subtype(&call_sig, to_fn)
     }
