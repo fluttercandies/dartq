@@ -225,6 +225,19 @@ pub struct LibraryTypes {
     /// property sub-pattern over such a member may fail and its case
     /// cannot cover vacuously.
     invalid_property_tys: FxHashSet<(StringId, StringId)>,
+    /// Extension-type declaration → the head of its representation type:
+    /// the erasure every exhaustiveness ask recurses through (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/element/type_system.dart
+    /// `isAlwaysExhaustive`'s `ExtensionTypeElement` arm,
+    /// `isAlwaysExhaustive(type.extensionTypeErasure)`), so
+    /// `extension type W(E _)` over an enum `E` closes a switch exactly
+    /// like `E` itself — the tail after it is unreachable and no
+    /// `body_might_complete_normally` reports. Only a named representation
+    /// registers: a record/function/`dynamic`/unresolved erasure keeps the
+    /// written face (the under-report direction). A chained
+    /// representation (`extension type W2(W1 _)`) recurses one hop at a
+    /// time, bounded the way the name-level walk bounds it.
+    extension_erasures: FxHashMap<TypeDeclId, StringId>,
 }
 
 /// One container's parse-time supertype capture: the type-parameter
@@ -450,6 +463,7 @@ impl LibraryTypes {
         let non_containers: FxHashSet<StringId> = FxHashSet::default();
         let typedef_targets: FxHashMap<StringId, (StringId, bool)> = FxHashMap::default();
         let type_params: FxHashMap<StringId, TypeParamId> = FxHashMap::default();
+        let extension_erasures: FxHashMap<TypeDeclId, StringId> = FxHashMap::default();
         let mut next_decl = FIRST_BUILTIN_RAW;
         let mut next_param = 2_u32;
         let mut param_names: FxHashMap<TypeParamId, StringId> = FxHashMap::default();
@@ -534,6 +548,7 @@ impl LibraryTypes {
             param_names,
             invokable_members: FxHashSet::default(),
             property_ty_heads: Vec::new(),
+            extension_erasures,
             facts,
             next_decl: FIRST_CONTAINER_RAW,
             next_param,
@@ -811,6 +826,7 @@ impl LibraryTypes {
             param_names,
             invokable_members,
             property_ty_heads,
+            extension_erasures,
             mut facts,
             ..
         } = registry;
@@ -1105,6 +1121,7 @@ impl LibraryTypes {
             type_param_scope,
             invokable_members,
             invalid_property_tys,
+            extension_erasures,
         }
     }
 }
@@ -1199,6 +1216,8 @@ struct Registry {
     /// registered (a member typed by a later-registered container must
     /// not read unresolved mid-build).
     property_ty_heads: Vec<(StringId, StringId, StringId)>,
+    /// See [`LibraryTypes::extension_erasures`].
+    extension_erasures: FxHashMap<TypeDeclId, StringId>,
     facts: ParamFactsTable,
     next_decl: u32,
     next_param: u32,
@@ -1301,6 +1320,18 @@ impl Registry {
             actions.push(DeclAction::Decl(decl, param_ids));
             if container.sealed {
                 actions.push(DeclAction::Sealed(decl));
+            }
+            // An extension type's representation head — the erasure the
+            // exhaustiveness walk recurses into
+            // (type_system.dart:862-868). Only a named representation
+            // registers; a record/function/`dynamic` erasure and a
+            // body-less recovery shape keep the written face (the
+            // under-report direction, never a false closure).
+            if container.kind == ContainerKind::ExtensionType
+                && let Some(rep) = container.primary_formals.first()
+                && let Ty::Named { name: head, .. } = rep.formal.ty
+            {
+                self.extension_erasures.insert(decl, head);
             }
             if container.kind == ContainerKind::Enum {
                 let constants = u16::try_from(container.enum_constants.len()).unwrap_or(u16::MAX);
@@ -4109,6 +4140,48 @@ impl<'a> ResolvedTypeOps<'a> {
         self.observe_names(names);
         self.undefined_ids.borrow().contains(&id)
     }
+
+    /// The declaration arm of `isAlwaysExhaustive`
+    /// (type_system.dart:812-868): `bool` closes as the two-constant
+    /// enumeration the builtin face registers (`enum_constant_count`),
+    /// a user enum by its constants, a `sealed` class by its modifier,
+    /// and an extension type by recursing into its representation
+    /// ([:862-868]) — `extension type W(E _)` over an enum `E` closes a
+    /// switch exactly like `E` itself. A chained representation
+    /// (`extension type W2(W1 _)`) spends one hop each, bounded at eight
+    /// like the name-level walk so a cyclic self-representation
+    /// (`extension type W(W _)`, already reported upstream) cannot hang
+    /// the walk. Any other declaration — an open class, a mixin, a
+    /// declaration-less head — answers `false` (the post-switch state
+    /// stays live, the under-report direction).
+    fn always_exhaustive_decl(&self, decl: TypeDeclId) -> bool {
+        let mut decl = decl;
+        for _ in 0..8 {
+            let own = {
+                let mut closed = self.closed.borrow_mut();
+                match closed.get(&decl) {
+                    Some(&own) => own,
+                    None => {
+                        let own = self.snapshot.hierarchy.is_sealed(decl)
+                            || self.snapshot.hierarchy.enum_constant_count(decl).is_some();
+                        closed.insert(decl, own);
+                        own
+                    }
+                }
+            };
+            if own {
+                return true;
+            }
+            let Some(&head) = self.snapshot.extension_erasures.get(&decl) else {
+                return false;
+            };
+            let Some(&erased) = self.snapshot.registry.get(&head) else {
+                return false;
+            };
+            decl = erased;
+        }
+        false
+    }
 }
 
 impl TypeOps for ResolvedTypeOps<'_> {
@@ -4219,9 +4292,10 @@ impl TypeOps for ResolvedTypeOps<'_> {
         }
     }
 
-    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:846-888) over
-    /// the resolved hierarchy: `Null`/`bool` split completely, enums and
-    /// sealed classes close by their element faces, `FutureOr<T>`
+    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:812-888) over
+    /// the resolved hierarchy: `Null` splits completely, `bool`/enums and
+    /// sealed classes close by their element faces, an extension type
+    /// recurses into its representation ([:862-868]), and `FutureOr<T>`
     /// recurses into `T`. A `Base::Name` spelling resolves through
     /// `names` (populating the `name_ty` cache for the base ops); an
     /// unresolvable spelling is the under-report `false`.
@@ -4234,23 +4308,17 @@ impl TypeOps for ResolvedTypeOps<'_> {
     ) -> bool {
         self.observe_names(names);
         let mapped = self.map_scrutinee(ty, args, arena, names);
-        let is_closed = |decl: TypeDeclId| -> bool {
-            *self.closed.borrow_mut().entry(decl).or_insert_with(|| {
-                self.snapshot.hierarchy.is_sealed(decl)
-                    || self.snapshot.hierarchy.enum_constant_count(decl).is_some()
-            })
-        };
         match self.snapshot.table.get(mapped).kind() {
             // `Null` splits completely — the official's `isDartCoreNull`
             // arm. `Never?` interned as `Null` lands here too.
             TypeKind::Null => true,
-            TypeKind::Interface { decl, .. } => is_closed(decl),
+            TypeKind::Interface { decl, .. } => self.always_exhaustive_decl(decl),
             TypeKind::FutureOr { base } => match self.snapshot.table.get(base).kind() {
-                // `FutureOr<T>` recurses into `T` (type_system.dart:865):
+                // `FutureOr<T>` recurses into `T` (type_system.dart:869-871):
                 // a closed base closes the `FutureOr` — `Null` splits
                 // completely, a sealed/enum base's decl answers.
                 TypeKind::Null => true,
-                TypeKind::Interface { decl, .. } => is_closed(decl),
+                TypeKind::Interface { decl, .. } => self.always_exhaustive_decl(decl),
                 // `FutureOr<FutureOr<…>>` unrolls one arm deeper than
                 // this single-level match reaches — under-report.
                 _ => false,
