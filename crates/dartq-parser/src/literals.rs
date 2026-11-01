@@ -219,21 +219,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         Unwind::Done(self.peek_span())
     }
 
-    /// The `[]`-token arm of `parseLiteralListSuffix` (:8541-8549): an
-    /// empty list literal parsed from the combined token.
+    /// The `[]`-token arm of `parseLiteralListSuffix` (:8457-8465): an
+    /// empty list literal parsed from the combined token. The cursor sits
+    /// on `[]`.
     pub(crate) fn parse_list_literal_index_arm(
         &mut self,
         const_keyword: Option<TokenSpan>,
     ) -> TokenSpan {
-        let offset = self.peek_span().range.offset;
+        let index = self.peek_span();
         self.cursor.advance();
-        let open = self.synthetic(TokenKind::OpenSquare, offset);
-        let close = self.synthetic(TokenKind::CloseSquare, offset);
-        self.cursor.advance();
-        self.cursor.advance();
-        self.listener
-            .handle_literal_list(0, open, const_keyword, close);
-        close
+        self.finish_list_literal_index(index, const_keyword)
     }
 
     /// This method parses the portion of a list literal starting with the
@@ -244,7 +239,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let was_index = self.peek_kind() == TokenKind::Index;
         self.cursor.advance();
         if was_index {
-            // `[]` arm (:8541-8549): an empty list literal.
+            // `[]` arm (:8457-8465): an empty list literal.
             return self.finish_list_literal_index(left, const_keyword);
         }
         let saved = self.may_parse_function_expressions;
@@ -351,15 +346,30 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     }
 
     /// Event shape of the `[]` arm when the bracket token was already
-    /// consumed by [`Self::parse_list_literal`].
+    /// consumed by [`Self::parse_list_literal`] (official
+    /// `rewriteSquareBrackets` :5074-5095 + `handleLiteralList` :8460-8465):
+    /// a real `[]` splits into the real `[` at its own offset and the real
+    /// `]` one past it — both carry their one-character lexeme, so the
+    /// literal's end is the `]`'s END and row faces reading
+    /// `right.range.end()` reach past the `]` instead of anchoring at the
+    /// type-argument `>` (#3486: `for (x in <void>[])`). A synthetic `[]`
+    /// keeps the official synthetic posture (zero-width pair at one offset).
     fn finish_list_literal_index(
         &mut self,
         index: TokenSpan,
         const_keyword: Option<TokenSpan>,
     ) -> TokenSpan {
         let offset = index.range.offset;
-        let open = self.synthetic(TokenKind::OpenSquare, offset);
-        let close = self.synthetic(TokenKind::CloseSquare, offset);
+        let (open, close) = if self.cursor.resolve(index.id).1 {
+            (
+                self.synthetic(TokenKind::OpenSquare, offset),
+                self.synthetic(TokenKind::CloseSquare, offset),
+            )
+        } else {
+            let open = self.cursor.queue_split(TokenKind::OpenSquare, offset);
+            let close = self.cursor.queue_split(TokenKind::CloseSquare, offset + 1);
+            (self.span_of(open), self.span_of(close))
+        };
         self.cursor.advance();
         self.cursor.advance();
         self.listener
@@ -774,6 +784,9 @@ mod tests {
         strings: Vec<(TokenSpan, TokenSpan)>,
         /// The begin token of the string literal currently open.
         pending_string_begin: Option<TokenSpan>,
+        /// Every `handle_literal_list` as `(count, left, right)` in
+        /// completion order — the empty-list bracket-split pins (#3486).
+        lists: Vec<(usize, TokenSpan, TokenSpan)>,
     }
 
     impl crate::listener::ParserListener for LiteralLog {
@@ -849,6 +862,16 @@ mod tests {
         fn end_literal_string(&mut self, _: usize, end: TokenSpan) {
             let begin = self.pending_string_begin.take().expect("string begin seen");
             self.strings.push((begin, end));
+        }
+
+        fn handle_literal_list(
+            &mut self,
+            count: usize,
+            left: TokenSpan,
+            _: Option<TokenSpan>,
+            right: TokenSpan,
+        ) {
+            self.lists.push((count, left, right));
         }
     }
 
@@ -1028,6 +1051,90 @@ mod tests {
             p.listener.errors,
             vec!["expected_else_or_comma".to_string()]
         );
+    }
+
+    // —— #3486: the `[]` arm splits a real `[]` into real brackets
+    // (`rewriteSquareBrackets`, parser_impl.dart:5074-5095) ——————————————
+
+    /// `(count, left (offset, len), right (offset, len))` of every list
+    /// literal event.
+    fn list_shapes(
+        p: &crate::Parser<'_, '_, '_, LiteralLog>,
+    ) -> Vec<(usize, (u32, u32), (u32, u32))> {
+        p.listener
+            .lists
+            .iter()
+            .map(|(count, left, right)| {
+                (
+                    *count,
+                    (left.range.offset, left.range.length),
+                    (right.range.offset, right.range.length),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_list_index_token_splits_into_a_real_bracket_pair() {
+        // The scanner emits `[]` as ONE `Index` token; the official arm
+        // replaces it with a real `[` at its offset and a real `]` one past
+        // it (`new Token(CLOSE_SQUARE_BRACKET, next.offset + 1)`), each
+        // carrying its one-character lexeme — never a zero-width synthetic
+        // pair. The literal's end is the `]`'s end (offset 2).
+        let mut p = literal_parser("[]");
+        let end = p.parse_list_literal(None);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+        assert_eq!(list_shapes(&p), vec![(0, (0, 1), (1, 1))]);
+        assert_eq!(end, p.listener.lists[0].2);
+        assert_eq!(end.range.end(), 2);
+        let (kind, synthetic) = p.cursor.resolve(end.id);
+        assert_eq!(kind, TokenKind::CloseSquare);
+        assert!(!synthetic, "a real `[]` must split into real brackets");
+        let (kind, synthetic) = p.cursor.resolve(p.listener.lists[0].1.id);
+        assert_eq!(kind, TokenKind::OpenSquare);
+        assert!(!synthetic, "a real `[]` must split into real brackets");
+    }
+
+    #[test]
+    fn typed_empty_list_right_bracket_closes_the_whole_literal() {
+        // #3486's shape: `<void>[]` — the `]` lands at offset 7 (length
+        // 1), so `right.range.end()` is 8, the literal's end, where the
+        // former zero-width `]` at the `[`'s offset stopped the semantic
+        // `use_of_void_result` row at the type-argument `>` (`<void>`,
+        // length 6, against the oracle's `<void>[]`, length 8).
+        let mut p = literal_parser("<void>[]");
+        let _ = p.parse_expression();
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+        assert_eq!(list_shapes(&p), vec![(0, (6, 1), (7, 1))]);
+        assert_eq!(p.listener.lists[0].2.range.end(), 8);
+    }
+
+    #[test]
+    fn typed_non_empty_list_right_bracket_is_unchanged() {
+        // Control: `<void>[1]` scans a separate `[` and `]`, so the `]` is
+        // the scanned token at offset 8 and the literal ends at 9 — the
+        // shape the oracle already matched (`use_of_void_result` over
+        // `<void>[1]`, length 9).
+        let mut p = literal_parser("<void>[1]");
+        let _ = p.parse_expression();
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+        assert_eq!(list_shapes(&p), vec![(1, (6, 1), (8, 1))]);
+        assert_eq!(p.listener.lists[0].2.range.end(), 9);
+    }
+
+    #[test]
+    fn synthetic_index_recovery_keeps_the_zero_width_bracket_pair() {
+        // `<int> 3`: the missing-`[` recovery splices a SYNTHETIC `[]` at
+        // the follower (parser_impl.dart:8360-8366, `insertSyntheticToken`)
+        // and the arm keeps the official synthetic posture — a zero-width
+        // `[`/`]` pair at that one offset (the `isSynthetic` branch of
+        // `rewriteSquareBrackets`), never a real split.
+        let mut p = literal_parser("<int> 3");
+        let _ = p.parse_expression();
+        assert_eq!(list_shapes(&p), vec![(0, (6, 0), (6, 0))]);
+        let (kind, synthetic) = p.cursor.resolve(p.listener.lists[0].2.id);
+        assert_eq!(kind, TokenKind::CloseSquare);
+        assert!(synthetic, "a synthetic `[]` must stay synthetic");
     }
 
     /// Local listener capturing the ordered symbol event sequence,
