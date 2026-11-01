@@ -2231,25 +2231,52 @@ impl FileElements {
     /// and takes the generic arm — the in-file declaration wins resolution
     /// (the `switch_tracker` shadow gate's model-level twin).
     ///
-    /// #3324: the engine's bound-aware delegate (`strictly_non_nullable`,
-    /// `diagnose/engine_core.rs`) still answers plain faces through
-    /// [`Ty::is_strictly_non_nullable`]; routing it through this helper is
-    /// a follow-up owned by the #3316 engine_core lane. The delegate's
-    /// scope-param face must stay ahead of this helper (a type parameter
-    /// named `FutureOr` decides through its written bound, never the
-    /// union arm), and a caller holding the cross-file index may consult
-    /// foreign-unit extension types — this unit-local answer takes the
-    /// generic arm for them.
+    /// The delegate's scope-param face must stay ahead of this helper (a
+    /// type parameter named `FutureOr` decides through its written bound,
+    /// never the union arm), and a caller holding the cross-file index may
+    /// consult foreign-unit extension types — this unit-local answer takes
+    /// the generic arm for them.
+    ///
+    /// `ty`'s pool is this unit's own [`ArgPool`] (`self.type_args`): the
+    /// `ArgListId` slots its `Ty::Named` shapes carry index this model.
+    /// A caller whose `Ty` was minted in a different pool (the engine's
+    /// diagnosis pool — #3531) must call [`Self::is_strictly_non_nullable_in`]
+    /// and hand that pool across; reading a foreign slot through this
+    /// unit's pool indexes another universe — an out-of-bounds panic or a
+    /// silently different argument list.
     #[must_use]
     pub fn is_strictly_non_nullable(&self, strings: &StringTable, ty: Ty) -> bool {
-        self.strictly_non_nullable_within(strings, ty, 8)
+        self.is_strictly_non_nullable_in(strings, ty, &self.type_args)
     }
 
-    /// [`Self::is_strictly_non_nullable`] with a recursion budget: nested
-    /// `FutureOr` chains (`FutureOr<FutureOr<S>>`) spend one unit each;
-    /// an exhausted chain answers `false`, the conservative arm (the
-    /// `switch_tracker` budget posture).
-    fn strictly_non_nullable_within(&self, strings: &StringTable, ty: Ty, depth: u8) -> bool {
+    /// [`Self::is_strictly_non_nullable`] over a `ty` whose argument-list
+    /// ids live in `args`, not this unit's pool. The container/shadow
+    /// lookup still reads this unit's declaration table (the model's own
+    /// `FutureOr` shadow arm); only the argument slots resolve through the
+    /// handed pool — the one that minted them.
+    #[must_use]
+    pub fn is_strictly_non_nullable_in(
+        &self,
+        strings: &StringTable,
+        ty: Ty,
+        args: &ArgPool,
+    ) -> bool {
+        self.strictly_non_nullable_within(strings, ty, args, 8)
+    }
+
+    /// [`Self::is_strictly_non_nullable_in`] with a recursion budget:
+    /// nested `FutureOr` chains (`FutureOr<FutureOr<S>>`) spend one unit
+    /// each; an exhausted chain answers `false`, the conservative arm (the
+    /// `switch_tracker` budget posture). `args` is the pool `ty`'s ids
+    /// index — every nested `FutureOr<T>` argument read resolves through
+    /// it, so the whole walk stays inside one universe.
+    fn strictly_non_nullable_within(
+        &self,
+        strings: &StringTable,
+        ty: Ty,
+        pool: &ArgPool,
+        depth: u8,
+    ) -> bool {
         let Ty::Named {
             name,
             nullable: false,
@@ -2262,11 +2289,10 @@ impl FileElements {
             return false;
         }
         if strings.resolve(name) == "FutureOr" && self.container(name).is_none() {
-            return self
-                .type_args
+            return pool
                 .get(args)
                 .first()
-                .is_some_and(|&arg| self.strictly_non_nullable_within(strings, arg, depth - 1));
+                .is_some_and(|&arg| self.strictly_non_nullable_within(strings, arg, pool, depth - 1));
         }
         match self.container(name) {
             // A non-extension-type head (class, enum, mixin, extension) is

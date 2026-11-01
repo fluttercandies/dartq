@@ -22849,3 +22849,27 @@ mod ticket_3503_tests;
 #[cfg(test)]
 #[path = "ticket_3519_tests.rs"]
 mod ticket_3519_tests;
+
+// —— #3531 ——
+// The `...?x6` cross-pool panic: `FileElements::is_strictly_non_nullable`
+// read the unit `ArgPool` with an engine-minted `ArgListId`. The helper
+// now takes the owning pool across the boundary
+// (`is_strictly_non_nullable_in`), and the spread-of-`FutureOr` repro,
+// its `FutureOr<int>` dead-operator twin, and the `FutureOr<int>?` live
+// control pin the oracle rows panic-free. Registered here via `#[path]`;
+// the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3531 ——
+// The `...?x6` cross-pool panic: `FileElements::is_strictly_non_nullable`
+// read the unit `ArgPool` with an engine-minted `ArgListId`. The helper
+// now takes the owning pool across the boundary
+// (`is_strictly_non_nullable_in`), and the spread-of-`FutureOr` repro,
+// its `FutureOr<int>` dead-operator twin, and the `FutureOr<int>?` live
+// control pin the oracle rows panic-free. Registered here via `#[path]`;
+// the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3531_tests.rs"]
+mod ticket_3531_tests;

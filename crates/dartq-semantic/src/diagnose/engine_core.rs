@@ -7313,15 +7313,25 @@ impl<'a> Engine<'a> {
     }
 
     /// The model's argument-aware `isStrictlyNonNullable`
-    /// (`FileElements::is_strictly_non_nullable`): a non-nullable
+    /// (`FileElements::is_strictly_non_nullable_in`): a non-nullable
     /// `FutureOr<T>` is strictly non-nullable exactly when `T` is, and an
     /// extension type exactly when it declares interfaces. Every face the
     /// bound-aware delegate above does not decide itself routes here, so
     /// the union and extension-type arms live in one place (the model). A
     /// file the index never recorded keeps the plain shape face.
+    ///
+    /// `ty` arrives minted in the engine's own [`ArgPool`]
+    /// (`boundary.pool()` — every row/`operand_static_ty`/`param_bound`
+    /// face lives there), never the unit model's `type_args`: the helper
+    /// must resolve the `FutureOr` argument list through the pool that
+    /// minted the ids, so the diagnosis pool crosses the call boundary as
+    /// the explicit `args` parameter (#3531 — indexing the unit pool with
+    /// an engine slot read another universe and panicked).
     fn declared_strict_non_nullable(&self, ty: Ty) -> bool {
         match self.index.get(self.file) {
-            Some(elements) => elements.is_strictly_non_nullable(self.strings, ty),
+            Some(elements) => {
+                elements.is_strictly_non_nullable_in(self.strings, ty, &self.boundary.pool())
+            }
             None => ty.is_strictly_non_nullable(),
         }
     }
