@@ -514,15 +514,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::external_method_with_body(), self.peek_span());
         }
         // Upstream `parseTopLevelMethod` passes
-        // `isAugmentationsFeatureEnabled` into `allowAbstract`
-        // (parser_impl.dart:6255) so the `;` arm stays silent at parse
-        // time, then the analyzer reports `missingFunctionBody` on any
-        // declaration with no complete fragment — every top-level `;`
-        // body that is not itself `augment`/`external` (a top-level
-        // member can never be abstract). dartq has no post-parse
-        // fragment walk, so the parser emits the row: only a real
-        // `augment`/`external` declaration legally keeps a `;` body.
-        let allow_abstract = is_external || augment.is_some();
+        // `isExternal || isAugmentationsFeatureEnabled` into `allowAbstract`
+        // (parser_impl.dart:4606-4610), so a top-level `;` body is silent at
+        // parse time under the augmentations feature. The completeness
+        // verdict is then the analyzer's post-parse fragment walk
+        // (`missingFunctionBody` / `functionNotCompleteAfterAugmentations`),
+        // which cannot be decided per unit — an `augment` may live in another
+        // part file. Emitting from the parse tier would fire on every
+        // declaration an augmentation completes later (oracle
+        // ExecutableBodyTest/test_class_getter_static_augmentation_hasBody:
+        // silent), so the stance follows the feature flag exactly.
+        let allow_abstract = is_external || self.features.augmentations_enabled;
         let end = self.parse_function_body(false, allow_abstract);
         self.async_state = saved_async;
         let begin_token = self.span_at_mark(before_start);
@@ -1541,21 +1543,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::expected_body(), follower);
             follower
         } else {
-            // Upstream `parseClassOrMixinOrExtensionOrEnumMemberImpl`
-            // passes `isAugmentationsFeatureEnabled` into `allowAbstract`
-            // (parser_impl.dart:6077) so the `;` arm stays silent at
-            // parse time, then the analyzer reports `missingFunctionBody`
-            // on any member with no complete fragment — concretely every
-            // `static` member with a `;` body (a static member can never
-            // be abstract, and `augment`/`external` are their own body
-            // kinds). Non-static `;` members stay silent here: they are
-            // abstract-legal at this tier and any misuse surfaces as the
-            // verifier's `concrete_class_with_abstract_member`, not
-            // `missing_function_body`. dartq has no post-parse fragment
-            // walk, so the parser emits the row for the static arm.
+            // Upstream `parseClassOrMixinOrExtensionOrEnumMemberImpl` passes
+            // `isAugmentationsFeatureEnabled` into `allowAbstract`
+            // (parser_impl.dart:6029-6035), so under the feature the `;` arm
+            // stays silent at parse time for every member — including the
+            // static ones, which cannot be abstract. The analyzer then walks
+            // the augmentation chain post-parse and picks
+            // `missingFunctionBody` (no completing fragment at all) or
+            // `functionNotCompleteAfterAugmentations`. That verdict is not
+            // decidable per unit (an `augment` may sit in another part file),
+            // so the parser must not guess: reporting here fires on every
+            // static member an augmentation completes (oracle
+            // ExecutableBodyTest/test_class_getter_static_augmentation_hasBody:
+            // silent). Feature off ⇒ report at parse time, as upstream.
             let allow_abstract = (static_kw.is_none()
                 || mods.external.is_some()
-                || mods.augment.is_some())
+                || self.features.augmentations_enabled)
                 && self.async_state == AsyncModifier::Sync;
             self.parse_function_body(false, allow_abstract)
         };

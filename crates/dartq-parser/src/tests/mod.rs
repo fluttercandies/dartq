@@ -21,6 +21,7 @@ mod gate_2941_parser_residuals;
 mod gate_2942_junk_dispatch;
 mod gate_3135_lane_c;
 mod gate_3141_lane_b;
+mod gate_3317_recovery;
 mod gate_351;
 mod gate_410;
 mod gate_445;
