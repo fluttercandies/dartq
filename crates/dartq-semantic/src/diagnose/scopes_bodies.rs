@@ -2540,6 +2540,37 @@ impl<'a> Engine<'a> {
         // latched prefix operators exactly as the close would and is a
         // no-op for the later [`ConstCapture::close_constant_pattern`].
         let node = self.const_capture.peek_constant_pattern_root()?;
+        // A symbol literal's capture node spans only the `#` token — the
+        // listener's `end_literal_symbol` hands the hash range because the
+        // name's identifier parts live on the token stream. The upstream
+        // never-matches row anchors at the ConstantPattern node (`const #a`
+        // whole), so the root's span widens to the literal's real end: the
+        // byte scan walks the source past `#` over `(ident .)* ident` and
+        // `utf16_of` re-bases it.
+        if matches!(node.expr, Expr::Value(ConstantValue::Symbol(_))) {
+            let bytes = self.source.as_bytes();
+            // `node.span` is UTF-16; `#` is ASCII, so the byte walk starts
+            // at its end. The last identifier part's end is the literal end
+            // — a trailing `.` does not count.
+            let mut pos = self.byte_of(node.span.end());
+            let mut last_ident_end = pos;
+            let mut expect_ident = true;
+            while pos < bytes.len() {
+                let byte = bytes[pos];
+                if byte == b'.' && !expect_ident {
+                    expect_ident = true;
+                    pos += 1;
+                } else if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+                    expect_ident = false;
+                    pos += 1;
+                    last_ident_end = pos;
+                } else {
+                    break;
+                }
+            }
+            self.const_capture
+                .respan_constant_pattern_root(self.utf16_of(last_ident_end));
+        }
         let static_ty = self
             .rows
             .last()
@@ -2547,16 +2578,21 @@ impl<'a> Engine<'a> {
             .filter(|ty| *ty != Ty::UNKNOWN);
         match eval(&node, self) {
             // A produced value is the oracle's DartObject: the gate reads
-            // `value.type` once `hasPrimitiveEquality` accepts it.
+            // `value.type` once `hasPrimitiveEquality` accepts it — the
+            // VALUE's own type first (a `Created`'s container, never the
+            // `Type`-literal row the creation head left on top), then the
+            // expression's static row for the faces `folded_ty` cannot
+            // spell (List/Map/Type/Symbol/Record/Instance).
             Verdict::Value(value) => {
                 if !self.const_value_primitive_equality(&value) {
                     return None;
                 }
-                static_ty
-                    .or_else(|| {
-                        let ty = self.folded_ty(&value);
-                        (ty != Ty::UNKNOWN).then_some(ty)
-                    })
+                let ty = self.folded_ty(&value);
+                if ty != Ty::UNKNOWN {
+                    Some(ty)
+                } else {
+                    static_ty
+                }
             }
             // `Verdict::Constant` — a const expression whose value the
             // subset does not carry (the `const C()` creation faces the

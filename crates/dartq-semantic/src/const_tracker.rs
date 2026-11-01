@@ -24,6 +24,14 @@ pub(crate) struct ConstTracker {
     /// The anchor the `constant_pattern_never_matches_value_type`
     /// diagnostic attaches to.
     pub(crate) pending_const_at: Option<SourceRange>,
+    /// Armings inside the current pattern window. A single literal IS the
+    /// pattern's expression, so its type answers `value.type`; two or more
+    /// means the expression is a composite (`1 == 2`, `'a' 'b'`, `{1, 2}`)
+    /// whose own static type the last arm cannot spell — the recovered
+    /// eval tail in `class_static_const_tail_ty` answers it instead
+    /// (upstream `visitConstantPattern` reads the DartObject's
+    /// `value.type`, never an operand's).
+    arms: u32,
 }
 
 impl ConstTracker {
@@ -31,6 +39,7 @@ impl ConstTracker {
         ConstTracker {
             pending_const_ty: None,
             pending_const_at: None,
+            arms: 0,
         }
     }
 
@@ -39,17 +48,25 @@ impl ConstTracker {
     pub(crate) fn clear(&mut self) {
         self.pending_const_ty = None;
         self.pending_const_at = None;
+        self.arms = 0;
     }
 
     /// Arms the literal's static type and anchor (the engine gates the arm
     /// on the open-pattern depth).
     pub(crate) fn arm(&mut self, ty: Ty, at: SourceRange) {
+        self.arms += 1;
         self.pending_const_ty = Some(ty);
         self.pending_const_at = Some(at);
     }
 
-    /// Takes the armed type (the pattern's end consumes it).
+    /// Takes the armed type (the pattern's end consumes it). A composite
+    /// constant — more than one literal arming in the window — has no
+    /// single armed type: the expression's own recovered type answers from
+    /// the eval tail, so `None` falls through to it.
     pub(crate) fn take_ty(&mut self) -> Option<Ty> {
+        if self.arms > 1 {
+            return None;
+        }
         self.pending_const_ty.take()
     }
 

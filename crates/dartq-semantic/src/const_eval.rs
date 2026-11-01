@@ -2120,6 +2120,44 @@ impl ConstCapture {
             .is_some_and(|w| w.kind == WindowKind::ConstantPattern)
     }
 
+    /// A non-consuming look at the in-flight constant-pattern root: the
+    /// pending prefix operators apply exactly as [`Self::close_constant_pattern`]
+    /// would apply them, and the root clone returns for a verdict probe
+    /// (the oracle's `visitConstantPattern` evaluates the recovered
+    /// expression even when the parser flagged the pattern — the
+    /// never-matches judgment reads that evaluation). The window stays
+    /// open: the caller's later close takes the same applied root and the
+    /// second [`Self::apply_unaries`] is a no-op.
+    pub fn peek_constant_pattern_root(&mut self) -> Option<Node> {
+        if !self.top_is_constant_pattern() {
+            return None;
+        }
+        self.apply_unaries();
+        let base = self.base();
+        self.stack.get(base.max(self.stack.len().saturating_sub(1))).cloned()
+    }
+
+    /// Widens the in-flight constant-pattern root's span when its expression
+    /// is a symbol literal: the listener's `end_literal_symbol` only hands
+    /// the `#` token's range (the name's identifier parts sit on the token
+    /// stream, which the capture cannot see), so a recovered `const #a`
+    /// would anchor its never-matches row at `const #` — one short of the
+    /// ConstantPattern node's true end. The caller computes the literal's
+    /// end from the source bytes and passes it here; a non-symbol root or a
+    /// root already reaching `end` is a no-op.
+    pub(crate) fn respan_constant_pattern_root(&mut self, end: u32) {
+        if !self.top_is_constant_pattern() {
+            return;
+        }
+        let base = self.base();
+        let index = base.max(self.stack.len().saturating_sub(1));
+        if let Some(node) = self.stack.get_mut(index)
+            && node.span.end() < end
+        {
+            node.span.length = end - node.span.offset;
+        }
+    }
+
     /// Closes a constant-pattern window, returning its root node for the
     /// caller to evaluate — mirrors [`Self::close_initializer`] (the engine
     /// supplies the [`ConstLookup`], so the borrows stay split). `None`

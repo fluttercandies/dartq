@@ -2221,30 +2221,9 @@ pub fn fold_unit_with_ops<'t>(
         let Some(matched) = matched else {
             continue;
         };
-        // The expression's recovered static type (`value.type` in the
-        // oracle, constant_verifier.dart:140-165): a composite constant
-        // (`case 1 == 2:`) arms the LAST literal's type while the parsed
-        // expression's own type is the fold's (`bool`) — the candidate's
-        // `constant` is wrong whenever the fold answered differently. The
-        // folded `Value` row spans the whole expression node (the operand
-        // rows it drained are strictly smaller), so the widest row inside
-        // the pattern's span re-reads it — `operand_static_ty` answering
-        // the `typeOrThrow` face the oracle's gate reads.
-        let constant = engine
-            .rows
-            .iter()
-            .filter(|row| {
-                row.range.offset >= cand.at.offset
-                    && row.range.end() <= cand.at.end()
-                    && matches!(row.shape, RowShape::Value | RowShape::Record(..))
-            })
-            .max_by_key(|row| row.range.length)
-            .map(|row| engine.operand_static_ty(row))
-            .filter(|ty| *ty != Ty::UNKNOWN)
-            .unwrap_or(cand.constant);
-        if engine.constant_never_matches(constant, matched) {
+        if engine.constant_never_matches(cand.constant, matched) {
             let a0 = engine.ty_display(matched);
-            let a1 = engine.ty_display(constant);
+            let a1 = engine.ty_display(cand.constant);
             // The row stages into the TAKEN report's usage tail: the
             // engine's own report left with `let mut report` above, so an
             // `engine.stage_typed` push here would land in the fresh
