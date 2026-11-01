@@ -3592,9 +3592,64 @@ impl<'a> Engine<'a> {
         ty
     }
 
+    /// The CALL RESULT of a receiver span a send already consumed. A
+    /// completed send's callee span denotes the call's VALUE, never the
+    /// callee's own type: upstream types a `FunctionExpressionInvocation`
+    /// / `MethodInvocation` node by the invoked signature's return (the
+    /// receiver-type computation in
+    /// `method_invocation_resolver.dart` reads the receiver node's
+    /// `staticType`, which for `f(x)` is `staticType.returnType`), so
+    /// `f(x).m` resolves `m` on `f`'s RETURN type. Reading the callee's
+    /// own face there modelled the receiver as its `FunctionType` and ran
+    /// the member verdict on the function face instead, reporting
+    /// `undefined_method`/`undefined_getter` against a `Function`
+    /// receiver the oracle never resolves against.
+    ///
+    /// [`Engine::call_ends`] keys exactly the callee offsets of completed
+    /// sends, so the gate is exact: a non-invoked read of the same span
+    /// (a tear-off `f.gone`, a bare operand) keeps the callee's own face,
+    /// and a callable face whose result the walk cannot decide (a generic
+    /// signature, a callable class) keeps it too — the under-report
+    /// posture the result faces already take.
+    fn invoked_receiver_face(&self, read_span: SourceRange, face: Ty) -> Ty {
+        if self
+            .call_ends
+            .binary_search_by_key(&read_span.offset, |(offset, _)| *offset)
+            .is_err()
+        {
+            return face;
+        }
+        self.callable_result_of(face).unwrap_or(face)
+    }
+
     /// [`Self::recv_expression_ty`] before the trailing null-assert: the
     /// flow read face, then the chained-member face.
     fn recv_expression_face(&self, read_span: SourceRange) -> Option<Ty> {
+        // The value legs answer the receiver EXPRESSION's own face; a span
+        // a completed send already consumed denotes the call's VALUE, so
+        // the callee's own face is swapped for it
+        // ([`Self::invoked_receiver_face`]).
+        if let Some(face) = self.recv_value_face(read_span) {
+            return Some(self.invoked_receiver_face(read_span, face));
+        }
+        // The chain leg needs no swap: an invoked node's answer IS the
+        // send's result already (`a.b()`'s node is the send, never the
+        // tear-off), and swapping it again would unwrap the result type.
+        // It reads the staged member-read records only: a chain node's own
+        // record sits at its member token, whose span END equals the
+        // receiver span the child merge recorded (`e.supertype.m`'s leaf
+        // names `supertype`'s end) — so the walk matches the node by its
+        // member token's end and descends through each record's
+        // `recv_span`. Offsets are UTF-16 units, so the token end is the
+        // name's UTF-16 length past its offset.
+        let prev = self.chain_node_read(read_span, false)?;
+        self.chained_read_static_ty(prev)
+    }
+
+    /// [`Self::recv_expression_face`]'s value legs: the re-bound local's
+    /// read, the flow read face, the flow-blind initializer face, the
+    /// index-result fold, the compound join, and the parenthesized group.
+    fn recv_value_face(&self, read_span: SourceRange) -> Option<Ty> {
         // The re-bound local's corrected face outranks the raw flow read:
         // the flow layer's declared slot staged the parse-time bind
         // (#2140) and pass 2's re-bind (#2539) is the only holder of the
@@ -3631,13 +3686,6 @@ impl<'a> Engine<'a> {
         {
             return Some(Self::non_null_form(ty));
         }
-        // The chain leg reads the staged member-read records only: a chain
-        // node's own record sits at its member token, whose span END equals
-        // the receiver span the child merge recorded (`e.supertype.m`'s
-        // leaf names `supertype`'s end) — so the walk matches the node by
-        // its member token's end and descends through each record's
-        // `recv_span`. Offsets are UTF-16 units, so the token end is the
-        // name's UTF-16 length past its offset.
         // The index-result leg: a folded `recv[i]` result row re-types
         // through its receiver expression's re-derived face — the fold's
         // push-time result read the unpromoted receiver. Each hop names a
@@ -3684,8 +3732,7 @@ impl<'a> Engine<'a> {
         if let Some(group) = self.group_expression_face(read_span) {
             return Some(group);
         }
-        let prev = self.chain_node_read(read_span, false)?;
-        self.chained_read_static_ty(prev)
+        None
     }
 
     /// The name-level join of a `??`/`?:` receiver's arm faces — the
@@ -4674,7 +4721,13 @@ impl<'a> Engine<'a> {
                         // (callee offset -> closing `)`), the same offset
                         // key [`Self::invocation_span`] reads, so the gate
                         // is exact and covers all three declaration arms
-                        // (`Decl`/`Member`/`Local`).
+                        // (`Decl`/`Member`/`Local`). The send's own result
+                        // face is answered by [`Self::recv_expression_ty`]'s
+                        // value legs above; a declaration shape is the
+                        // callee's SIGNATURE, so a completed send has no
+                        // declaration-shape face at all (an untyped or
+                        // parameter-headed return would otherwise leak a
+                        // `Function`/unresolved head into the receiver).
                         .or_else(|| {
                             if self
                                 .call_ends

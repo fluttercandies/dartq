@@ -19620,6 +19620,17 @@ mod ticket_3394_tests;
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// The #3406 pins (the `undefined_*` C2 cluster): a receiver that IS a call
+// result is modelled by the invocation's RETURN type, never by the callee's
+// own function type — `f(x).m`, `f(x)..m()` and `f<A>(x).m` resolved the
+// receiver on the callee's `FunctionType` face and reported
+// `undefined_method`/`undefined_getter` against a receiver the oracle never
+// resolves against. Registered here via `#[path]`; the module stays inside
+// the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3406_tests.rs"]
+mod ticket_3406_tests;
+
 // The #3407 pins (the `undefined_*` C6/C9/C12 cluster faces, pinned at the
 // model layer): an `augment` head declares no name of its own — the target
 // resolves to the introducing unit, and a target with no introduction stays
