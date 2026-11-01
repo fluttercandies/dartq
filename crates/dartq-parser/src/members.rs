@@ -613,6 +613,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 
         if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
             new_kw = Some(self.peek_span());
+            // The `new`-member face (`parseMethod`, parser_impl.dart:5380-
+            // 5386): a primary-constructor `new` member below 3.13 reports
+            // `experiment_not_enabled` at the `new` token.
+            if !self.features.primary_constructors_enabled {
+                self.report_experiment_not_enabled(new_kw.unwrap());
+            }
             self.cursor.advance();
         } else if !matches!(self.peek_kind(), TokenKind::Identifier) {
             match self.peek_kind() {
@@ -1192,6 +1198,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // `parseOperatorName` sub-cases).
         let mut is_operator = false;
         let mut name: TokenSpan;
+        // The split `>>>` operator's skip anchor for the return-type
+        // re-parse (the splice's last real token — see the arm below).
+        let mut operator_skip_anchor = None;
         if get_or_set.is_none() && self.peek_kind() == TokenKind::Keyword(Keyword::Operator) {
             let operator_kw = self.peek_span();
             let follower = self.cursor.look_kind(1);
@@ -1203,9 +1212,38 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 || matches!(follower, TokenKind::EqEqEq | TokenKind::BangEqEq)
             {
                 is_operator = true;
-                self.cursor.advance();
+                // The split `>>>` operator-member face (`parseMethod`,
+                // parser_impl.dart:5786-5800): with the feature off the
+                // scanner hands `operator` + adjacent `>>` `>`; one
+                // `experiment_not_enabled` row spans the pair, then the
+                // tokens continue as the merged operator — a queued
+                // zero-width synthetic `>>>` replaces the pair (official
+                // `replaceNextTokensWithSyntheticToken`), so
+                // `handleOperatorName` carries it and no
+                // `missing_keyword_operator`/`missing_method_parameters`
+                // cascade fires.
+                let triple_shift_split = !self.features.triple_shift_enabled
+                    && follower == TokenKind::GtGt
+                    && self.cursor.look_kind(2) == TokenKind::Gt
+                    && self.look_span_at(1).range.offset + self.look_span_at(1).range.length
+                        == self.look_span_at(2).range.offset;
+                self.cursor.advance(); // `operator`
                 let op = self.peek_span();
-                self.cursor.advance();
+                self.cursor.advance(); // the scanned op (`>>` for the split)
+                let mut op = op;
+                if triple_shift_split {
+                    let gt = self.peek_span();
+                    self.report_with_end(msg::experiment_not_enabled("triple-shift"), op, gt);
+                    let syn = self.cursor.insert_synthetic(TokenKind::GtGtGt, op.range.offset);
+                    op = self.span_of(syn);
+                    self.cursor.advance(); // the synthetic `>>>`
+                    self.cursor.advance(); // the real `>`
+                    // The splice's last real token (the leftover `>`): the
+                    // skip anchor for the return-type re-parse below — the
+                    // synthetic name id is a queued id and cannot anchor
+                    // `jump_to` (real-stream indexes only).
+                    operator_skip_anchor = self.cursor.last_consumed_id();
+                }
                 if matches!(follower, TokenKind::EqEqEq | TokenKind::BangEqEq) {
                     // The scanner reports `===`/`!==`; the parser only fires
                     // the invalid-name event (official parseOperatorName).
@@ -1367,9 +1405,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // introducer and the operator token consumed above (grammar
             // guarantees adjacency, official parseMethod keeps `token` on
             // the name throughout). The recovered no-keyword form (synthetic
-            // introducer) may already sit ON the operator token.
-            if (name.id as usize) > self.cursor.real_pos() {
-                self.cursor.jump_to(name.id);
+            // introducer) may already sit ON the operator token. A spliced
+            // `>>>` name is a queued id — the anchor is its last real
+            // token instead.
+            let skip = operator_skip_anchor.unwrap_or(name.id);
+            if (skip as usize) > self.cursor.real_pos() {
+                self.cursor.jump_to(skip);
             }
             self.cursor.advance();
         }

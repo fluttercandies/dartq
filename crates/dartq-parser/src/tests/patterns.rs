@@ -147,6 +147,11 @@ fn patterns_disabled_reports_experiment() {
         dot_shorthands_enabled: false,
         anonymous_methods_enabled: false,
         sound_flow_analysis: false,
+        records_enabled: false,
+        class_modifiers_enabled: false,
+        sealed_class_enabled: false,
+        digit_separators_enabled: false,
+        triple_shift_enabled: false,
     };
     let mut collector = super::collector::Collector::default();
     let mut p = crate::Parser::new(text, table, features, &mut collector);

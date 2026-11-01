@@ -1294,6 +1294,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if self.peek_kind() == TokenKind::Semicolon {
             let semi = self.peek_span();
             self.cursor.advance();
+            // The enum empty-body face (`parseEnumDeclaration`,
+            // parser_impl.dart:2623-2631): an `enum E;` body below 3.13
+            // reports `experiment_not_enabled` at the `;`.
+            if !self.features.primary_constructors_enabled {
+                self.report_experiment_not_enabled(semi);
+            }
             self.listener
                 .handle_enum_header(augment, enum_keyword, semi);
             self.listener.handle_no_enum_body(semi);
@@ -1587,6 +1593,31 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         mixin: Option<TokenSpan>,
         class_keyword: TokenSpan,
     ) {
+        // The analyzer's off-version modifier faces (`beginClassDeclaration`
+        // ast_builder.dart:241-283, `beginNamedMixinApplication` :502-554 —
+        // one `experiment_not_enabled` row per present modifier, anchored on
+        // the modifier token, which is then dropped from the declaration):
+        // `sealed` under the sealed-class gate, `base`/`interface`/`final`
+        // and `mixin class`'s `mixin` under the class-modifiers gate.
+        if let Some(t) = sealed
+            && !self.features.sealed_class_enabled
+        {
+            self.report(msg::experiment_not_enabled("sealed-class"), t);
+        }
+        if !self.features.class_modifiers_enabled {
+            if let Some(t) = base {
+                self.report(msg::experiment_not_enabled("class-modifiers"), t);
+            }
+            if let Some(t) = interface {
+                self.report(msg::experiment_not_enabled("class-modifiers"), t);
+            }
+            if let Some(t) = final_kw {
+                self.report(msg::experiment_not_enabled("class-modifiers"), t);
+            }
+            if let Some(t) = mixin {
+                self.report(msg::experiment_not_enabled("class-modifiers"), t);
+            }
+        }
         self.listener
             .begin_class_or_mixin_or_named_mixin_application_prelude(begin);
         self.cursor.advance(); // `class`
@@ -2164,6 +2195,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         base: Option<TokenSpan>,
         mixin_keyword: TokenSpan,
     ) {
+        // `beginMixinDeclaration`'s off-version face (ast_builder.dart:
+        // 487-494): `base mixin M` below 3.0 reports `experiment_not_enabled`
+        // at the `base` token, which is then dropped.
+        if let Some(t) = base
+            && !self.features.class_modifiers_enabled
+        {
+            self.report(msg::experiment_not_enabled("class-modifiers"), t);
+        }
         self.listener
             .begin_class_or_mixin_or_named_mixin_application_prelude(mixin_keyword);
         self.cursor.advance(); // `mixin`

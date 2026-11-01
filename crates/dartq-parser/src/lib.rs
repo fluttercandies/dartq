@@ -120,6 +120,12 @@ mod ticket_3376_tests;
 #[cfg(test)]
 mod ticket_3413_tests;
 
+#[cfg(test)]
+mod ticket_3462_tests;
+
+#[cfg(test)]
+mod ticket_3463_tests;
+
 pub use cursor::TokenCursor;
 pub use features::ParserFeatures;
 pub use listener::{

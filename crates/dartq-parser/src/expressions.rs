@@ -257,6 +257,64 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         end.id == prev.id + 1 && self.span_kind(end.id) == TokenKind::Keyword(Keyword::Super)
     }
 
+    /// The binary `>>>` split face's body (`parsePrecedenceExpression`,
+    /// parser_impl.dart:7386-7402; dispatched from the loop in
+    /// [`Self::parse_precedence`]). The cursor sits on the real `>>`; the
+    /// scanner handed adjacent `>>` `>`. One `experiment_not_enabled` row
+    /// spans the real pair, one rides the zero-width synthetic `>>>` that
+    /// the analyzer's `endBinaryExpression` then sees
+    /// (ast_builder.dart:1084-1093, `startToken` only); the walk continues
+    /// on the merged operator, the loop's `left`.
+    fn parse_triple_shift_binary_rest(&mut self, level: u8, allow_cascades: bool) -> TokenSpan {
+        let gt_gt = self.peek_span();
+        let gt = self.look_span_at(1);
+        self.report_with_end(msg::experiment_not_enabled("triple-shift"), gt_gt, gt);
+        let syn = self.cursor.insert_synthetic(TokenKind::GtGtGt, gt_gt.range.offset);
+        let operator = self.span_of(syn);
+        self.cursor.advance(); // the synthetic `>>>`
+        self.cursor.advance(); // the real `>>`
+        self.cursor.advance(); // the real `>`
+        self.listener.begin_binary_expression(operator);
+        let right = self.parse_precedence(level + 1, allow_cascades);
+        if self.ends_bare_super_after(operator, right) {
+            self.report(msg::missing_assignable_selector(), right);
+        }
+        let rhs_last = self.last_consumed_span();
+        self.listener.handle_binary_rhs_end(operator, rhs_last);
+        self.listener.end_binary_expression(operator, right);
+        self.report(msg::experiment_not_enabled("triple-shift"), operator);
+        right
+    }
+
+    /// The `>>>=` split face's body (`parseAssignmentExpression`,
+    /// parser_impl.dart:7259-7275): the same row pair over `>>`+`>=`, then
+    /// the assignment continuation on the merged synthetic `>>>=` —
+    /// right-associative, so the RHS parses at the assignment level
+    /// (`_parseExpression`, :7271-7283). The analyzer's
+    /// `endAssignmentExpression` re-reports on the synthetic `>>>=`
+    /// (ast_builder.dart:3660-3667) — the zero-width second row.
+    fn parse_triple_shift_assignment_rest(&mut self, allow_cascades: bool) -> TokenSpan {
+        let gt_gt = self.peek_span();
+        let gt_eq = self.look_span_at(1);
+        self.report_with_end(msg::experiment_not_enabled("triple-shift"), gt_gt, gt_eq);
+        let syn = self.cursor.insert_synthetic(TokenKind::GtGtGtEq, gt_gt.range.offset);
+        let operator = self.span_of(syn);
+        self.cursor.advance(); // the synthetic `>>>=`
+        self.cursor.advance(); // the real `>>`
+        self.cursor.advance(); // the real `>=`
+        let end = if self.peek_kind() == TokenKind::Keyword(Keyword::Throw) {
+            self.parse_throw_expression(allow_cascades)
+        } else {
+            self.parse_precedence(ASSIGNMENT_PRECEDENCE, allow_cascades)
+        };
+        if self.ends_bare_super_after(operator, end) {
+            self.report(msg::missing_assignable_selector(), end);
+        }
+        self.listener.handle_assignment_expression(operator, end);
+        self.report(msg::experiment_not_enabled("triple-shift"), operator);
+        end
+    }
+
     /// The kind-only half of [`Parser::ends_bare_super_after`] for sites
     /// whose predecessor token can be a spliced synthetic (the conditional
     /// colon): an inserted id sits off the real sequence, so the identity
@@ -806,6 +864,29 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             } else if kind == TokenKind::Question {
                 left = self.parse_conditional_expression_rest();
                 lhs_ends_index = false;
+            } else if !self.features.triple_shift_enabled
+                && kind == TokenKind::GtGt
+                && self.cursor.look_kind(1) == TokenKind::Gt
+                && self.peek_span().range.offset + self.peek_span().range.length
+                    == self.look_span_at(1).range.offset
+            {
+                // The binary `>>>` split face (`parsePrecedenceExpression`,
+                // parser_impl.dart:7386-7402) — see
+                // [`Self::parse_triple_shift_binary_rest`]. The body lives
+                // out of line: this loop frame sits on every nested-
+                // expression recursion (the 500-deep canary), so the split
+                // path's locals must not grow it.
+                left = self.parse_triple_shift_binary_rest(level, allow_cascades);
+                lhs_ends_index = false;
+            } else if !self.features.triple_shift_enabled
+                && kind == TokenKind::GtGt
+                && self.cursor.look_kind(1) == TokenKind::GtGtEq
+                && self.peek_span().range.offset + self.peek_span().range.length
+                    == self.look_span_at(1).range.offset
+            {
+                // The `>>>=` split face (parser_impl.dart:7259-7275) — see
+                // [`Self::parse_triple_shift_assignment_rest`].
+                left = self.parse_triple_shift_assignment_rest(allow_cascades);
             } else {
                 // Plain binary (:6818-6851). Equality/relational chains are
                 // rejected once per tier.
@@ -1784,6 +1865,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let token = self.peek_span();
                 self.cursor.advance();
                 if self.cursor.lexeme(token.id).contains('_') {
+                    // `handleLiteralIntWithSeparators`
+                    // (ast_builder.dart:4706-4730): below 3.6 the
+                    // separator literal reports `experiment_not_enabled`
+                    // at the token.
+                    if !self.features.digit_separators_enabled {
+                        self.report(msg::experiment_not_enabled("digit-separators"), token);
+                    }
                     self.listener.handle_literal_int_with_separators(token);
                 } else {
                     self.listener.handle_literal_int(token);
@@ -1794,6 +1882,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let token = self.peek_span();
                 self.cursor.advance();
                 if self.cursor.lexeme(token.id).contains('_') {
+                    // `handleLiteralDoubleWithSeparators`
+                    // (ast_builder.dart:4668-4695): the int twin's
+                    // off-version face.
+                    if !self.features.digit_separators_enabled {
+                        self.report(msg::experiment_not_enabled("digit-separators"), token);
+                    }
                     self.listener.handle_literal_double_with_separators(token);
                 } else {
                     self.listener.handle_literal_double(token);

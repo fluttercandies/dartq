@@ -561,6 +561,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.cursor.advance();
         }
         if was_record {
+            // The analyzer's off-version record face (`endRecordLiteral`,
+            // ast_builder.dart:2786-2809): below 3.0 the record reports
+            // `experiment_not_enabled` at the `(` and degrades to the
+            // parenthesized shape.
+            if !self.features.records_enabled {
+                self.report(msg::experiment_not_enabled("records"), begin);
+            }
             if let (0, Some(comma)) = (count, illegal_trailing_comma) {
                 // Empty record literal with a comma `(,)`
                 // (`recordLiteralZeroFieldsWithTrailingComma`, the analyzer's

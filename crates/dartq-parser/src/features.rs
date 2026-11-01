@@ -9,10 +9,12 @@
 //! Division of labor with the scanner (its `ScanConfig`): `triple_shift` and
 //! `augmentations` are **lexical** gates — the scanner decides whether
 //! `>>>` lexes as one token and whether `augment` is a keyword (scanner
-//! crate docs). The parser needs no field for `triple_shift`: when the
-//! feature is off, the scanner hands it plain `>>`+`>` sequences and the
-//! ordinary grammar paths do the right thing. `patterns` and `variance`
-//! are **syntactic** gates owned here.
+//! crate docs). `triple_shift` is lexical *and* syntactic: with the feature
+//! off the scanner hands the parser adjacent `>>`+`>` sequences, and the
+//! parser's split-shape recovery faces (`parser_impl.dart:5790/:7262/:7392`)
+//! report `experiment_not_enabled` and continue as the merged operator, so
+//! the fold carries the bit too. `patterns` and `variance` are **syntactic**
+//! gates owned here.
 //!
 //! The fold is keyed by the generated registry: one pass over
 //! [`Feature::ALL`], each enabled feature applied through
@@ -82,6 +84,37 @@ pub struct ParserFeatures {
     /// satisfied checks, `??` RHS kills, pattern cannot-match kills)
     /// standing down.
     pub sound_flow_analysis: bool,
+    /// `records` (`enabledIn: 3.0.0`): record literals and record types.
+    /// When off, the analyzer's `AstBuilder` reports
+    /// `experiment_not_enabled` at the record's `(` and degrades the node
+    /// (`endRecordLiteral` ast_builder.dart:2786, `endRecordType`
+    /// :2831) — the parse continues on the parenthesized shape.
+    pub records_enabled: bool,
+    /// `class-modifiers` (`enabledIn: 3.0.0`): the `base`/`interface`/
+    /// `final` class modifiers and the `mixin` of `mixin class`. When off,
+    /// each modifier reports `experiment_not_enabled` at its own token
+    /// (`beginClassDeclaration` ast_builder.dart:252-282,
+    /// `beginNamedMixinApplication` :524-553, `beginMixinDeclaration`
+    /// :487-494 for `base`) and is dropped from the declaration.
+    pub class_modifiers_enabled: bool,
+    /// `sealed-class` (`enabledIn: 3.0.0`): the `sealed` modifier, gated
+    /// separately from [`Self::class_modifiers_enabled`] exactly as the
+    /// analyzer gates it (`beginClassDeclaration` ast_builder.dart:242-250).
+    pub sealed_class_enabled: bool,
+    /// `digit-separators` (`enabledIn: 3.6.0`): `_` in int/double literals.
+    /// The scanner always lexes the separators; the analyzer's
+    /// `handleLiteral{Int,Double}WithSeparators` report
+    /// `experiment_not_enabled` at the literal token when off
+    /// (ast_builder.dart:4680/:4719).
+    pub digit_separators_enabled: bool,
+    /// `triple-shift` (`enabledIn: 2.14.0`): the lexical gate decides in
+    /// the scanner (`>>>` as one token; the module docs' division of
+    /// labor); with it off the scanner hands the parser adjacent `>>`+`>`
+    /// sequences and the parser's split-shape faces report
+    /// `experiment_not_enabled` and continue as the merged operator
+    /// (`parser_impl.dart:5790` operator member, :7262 `>>>=`, :7392
+    /// binary `>>>`).
+    pub triple_shift_enabled: bool,
 }
 
 impl ParserFeatures {
@@ -95,6 +128,11 @@ impl ParserFeatures {
         dot_shorthands_enabled: false,
         anonymous_methods_enabled: false,
         sound_flow_analysis: false,
+        records_enabled: false,
+        class_modifiers_enabled: false,
+        sealed_class_enabled: false,
+        digit_separators_enabled: false,
+        triple_shift_enabled: false,
     };
 
     /// Folds a [`FeatureSet`] into the parser's plain flags.
@@ -134,10 +172,16 @@ impl ParserFeatures {
             // Not a grammar gate: the fold carries the posture for the
             // flow-analysis replay (the field's doc).
             Feature::SoundFlowAnalysis => self.sound_flow_analysis = true,
-            // Lexical only: `triple-shift` decides in the scanner
-            // (`>>>` as one token); the parser sees its effect through
-            // the token stream (the module docs' division of labor).
-            Feature::TripleShift => {}
+            // Version-gated grammar faces (the fields' docs): the shipped
+            // features whose off-version parse still reports
+            // `experiment_not_enabled`.
+            Feature::Records => self.records_enabled = true,
+            Feature::ClassModifiers => self.class_modifiers_enabled = true,
+            Feature::SealedClass => self.sealed_class_enabled = true,
+            Feature::DigitSeparators => self.digit_separators_enabled = true,
+            // Lexical gate in the scanner (`>>>` as one token) plus the
+            // parser's split-shape faces (the field's doc).
+            Feature::TripleShift => self.triple_shift_enabled = true,
             // No parser stance: the grammar surface is version-blind for
             // these entries (the fixed 3.15 surface accepts the shipped
             // shapes; the experimental ones have no production here), and
@@ -157,13 +201,9 @@ impl ParserFeatures {
             | Feature::NullAwareElements
             | Feature::InferenceUsingBounds
             | Feature::WildcardVariables
-            | Feature::DigitSeparators
             | Feature::InferenceUpdate3
             | Feature::InlineClass
             | Feature::InferenceUpdate2
-            | Feature::SealedClass
-            | Feature::ClassModifiers
-            | Feature::Records
             | Feature::UnnamedLibraries
             | Feature::AlternativeInvalidationStrategy
             | Feature::InferenceUpdate1
@@ -209,16 +249,24 @@ mod tests {
     /// every version that decides differently: each bit is exactly the
     /// `enabledIn <= version` predicate over its yaml entry (clamped at
     /// the data horizon like every version-derived face). The matrix
-    /// brackets every shipped boundary the six stances cross; a new fold
-    /// bit without its registry truth — or a stance flip — fails here.
+    /// brackets every shipped boundary the stances cross — 2.14
+    /// (triple-shift), 3.0 (records / class-modifiers / sealed-class),
+    /// 3.6 (digit-separators), 3.9 (sound-flow-analysis), 3.10
+    /// (dot-shorthands), 3.13 (primary-constructors) — on both sides; a
+    /// new fold bit without its registry truth — or a stance flip — fails
+    /// here.
     #[test]
     fn fold_matches_the_registry_truth_across_versions() {
-        const MATRIX: [dartq_language::LanguageVersion; 10] = [
+        const MATRIX: [dartq_language::LanguageVersion; 14] = [
             dartq_language::LanguageVersion::new(2, 12),
+            dartq_language::LanguageVersion::new(2, 13),
+            dartq_language::LanguageVersion::new(2, 14),
             dartq_language::LanguageVersion::new(2, 16),
             dartq_language::LanguageVersion::new(2, 19),
             dartq_language::LanguageVersion::new(2, 99),
             dartq_language::LanguageVersion::new(3, 0),
+            dartq_language::LanguageVersion::new(3, 5),
+            dartq_language::LanguageVersion::new(3, 6),
             // The sound-flow-analysis boundary's two sides (the #2837
             // posture: a `// @dart = 3.8` unit folds the bit off).
             dartq_language::LanguageVersion::new(3, 8),
@@ -248,6 +296,11 @@ mod tests {
                 dot_shorthands_enabled: shipped(Feature::DotShorthands, version),
                 anonymous_methods_enabled: shipped(Feature::AnonymousMethods, version),
                 sound_flow_analysis: shipped(Feature::SoundFlowAnalysis, version),
+                records_enabled: shipped(Feature::Records, version),
+                class_modifiers_enabled: shipped(Feature::ClassModifiers, version),
+                sealed_class_enabled: shipped(Feature::SealedClass, version),
+                digit_separators_enabled: shipped(Feature::DigitSeparators, version),
+                triple_shift_enabled: shipped(Feature::TripleShift, version),
             };
             assert_eq!(folded, expected, "parser fold drifts at {version}");
         }

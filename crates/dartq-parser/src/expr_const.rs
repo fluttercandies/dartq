@@ -410,6 +410,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 self.cursor.advance();
                 if self.cursor.lexeme(token.id).contains('_') {
+                    // The constant-pattern twin of the
+                    // `handleLiteralIntWithSeparators` gate
+                    // (ast_builder.dart:4706-4730): below 3.6 the
+                    // separator literal reports `experiment_not_enabled`
+                    // at the token.
+                    if !self.features.digit_separators_enabled {
+                        self.report(msg::experiment_not_enabled("digit-separators"), token);
+                    }
                     self.listener.handle_literal_int_with_separators(token);
                 } else {
                     self.listener.handle_literal_int(token);
@@ -423,6 +431,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 self.cursor.advance();
                 if self.cursor.lexeme(token.id).contains('_') {
+                    // The constant-pattern twin of
+                    // `handleLiteralDoubleWithSeparators`
+                    // (ast_builder.dart:4668-4695).
+                    if !self.features.digit_separators_enabled {
+                        self.report(msg::experiment_not_enabled("digit-separators"), token);
+                    }
                     self.listener.handle_literal_double_with_separators(token);
                 } else {
                     self.listener.handle_literal_double(token);

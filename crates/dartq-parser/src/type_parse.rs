@@ -650,6 +650,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             };
             question = Some(q);
         }
+        // The analyzer's off-version record face (`endRecordType`,
+        // ast_builder.dart:2831-2856): below 3.0 the record type reports
+        // `experiment_not_enabled` at the `(` and degrades to a plain
+        // `NamedType`.
+        if !self.features.records_enabled {
+            self.report(msg::experiment_not_enabled("records"), start);
+        }
         self.listener
             .end_record_type(start, question, parameter_count, has_named_fields);
         self.leave_type_depth();

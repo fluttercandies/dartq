@@ -939,15 +939,25 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     shape_matched = true;
                 }
                 if shape_matched {
-                    if let Some(t) = var_final_or_const
-                        && member_kind != MemberKind::PrimaryConstructor
-                    {
-                        // Official :2210-2220/:2226-2236 — the shape-matched
-                        // probe reports `function_typed_parameter_var` on the
-                        // modifier (receivers included: `var this.h()`
-                        // carries the pair); the `extraneous_modifier` half
-                        // comes from the var/final walk-end gate below.
-                        self.report(msg::function_typed_parameter_var(), t);
+                    if let Some(t) = var_final_or_const {
+                        if member_kind != MemberKind::PrimaryConstructor {
+                            // Official :2210-2220/:2226-2236 — the shape-matched
+                            // probe reports `function_typed_parameter_var` on the
+                            // modifier (receivers included: `var this.h()`
+                            // carries the pair); the `extraneous_modifier` half
+                            // comes from the var/final walk-end gate below.
+                            self.report(msg::function_typed_parameter_var(), t);
+                        } else if !self.features.primary_constructors_enabled {
+                            // The primary-constructor formals' off-version
+                            // faces (`parseVariables`, parser_impl.dart:2216-
+                            // 2227 `<...>(` and :2240-2256 `(`): the modifier
+                            // reports `experiment_not_enabled` instead of the
+                            // `function_typed_parameter_var` wording.
+                            self.report(
+                                msg::experiment_not_enabled("primary-constructors"),
+                                t,
+                            );
+                        }
                     }
                     inline_name = Some(name);
                     // `beforeInlineFunctionType = token` — the tentative
@@ -956,12 +966,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     step_receiver_head = has_receiver_head;
                 }
             } else if self.peek_kind() == TokenKind::OpenParen {
-                if let Some(t) = var_final_or_const
-                    && member_kind != MemberKind::PrimaryConstructor
-                {
-                    // Same probed pair as the name-led shape above; the
-                    // walk-end gate owns the `extraneous_modifier` half.
-                    self.report(msg::function_typed_parameter_var(), t);
+                if let Some(t) = var_final_or_const {
+                    if member_kind != MemberKind::PrimaryConstructor {
+                        // Same probed pair as the name-led shape above; the
+                        // walk-end gate owns the `extraneous_modifier` half.
+                        self.report(msg::function_typed_parameter_var(), t);
+                    } else if !self.features.primary_constructors_enabled {
+                        // The name-less `(`-suffix primary-ctor face
+                        // (parser_impl.dart:2248-2256).
+                        self.report(msg::experiment_not_enabled("primary-constructors"), t);
+                    }
                 }
                 // `before` is the `(` itself, which is also the upstream
                 // anchor (`beforeInlineFunctionType.next!` — for a receiver
@@ -1038,19 +1052,22 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     self.report(msg::extraneous_modifier(&lexeme), t);
                 }
                 // `varAndType` for `var` + a type in ordinary formal
-                // positions (parser_impl.dart:2286-2298). Primary-constructor
-                // declaring parameters legitimately carry `var` + a type and
-                // stay silent: the official gate keys on
-                // `memberKind != MemberKind.PrimaryConstructor`, and the
-                // front_end's feature-off `reportExperimentNotEnabled` arm
-                // (:2290-2296) never fires on the analyzer — probed 3.13.1
-                // at language version 3.12, `class C(var int a) {}` yields
-                // zero rows. The `final` arm (:2299-2307) has no type gate.
+                // positions (parser_impl.dart:2286-2298). A primary-
+                // constructor declaring parameter below 3.13 reports
+                // `experiment_not_enabled` on the keyword instead (the
+                // official :2277-2283 else arm — probed 3.13.1 at
+                // `// @dart=3.12`: `class C(var int a) {}` yields the row
+                // at `var`; `class C(var a) {}` — no type after `var` —
+                // stays silent). The `final` arm (:2299-2307) has no type
+                // gate.
                 if is_var
                     && !matches!(type_info, TypeInfo::NoType)
-                    && member_kind != MemberKind::PrimaryConstructor
                 {
-                    self.report(msg::var_and_type(), t);
+                    if member_kind != MemberKind::PrimaryConstructor {
+                        self.report(msg::var_and_type(), t);
+                    } else if !self.features.primary_constructors_enabled {
+                        self.report(msg::experiment_not_enabled("primary-constructors"), t);
+                    }
                 }
             }
         }
