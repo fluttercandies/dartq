@@ -197,7 +197,7 @@ impl TypeTable {
     /// return themselves (`dynamic`, type.dart:90-92); `Never` keeps both
     /// projections as distinct interned shapes.
     #[must_use]
-    pub(crate) fn with_nullability(&self, id: TypeId, nullable: bool) -> TypeId {
+    pub fn with_nullability(&self, id: TypeId, nullable: bool) -> TypeId {
         self.state.borrow_mut().with_nullability(id, nullable)
     }
 

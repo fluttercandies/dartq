@@ -2481,7 +2481,26 @@ impl<'a> Bounds<'a> {
                 // its written argument's text, so `Fcon<X>` over the
                 // argument `Fcon<Never?>` prints `'Fcon<Fcon<Never?>>'`.
                 // A bare head (no written arguments) substitutes the
-                // expanded instantiation's display instead.
+                // expanded instantiation's display instead — read from the
+                // type the REPORTING pass checked: where the super-bounded
+                // pass ran, the issues are the inverted type's and the
+                // official substitutes each bound through the inverted
+                // arguments (`invertedSubstitution = Substitution.fromPairs2(
+                // typeParameters, invertedTypeArguments)`, upstream Dart SDK
+                // source, pkg/analyzer/lib/src/error/
+                // type_arguments_verifier.dart; the alias face reads the same
+                // inverted arguments in well_bounded.dart `_isSuperBounded`
+                // → `_isRegularBounded(invertedType)`). A raw `G` over
+                // `typedef G<X extends A<X>, Y extends A<Y>> = X Function(Y)`
+                // instantiates `G<A<dynamic>, A<Never>>`, inverts to
+                // `G<A<Never>, A<Object?>>`, and reports `'A<Object?>'`
+                // against `'A<A<Object?>>'` — never against the
+                // un-inverted `'A<A<Never>>'`. The regular pass (no super
+                // allowance) keeps the instantiation's own arguments. The
+                // inversion of an interface instantiation is always an
+                // interface of the same declaration (an interface type is
+                // neither top nor a `Never` subtype), so a non-interface
+                // inverted shape can only mean the pass did not run.
                 let written_args: Vec<Option<String>> = (0..head_params.len())
                     .map(|index| {
                         args.get(index).and_then(|arg| {
@@ -2501,9 +2520,20 @@ impl<'a> Bounds<'a> {
                         })
                     })
                     .collect();
+                let subst_source = match inverted_ty {
+                    Some(inverted)
+                        if matches!(
+                            snapshot.table.get(inverted).kind(),
+                            TypeKind::Interface { .. }
+                        ) =>
+                    {
+                        inverted
+                    }
+                    _ => instantiation,
+                };
                 let mut subst: FxHashMap<StringId, String> = FxHashMap::default();
                 if let TypeKind::Interface { args: arg_range, .. } =
-                    snapshot.table.get(instantiation).kind()
+                    snapshot.table.get(subst_source).kind()
                 {
                     for (index, param) in head_params.iter().enumerate() {
                         if index < arg_range.len() {
@@ -3417,7 +3447,24 @@ impl MapCtx<'_, '_> {
                             };
                             let map: Vec<(TypeParamId, TypeId)> =
                                 params.iter().copied().zip(args).collect();
-                            return Some(self.table.substitute(expansion, &map));
+                            let substituted = self.table.substitute(expansion, &map);
+                            // The use-site `?` lands on the instantiated
+                            // alias (`TypeAliasElementImpl.instantiateImpl`:
+                            // `type.withNullability(resultNullability)`, where
+                            // an already-nullable aliased type keeps its own
+                            // suffix and every other one takes the use
+                            // site's — upstream Dart SDK source,
+                            // pkg/analyzer/lib/src/dart/element/element.dart).
+                            // Dropping it read `A<G<int>?>` over `class A<X
+                            // extends G>` as the non-nullable `int Function()`
+                            // and passed a bound the oracle reports
+                            // (`'G<int>?' doesn't conform to the bound
+                            // 'G<dynamic>'`, #3581).
+                            return Some(if tree.nullable {
+                                self.table.with_nullability(substituted, true)
+                            } else {
+                                substituted
+                            });
                         }
                         // An alias declaration without an expansion (a chain
                         // still pending, a cycle, a poisoned RHS) is not
