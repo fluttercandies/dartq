@@ -3612,6 +3612,50 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the report already holds this `conflicting_static_and_instance`
+    /// row (same anchor, same rendered message).
+    fn static_instance_reported(&self, range: SourceRange, message: &str) -> bool {
+        self.report.diagnostics.iter().any(|d| {
+            d.code.name == "conflicting_static_and_instance"
+                && d.range == range
+                && d.message.to_string() == message
+        })
+    }
+
+    /// Emits the own-scope `conflicting_static_and_instance` row (the
+    /// container names itself as the conflicting owner) unless the same row
+    /// is already in the report.
+    ///
+    /// An extension type reaches the check twice — the body-close hook and
+    /// the declaration-end hook both fire, and an augmentation re-fires the
+    /// declaration event — so the second run must not duplicate the first.
+    /// Rows that differ only in the conflicting owner are distinct upstream
+    /// rows (the own-scope and inherited arms report independently) and both
+    /// stay.
+    fn emit_static_instance(&mut self, range: SourceRange, class: &str, member: &str) {
+        let code = SemanticCode::ConflictingStaticAndInstance;
+        if !self.static_instance_reported(range, &code.message(class, member)) {
+            self.emit(code, range, class, member);
+        }
+    }
+
+    /// Emits the inherited-arm `conflicting_static_and_instance` row (the
+    /// found member's declaring container renders as the conflicting owner)
+    /// under the same no-duplicate contract as
+    /// [`Engine::emit_static_instance`].
+    fn emit_static_instance3(
+        &mut self,
+        range: SourceRange,
+        class: &str,
+        member: &str,
+        owner: &str,
+    ) {
+        let code = SemanticCode::ConflictingStaticAndInstance;
+        if !self.static_instance_reported(range, &code.message3(class, member, owner)) {
+            self.emit3(code, range, class, member, owner);
+        }
+    }
+
     /// The `conflicting_static_and_instance` face (three upstream arms):
     /// 1. The OWN-scope arm — a static member whose bare name collides
     ///    with an instance member of the same container reports at the
@@ -3639,10 +3683,36 @@ impl<'a> Engine<'a> {
     ///    `conflictingClassName` = the found owner (`Object`/superclass/
     ///    constraint included). Both an own row and an inherited row can
     ///    fire for one member (upstream emits each independently).
+    ///
+    /// The comparator scopes upstream applies, both pinned by #3583:
+    /// - An EXTENSION TYPE has no implicit `Object` face. Its inherited
+    ///   conflicts come from `getInterface(element).conflicts`, whose
+    ///   `redeclared` map is built from the `implements` clause
+    ///   (`InheritanceManager3._getInterfaceExtensionType`, upstream Dart
+    ///   SDK source, pkg/analyzer/lib/src/dart/element/
+    ///   inheritance_manager3.dart:778-792) — a `static int hashCode()`
+    ///   reports `extension_type_declares_member_of_object` alone.
+    /// - A CONSTRUCTOR is not a member of the instance scope
+    ///   (`_checkClassStatic` walks `ClassMember` field/method
+    ///   declarations only), so a `factory foo()` never collides with a
+    ///   static member named `foo`.
     pub(crate) fn check_conflicting_static_and_instance(&mut self) {
         let Some((container, container_kind)) = self.container_context() else {
             return;
         };
+        // The container's own constructor selectors. A constructor is not a
+        // member of the instance scope (`member_duplicate_definition
+        // .dart:191-233` walks `ClassMember` field/method declarations), and
+        // the member capture keeps a factory head as a site of its own
+        // ("factories … keep their member capture"), so the name must be
+        // dropped here or a `factory foo()` would read as an instance member
+        // of `foo`.
+        let ctor_names: FxHashSet<StringId> = self
+            .index
+            .get(self.file)
+            .and_then(|elements| elements.container(container))
+            .map(|decl| decl.constructors.iter().copied().collect())
+            .unwrap_or_default();
         // The instance-scope bare names of this container's own members.
         let instance_names: FxHashSet<StringId> = self
             .decl_sites
@@ -3658,13 +3728,20 @@ impl<'a> Engine<'a> {
                 )
             })
             .map(|site| self.bare_name(site.name))
+            .filter(|name| !ctor_names.contains(name))
             .collect();
         // The implicit `Object` instance members a static member can
         // collide with through `getInherited` — the walk has no model rows
         // for them (they live on dart:core's `Object`), so the probe falls
         // back to this fixed set. `index` is `Enum`'s, so an enum's probe
         // set adds it on top (a class inherits no `index`; the enum's own
-        // constants are static and answer neither probe).
+        // constants are static and answer neither probe). An extension type
+        // gets NO implicit face: its conflict set is computed from the
+        // `implements` clause alone (`InheritanceManager3
+        // ._getInterfaceExtensionType` builds candidates from
+        // `element.interfaces`; `Object` is not one), so a `static int
+        // hashCode()` reports `extension_type_declares_member_of_object`
+        // alone.
         const IMPLICIT_OBJECT: [&str; 5] = [
             "hashCode",
             "toString",
@@ -3682,7 +3759,11 @@ impl<'a> Engine<'a> {
         ];
         let values = self.intern("values");
         let is_enum = container_kind == ContainerKind::Enum;
-        let implicit: &[&str] = if is_enum {
+        let is_extension_type = container_kind == ContainerKind::ExtensionType;
+        let object_name = self.intern("Object");
+        let implicit: &[&str] = if is_extension_type {
+            &[]
+        } else if is_enum {
             &IMPLICIT_ENUM
         } else {
             &IMPLICIT_OBJECT
@@ -3780,8 +3861,7 @@ impl<'a> Engine<'a> {
                 if !values_accessor
                     && (own_hit || inherited_hit || setter_hit || implicit_hit)
                 {
-                    self.emit3(
-                        SemanticCode::ConflictingStaticAndInstance,
+                    self.emit_static_instance3(
                         range,
                         &container_text,
                         &base_text,
@@ -3793,12 +3873,7 @@ impl<'a> Engine<'a> {
             // Arm 1 — own-scope. `values` accessors are exempt; every
             // other bare name in the instance scope collides.
             if own_hit && !values_accessor {
-                self.emit(
-                    SemanticCode::ConflictingStaticAndInstance,
-                    range,
-                    &container_text,
-                    &base_text,
-                );
+                self.emit_static_instance(range, &container_text, &base_text);
             }
             // Arm 3 — the inherited probe. Every non-enum kind reads
             // strictly above the container (`skip_own`): the interface
@@ -3809,56 +3884,48 @@ impl<'a> Engine<'a> {
                 Walk::Found(entry) => Some(entry),
                 _ => None,
             };
+            // The declaring container of the probe's hit (`last_origin`
+            // reads the memoized or fresh outcome).
+            let origin = self.member_faces.last_origin();
+            // An extension type's inherited face is its `implements`
+            // clause; `Object` never joins that map, so an `Object`-owned
+            // hit is no conflict (the implicit-set exclusion above has the
+            // same reason).
+            let object_owned = is_extension_type && origin == Some(object_name);
             // The getter probe landed a non-static inherited member: its
             // declaring container is the conflicting owner.
             if let Some(entry) = &found
                 && !entry.is_static
+                && !object_owned
             {
-                let owner = self
-                    .member_faces
-                    .last_origin()
+                let owner = origin
                     .map(|name| self.strings.resolve(name).to_string())
                     .unwrap_or_else(|| container_text.clone());
-                self.emit3(
-                    SemanticCode::ConflictingStaticAndInstance,
-                    range,
-                    &container_text,
-                    &base_text,
-                    &owner,
-                );
+                self.emit_static_instance3(range, &container_text, &base_text, &owner);
                 continue;
             }
             // The implicit `Object` faces answer the same probe without
             // model rows (dart:core owns them); their declaring container
             // is what renders.
             if implicit.iter().any(|member| self.intern(member) == base) {
-                self.emit3(
-                    SemanticCode::ConflictingStaticAndInstance,
-                    range,
-                    &container_text,
-                    &base_text,
-                    "Object",
-                );
+                self.emit_static_instance3(range, &container_text, &base_text, "Object");
                 continue;
             }
             // The setter probe (`getInherited(name=)`): a written setter's
             // `name=` spelling answers where the bare getter probe missed.
+            // An extension type skips an `Object`-owned hit for the same
+            // reason the getter probe does.
             let setter_spelling = self.setter_spelling(base);
             if let Walk::Found(entry) = self.walk_from(container, setter_spelling, true)
                 && !entry.is_static
             {
-                let owner = self
-                    .member_faces
-                    .last_origin()
-                    .map(|name| self.strings.resolve(name).to_string())
-                    .unwrap_or_else(|| container_text.clone());
-                self.emit3(
-                    SemanticCode::ConflictingStaticAndInstance,
-                    range,
-                    &container_text,
-                    &base_text,
-                    &owner,
-                );
+                let origin = self.member_faces.last_origin();
+                if !(is_extension_type && origin == Some(object_name)) {
+                    let owner = origin
+                        .map(|name| self.strings.resolve(name).to_string())
+                        .unwrap_or_else(|| container_text.clone());
+                    self.emit_static_instance3(range, &container_text, &base_text, &owner);
+                }
             }
         }
         self.emit_wildcard_dups();
