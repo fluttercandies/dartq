@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 
-use dartq_pub::{LanguageVersion, PackageConfig, ResolvedPackageGraph, normalize};
+use dartq_pub::{
+    LanguageVersion, PackageConfig, ResolvedPackage, ResolvedPackageGraph, normalize,
+};
 use dartq_source::normalize_path;
 use rustc_hash::FxHashMap;
 
@@ -58,6 +60,20 @@ pub struct PackageTable {
     /// `pub.dart:334-358`: `isWithin(root, filePath)` then
     /// `folder.withAncestors`, the `current.path == root` stop).
     workspace_root: PathBuf,
+    /// Per-context-root identities, deepest first: one per nested
+    /// self-resolved package root the assembly discovered under the analyzed
+    /// tree (the oracle's separate `AnalysisContext` per locally different
+    /// packages file, `context_locator.dart` `_createContextRoots`). Each
+    /// root pairs with the identities its own config resolves inside it —
+    /// a file under a context root attributes ONLY to that context's
+    /// entries (the oracle's per-context package set: an unparseable or
+    /// self-less context owns nothing, and the outer package never claims
+    /// through it). These live OUTSIDE `packages` deliberately: sibling
+    /// case roots share the self-package name (`test` across a
+    /// chunked-conformance floor), so a name-keyed map cannot hold them.
+    /// Empty in every non-floor shape; [`PackageTable::basic_with_contexts`]
+    /// is the only constructor that populates it.
+    contexts: Vec<(PathBuf, Vec<PackageIdentity>)>,
     /// Memoized per-directory attribution (oracle `_workspacePackages`,
     /// `pub.dart:187`, backfilled over the walked chain):
     /// directory → owning package, `None` recording "walked, found nothing
@@ -80,6 +96,7 @@ impl Clone for PackageTable {
             root: self.root.clone(),
             workspace_members: self.workspace_members.clone(),
             workspace_root: self.workspace_root.clone(),
+            contexts: self.contexts.clone(),
             // The memo is a pure cache; a clone starts cold.
             ancestor_memo: RwLock::new(FxHashMap::default()),
         }
@@ -245,6 +262,7 @@ impl PackageTable {
             root: Some(root_name),
             workspace_members,
             workspace_root,
+            contexts: Vec::new(),
             ancestor_memo: RwLock::new(FxHashMap::default()),
         })
     }
@@ -297,8 +315,64 @@ impl PackageTable {
             root,
             workspace_members: None,
             workspace_root: root_dir,
+            contexts: Vec::new(),
             ancestor_memo: RwLock::new(FxHashMap::default()),
         })
+    }
+
+    /// [`Self::basic`] plus per-context-root identities: the degraded
+    /// floors' attribution face for nested self-resolved package roots
+    /// discovered under the analyzed tree (the chunked-conformance shape —
+    /// a package-less directory of standalone package roots, each carrying
+    /// its own `.dart_tool/package_config.json` and therefore its own
+    /// `languageVersion`). The oracle splits each such directory into its
+    /// own `AnalysisContext` over its own parsed config, so a file under a
+    /// context root attributes to the package that root's own config names —
+    /// at that context's language version — never to the floor's self
+    /// package or the default.
+    ///
+    /// `contexts` pairs each discovered context root with the entries its
+    /// own config resolves (the caller harvests only entries rooted inside
+    /// the context root — the self package plus same-context aux roots);
+    /// it flattens into the depth-sorted identity list [`Self::containing`]
+    /// scans first, so a context nested inside a context owns its own
+    /// subtree. Name collisions are legal here — sibling roots commonly
+    /// share the self-package name (`test`) — which is exactly why these
+    /// identities live outside the name-keyed `packages` map; entry names
+    /// ride `new_unchecked` because [`PackageConfig::resolve`] already ran
+    /// the reader grammar.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::basic`].
+    pub fn basic_with_contexts(
+        root_dir: &Path,
+        self_package: Option<(&str, Option<LanguageVersion>)>,
+        contexts: &[(PathBuf, Vec<ResolvedPackage>)],
+    ) -> Result<PackageTable, crate::PackageError> {
+        let mut table = Self::basic(root_dir, self_package)?;
+        table.contexts = contexts
+            .iter()
+            .map(|(root, entries)| {
+                let mut identities: Vec<PackageIdentity> = entries
+                    .iter()
+                    .map(|entry| PackageIdentity {
+                        name: PackageName::new_unchecked(entry.name.clone()),
+                        root: normalize_path(&entry.root),
+                        lib_dir: normalize_path(&entry.lib_dir),
+                        language_version: entry.language_version,
+                        category: SourceCategory::Path,
+                    })
+                    .collect();
+                identities
+                    .sort_by_key(|identity| std::cmp::Reverse(identity.root.components().count()));
+                (normalize_path(root), identities)
+            })
+            .collect();
+        table
+            .contexts
+            .sort_by_key(|(root, _)| std::cmp::Reverse(root.components().count()));
+        Ok(table)
     }
 
     /// The entrypoint package of the resolution, `None` for a context with
@@ -367,6 +441,24 @@ impl PackageTable {
     #[must_use]
     pub fn containing(&self, path: &Path) -> Option<&PackageIdentity> {
         let path = normalize(path);
+        // A nested self-resolved context root owns its whole subtree ahead
+        // of the flat walk: the oracle gives that directory its own
+        // `AnalysisContext` (its own parsed config, its own language
+        // version), so the floor's self package — or the absence of one —
+        // never claims a file inside a discovered context root, and an
+        // unparseable or self-less context owns nothing inside it (the
+        // oracle's `Packages.empty` posture). The list is depth-sorted, so
+        // the first containing root is the innermost context; empty in
+        // every non-floor shape, where this scan costs one bounds check.
+        if let Some((_, identities)) = self
+            .contexts
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+        {
+            return identities
+                .iter()
+                .find(|identity| path.starts_with(&identity.root));
+        }
         // Structural file/directory class. The supported query shape is
         // per-file `.dart` attribution: file paths carry an extension, so
         // such queries skip the memoization of the query itself;

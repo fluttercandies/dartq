@@ -808,9 +808,12 @@ fn no_root_posture(dir: &Path, packages_overridden: bool) -> Result<AssemblyBody
         // pubspec on the ancestor chain (the chunked-conformance shape: a
         // directory of independent case roots, each analyzed against its own
         // resolution). The single-context stand-in merges those resolutions
-        // into the floor's config.
+        // into the floor's config, and the floor's attribution table gains
+        // the same roots' identities so a case file analyzes at its own
+        // `languageVersion` instead of the workspace default.
         bare_assembly(dir).map(|(packages, config, config_dir, analyzed, advisory, _)| {
             let (config, context_roots) = extend_config_with_nested_roots(config, &config_dir, dir);
+            let packages = with_context_identities(packages, &context_roots);
             AssemblyBody::Floor((
                 packages,
                 config,
@@ -824,7 +827,8 @@ fn no_root_posture(dir: &Path, packages_overridden: bool) -> Result<AssemblyBody
 }
 
 /// The degraded floor's assembly: a single-package context rooted at the
-/// pubspec directory, an empty `package:` map, and the missing-config
+/// pubspec directory, an empty `package:` map (nested self-resolved roots
+/// merge theirs in, same as the bare floor), and the missing-config
 /// advisory. The self package's language version is its pubspec's sdk
 /// lower bound — what pub would materialize into the config's
 /// `languageVersion`. `dir` (the canonicalized target) returns unchanged:
@@ -839,13 +843,20 @@ fn degraded_assembly(
     let language_version = LanguageVersion::from_sdk_constraint(pubspec.environment.sdk.as_ref());
     let packages = PackageTable::basic(root, self_package_facts(&pubspec, language_version))
         .map_err(|error| WorkspaceError(error.to_string()))?;
+    // The floor's empty `package:` map still gains the nested resolutions
+    // and the identity table the same per-context attributions: the
+    // locator splits a nested self-resolved root into its own context
+    // regardless of the parent's missing config.
+    let (config, context_roots) =
+        extend_config_with_nested_roots(empty_package_config(), &root.join(".dart_tool"), dir);
+    let packages = with_context_identities(packages, &context_roots);
     Ok((
         packages,
-        empty_package_config(),
+        config,
         root.join(".dart_tool"),
         dir.to_path_buf(),
         Some(WorkspaceAdvisory::MissingConfig(config_path.to_path_buf())),
-        Vec::new(),
+        context_roots,
     ))
 }
 
@@ -867,13 +878,19 @@ fn corrupt_config_assembly(root: &Path, dir: &Path) -> Result<Assembly, Workspac
     let language_version = LanguageVersion::from_sdk_constraint(pubspec.environment.sdk.as_ref());
     let packages = PackageTable::basic(root, self_package_facts(&pubspec, language_version))
         .map_err(|error| WorkspaceError(error.to_string()))?;
+    // Same nested-root split as [`degraded_assembly`]: a nested root's own
+    // config is a different packages file than the parent's unreadable one,
+    // so the locator still gives it its own context.
+    let (config, context_roots) =
+        extend_config_with_nested_roots(empty_package_config(), &root.join(".dart_tool"), dir);
+    let packages = with_context_identities(packages, &context_roots);
     Ok((
         packages,
-        empty_package_config(),
+        config,
         root.join(".dart_tool"),
         dir.to_path_buf(),
         None,
-        Vec::new(),
+        context_roots,
     ))
 }
 
@@ -905,6 +922,59 @@ fn empty_package_config() -> Arc<PackageConfig> {
         generator_version: None,
         additional_properties: BTreeMap::new(),
     })
+}
+
+/// Rebuilds a floor's identity table with the discovered context roots'
+/// per-context attributions: each root's own `package_config.json` is read
+/// and resolved, and every entry whose package root lies inside the context
+/// root becomes an identity — the self package plus same-context aux roots
+/// (the `package:`-section materialization). The oracle analyzes each such
+/// directory as its own `AnalysisContext` over its own parsed config
+/// (`context_locator.dart` `_createContextRoots` + `_createWorkspace`), so a
+/// file under a context root analyzes at the version that context's config
+/// declares — the `//- language:` marker's only channel into the engine —
+/// instead of the floor's self package or the workspace default.
+///
+/// A root whose config does not parse contributes nothing: the oracle's
+/// `parsePackageConfigJsonFile` catch-all floors that context's package set
+/// to `Packages.empty`, so its files attribute to the floor exactly as the
+/// unparseable-context posture there — the merge's pubspec-identity
+/// fallback feeds the URI face only, never the version face. No-op when the
+/// floor discovered no roots.
+fn with_context_identities(packages: PackageTable, roots: &[PathBuf]) -> PackageTable {
+    if roots.is_empty() {
+        return packages;
+    }
+    let contexts: Vec<(PathBuf, Vec<dartq_pub::ResolvedPackage>)> = roots
+        .iter()
+        .map(|root| {
+            let config_dir = root.join(".dart_tool");
+            let entries = fs::read_to_string(config_dir.join("package_config.json"))
+                .ok()
+                .and_then(|text| PackageConfig::parse(&text).ok())
+                .and_then(|config| config.resolve(&config_dir).ok())
+                .map(|resolved| {
+                    resolved
+                        .into_iter()
+                        .filter(|entry| entry.root.starts_with(root))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (root.clone(), entries)
+        })
+        .collect();
+    PackageTable::basic_with_contexts(
+        packages.workspace_root(),
+        packages
+            .root()
+            .and_then(|name| {
+                packages
+                    .get(name.as_str())
+                    .map(|identity| (name.as_str(), identity.language_version))
+            }),
+        &contexts,
+    )
+    .unwrap_or(packages)
 }
 
 /// The nearest directory at or above `from` carrying a `pubspec.yaml` —
@@ -1261,6 +1331,15 @@ fn extend_config_with_nested_roots(
     let mut discovered_roots: Vec<PathBuf> = Vec::new();
     let mut added_roots: BTreeSet<PathBuf> = BTreeSet::new();
     let mut added_names: BTreeSet<String> = BTreeSet::new();
+    // The containing context root is never a nested discovery: the
+    // locator's trigger is a packages file DIFFERENT from the containing
+    // root's own (`packageConfigFileToUse != containingRoot.packagesFile`),
+    // so the directory `config_dir` already speaks for is excluded by
+    // construction. On the resolved path `taken_roots` covers it through
+    // the self entry; the floors carry no entry, and a corrupt root config
+    // is still a file — without this guard the floor would rediscover its
+    // own root and merge it as a nested one.
+    let base = normalize(config_dir.parent().unwrap_or(config_dir));
     let mut visited = 0usize;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -1303,13 +1382,12 @@ fn extend_config_with_nested_roots(
             continue;
         };
         let target = normalize(&target);
-        if taken_roots.contains(&target) || !added_roots.insert(target.clone()) {
+        if target == base || taken_roots.contains(&target) || !added_roots.insert(target.clone()) {
             continue;
         }
         // The root itself is a context root however its entries fare below:
         // the URI table keys universes by root, not by merged entry.
         discovered_roots.push(target.clone());
-        let base = config_dir.parent().unwrap_or(config_dir);
         let nested_config_dir = target.join(".dart_tool");
         let nested_config = fs::read_to_string(nested_config_dir.join("package_config.json"))
             .ok()
@@ -1341,7 +1419,7 @@ fn extend_config_with_nested_roots(
                         continue;
                     }
                     let merged = PackageConfigEntry {
-                        root_uri: nested_root_uri(base, &root),
+                        root_uri: nested_root_uri(&base, &root),
                         package_uri: entry.package_uri,
                         language_version: entry.language_version,
                         ..entry
@@ -1349,7 +1427,7 @@ fn extend_config_with_nested_roots(
                     // The resolution faces reject the whole config on one
                     // invalid entry; the merge must never turn a nested
                     // root's broken entry into an assembly refusal.
-                    if entry_resolves(&merged, base) {
+                    if entry_resolves(&merged, &base) {
                         entries.push(merged);
                     }
                 }
@@ -1366,7 +1444,7 @@ fn extend_config_with_nested_roots(
                 {
                     continue;
                 }
-                let Ok(relative) = target.strip_prefix(base) else {
+                let Ok(relative) = target.strip_prefix(&base) else {
                     continue;
                 };
                 entries.push(PackageConfigEntry {
@@ -2115,17 +2193,162 @@ mod tests {
             vec![normalize(&chunk.join("0")), normalize(&chunk.join("1"))],
             "every same-named sibling root threads through as a context root"
         );
-        // The floor's attribution face is unchanged: the identity table
-        // stays bare; only the URI face joins the nested resolutions.
-        assert!(
-            config
-                .packages
-                .containing(&chunk.join("0/lib/test.dart"))
-                .is_none()
+        // The floor's attribution face now mirrors the oracle's per-context
+        // split: each case file attributes to its own root's `test`
+        // identity at that root's language version.
+        let identity = config
+            .packages
+            .containing(&chunk.join("0/lib/test.dart"))
+            .expect("case file attributes to its own context root");
+        assert_eq!(identity.name.as_str(), "test");
+        assert_eq!(
+            identity.language_version.map(|v| (v.major(), v.minor())),
+            Some((3, 13))
         );
 
         fs::remove_dir_all(&chunk).ok();
         fs::remove_dir_all(&mocks).ok();
+    }
+
+    /// The version-gate face of the chunked-conformance floor: sibling case
+    /// roots sharing the self-package name `test` each carry their own
+    /// `languageVersion` (the `//- language:` marker's channel), so a file
+    /// under a `2.19` root analyzes at 2.19 — patterns-era code gated off —
+    /// while its `3.13` sibling stays modern, and a file outside every case
+    /// root keeps the bare floor's ownerless default.
+    #[test]
+    fn bare_floor_case_files_attribute_at_their_own_language_versions() {
+        let chunk = workspace("ws_case_versions", &[]);
+        fs::remove_file(chunk.join("pubspec.yaml")).expect("drop pubspec");
+        fs::remove_file(chunk.join("pubspec.lock")).expect("drop lock");
+        fs::remove_file(chunk.join(".dart_tool/package_config.json")).expect("drop config");
+        let chunk = chunk.canonicalize().expect("chunk");
+        let case_config = |version: &str| {
+            format!(
+                r#"{{"configVersion": 2, "packages": [{{"name": "test", "rootUri": "../", "packageUri": "lib/", "languageVersion": "{version}"}}], "generator": "pub"}}"#
+            )
+        };
+        for (index, version) in [("0", "2.19"), ("1", "3.13")] {
+            let root = chunk.join(index);
+            fs::create_dir_all(root.join("lib")).expect("case lib");
+            fs::create_dir_all(root.join(".dart_tool")).expect("case dart_tool");
+            fs::write(root.join("pubspec.yaml"), "name: test\n").expect("case pubspec");
+            fs::write(root.join("lib/test.dart"), "var x = 1;\n").expect("case source");
+            fs::write(
+                root.join(".dart_tool/package_config.json"),
+                case_config(version),
+            )
+            .expect("case config");
+        }
+        fs::write(chunk.join("loose.dart"), "var loose = 1;\n").expect("loose file");
+
+        let (config, _, _) = engine_config_with_advisory(&chunk, Some(&chunk.join("sdk")))
+            .expect("the bare floor assembles");
+        let version_at = |path: &str| {
+            config
+                .packages
+                .containing(&chunk.join(path))
+                .map(|identity| identity.language_version.map(|v| (v.major(), v.minor())))
+        };
+        assert_eq!(
+            version_at("0/lib/test.dart"),
+            Some(Some((2, 19))),
+            "the 2.19 root's own version"
+        );
+        assert_eq!(
+            version_at("1/lib/test.dart"),
+            Some(Some((3, 13))),
+            "the same-named sibling's own version"
+        );
+        assert_eq!(
+            version_at("loose.dart"),
+            None,
+            "outside every context root stays ownerless"
+        );
+
+        fs::remove_dir_all(&chunk).ok();
+    }
+
+    /// A case root whose own `package_config.json` cannot be parsed keeps
+    /// the oracle's floor posture: its files attribute to no context
+    /// package (the oracle floors that context's package set to
+    /// `Packages.empty`), so the version face falls through to the bare
+    /// default — the merge's pubspec-identity fallback feeds the URI face
+    /// only, never the version face.
+    #[test]
+    fn bare_floor_unparseable_case_config_attributes_to_nothing() {
+        let chunk = workspace("ws_case_badcfg", &[]);
+        fs::remove_file(chunk.join("pubspec.yaml")).expect("drop pubspec");
+        fs::remove_file(chunk.join("pubspec.lock")).expect("drop lock");
+        fs::remove_file(chunk.join(".dart_tool/package_config.json")).expect("drop config");
+        let chunk = chunk.canonicalize().expect("chunk");
+        let root = chunk.join("0");
+        fs::create_dir_all(root.join("lib")).expect("case lib");
+        fs::create_dir_all(root.join(".dart_tool")).expect("case dart_tool");
+        fs::write(root.join("pubspec.yaml"), "name: test\n").expect("case pubspec");
+        fs::write(root.join("lib/test.dart"), "var x = 1;\n").expect("case source");
+        fs::write(root.join(".dart_tool/package_config.json"), "not json")
+            .expect("unparseable case config");
+
+        let (config, _, _) = engine_config_with_advisory(&chunk, Some(&chunk.join("sdk")))
+            .expect("the bare floor assembles");
+        assert!(
+            config
+                .packages
+                .containing(&chunk.join("0/lib/test.dart"))
+                .is_none(),
+            "no identity under an unparseable context config"
+        );
+
+        fs::remove_dir_all(&chunk).ok();
+    }
+
+    /// The degraded floor (pubspec present, config absent) splits nested
+    /// roots the same way: a self-resolved directory under the analyzed
+    /// tree attributes its files at its own `languageVersion`, not the
+    /// enclosing pubspec's sdk bound.
+    #[test]
+    fn degraded_floor_nested_root_keeps_its_own_language_version() {
+        let root = workspace("ws_degraded_nested", &[]);
+        fs::remove_file(root.join(".dart_tool/package_config.json")).expect("drop config");
+        fs::create_dir_all(root.join("case")).expect("nested dir");
+        fs::write(
+            root.join("case/pubspec.yaml"),
+            "name: test\nenvironment:\n  sdk: ^2.19.0\n",
+        )
+        .expect("nested pubspec");
+        fs::create_dir_all(root.join("case/.dart_tool")).expect("nested dart_tool");
+        fs::write(
+            root.join("case/.dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "test", "rootUri": "../", "packageUri": "lib/", "languageVersion": "2.19"}], "generator": "pub"}"#,
+        )
+        .expect("nested config");
+        fs::create_dir_all(root.join("case/lib")).expect("nested lib");
+        fs::write(root.join("case/lib/t.dart"), "var t = 1;\n").expect("nested file");
+        fs::create_dir_all(root.join("lib")).expect("own lib");
+        fs::write(root.join("lib/main.dart"), "var m = 1;\n").expect("own file");
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("the degraded floor assembles");
+        let version_at = |path: &Path| {
+            config
+                .packages
+                .containing(path)
+                .map(|identity| identity.language_version.map(|v| (v.major(), v.minor())))
+        };
+        assert_eq!(
+            version_at(&root.join("case/lib/t.dart")),
+            Some(Some((2, 19))),
+            "the nested root's own version"
+        );
+        assert_eq!(
+            version_at(&root.join("lib/main.dart")),
+            Some(Some((3, 5))),
+            "the enclosing pubspec bound still owns its own tree"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// The lock is optional (#759): config present, lock absent — the
