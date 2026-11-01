@@ -8761,6 +8761,7 @@ fn overridden_member_context_degrades_on_a_missing_span() {
     let file = files.intern(Path::new("a.dart"));
     let entry = MemberEntry {
         kind: MemberKind::Method,
+        is_augment: false,
         is_static: false,
         is_abstract: false,
         is_external: false,
@@ -23016,3 +23017,19 @@ mod ticket_3557_tests;
 #[cfg(test)]
 #[path = "ticket_3419_tests.rs"]
 mod ticket_3419_tests;
+
+#[cfg(test)]
+#[path = "ticket_3567_tests.rs"]
+mod ticket_3567_tests;
+
+#[cfg(test)]
+#[path = "ticket_3563_tests.rs"]
+mod ticket_3563_tests;
+
+#[cfg(test)]
+#[path = "ticket_3554_tests.rs"]
+mod ticket_3554_tests;
+
+#[cfg(test)]
+#[path = "ticket_3571_tests.rs"]
+mod ticket_3571_tests;
