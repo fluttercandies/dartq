@@ -2405,6 +2405,11 @@ pub fn fold_unit_with_ops<'t>(
     // anchored at a member read whose receiver and member face are both
     // non-nullable function types is the invoke arm's over-report.
     gate_non_nullable_callee_rows(&mut report.diagnostics, &engine);
+    // The #3300 extension-acceptance gate runs on the same joined list: an
+    // access a nullable-accepting extension resolved is no dereference at
+    // all, so any arm that emitted before the application was known
+    // over-reported there.
+    gate_extension_resolved_nullable_rows(&mut report.diagnostics, &engine);
     // The #2340 InvalidType-scrutinee coverage face runs on the same joined
     // list: an invalid-posture scrutinee makes the oracle's
     // `promoteForPattern` absorb the match at the first guard-free
@@ -3731,6 +3736,11 @@ pub(crate) fn access_kind(intent: &Intent) -> UncheckedNullableKind {
 const UNCHECKED_FUNCTION_TEXT: &str =
     "The function can't be unconditionally invoked because it can be 'null'.";
 
+/// The shared family's code name — the four message variants report under
+/// one code (messages.yaml's `uncheckedUseOfNullableValue` group), so every
+/// row-identifying gate matches the code alone.
+const UNCHECKED_NAME: &str = "unchecked_use_of_nullable_value";
+
 /// The #3288 dead-clause containment pass — a dead clause subsumes its body.
 ///
 /// When a run of catch clauses is dead (`dead_code_catch_following_catch`)
@@ -3787,7 +3797,7 @@ fn suppress_dead_code_inside_dead_clauses(diagnostics: &mut Vec<Diagnostic>) {
 fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine) {
     let function_head = engine.intern("Function");
     diagnostics.retain(|row| {
-        if row.code.name != "unchecked_use_of_nullable_value"
+        if row.code.name != UNCHECKED_NAME
             || row.message.as_str() != UNCHECKED_FUNCTION_TEXT
         {
             return true;
@@ -3811,6 +3821,42 @@ fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Eng
         // A non-nullable function result means the callee can never be
         // `null`; the row is the receiver-face over-report.
         !non_nullable_function_face(engine, Engine::member_result_ty(&entry), function_head)
+    });
+}
+
+/// The #3300 extension-acceptance gate — an unchecked row at an access a
+/// nullable-accepting extension already resolved.
+///
+/// The oracle asks the nullable-dereference verifier (`_checkForUseOfNullable`
+/// behind `checkNullable`, nullable_dereference_verifier.dart) only for an
+/// access whose member resolution went through the INSTANCE face: the
+/// resolution consults the applicable extensions against the receiver's
+/// static type first, and an extension whose instantiated `on` type accepts
+/// the receiver's nullable type (`extension E on C?`, and the unbounded
+/// `extension StaticType<T> on T` whose `on` type instantiates to the
+/// nullable receiver itself) resolves the member WITHOUT dereferencing
+/// anything — no row is reported at that access
+/// (type_property_resolver.dart:96-124: the applicability test precedes the
+/// report, so the verifier never sees the node).
+///
+/// The pass-2 member face records that verdict per selector offset in
+/// `Engine::extension_nullable_resolved`. A row still anchored at such an
+/// offset therefore came from an arm that decided before the application was
+/// known — the parse-time staged rows, the invocation faces, the
+/// condition/operand faces — and it is the over-report the oracle's ordering
+/// keeps silent. The access is not a dereference at all, so the drop is
+/// exact; an access resolved through a NON-nullable `on` face over a nullable
+/// receiver (`extension E on C` over `C?` — the unsafe single) keeps its row,
+/// because that offset never enters the set.
+fn gate_extension_resolved_nullable_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine) {
+    if engine.extension_nullable_resolved.is_empty() {
+        return;
+    }
+    diagnostics.retain(|row| {
+        row.code.name != UNCHECKED_NAME
+            || !engine
+                .extension_nullable_resolved
+                .contains(&row.range.offset)
     });
 }
 

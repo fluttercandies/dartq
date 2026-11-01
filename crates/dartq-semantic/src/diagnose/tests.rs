@@ -17990,3 +17990,14 @@ mod ticket_3287_tests;
 #[cfg(test)]
 #[path = "ticket_3297_tests.rs"]
 mod ticket_3297_tests;
+
+// The #3300 pins (`unchecked_use_of_nullable_value`'s dominant EXTRA
+// cluster): the extension-acceptance rule — an access a nullable-accepting
+// extension resolved (`extension on C?`, the unbounded `on T` of the co19
+// `StaticType` helper) is no dereference at all, so no row may survive at
+// that selector, while the unsafe single over a non-nullable `on` face keeps
+// its row. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3300_tests.rs"]
+mod ticket_3300_tests;
