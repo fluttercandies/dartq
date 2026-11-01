@@ -1412,6 +1412,7 @@ impl<'a> Engine<'a> {
             Receiver::Created {
                 name,
                 kind: ContainerKind::Class,
+                ..
             } => Ty::named(*name),
             _ => return Ty::UNKNOWN,
         };
