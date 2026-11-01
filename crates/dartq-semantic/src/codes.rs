@@ -126,6 +126,11 @@ pub enum SemanticCode {
     UndefinedFunction,
     /// `The getter '{0}' isn't defined for the type '{1}'.`
     UndefinedGetter,
+    /// `The getter '{0}' isn't defined for the '{1}' function type.` — a
+    /// member miss on a function type; `{1}` is the function type *alias
+    /// name* (a string), not a `DartType` (diagnostic.g.dart:16696-16713,
+    /// `uniqueName` `undefined_getter_on_function_type`).
+    UndefinedGetterOnFunctionType,
     /// `Undefined name '{0}'.`
     UndefinedIdentifier,
     /// `Undefined name 'await' in function body not marked with 'async'.`
@@ -140,6 +145,11 @@ pub enum SemanticCode {
     AwaitInWrongContext,
     /// `The method '{0}' isn't defined for the type '{1}'.`
     UndefinedMethod,
+    /// `The method '{0}' isn't defined for the '{1}' function type.` — a
+    /// member miss on a function type; `{1}` is the alias name
+    /// (diagnostic.g.dart:16813-16830, `uniqueName`
+    /// `undefined_method_on_function_type`).
+    UndefinedMethodOnFunctionType,
     /// `The named parameter '{0}' isn't defined.`
     UndefinedNamedParameter,
     /// `The operator '{0}' isn't defined for the type '{1}'.`
@@ -155,6 +165,11 @@ pub enum SemanticCode {
     PrefixShadowedByLocalDeclaration,
     /// `The setter '{0}' isn't defined for the type '{1}'.`
     UndefinedSetter,
+    /// `The setter '{0}' isn't defined for the '{1}' function type.` — a
+    /// member miss on a function type; `{1}` is the alias name
+    /// (diagnostic.g.dart:16939-16956, `uniqueName`
+    /// `undefined_setter_on_function_type`).
+    UndefinedSetterOnFunctionType,
     /// `UNDEFINED_SUPER_MEMBER`: one code name with a per-member-shape message
     /// (`uniqueName` `UNDEFINED_SUPER_GETTER`/`_METHOD`/`_OPERATOR`/`_SETTER`).
     UndefinedSuperMember(SuperShape),
@@ -2034,12 +2049,20 @@ impl SemanticCode {
             }
             Self::UndefinedFunction => ("undefined_function", "UNDEFINED_FUNCTION"),
             Self::UndefinedGetter => ("undefined_getter", "UNDEFINED_GETTER"),
+            // The function-type rows report the base analyzer `name` (the
+            // corpus records `undefined_getter` against the function-type
+            // text); the `_on_function_type` split lives in the registry's
+            // `uniqueName` (diagnostic.g.dart:16696-16713).
+            Self::UndefinedGetterOnFunctionType => ("undefined_getter", "UNDEFINED_GETTER"),
             Self::UndefinedIdentifier => ("undefined_identifier", "UNDEFINED_IDENTIFIER"),
             Self::UndefinedIdentifierAwait => {
                 ("undefined_identifier_await", "UNDEFINED_IDENTIFIER_AWAIT")
             }
             Self::AwaitInWrongContext => ("await_in_wrong_context", "AWAIT_IN_WRONG_CONTEXT"),
             Self::UndefinedMethod => ("undefined_method", "UNDEFINED_METHOD"),
+            // The function-type row reports the base analyzer `name`
+            // (diagnostic.g.dart:16813-16830).
+            Self::UndefinedMethodOnFunctionType => ("undefined_method", "UNDEFINED_METHOD"),
             Self::UndefinedNamedParameter => {
                 ("undefined_named_parameter", "UNDEFINED_NAMED_PARAMETER")
             }
@@ -2050,6 +2073,9 @@ impl SemanticCode {
                 "PREFIX_SHADOWED_BY_LOCAL_DECLARATION",
             ),
             Self::UndefinedSetter => ("undefined_setter", "UNDEFINED_SETTER"),
+            // The function-type row reports the base analyzer `name`
+            // (diagnostic.g.dart:16939-16956).
+            Self::UndefinedSetterOnFunctionType => ("undefined_setter", "UNDEFINED_SETTER"),
             // The analyzer registry keeps one `analyzerCode` for the whole
             // super-member family; the shape lives in the `uniqueName`.
             Self::UndefinedSuperMember(_) => ("undefined_super_member", "UNDEFINED_SUPER_MEMBER"),
@@ -3360,6 +3386,9 @@ impl SemanticCode {
             Self::UndefinedGetter => {
                 format!("The getter '{a0}' isn't defined for the type '{a1}'.")
             }
+            Self::UndefinedGetterOnFunctionType => {
+                format!("The getter '{a0}' isn't defined for the '{a1}' function type.")
+            }
             Self::UndefinedIdentifier => format!("Undefined name '{a0}'."),
             // Verbatim: the message names `await` itself and takes no arguments.
             Self::UndefinedIdentifierAwait => {
@@ -3371,6 +3400,9 @@ impl SemanticCode {
             Self::UndefinedMethod => {
                 format!("The method '{a0}' isn't defined for the type '{a1}'.")
             }
+            Self::UndefinedMethodOnFunctionType => {
+                format!("The method '{a0}' isn't defined for the '{a1}' function type.")
+            }
             Self::UndefinedNamedParameter => format!("The named parameter '{a0}' isn't defined."),
             Self::UndefinedOperator => {
                 format!("The operator '{a0}' isn't defined for the type '{a1}'.")
@@ -3381,6 +3413,9 @@ impl SemanticCode {
             ),
             Self::UndefinedSetter => {
                 format!("The setter '{a0}' isn't defined for the type '{a1}'.")
+            }
+            Self::UndefinedSetterOnFunctionType => {
+                format!("The setter '{a0}' isn't defined for the '{a1}' function type.")
             }
             Self::UndefinedSuperMember(shape) => match shape {
                 SuperShape::Getter => {
@@ -5122,14 +5157,17 @@ mod tests {
             SemanticCode::UndefinedExtensionSetter,
             SemanticCode::UndefinedFunction,
             SemanticCode::UndefinedGetter,
+            SemanticCode::UndefinedGetterOnFunctionType,
             SemanticCode::UndefinedIdentifier,
             SemanticCode::UndefinedIdentifierAwait,
             SemanticCode::AwaitInWrongContext,
             SemanticCode::UndefinedMethod,
+            SemanticCode::UndefinedMethodOnFunctionType,
             SemanticCode::UndefinedNamedParameter,
             SemanticCode::UndefinedOperator,
             SemanticCode::UndefinedPrefixedName,
             SemanticCode::UndefinedSetter,
+            SemanticCode::UndefinedSetterOnFunctionType,
             SemanticCode::UndefinedSuperMember(SuperShape::Getter),
             SemanticCode::UndefinedSuperMember(SuperShape::Method),
             SemanticCode::UndefinedSuperMember(SuperShape::Operator),
@@ -5452,13 +5490,16 @@ mod tests {
         SemanticCode::UndefinedExtensionSetter,
         SemanticCode::UndefinedFunction,
         SemanticCode::UndefinedGetter,
+        SemanticCode::UndefinedGetterOnFunctionType,
         SemanticCode::UndefinedIdentifier,
         SemanticCode::UndefinedIdentifierAwait,
         SemanticCode::UndefinedMethod,
+        SemanticCode::UndefinedMethodOnFunctionType,
         SemanticCode::UndefinedNamedParameter,
         SemanticCode::UndefinedOperator,
         SemanticCode::UndefinedPrefixedName,
         SemanticCode::UndefinedSetter,
+        SemanticCode::UndefinedSetterOnFunctionType,
         SemanticCode::UndefinedSuperMember(SuperShape::Getter),
         SemanticCode::UndefinedSuperMember(SuperShape::Method),
         SemanticCode::UndefinedSuperMember(SuperShape::Operator),
@@ -5602,6 +5643,23 @@ mod tests {
         assert_eq!(
             SemanticCode::UndefinedSuperMember(SuperShape::Operator).message("+", "C"),
             "The operator '+' isn't defined in a superclass of 'C'."
+        );
+        // The function-type member-miss rows: the base analyzer `name` with
+        // the alias-name-shaped template (diagnostic.g.dart:16696-16713,
+        // :16813-16830, :16939-16956; the corpus rows under
+        // `diagnostics/undefined_{getter,method,setter}/...functionAlias_
+        // typeInstantiated*` pin the same text).
+        assert_eq!(
+            SemanticCode::UndefinedGetterOnFunctionType.message("foo", "Fn"),
+            "The getter 'foo' isn't defined for the 'Fn' function type."
+        );
+        assert_eq!(
+            SemanticCode::UndefinedMethodOnFunctionType.message("foo", "Fn"),
+            "The method 'foo' isn't defined for the 'Fn' function type."
+        );
+        assert_eq!(
+            SemanticCode::UndefinedSetterOnFunctionType.message("foo", "Fn"),
+            "The setter 'foo' isn't defined for the 'Fn' function type."
         );
         assert_eq!(
             SemanticCode::UndefinedEnumConstant.message("x", "E"),
@@ -6208,6 +6266,12 @@ mod tests {
             | SemanticCode::UndefinedPrefixedName
             | SemanticCode::UndefinedReferencedParameter
             | SemanticCode::UndefinedSetter
+            // The function-type member-miss rows: inline `message` arms (the
+            // generated table carries the base row's type-shaped template,
+            // never the function-type one).
+            | SemanticCode::UndefinedGetterOnFunctionType
+            | SemanticCode::UndefinedMethodOnFunctionType
+            | SemanticCode::UndefinedSetterOnFunctionType
             | SemanticCode::PrefixShadowedByLocalDeclaration
             | SemanticCode::UnnecessaryCast
             | SemanticCode::UnnecessaryCastPattern
@@ -6531,15 +6595,18 @@ mod tests {
             SemanticCode::UndefinedExtensionSetter,
             SemanticCode::UndefinedFunction,
             SemanticCode::UndefinedGetter,
+            SemanticCode::UndefinedGetterOnFunctionType,
             SemanticCode::UndefinedIdentifier,
             SemanticCode::UndefinedIdentifierAwait,
             SemanticCode::AwaitInWrongContext,
             SemanticCode::UndefinedMethod,
+            SemanticCode::UndefinedMethodOnFunctionType,
             SemanticCode::UndefinedNamedParameter,
             SemanticCode::UndefinedOperator,
             SemanticCode::UndefinedPrefixedName,
             SemanticCode::UndefinedReferencedParameter,
             SemanticCode::UndefinedSetter,
+            SemanticCode::UndefinedSetterOnFunctionType,
             SemanticCode::UndefinedSuperMember(SuperShape::Getter),
             SemanticCode::UndefinedSuperMember(SuperShape::Method),
             SemanticCode::UndefinedSuperMember(SuperShape::Operator),
