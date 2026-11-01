@@ -244,6 +244,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             if let Some(t) = mods.late_kw {
                 self.report(msg::extraneous_modifier("late"), t);
             }
+            // Upstream reports extraneous `abstract` on the method path
+            // unconditionally (upstream Dart SDK source, pkg/
+            // _fe_analyzer_shared/lib/src/parser/parser_impl.dart:4354-4355)
+            // — the augmentations gate lives on the fields path only.
+            if let Some(a) = mods.abstract_kw {
+                self.report(msg::extraneous_modifier("abstract"), a);
+            }
             self.parse_top_level_method(
                 before_start,
                 mods.augment,
@@ -257,6 +264,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         } else {
             if let Some(t) = get_or_set {
                 self.report(msg::extraneous_modifier(self.cursor.lexeme(t.id)), t);
+            }
+            // Upstream fields path: `abstract` on a top-level variable
+            // reports extraneous_modifier only when the augmentations
+            // experiment is off (upstream Dart SDK source, pkg/
+            // _fe_analyzer_shared/lib/src/parser/parser_impl.dart:4372-4374
+            // — `!isAugmentationsFeatureEnabled && abstractToken != null`);
+            // with it on the `abstract` is a legal incomplete declaration
+            // an `augment` may complete.
+            if let Some(a) = mods.abstract_kw
+                && !self.features.augmentations_enabled
+            {
+                self.report(msg::extraneous_modifier("abstract"), a);
             }
             self.parse_fields(
                 DeclarationKind::TopLevel,
@@ -357,7 +376,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     } else {
                         // Official `_parseAbstract` order chain (top-level
                         // member flavor): `var/final/const` before
-                        // `abstract`.
+                        // `abstract`. The extraneous-`abstract` report is
+                        // NOT emitted here: upstream reports it in the
+                        // method-vs-fields dispatch of
+                        // `parseTopLevelMemberImpl` — unconditionally on the
+                        // method path (upstream Dart SDK source,
+                        // pkg/_fe_analyzer_shared/lib/src/parser/
+                        // parser_impl.dart:4354-4355) and gated on
+                        // `!isAugmentationsFeatureEnabled` on the fields
+                        // path (:4372-4374) — so early-return recoveries
+                        // (pattern variables, invalid heads) never report
+                        // it at all.
                         if let Some(vfc) = mods.var_final_or_const {
                             let earlier = self.cursor.lexeme(vfc.id);
                             self.report(msg::modifier_out_of_order("abstract", earlier), t);
@@ -367,7 +396,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                                 t,
                             );
                         }
-                        self.report(msg::extraneous_modifier("abstract"), t);
                         mods.abstract_kw = Some(t);
                     }
                 }
@@ -1669,11 +1697,18 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
             // error_verifier `extensionDeclaresAbstractMember` (the parse
             // body is `;` and the extension member is neither static nor
-            // external): reported at the member name.
+            // external): reported at the member name. The whole check is
+            // skipped when the augmentations experiment is enabled
+            // (upstream Dart SDK source, pkg/analyzer/lib/src/generated/
+            // error_verifier.dart `_checkForExtensionDeclaresAbstractMember`
+            // — `if (_featureSet.isEnabled(Feature.augmentations)) return;`):
+            // under the feature the `;` member is a legal incomplete
+            // fragment an `augment` may complete.
             if kind == DeclarationKind::Extension
                 && static_kw.is_none()
                 && mods.external.is_none()
                 && body_kind == TokenKind::Semicolon
+                && !self.features.augmentations_enabled
             {
                 self.report(msg::extension_declares_abstract_member(), name);
             }
@@ -2011,7 +2046,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             DeclarationKind::Extension | DeclarationKind::ExtensionType
         ) {
             if let Some(a) = mods.abstract_kw {
-                if mods.static_kw.is_some() {
+                // Upstream `_endClassFields`: `abstractStaticField` fires
+                // only when the augmentations experiment is off (upstream
+                // Dart SDK source, pkg/analyzer/lib/src/fasta/
+                // ast_builder.dart `_endClassFields` — `staticToken != null
+                // && !enableAugmentations`); `abstractLateField` is ungated.
+                if mods.static_kw.is_some() && !self.features.augmentations_enabled {
                     self.report(msg::abstract_static_field(), a);
                 }
                 if mods.late_kw.is_some() {
@@ -2192,7 +2232,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 
         match kind {
             DeclarationKind::Extension => {
-                if let Some(a) = mods.abstract_kw {
+                // `abstractExtensionField` is a parser pseudo-code upstream;
+                // the analyzer's error converter drops it unconditionally
+                // (upstream Dart SDK source, pkg/analyzer/lib/src/fasta/
+                // error_converter.dart — "Not reported but followed by a
+                // CompileTimeErrorCode.EXTENSION_DECLARES_INSTANCE_FIELD").
+                // dartq emits it as its own code (the gate_local_pins
+                // tripwire), so the converter's drop is mirrored as a gate
+                // on the augmentations experiment: under the feature the
+                // `abstract` is legal on the incomplete fragment, matching
+                // the oracle's silence.
+                if let Some(a) = mods.abstract_kw
+                    && !self.features.augmentations_enabled
+                {
                     self.report(msg::abstract_extension_field(), a);
                 }
                 if mods.static_kw.is_none() && mods.external.is_none() {
