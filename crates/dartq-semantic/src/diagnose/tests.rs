@@ -22641,6 +22641,16 @@ mod ticket_3438_tests;
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3402 —— a call site's static type is the send's result, resolved
+// —— through the callee's declared return — an alias-typed local's
+// —— invocation answers the substituted signature's return, and the send
+// —— feeds the next member/send face transitively. Registered here via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3402_tests.rs"]
+mod ticket_3402_tests;
+
 // —— #3449 —— a cascade section over a non-bare target (`f()..x`,
 // —— `C()..x`) checks members against the target's own value face. The
 // —— defined section stays silent; the missing one reports on the
@@ -22648,6 +22658,16 @@ mod ticket_3438_tests;
 // —— inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // —— resolves.
 #[cfg(test)]
+
+// —— #3449 —— a cascade section over a non-bare target (`f()..x`,
+// —— `C()..x`) checks members against the target's own value face. The
+// —— defined section stays silent; the missing one reports on the
+// —— target's type. Registered here via `#[path]`; the module stays
+// —— inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// —— resolves.
+#[cfg(test)]
+#[path = "ticket_3449_tests.rs"]
+mod ticket_3449_tests;
 
 // —— #3457 —— the extension consult and instance-member faces route
 // —— receivers the named-container walk never owned: a type-variable
@@ -22658,6 +22678,17 @@ mod ticket_3438_tests;
 // —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3457 —— the extension consult and instance-member faces route
+// —— receivers the named-container walk never owned: a type-variable
+// —— receiver resolves through its bound (`<unknown>` display, nullable
+// —— bound reports unchecked, extension-through-bound applies), and a
+// —— `FutureOr` receiver checks its nullable face against the `on`
+// —— constraint. Registered here via `#[path]`; the module stays inside
+// —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3457_tests.rs"]
+mod ticket_3457_tests;
+
 // —— #3400 —— a const constructor's `x = e` field-initializer RHS runs
 // —— the potentially-constant scan at the list's close: formals bound
 // —— opaque minus wildcards, instance-member reads report
@@ -22666,6 +22697,17 @@ mod ticket_3438_tests;
 // —— via `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
+
+// —— #3400 —— a const constructor's `x = e` field-initializer RHS runs
+// —— the potentially-constant scan at the list's close: formals bound
+// —— opaque minus wildcards, instance-member reads report
+// —— `invalid_constant` beside `implicit_this_reference_in_initializer`,
+// —— non-const top-level reads report `invalid_constant`. Registered here
+// —— via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3400_tests.rs"]
+mod ticket_3400_tests;
 
 // —— #3504 —— `return_of_invalid_type` inside an extension member reads
 // —— the member's own declared return annotation, never the extension's

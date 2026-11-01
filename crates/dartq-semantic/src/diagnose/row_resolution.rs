@@ -2283,6 +2283,30 @@ impl<'a> Engine<'a> {
                     && let RefTarget::Member { container } = self.refs[at].target
                 {
                     let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+                    // A wildcard `_` never enters the lexical scope
+                    // (upstream `WildcardScope` — the wildcard-variables
+                    // experiment binds `_` nowhere): the member walk's hit
+                    // is an artifact of the name-level climb, not a
+                    // resolution — the bare spelling reports
+                    // `undefined_identifier` (probed 3.13.7: `var a = _;`
+                    // inside `m()` over a `final int _` field reports the
+                    // name, `this._` still resolves). A `_` inside a
+                    // constructor-initializer's RHS resolves to the field
+                    // through the implicit-`this` face instead — the
+                    // initializer's `_checkForImplicitThisReferenceIn
+                    // Initializer` consults the member face directly, so
+                    // the row keeps its member target (the
+                    // `init_this_member` arm below reports it).
+                    if self.is_wildcard(row.name) && !self.init_rows.contains_key(&row.range.offset)
+                    {
+                        self.emit(
+                            SemanticCode::UndefinedIdentifier,
+                            row.range,
+                            name_text,
+                            "",
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                    } else {
                     if write && self.init_rows.contains_key(&row.range.offset) {
                         // A bare name written inside a constructor-initializer
                         // list is the field-initializer LHS (`x = e`) — it
@@ -2330,6 +2354,7 @@ impl<'a> Engine<'a> {
                             landing.map(|(file, origin)| (file, row.name, origin)),
                         );
                     }
+                    }
                 }
                 // The implicit-this face (`_checkForInvalidInstanceMember
                 // Access2`, upstream Dart SDK source, pkg/analyzer/lib/src/
@@ -2339,8 +2364,56 @@ impl<'a> Engine<'a> {
                 // member of the enclosing container reports at the name.
                 // Both facts snapshot at push time (the field group and the
                 // container stack tear down before pass 2).
+                //
+                // The constructor-initializer RHS reads the same face
+                // (#3400): `x = g` inside `: ...` reports `implicit_this_
+                // reference_in_initializer` at `g` beside the
+                // potentially-constant walk's `invalid_constant` (probed
+                // 3.13.7 — `f = m` over an instance method reports both
+                // codes at the name). `init_rows` carries every bare name
+                // the initializer list pushed; the member question walks
+                // the recorded container — a hit on a non-static member is
+                // the `this` read, everything else keeps the ordinary
+                // resolution (a formal, a static, a miss).
+                // A name that spells a (non-wildcard) formal of the
+                // enclosing constructor binds the formal, not the field —
+                // `Tag2([String? name]) : name = name` reads the formal
+                // and stays silent (the wildcard `this._` formal declares
+                // no readable `_`, so it never suppresses the field read
+                // below). The name-level union across the container's
+                // constructor tables keeps the under-report direction on
+                // the rare two-constructors-share-a-spelling shape.
+                let init_rows_formal = |container: StringId| -> bool {
+                    let Some(file) = self.index.get(self.file) else {
+                        return false;
+                    };
+                    let Some(c) = file.container(container) else {
+                        return false;
+                    };
+                    !self.is_wildcard(row.name)
+                        && c.ctor_formals.values().any(|formals| {
+                            formals
+                                .positional
+                                .iter()
+                                .chain(formals.named.iter())
+                                .any(|formal| formal.name == row.name)
+                        })
+                };
+                let init_this_member = !matches!(row.intent, Intent::Write | Intent::ReadWrite)
+                    && !self.field_init_this_rows.contains(&row.range.offset)
+                    && self
+                        .init_rows
+                        .get(&row.range.offset)
+                        .is_some_and(|container| {
+                            !init_rows_formal(*container)
+                                && matches!(
+                                    self.walk_members(*container, row.name),
+                                    Walk::Found(entry) if !entry.is_static
+                                )
+                        });
                 if !matches!(row.intent, Intent::Write | Intent::ReadWrite)
-                    && self.field_init_this_rows.contains(&row.range.offset)
+                    && (self.field_init_this_rows.contains(&row.range.offset)
+                        || init_this_member)
                 {
                     self.emit(
                         SemanticCode::ImplicitThisReferenceInInitializer,
@@ -4983,8 +5056,15 @@ impl<'a> Engine<'a> {
                     // the `Type` instance as its VALUE. A member or send
                     // target (`C.new..foo()`, `Future.value(x)..foo()`,
                     // `C.staticField..foo()`) denotes THAT expression's
-                    // value, which the row model cannot spell here — the
-                    // verdict stays silent ([`Self::cascade_target_is_bare_type_literal`]).
+                    // value ([`Self::cascade_target_is_bare_type_literal`]):
+                    // a selector continuation's face is the member's own —
+                    // the constructor/method tear-off reads `Function`
+                    // (`C.new..gone()` reports `undefined_method` naming
+                    // `Function`, probed 3.13.7), the static field or
+                    // getter reads its declared type (`C.sg..gone()` names
+                    // `int`) — and a `)`/`]`-ended target keeps the arm's
+                    // under-report (its send/index fold owns the face
+                    // elsewhere).
                     if self.cascade_target_is_bare_type_literal(row.range) {
                         let spelling = if matches!(row.intent, Intent::Write | Intent::ReadWrite) {
                             self.setter_spelling(row.name)
@@ -5015,6 +5095,18 @@ impl<'a> Engine<'a> {
                                 Intent::Operator(..) => {}
                             }
                         }
+                    } else if let Some((face, head)) =
+                        self.cascade_selector_target_ty(row.range, name)
+                    {
+                        self.check_instance_member(
+                            promotions,
+                            row,
+                            Receiver::Typed {
+                                type_name: head,
+                                ty: face,
+                            },
+                        );
+                        return;
                     }
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
@@ -5516,6 +5608,92 @@ impl<'a> Engine<'a> {
                 tokens[at - 3].kind,
                 dartq_scanner::TokenKind::Period | dartq_scanner::TokenKind::QuestionPeriod
             ))
+    }
+
+    /// The cascade target's VALUE face when the target continues a selector
+    /// past a `.`/`?.` (`C.new..foo()`, `C.named..foo()`, `C.sm..foo()`,
+    /// `C.sg..foo()`): upstream `CascadeExpression.target` is the whole
+    /// `C.sel` expression, whose `staticType` is the selector's own — a
+    /// constructor or static-method tear-off types `FunctionType` (the
+    /// section's member verdict runs on the `Function` face: `call` and the
+    /// `Object` members resolve, a miss names `Function`), and a static
+    /// field/getter types its declared type. `None` for every other
+    /// continuation (an instance member — its own access face reports; a
+    /// miss on the head — the selector's own row reports; a `)`/`]`-ended
+    /// target — its send/index fold's face lives on a different row).
+    ///
+    /// Returns `(face, head)`: `face` is the receiver's static type,
+    /// `head` the container spelling the member verdict keys on (`Function`
+    /// for the tear-off face — `type_property_resolver`'s
+    /// `isDartCoreFunction` arm resolves `call` and reports the trio
+    /// against `Function` itself).
+    fn cascade_selector_target_ty(
+        &self,
+        selector: SourceRange,
+        container: StringId,
+    ) -> Option<(Ty, StringId)> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < selector.offset);
+        // `tokens[at - 1]` is the section's `..`, `tokens[at - 2]` the
+        // target's last token, `tokens[at - 3]` the selector `.`/`?.` that
+        // makes the target non-bare (a `)`/`]` end or a bare head never
+        // reaches here — the call sites gate the same pair).
+        if at < 3
+            || !matches!(
+                tokens[at - 1].kind,
+                dartq_scanner::TokenKind::PeriodPeriod
+                    | dartq_scanner::TokenKind::QuestionPeriodPeriod
+            )
+            || tokens[at - 2].kind != dartq_scanner::TokenKind::Identifier
+            || !matches!(
+                tokens[at - 3].kind,
+                dartq_scanner::TokenKind::Period | dartq_scanner::TokenKind::QuestionPeriod
+            )
+        {
+            return None;
+        }
+        let member = self.intern(&self.source[tokens[at - 2].byte_range()]);
+        let (found, owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )?;
+        let function = self.intern("Function");
+        // A constructor tear-off (`C.new`, `C.named`, `E.new` — the
+        // enum's generative miss tears off `Function` too, the oracle
+        // reporting the section's verdict beside the constructor's own
+        // row): the selector names a constructor when the member table
+        // does not carry it first (a static member sharing the spelling
+        // keeps its own face).
+        if !found.members.contains_key(&member)
+            && (found.constructors.contains(&member)
+                || (member == self.intern("new") && found.has_unnamed_constructor))
+        {
+            return Some((Ty::named(function), function));
+        }
+        let entry = found.members.get(&member)?;
+        if !entry.is_static {
+            // `C.im..foo()` — the instance member's own access face
+            // (`static_access_to_instance_member` at the selector) owns
+            // the report; the section's receiver is Invalid upstream.
+            return None;
+        }
+        let entry = self.boundary.member(owner, container, member, entry);
+        match entry.kind {
+            MemberKind::Method => Some((Ty::named(function), function)),
+            MemberKind::Field | MemberKind::Getter => {
+                let declared = Self::member_result_ty(&entry);
+                let head = match declared {
+                    Ty::Named { name, .. } => name,
+                    _ => function,
+                };
+                (declared != Ty::UNKNOWN).then_some((declared, head))
+            }
+            MemberKind::Setter => None,
+        }
     }
 
     /// The type-literal receiver face: a receiver head that spells a TYPE —
@@ -6212,7 +6390,317 @@ impl<'a> Engine<'a> {
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
-        if self.member_defined(container, receiver_ty, row, false, receiver_nullable) {
+        // A type-PARAMETER receiver (`t.m()` over `void f<T extends Bound>
+        // (T t)`): upstream's `resolveToBound` reads the member through the
+        // parameter's bound (the bound's own interface plus the extensions
+        // its head admits), but every miss face names the PARAMETER: the
+        // invocation resolver's `receiverClassName` escapes both its
+        // `InterfaceType` and `FunctionType` arms on a `TypeParameterType`
+        // (`<unknown>` — method_invocation_resolver.dart:1190-1199), the
+        // getter/setter faces spell the parameter itself (probed 3.13.7).
+        // The scope window survives in the post-walk `param_bound_of`
+        // captures; a bound the model cannot walk keeps the under-report
+        // (the oracle's `InvalidType` bound owns no honest verdict). The
+        // same convention `param_bound_potentially_nullable` keeps decides
+        // the receiver's nullability — a spelling any captured window
+        // declares IS a parameter, even where a same-named declared type
+        // exists (the name-level answer upstream's shadowing rules give).
+        // Known under-report: an extension `on Object` applied to a bounded
+        // parameter reads `Single` here (the bound reaches `Object` by
+        // name), while the oracle's `applicableTo` instantiates the
+        // parameter to its bound and reports the shared unchecked code —
+        // the bound's own-name walk cannot express the instantiation.
+        // The arm fires only when the receiver's static type IS the
+        // parameter spelling — a lambda/formal whose declared type is `T`
+        // but whose inferred face already resolved to a concrete head
+        // (`(t) => t.name` under `mapOrNull<R>(R Function(T) mapper)`
+        // over a `Prefix?` receiver types `t` `Prefix`, never `T`) keeps
+        // the normal `member_defined` walk; gating on `container` alone
+        // would misread the param's bound for that concrete face.
+        if matches!(recv, Receiver::Typed { .. })
+            && !matches!(row.intent, Intent::Operator(..))
+            && matches!(
+                self.fold_alias_ty(receiver_ty),
+                Ty::Named { name, .. } if name == container
+            )
+            && let Some(bound) = self.param_bound_of(container)
+        {
+            // A parameter bound to another parameter (`T extends S`)
+            // resolves on the LAST hop's bound — the same chase
+            // `param_bound_potentially_nullable` runs, capped so a cyclic
+            // capture falls out on the last seen bound.
+            let mut bound = bound;
+            for _ in 0..4 {
+                let Ty::Named {
+                    name: hop,
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                    ..
+                } = self.fold_alias_ty(bound)
+                else {
+                    break;
+                };
+                let Some(next) = self.param_bound_of(hop) else {
+                    break;
+                };
+                bound = next;
+            }
+            match self.fold_alias_ty(bound) {
+                // A shape bound answers its own members first (`call` on a
+                // function bound, the record field getters), then the
+                // extension consult the shape's own faces admit — but every
+                // miss face names the PARAMETER: `<unknown>` on the
+                // invocation face even over a `Function` bound (probed
+                // 3.13.7: `t.gone()` over `T extends Bound Function()`
+                // names `<unknown>`, never `Function` — the
+                // `TypeParameterType` receiver escapes the invocation
+                // resolver's `receiverClassName` arms).
+                shape @ (Ty::Record { .. } | Ty::Function { .. }) => {
+                    let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+                    let field_read = matches!(shape, Ty::Record { .. })
+                        && self
+                            .record_field_ty(
+                                shape,
+                                row.name,
+                                self.null_aware_members.contains(&row.range.offset),
+                            )
+                            .is_some();
+                    // Records are immutable upstream: a field hit answers
+                    // the READ face only — a write to a declared field
+                    // reports `undefined_setter` on the parameter.
+                    let read_resolved = field_read
+                        || (matches!(shape, Ty::Function { .. })
+                            && row.name == self.intern("call"))
+                        || self.members.object_members.contains(&row.name)
+                        || row.name == self.intern("==")
+                        || self.record_extension_face(shape, row.name).is_some();
+                    let setter = self.setter_spelling(row.name);
+                    let write_resolved = write
+                        && self
+                            .record_extension_face(shape, setter)
+                            .is_some();
+                    // A write resolves only through the `name=` extension
+                    // spelling; its READ half reports unless the field or
+                    // an `Object` member answered it (`check_shape_receiver`'s
+                    // same split — a compound miss reports getter then
+                    // setter, a field hit still reports the setter alone).
+                    let (getter_miss, setter_miss) = match row.intent {
+                        Intent::Write => (false, !write_resolved),
+                        Intent::ReadWrite => (!read_resolved, !write_resolved),
+                        Intent::Read => (!read_resolved, false),
+                        Intent::Invoke => (!read_resolved, false),
+                        Intent::Operator(..) => (false, false),
+                    };
+                    if getter_miss || setter_miss {
+                        let name_text = self.strings.resolve(row.name);
+                        if receiver_nullable {
+                            self.emit_unchecked_nullable(
+                                row.range,
+                                name_text,
+                                access_kind(&row.intent),
+                            );
+                        } else {
+                            let param_text =
+                                self.strings.resolve(container).to_string();
+                            match row.intent {
+                                Intent::Invoke => {
+                                    self.emit(
+                                        SemanticCode::UndefinedMethod,
+                                        row.range,
+                                        name_text,
+                                        "<unknown>",
+                                    );
+                                }
+                                _ => {
+                                    if getter_miss {
+                                        self.emit(
+                                            SemanticCode::UndefinedGetter,
+                                            row.range,
+                                            name_text,
+                                            &param_text,
+                                        );
+                                    }
+                                    if setter_miss {
+                                        self.emit(
+                                            SemanticCode::UndefinedSetter,
+                                            row.range,
+                                            name_text,
+                                            &param_text,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                    return;
+                }
+                Ty::Named {
+                    name: bound_head, ..
+                } => {
+                    // `call` on a `Function`-bound parameter is the
+                    // `isDartCoreFunction` arm's silent resolve (probed
+                    // 3.13.7: `t.call`/`t.call()` over `T extends Function`
+                    // report nothing; `T extends Bound Function()` the
+                    // same).
+                    if !receiver_nullable
+                        && row.name == self.intern("call")
+                        && bound_head == self.intern("Function")
+                    {
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    // Every interface member upstream resolves through the
+                    // `Object` face on ANY bound — `t.hashCode`/`t ==
+                    // other`/`t.toString()` stay silent even over the
+                    // implicit `Object?` (the `Null` face's member map
+                    // answers them).
+                    if self.member_defined(bound_head, bound, row, false, receiver_nullable) {
+                        return;
+                    }
+                    // A bound spelling a core interface/type-table head
+                    // answers its frozen members the same way
+                    // `check_core_type_member` does — the rig's stub
+                    // classes declare nothing, so `num.abs`, `int.sign`,
+                    // `Function.call` resolve off the static face
+                    // (`class num {}` walks no members; the table carries
+                    // the names-only SDK answer upstream's bound walk
+                    // finds). `write` reads the setter spelling's
+                    // membership the same as the getter's — the frozen
+                    // face declares no setter, so a miss stays a miss.
+                    let bound_text = self.strings.resolve(bound_head);
+                    let member_text = self.strings.resolve(row.name);
+                    let setter_id = self.setter_spelling(row.name);
+                    let setter_text = self.strings.resolve(setter_id);
+                    let bound_core_member = crate::member_face::CORE_INTERFACE_MEMBERS
+                        .iter()
+                        .chain(crate::member_face::CORE_TYPE_MEMBERS.iter())
+                        .any(|(head, members)| {
+                            *head == bound_text
+                                && (members.contains(&member_text)
+                                    || (matches!(row.intent, Intent::Write | Intent::ReadWrite)
+                                        && members.contains(&setter_text)))
+                        })
+                        || (bound_text == "Function" && member_text == "call");
+                    if bound_core_member {
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    // A bound name the model cannot walk (unresolvable,
+                    // or another parameter spelling): the miss stays
+                    // under-report rather than inventing a verdict.
+                    let bound_walkable = matches!(self.strings.resolve(bound_head), "Object")
+                        || resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            bound_head,
+                        )
+                        .is_some()
+                        || crate::member_face::CORE_INTERFACE_MEMBERS
+                            .iter()
+                            .chain(crate::member_face::CORE_TYPE_MEMBERS.iter())
+                            .any(|(head, _)| *head == self.strings.resolve(bound_head));
+                    if !bound_walkable {
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    // A receiver riding a nullable-own-param face's own
+                    // parameter (`extension<T> on T?`'s `T`): the oracle
+                    // instantiates the parameter at the application site
+                    // and resolves the access against the instantiation —
+                    // the same suppression `check_core_type_member`'s
+                    // undecidable arm encodes, kept here so the bound
+                    // miss does not over-report on a receiver an armed
+                    // nullable extension already owns.
+                    let own_param_armed = receiver_nullable
+                        && self.accessible_extension_faces().iter().any(|(face, _)| {
+                            face.on_type_nullable
+                                && face.on_type == Some(container)
+                                && face.type_param_names.contains(&container)
+                        });
+                    let name_text = self.strings.resolve(row.name);
+                    if receiver_nullable && !own_param_armed {
+                        self.emit_unchecked_nullable(
+                            row.range,
+                            name_text,
+                            access_kind(&row.intent),
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    if own_param_armed {
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    let param_text = self.strings.resolve(container).to_string();
+                    match row.intent {
+                        Intent::Invoke => {
+                            self.emit(
+                                SemanticCode::UndefinedMethod,
+                                row.range,
+                                name_text,
+                                "<unknown>",
+                            );
+                        }
+                        Intent::Read => {
+                            self.emit(
+                                SemanticCode::UndefinedGetter,
+                                row.range,
+                                name_text,
+                                &param_text,
+                            );
+                        }
+                        Intent::Write | Intent::ReadWrite => {
+                            // The oracle resolves the read face first — a
+                            // compound write reports both faces in that
+                            // order (`t.z += 1` reports getter then
+                            // setter, probe 3.13.7).
+                            if row.intent == Intent::ReadWrite {
+                                self.emit(
+                                    SemanticCode::UndefinedGetter,
+                                    row.range,
+                                    name_text,
+                                    &param_text,
+                                );
+                            }
+                            self.emit(
+                                SemanticCode::UndefinedSetter,
+                                row.range,
+                                name_text,
+                                &param_text,
+                            );
+                        }
+                        Intent::Operator(..) => {}
+                    }
+                    self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                    return;
+                }
+                // A `dynamic`/`Null`/`void`/unresolvable bound owns no
+                // member verdict — the under-report posture the
+                // `InvalidType` face keeps.
+                _ => {
+                    self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                    return;
+                }
+            }
+        }
+        // The `?`-less `FutureOr<A>` receiver's extension consult reads its
+        // arg-nullability too: `extension on Object` (or `on Future`)
+        // applies to `FutureOr<int?>` only through the non-null projection
+        // — the oracle's unsafe application earns the shared unchecked
+        // code at the selector, the same verdict the miss tail below
+        // answers for a clean miss (`x.om()` vs `y.om()` over
+        // `FutureOr<int>`, #3457). Other receivers never carry the flag.
+        if self.member_defined(
+            container,
+            receiver_ty,
+            row,
+            false,
+            receiver_nullable || future_or_nullable,
+        ) {
             // The compound-write read face (the oracle resolves the getter
             // before the setter): a compound write satisfied through the
             // SETTER spelling (`name=`) still reports the getter half's own
@@ -6493,8 +6981,18 @@ impl<'a> Engine<'a> {
             // core primitives in the CLI world, an undeclared name in the
             // bare unit) decides through the core member table — the
             // dead-edge walk lands here as a clean `Missing` now, never as
-            // the broken-chain arm above.
-            self.check_core_type_member(container, row, receiver_nullable);
+            // the broken-chain arm above. The `?`-less `FutureOr<A>`
+            // receiver's arg-nullability joins the same unchecked question
+            // the miss tail answers (#3457): an extension `on Object`
+            // (or `on Future`) applies to `FutureOr<int?>` only through the
+            // non-null projection, so `x.om()` earns the oracle's unsafe
+            // application row beside `y.om()`'s silent resolve over
+            // `FutureOr<int>`.
+            self.check_core_type_member(
+                container,
+                row,
+                receiver_nullable || future_or_nullable,
+            );
             return;
         };
         if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&row.name) {
@@ -7338,12 +7836,33 @@ impl<'a> Engine<'a> {
         }
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
         // The core-type face knows the receiver's spelling only — the
-        // nullability split stays under-report (`false`).
-        match self.extension_application(container, Ty::UNKNOWN, row.name, write, false) {
+        // consult reads the UNKNOWN-typed spelling and the caller's
+        // nullability verdict. A non-nullable `on` face applied to a
+        // nullable receiver is the oracle's unsafe application: the member
+        // resolves but the dereference reports the shared unchecked code
+        // at the selector (`applicableTo`'s non-nullable `on` never covers
+        // a nullable `FutureOr<A>` receiver — the #3457 `x.om()` face).
+        match self.extension_application(
+            container,
+            Ty::UNKNOWN,
+            row.name,
+            write,
+            receiver_nullable,
+        ) {
             ExtensionApp::None => {}
-            // `UnsafeSingle` never surfaces here — the `false` receiver
-            // nullability keeps every resolved face safe.
-            ExtensionApp::Single | ExtensionApp::UnsafeSingle => return,
+            ExtensionApp::Single => return,
+            ExtensionApp::UnsafeSingle => {
+                if receiver_nullable {
+                    let name_text = self.strings.resolve(row.name);
+                    self.emit_unchecked_nullable(
+                        row.range,
+                        name_text,
+                        access_kind(&row.intent),
+                    );
+                    self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                }
+                return;
+            }
             ExtensionApp::Ambiguous(displays) => {
                 self.emit_extension_ambiguity(row.name, row.range, displays);
                 return;
@@ -7804,44 +8323,72 @@ impl<'a> Engine<'a> {
     /// statically-`bool` composite keeps the composite's `bool`: `x?.m ==
     /// y` types `bool`, never `bool?` — so the upgrade leaves both alone.
     pub(crate) fn expression_row_ty(&self, row: &Row) -> Ty {
-        // An invocation row stores its callee's declared type; the
-        // expression's type is the send's result — a function-typed
-        // callee's signature return ([`Self::invoked_callee_result`]),
-        // else the resolved callee's declared return
-        // ([`Self::callee_return_ty`], the same face the write staging
-        // reads).
-        // A stored send type stands (a folded creation's instance, the
-        // null-assert rewrite `f()!` left on the row); only a send whose
-        // row carries nothing resolves its callee here.
-        let ty = match self.invoked_callee_result(row) {
-            Some(ty) => ty,
-            None if row.intent == Intent::Invoke && row.ty == Ty::UNKNOWN => {
-                let declared = self.callee_return_ty(row);
-                // The downward-context face (#3064): a generic send whose
-                // declared return is its own free inference parameter
-                // (`T f<T>()`) answers the context its argument position
-                // supplies — `h(a.remainder(f()))` infers `T = int`
-                // through the numeric context ladder, and the index
-                // argument of `a[g()]++` infers from `[]`'s first formal —
-                // the upstream `staticType` the oracle's argument checks
-                // read (resolver.dart:3378's `analyzeExpression(node.index,
-                // indexContextType)`, binary_expression_resolver.dart:346's
-                // operator-param context). `Unknown` stands when no
-                // concrete context resolves.
-                if declared != Ty::UNKNOWN {
-                    declared
-                } else {
-                    self.context_invoke_ty(row).unwrap_or(declared)
+        let ty = if row.intent == Intent::Invoke {
+            // An invocation expression's static type is the send's RESULT,
+            // never the callee face the row carries: a function-typed
+            // callee's signature return (`f(x)` on `int Function(int)`
+            // types `int`), a resolved callee's declared return
+            // (`typedef F<T> = T Function(); F<int> mk();` reads `F<int>`,
+            // the alias face the oracle's `recordStaticType` records),
+            // and a callable value's `.call` dispatch. The resolved
+            // callee's return wins over the stored face — an alias-typed
+            // callee stores its EXPANDED signature on the row, which the
+            // callable-result read would then apply a second time
+            // (`void Function() g(); g()` stored `void Function()` and
+            // misread `void` — the `use_of_void_result` double-apply,
+            // #3402). The context face and the callable face are the
+            // fallback order: a generic send whose declared return stays
+            // free answers the context its argument position supplies
+            // (#3064's `h(a.remainder(f()))` numeric ladder /
+            // `a[g()]++` index formal — resolver.dart:3378's
+            // `analyzeExpression(node.index, indexContextType)`),
+            // and an unresolved callee whose row carries a function type
+            // still answers its signature's return.
+            let send = self.callee_return_ty(row);
+            let send = if send != Ty::UNKNOWN {
+                send
+            } else if let Some(result) = self.invoked_callee_result(row) {
+                result
+            } else if let Some(context) = self.context_invoke_ty(row) {
+                context
+            } else {
+                // A folded creation whose row carries nothing: the
+                // expression's static type is the instantiated head
+                // (`A<int>()` is `A<int>`) — the written arguments
+                // reattach from the creation row (#2873) so the
+                // assignment faces decide and DISPLAY the instantiation
+                // (`A value of type 'A<int, dynamic>' ...`), never the
+                // bare fold-sentinel head. An inferred creation has no
+                // written entry and keeps the row's own face.
+                match &row.shape {
+                    RowShape::Receiver(Receiver::Created { name, kind, .. })
+                        if *kind != ContainerKind::Extension =>
+                    {
+                        self.creation_row_ty(*name, false, row.range.offset)
+                            .unwrap_or(row.ty)
+                    }
+                    _ => row.ty,
                 }
+            };
+            // A stored send type stands where it already IS the resolved
+            // answer: the `!` rewrite (`f()!` promoted the row to the
+            // operand's non-null form — the only face that non-nulls a
+            // send row) and a creation fold's solved instance. Everything
+            // else re-decides above.
+            let asserted = self
+                .invocation_span(row.range)
+                .map(|span| self.null_asserted_after(span, send))
+                .unwrap_or(send);
+            if send == Ty::UNKNOWN
+                || row.ty == asserted
+                || (row.ty != Ty::UNKNOWN && row.ty == Self::non_null_form(send))
+            {
+                row.ty
+            } else {
+                asserted
             }
-            // A folded creation whose row carries nothing: the expression's
-            // static type is the instantiated head (`A<int>()` is
-            // `A<int>`) — the written arguments reattach from the creation
-            // row (#2873) so the assignment faces decide and DISPLAY the
-            // instantiation (`A value of type 'A<int, dynamic>' ...`),
-            // never the bare fold-sentinel head. An inferred creation has
-            // no written entry and keeps the row's own face.
-            None => match &row.shape {
+        } else {
+            match &row.shape {
                 RowShape::Receiver(Receiver::Created { name, kind, .. })
                     if *kind != ContainerKind::Extension =>
                 {
@@ -7849,7 +8396,7 @@ impl<'a> Engine<'a> {
                         .unwrap_or(row.ty)
                 }
                 _ => row.ty,
-            },
+            }
         };
         if self.null_aware_members.contains(&row.range.offset)
             && !matches!(row.intent, Intent::Operator(..))

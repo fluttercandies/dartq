@@ -39,6 +39,74 @@ impl PatternNodeState {
     }
 }
 
+/// The potentially-constant scan face of a const constructor's field
+/// initializer (`_reportNotPotentialConstants` over `x = e` initializer
+/// entries, #3400): the const constructor's formal parameters bound opaque
+/// (potentially constant), with two verdicts the shared engine face does
+/// not carry —
+///
+/// * a bare instance-member spelling (`f = g` over instance `g`): the name
+///   resolves through implicit `this`, which is never a constant — the
+///   oracle's `_Collector` reports `invalid_constant` at the read (and the
+///   implicit-`this` row reports its own
+///   `implicit_this_reference_in_initializer`). A static member keeps the
+///   declarator-keyed verdict (`f = s` over `static const s` stays
+///   silent);
+/// * a wildcard formal (`_`): wildcards declare no name the initializer
+///   can read, so `ctor_init_formals` drops them before the env is built —
+///   `assert(_ > 0)` classifies `_` unresolved and reports
+///   `invalid_constant` beside the row's `undefined_identifier`.
+///
+/// Every other leaf defers to the engine's own classification, so the
+/// scan stays the single gate the shared scan sites run.
+struct InitRhsLookup<'a, 'e> {
+    engine: &'e Engine<'a>,
+    env: &'e FxHashMap<StringId, CtorBinding>,
+}
+
+impl ConstLookup for InitRhsLookup<'_, '_> {
+    fn ident(&self, name: StringId) -> IdentVerdict {
+        if let Some(binding) = self.env.get(&name) {
+            return match binding {
+                CtorBinding::Value(v) => IdentVerdict::Value(v.clone()),
+                CtorBinding::Opaque => IdentVerdict::Constant,
+                CtorBinding::Invalid => IdentVerdict::NotConstant,
+            };
+        }
+        if let (BareInfo::Plain { .. }, RefTarget::Member { container }) =
+            self.engine.resolve_bare(name)
+            && let Walk::Found(entry) = self.engine.walk_members(container, name)
+        {
+            return if entry.is_static {
+                self.engine.ident(name)
+            } else {
+                IdentVerdict::NotConstant
+            };
+        }
+        self.engine.ident(name)
+    }
+
+    fn member(&self, recv: &ConstantValue, name: StringId) -> Verdict {
+        self.engine.member(recv, name)
+    }
+
+    fn prefixed(&self, prefix: StringId, name: StringId) -> Option<IdentVerdict> {
+        self.engine.prefixed(prefix, name)
+    }
+
+    fn is_identical(&self, name: StringId) -> bool {
+        self.engine.is_identical(name)
+    }
+
+    fn created_state(&self, container: StringId) -> crate::const_eval::CreatedState {
+        self.engine.created_state(container)
+    }
+
+    fn shorthand_context(&self, span: SourceRange) -> bool {
+        self.engine.shorthand_context(span)
+    }
+}
+
 /// A record pattern's required-type shape: the positional field count and the
 /// named field set (`analyzeRecordPattern`'s `recordType(positional:
 /// List.filled(positionalCount, objectQuestionType), named: ...)`, pkg/
@@ -4394,6 +4462,69 @@ impl ParserListener for DiagnoseListener<'_> {
         // #1351: the capture closes — the stashed RHS trees join the
         // walk's stash (keep-last: one initializer list per constructor).
         if let Some(key) = engine.ctor_init_latch.take() {
+            // The const constructor's `_reportNotPotentialConstants` gate
+            // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+            // constant/constant_verifier.dart —
+            // `_validateConstructorInitializers` scans each `x = e` field
+            // initializer under `node.constKeyword != null`): every leaf
+            // must be *potentially* constant — a const-ctor formal bound
+            // opaque passes, a non-const or implicit-`this` member read
+            // collects `invalid_constant` at its own span. Wildcard
+            // formals bind no readable name, so they are filtered out —
+            // `assert(_ > 0)` leaves `_` unresolved. The formals resolve
+            // off the latch key directly: `initializer_depth` is already
+            // closed above, so `ctor_init_formals` no longer sees the
+            // constructor.
+            let formals_key = if engine.is_bare_new_head(key.1) {
+                key.0
+            } else {
+                key.1
+            };
+            let formals: Vec<StringId> = engine
+                .index
+                .get(engine.file)
+                .and_then(|f| f.container(key.0))
+                .and_then(|c| c.ctor_formals.get(&formals_key))
+                .map(|formals| {
+                    formals
+                        .positional
+                        .iter()
+                        .chain(formals.named.iter())
+                        .map(|formal| formal.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut spans = Vec::new();
+            {
+                let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
+                for name in formals {
+                    if !engine.is_wildcard(name) {
+                        env.insert(name, CtorBinding::Opaque);
+                    }
+                }
+                let scope = InitRhsLookup {
+                    engine,
+                    env: &env,
+                };
+                for node in &engine.ctor_init_pending {
+                    collect_not_potentially_constant(node, &scope, &mut spans);
+                }
+            }
+            for span in spans {
+                // A leaf another face already reported at the same span
+                // (`(a: g)`'s record-element verdict under
+                // `check_const_elements`, or the super-arglist scan on a
+                // shared offset) fires once upstream — the oracle's
+                // `_reportNotPotentialConstants` is a single pass, so a
+                // same-code same-span hit is the duplicate, not a second
+                // row.
+                if engine.report.diagnostics.iter().any(|d| {
+                    d.code.name == "invalid_constant" && d.range == span
+                }) {
+                    continue;
+                }
+                engine.emit(SemanticCode::InvalidConstant, span, "", "");
+            }
             let inits = std::mem::take(&mut engine.ctor_init_pending);
             engine.ctor_inits.insert(key, inits);
             let _ = engine.const_capture.close_initializer();
@@ -6355,29 +6486,33 @@ impl ParserListener for DiagnoseListener<'_> {
                 // one (`potentially_constant.dart` `_nameExpression`): the
                 // enclosing const constructor's formal parameters are
                 // potentially constant, so the scan runs with the formals
-                // bound as opaque names (the [`CtorScope`] overlay) — a
+                // bound as opaque names (the [`InitRhsLookup`] overlay) — a
                 // const-ctor formal passed through `: super(f)` /
                 // `: this.other(f)` stays silent, a genuinely non-constant
                 // argument still collects.
                 let mut spans = Vec::new();
                 if self.engine.in_const_ctor {
                     let formals = self.engine.ctor_init_formals();
-                    if formals.is_empty() {
-                        for arg in &closed.args {
-                            collect_not_potentially_constant(arg, &self.engine, &mut spans);
-                        }
-                    } else {
-                        let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
-                        for name in formals {
+                    // Wildcard formals declare no readable name — they drop
+                    // out of the env so `super(_)`/`assert(_ > 0)` leaves
+                    // `_` unresolved (the oracle reports `invalid_constant`
+                    // beside the row's `undefined_identifier`, #3400).
+                    let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
+                    for name in formals {
+                        if !self.engine.is_wildcard(name) {
                             env.insert(name, CtorBinding::Opaque);
                         }
-                        let scope = CtorScope {
-                            engine: &self.engine,
-                            env: &env,
-                        };
-                        for arg in &closed.args {
-                            collect_not_potentially_constant(arg, &scope, &mut spans);
-                        }
+                    }
+                    // [`InitRhsLookup`] also carries the implicit-`this`
+                    // member rule — `super(g)` over instance `g` collects
+                    // the same `invalid_constant` the field-initializer
+                    // scan reports.
+                    let scope = InitRhsLookup {
+                        engine: &self.engine,
+                        env: &env,
+                    };
+                    for arg in &closed.args {
+                        collect_not_potentially_constant(arg, &scope, &mut spans);
                     }
                 }
                 let engine = &mut self.engine;
