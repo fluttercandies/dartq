@@ -19779,6 +19779,18 @@ mod ticket_3359_tests;
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// The #3411 pins (the `@nonVirtual` override face and the setter
+// function-type arity): a member overriding an inherited CONCRETE member
+// that carries `@nonVirtual` reports at its own name and names the
+// declaring container — the superclass-and-mixins map only, `implements`
+// faces never; and a setter compares its function type's single parameter
+// rather than a malformed declaration's written list. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3411_tests.rs"]
+mod ticket_3411_tests;
+
 // The #3415 pins (the send close's staging source and the named-selector
 // creation's published instantiation): the flow send fold now reads the
 // same operand-static-type fact every verdict over the row reads, so a

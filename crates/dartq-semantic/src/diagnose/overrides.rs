@@ -288,6 +288,105 @@ fn has_implicit_slot(entry: &MemberEntry) -> bool {
     }
 }
 
+/// The `invalid_override_of_non_virtual_member` code (upstream Dart SDK
+/// source, `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`'s
+/// `invalidOverrideOfNonVirtualMember` row — a `WarningCode`
+/// `STATIC_WARNING`). The semantic code table carries no variant for it
+/// because this file owns its only emit site, so the descriptor lives
+/// beside that site.
+const INVALID_OVERRIDE_OF_NON_VIRTUAL_MEMBER: CodeInfo = CodeInfo::new(
+    "invalid_override_of_non_virtual_member",
+    "INVALID_OVERRIDE_OF_NON_VIRTUAL_MEMBER",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// The parameter list a SETTER's function type carries: exactly one
+/// required positional slot, typed by the declared first parameter or
+/// `dynamic` when the declaration wrote none. Upstream builds a setter
+/// element's type from the single parameter it owns (`SetterElementImpl`,
+/// upstream Dart SDK source, `pkg/analyzer/lib/src/dart/element/
+/// element.dart`), never from the written list — a malformed
+/// `set foo()` still types `void Function(dynamic)`. Comparing the
+/// WRITTEN lists instead reads that malformed arity as a break and
+/// fabricates an override row the oracle does not report
+/// (`test_setter_single_setter_withoutParameter`).
+fn setter_type_formals(formals: Option<&Formals>) -> Formals {
+    let first = formals.and_then(|f| f.positional.first());
+    Formals {
+        positional: Box::new([Formal {
+            name: first.map_or(StringId::NONE, |f| f.name),
+            ty: first.map_or(Ty::Dynamic, |f| f.ty),
+            required: true,
+            covariant: first.is_some_and(|f| f.covariant),
+            default_value: None,
+        }]),
+        named: Box::new([]),
+    }
+}
+
+/// Pushes one level's inherited faces so a LIFO walk visits them in the
+/// oracle's most-specific-first order: the last-written mixin leads (each
+/// later application's whole interface shadows the earlier ones and the
+/// superclass — `_addImplemented` (`inheritance_manager3.dart:333-352`)
+/// overlays them into one map in application order), then the
+/// superclass edge. A mixin's `on` constraints are NOT inherited concrete
+/// members (the map carries only the element's own methods/getters/setters
+/// plus its own application faces), so they never join the walk.
+fn push_concrete_faces(
+    decl: &Container,
+    writer: StringId,
+    writer_file: FileId,
+    lib: LibraryId,
+    pending: &mut Vec<(StringId, StringId, FileId, LibraryId)>,
+) {
+    if let Some(superclass) = decl.superclass {
+        pending.push((superclass, writer, writer_file, lib));
+    }
+    for mixin in decl.with_clause.iter() {
+        pending.push((*mixin, writer, writer_file, lib));
+    }
+}
+
+/// The concrete instance member a container answers for the lookup name —
+/// the `_addImplemented` filter (`inheritance_manager3.dart:339-347`: only
+/// a non-abstract, non-static member joins the inherited map). A stored
+/// FIELD answers the SETTER lookup through its induced setter (the official
+/// map keys a non-final field's setter under `name=`).
+///
+/// Distinct from `diagnose::enum_verifier`'s `concrete_member` predicate
+/// (`entry.is_abstract`-free static/concrete test) and from that module's
+/// `Engine::inherited_concrete_member`, which answers a container spelling
+/// for the enum-constant superset face: this one answers the member ENTRY
+/// (its metadata is the question) and kind-matches the getter/setter lookup
+/// forms the `@nonVirtual` face asks in.
+fn concrete_member_of<'c>(
+    decl: &'c Container,
+    plain: StringId,
+    setter: StringId,
+    setter_face: bool,
+) -> Option<&'c MemberEntry> {
+    let joinable = |entry: &MemberEntry| !entry.is_static && !entry.is_abstract;
+    if setter_face {
+        if let Some(entry) = decl.members.get(&setter)
+            && joinable(entry)
+            && entry.kind == MemberKind::Setter
+        {
+            return Some(entry);
+        }
+        let field = decl.members.get(&plain)?;
+        return (joinable(field) && field.kind == MemberKind::Field && !field.is_final)
+            .then_some(field);
+    }
+    let entry = decl.members.get(&plain)?;
+    (joinable(entry)
+        && matches!(
+            entry.kind,
+            MemberKind::Getter | MemberKind::Method | MemberKind::Field
+        ))
+    .then_some(entry)
+}
+
 impl<'a> Engine<'a> {
     /// Walks `container`'s member face through the linearized supertype
     /// chain: the container's own members, then its `with` mixins in reverse
@@ -798,6 +897,166 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// `invalid_override_of_non_virtual_member` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/best_practices_verifier.dart:405-451`
+    /// `visitFieldDeclaration` and `:595-648` `visitMethodDeclaration`): an
+    /// instance member whose same-named INHERITED CONCRETE member —
+    /// `InterfaceElement.getInheritedConcreteMember`
+    /// (`inheritance_manager3.dart:159-174`, the superclass-and-mixins map,
+    /// never the `implements` faces) — carries `@nonVirtual` metadata
+    /// (`_hasNonVirtualAnnotation`, :1550-1557).
+    ///
+    /// The lookup names follow the oracle's per-declaration shape: a method
+    /// and an accessor answer their own spelling (a setter's model spelling
+    /// already carries the `=` marker), while a FIELD tries its getter name
+    /// first and only falls back to the setter name when the getter misses
+    /// (:427-430's `??` — the annotation of the entry the first lookup
+    /// found is the only one read). A static member never overrides, and a
+    /// duplicate declaration's report belongs to `duplicate_definition`.
+    pub(crate) fn check_non_virtual_override(&mut self, spelling: StringId, range: SourceRange) {
+        let Some((container, kind)) = self.container_context() else {
+            return;
+        };
+        if matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        ) {
+            return;
+        }
+        let owner = {
+            let Some(elements) = self.index.get(self.file) else {
+                return;
+            };
+            let Some(decl) = elements.container(container) else {
+                return;
+            };
+            let Some(entry) = decl.members.get(&spelling) else {
+                return;
+            };
+            if entry.is_static {
+                return;
+            }
+            if elements
+                .duplicates()
+                .iter()
+                .any(|d| d.name == spelling && d.range == range)
+            {
+                return;
+            }
+            // The lookup pair. A written setter's model spelling carries the
+            // `=` marker, so the bare name is stripped back for the walk and
+            // the face it asks is the setter face; every other member
+            // answers its written spelling as the getter-face name. A FIELD
+            // tries the getter face first and falls back to the setter face
+            // (the oracle's `??` at :427-430).
+            let setter_face = entry.kind == MemberKind::Setter;
+            let bare = if setter_face {
+                let text = self.strings.resolve(spelling);
+                self.intern(self.member_display_name(text))
+            } else {
+                spelling
+            };
+            let setter = self.setter_spelling(bare);
+            let mut hit =
+                self.non_virtual_inherited_hit(decl, container, bare, setter, setter_face);
+            if hit.is_none() && entry.kind == MemberKind::Field {
+                hit = self.non_virtual_inherited_hit(decl, container, bare, setter, true);
+            }
+            let Some((found, found_owner)) = hit else {
+                return;
+            };
+            if !self.declares_non_virtual(found) {
+                return;
+            }
+            found_owner
+        };
+        let display = self.strings.resolve(spelling);
+        let display = self.member_display_name(display);
+        let owner = self.strings.resolve(owner);
+        let message = format!(
+            "The member '{display}' is declared non-virtual in '{owner}' and can't be \
+             overridden in subclasses."
+        );
+        self.report.diagnostics.push(Diagnostic::new(
+            INVALID_OVERRIDE_OF_NON_VIRTUAL_MEMBER.dtype.severity(),
+            INVALID_OVERRIDE_OF_NON_VIRTUAL_MEMBER,
+            message,
+            self.file,
+            range,
+            None,
+        ));
+    }
+
+    /// The most specific CONCRETE instance member the container inherits
+    /// for the lookup name — upstream `getInheritedConcreteMap`'s
+    /// `superImplemented.last` (`inheritance_manager3.dart:159-174`): the
+    /// superclass-and-mixins map, built by overlaying each face's own
+    /// concrete members in application order (`_addImplemented` :333-352,
+    /// so a later mixin's interface shadows an earlier one's and the
+    /// superclass's). The walk is pre-order over the written
+    /// `with`/`extends` edges — each face's own members before its
+    /// ancestors', and each level's faces visited last-written mixin first
+    /// ([`push_concrete_faces`]) — which reproduces that overlay order. An
+    /// unresolvable hop and a cycle are skipped, and an abstract
+    /// redeclaration never shadows (it is absent from the official map), so
+    /// the search keeps running past both.
+    ///
+    /// Narrower than `diagnose::enum_verifier`'s `inherited_concrete_member`
+    /// on purpose: that face answers which container declares the name (for
+    /// the enum-constant superset checks) and stops at one mixin level,
+    /// while this one answers the inherited ENTRY (the `@nonVirtual` metadata
+    /// is the question), kind-matches the getter/setter lookup forms, and
+    /// descends through a mixin's own application faces.
+    fn non_virtual_inherited_hit(
+        &self,
+        decl: &'a Container,
+        container: StringId,
+        plain: StringId,
+        setter: StringId,
+        setter_face: bool,
+    ) -> Option<(&'a MemberEntry, StringId)> {
+        if decl.superclass.is_none() && decl.with_clause.is_empty() {
+            // Only the implicit `Object` face is inherited, and its members
+            // carry no annotation this face reads.
+            return None;
+        }
+        let mut pending: Vec<(StringId, StringId, FileId, LibraryId)> = Vec::new();
+        push_concrete_faces(decl, container, self.file, self.lib, &mut pending);
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        seen.insert(container);
+        while let Some((face, writer, writer_file, lib)) = pending.pop() {
+            if !seen.insert(face) {
+                continue;
+            }
+            let Some((face_decl, face_file)) =
+                self.resolve_clause_face(writer, writer_file, lib, face)
+            else {
+                continue;
+            };
+            if let Some(entry) = concrete_member_of(face_decl, plain, setter, setter_face) {
+                return Some((entry, face));
+            }
+            let face_lib = self.owner_library_of(face_file, face).unwrap_or(lib);
+            push_concrete_faces(face_decl, face, face_file, face_lib, &mut pending);
+        }
+        None
+    }
+
+    /// Whether the entry carries the `nonVirtual` annotation — name-level
+    /// recognition, the posture `site_annotation` keeps for
+    /// `@mustCallSuper` (a prefixed `@meta.nonVirtual` joins through its
+    /// last segment). The model keeps the written star on the entry itself,
+    /// so a cross-file ancestor answers too.
+    fn declares_non_virtual(&self, entry: &MemberEntry) -> bool {
+        entry.annotations.iter().any(|annotation| {
+            self.strings
+                .resolve(annotation.name)
+                .rsplit('.')
+                .next()
+                .is_some_and(|segment| segment == "nonVirtual")
+        })
+    }
+
     pub(crate) fn check_override(&mut self, spelling: StringId, range: SourceRange) {
         // Member declarations parse inside a container frame; extensions and
         // extension types have no inheritance faces.
@@ -810,6 +1069,13 @@ impl<'a> Engine<'a> {
         ) {
             return;
         }
+        // The annotation-driven `@nonVirtual` face runs first: upstream it
+        // lives in a separate verifier
+        // (`best_practices_verifier.dart`'s `visitMethodDeclaration` and
+        // `visitFieldDeclaration`, :595-648 / :405-451), so neither the
+        // disallowed-clause gate nor the declared-face loop below
+        // suppresses it.
+        self.check_non_virtual_override(spelling, range);
         let Some(elements) = self.index.get(self.file) else {
             return;
         };
@@ -7853,6 +8119,27 @@ impl<'a> Engine<'a> {
         }
         match (declared.formals.as_deref(), inherited.formals.as_deref()) {
             (Some(a), Some(b)) => {
+                // The setter faces compare their FUNCTION TYPE's parameter
+                // list, which always holds exactly one slot
+                // ([`setter_type_formals`]) — the written list of a malformed
+                // declaration (`set foo() {}`, its arity reported by
+                // `wrong_number_of_parameters_for_setter`) is not the type
+                // the oracle compares, and reading it fabricated an
+                // `invalid_override` between two `void Function(dynamic)`
+                // faces (`test_setter_single_setter_withoutParameter`). A
+                // face whose list the model never captured keeps the
+                // arm below's suppression (the under-report direction).
+                let setter_declared;
+                let setter_inherited;
+                let (a, b) =
+                    if declared.kind == MemberKind::Setter && inherited.kind == MemberKind::Setter
+                    {
+                        setter_declared = setter_type_formals(Some(a));
+                        setter_inherited = setter_type_formals(Some(b));
+                        (&setter_declared, &setter_inherited)
+                    } else {
+                        (a, b)
+                    };
                 // The function-subtype arity rule, not an equality: the
                 // override must accept every call the super member accepts
                 // (upstream Dart SDK source,
