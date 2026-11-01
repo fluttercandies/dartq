@@ -22635,6 +22635,16 @@ mod ticket_3434_tests;
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3469 — alias-headed bounds: the alias parameters' stored variance is
+// —— the typedef one (their occurrences in the aliased body), so the
+// —— instantiate-to-bound defaults ground the way the oracle's do, and a
+// —— written bound naming a bare generic alias decides the type-argument
+// —— faces. Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3469_tests.rs"]
+mod ticket_3469_tests;
+
 // —— #3516 —— a cross-unit `augment` fragment's declarations join the merged
 // —— element face: enum constants (read face + switch witness set),
 // —— constructor selectors, `const`-constructor presence, the implicit

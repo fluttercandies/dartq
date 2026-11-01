@@ -55,6 +55,23 @@
 //! closure is unsafe and every check whose argument root reaches it is
 //! suppressed — the subtype walk would otherwise answer `false` where
 //! the truth is `true`, the false-positive direction.
+//!
+//! # Alias-headed bounds
+//!
+//! A written bound naming a typedef (`class A<T extends F>`, `typedef F<X>
+//! = X Function(X)`) is no type the model has: the snapshot expands it
+//! through the alias's captured RHS with the alias parameters'
+//! instantiate-to-bound defaults — the same expansion a use-site alias
+//! application runs (#1351) — and the bound the verdict rests on is that
+//! expanded shape. A typedef parameter's stored variance is the value
+//! computed from its occurrences in the aliased body, not the class-side
+//! covariant default, so a self-referential bound grounds the way the
+//! oracle's does (`X extends A<X>` over a contravariant occurrence reads
+//! `A<Never>`, a covariant one `A<dynamic>`). The alias parameter bounds
+//! themselves map only once every expansion is final: a bound naming a
+//! co-alias expands like any other alias use, and one whose alias never
+//! expands reads `dynamic` — the always-satisfied default, the
+//! under-report direction.
 
 use std::cell::{Cell, Ref, RefCell};
 
@@ -65,6 +82,7 @@ use dartq_types::{
     Boundedness, CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy,
     TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedType,
     Variance, instantiate_type_formals_to_bounds, is_well_bounded, replace_top_bottom,
+    variance_in_type,
 };
 
 // The written-type capture is shared with the collector's pool feeding
@@ -3456,9 +3474,9 @@ impl<'a> Snapshot<'a> {
         let scratch_facts = ParamFactsTable::new();
         // The captured aliases' expansions (#1351): each RHS maps in the
         // alias's own parameter scope (the declarations registered above);
-        // a bound or RHS referencing a not-yet-expanded alias defers to
-        // the next round (a chain terminates, a cycle drops — the
-        // under-report direction).
+        // an RHS referencing a not-yet-expanded alias defers to the next
+        // round (a chain terminates, a cycle drops — the under-report
+        // direction).
         let mut pending: Vec<(StringId, &AliasCapture)> =
             index.aliases.iter().map(|(name, c)| (*name, c)).collect();
         let mut rounds = index.aliases.len() + 1;
@@ -3472,10 +3490,10 @@ impl<'a> Snapshot<'a> {
                 let Some(scope) = alias_scopes.get(&decl) else {
                     continue;
                 };
-                // The expansion and the parameter-bounds mapping run in a
-                // scope that drops the `ctx` before the results apply —
-                // the map and the facts face update after the borrow.
-                let outcome = {
+                // The expansion runs in a scope that drops the `ctx` before
+                // the map applies — the expansion table updates after the
+                // borrow.
+                let expansion = {
                     let ctx = MapCtx {
                         table: &table,
                         strings,
@@ -3487,42 +3505,11 @@ impl<'a> Snapshot<'a> {
                         lazy_params: &RefCell::new(FxHashMap::default()),
                         next_param: &next_param,
                     };
-                    match expand_alias(capture, &ctx, scope) {
-                        Some(ty) => {
-                            let mapped_bounds = decl_params
-                                .get(&decl)
-                                .into_iter()
-                                .flatten()
-                                .zip(capture.params.iter())
-                                .map(|(&id, (_, bound, poisoned))| {
-                                    let mapped = match (bound, poisoned) {
-                                        (Some(tree), false) => {
-                                            ctx.map_tree(tree, scope).unwrap_or_else(|| {
-                                                table.intern(UninternedType::Dynamic, false)
-                                            })
-                                        }
-                                        _ => table.intern(UninternedType::Dynamic, false),
-                                    };
-                                    (id, mapped)
-                                })
-                                .collect::<Vec<_>>();
-                            Some((ty, mapped_bounds))
-                        }
-                        None => None,
-                    }
+                    expand_alias(capture, &ctx, scope)
                 };
-                match outcome {
-                    Some((ty, mapped_bounds)) => {
+                match expansion {
+                    Some(ty) => {
                         alias_expansions.insert(decl, ty);
-                        for (id, mapped) in mapped_bounds {
-                            facts.set(
-                                id,
-                                ParamFacts {
-                                    variance: Variance::Covariant,
-                                    bound: Some(mapped),
-                                },
-                            );
-                        }
                     }
                     None => deferred.push((name, capture)),
                 }
@@ -3531,6 +3518,101 @@ impl<'a> Snapshot<'a> {
                 break; // no progress: an alias cycle, the drops are final
             }
             pending = deferred;
+        }
+
+        // The alias parameters' own facts, mapped AFTER every expansion:
+        // a written bound naming a co-alias (`typedef G<X> = X Function(X);`
+        // `typedef D<X extends G<C<X, X>>> = ...`) expands through the same
+        // alias machinery a use-site application does. Mapping a bound in
+        // the round its own RHS resolved read a co-alias that had not
+        // expanded yet as unmodelable and recorded `dynamic` for the file's
+        // lifetime — an alias-headed bound the instantiate-to-bound never
+        // saw, so every default and every verdict resting on it was wrong.
+        //
+        // The stored variance is the *typedef* one: `VarianceBuilder`
+        // computes an alias parameter's variance from its occurrences in
+        // the aliased body (`pkg/analyzer/lib/src/dart/element/
+        // variance_builder.dart` `_genericTypeAlias`/`_functionTypeAlias`),
+        // and the instantiate-to-bound's component rewrite seeds from that
+        // value — `typedef G<X extends A<X>, Y extends X> = Y Function(X)`
+        // stores `X` contravariant, so its default grounds to `A<Never>`
+        // (the oracle's `G<A<Never>, A<Never>>`), not to the class-side
+        // covariant `A<dynamic>`. The walk reads declarations' parameter
+        // lists but no supertype edges, so a provisional hierarchy over the
+        // build's own declaration map answers it before the real one
+        // freezes; when it cannot (a rejected build, an alias that never
+        // expanded) the class-side default stands — the under-report
+        // direction, since a covariant seed can only leave a rewrite at
+        // `dynamic`, never fabricate a `Never`.
+        let provisional = index
+            .aliases
+            .values()
+            .any(|capture| capture.params.iter().any(|(_, bound, _)| bound.is_some()))
+            .then(|| {
+                let mut builder =
+                    TypeHierarchy::builder(CoreDecls { object, future, function, record: None });
+                for (&decl, params) in &decl_params {
+                    builder = builder.decl(decl, params.clone());
+                }
+                builder.build(&table).ok()
+            })
+            .flatten();
+        let alias_parameter_facts: Vec<(TypeParamId, ParamFacts)> = {
+            let ctx = MapCtx {
+                table: &table,
+                strings,
+                registry: &registry,
+                decl_params: &decl_params,
+                facts: &scratch_facts,
+                alias_expansions: &alias_expansions,
+                alias_decls: &alias_decls,
+                lazy_params: &RefCell::new(FxHashMap::default()),
+                next_param: &next_param,
+            };
+            let mut parameter_facts: Vec<(TypeParamId, ParamFacts)> = Vec::new();
+            for (name, capture) in &index.aliases {
+                let Some(&decl) = registry.get(&name) else {
+                    continue;
+                };
+                let Some(scope) = alias_scopes.get(&decl) else {
+                    continue;
+                };
+                let Some(params) = decl_params.get(&decl) else {
+                    continue;
+                };
+                let variances: Vec<Variance> = match (&provisional, alias_expansions.get(&decl)) {
+                    (Some(hierarchy), Some(&body)) => {
+                        let system = TypeSystem::new(&table, hierarchy);
+                        let no_facts = ParamFactsTable::new();
+                        params
+                            .iter()
+                            .map(|&parameter| variance_in_type(&system, &no_facts, parameter, body))
+                            .collect()
+                    }
+                    _ => vec![Variance::Covariant; params.len()],
+                };
+                for (position, (&id, (_, bound, poisoned))) in
+                    params.iter().zip(capture.params.iter()).enumerate()
+                {
+                    let bound_ty = match (bound, poisoned) {
+                        (Some(tree), false) => ctx.map_tree(tree, scope),
+                        _ => None,
+                    };
+                    parameter_facts.push((
+                        id,
+                        ParamFacts {
+                            variance: variances[position],
+                            bound: Some(bound_ty.unwrap_or_else(|| {
+                                table.intern(UninternedType::Dynamic, false)
+                            })),
+                        },
+                    ));
+                }
+            }
+            parameter_facts
+        };
+        for (id, parameter_facts) in alias_parameter_facts {
+            facts.set(id, parameter_facts);
         }
 
         // The container bounds map against the REAL facts face and the
