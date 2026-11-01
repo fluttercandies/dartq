@@ -8757,6 +8757,7 @@ fn overridden_member_context_degrades_on_a_missing_span() {
         is_abstract: false,
         is_external: false,
         is_final: false,
+        covariant: false,
         type_params: 0,
         type_param_names: Box::new([]),
         type_param_bounds: Box::default(),
@@ -18353,3 +18354,81 @@ mod ticket_3349_tests;
 #[cfg(test)]
 #[path = "ticket_3357_tests.rs"]
 mod ticket_3357_tests;
+
+// The #3336 pins (a generic top-level function's and a type alias's own
+// `<T extends E>` group reaches the resolved bound ledger): the collector
+// used to take the buffered bound list at the depth-1 close and drop it, so
+// only containers and members carried bounds and the `isAlwaysExhaustive`
+// type-parameter arm answered the unbounded face for a top-level
+// declaration's parameter. Registered here via `#[path]`; the module stays
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3336_tests.rs"]
+mod ticket_3336_tests;
+
+// The #3330 pins (the collector sites behind the #3301/#3305 residuals): the
+// field `covariant` bit its induced setter carries, the merged-element member
+// scope an `augment` block claims into, a primary-constructor declaring
+// formal's getter/setter claims, the wildcard-shaped formal gate, and the
+// non-identifier name slot. Registered here via `#[path]`; the module stays
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3330_tests.rs"]
+mod ticket_3330_tests;
+
+// The #3361 pins (the written `void` type argument of a collection
+// literal's `<…>` group): the keyword fires no type-use row (the parser
+// routes it through `handle_void_keyword`), so the list/set/map literal
+// faces read the group from their own bytes — `<void>[]`/`<void>{}` carry
+// the canonical `List<void>`/`Set<void>` element the `use_of_void_result`
+// family reads, and a `void` value slot keeps its entries silent.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3361_tests.rs"]
+mod ticket_3361_tests;
+
+// The #3331 pins (`no_combined_super_signature`, the #3301 residual C): the
+// registry row plus the emit face — a METHOD with an implicit type slot over
+// a multi-candidate set with no combined signature reports at the method
+// name with the `Class.member (signature)` candidate list, and the member's
+// declared-face override check skips. Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3331_tests.rs"]
+mod ticket_3331_tests;
+
+// The #3343 pins (the const-eval residual faces #3307 routed here): the
+// for-element collection-literal rows (`const_eval_for_element` at the for
+// element + the site default at the literal), the const dot-shorthand
+// missing-context rows, and the wildcard-field initializer walk's
+// `invalid_constant` + implicit-this pair — each an `#[ignore]`d oracle
+// anchor at the corpus span for the lane that owns the face's missing
+// machinery. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3343_tests.rs"]
+mod ticket_3343_tests;
+
+// The #3345 pins (the invalid_override residual cohort): the per-face
+// `interface.map` selection over the transitive hits (the superclass /
+// `with`-own-replace / inherited-merge / implements-append assembly), the
+// `_checkDirectSuperTypes` clause gate, the declaring-container's own
+// implicit-slot inference for an inherited hit, and the `covariant` field
+// keyword's induced-setter propagation. Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3345_tests.rs"]
+mod ticket_3345_tests;
+
+// The #3356 pins (the `unnecessary_type_check` /
+// `unnecessary_null_comparison` operand-static-type faces): the untyped-row
+// arm (`untyped_operand_ty`) reaching the is-check and `== null` walks, the
+// `TypeUse`-tailed var-initializer window binding the inferred local.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3356_tests.rs"]
+mod ticket_3356_tests;
