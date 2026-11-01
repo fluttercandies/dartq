@@ -6186,6 +6186,318 @@ impl<'a> Engine<'a> {
         // values are instances of.
         Some(enum_target)
     }
+
+    /// The `const_constructor_with_non_final_field` declaration face
+    /// (`_checkForConstConstructorWithNonFinalField`,
+    /// error_verifier.dart:4098-4112, reached from the
+    /// `ConstructorDeclaration` / `PrimaryConstructorDeclaration` visitors
+    /// at :697-712 / :1766-1790): a const GENERATIVE constructor of a class
+    /// reports when the class carries a non-final instance field — its own,
+    /// its superclass chain's, or its mixins' (`hasNonFinalField`,
+    /// summary2/link.dart:295-322) — anchored on the constructor's
+    /// `errorRange`: a secondary head's type name through its selector, a
+    /// primary head's `const` keyword through the constructor name.
+    ///
+    /// The two upstream siblings that pre-empt this row keep it silent:
+    /// `const_constructor_with_mixin_with_field[s]` (a class mixin adding an
+    /// instance field) and `const_constructor_with_non_const_super` (the
+    /// invoked super constructor is not const). Neither sibling is
+    /// implemented here, so this face carries their gates itself — without
+    /// them the oracle's sibling row would surface as an extra row of ours.
+    pub(crate) fn flush_const_ctor_non_final_face(&mut self, container: StringId) {
+        let Some(decl) = self
+            .index
+            .get(self.file)
+            .and_then(|elements| elements.container(container))
+        else {
+            return;
+        };
+        // `enclosingElement is! ClassElement` exempts enums, mixins, and
+        // extension types (:4105-4108).
+        if decl.kind != ContainerKind::Class {
+            return;
+        }
+        if !self.face_has_non_final_field(
+            self.file,
+            self.lib,
+            container,
+            &mut FxHashSet::default(),
+        ) || self.class_mixin_adds_instance_field(decl, container)
+        {
+            return;
+        }
+        // The const GENERATIVE constructor sites of this class: a factory is
+        // not generative (upstream `isGenerative` false), an augment
+        // declaration carries no row of its own, and every site without a
+        // latched head anchor (nameless recovery) stays out.
+        let sites: Vec<(usize, SourceRange)> = self
+            .decl_sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| {
+                !site.is_factory
+                    && !site.is_augment
+                    && matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
+            })
+            .filter_map(|(index, _)| {
+                let head = *self.ctor_head_anchors.get(&index)?;
+                Some((index, head))
+            })
+            .collect();
+        for (index, head) in sites {
+            let primary = matches!(self.lexeme_at(head.offset), Some("(" | "."));
+            let range = if primary {
+                // A primary constructor's const bit lives on the class
+                // header, not the constructor (the site opens before the
+                // keyword is visited): the written `const` decides.
+                let Some(range) = self.primary_ctor_error_range(container, head) else {
+                    continue;
+                };
+                if self.lexeme_at(range.offset) != Some("const") {
+                    continue;
+                }
+                range
+            } else {
+                if !self.decl_sites[index].const_ctor {
+                    continue;
+                }
+                if self.decl_sites[index].range.offset > head.offset {
+                    // A named secondary: the type name through the selector
+                    // (the site range was rewritten to the selector token).
+                    SourceRange {
+                        offset: head.offset,
+                        length: self.decl_sites[index].range.end() - head.offset,
+                    }
+                } else {
+                    // An unnamed secondary (`C(...)`, `new(...)`): the head
+                    // token IS the oracle's whole `errorRange`.
+                    head
+                }
+            };
+            if self.ctor_has_non_const_super(decl, head) {
+                continue;
+            }
+            self.emit(
+                SemanticCode::ConstConstructorWithNonFinalField,
+                range,
+                "",
+                "",
+            );
+        }
+    }
+
+    /// Whether the class `container` (or any superclass/mixin it climbs
+    /// through) has a non-final instance field with storage — the summary2
+    /// `hasNonFinalField` computation (link.dart:295-322): a field with
+    /// storage (the origin declaration is not abstract, or the field is a
+    /// declaring formal parameter) must be `final`.
+    fn face_has_non_final_field(
+        &self,
+        file: FileId,
+        lib: LibraryId,
+        name: StringId,
+        seen: &mut FxHashSet<(FileId, StringId)>,
+    ) -> bool {
+        let Some((decl, owner)) =
+            resolve_container(self.graph, self.namespaces, self.index, lib, file, name)
+        else {
+            return false;
+        };
+        if !seen.insert((owner, name)) {
+            return false;
+        }
+        if decl.members.values().any(|entry| {
+            !entry.is_static
+                && matches!(entry.kind, crate::model::MemberKind::Field)
+                && !entry.is_abstract
+                && !entry.is_final
+        }) {
+            return true;
+        }
+        let scope_lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(lib);
+        decl.superclass.is_some_and(|superclass| {
+            self.face_has_non_final_field(owner, scope_lib, superclass, seen)
+        }) || decl.with_clause.iter().any(|mixin| {
+            self.face_has_non_final_field(owner, scope_lib, *mixin, seen)
+        })
+    }
+
+    /// Whether one of the class's mixins adds an instance field — the
+    /// `const_constructor_with_mixin_with_field[s]` trigger
+    /// (`_checkForConstConstructorWithNonConstSuper`'s mixin loop,
+    /// error_verifier.dart:4053-4098): a non-static field that is not an
+    /// accessor, the abstract+final pair excepted (an abstract final field
+    /// is a getter alone).
+    fn class_mixin_adds_instance_field(&self, decl: &Container, container: StringId) -> bool {
+        if decl.with_clause.is_empty() {
+            return false;
+        }
+        let lib = owner_library(self.graph, self.lib, self.file, container).unwrap_or(self.lib);
+        let mut seen = FxHashSet::default();
+        decl.with_clause
+            .iter()
+            .any(|mixin| self.face_has_mixin_field(self.file, lib, *mixin, &mut seen))
+    }
+
+    /// The mixin-field walk for [`Self::class_mixin_adds_instance_field`],
+    /// climbing the resolved face's superclass/mixin edges (a mixin
+    /// application in the `with` list resolves to its class face).
+    fn face_has_mixin_field(
+        &self,
+        file: FileId,
+        lib: LibraryId,
+        name: StringId,
+        seen: &mut FxHashSet<(FileId, StringId)>,
+    ) -> bool {
+        let Some((decl, owner)) =
+            resolve_container(self.graph, self.namespaces, self.index, lib, file, name)
+        else {
+            return false;
+        };
+        if !seen.insert((owner, name)) {
+            return false;
+        }
+        if decl.members.values().any(|entry| {
+            !entry.is_static
+                && matches!(entry.kind, crate::model::MemberKind::Field)
+                && !(entry.is_abstract && entry.is_final)
+        }) {
+            return true;
+        }
+        let scope_lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(lib);
+        decl.superclass
+            .is_some_and(|superclass| self.face_has_mixin_field(owner, scope_lib, superclass, seen))
+            || decl
+                .with_clause
+                .iter()
+                .any(|mixin| self.face_has_mixin_field(owner, scope_lib, *mixin, seen))
+    }
+
+    /// Whether the constructor whose head anchor is `head` invokes a
+    /// non-const super constructor — the
+    /// `_checkForConstConstructorWithNonConstSuper` pre-emption
+    /// (error_verifier.dart:4034-4130). An unresolvable super face answers
+    /// `false`: the oracle's null `superConstructor` never pre-empts.
+    fn ctor_has_non_const_super(&self, decl: &Container, head: SourceRange) -> bool {
+        let Some(super_name) = decl.superclass else {
+            return false;
+        };
+        let Some((super_decl, super_file)) =
+            resolve_container(self.graph, self.namespaces, self.index, self.lib, self.file, super_name)
+        else {
+            return false;
+        };
+        // An enum's generative constructors are implicitly const.
+        if super_decl.kind == ContainerKind::Enum {
+            return false;
+        }
+        let invoked = self.invoked_super_selector(head).unwrap_or(super_name);
+        let unnamed = invoked == super_name || invoked == self.intern("new");
+        if super_file == self.file {
+            if let Some(target) = self.ctor_decl_site(super_name, invoked) {
+                // `super.x(...)` never invokes a factory (upstream's
+                // `invokedSuper` is the generative face).
+                return !target.is_factory && !target.const_ctor;
+            }
+            // No declaration site: the unnamed spelling resolves to the
+            // implicit default (never const, and only present when the
+            // class is constructible unnamed); a named spelling resolves to
+            // no generative face upstream — no pre-emption.
+            return unnamed && super_decl.has_unnamed_constructor;
+        }
+        // A foreign superclass answers no per-selector declaration site; the
+        // container-level const bit is the coarse face (an unnamed
+        // invocation against a class with no unnamed constructor is an
+        // undefined face upstream — no pre-emption).
+        if unnamed && !super_decl.has_unnamed_constructor {
+            return false;
+        }
+        unnamed && !super_decl.has_const_constructor
+    }
+
+    /// The super constructor a constructor head's initializer list invokes:
+    /// `None` for the implicit or explicit unnamed invocation, `Some(sel)`
+    /// for `super.sel(...)`. The scan runs past the formal-parameters group
+    /// up to the body brace or the terminating `;` (nested groups skip
+    /// whole), so a `super.x = v` field initializer never reads as an
+    /// invocation.
+    fn invoked_super_selector(&self, head: SourceRange) -> Option<StringId> {
+        let tokens = self.tokens.as_slice();
+        let start = tokens.partition_point(|token| token.utf16_offset < head.offset);
+        let open = (start..tokens.len())
+            .find(|&index| tokens[index].kind == dartq_scanner::TokenKind::OpenParen)?;
+        let mut index = self.tokens.matching_end(open)? + 1;
+        while let Some(token) = tokens.get(index) {
+            match token.kind {
+                dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::OpenCurly => break,
+                dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                    index = self.tokens.matching_end(index)? + 1;
+                }
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Super) => {
+                    match tokens.get(index + 1).map(|next| &next.kind) {
+                        Some(dartq_scanner::TokenKind::OpenParen) => return None,
+                        Some(dartq_scanner::TokenKind::Period) => {
+                            let selector = tokens.get(index + 2)?;
+                            if selector.kind == dartq_scanner::TokenKind::Identifier
+                                && tokens.get(index + 3).map(|next| &next.kind)
+                                    == Some(&dartq_scanner::TokenKind::OpenParen)
+                            {
+                                return Some(self.intern(self.tokens.lexeme(self.source, index + 2)));
+                            }
+                        }
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                _ => index += 1,
+            }
+        }
+        None
+    }
+
+    /// A primary constructor's `errorRange` (`PrimaryConstructorDeclaration`
+    /// overrides it): `beginToken` — the `const` keyword when written, else
+    /// the class name — through the constructor name. The `const` keyword
+    /// sits immediately before the class name (`class const A.named(...)`);
+    /// an unnamed head ends at the begin token itself.
+    fn primary_ctor_error_range(
+        &self,
+        container: StringId,
+        head: SourceRange,
+    ) -> Option<SourceRange> {
+        let name = self
+            .decl_sites
+            .iter()
+            .rev()
+            .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
+            .map(|site| site.range)?;
+        let start = self
+            .token_before(name.offset)
+            .filter(|previous| self.lexeme_at(previous.offset) == Some("const"))
+            .unwrap_or(name);
+        let end = if self.lexeme_at(head.offset) == Some(".") {
+            self.token_after(head.offset)
+                .map_or(start.end(), |selector| selector.end())
+        } else {
+            start.end()
+        };
+        Some(SourceRange {
+            offset: start.offset,
+            length: end - start.offset,
+        })
+    }
+
+    /// The token immediately BEFORE the one starting at `offset` (UTF-16).
+    fn token_before(&self, offset: u32) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < offset);
+        let token = tokens.get(at.checked_sub(1)?)?;
+        Some(SourceRange {
+            offset: token.utf16_offset,
+            length: self.utf16_of((token.byte_offset + token.byte_len) as usize)
+                - token.utf16_offset,
+        })
+    }
 }
 
 // The #2815 pins (the B2 unchecked-nullable family). Registered here,

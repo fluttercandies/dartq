@@ -195,14 +195,12 @@ fn chained_send_callee_is_not_a_receiver_face() {
     assert_no_function_receiver(&report);
 }
 
-// —— The target pins (blocked on #3316's `receiver_decl_shape` gate) ——
+// —— The target pins (the `receiver_decl_shape` send gate is #3316's) ——
 
 /// `later(v) => new Future.value(v)` has no declared return: the call's
 /// result must be the body-inferred `Future<...>` (the oracle resolves
 /// `.then` against it), never the callee's tear-off.
 #[test]
-#[ignore = "target: pass-2 `receiver_decl_shape` answers the callee tear-off for a completed \
-            send (row_resolution.rs:4025/4037) — #3316 gates it on the send span"]
 fn untyped_top_level_callee_return_is_not_a_function_metaclass() {
     let report = report_ops(
         "later(v) => new Future.value(v);\
@@ -217,8 +215,6 @@ fn untyped_top_level_callee_return_is_not_a_function_metaclass() {
 /// A context-free unbounded generic call infers `dynamic` upstream, so the
 /// member access is silent; today the tear-off leak names `Function`.
 #[test]
-#[ignore = "target: unsolved generic return merges as Unknown and the \
-            `receiver_decl_shape` fallback leaks the tear-off — #3316"]
 fn context_free_unsolved_generic_receiver_is_dynamic_not_function() {
     let report = report_ops(
         "T castObject<T>(Object value) => value as T;\
@@ -231,8 +227,6 @@ fn context_free_unsolved_generic_receiver_is_dynamic_not_function() {
 /// A declared `dynamic` return types the result `dynamic`: the receiver is
 /// not a function and the member access is silent.
 #[test]
-#[ignore = "target: a dynamic callee result merges as Receiver::Unknown and the \
-            `receiver_decl_shape` fallback leaks the tear-off — #3316"]
 fn dynamic_callee_result_is_silent() {
     let report = report_ops(
         "dynamic plainDyn(Object v) => v;\

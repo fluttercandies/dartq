@@ -6441,14 +6441,30 @@ impl<'a> Engine<'a> {
             ..
         } = ty
         else {
-            return ty.is_strictly_non_nullable();
+            return self.declared_strict_non_nullable(ty);
         };
         if !self.is_scope_param(name) {
-            return ty.is_strictly_non_nullable();
+            return self.declared_strict_non_nullable(ty);
         }
         match self.param_bound(name) {
             None => false,
-            Some(bound) => !self.ty_mentions_param(bound) && bound.is_strictly_non_nullable(),
+            Some(bound) => {
+                !self.ty_mentions_param(bound) && self.declared_strict_non_nullable(bound)
+            }
+        }
+    }
+
+    /// The model's argument-aware `isStrictlyNonNullable`
+    /// (`FileElements::is_strictly_non_nullable`): a non-nullable
+    /// `FutureOr<T>` is strictly non-nullable exactly when `T` is, and an
+    /// extension type exactly when it declares interfaces. Every face the
+    /// bound-aware delegate above does not decide itself routes here, so
+    /// the union and extension-type arms live in one place (the model). A
+    /// file the index never recorded keeps the plain shape face.
+    fn declared_strict_non_nullable(&self, ty: Ty) -> bool {
+        match self.index.get(self.file) {
+            Some(elements) => elements.is_strictly_non_nullable(self.strings, ty),
+            None => ty.is_strictly_non_nullable(),
         }
     }
 

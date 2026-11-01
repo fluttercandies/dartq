@@ -347,7 +347,6 @@ void f(int? y) {
 /// [`FileElements::is_strictly_non_nullable`] — remove the `#[ignore]`
 /// with that wiring.
 #[test]
-#[ignore = "#3324 follow-up: the engine_core delegate routing (see FileElements::is_strictly_non_nullable)"]
 fn future_or_nullable_argument_spread_stays_silent() {
     let fixture = "\
 void f(FutureOr<int?> x) {

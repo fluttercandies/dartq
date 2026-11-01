@@ -1439,6 +1439,15 @@ impl<'a> Engine<'a> {
                 self.resolve_row(promotions, deferred_row, &cascade_targets);
             }
         }
+        // The `[]` argument's void face: the index expression is the
+        // operator application's argument, so a `void`-typed index uses a
+        // value (`list[x]`, `list[x] = v`) exactly as any other argument
+        // does. The receiver's own void face is the bracket-anchored face
+        // beside this one (`_reportUnresolvedIndex`,
+        // property_element_resolver.dart); this arm owns the ARGUMENT. It
+        // runs over the whole resolved set (both stacks), because the
+        // pass-2 walk drains `self.rows` into its own local.
+        self.check_index_argument_void(&rows, &deferred);
         self.recv_memo_active = false;
         self.recv_memo.borrow_mut().clear();
     }
@@ -1525,6 +1534,67 @@ impl<'a> Engine<'a> {
             RowShape::TypeUse(..) => self.resolve_type_row(row),
             RowShape::Record(fields) => self.resolve_record_row(row, fields),
             RowShape::Value => {}
+        }
+    }
+
+    /// The `[]` application's ARGUMENT void face (upstream
+    /// `checkForUseOfVoidResult`, error_detection_helpers.dart:245-258):
+    /// the index expression is the operator's argument, so its value is
+    /// consumed — `list[x]`, `list[x] = v` and `list[x] += v` all report at
+    /// the index expression when its static type is `void`. The receiver's
+    /// void face is the bracket-anchored twin beside this one
+    /// (`_reportUnresolvedIndex`, property_element_resolver.dart:181), and
+    /// the two never collide: this walk only reads rows strictly INSIDE the
+    /// bracket pair, the receiver row sits wholly before it.
+    ///
+    /// The argument is located by range, not by an operator mark: the index
+    /// expression's row keeps its own intent (`Intent::Invoke` for
+    /// `list[f()]`, `Intent::Operator` for `list[a + b]`), and
+    /// `mark_operator` tags only `Intent::Read` rows. The same by-range
+    /// fallback serves `fold_binary`'s unmarked operand. The OUTERMOST row
+    /// inside the pair is the argument's whole expression (the innermost is
+    /// its head: for `list[a.b]` that is the receiver `a`), so the walk
+    /// keeps the greatest offset.
+    fn check_index_argument_void(&mut self, rows: &[Row], deferred: &[Row]) {
+        let index_op = self.intern("[]");
+        let brackets: Vec<SourceRange> = rows
+            .iter()
+            .chain(deferred.iter())
+            .filter_map(|row| match row.intent {
+                Intent::Operator(op, bracket) if op == index_op => Some(bracket),
+                _ => None,
+            })
+            .collect();
+        for bracket in brackets {
+            let argument = rows
+                .iter()
+                .chain(deferred.iter())
+                .filter(|row| {
+                    !matches!(row.shape, RowShape::TypeUse(..))
+                        && row.range.offset > bracket.offset
+                        && row.range.end() < bracket.end()
+                })
+                .max_by_key(|row| row.range.offset)
+                .cloned();
+            let Some(argument) = argument else {
+                continue;
+            };
+            let ty = self.operand_static_ty(&argument);
+            if ty != Ty::Void {
+                continue;
+            }
+            // One report per argument: an index expression inside another
+            // index expression's argument is nested, and the enclosing
+            // bracket never contains it (the containment gate is strict).
+            if self
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "use_of_void_result" && d.range == argument.range)
+            {
+                continue;
+            }
+            self.emit_use_of_void_result(ty, &argument);
         }
     }
 
@@ -4554,7 +4624,32 @@ impl<'a> Engine<'a> {
                     match self
                         .rebound_local_receiver(row.range.offset, &recv)
                         .or_else(|| self.recv_expression_ty(read_span))
-                        .or_else(|| self.receiver_decl_shape(read_span))
+                        // A COMPLETED SEND's span is the call's RESULT
+                        // expression, never a function reference: the
+                        // `refs` entry at that offset is the bare CALLEE
+                        // identifier, and
+                        // [`Self::receiver_decl_shape`] answers its
+                        // tear-off face. `rawDyn(1).m` would then read
+                        // `rawDyn`'s function type as the receiver and
+                        // report the miss against a `Function` receiver,
+                        // where the oracle types the *result* (an
+                        // unannotated or `dynamic` callee returns
+                        // `Unknown`/`dynamic` and the access is silent).
+                        // `call_ends` records one span per completed send
+                        // (callee offset -> closing `)`), the same offset
+                        // key [`Self::invocation_span`] reads, so the gate
+                        // is exact and covers all three declaration arms
+                        // (`Decl`/`Member`/`Local`).
+                        .or_else(|| {
+                            if self
+                                .call_ends
+                                .binary_search_by_key(&read_span.offset, |(offset, _)| *offset)
+                                .is_ok()
+                            {
+                                return None;
+                            }
+                            self.receiver_decl_shape(read_span)
+                        })
                     {
                         Some(
                             face @ Ty::Named {

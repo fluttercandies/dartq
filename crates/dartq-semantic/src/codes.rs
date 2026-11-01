@@ -1356,6 +1356,17 @@ pub enum SemanticCode {
     /// (`const_constructor_param_type_mismatch`, diagnostic.g.dart:2619;
     /// `evaluation.dart` `_checkArgumentType` / the field-formal arm).
     ConstConstructorParamTypeMismatch,
+    /// `Can't define a const constructor for a class with non-final
+    /// fields.` — a const generative constructor declared in a class whose
+    /// field set (its own, its superclass chain's, and its mixins') holds a
+    /// non-final instance field with storage
+    /// (`const_constructor_with_non_final_field`, diagnostic.g.dart;
+    /// `_checkForConstConstructorWithNonFinalField`,
+    /// error_verifier.dart:4098-4112, reached from the
+    /// `ConstructorDeclaration` / `PrimaryConstructorDeclaration` visits
+    /// only when `_checkForConstConstructorWithNonConstSuper` reported
+    /// nothing).
+    ConstConstructorWithNonFinalField,
     /// `The element type '{0}' can't be assigned to the map key type
     /// '{1}'.` — a map literal entry's key whose static type is not
     /// assignable to the literal's resolved key type
@@ -2780,6 +2791,10 @@ impl SemanticCode {
                 "const_constructor_param_type_mismatch",
                 "CONST_CONSTRUCTOR_PARAM_TYPE_MISMATCH",
             ),
+            Self::ConstConstructorWithNonFinalField => (
+                "const_constructor_with_non_final_field",
+                "CONST_CONSTRUCTOR_WITH_NON_FINAL_FIELD",
+            ),
             // The registry's nullability twins share the name and the
             // machine form (the `uniqueName` split) — the base variant
             // covers both report faces.
@@ -3938,6 +3953,9 @@ impl SemanticCode {
             Self::ConstConstructorParamTypeMismatch => format!(
                 "A value of type '{a0}' can't be assigned to a parameter of type '{a1}' in a const constructor."
             ),
+            Self::ConstConstructorWithNonFinalField => {
+                "Can't define a const constructor for a class with non-final fields.".to_string()
+            }
             Self::MapKeyTypeNotAssignable => {
                 format!("The element type '{a0}' can't be assigned to the map key type '{a1}'.")
             }
@@ -4762,6 +4780,12 @@ impl SemanticCode {
             Self::ConstConstructorParamTypeMismatch => Some(
                 "Try using a subtype, or removing the keyword 'const'.".to_string(),
             ),
+            // `const_constructor_with_non_final_field`'s verbatim
+            // correctionMessage (analyzer-codes.tsv).
+            Self::ConstConstructorWithNonFinalField => Some(
+                "Try making all of the fields final, or removing the keyword 'const' from the constructor."
+                    .to_string(),
+            ),
             // The ambiguity pair's verbatim oracle correctionMessages
             // (diagnostic.g.dart:419-422 and :436-439).
             Self::AmbiguousSetOrMapLiteralEither => Some(
@@ -4929,6 +4953,7 @@ mod tests {
             SemanticCode::TypeArgumentNotMatchingBounds,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
             SemanticCode::EnumWithoutConstants,
+            SemanticCode::ConstConstructorWithNonFinalField,
             SemanticCode::InvalidAssignment,
             SemanticCode::AssignmentToFinal,
             SemanticCode::AssignmentToFinalLocal,
@@ -5797,6 +5822,9 @@ mod tests {
             | SemanticCode::AssignmentToFinal
             | SemanticCode::AssignmentToFinalLocal
             | SemanticCode::AssignmentToFinalNoSetter
+            // The #3293 const-constructor declaration face: an inline
+            // `message` arm (no `registry_message` call site).
+            | SemanticCode::ConstConstructorWithNonFinalField
             // The #2784/#2867 augmentation faces — none registry-backed (the
             // dartq-diagnostics table predates them; the inline `message`
             // arms above are the sole template source).
