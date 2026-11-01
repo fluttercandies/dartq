@@ -9839,10 +9839,14 @@ impl ParserListener for DiagnoseListener<'_> {
                             if engine.operand_static_ty(row) != Ty::Void {
                                 continue;
                             }
+                            let value = engine
+                                .invocation_span(row.range)
+                                .or_else(|| engine.property_access_span(row.range))
+                                .unwrap_or(row.range);
                             anchors.push(if index >= first_named {
-                                engine.named_field_span(row.range).unwrap_or(row.range)
+                                engine.named_field_span(value).unwrap_or(value)
                             } else {
-                                row.range
+                                value
                             });
                         }
                     }

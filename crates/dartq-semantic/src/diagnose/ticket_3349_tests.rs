@@ -15,7 +15,8 @@
 //!    :95, the map arms :127/:166);
 //! 4. the named record field's ANCHOR: the `RecordLiteralNamedField` node
 //!    (`name: value`), not its value alone (record_literal_resolver.dart
-//!    :159 `.at(field)`).
+//!    :159 `.at(field)`), and the field NODE's full extent on both shapes
+//!    (#3509 — see the residual-4 pin below).
 //!
 //! Registered through `diagnose/tests.rs`'s `#[path]` block; the module
 //! stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
@@ -148,15 +149,27 @@ fn ticket_3349_collection_literal_element_gate() {
     }
 }
 
-/// Residual 4: a named record field anchors on the whole
-/// `RecordLiteralNamedField` (`one: v` — the value's row stops at the
-/// callee name), a positional field on its expression.
+/// Residual 4: a named record field anchors on the WHOLE
+/// `RecordLiteralNamedField` — label through the value's expression end
+/// (`one: v()`, length 8, never `one: v`), a positional field on its value
+/// expression (`v()`, length 3, never the callee name token). The earlier
+/// pin here expected the value row's token span (6 / 1); the oracle
+/// (dart analyze 3.13.7) reports `(one: v(),)` at 3:12 length 8 and
+/// `(v(), 1)` at 3:12 length 3, and `record_literal_resolver.dart:159`
+/// anchors `.at(field)` — the field node, not the operand's own token.
 #[test]
 fn ticket_3349_named_record_field_anchor() {
     let named = "void v() {}\nvoid f() {\n  var r = (one: v(),);\n}";
-    let (offset, _) = span_of(named, "one");
-    assert_eq!(void_spans(&report_ops(named)), vec![(offset, 6)], "`one: v`");
+    assert_eq!(
+        void_spans(&report_ops(named)),
+        vec![span_of(named, "one: v()")],
+        "`one: v()` whole field"
+    );
 
     let positional = "void v() {}\nvoid f() {\n  var r = (v(), 1);\n}";
-    assert_eq!(sole_void(positional), callee_span(positional, "v()"));
+    assert_eq!(
+        sole_void(positional),
+        span_of(positional, "v()"),
+        "`v()` value extent"
+    );
 }

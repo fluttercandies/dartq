@@ -89,19 +89,23 @@ fn ticket_3249_index_write_void_receiver() {
     assert_single_void(&report, fixture, fixture.find("[0] =").unwrap(), 3);
 }
 
-/// A record literal's field value reports on the field node
-/// (record_literal_resolver.dart:159 `.at(field)`) — the whole
-/// `RecordLiteralNamedField` for a named field (`a: v`: the value's row
-/// stops at the callee name), the expression itself for a positional one.
+/// A record literal's field reports on the FIELD node
+/// (record_literal_resolver.dart:159 `.at(field)`) — its whole extent, not
+/// the value row's own token: a named field is the
+/// `RecordLiteralNamedField` (`a: v()` — label through the value's
+/// expression end), a positional field is the value expression itself
+/// (`v()`, never the bare callee name). The earlier pin here expected the
+/// value row's token span (`a: v`/`v`) and was two bytes short on both
+/// shapes; the oracle (dart analyze 3.13.7) is authoritative.
 #[test]
 fn ticket_3249_record_literal_field_void_value() {
     let named = "void v() {}\nvoid main() {\n  var r = (a: v());\n  print(r);\n}";
     let report = report_ops(named);
-    assert_single_void(&report, named, named.find("a: v").unwrap(), 4);
+    assert_single_void(&report, named, named.find("a: v()").unwrap(), 6);
 
     let positional = "void v() {}\nvoid main() {\n  var r = (v(), 1);\n  print(r);\n}";
     let report = report_ops(positional);
-    assert_single_void(&report, positional, positional.find("v(),").unwrap(), 1);
+    assert_single_void(&report, positional, positional.find("v(),").unwrap(), 3);
 }
 
 /// The negative control: a non-`void` receiver keeps every access face
