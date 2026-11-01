@@ -2192,6 +2192,68 @@ impl FileElements {
         self.containers.get(&name)
     }
 
+    /// `type_system.dart:1255-1274` `isStrictlyNonNullable` over the
+    /// model's `Ty` lattice — the argument-aware refinement of
+    /// [`Ty::is_strictly_non_nullable`]: a non-nullable `FutureOr<T>` is
+    /// strictly non-nullable exactly when its argument is (so
+    /// `FutureOr<int?>` is NOT — the receiver test behind
+    /// `invalid_null_aware_operator`'s spread/index/member faces), a bare
+    /// `FutureOr` reads `FutureOr<dynamic>` (nullable), and an extension
+    /// type is strictly non-nullable exactly when it declares interfaces
+    /// (`type.element is ExtensionTypeElement` → `interfaces.isNotEmpty`).
+    /// A declared container named `FutureOr` shadows the dart:async union
+    /// and takes the generic arm — the in-file declaration wins resolution
+    /// (the `switch_tracker` shadow gate's model-level twin).
+    ///
+    /// #3324: the engine's bound-aware delegate (`strictly_non_nullable`,
+    /// `diagnose/engine_core.rs`) still answers plain faces through
+    /// [`Ty::is_strictly_non_nullable`]; routing it through this helper is
+    /// a follow-up owned by the #3316 engine_core lane. The delegate's
+    /// scope-param face must stay ahead of this helper (a type parameter
+    /// named `FutureOr` decides through its written bound, never the
+    /// union arm), and a caller holding the cross-file index may consult
+    /// foreign-unit extension types — this unit-local answer takes the
+    /// generic arm for them.
+    #[must_use]
+    pub fn is_strictly_non_nullable(&self, strings: &StringTable, ty: Ty) -> bool {
+        self.strictly_non_nullable_within(strings, ty, 8)
+    }
+
+    /// [`Self::is_strictly_non_nullable`] with a recursion budget: nested
+    /// `FutureOr` chains (`FutureOr<FutureOr<S>>`) spend one unit each;
+    /// an exhausted chain answers `false`, the conservative arm (the
+    /// `switch_tracker` budget posture).
+    fn strictly_non_nullable_within(&self, strings: &StringTable, ty: Ty, depth: u8) -> bool {
+        let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = ty
+        else {
+            return ty.is_strictly_non_nullable();
+        };
+        if depth == 0 {
+            return false;
+        }
+        if strings.resolve(name) == "FutureOr" && self.container(name).is_none() {
+            return self
+                .type_args
+                .get(args)
+                .first()
+                .is_some_and(|&arg| self.strictly_non_nullable_within(strings, arg, depth - 1));
+        }
+        match self.container(name) {
+            // A non-extension-type head (class, enum, mixin, extension) is
+            // a plain interface face: strictly non-nullable once `?`-free.
+            Some(container) if container.kind != ContainerKind::ExtensionType => true,
+            // The extension-type arm: `interfaces.isNotEmpty` decides.
+            Some(container) => !container.implements_clause.is_empty(),
+            // An unindexed head (core names, foreign spellings): the plain
+            // shape face decides.
+            None => true,
+        }
+    }
+
     /// The const-creation face of the top-level const variable `name`
     /// ([`ConstCreationFace`]); `None` when the initializer is not one
     /// bare named-argument creation.
