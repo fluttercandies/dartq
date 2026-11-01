@@ -245,4 +245,5 @@ fi
 # its way into the repo — may reference never-tracked local workspace
 # material (vendored checkouts, evidence/ledger paths, home paths).
 bash "$(dirname "$0")/untracked-ref-gate.sh"
+bash "$(dirname "$0")/test-registry-gate.sh"
 echo "ci: gate passed"
