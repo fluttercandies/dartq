@@ -67,6 +67,9 @@ mod rule_states;
 pub mod uri;
 pub mod workspace;
 
+#[cfg(test)]
+mod ticket_3580_tests;
+
 use serde::Deserialize;
 
 /// The response/output contract version. Mirrors the frozen v1 contract —

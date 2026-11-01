@@ -12,7 +12,9 @@
 //!
 //! The graph build ([`crate::pipeline::build_library_graph`]) walks the
 //! live libraries' import/export targets: a resolved target outside
-//! residency whose package is outside the workspace bound seeds a BFS —
+//! residency that discovery cannot make resident — its package sits outside
+//! the workspace bound, or beneath a dot-prefixed directory discovery never
+//! descends — seeds a BFS —
 //! the target file reads from disk, runs the shared per-file pipeline
 //! ([`crate::l1::compute_unit`]: scan, one parse, element collection),
 //! and its own import/export directives resolve for the next frontier.
@@ -210,22 +212,47 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
     }
 }
 
-/// Whether `file` may join the dependency index: anything outside the
-/// analyzed workspace. The bound is the same one discovery walks — a
-/// package root at or beneath the workspace root is analyzed surface
-/// (its files enter residency through discovery, and one that did not —
-/// an options-excluded file — keeps that posture instead of silently
+/// Whether `file` may join the dependency index: anything discovery cannot
+/// make resident. The bound is the same one discovery walks — a package
+/// root at or beneath the workspace root is analyzed surface (its files
+/// enter residency through discovery, and one that did not — an
+/// options-excluded file — keeps that posture instead of silently
 /// re-entering through the dep face); a package outside the bound (the
 /// pub cache, a git checkout, an SDK-provided package, a path dependency
 /// pointing elsewhere) and a path under no package root at all index.
+///
+/// The dot-prefixed arm closes the one place the two bounds disagreed:
+/// discovery skips every dot directory, so a package root beneath one (the
+/// chunked-conformance shape's `.aux/<package>` roots — resolved into the
+/// context's `package:` map but never walked) is analyzed surface
+/// discovery can never reach. Without the index its interface never loads,
+/// and the resolution face reports the imports that DO resolve there as
+/// `uri_does_not_exist` plus an undefined-name cascade the oracle never
+/// emits (the oracle resolves such a target as a dependency library).
 fn dep_candidate(state: &EngineState, file: FileId) -> bool {
     let Some(path) = state.files.path(file) else {
         return false;
     };
     match state.packages.containing(path) {
-        Some(identity) => !identity.root.starts_with(state.packages.workspace_root()),
+        Some(identity) => {
+            !identity.root.starts_with(state.packages.workspace_root())
+                || !discovery_reaches(path, state.packages.workspace_root())
+        }
         None => true,
     }
+}
+
+/// Whether the discovery walk reaches `path` from the workspace bound: it
+/// descends no dot-prefixed directory and takes no dot-named file
+/// (`dartq-engine`'s `walk`, the oracle's `_isExcluded` dot rule), so any
+/// dot component below the bound puts the file outside the resident world.
+fn discovery_reaches(path: &Path, bound: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(bound) else {
+        return false;
+    };
+    relative
+        .components()
+        .all(|component| !component.as_os_str().to_string_lossy().starts_with('.'))
 }
 
 /// Loads one dep file: disk read, the shared per-file pipeline, directive
