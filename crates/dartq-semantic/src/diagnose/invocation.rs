@@ -1251,7 +1251,7 @@ impl<'a> Engine<'a> {
                 match recv {
                     Receiver::This { container, kind } => self.this_static_ty(container, kind),
                     Receiver::Super { .. } => Ty::UNKNOWN,
-                    Receiver::Created { name, kind } if kind != ContainerKind::Extension => {
+                    Receiver::Created { name, kind, .. } if kind != ContainerKind::Extension => {
                         Ty::named(name)
                     }
                     Receiver::Typed { ty, .. } => ty,
@@ -3058,6 +3058,9 @@ impl<'a> Engine<'a> {
                     shape: RowShape::Receiver(Receiver::Created {
                         name: class,
                         kind: ContainerKind::Class,
+                        // #3398: the creation's resolved `ty` rides along —
+                        // populated by #3394 (`ty: Some(ty)`).
+                        ty: None,
                     }),
                     intent: Intent::Read,
                     write_op: None,
@@ -3549,7 +3552,13 @@ impl<'a> Engine<'a> {
             name: head,
             range,
             qualified: false,
-            shape: RowShape::Receiver(Receiver::Created { name: head, kind }),
+            shape: RowShape::Receiver(Receiver::Created {
+                name: head,
+                kind,
+                // #3398: the creation's resolved `ty` rides along —
+                // populated by #3394 (`ty: Some(ty)`).
+                ty: None,
+            }),
             intent: Intent::Read,
             write_op: None,
             ty,
@@ -6608,7 +6617,7 @@ impl<'a> Engine<'a> {
             // (generic_inferrer.dart's upward constraint arm; a `C<int>()`
             // creation's explicit arguments live on the callee row, not
             // this receiver — under-report over a wrong binding).
-            Receiver::Created { name, kind } if kind != ContainerKind::Extension => {
+            Receiver::Created { name, kind, .. } if kind != ContainerKind::Extension => {
                 (name, kind, None)
             }
             _ => return None,
@@ -12909,7 +12918,14 @@ impl<'a> Engine<'a> {
                     name,
                     range,
                     qualified: false,
-                    shape: RowShape::Receiver(Receiver::Created { name, kind }),
+                    shape: RowShape::Receiver(Receiver::Created {
+                        name,
+                        kind,
+                        // #3398: the creation's resolved `ty` rides along —
+                        // populated by #3394 (`ty: Some(solved)` when
+                        // `solved != Ty::UNKNOWN`).
+                        ty: None,
+                    }),
                     intent: Intent::Read,
                     write_op: None,
                     ty: solved,

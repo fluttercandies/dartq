@@ -5851,7 +5851,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 // `container_kind_of` discrimination the bare arm reads
                 // decides it — a plain `extension`'s `(` keeps the unknown
                 // suppress (`Ex(1) is Ex` stays silent upstream).
-                RowShape::Receiver(Receiver::Created { name, kind }) => {
+                RowShape::Receiver(Receiver::Created { name, kind, .. }) => {
                     if *kind != ContainerKind::Extension
                         || engine.container_kind_of(*name)
                             == Some(ContainerKind::ExtensionType)
@@ -9455,7 +9455,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // types as its container — `(C())` reads `C`
                     // regardless of the argument slots.
                     match &row.shape {
-                        RowShape::Receiver(Receiver::Created { name, kind })
+                        RowShape::Receiver(Receiver::Created { name, kind, .. })
                             if *kind != ContainerKind::Extension =>
                         {
                             Ty::named(*name)

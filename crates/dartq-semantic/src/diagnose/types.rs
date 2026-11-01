@@ -426,8 +426,17 @@ pub(crate) enum Receiver {
     /// A folded creation/extension-override result (`C()`, `E('x')`): the
     /// container the send resolves against, with the instance-shaped face —
     /// superclass chains and `Object` members apply, the static-face
-    /// dispatch does not.
-    Created { name: StringId, kind: ContainerKind },
+    /// dispatch does not. `ty` is the creation's resolved instance type
+    /// (`Holder<int>(x)` carries `Holder<int>`): when populated it
+    /// instantiates the member face the way a declaration-typed receiver's
+    /// written type does, so `member_formals_full` substitutes the
+    /// container parameters the member's formals spell (#3398). `None`
+    /// keeps the pre-#3398 under-report — the unsubstituted declared table.
+    Created {
+        name: StringId,
+        kind: ContainerKind,
+        ty: Option<Ty>,
+    },
     /// Unknown type — checks are skipped (under-report).
     Unknown,
 }

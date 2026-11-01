@@ -6776,6 +6776,7 @@ impl<'a> Engine<'a> {
         if let RowShape::Receiver(Receiver::Created {
             name,
             kind: ContainerKind::Class,
+            ..
         }) = row.shape
         {
             // The creation's INSTANCE type, never the bare head (#3063):

@@ -1462,7 +1462,7 @@ impl<'a> Engine<'a> {
             // name-level only: `check_arguments` stages and renders formal
             // types against it, and those renders stay single-pool because
             // the walks below route every find through the boundary.
-            Receiver::Created { name, .. } => (name, false, None),
+            Receiver::Created { name, ty, .. } => (name, false, ty),
             Receiver::Container {
                 name: container, ..
             } => {

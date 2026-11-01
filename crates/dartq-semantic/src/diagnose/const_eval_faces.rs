@@ -1769,6 +1769,7 @@ impl<'a> Engine<'a> {
                         RowShape::Receiver(Receiver::Created {
                             name,
                             kind: ContainerKind::Class,
+                            ..
                         })
                         | RowShape::Bare(BareInfo::Container {
                             name,

@@ -3063,7 +3063,7 @@ impl<'a> Engine<'a> {
                 RowShape::Member { .. } if row.intent != Intent::Invoke => {
                     self.accessor_read_ty(row)
                 }
-                RowShape::Receiver(Receiver::Created { name, kind })
+                RowShape::Receiver(Receiver::Created { name, kind, .. })
                     if *kind != ContainerKind::Extension =>
                 {
                     self.instantiated_head_ty(Ty::named(*name))
@@ -4798,7 +4798,7 @@ impl<'a> Engine<'a> {
             self.fn_sig_ty(&sig)
         } else {
             match &row.shape {
-                RowShape::Receiver(Receiver::Created { name, kind })
+                RowShape::Receiver(Receiver::Created { name, kind, .. })
                     if *kind != ContainerKind::Extension =>
                 {
                     // The expression's static type is the instantiated head:

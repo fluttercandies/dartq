@@ -1895,7 +1895,7 @@ impl<'a> Engine<'a> {
             // A folded creation/extension-override receiver (`C() + 1`,
             // `E(1) * 2`): the operator resolves against the container's
             // member face — extensions report their dedicated operator row.
-            Receiver::Created { name, kind } => {
+            Receiver::Created { name, kind, .. } => {
                 let Intent::Operator(_, op_range) = row.intent else {
                     return;
                 };
@@ -4870,7 +4870,7 @@ impl<'a> Engine<'a> {
             // instance face (superclass walk, `Object` members); an
             // extension override resolves against the extension's members —
             // its `on` type's `Object` face is the under-report.
-            Receiver::Created { name, kind } => {
+            Receiver::Created { name, kind, .. } => {
                 if kind == ContainerKind::Extension {
                     if self.members.object_members.contains(&row.name)
                         || row.name == self.intern("==")
@@ -7479,7 +7479,7 @@ impl<'a> Engine<'a> {
             // never the bare fold-sentinel head. An inferred creation has
             // no written entry and keeps the row's own face.
             None => match &row.shape {
-                RowShape::Receiver(Receiver::Created { name, kind })
+                RowShape::Receiver(Receiver::Created { name, kind, .. })
                     if *kind != ContainerKind::Extension =>
                 {
                     self.creation_row_ty(*name, false, row.range.offset)
