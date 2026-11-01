@@ -8286,6 +8286,130 @@ impl<'a> Engine<'a> {
                             }
                         }
                     }
+                } else {
+                    // The constant wrote no type-argument group (`v2(20)`
+                    // over `enum E<T>`): upstream infers the enum's
+                    // instantiation at the constant's implicit
+                    // `InstanceCreationExpression` — `GenericInferrer`
+                    // solves each parameter upward from the argument
+                    // expressions, and the unsolved slots instantiate to
+                    // bounds — so `v2` checks `20` against `int`, never
+                    // the declared `T` leaf. The same
+                    // `infer_gather`/`infer_choose_param` pipeline the
+                    // invocation inference runs, context-free (a constant
+                    // carries no downward context), with the origin table
+                    // kept empty — no `couldNotInfer` face rides an enum
+                    // constant's own solve upstream.
+                    let params: Vec<(StringId, Option<Ty>)> = container
+                        .type_param_names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            let bound = container
+                                .type_param_bounds
+                                .get(index)
+                                .copied()
+                                .filter(|bound| *bound != Ty::Dynamic)
+                                .map(|bound| self.boundary.ty(owner, bound));
+                            (*name, bound)
+                        })
+                        .collect();
+                    let mut constraints: Vec<Vec<InferConstraint>> =
+                        vec![Vec::new(); params.len()];
+                    let no_fixed = vec![false; params.len()];
+                    // The gather table carries no param-named bounds: the
+                    // `P <: T` bound gate in `infer_gather` closes a bound
+                    // spelling another parameter (`T extends U`) to the
+                    // covariant `Object?`, whose verdict against the
+                    // argument is undecidable in this model and drops the
+                    // constraint the oracle keeps (`q(0)` over
+                    // `P<T extends U, U extends num>` still lowers `int`
+                    // into `T`, and the extends-clause merge at choose
+                    // time propagates `int <: U` onward). A concrete bound
+                    // (`U extends num`) keeps its gate — `z('s')` under
+                    // `T extends num` still refuses `String`'s lower.
+                    let gather_params: Vec<(StringId, Option<Ty>)> = params
+                        .iter()
+                        .map(|(param, bound)| {
+                            let bound = bound.filter(|ty| {
+                                !matches!(
+                                    ty,
+                                    Ty::Named { name, args, .. }
+                                        if *args == ArgListId::EMPTY
+                                            && params.iter().any(|(p, _)| p == name)
+                                )
+                            });
+                            (*param, bound)
+                        })
+                        .collect();
+                    let mut positional_index = 0usize;
+                    for (name, ty, ..) in &level.args {
+                        let formal = if let Some(n) = name {
+                            self.named_formal_for(&formals, *n)
+                        } else {
+                            let formal = formals.positional.get(positional_index);
+                            positional_index += 1;
+                            formal
+                        };
+                        let Some(formal) = formal else {
+                            continue;
+                        };
+                        let mut raw = Vec::new();
+                        let gathered =
+                            self.infer_gather(*ty, formal.ty, &gather_params, false, &mut raw);
+                        if gathered {
+                            self.infer_merge_round(
+                                &params,
+                                &raw,
+                                0,
+                                &mut constraints,
+                                &no_fixed,
+                            );
+                        }
+                    }
+                    let mut inferred: Vec<Ty> = Vec::with_capacity(params.len());
+                    let mut origins: Vec<InferOrigin> = Vec::new();
+                    for index in 0..params.len() {
+                        let (lower, upper) = self.infer_squash(&constraints[index]);
+                        let chosen = self.infer_choose_param(
+                            &params,
+                            index,
+                            lower,
+                            upper,
+                            &inferred,
+                            &mut constraints,
+                            &mut origins,
+                            false,
+                        );
+                        inferred.push(chosen);
+                    }
+                    let map: Vec<(StringId, Ty)> = params
+                        .iter()
+                        .zip(inferred.iter())
+                        .map(|((param, bound), ty)| {
+                            // The `instantiateToBounds` fallback: an
+                            // unsolved parameter reads its declared bound
+                            // (`v2` under `T extends num` still checks
+                            // against `num`), an unbounded one stays its
+                            // own spelling — the same `effective` table
+                            // the send path builds.
+                            let ty = if self.infer_known(*ty) {
+                                *ty
+                            } else {
+                                bound.unwrap_or_else(|| Ty::named(*param))
+                            };
+                            (*param, ty)
+                        })
+                        .collect();
+                    for formal in formals
+                        .positional
+                        .iter_mut()
+                        .chain(formals.named.iter_mut())
+                    {
+                        if let Some(substituted) = self.subst_params(formal.ty, &map) {
+                            formal.ty = substituted;
+                        }
+                    }
                 }
             }
             Some((formals, container.has_const_constructor))
@@ -11584,6 +11708,45 @@ impl<'a> Engine<'a> {
             // `fnVar<String>(x)` over `T Function<T extends num>(T)` is
             // the function-expression-invocation verdict.
             decl_bounds = Some(sig.params.iter().copied().map(TypeArgBound::from).collect());
+        }
+        // The function-RHS alias's own signature parameters (#3584): a
+        // callee typed by `typedef Foo = int Function<T>(T x)` — a field
+        // `Foo f`, a `Foo`-returning send `bar()`, or a `Foo`-typed local —
+        // spells the RHS's `T` in its formals, and `alias_fn_sig`'s sig
+        // carries no params (the alias's OWN parameters are bound by the
+        // written use, never inference variables). The invocation solves
+        // the RHS's own `<T>` like any generic send's — `f<String>(x)`
+        // fixes `T := String`, `f(x)` infers it upward — and the solved
+        // slot substitutes the formal leaf before the argument verdict
+        // asks (upstream's `FunctionTypeAliasElement.instantiate`). The
+        // head is the callee row's written type — a bare `Foo` spelling —
+        // and the bounds verdict table is the RHS's own declared bounds
+        // (`checkFunctionExpressionInvocation` reads the instantiated
+        // signature's parameters, upstream Dart SDK source,
+        // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
+        // :193-196).
+        if exec_params.is_none()
+            && sig_from_row.is_some()
+            && let Ty::Named {
+                name,
+                nullable: false,
+                args,
+            } = row.ty
+            && args == ArgListId::EMPTY
+            && let Some((_, rhs_params, ..)) = self.bounds.alias_fn_shape(name)
+            && !rhs_params.is_empty()
+        {
+            let params: Vec<(StringId, Option<Ty>)> = rhs_params
+                .iter()
+                .map(|(param, bound, _)| {
+                    (
+                        *param,
+                        bound.as_ref().map(|tree| self.tree_ty(tree)),
+                    )
+                })
+                .collect();
+            decl_bounds = Some(params.iter().copied().map(TypeArgBound::from).collect());
+            exec_params = Some(params.into());
         }
         // A function-typed value invoked with explicit type arguments
         // (`fn<String>(x)` over `fn: T Function<T extends num>(T)`, or a
