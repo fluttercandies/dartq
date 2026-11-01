@@ -1,8 +1,9 @@
 #!/bin/sh
 # The test-registry gate: every `#[path]` / `mod NAME;` registration in the
-# workspace must resolve to a file that exists, test-kind targets must
-# declare at least one `#[test]`, tracked registries must not reference
-# untracked files, and no registration may silently disappear from HEAD.
+# workspace must resolve to a file that exists, every `*_tests.rs` file must
+# be mounted by a registration, test-kind targets must declare at least one
+# `#[test]`, tracked registries must not reference untracked files, and no
+# registration may silently disappear from HEAD.
 #
 # Failure history this guards: ticket-file registrations dropped four times
 # in one session, and HEAD once referenced four `#[path]` modules whose
@@ -26,6 +27,16 @@
 #   removed    a `mod NAME` in HEAD's copy of a registry is gone from the
 #              worktree copy — silent coverage loss (`--allow-remove`
 #              exempts one name; additions never fail)
+#   unmounted  a `*_tests.rs` file exists on disk but nothing in the worktree
+#              mounts it — no `mod NAME;` by that name, and no `#[path]`
+#              target resolving to it. The module never compiles and its
+#              tests never run, and nothing else in the tree notices. This
+#              is the exact inverse of `missing`: `missing` catches a
+#              registration whose file is gone, `unmounted` catches a file
+#              whose registration is gone. Eight parallel lanes appending to
+#              one registry tail dropped twelve registrations that way.
+#              `--allow-unmounted` (or KNOWN_UNMOUNTED below) exempts a
+#              deliberately unmounted rig.
 #
 # Discovery is by grep over crates/ — no crate names are hardcoded, so new
 # crates are covered automatically. Inline `mod NAME { ... }` bodies need
@@ -34,10 +45,13 @@
 # Usage:
 #   scripts/test-registry-gate.sh [--allow-remove <name>]...
 #                                  [--allow-empty <name>]...
+#                                  [--allow-unmounted <name>]...
 #   --allow-remove <name>     accept one disappeared registration by mod name
 #   --allow-empty <name>      accept a zero-#[test] target that is a known
 #                             helper rig, by mod or file name. Two rigs are
 #                             exempted in the script itself (see KNOWN_RIGS).
+#   --allow-unmounted <name>  accept a `*_tests.rs` module nothing mounts, by
+#                             mod or file name (see KNOWN_UNMOUNTED).
 #
 # Runs in about a second: grep + awk + git ls-files/show, no cargo.
 # Exit codes: 0 pass · 1 registry violations · 2 usage/environment.
@@ -49,6 +63,7 @@ TAB=$(printf '\t')
 
 ALLOW_REMOVE=""
 ALLOW_EMPTY=""
+ALLOW_UNMOUNTED=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --allow-remove)
@@ -65,7 +80,14 @@ $2"; shift 2 ;;
         --allow-empty=*)
             ALLOW_EMPTY="$ALLOW_EMPTY
 ${1#--allow-empty=}"; shift ;;
-        -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+        --allow-unmounted)
+            [ $# -ge 2 ] || { echo "error: --allow-unmounted needs a name" >&2; exit 2; }
+            ALLOW_UNMOUNTED="$ALLOW_UNMOUNTED
+$2"; shift 2 ;;
+        --allow-unmounted=*)
+            ALLOW_UNMOUNTED="$ALLOW_UNMOUNTED
+${1#--allow-unmounted=}"; shift ;;
+        -h|--help) sed -n '2,/^set /p' "$0" | sed '$d'; exit 0 ;;
         *) echo "error: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -88,6 +110,13 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
 KNOWN_RIGS="test_rig
 ticket_2568_tests
 ticket_2568_tests.rs"
+
+# Known `*_tests.rs` modules that are deliberately mounted by nobody, exempt
+# from the `unmounted` class by construction (each entry states why the
+# absence of a `mod` is the intended state, not a dropped registration):
+#   (empty) — every `*_tests.rs` file in the worktree is expected to be
+#             mounted; add `<stem> <file name>` here only with a reason.
+KNOWN_UNMOUNTED=""
 
 # --- discover registry files ----------------------------------------------
 # A file is a registry when it contains a `#[path]` attribute or a
@@ -369,6 +398,49 @@ git ls-files -co --exclude-standard -- 'crates/*.rs' \
 comm -23 "$TMPD/head_mods.txt" "$TMPD/wt_mods.txt" > "$TMPD/gone_mods.txt"
 comm -13 "$TMPD/head_mods.txt" "$TMPD/wt_mods.txt" > "$TMPD/new_mods.txt"
 
+# --- missing registration: a *_tests.rs module nobody mounts ---------------
+# The inverse of `missing`. A test module file on disk that no `mod NAME;`
+# in the worktree declares (and that no `#[path]` target resolves to) never
+# compiles, so its tests never run — a failure with no other symptom, which
+# is why it survived eight parallel lanes and a manual ledger cross-check.
+# Mount is matched by stem: `mod NAME;` anywhere in crates/, or any
+# registration `#[path]` whose basename is `NAME.rs`. Ticket stems are
+# globally unique in this repo, so a name match is a real mount. Only files
+# under a crate's `src/` tree count: a `*_tests.rs` under `tests/` is an
+# integration target Cargo discovers on its own and needs no `mod`.
+git ls-files -co --exclude-standard -- 'crates/*_tests.rs' \
+    | grep '/src/' | sort -u > "$TMPD/test_files.txt"
+sed 's#^.*/##; s#\.rs$##' "$TMPD/test_files.txt" | sort -u > "$TMPD/test_stems.txt"
+{
+    cat "$TMPD/wt_mods.txt"
+    awk -F'\t' '$4 != "-" && $4 != "" { print $4 }' "$TMPD/regs.tsv" \
+        | sed 's#^.*/##; s#\.rs$##'
+} | sort -u > "$TMPD/mounted_stems.txt"
+comm -23 "$TMPD/test_stems.txt" "$TMPD/mounted_stems.txt" > "$TMPD/unmounted_stems.txt"
+
+# Join the unmounted stems back to their file paths, then split off the
+# exemptions (KNOWN_UNMOUNTED + --allow-unmounted, by stem or file name).
+awk -F'\t' -v OFS='\t' '
+    NR == FNR { off[$1] = 1; next }
+    {
+        stem = $1; sub(/^.*\//, "", stem); sub(/\.rs$/, "", stem)
+        if (stem in off) print $1, stem
+    }
+' "$TMPD/unmounted_stems.txt" "$TMPD/test_files.txt" > "$TMPD/unmounted_all.tsv"
+printf '%s\n%s\n' "$KNOWN_UNMOUNTED" "$ALLOW_UNMOUNTED" | sed '/^$/d' \
+    | sort -u > "$TMPD/allow_unmounted.txt"
+: > "$TMPD/unmounted.tsv"
+: > "$TMPD/unmounted_allowed.txt"
+awk -F'\t' -v allow="$TMPD/allow_unmounted.txt" \
+    -v allowed="$TMPD/unmounted_allowed.txt" -v denied="$TMPD/unmounted.tsv" '
+    BEGIN { while ((getline l < allow) > 0) ok[l] = 1; close(allow) }
+    {
+        file = $1; stem = $2
+        if ((stem in ok) || (file in ok)) printf "  allowed  %s\n", file > allowed
+        else print file "\t" stem > denied
+    }
+' "$TMPD/unmounted_all.tsv"
+
 # --- report -----------------------------------------------------------------
 crate_of() { printf '%s\n' "$1" | cut -d/ -f2; }
 report_tsv() {
@@ -405,6 +477,16 @@ if [ -s "$TMPD/new_mods.txt" ]; then
     newc=$(wc -l < "$TMPD/new_mods.txt" | tr -d ' ')
     echo "new registrations since HEAD: $newc (additions are not failures)"
 fi
+if [ -s "$TMPD/unmounted.tsv" ]; then
+    echo "missing registration (a *_tests.rs module exists but nothing mounts it):"
+    while IFS="$TAB" read -r file stem; do
+        printf '  %-58s %s\n' "$stem" "$file"
+    done < "$TMPD/unmounted.tsv"
+fi
+if [ -s "$TMPD/unmounted_allowed.txt" ]; then
+    echo "deliberately unmounted (exempt by KNOWN_UNMOUNTED/--allow-unmounted):"
+    cat "$TMPD/unmounted_allowed.txt"
+fi
 
 echo ""
 echo "=== test registry coverage ==="
@@ -421,13 +503,16 @@ missing=$( [ -f "$TMPD/miss.tsv" ]   && wc -l < "$TMPD/miss.tsv"   | tr -d ' ' |
 empty=$(   [ -f "$TMPD/empty.tsv" ]  && wc -l < "$TMPD/empty.tsv"  | tr -d ' ' || echo 0)
 broken=$(  [ -f "$TMPD/broken.tsv" ] && wc -l < "$TMPD/broken.tsv" | tr -d ' ' || echo 0)
 removed=$( [ -f "$TMPD/denied.txt" ] && wc -l < "$TMPD/denied.txt" | tr -d ' ' || echo 0)
+unmounted=$( [ -f "$TMPD/unmounted.tsv" ] && wc -l < "$TMPD/unmounted.tsv" | tr -d ' ' || echo 0)
 
 echo ""
-if [ "$missing" -eq 0 ] && [ "$empty" -eq 0 ] && [ "$broken" -eq 0 ] && [ "$removed" -eq 0 ]; then
+if [ "$missing" -eq 0 ] && [ "$empty" -eq 0 ] && [ "$broken" -eq 0 ] \
+    && [ "$removed" -eq 0 ] && [ "$unmounted" -eq 0 ]; then
     total_regs=$(wc -l < "$TMPD/table.tsv" 2>/dev/null | tr -d ' ' || echo 0)
     total_tests=$(awk -F'\t' '{s+=$4} END {print s+0}' "$TMPD/table.tsv" 2>/dev/null || echo 0)
     echo "test-registry gate: PASS ($total_regs registrations, $total_tests tests)"
     exit 0
 fi
-echo "test-registry gate: FAIL -- missing=$missing empty=$empty broken-at-head=$broken removed=$removed"
+echo "test-registry gate: FAIL -- missing=$missing empty=$empty broken-at-head=$broken" \
+    "removed=$removed unmounted=$unmounted"
 exit 1
