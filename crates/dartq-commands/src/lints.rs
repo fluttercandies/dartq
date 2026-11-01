@@ -231,8 +231,9 @@ pub(crate) const SEMANTIC_SCAN_CONFIG: dartq_scanner::ScanConfig = dartq_scanner
 };
 
 /// The semantic fold's parse posture: the lints bridge's fixed production
-/// surface (bridge `PARSE_FEATURES`, Dart 3.15), for the same
-/// span-consistency reason as [`SEMANTIC_SCAN_CONFIG`].
+/// surface (bridge `PARSE_FEATURES`, Dart 3.15 — every version-gated face
+/// shipped), for the same span-consistency reason as
+/// [`SEMANTIC_SCAN_CONFIG`]. Field for field the bridge constant's mirror.
 pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
     patterns_enabled: true,
     variance_enabled: false,
@@ -242,6 +243,11 @@ pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
     dot_shorthands_enabled: true,
     anonymous_methods_enabled: false,
     sound_flow_analysis: true,
+    records_enabled: true,
+    class_modifiers_enabled: true,
+    sealed_class_enabled: true,
+    digit_separators_enabled: true,
+    triple_shift_enabled: true,
 };
 
 const _: () = assert!(

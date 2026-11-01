@@ -111,8 +111,12 @@ pub(crate) fn scan_tokens(source: &str, file: dartq_source::FileId) -> TokenTabl
     scan(source, SCAN_CONFIG, file).tokens
 }
 
-/// Production parse posture: Dart 3.15 — patterns (3.0) and primary
-/// constructors (3.13) shipped, variance and enhanced parts unshipped.
+/// Production parse posture: Dart 3.15 — patterns (3.0), primary
+/// constructors (3.13), dot shorthands (3.10) shipped, variance and
+/// enhanced parts unshipped; the version-gated faces (records /
+/// class-modifiers / sealed-class 3.0, digit-separators 3.6,
+/// triple-shift 2.14 — the parser half of the scanner's
+/// [`SCAN_CONFIG`] gate) are all shipped at 3.15.
 const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     patterns_enabled: true,
     variance_enabled: false,
@@ -122,6 +126,11 @@ const PARSE_FEATURES: ParserFeatures = ParserFeatures {
     dot_shorthands_enabled: true,
     anonymous_methods_enabled: false,
     sound_flow_analysis: true,
+    records_enabled: true,
+    class_modifiers_enabled: true,
+    sealed_class_enabled: true,
+    digit_separators_enabled: true,
+    triple_shift_enabled: true,
 };
 
 /// Parses `source` once (scanner → parser → arena) and yields the transient
