@@ -19978,3 +19978,17 @@ mod ticket_3423_tests;
 #[cfg(test)]
 #[path = "ticket_3433_tests.rs"]
 mod ticket_3433_tests;
+
+// The #3443 pins (the undefined-ARGUMENT is-face rides the lattice): an
+// `is`-tested spelling whose head is a registered container but whose
+// written argument tree names an undefined id is the oracle's
+// `InterfaceType` carrying `InvalidType` at that position — subtype.dart's
+// 0c arm answers the argument's subtype questions vacuously in both
+// directions, so `List<int> is List<Missing>` deads the else exactly like
+// the pinned 3.13.7 oracle while `List<int> is List<String>` folds
+// nothing. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3443_tests.rs"]
+mod ticket_3443_tests;

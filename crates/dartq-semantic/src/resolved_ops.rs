@@ -2832,12 +2832,6 @@ pub struct ResolvedTypeOps<'a> {
     /// (`is_subtype`, `factor`, `try_promote_to`) carry no `names`
     /// slice, so this set is the only overload face they can read.
     overload_ids: RefCell<FxHashSet<u32>>,
-    /// Flow-layer name ids whose spelling resolves nowhere — the oracle's
-    /// undefined-name face (`type_test_with_undefined_name`), extended
-    /// beside the `name_ty` cache in `observe_names` where the lexeme is
-    /// already interned. `tested_arg_undefined` consults this set
-    /// instead of re-interning each probe's spelling (#2487 F6).
-    undefined_ids: RefCell<FxHashSet<u32>>,
     /// `TypeDeclId` → memoized "sealed or enum" answer — the
     /// `is_always_exhaustive` per-decl verdict, stable across the
     /// corpus's switch-end probes.
@@ -2922,7 +2916,6 @@ impl<'a> ResolvedTypeOps<'a> {
             name_ty: RefCell::new(Vec::new()),
             local_fn_shapes: RefCell::new(FxHashMap::default()),
             overload_ids: RefCell::new(FxHashSet::default()),
-            undefined_ids: RefCell::new(FxHashSet::default()),
             closed: RefCell::new(FxHashMap::default()),
             opaque: RefCell::new(FxHashMap::default()),
             decl_names: RefCell::new(None),
@@ -3109,20 +3102,6 @@ impl<'a> ResolvedTypeOps<'a> {
             }
             let name = self.strings.intern(lexeme);
             let scoped = self.scoped_param(name);
-            // The undefined-name face (`tested_arg_undefined`'s verdict,
-            // #2450): not a kind spelling, not a scoped type parameter,
-            // not a resolved-but-unmodeled name, and absent from the
-            // registry. Cached id-keyed beside `overload_ids` so the
-            // is-check guards never re-intern (#2487 F6).
-            if scoped.is_none()
-                && !matches!(&**lexeme, "FutureOr" | "Null" | "Never")
-                && !self.snapshot.non_containers.contains(&name)
-                && !self.snapshot.registry.contains_key(&name)
-            {
-                self.undefined_ids
-                    .borrow_mut()
-                    .insert((start + offset) as u32);
-            }
             let pair = if let Some(param) = scoped {
                 (
                     self.snapshot
@@ -4675,10 +4654,11 @@ impl<'a> ResolvedTypeOps<'a> {
     /// test-false arm deads) and `is_subtype(_, Invalid)` is vacuously
     /// `true` (the non-reference operand folds to the succeed literal),
     /// while the promotion gate refuses the step (mutual subtypes). The
-    /// undefined ARGUMENT face is the one that folds nothing: `x is
+    /// undefined ARGUMENT face rides the same lattice: `x is
     /// Box<Missing>` is the official's `Box<InvalidType>`, still an
-    /// interface, and the gates veto it
-    /// ([`Self::tested_arg_undefined`]).
+    /// interface, whose argument positions answer through the 0c arm at
+    /// every depth — `int <: Invalid` vacuously holds, so the instantiated
+    /// relations fold exactly as the oracle's (#3443).
     fn map_tested(
         &self,
         ty: FlowTy,
@@ -4721,76 +4701,6 @@ impl<'a> ResolvedTypeOps<'a> {
             },
             ty.nullable,
         )
-    }
-
-    /// Whether the is-check's tested spelling is the oracle's
-    /// parameterized-invalid face: the head resolves to a registered
-    /// container while an argument spelling resolves nowhere
-    /// (`x is Box<Missing>`). The official builds `Box<InvalidType>` for
-    /// that spelling — still an `InterfaceType`, so no subtype question
-    /// bottoms and the test folds NOTHING — and dartq's mapping keeps the
-    /// same shape (the `Invalid` sits inside the `Interface`), so the
-    /// gates veto the face instead of letting a mapping that degraded to
-    /// the whole-face `Invalid` (an arity veto, the #2636 fuel trip) fold
-    /// a branch the oracle keeps live.
-    ///
-    /// A head that resolves NOWHERE (`x is Missing`) is not this face:
-    /// that spelling IS the whole-face `InvalidType`, whose relations are
-    /// vacuously true (subtype.dart's 0c arm), so the folds answer it
-    /// (#2490 supersedes #2450's bail reading). The id-keyed
-    /// `undefined_ids` set `observe_names` extends beside the `name_ty`
-    /// cache decides both halves (#2487 F6 — the probe never re-interns:
-    /// the same resolution chain [`Self::map_name`] walks already ran
-    /// inside the scan). A type parameter, the `FutureOr` pseudo type, a
-    /// registered container, the `Null`/`Never` kind spellings, or a
-    /// resolved-but-unmodeled (`non_containers`) name all resolve;
-    /// anything else is the undefined spelling the official's
-    /// `named_type_resolver.dart` reports `type_test_with_undefined_name`
-    /// on.
-    fn tested_arg_undefined(
-        &self,
-        ty: FlowTy,
-        args: u32,
-        arena: &[Vec<ArgTy>],
-        names: &[Box<str>],
-    ) -> bool {
-        let Base::Name(id) = ty.base else {
-            return false;
-        };
-        // The run-start `observe_names` already classified every lexeme
-        // interned before the replay; this top-up covers only the ids a
-        // mid-replay probe appended (a no-op bounds check in the common
-        // case), then the set answers by id — the same face
-        // `id_overloaded` reads for the overload guard.
-        self.observe_names(names);
-        if self.undefined_ids.borrow().contains(&id) {
-            return false;
-        }
-        let Some(lexeme) = names.get(id as usize) else {
-            return false;
-        };
-        let name = self.strings.intern(lexeme);
-        if !self.snapshot.registry.contains_key(&name)
-            || self.snapshot.non_containers.contains(&name)
-        {
-            return false;
-        }
-        self.args_undefined(args, arena, 8)
-    }
-
-    /// [`Self::tested_arg_undefined`]'s argument walk: whether any node of
-    /// the written-argument tree names an undefined spelling. Bounded at
-    /// eight hops like the other structural walks — a self-referencing
-    /// arena (the recorder-bug class) must not recurse here.
-    fn args_undefined(&self, args: u32, arena: &[Vec<ArgTy>], depth: u32) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        let row = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
-        row.iter().any(|node| {
-            matches!(node.base, Base::Name(id) if self.undefined_ids.borrow().contains(&id))
-                || self.args_undefined(node.args, arena, depth - 1)
-        })
     }
 
     /// The declaration arm of `isAlwaysExhaustive`
@@ -5150,12 +5060,16 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// cannot resolve IS the oracle's `InvalidType` — a name the scopes
     /// do resolve (`non_containers`) maps opaque instead
     /// ([`ResolvedTypeOps::opaque_decl`]), keeping the remainder live
-    /// like the oracle's resolved class. The tested side's arity veto
-    /// recovers instead ([`Self::map_tested`]) — the official's
-    /// `Response<InvalidType>` keeps the test decidable. A fuel trip
-    /// anywhere inside (#2636) keeps `from` whole — a tripped mapping's
-    /// vacuous 0c arm must not bottom the remainder and dead a branch
-    /// the oracle keeps live.
+    /// like the oracle's resolved class. The undefined-argument face
+    /// folds the same way (#3443): `x is Box<Missing>` is the official's
+    /// `Box<InvalidType>` — an interface whose argument positions answer
+    /// through the 0c arm, so `Box<int> is Box<Missing>` deads the else
+    /// while `Base is Box<Missing>` keeps both arms. The tested side's
+    /// arity veto recovers instead ([`Self::map_tested`]) — the
+    /// official's `Response<InvalidType>` keeps the test decidable. A
+    /// fuel trip anywhere inside (#2636) keeps `from` whole — a tripped
+    /// mapping's vacuous 0c arm must not bottom the remainder and dead a
+    /// branch the oracle keeps live.
     fn factor_typed(
         &self,
         from: FlowTy,
@@ -5165,13 +5079,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> FlowTy {
-        // An undefined tested ARGUMENT contributes no remainder fact
-        // ([`Self::tested_arg_undefined`]): the official's checked type is
-        // `Box<InvalidType>` — still an interface, so nothing bottoms and
-        // both branches stay live.
-        if self.tested_arg_undefined(what, what_args, arena, names) {
-            return from;
-        }
         // A lossy-overload head factors name-level
         // ([`Self::head_overloaded`]) — the resolved remainder would
         // bottom over `Invalid`'s vacuous subtype arm and dead a branch
@@ -5199,11 +5106,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// verdict, so the resolved face reports exactly what the analyzer
     /// reports for a name it cannot resolve (`x is Missing` folds its
     /// non-reference operand to the succeed literal). The undefined
-    /// ARGUMENT face is vetoed instead ([`Self::tested_arg_undefined`]):
-    /// `Box<InvalidType>` has real relations and folds nothing. The
-    /// tested side's arity veto recovers ([`Self::map_tested`]) — the
-    /// official's `Response<InvalidType>` keeps the question decidable
-    /// (#2370).
+    /// ARGUMENT face rides the same lattice (#3443): `Box<Missing>` is
+    /// the official's `Box<InvalidType>` — an interface whose argument
+    /// positions answer through the 0c arm at every depth, so
+    /// `Box<int> is Box<Missing>` folds while `Base is Box<Missing>`
+    /// stays live. The tested side's arity veto recovers
+    /// ([`Self::map_tested`]) — the official's `Response<InvalidType>`
+    /// keeps the question decidable (#2370).
     fn is_subtype_typed(
         &self,
         left: FlowTy,
@@ -5214,15 +5123,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         names: &[Box<str>],
     ) -> bool {
         let mark = self.work_mark();
-        // The undefined tested ARGUMENT keeps the guaranteed-succeed face
-        // silent ([`Self::tested_arg_undefined`]): the official's checked
-        // type is `Box<InvalidType>`, whose relations run over an
-        // interface — nothing folds. A head that resolves nowhere is not
-        // this face: its `Invalid` answers vacuously true below.
-        if self.tested_arg_undefined(right, right_args, arena, names) {
-            return false;
-        }
-
         // A lossy-overload head answers name-level
         // ([`Self::head_overloaded`]) — the resolved verdict would ride
         // the wrong class half the time, and its `Invalid` face would
@@ -5267,17 +5167,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> Option<FlowTy> {
-        // No promotion rides an undefined tested ARGUMENT
-        // ([`Self::tested_arg_undefined`]): its checked type is an
-        // interface the strict gate below already answers. A head that
-        // resolves nowhere is refused by that gate too — `Invalid` is a
-        // mutual subtype of everything (subtype.dart's 0c arm), so
-        // `isValidPromotionStep` takes the `from <: to` arm and no step
-        // stands.
-        if self.tested_arg_undefined(to, to_args, arena, names) {
-            return None;
-        }
-
         // A lossy-overload head promotes name-level
         // ([`Self::head_overloaded`]) — the resolved strict gate would
         // consult the wrong class half the time, forcing or refusing
