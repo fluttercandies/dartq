@@ -8757,6 +8757,7 @@ fn overridden_member_context_degrades_on_a_missing_span() {
         is_abstract: false,
         is_external: false,
         is_final: false,
+        covariant: false,
         type_params: 0,
         type_param_names: Box::new([]),
         type_param_bounds: Box::default(),
@@ -18464,3 +18465,52 @@ mod ticket_3341_tests;
 #[cfg(test)]
 #[path = "ticket_3355_tests.rs"]
 mod ticket_3355_tests;
+
+// The #3368 pins (the `invalid_assignment`/`argument_type_not_assignable`
+// foreign-alias residual): the folded-pair function-shape read inside
+// `Engine::assignable` (a foreign function-RHS typedef unfolds through
+// `fold_alias_verdict` into `Ty::Function`, `type_params_named` bounds
+// substituted) and the callable-class → `Function` arm's instantiated
+// `call` face. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3368_tests.rs"]
+mod ticket_3368_tests;
+
+// The #3369 pins (the extension override's receiver anchors): the `void`
+// receiver's `use_of_void_result` at the whole receiver expression (`f()`
+// for `E(f()).g`, `c.bad` for a member read, the plain identifier's own
+// span), the not-assignable sibling's same anchor, and the non-void
+// negative. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3369_tests.rs"]
+mod ticket_3369_tests;
+
+// The #3370 pins (the `undefined_*` residuals the recon cluster map routes
+// to `diagnose/augmentations.rs` and `diagnose/pattern_scope.rs`): two
+// green guards lock the pattern-scope state a C10 fix must preserve (an
+// if-case binder read across a nested collection if-element, and inside
+// its own `when` guard); three `#[ignore]`d pins carry the oracle
+// behaviour, the exact repro and the owning file for the clusters neither
+// file can reach (if-case ELEMENT close, augment member merge, wildcard
+// declarations). Registered here via `#[path]`; the module stays inside
+// the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3370_tests.rs"]
+mod ticket_3370_tests;
+
+// The #3372 pins (the `clause_arg_ty` typedef-alias arm): a typedef head in
+// a written parameter bound expands through `typedef_shapes` — the shape
+// substituted by the written arguments (or the to-bounds defaults for a raw
+// use), the use-site `?` composed on top — so the parameter's `facts` bound
+// is the real right-hand side rather than the unmodelled face, and the
+// type-variable bound rule decides with it. Covers the function-type bound
+// feeding `bound(X) <: B`, the raw head's defaults, both `?` compositions,
+// the registered-head regression (`List<num>` keeps the registry arm), and
+// the self-referential alias that registers no shape. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3372_tests.rs"]
+mod ticket_3372_tests;
