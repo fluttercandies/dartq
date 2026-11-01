@@ -1455,10 +1455,84 @@ pub fn fold_unit_with_ops<'t>(
                         range.length = close.utf16_offset + close.byte_len - range.offset;
                     }
                 } else {
-                    // A marker row's `;` spill: `n?.p = i` rows `p = i`,
-                    // never `p = i;` (the statement's terminator is not
-                    // part of the dead NODE the official reports).
-                    if mid_expression_anchor
+                    // A marker row's `;` spill: the statement terminator
+                    // belongs to the row only when the dead region's
+                    // covering node IS the statement — `a.foo;` on a
+                    // `Never` receiver reports `foo;` whole
+                    // (`flowEnd(expressionStatement)`), `a.clamp(b, c)` on
+                    // a `Never` argument reports `c);` the same way. It is
+                    // trimmed when the covering node is smaller: an
+                    // assignment reports its RHS end (`n?.p = i` → `p = i`,
+                    // `flowEnd(assignment)`), a collection literal reports
+                    // its `]`/`}` (`var x = [1, 2, g(), 4];` → `4]`,
+                    // `flowEnd(listLiteral)`), a null-aware index its `]`
+                    // (`n?[i]` → `i]`). The token shape decides: a
+                    // depth-0 `=`/`??=`/compound-assign inside the run
+                    // marks the assignment node; a `]`/`}` immediately
+                    // before the `;` marks a literal closer; `)` and bare
+                    // tails keep the `;` (a call/member chain's tail is
+                    // the statement's own extent).
+                    let marker_assignment = mid_expression_anchor && {
+                        let mut depth = 0i32;
+                        tokens.as_slice().iter().any(|t| {
+                            if t.is_synthetic()
+                                || t.utf16_offset < range.offset
+                                || t.utf16_offset >= range.end()
+                            {
+                                return false;
+                            }
+                            let hit = depth == 0
+                                && matches!(
+                                    t.kind,
+                                    dartq_scanner::TokenKind::Eq
+                                        | dartq_scanner::TokenKind::QuestionQuestionEq
+                                        | dartq_scanner::TokenKind::PlusEq
+                                        | dartq_scanner::TokenKind::MinusEq
+                                        | dartq_scanner::TokenKind::StarEq
+                                        | dartq_scanner::TokenKind::SlashEq
+                                        | dartq_scanner::TokenKind::TildeSlashEq
+                                        | dartq_scanner::TokenKind::PercentEq
+                                        | dartq_scanner::TokenKind::AmpersandEq
+                                        | dartq_scanner::TokenKind::BarEq
+                                        | dartq_scanner::TokenKind::CaretEq
+                                        | dartq_scanner::TokenKind::LtLtEq
+                                        | dartq_scanner::TokenKind::GtGtEq
+                                        | dartq_scanner::TokenKind::GtGtGtEq
+                                        | dartq_scanner::TokenKind::IndexEq
+                                );
+                            depth += group_depth_step(t.kind);
+                            hit
+                        })
+                    };
+                    // The `]`/`}` immediately before a trailing `;` marks
+                    // the dead run's covering node as the LITERAL (a
+                    // sub-expression whose statement keeps its own `;`) —
+                    // but only when the group sits in sub-expression
+                    // position: `[1, 2, g(), 4];` clamps to `4]` (the `[`'s
+                    // `=` predecessor), `n?[i];` to `i]` (the `?`), while
+                    // `=> [for (...) ...[throw '', 2]];` keeps `2]];` (the
+                    // `=>` body IS the statement's extent).
+                    let literal_tail = mid_expression_anchor
+                        && tokens
+                            .as_slice()
+                            .iter()
+                            .position(|t| {
+                                !t.is_synthetic()
+                                    && t.kind == dartq_scanner::TokenKind::Semicolon
+                                    && t.utf16_offset + t.byte_len == range.end()
+                            })
+                            .and_then(|semi_idx| {
+                                let slice = tokens.as_slice();
+                                (semi_idx > 0
+                                    && matches!(
+                                        slice[semi_idx - 1].kind,
+                                        dartq_scanner::TokenKind::CloseSquare
+                                            | dartq_scanner::TokenKind::CloseCurly
+                                    ))
+                                .then(|| closer_is_subexpression(slice, semi_idx - 1))
+                            })
+                            .unwrap_or(false);
+                    if (marker_assignment || literal_tail)
                         && tokens.as_slice().iter().any(|t| {
                             !t.is_synthetic()
                                 && t.kind == dartq_scanner::TokenKind::Semicolon
@@ -1521,7 +1595,37 @@ pub fn fold_unit_with_ops<'t>(
                             )
                             && t.utf16_offset + t.byte_len == range.end()
                     });
+                    // The `;` rides only when the trailing closer ends the
+                    // dead NODE itself — a `}`/`]` closing the dead
+                    // statement's own extent (`=> [for (...) ...[throw '',
+                    // 2]];` rows `2]];`, the arrow body's `;` inside the
+                    // dead region). A closer ending a SUB-EXPRESSION whose
+                    // statement still completes excludes it: a var
+                    // initializer's literal (`var x = [1, 2, g(), 4];`
+                    // rows `4]` — the `;` is the declaration's, not the
+                    // literal's) and a null-aware index (`n?[i]` rows
+                    // `i]` — `]` is the IndexExpression's own end).
+                    let subexpression_tail = ends_with_closer && {
+                        let slice = tokens.as_slice();
+                        // The trailing closer (its end is range.end()) and
+                        // its matching opener.
+                        slice
+                            .iter()
+                            .rposition(|t| {
+                                !t.is_synthetic()
+                                    && matches!(
+                                        t.kind,
+                                        dartq_scanner::TokenKind::CloseSquare
+                                            | dartq_scanner::TokenKind::CloseCurly
+                                    )
+                                    && t.utf16_offset + t.byte_len == range.end()
+                            })
+                            .is_some_and(|close_idx| {
+                                closer_is_subexpression(slice, close_idx)
+                            })
+                    };
                     if ends_with_closer
+                        && !subexpression_tail
                         && let Some(semi) = tokens.as_slice().iter().find(|t| {
                             !t.is_synthetic()
                                 && t.kind == dartq_scanner::TokenKind::Semicolon
@@ -2140,9 +2244,13 @@ pub fn fold_unit_with_ops<'t>(
             // The same decide gate `teardown_covering` applies: a matched
             // spelling refines the verdict only when it differs from the
             // baseline AND the world can decide it — anything else keeps
-            // the parse-time verdict verbatim.
+            // the parse-time verdict verbatim. An unresolved flow row
+            // (`Ty::Unknown`) refines nothing: it folds to the nullable top,
+            // which answers over a space the program never had and renders
+            // the type as the empty text.
             let matched_decides = matched.is_some_and(|ty| {
-                ty != baseline
+                ty != Ty::Unknown
+                    && ty != baseline
                     && match NameTy::from_semantic(ty) {
                         NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
                             world.is_known_head(name)
@@ -2229,9 +2337,8 @@ pub fn fold_unit_with_ops<'t>(
                 }
                 _ => false,
             };
-            let must_be_exhaustive = !private_foreign_enum
-                && ((ctx.is_expression && expression_face_decides)
-                    || is_always_exhaustive(&world, value));
+            let must_be_exhaustive = (ctx.is_expression && expression_face_decides)
+                || is_always_exhaustive(&world, value);
             // The covering row: owned by the covering deferral when it
             // staged one (#2538 — the pending re-decides the same matched
             // type), re-decided here otherwise.
@@ -2254,13 +2361,13 @@ pub fn fold_unit_with_ops<'t>(
                     } else {
                         SemanticCode::NonExhaustiveSwitchStatement
                     };
-                    covering_row = Some(Diagnostic::new(
-                        code.severity(),
-                        code.code_info(),
-                        code.message3(&ty_text, &unmatched, &suggested),
-                        file,
+                    covering_row = Some(engine.covering_row(
+                        code,
                         ctx.switch_kw,
-                        code.correction_message(&suggested),
+                        &ty_text,
+                        &unmatched,
+                        &suggested,
+                        private_foreign_enum,
                     ));
                 }
             } else if must_be_exhaustive && let Some(default_at) = ctx.default_kw {
@@ -2455,6 +2562,14 @@ pub fn fold_unit_with_ops<'t>(
         lib,
     );
     report.diagnostics = merge_source_ordered(report.diagnostics, dead_cases);
+    // The #3465 verdict-dead-branch synthesis runs on the same joined
+    // list: an `unnecessary_type_check`/`unnecessary_null_comparison` row
+    // IS the oracle's constant verdict — where the flow's own fold cannot
+    // reach it (typedef operand, catch parameter, `this`-property), the
+    // dead arm's `dead_code` row still owes. The walk decides from the
+    // row's own message polarity and the token table alone.
+    let dead_arms = synthesize_verdict_dead_branches(&report.diagnostics, tokens, file);
+    report.diagnostics = merge_source_ordered(report.diagnostics, dead_arms);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // A top-level setter duplicates under its `name=` lookup spelling and
@@ -5027,6 +5142,399 @@ fn switch_clause_absorber(
         }
     }
     None
+}
+
+/// Synthesizes the `dead_code` rows the oracle's `checkUnreachableNode`
+/// owes on branches a semantic-verdict row proves dead but the flow's own
+/// `cond_split`/`if_branch_folded` machinery never folded (#3465).
+///
+/// Upstream (`dead_code_verifier.dart:183-189`) walks top-down and latches
+/// the FIRST unreachable node — a constant-condition `if`'s dead arm rows
+/// its own extent: a `{`-block arm reports the whole block (`checkBlock`
+/// latches the block itself, so `flowEnd(block)` spans `{`..`}`), a
+/// statement arm reports `stmt.firstToken.offset..stmt.end`. dartq's flow
+/// reaches the same rows only when the expression's `bool_value`/
+/// `proven_bool` folds — a `typedef`-spelled operand (`topx is! fx`), a
+/// catch-parameter read (`s is! StackTrace` — the catch's names declare no
+/// flow variable), or a promoted-`this`-property test (`nullProperty ==
+/// null`) leaves the branch's `Expr::branches` empty where the oracle's
+/// type-system verdict already answered the condition. The semantic layer
+/// DOES emit the verdict (`unnecessary_type_check`,
+/// `unnecessary_null_comparison`), so the branch's truth is known — the
+/// dead arm's own `dead_code` row is the missing half.
+///
+/// The walk reads each verdict row's own message polarity (the
+/// `UnnecessaryTypeCheck*`/`UnnecessaryNullComparison*` variants share one
+/// `CodeInfo::name` — the message's `'true'`/`'false'` IS the condition's
+/// folded value, the only signal at `Diagnostic` granularity):
+/// `'true'` → the else arm dead; `'false'` → the then arm dead. The
+/// emission walks tokens only: the verdict's offset locates the enclosing
+/// `if (` group by backward depth-scan, the `(`-group's `matching_end`
+/// locates the `)`, and the arm's extent follows — `{`-block arm reports
+/// `{`..matching `}` (matching_end), statement arm reports its first token
+/// through the depth-0 `;`. An `else if` chain's dead arm is the nested
+/// `if` statement's own extent (`else` next-heads `if` — the `if` IS the
+/// else arm's statement).
+///
+/// A row whose verdict-site sits inside a non-`if` condition (`while`,
+/// `?:`, `for`-cond, `do-while`) is out of this walk's decision space and
+/// bails — the oracle's `flowEnd` shape differs there (the `while` arm's
+/// `while`-part trim, the `?:` arm's own extent) and a wrong-shape row is
+/// worse than a missing one. A dangling-else clause (`if (a) if (b) s;
+/// else t;`) likewise bails — the token walk cannot attribute the `else`.
+/// A dead arm already carrying a `dead_code` row at its anchor never
+/// doubles — the flow's own dead window owns the offset when it folded
+/// the branch itself.
+fn synthesize_verdict_dead_branches(
+    diagnostics: &[Diagnostic],
+    tokens: &TokenTable,
+    file: FileId,
+) -> Vec<Diagnostic> {
+    use dartq_scanner::{Keyword, TokenKind};
+    let dead_code = SemanticCode::DeadCode;
+    let dead_name = dead_code.code_info().name;
+    let anchored: FxHashSet<u32> = diagnostics
+        .iter()
+        .filter(|d| d.code.name == dead_name)
+        .map(|d| d.range.offset)
+        .collect();
+    let verdict_names: [&str; 2] = ["unnecessary_type_check", "unnecessary_null_comparison"];
+    let slice = tokens.as_slice();
+    let mut rows: Vec<Diagnostic> = Vec::new();
+    for d in diagnostics {
+        if !verdict_names.contains(&d.code.name) {
+            continue;
+        }
+        // The verdict's polarity: `'true'` kills the else arm, `'false'`
+        // the then arm. (`type_check_with_null`'s style rows carry no
+        // constant — they never appear in `verdict_names`.)
+        let else_dead = d.message.contains("always 'true'");
+        let then_dead = d.message.contains("always 'false'");
+        if else_dead == then_dead {
+            continue;
+        }
+        // The token index carrying the verdict's offset.
+        let head = slice.partition_point(|t| t.utf16_offset < d.range.offset);
+        // Backward depth-scan for the IMMEDIATE enclosing `(` — the
+        // verdict must sit at the `if (`'s own top level (a nested
+        // parenthesized operand's `(` prev fails the `if` check and bails
+        // conservatively; `&&`/`||` composition changes the verdict's
+        // reach, which this walk does not model).
+        let mut depth = 0i32;
+        let mut open = None;
+        let mut i = head;
+        while i > 0 {
+            i -= 1;
+            depth += match slice[i].kind {
+                TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => 1,
+                TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => -1,
+                _ => 0,
+            };
+            if depth < 0 {
+                if slice[i].kind == TokenKind::OpenParen
+                    && slice
+                        .get(i.wrapping_sub(1))
+                        .is_some_and(|t| t.kind == TokenKind::Keyword(Keyword::If))
+                {
+                    open = Some(i);
+                }
+                break;
+            }
+        }
+        let Some(open) = open else { continue };
+        let Some(close) = tokens.matching_end(open) else {
+            continue;
+        };
+        // The verdict must decide the condition alone — a `&&`/`||`/
+        // `?`/`:`/prefix-`!`/`(`-opener at the `(`-group's own level
+        // composes the verdict into an expression the folded value no
+        // longer reaches (`a && x == null`'s `a` side stays live;
+        // `x == null ? a : b` is the `?:`'s own domain). Only a
+        // `(`-group whose interior carries no such operator lets the
+        // folded value reach the branch split unattenuated. (`is!`'s
+        // own `!` is the type test's spelling, not a composition —
+        // the `!` whose prev is `is` is filtered out here.)
+        let mut depth = 0i32;
+        let mut composed = false;
+        for (j, t) in slice.iter().enumerate().take(close).skip(open + 1) {
+            depth += group_depth_step(t.kind);
+            if depth != 0 {
+                continue;
+            }
+            let is_bang_of_is = t.kind == TokenKind::Bang
+                && slice
+                    .get(j.wrapping_sub(1))
+                    .is_some_and(|p| p.kind == TokenKind::Keyword(Keyword::Is));
+            if !is_bang_of_is
+                && matches!(
+                    t.kind,
+                    TokenKind::AmpersandAmpersand
+                        | TokenKind::BarBar
+                        | TokenKind::Question
+                        | TokenKind::Colon
+                        | TokenKind::Bang
+                        | TokenKind::OpenParen
+                )
+            {
+                composed = true;
+                break;
+            }
+        }
+        if composed {
+            continue;
+        }
+        if else_dead {
+            // The then arm's end locates `else`: a `{` block ends at its
+            // match, a statement arm at the depth-0 `;` after `close`.
+            let then_first = close + 1;
+            let then_end = if slice
+                .get(then_first)
+                .is_some_and(|t| t.kind == TokenKind::OpenCurly)
+            {
+                tokens.matching_end(then_first)
+            } else if slice
+                .get(then_first)
+                .is_some_and(|t| t.kind == TokenKind::Keyword(Keyword::If))
+            {
+                // `if (a) if (b) x; else y;` — the `else` binds to the
+                // inner `if` and token depth cannot separate it; bail
+                // rather than attribute the arm to the wrong `if`.
+                None
+            } else {
+                // Statement arm: its end is the depth-0 `;` at the group's
+                // own level.
+                let mut depth = 0i32;
+                let mut end = None;
+                for (j, t) in slice.iter().enumerate().skip(then_first) {
+                    depth += group_depth_step(t.kind);
+                    if depth == 0 && t.kind == TokenKind::Semicolon {
+                        end = Some(j);
+                        break;
+                    }
+                    if depth < 0 {
+                        break;
+                    }
+                }
+                end
+            };
+            let Some(then_end) = then_end else { continue };
+            if slice
+                .get(then_end + 1)
+                .is_none_or(|t| t.kind != TokenKind::Keyword(Keyword::Else))
+            {
+                continue;
+            }
+            // The else arm's first token: `else if`'s `if`, `else {`'s
+            // `{`, else the arm's statement head.
+            let arm_first = then_end + 2;
+            let Some(arm) = slice.get(arm_first) else {
+                continue;
+            };
+            let (arm_offset, arm_end) = if arm.kind == TokenKind::OpenCurly {
+                match tokens.matching_end(arm_first) {
+                    Some(m) => (arm.utf16_offset, slice[m].utf16_offset + slice[m].byte_len),
+                    None => continue,
+                }
+            } else if arm.kind == TokenKind::Keyword(Keyword::If) {
+                // `else if`'s dead arm is the nested `if` statement's own
+                // extent — the oracle rows the whole statement (`else` +
+                // nested if + its own else-tail).
+                let Some(nested_end) = if_stmt_end(slice, tokens, arm_first) else {
+                    continue;
+                };
+                (arm.utf16_offset, nested_end)
+            } else {
+                // A bare statement arm: first token through its `;`.
+                let Some(end) = statement_semi_end(slice, arm_first) else {
+                    continue;
+                };
+                (arm.utf16_offset, end)
+            };
+            if anchored.contains(&arm_offset) {
+                continue;
+            }
+            rows.push(Diagnostic::new(
+                dead_code.severity(),
+                dead_code.code_info(),
+                dead_code.message("", ""),
+                file,
+                SourceRange {
+                    offset: arm_offset,
+                    length: arm_end.saturating_sub(arm_offset),
+                },
+                dead_code.correction_message(""),
+            ));
+        } else {
+            // then_dead: the arm's first token follows `close`'s `)`.
+            let arm_first = close + 1;
+            let Some(arm) = slice.get(arm_first) else {
+                continue;
+            };
+            let (arm_offset, arm_end) = if arm.kind == TokenKind::OpenCurly {
+                match tokens.matching_end(arm_first) {
+                    Some(m) => (arm.utf16_offset, slice[m].utf16_offset + slice[m].byte_len),
+                    None => continue,
+                }
+            } else {
+                let Some(end) = statement_semi_end(slice, arm_first) else {
+                    continue;
+                };
+                (arm.utf16_offset, end)
+            };
+            if anchored.contains(&arm_offset) {
+                continue;
+            }
+            rows.push(Diagnostic::new(
+                dead_code.severity(),
+                dead_code.code_info(),
+                dead_code.message("", ""),
+                file,
+                SourceRange {
+                    offset: arm_offset,
+                    length: arm_end.saturating_sub(arm_offset),
+                },
+                dead_code.correction_message(""),
+            ));
+        }
+    }
+    rows
+}
+
+/// The end offset of a bare statement beginning at `first` — its depth-0
+/// `;`'s end — or `None` when no `;` terminates it within a sane bound
+/// (a `}` crossing means the statement was something else — an `if`/`for`
+/// — whose extent this walk does not answer).
+fn statement_semi_end(slice: &[dartq_scanner::Token], first: usize) -> Option<u32> {
+    use dartq_scanner::TokenKind;
+    let mut depth = 0i32;
+    for (j, t) in slice.iter().enumerate().skip(first) {
+        depth += group_depth_step(t.kind);
+        if depth == 0 && t.kind == TokenKind::Semicolon {
+            return Some(t.utf16_offset + t.byte_len);
+        }
+        if depth < 0 || j > first + 400 {
+            return None;
+        }
+    }
+    None
+}
+
+/// The end offset of an `if` statement starting at `if_idx` (the `if`
+/// keyword's token index) — the statement's own extent including its
+/// whole `else if`/`else` tail. The walk iterates clause ends: each
+/// clause is `{`→matching `}`, else a statement's depth-0 `;`; a
+/// following `else` either chains a nested `if` (recurse one loop) or
+/// rows its own clause end as the statement's last. `None` on any
+/// clause the token shape cannot terminate.
+fn if_stmt_end(
+    slice: &[dartq_scanner::Token],
+    tokens: &TokenTable,
+    if_idx: usize,
+) -> Option<u32> {
+    use dartq_scanner::{Keyword, TokenKind};
+    let mut idx = if_idx;
+    // Each loop answers one `if (cond) <then> [else <tail>]` — a chained
+    // `else if` just moves `idx` to the nested `if` and repeats; the
+    // statement ends where the final clause does.
+    for _ in 0..64 {
+        let open = idx + 1;
+        if slice.get(open)?.kind != TokenKind::OpenParen {
+            return None;
+        }
+        let close = tokens.matching_end(open)?;
+        // The then clause's extent — `{`-block by match, statement by
+        // `;`. (An unbraced `if` then-clause is a dangling-else shape
+        // the token walk cannot attribute — bail rather than misrow.)
+        let first = close + 1;
+        let t = slice.get(first)?;
+        let (end_off, end_idx) = if t.kind == TokenKind::OpenCurly {
+            let m = tokens.matching_end(first)?;
+            (slice[m].utf16_offset + slice[m].byte_len, m)
+        } else if t.kind == TokenKind::Keyword(Keyword::If) {
+            // Dangling-else ambiguity — the `else` binds to the inner
+            // `if` and token depth cannot separate it. Conservatively
+            // bail: a wrong row is worse than a missing one.
+            return None;
+        } else {
+            // The statement clause: find its depth-0 `;` token index.
+            let mut depth = 0i32;
+            let mut semi = None;
+            for (j, s) in slice.iter().enumerate().skip(first) {
+                depth += group_depth_step(s.kind);
+                if depth == 0 && s.kind == TokenKind::Semicolon {
+                    semi = Some(j);
+                    break;
+                }
+                if depth < 0 || j > first + 400 {
+                    break;
+                }
+            }
+            let j = semi?;
+            (slice[j].utf16_offset + slice[j].byte_len, j)
+        };
+        // An `else` tail: `else if` recurses the loop, else the else's
+        // own clause end is the statement's end.
+        let after = slice.get(end_idx + 1)?;
+        if after.kind != TokenKind::Keyword(Keyword::Else) {
+            return Some(end_off);
+        }
+        let tail = slice.get(end_idx + 2)?;
+        if tail.kind == TokenKind::Keyword(Keyword::If) {
+            idx = end_idx + 2;
+            continue;
+        }
+        // The else clause's end — `{`-block or statement `;`.
+        return if tail.kind == TokenKind::OpenCurly {
+            tokens
+                .matching_end(end_idx + 2)
+                .map(|m| slice[m].utf16_offset + slice[m].byte_len)
+        } else {
+            statement_semi_end(slice, end_idx + 2)
+        };
+    }
+    None
+}
+
+/// Whether the `]`/`}` at `close_idx` opens a group sitting in
+/// SUB-EXPRESSION position — the group's covering node ends at the
+/// closer, not at a statement `;` beyond it. The discriminator is the
+/// opener's predecessor: `=` / `(` / `[` / `{` / `,` / `:` / `?` / `??` /
+/// `return` mean the group rides inside a larger construct (an
+/// initializer, an index access, an argument); `=>`, a spread head, or a
+/// statement head mean the group IS the construct's own extent.
+fn closer_is_subexpression(
+    slice: &[dartq_scanner::Token],
+    close_idx: usize,
+) -> bool {
+    use dartq_scanner::TokenKind;
+    let mut depth = 0i32;
+    let mut open_idx = None;
+    for (j, t) in slice.iter().enumerate().take(close_idx).rev() {
+        depth += match t.kind {
+            TokenKind::CloseSquare | TokenKind::CloseCurly => 1,
+            TokenKind::OpenSquare | TokenKind::OpenCurly => -1,
+            _ => 0,
+        };
+        if depth < 0 {
+            open_idx = Some(j);
+            break;
+        }
+    }
+    open_idx.is_some_and(|j| {
+        j > 0
+            && matches!(
+                slice[j - 1].kind,
+                TokenKind::Eq
+                    | TokenKind::Question
+                    | TokenKind::QuestionQuestion
+                    | TokenKind::OpenParen
+                    | TokenKind::OpenSquare
+                    | TokenKind::OpenCurly
+                    | TokenKind::Comma
+                    | TokenKind::Colon
+                    | TokenKind::Keyword(dartq_scanner::Keyword::Return)
+            )
+    })
 }
 
 /// The forward group-depth step: openers descend a level, closers climb
