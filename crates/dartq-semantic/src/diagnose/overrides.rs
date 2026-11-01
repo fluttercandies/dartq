@@ -6100,6 +6100,22 @@ impl<'a> Engine<'a> {
     /// set of mutually valid overrides answers the merged signature rather
     /// than the first one. An empty survivor set — the conflict arm —
     /// answers `None`, the caller's `dynamic`.
+    ///
+    /// Every arm answers the INSTANTIATED read: the oracle's combined
+    /// super signature is the interface map's, whose members are already
+    /// substituted by the edge arguments (`Substitution.fromInterfaceType`),
+    /// and an implicit declared slot infers from THAT read
+    /// (`instance_member_inferrer.dart`). Answering the declaring hop's own
+    /// parameter spellings instead leaks them into the inferred type —
+    /// `class A<E> { E foo() => 0; }` with `class B<T> extends A<T> {
+    /// foo() => 0; }` inferred `E` against the comparison's substituted `T`
+    /// and fabricated a break on every such one-face chain (the SDK faces
+    /// read the same way: a `Future<X>` member's `X` inferred against the
+    /// edge's written argument). An undecidable
+    /// environment keeps the unsubstituted read — the same suppression
+    /// posture the multi-candidate arm takes, and the alignment that
+    /// matters: the inference and the subtype pass below now read the SAME
+    /// entry, so they can never disagree about one face's signature.
     fn combined_inherited(
         &self,
         container: StringId,
@@ -6107,7 +6123,11 @@ impl<'a> Engine<'a> {
         facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
     ) -> Option<MemberEntry> {
         if candidates.len() <= 1 {
-            return candidates.first().map(|hit| hit.entry().clone());
+            let hit = candidates.first()?;
+            return Some(
+                self.substituted_signature(hit, container, facts)
+                    .unwrap_or_else(|| hit.entry().clone()),
+            );
         }
         let merged = {
             let refs: Vec<&FaceHit<'a>> = candidates.iter().collect();
