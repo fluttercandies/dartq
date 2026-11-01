@@ -856,6 +856,39 @@ pub enum SemanticCode {
     /// [`SemanticCode::UnnecessaryNullCheckPattern`]
     /// (shared_type_analyzer.dart:129-133).
     UnnecessaryNullAssertPattern,
+    // —— #3519: the pattern-scope rule cluster (all `COMPILE_TIME_ERROR`) —
+    /// `The matched value of type '{0}' isn't assignable to the required
+    /// type '{1}'.` — an irrefutable pattern's matched type fails the
+    /// required-type assignability (`patternTypeMismatchInIrrefutableContext`,
+    /// shared_type_analyzer.dart:158-166).
+    PatternTypeMismatchInIrrefutableContext,
+    /// `The relational pattern expression must be a constant.` — a
+    /// relational pattern's operand expression is not a compile-time
+    /// constant (`nonConstantRelationalPatternExpression`,
+    /// constant_verifier.dart `visitRelationalPattern`).
+    NonConstantRelationalPatternExpression,
+    /// `Pattern variables can't be assigned inside the guard of the
+    /// enclosing guarded pattern.` — an unqualified write to a pattern
+    /// variable inside its own `when` clause (`isVisitingWhenClause`,
+    /// scope_analyzer.dart `_recordUnqualifiedWrite`).
+    PatternVariableAssignmentInsideGuard,
+    /// `Local variable '{0}' can't be referenced before it is declared.` —
+    /// a pattern variable referenced inside the relational operand of the
+    /// pattern that declares it (`referencedBeforeDeclaration`,
+    /// `_hiddenElements` face, error_verifier.dart).
+    ReferencedBeforeDeclaration,
+    /// `The variable '{0}' doesn't have the same type and/or finality in all
+    /// cases that share this body.` — shared-case-scope uniqueName
+    /// `pattern_variable_shared_case_scope_different_finality_or_type`.
+    PatternVariableSharedCaseScopeDifferentFinalityOrType,
+    /// `The variable '{0}' is not available because there is a label or
+    /// 'default' case.` — shared-case-scope uniqueName
+    /// `pattern_variable_shared_case_scope_has_label`.
+    PatternVariableSharedCaseScopeHasLabel,
+    /// `The variable '{0}' is available in some, but not all cases that
+    /// share this body.` — shared-case-scope uniqueName
+    /// `pattern_variable_shared_case_scope_not_all_cases`.
+    PatternVariableSharedCaseScopeNotAllCases,
     // —— #480: the analyzer language-strictness family (all `STATIC_WARNING`) ——
     /// `The generic type '{0}' should have explicit type arguments but
     /// doesn't.` — the `strict-raw-types` mode's raw-type row
@@ -2436,6 +2469,32 @@ impl SemanticCode {
                 "unnecessary_null_assert_pattern",
                 "UNNECESSARY_NULL_ASSERT_PATTERN",
             ),
+            // The #3519 pattern-scope rules: three share one registry name
+            // with their own uniqueNames (the shared-case-scope family);
+            // the rest map one-to-one (diagnostic.g.dart :12589, :13848,
+            // :13865, :13900-13957, :14784).
+            Self::PatternTypeMismatchInIrrefutableContext => (
+                "pattern_type_mismatch_in_irrefutable_context",
+                "PATTERN_TYPE_MISMATCH_IN_IRREFUTABLE_CONTEXT",
+            ),
+            Self::NonConstantRelationalPatternExpression => (
+                "non_constant_relational_pattern_expression",
+                "NON_CONSTANT_RELATIONAL_PATTERN_EXPRESSION",
+            ),
+            Self::PatternVariableAssignmentInsideGuard => (
+                "pattern_variable_assignment_inside_guard",
+                "PATTERN_VARIABLE_ASSIGNMENT_INSIDE_GUARD",
+            ),
+            Self::ReferencedBeforeDeclaration => (
+                "referenced_before_declaration",
+                "REFERENCED_BEFORE_DECLARATION",
+            ),
+            Self::PatternVariableSharedCaseScopeDifferentFinalityOrType
+            | Self::PatternVariableSharedCaseScopeHasLabel
+            | Self::PatternVariableSharedCaseScopeNotAllCases => (
+                "invalid_pattern_variable_in_shared_case_scope",
+                "INVALID_PATTERN_VARIABLE_IN_SHARED_CASE_SCOPE",
+            ),
             // The #480 language-strictness rows: the `strict-raw-types` and
             // `strict-inference` modes' diagnostics, verbatim from the
             // registry (`strictRawType` :15793-15806,
@@ -3355,6 +3414,41 @@ impl SemanticCode {
             Self::UnnecessaryNullAssertPattern => {
                 "The null-assert pattern will have no effect because the matched type isn't nullable."
                     .to_string()
+            }
+            // The #3519 pattern-scope rules, verbatim (diagnostic.g.dart
+            // :12589-12599, :13848-13861, :13865-13876, :13900-13957,
+            // :14784-14796).
+            Self::PatternTypeMismatchInIrrefutableContext => {
+                format!(
+                    "The matched value of type '{a0}' isn't assignable to the required type '{a1}'."
+                )
+            }
+            Self::NonConstantRelationalPatternExpression => {
+                "The relational pattern expression must be a constant.".to_string()
+            }
+            Self::PatternVariableAssignmentInsideGuard => {
+                "Pattern variables can't be assigned inside the guard of the enclosing guarded pattern."
+                    .to_string()
+            }
+            Self::ReferencedBeforeDeclaration => {
+                format!(
+                    "Local variable '{a0}' can't be referenced before it is declared."
+                )
+            }
+            Self::PatternVariableSharedCaseScopeDifferentFinalityOrType => {
+                format!(
+                    "The variable '{a0}' doesn't have the same type and/or finality in all cases that share this body."
+                )
+            }
+            Self::PatternVariableSharedCaseScopeHasLabel => {
+                format!(
+                    "The variable '{a0}' is not available because there is a label or 'default' case."
+                )
+            }
+            Self::PatternVariableSharedCaseScopeNotAllCases => {
+                format!(
+                    "The variable '{a0}' is available in some, but not all cases that share this body."
+                )
             }
             // The #480 language-strictness rows, verbatim
             // (diagnostic.g.dart:15800-15801 and :8104).
@@ -4748,6 +4842,32 @@ impl SemanticCode {
             Self::UnnecessaryNullAssertPattern => Some(
                 "Try replacing the null-assert pattern with its nested pattern.".to_string(),
             ),
+            // The #3519 pattern-scope rows' verbatim oracle corrections
+            // (diagnostic.g.dart :12595, :13855-13857, :13872-13873,
+            // :13909-13911/:13930-13932/:13951-13953, :14791-14793).
+            Self::PatternTypeMismatchInIrrefutableContext => Some(
+                "Try changing the required type of the pattern, or the matched value type."
+                    .to_string(),
+            ),
+            Self::NonConstantRelationalPatternExpression => {
+                Some("Try using a constant instead.".to_string())
+            }
+            Self::PatternVariableAssignmentInsideGuard => {
+                Some("Try assigning to a different variable.".to_string())
+            }
+            Self::ReferencedBeforeDeclaration => Some(
+                "Try moving the declaration to before the first use, or renaming the local variable so that it doesn't hide a name from an enclosing scope."
+                    .to_string(),
+            ),
+            Self::PatternVariableSharedCaseScopeDifferentFinalityOrType
+            | Self::PatternVariableSharedCaseScopeNotAllCases => Some(
+                "Try declaring the variable pattern with the same type and finality in all cases."
+                    .to_string(),
+            ),
+            Self::PatternVariableSharedCaseScopeHasLabel => Some(
+                "Try removing the label, or providing the 'default' case with its own body."
+                    .to_string(),
+            ),
             // The #480 language-strictness rows' corrections, verbatim
             // (diagnostic.g.dart:15802 and :8105); `{a2}` carries the same
             // name the problem message renders.
@@ -5354,6 +5474,14 @@ mod tests {
             SemanticCode::UnnecessaryCastPattern,
             SemanticCode::UnnecessaryNullCheckPattern,
             SemanticCode::UnnecessaryNullAssertPattern,
+            // The #3519 pattern-scope rule cluster.
+            SemanticCode::PatternTypeMismatchInIrrefutableContext,
+            SemanticCode::NonConstantRelationalPatternExpression,
+            SemanticCode::PatternVariableAssignmentInsideGuard,
+            SemanticCode::ReferencedBeforeDeclaration,
+            SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType,
+            SemanticCode::PatternVariableSharedCaseScopeHasLabel,
+            SemanticCode::PatternVariableSharedCaseScopeNotAllCases,
             // The #480 strict-mode rows, the #612 variance family, and the
             // #702 @sealed contract.
             SemanticCode::StrictRawType,
@@ -6288,6 +6416,16 @@ mod tests {
             | SemanticCode::OverrideOnNonOverridingMethod
             | SemanticCode::OverrideOnNonOverridingSetter
             | SemanticCode::PatternNeverMatchesValueType
+            // The #3519 pattern-scope rows: none registry-backed (the
+            // dartq-diagnostics table predates them; the inline `message`
+            // arms are the sole template source).
+            | SemanticCode::PatternTypeMismatchInIrrefutableContext
+            | SemanticCode::NonConstantRelationalPatternExpression
+            | SemanticCode::PatternVariableAssignmentInsideGuard
+            | SemanticCode::ReferencedBeforeDeclaration
+            | SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType
+            | SemanticCode::PatternVariableSharedCaseScopeHasLabel
+            | SemanticCode::PatternVariableSharedCaseScopeNotAllCases
             | SemanticCode::ReceiverOfTypeNever
             | SemanticCode::RecursiveCompileTimeConstant
             | SemanticCode::StrictRawType
@@ -6630,6 +6768,13 @@ mod tests {
             SemanticCode::OverrideOnNonOverridingMethod,
             SemanticCode::OverrideOnNonOverridingSetter,
             SemanticCode::PatternNeverMatchesValueType,
+            SemanticCode::PatternTypeMismatchInIrrefutableContext,
+            SemanticCode::NonConstantRelationalPatternExpression,
+            SemanticCode::PatternVariableAssignmentInsideGuard,
+            SemanticCode::ReferencedBeforeDeclaration,
+            SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType,
+            SemanticCode::PatternVariableSharedCaseScopeHasLabel,
+            SemanticCode::PatternVariableSharedCaseScopeNotAllCases,
             SemanticCode::ReceiverOfTypeNever,
             SemanticCode::RecursiveCompileTimeConstant,
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),

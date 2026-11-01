@@ -1,4 +1,18 @@
 use super::*;
+use super::scopes_bodies::PATTERN_ARM_SCOPE_BASE;
+use dartq_scanner::{Keyword, TokenKind};
+
+/// One `case`-head contribution to a shared-body member group (#3519):
+/// the pattern variables it declared (`name`, declared type, is-final)
+/// and whether a member label or `default` header rode along — the
+/// `_SharedCaseScope` reason split's inputs.
+struct SharedHeadVars {
+    vars: Vec<(StringId, Option<Ty>, bool)>,
+    label_or_default: bool,
+    /// The head's `case` keyword offset (the member-label ordering key);
+    /// `None` for the synthetic `default:` member row.
+    offset: Option<u32>,
+}
 
 impl<'a> Engine<'a> {
     /// The name after the dot of a qualified type arrived: the prefix slot
@@ -1018,7 +1032,42 @@ impl<'a> Engine<'a> {
             Ty::Function { .. } | Ty::Record { .. } => Self::non_null_form(from),
             _ => self.non_null_face(from),
         };
-        Self::promotable_field_entry(self, &entry, name).then_some(promoted)
+        if !Self::promotable_field_entry(self, &entry, name) {
+            return None;
+        }
+        // The promoted TYPE the flow published on the receiver face
+        // (#3430): a type test's gated candidate rides the member read's
+        // own `read_types` row — `x._f is B` judges the read at `B`, the
+        // promoted static type the official resolves members on
+        // (`property_element_resolver.dart:2158-2166`). The candidates at
+        // the read's offset filter on `!= from` — a promotion narrows, so
+        // the declared face itself never qualifies: the semantic query
+        // row an implicit-`this` read stages at the same offset (the
+        // #1869-2 `query_type_rows` merge — the `read_type_at` poison
+        // rule would answer nothing over two differing rows) spells
+        // `from` byte for byte, and the marker promotions (`!= null`,
+        // `!`) emit no row at all. A row the declared face provably does
+        // not subsume is a foreign face, never this read's promotion; a
+        // divergent pair (a loop body walked under two states) keeps no
+        // single answer — the non-null face stands, the same
+        // under-report direction `PromotionStaging`'s own poison takes.
+        let start = self
+            .read_types
+            .partition_point(|(row, _)| row.offset < range.offset);
+        let end = start
+            + self.read_types[start..].partition_point(|(row, _)| row.offset == range.offset);
+        let mut candidates = self.read_types[start..end].iter().filter_map(|(_, ty)| {
+            (*ty != from
+                && !matches!(ty, Ty::Unknown | Ty::Void | Ty::Never)
+                && self.declared_subtype_negative(ty, &from) != Some(false))
+            .then_some(*ty)
+        });
+        if let Some(ty) = candidates.next()
+            && candidates.next().is_none()
+        {
+            return Some(ty);
+        }
+        Some(promoted)
     }
 
     /// The member entry behind one promotable-shaped read, with its
@@ -2864,14 +2913,507 @@ impl<'a> Engine<'a> {
         self.rows.push(row);
     }
 
+    /// The guarded-pattern scope faces (#3519) evaluated at bare-identifier
+    /// resolution time, when the token window still shows the enclosing
+    /// `case`/`when`/`default` structure:
+    ///
+    /// * **Relational operand** (`case > x:`): the operand resolves in the
+    ///   scope enclosing the pattern — a hit on the pattern's own variable
+    ///   reports `referenced_before_declaration` (the official
+    ///   `_hiddenElements` hides every guarded-pattern variable while the
+    ///   pattern visits), and a provably non-constant operand reports
+    ///   `non_constant_relational_pattern_expression`
+    ///   (`_evaluateAndReportError`, resolver_visitor.dart
+    ///   `visitRelationalPattern` — `final a` fires, `const a` and
+    ///   literals stay silent).
+    /// * **Guard write** (`when a = 1`): an unqualified write to the
+    ///   guarded pattern's own variable inside the `when` clause reports
+    ///   `pattern_variable_assignment_inside_guard`
+    ///   (`isVisitingWhenClause` + `UnqualifiedNameAssignmentTarget`,
+    ///   error_verifier.dart `_checkForPatternVariableAssignmentInsideGuard`
+    ///   — nested closures keep the flag, member targets and plain reads
+    ///   stay silent).
+    /// * **Shared case scope** (`case int a: case num a: a;`): a body read
+    ///   of a variable the heads joined inconsistently reports
+    ///   `invalid_pattern_variable_in_shared_case_scope` with the official
+    ///   reason split — absent in some heads (`not_all_cases`), a label or
+    ///   `default` member in the group (`has_label`), mismatched type or
+    ///   finality (`differentFinalityOrType`), `_SharedCaseScope.finish` in
+    ///   variable_bindings.dart reporting at each `variable.references`
+    ///   read.
+    fn check_pattern_scope_faces(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        target: &mut RefTarget,
+    ) {
+        if self.switch.pattern_depth > 0 && self.relational_operand_at(range) {
+            self.check_relational_operand(name, range);
+        }
+        if self.in_when_guard(range) {
+            self.check_guard_write(name, range);
+        }
+        self.check_shared_case_scope(name, range, target);
+    }
+
+    /// Whether the token at `range` begins a relational pattern's operand:
+    /// scanning back over the unary prefix spellings (`-`, `~`, `!`) and
+    /// the operand's own grouping `(` lands on `>`, `>=`, `<`, `<=`, `==`,
+    /// or `!=`. Only consulted while a pattern is open.
+    fn relational_operand_at(&self, range: SourceRange) -> bool {
+        let toks = self.tokens.as_slice();
+        let mut i = self.token_at_offset(range.offset);
+        while i > 0 {
+            i -= 1;
+            match toks[i].kind {
+                TokenKind::Minus
+                | TokenKind::Tilde
+                | TokenKind::Bang
+                | TokenKind::OpenParen => {}
+                TokenKind::Gt
+                | TokenKind::GtEq
+                | TokenKind::Lt
+                | TokenKind::LtEq
+                | TokenKind::EqEq
+                | TokenKind::BangEq => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The relational operand's two verdicts: a same-head pattern variable
+    /// resolves in the enclosing scope (hidden upstream), and the operand
+    /// must be a constant. The self/same-head read answers BOTH rows —
+    /// upstream resolves the operand to the pattern variable itself (the
+    /// `referenced_before_declaration` report), which the constant visitor
+    /// then judges non-constant (`_evaluateAndReportError`'s own row) —
+    /// an outer `const` never feeds the ask.
+    fn check_relational_operand(&mut self, name: StringId, range: SourceRange) {
+        let self_read = self
+            .resolve_local(name)
+            .is_some_and(|hit| self.pattern_decl_in_head(hit, range.offset));
+        // `name(...)` is an invocation, never a constant operand.
+        let invoked = {
+            let toks = self.tokens.as_slice();
+            toks
+                .get(self.token_at_offset(range.offset) + 1)
+                .is_some_and(|t| t.kind == TokenKind::OpenParen)
+        };
+        let nonconst = self_read
+            || invoked
+            || matches!(
+                ConstLookup::ident(self, name),
+                IdentVerdict::NotConstant | IdentVerdict::Unresolved
+            );
+        if nonconst {
+            self.emit(
+                SemanticCode::NonConstantRelationalPatternExpression,
+                range,
+                "",
+                "",
+            );
+        }
+        if self_read {
+            let text = self.strings.resolve(name).to_string();
+            self.emit(SemanticCode::ReferencedBeforeDeclaration, range, &text, "");
+        }
+    }
+
+    /// Whether the `locals` row `hit` is a pattern variable declared inside
+    /// the still-open pattern window: its sentinel band names the case
+    /// head, and an ungrouped/site binder in the open if-case or shared
+    /// head belongs to it whenever the declaration offset follows the
+    /// clause anchor's.
+    fn pattern_decl_in_head(&self, hit: u32, at: u32) -> bool {
+        let decl = &self.locals[hit as usize];
+        if !matches!(decl.kind, LocalKind::PatternVariable) || decl.range.offset >= at {
+            return false;
+        }
+        match decl.group {
+            Some(group) if group >= PATTERN_ARM_SCOPE_BASE => true,
+            Some(_) => false,
+            None => {
+                let anchor = self
+                    .clause_anchor
+                    .or_else(|| self.switch.switches.last().map(|ctx| ctx.switch_kw));
+                anchor.is_some_and(|a| decl.range.offset >= a.offset)
+            }
+        }
+    }
+
+    /// Whether `range`'s token sits inside an open `when` clause: the
+    /// backward scan finds `when` at bracket depth 0 before any
+    /// guard-ending boundary — `case`/`default`/`;`, a non-ternary `:`, or
+    /// (in a switch expression) the arm's `=>`. Nested closures inside the
+    /// guard keep the flag upstream, so `(`/`{` openers step through to
+    /// the enclosing context; an arrow function inside a STATEMENT guard
+    /// still belongs to the clause, so `=>` only bounds a switch
+    /// expression's arm.
+    fn in_when_guard(&self, range: SourceRange) -> bool {
+        let toks = self.tokens.as_slice();
+        let is_expression = self
+            .switch
+            .switches
+            .last()
+            .is_some_and(|ctx| ctx.is_expression);
+        let read = self.token_at_offset(range.offset);
+        let mut i = read;
+        let mut depth = 0i32;
+        let mut ternaries = 0i32;
+        while i > 0 {
+            i -= 1;
+            match toks[i].kind {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    depth += 1;
+                }
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    // A bracket at depth 0 that closed BEFORE the read
+                    // means the scan left the clause's own group — the
+                    // `if (`/`case ...:` head preceding a then body.
+                    // Grouping that still wraps the read (`(a = 1)` inside
+                    // the guard) steps through to `when`.
+                    if depth == 0 {
+                        let Some(end) = self.tokens.matching_end(i) else {
+                            return false;
+                        };
+                        if end < read {
+                            return false;
+                        }
+                        // A `{` still wrapping the read: a statement block
+                        // (`if (...) {`, `case X: {`, `=> {`) closes the
+                        // clause — the read is the member body, never the
+                        // guard. An expression `{` (a `() {` closure or a
+                        // map literal) keeps `isVisitingWhenClause` set
+                        // upstream, so the scan continues.
+                        if matches!(toks[i].kind, TokenKind::OpenCurly)
+                            && self.curly_is_statement_block(i)
+                        {
+                            return false;
+                        }
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Keyword(Keyword::When) if depth <= 0 => return true,
+                TokenKind::Keyword(Keyword::Case | Keyword::Default)
+                | TokenKind::Semicolon
+                    if depth <= 0 =>
+                {
+                    return false;
+                }
+                TokenKind::Function if depth <= 0 => {
+                    if is_expression {
+                        return false;
+                    }
+                }
+                TokenKind::Colon if depth <= 0 => {
+                    if ternaries == 0 {
+                        return false;
+                    }
+                    ternaries -= 1;
+                }
+                TokenKind::Question if depth <= 0 => ternaries += 1,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a `{` opens a statement block rather than an expression:
+    /// the previous token answers it — `:` (a case/default head's colon
+    /// or a `label:`), a control-flow `)` whose `(` rides a keyword
+    /// (`if (`/`for (`/`while (`/`switch (`/`catch (`), `=>`, `else`,
+    /// `try`, `finally`, `do` — everything else (a call's `)`, `(`,
+    /// `,`, `=`, an operator, a map-literal `[`/`{`) is a guard
+    /// expression's own group.
+    fn curly_is_statement_block(&self, open: usize) -> bool {
+        let toks = self.tokens.as_slice();
+        match toks.get(open.wrapping_sub(1)).map(|t| t.kind) {
+            Some(TokenKind::Colon)
+            | Some(TokenKind::Function)
+            | Some(TokenKind::Keyword(
+                Keyword::Else | Keyword::Try | Keyword::Finally | Keyword::Do,
+            )) => true,
+            Some(TokenKind::CloseParen) => {
+                // `) {` — walk the `)`'s `(` backward and read the token
+                // in front of it: a control keyword makes the block a
+                // statement; a name/`(`/operator makes `()` a call or a
+                // closure signature — the guard's expression continues.
+                let mut inner = 0i32;
+                let mut j = open - 1;
+                while j > 0 {
+                    j -= 1;
+                    match toks[j].kind {
+                        TokenKind::CloseParen | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly => inner += 1,
+                        TokenKind::OpenParen => {
+                            if inner == 0 {
+                                return matches!(
+                                    toks.get(j.wrapping_sub(1)).map(|t| t.kind),
+                                    Some(TokenKind::Keyword(
+                                        Keyword::If
+                                            | Keyword::For
+                                            | Keyword::While
+                                            | Keyword::Switch
+                                            | Keyword::Catch
+                                    ))
+                                );
+                            }
+                            inner -= 1;
+                        }
+                        TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                            if inner == 0 {
+                                return false;
+                            }
+                            inner -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// An unqualified write inside the guard: `a = v`, any compound `op=`,
+    /// or `a++`/`a--`/`++a`/`--a` hitting a guarded pattern variable (its
+    /// arm-sentinel group or ungrouped/site binder — a declaration-window
+    /// even group belongs to a statement destructure, never a guard).
+    fn check_guard_write(&mut self, name: StringId, range: SourceRange) {
+        let toks = self.tokens.as_slice();
+        let idx = self.token_at_offset(range.offset);
+        let write = toks.get(idx + 1).is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Eq
+                    | TokenKind::PlusEq
+                    | TokenKind::MinusEq
+                    | TokenKind::StarEq
+                    | TokenKind::SlashEq
+                    | TokenKind::TildeSlashEq
+                    | TokenKind::PercentEq
+                    | TokenKind::AmpersandEq
+                    | TokenKind::BarEq
+                    | TokenKind::CaretEq
+                    | TokenKind::LtLtEq
+                    | TokenKind::GtGtEq
+                    | TokenKind::GtGtGtEq
+                    | TokenKind::QuestionQuestionEq
+                    | TokenKind::IndexEq
+                    | TokenKind::PlusPlus
+                    | TokenKind::MinusMinus
+            )
+        }) || idx > 0
+            && matches!(
+                toks[idx - 1].kind,
+                TokenKind::PlusPlus | TokenKind::MinusMinus
+            );
+        if !write {
+            return;
+        }
+        let Some(hit) = self.resolve_local(name) else {
+            return;
+        };
+        let decl = &self.locals[hit as usize];
+        let guarded = matches!(decl.kind, LocalKind::PatternVariable)
+            && decl.group.is_none_or(|group| group >= PATTERN_ARM_SCOPE_BASE || group % 2 == 1);
+        if guarded {
+            self.emit(
+                SemanticCode::PatternVariableAssignmentInsideGuard,
+                range,
+                "",
+                "",
+            );
+        }
+    }
+
+    /// The `_SharedCaseScope` join: a body read of a pattern variable the
+    /// member's heads declared inconsistently — or the `default`-member
+    /// continuation of a labeled group. `target` upgrades `Missing` to
+    /// `Local`: the official resolves the read to the joined variable (it
+    /// is in scope, merely flagged), so no `undefined_identifier` may ride
+    /// beside this row.
+    fn check_shared_case_scope(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        target: &mut RefTarget,
+    ) {
+        let Some(heads) = self.shared_case_heads(range.offset) else {
+            return;
+        };
+        // The read hits a name the group declares: present in at least one
+        // head's variable set.
+        let mut present = 0usize;
+        let mut declared = false;
+        for head in &heads {
+            if head.vars.iter().any(|(n, ..)| *n == name) {
+                present += 1;
+            }
+        }
+        declared = present > 0;
+        if !declared {
+            return;
+        }
+        // The body-position gate: the read follows the member's last head —
+        // the clause anchor's offset must precede it, and a read still
+        // inside a `when` clause keeps the hidden-elements rules instead
+        // (mid-head the last scope's `head_vars` is still empty, so a
+        // guard read would mis-join as "absent in this head").
+        if self
+            .clause_anchor
+            .is_none_or(|anchor| anchor.end() > range.offset)
+            || self.in_when_guard(range)
+            || self.switch.pattern_depth > 0
+            || self.switch.case_sink_open
+        {
+            return;
+        }
+        let has_label = heads.iter().any(|head| head.label_or_default);
+        // The official precedence (variable_bindings.dart:183-194):
+        // `allCases` joins cleanly or by type/finality; otherwise the
+        // label/default flag outranks the absent-in-a-head reason.
+        let code = if present == heads.len() {
+            // `_finishJoinedPatternVariables`: the joined variable demands
+            // the same declared type and finality in every head.
+            let consistent = {
+                let mut it = heads.iter().filter_map(|head| {
+                    head.vars.iter().find(|(n, ..)| *n == name)
+                });
+                match it.next() {
+                    Some((_, ty, fin)) => it.all(|(_, ty2, fin2)| ty2 == ty && fin2 == fin),
+                    None => true,
+                }
+            };
+            if consistent {
+                return;
+            }
+            SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType
+        } else if has_label {
+            SemanticCode::PatternVariableSharedCaseScopeHasLabel
+        } else {
+            SemanticCode::PatternVariableSharedCaseScopeNotAllCases
+        };
+        let text = self.strings.resolve(name).to_string();
+        self.emit(code, range, &text, "");
+        if matches!(target, RefTarget::Missing | RefTarget::Opaque) {
+            *target = RefTarget::Local;
+        }
+    }
+
+    /// The member's joined head list at a body position, `None` outside a
+    /// shared-body group: the trailing run of this switch depth's
+    /// `switch_arm_scopes` — closed members stay on the stack as
+    /// bookkeeping rows and `member_body` marks where the previous
+    /// statement-carrying member ended the run (the consecutive
+    /// `case`/`default` headers feeding one statement list upstream).
+    /// A run needs at least one head carrying variables (else nothing
+    /// joins).
+    fn shared_case_heads(&self, read: u32) -> Option<Vec<SharedHeadVars>> {
+        let depth = self.switch.switches.len();
+        if depth == 0 {
+            return None;
+        }
+        // The trailing run at this depth: walk back past empty-head
+        // members (`member_body == false`), stopping before the first
+        // body-carrying member — that member's statements ended the
+        // previous group.
+        // A `head_offset` at-or-before the open switch's keyword marks a
+        // FINISHED same-depth switch's stale scopes (its last member may
+        // have closed on a `default:` — leaving `member_body` false on
+        // the trailing row); they must not leak into this group.
+        let switch_offset = self.switch.switches.last().map_or(0, |ctx| ctx.switch_kw.offset);
+        let run: Vec<&SwitchArmScope> = self
+            .switch_arm_scopes
+            .iter()
+            .rev()
+            .take_while(|scope| scope.depth == depth)
+            .take_while(|scope| !scope.member_body)
+            .filter(|scope| scope.head_offset > switch_offset)
+            .collect();
+        let mut heads: Vec<SharedHeadVars> = run
+            .into_iter()
+            .rev()
+            .map(|scope| SharedHeadVars {
+                vars: scope.head_vars.clone(),
+                // A `default:` member's synthetic head carries the
+                // label/default reason with an empty variable set (the
+                // official `switchStatementSharedCaseScopeEmpty` join).
+                label_or_default: scope.is_default,
+                offset: (scope.head_offset != u32::MAX).then_some(scope.head_offset),
+            })
+            .collect();
+        // A `default:` member's head does not exist yet while its body
+        // reads — its synthetic scope lands at `switch_member_end`, after
+        // the statements ran. The token window answers it at read time:
+        // scanning back at bracket depth ≤ 0, a `default` keyword before
+        // the enclosing `{`/boundary means this group has a default head
+        // (upstream's `switchStatementSharedCaseScopeEmpty` join).
+        if !heads.iter().any(|h| h.label_or_default) {
+            let toks = self.tokens.as_slice();
+            let mut i = self.token_at_offset(read);
+            let mut depth = 0i32;
+            let mut has_default = false;
+            while i > 0 {
+                i -= 1;
+                match toks[i].kind {
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth += 1;
+                    }
+                    TokenKind::OpenCurly if depth == 0 => break,
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth -= 1;
+                    }
+                    TokenKind::Keyword(Keyword::Default) if depth <= 0 => {
+                        has_default = true;
+                        break;
+                    }
+                    TokenKind::Keyword(Keyword::Case)
+                    | TokenKind::Semicolon
+                    | TokenKind::Function
+                        if depth <= 0 =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if has_default {
+                heads.push(SharedHeadVars {
+                    vars: Vec::new(),
+                    label_or_default: true,
+                    offset: None,
+                });
+            }
+        }
+        // Member-level labels still open at the read count toward the
+        // label reason when they precede the group's last head.
+        if let Some(last) = heads.iter().filter_map(|h| h.offset).max() {
+            for scope in &self.label_scopes {
+                for (_, lrange, _) in &scope.labels {
+                    if lrange.offset < last {
+                        for head in heads.iter_mut() {
+                            head.label_or_default = true;
+                        }
+                    }
+                }
+            }
+        }
+        (!heads.is_empty()).then_some(heads)
+    }
+
     /// A bare identifier in value position: resolved immediately (the
-    /// verdict is the snapshot pass 2 emits from). A miss under `new`/`const`
-    /// is a creation head: it names a class, so the guarded miss is the
-    /// oracle's `creation_with_non_type` head face (`new Missing()`),
-    /// never an invocation read — the row reclassifies as a type use.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn push_bare(&mut self, name: StringId, range: SourceRange) {
-        let (info, target) = self.resolve_bare(name);
+        let (info, mut target) = self.resolve_bare(name);
+        // The guarded-pattern scope faces (#3519): while a case/if-case
+        // pattern is open the reads inside it resolve against the official
+        // hidden-element and shared-scope rules — a relational operand's
+        // reference to the pattern's own variables, a write to a pattern
+        // variable inside `when`, and a body read of an inconsistently
+        // joined shared-scope variable each carry their own row upstream.
+        self.check_pattern_scope_faces(name, range, &mut target);
         // The nullable implicit-`this` member face (#2926 F2): a bare send
         // inside `extension E on A?` resolving through the `on` face (the
         // `RefTarget::Member` naming the `on` head — `walk_members`'s

@@ -14,7 +14,7 @@ use dartq_scanner::{Keyword, TokenKind};
 /// up from 1; reaching the sentinel range would need ~4 billion pattern
 /// groups in one unit. Depths are syntactic nesting — a fraction of
 /// [`u16::MAX`]; deeper stacks stay untagged (the flat-frame under-report).
-const PATTERN_ARM_SCOPE_BASE: u32 = u32::MAX - u16::MAX as u32;
+pub(crate) const PATTERN_ARM_SCOPE_BASE: u32 = u32::MAX - u16::MAX as u32;
 
 /// The dart:core iterable-producer getters whose declared returns the
 /// member walk cannot reach (the declaring units are unindexed like every
@@ -651,7 +651,7 @@ impl<'a> Engine<'a> {
 
     /// The token index at/after a UTF-16 offset (the table is
     /// offset-ordered; EOF closes every walk).
-    fn token_at_offset(&self, offset: u32) -> usize {
+    pub(crate) fn token_at_offset(&self, offset: u32) -> usize {
         self.tokens.as_slice().partition_point(|t| t.utf16_offset < offset)
     }
 
@@ -1791,6 +1791,609 @@ impl<'a> Engine<'a> {
             .and_then(|frame| frame.var_types.get(&name).copied())
     }
 
+    /// `patternTypeMismatchInIrrefutableContext` over one
+    /// `PatternVariableDeclarationStatement` (`var (int a) = 's';`): every
+    /// node of the irrefutable pattern asks `matched <: required` —
+    /// the initializer's folded static type descends through record
+    /// slots / list elements / map values / object getter columns / the
+    /// cast target — and a provable non-answer reports the node's own
+    /// span (upstream `dispatchPattern` →
+    /// `patternTypeMismatchInIrrefutableContext` at `.at(pattern)`,
+    /// shared_type_analyzer.dart:176-190). The oracle-verified required
+    /// faces: a typed leaf `T x` requires `T`; a record node requires
+    /// the `Object?`-slot record of its field shape; a list requires
+    /// `List<written ?? matched-element ?? Object?>`; a map requires
+    /// `Map<written K, V ?? matched entries ?? Object?, Object?>`; an
+    /// object node requires its written head. Parenthesized nodes are
+    /// transparent; refutable nodes (constants, relationals, `||`,
+    /// `&&`, `?`) never check here — upstream marks them refutable and
+    /// their whole subtree skips the face.
+    ///
+    /// The walk is token-level: the statement's pattern window is the
+    /// tokens between the declaration keyword (`var`/`final`, found by a
+    /// depth-0 backward scan from `=`) and the `=` itself — `init_start`
+    /// (the `=`'s end) and `semi` only frame the initializer's row
+    /// window, which the same single-row rule as the destructure bind
+    /// reads for the matched type.
+    fn check_irrefutable_destructure(&mut self, init_start: u32, semi: u32) {
+        let toks = self.tokens.as_slice();
+        let eq = match self.token_at_offset(init_start).checked_sub(1) {
+            Some(eq) if toks.get(eq).is_some_and(|t| t.kind == TokenKind::Eq) => eq,
+            _ => return,
+        };
+        // The declaration keyword: the nearest `var`/`final` at bracket
+        // depth 0 before `=` — a `;`, `{`, or `}` closes the statement
+        // first (recovery keeps the whole ask silent).
+        let mut depth = 0i32;
+        let mut kw = None;
+        let mut i = eq;
+        while i > 0 {
+            i -= 1;
+            match toks[i].kind {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    depth += 1;
+                }
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Keyword(Keyword::Var | Keyword::Final) if depth == 0 => {
+                    kw = Some(i);
+                    break;
+                }
+                TokenKind::Semicolon if depth == 0 => break,
+                _ => {}
+            }
+        }
+        let Some(kw) = kw else { return };
+        // The matched type: the initializer's one non-TypeUse row inside
+        // `[init_start, semi)` — [`Self::destructure_record`]'s window.
+        let mut inits = self
+            .rows
+            .iter()
+            .filter(|row| {
+                !matches!(row.shape, RowShape::TypeUse(..))
+                    && row.range.offset >= init_start
+                    && row.range.end() <= semi
+            })
+            .cloned();
+        let (Some(row), None) = (inits.next(), inits.next()) else {
+            return;
+        };
+        let Some(matched) = self.initializer_static_ty(&row) else {
+            return;
+        };
+        if matched == Ty::UNKNOWN || self.is_invalid_ty(matched) {
+            return;
+        }
+        self.irrefutable_node(kw + 1, eq, matched);
+    }
+
+    /// The `[lo, hi)` token window's UTF-16 span (the node report's
+    /// `.at(pattern)` anchor: offset = first token's, end = last's).
+    fn token_span(&self, lo: usize, hi: usize) -> Option<SourceRange> {
+        let toks = self.tokens.as_slice();
+        let first = toks.get(lo)?;
+        let last = toks.get(hi.checked_sub(1)?)?;
+        Some(SourceRange {
+            offset: first.utf16_offset,
+            length: (last.utf16_offset + last.byte_len).saturating_sub(first.utf16_offset),
+        })
+    }
+
+    /// One irrefutable-pattern node over the token window `[lo, hi)`
+    /// carrying `matched` as its matched value type: the
+    /// `pattern_type_mismatch_in_irrefutable_context` emitter behind
+    /// [`Self::check_irrefutable_destructure`]. Structural recursion —
+    /// container children recurse with their column's matched type;
+    /// everything else stays silent.
+    fn irrefutable_node(&mut self, lo: usize, hi: usize, matched: Ty) {
+        if lo >= hi {
+            return;
+        }
+        let toks = self.tokens.as_slice();
+        // A cast tail `p as T` at depth 0 keeps the node check silent and
+        // re-dispatches the inner pattern with `T` as its matched type
+        // (`analyzeCastPattern`: no irrefutable check on the node; the
+        // operand sees `requiredType` — `var (int h as num) = 's'`
+        // reports the leaf's `'num'` vs `'int'`).
+        {
+            let mut depth = 0i32;
+            let mut cast = None;
+            for i in lo..hi {
+                match toks[i].kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth += 1;
+                    }
+                    TokenKind::CloseParen
+                    | TokenKind::CloseSquare
+                    | TokenKind::CloseCurly => depth -= 1,
+                    TokenKind::Keyword(Keyword::As) if depth == 0 => cast = Some(i),
+                    _ => {}
+                }
+            }
+            if let Some(as_at) = cast {
+                let mut carry = 0u32;
+                let Some((cast_ty, _)) = self.reconstruct_ty_at(as_at + 1, &mut carry) else {
+                    return;
+                };
+                self.irrefutable_node(lo, as_at, cast_ty);
+                return;
+            }
+        }
+        // The `?` null-check postfix is refutable (its whole subtree
+        // leaves this face); the `!` postfix re-dispatches transparently.
+        let mut hi = hi;
+        loop {
+            match toks.get(hi - 1).map(|t| t.kind) {
+                Some(TokenKind::Bang) => hi -= 1,
+                Some(TokenKind::Question) => return,
+                _ => break,
+            }
+        }
+        if lo >= hi {
+            return;
+        }
+        // Refutable shapes end the descent: logical operators and a
+        // depth-0 relational head make the subtree skip every check. A
+        // leading `<` that opens a typed collection's argument group is
+        // NOT a relational head — `<T>[...]`/`<K,V>{...}` spell the list
+        // and map nodes, so `Lt` only bails when no `>`-then-`[`/`{`
+        // shape follows.
+        {
+            let mut depth = 0i32;
+            let mut i = lo;
+            while i < hi {
+                match toks[i].kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth += 1;
+                    }
+                    TokenKind::CloseParen
+                    | TokenKind::CloseSquare
+                    | TokenKind::CloseCurly => depth -= 1,
+                    TokenKind::Lt if depth == 0 => {
+                        // Typed-collection head? scan forward for the
+                        // group's `>` and the `[`/`{` behind it.
+                        let mut inner = 0i32;
+                        let mut j = i + 1;
+                        let mut is_container = false;
+                        while j < hi {
+                            match toks[j].kind {
+                                TokenKind::Lt | TokenKind::LtLt => inner += 1,
+                                TokenKind::Gt | TokenKind::GtGt => {
+                                    if inner == 0 {
+                                        is_container = matches!(
+                                            toks.get(j + 1).map(|t| t.kind),
+                                            Some(TokenKind::OpenSquare | TokenKind::OpenCurly)
+                                        );
+                                        break;
+                                    }
+                                    inner -= 1;
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        if is_container {
+                            i = j;
+                        } else {
+                            return;
+                        }
+                    }
+                    TokenKind::BarBar
+                    | TokenKind::AmpersandAmpersand
+                    | TokenKind::EqEq
+                    | TokenKind::BangEq
+                    | TokenKind::Gt
+                    | TokenKind::GtEq
+                    | TokenKind::LtEq
+                        if depth == 0 =>
+                    {
+                        return;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        match toks[lo].kind {
+            TokenKind::OpenParen => {
+                let Some(close) = self.tokens.matching_end(lo) else {
+                    return;
+                };
+                if close + 1 != hi {
+                    return;
+                }
+                // Record vs parenthesized: a depth-0 comma or named-field
+                // colon inside makes the record node; a lone inner node
+                // is transparent (`(int a)` reports at `int a`'s span).
+                let mut depth = 0i32;
+                let mut is_record = false;
+                for i in (lo + 1)..close {
+                    match toks[i].kind {
+                        TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                            depth += 1;
+                        }
+                        TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly => depth -= 1,
+                        TokenKind::Comma | TokenKind::Colon if depth == 0 => is_record = true,
+                        _ => {}
+                    }
+                }
+                if !is_record {
+                    self.irrefutable_node(lo + 1, close, matched);
+                    return;
+                }
+                let fields = self.pattern_fields(lo + 1, close);
+                let mut positional = Vec::new();
+                let mut named: Vec<(StringId, Ty)> = Vec::new();
+                let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                for (name, _, _) in &fields {
+                    match name {
+                        Some(name) => named.push((*name, object_q)),
+                        None => positional.push(object_q),
+                    }
+                }
+                let required = self
+                    .boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, false);
+                if let Some(at) = self.token_span(lo, hi) {
+                    self.emit_irrefutable(at, matched, required);
+                }
+                // Children read their slot's type when the matched record
+                // carries the same shape; every other matched face hands
+                // them `Object?` (`analyzeRecordPattern`'s dispatch). The
+                // per-field answers materialize ahead — the recursion
+                // below needs `&mut self`, so the pool read cannot stay
+                // inside a closure borrow.
+                let slots: Vec<Ty> = {
+                    let pool = self.boundary.pool();
+                    fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (name, _, _))| {
+                            if let Ty::Record { shape, .. } = matched {
+                                let shape = pool.record_shape(shape);
+                                if shape.positional.len() == positional.len()
+                                    && shape.named.len() == named.len()
+                                {
+                                    return match name {
+                                        Some(name) => shape
+                                            .named
+                                            .iter()
+                                            .find(|(n, _)| n == name)
+                                            .map_or(object_q, |(_, ty)| *ty),
+                                        None => shape
+                                            .positional
+                                            .get(index)
+                                            .copied()
+                                            .unwrap_or(object_q),
+                                    };
+                                }
+                            }
+                            object_q
+                        })
+                        .collect()
+                };
+                for ((_, fld_lo, fld_hi), slot) in fields.iter().zip(slots) {
+                    self.irrefutable_node(*fld_lo, *fld_hi, slot);
+                }
+            }
+            TokenKind::OpenSquare | TokenKind::Lt => {
+                // List `[...]` / `<T>[...]` or map `{...}` / `<K,V>{...}`.
+                let (mut cursor, written) = if toks[lo].kind == TokenKind::Lt {
+                    let mut carry = 0u32;
+                    let Some((first, mut next)) = self.reconstruct_ty_at(lo + 1, &mut carry)
+                    else {
+                        return;
+                    };
+                    let mut args = vec![first];
+                    while toks.get(next).is_some_and(|t| t.kind == TokenKind::Comma) {
+                        let Some((arg, after)) = self.reconstruct_ty_at(next + 1, &mut carry)
+                        else {
+                            return;
+                        };
+                        args.push(arg);
+                        next = after;
+                    }
+                    match toks.get(next).map(|t| t.kind) {
+                        Some(TokenKind::Gt) => (next + 1, Some(args)),
+                        Some(TokenKind::GtEq) => (next + 1, Some(args)),
+                        _ => return,
+                    }
+                } else {
+                    (lo, None)
+                };
+                let (open, close_kind) = match toks.get(cursor).map(|t| t.kind) {
+                    Some(TokenKind::OpenSquare) => (cursor, TokenKind::CloseSquare),
+                    Some(TokenKind::OpenCurly) => (cursor, TokenKind::CloseCurly),
+                    _ => return,
+                };
+                cursor += 1;
+                let Some(close) = self.tokens.matching_end(open) else {
+                    return;
+                };
+                if toks.get(close).map(|t| t.kind) != Some(close_kind) || close + 1 != hi {
+                    return;
+                }
+                let fields = self.pattern_fields(cursor, close);
+                match close_kind {
+                    TokenKind::CloseSquare => {
+                        // `List<elementType>` — the written arg, else the
+                        // matched list's element, else `Object?`
+                        // (`analyzeListPattern`,
+                        // type_analyzer.dart:979-1009).
+                        let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                        let element = written
+                            .as_ref()
+                            .and_then(|args| args.first().copied())
+                            .unwrap_or_else(|| {
+                                self.list_element_of(matched).unwrap_or(object_q)
+                            });
+                        let required = {
+                            let list = self.intern("List");
+                            self.boundary.args.borrow_mut().named(list, false, &[element])
+                        };
+                        if let Some(at) = self.token_span(lo, hi) {
+                            self.emit_irrefutable(at, matched, required);
+                        }
+                        for (_, fld_lo, fld_hi) in &fields {
+                            self.irrefutable_node(*fld_lo, *fld_hi, element);
+                        }
+                    }
+                    _ => {
+                        // `Map<keyType, valueType>` — written args, else
+                        // the matched map's entries, else `Object?` both
+                        // (`analyzeMapPattern`). Only the VALUE patterns
+                        // recurse (a key is a constant face).
+                        let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                        let (key_ty, val_ty) = match written.as_ref() {
+                            Some(args) if args.len() >= 2 => (args[0], args[1]),
+                            _ => self
+                                .map_entries_of(matched)
+                                .unwrap_or((object_q, object_q)),
+                        };
+                        let required = {
+                            let map = self.intern("Map");
+                            self.boundary
+                                .args
+                                .borrow_mut()
+                                .named(map, false, &[key_ty, val_ty])
+                        };
+                        if let Some(at) = self.token_span(lo, hi) {
+                            self.emit_irrefutable(at, matched, required);
+                        }
+                        for (_, fld_lo, fld_hi) in &fields {
+                            // `fld_lo` here is the value sub-pattern —
+                            // [`Self::pattern_fields`] already split the
+                            // `key: value` pair for `{}`-led groups.
+                            self.irrefutable_node(*fld_lo, *fld_hi, val_ty);
+                        }
+                    }
+                }
+            }
+            TokenKind::OpenCurly => {
+                let Some(close) = self.tokens.matching_end(lo) else {
+                    return;
+                };
+                if close + 1 != hi {
+                    return;
+                }
+                let fields = self.pattern_fields(lo + 1, close);
+                let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                let (key_ty, val_ty) = self
+                    .map_entries_of(matched)
+                    .unwrap_or((object_q, object_q));
+                let required = {
+                    let map = self.intern("Map");
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .named(map, false, &[key_ty, val_ty])
+                };
+                if let Some(at) = self.token_span(lo, hi) {
+                    self.emit_irrefutable(at, matched, required);
+                }
+                for (_, fld_lo, fld_hi) in &fields {
+                    self.irrefutable_node(*fld_lo, *fld_hi, val_ty);
+                }
+            }
+            TokenKind::Identifier | TokenKind::Keyword(_) => {
+                // Typed leaf `T x` / `T _` vs object head `Name(...)`.
+                let mut carry = 0u32;
+                let Some((required, next)) = self.reconstruct_ty_at(lo, &mut carry) else {
+                    return;
+                };
+                let toks = self.tokens.as_slice();
+                match toks.get(next).map(|t| t.kind) {
+                    Some(TokenKind::OpenParen) => {
+                        let Some(close) = self.tokens.matching_end(next) else {
+                            return;
+                        };
+                        if close + 1 != hi {
+                            return;
+                        }
+                        if let Some(at) = self.token_span(lo, hi) {
+                            self.emit_irrefutable(at, matched, required);
+                        }
+                        // Getter-column dispatch: `Name(f: p)` reads
+                        // `f`'s column through the written head
+                        // (`resolveObjectPatternPropertyGet` —
+                        // [`Self::object_pattern_binder_ty`]).
+                        let head = match required {
+                            Ty::Named { name, .. } => Some(name),
+                            _ => None,
+                        };
+                        for (getter, fld_lo, fld_hi) in
+                            self.pattern_fields(next + 1, close)
+                        {
+                            let column = head
+                                .and_then(|head| {
+                                    getter.and_then(|g| self.object_pattern_binder_ty(head, g))
+                                })
+                                .unwrap_or_else(|| {
+                                    Self::nullable_form(Ty::named(self.intern("Object")))
+                                });
+                            self.irrefutable_node(fld_lo, fld_hi, column);
+                        }
+                    }
+                    Some(TokenKind::Identifier | TokenKind::Keyword(_)) => {
+                        // The declared-variable leaf: the node spans the
+                        // written type through the variable name.
+                        if next + 1 != hi {
+                            return;
+                        }
+                        let Some(at) = self.token_span(lo, hi) else {
+                            return;
+                        };
+                        self.emit_irrefutable(at, matched, required);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Splits a container's inner token window into its field
+    /// sub-patterns: `(name?, lo, hi)` per field — the name of a
+    /// `name: p` record/object field (and of a `key: p` map entry, where
+    /// `lo`/`hi` bound the VALUE), `None` for a positional/bare field.
+    /// Depth-0 commas delimit; a `...` rest marker is skipped.
+    fn pattern_fields(&self, lo: usize, hi: usize) -> Vec<(Option<StringId>, usize, usize)> {
+        let toks = self.tokens.as_slice();
+        let mut fields = Vec::new();
+        let mut depth = 0i32;
+        let mut start = lo;
+        let mut i = lo;
+        while i <= hi {
+            let at_break = i == hi || {
+                match toks[i].kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth += 1;
+                        false
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth -= 1;
+                        false
+                    }
+                    TokenKind::Comma => depth == 0,
+                    _ => false,
+                }
+            };
+            if at_break {
+                let mut lo = start;
+                let mut hi = i;
+                while lo < hi
+                    && matches!(
+                        toks[lo].kind,
+                        TokenKind::PeriodPeriodPeriod | TokenKind::PeriodPeriodPeriodQuestion
+                    )
+                {
+                    lo += 1;
+                }
+                // A `name: p` / `key: p` pair splits at the FIRST depth-0
+                // colon inside the field slice.
+                let mut inner_depth = 0i32;
+                let mut colon = None;
+                for j in lo..hi {
+                    match toks[j].kind {
+                        TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                            inner_depth += 1;
+                        }
+                        TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly => inner_depth -= 1,
+                        TokenKind::Colon if inner_depth == 0 => {
+                            colon = Some(j);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let (name, sub_lo) = match colon {
+                    Some(at) => (
+                        if matches!(toks[lo].kind, TokenKind::Identifier | TokenKind::Keyword(_))
+                            && lo + 1 == at
+                        {
+                            Some(self.intern(&self.source[toks[lo].byte_range()]))
+                        } else {
+                            None
+                        },
+                        at + 1,
+                    ),
+                    None => (None, lo),
+                };
+                if sub_lo < hi {
+                    fields.push((name, sub_lo, hi));
+                }
+                start = i + 1;
+            }
+            i += 1;
+        }
+        fields
+    }
+
+    /// The `List<X>` element face of a matched named type, `None` when
+    /// the matched head is not `List`.
+    fn list_element_of(&self, ty: Ty) -> Option<Ty> {
+        let Ty::Named { name, args, .. } = ty else {
+            return None;
+        };
+        if self.strings.resolve(name) != "List" {
+            return None;
+        }
+        self.boundary.pool().get(args).first().copied()
+    }
+
+    /// The `Map<K, V>` entry faces of a matched named type, `None` when
+    /// the matched head is not `Map`.
+    fn map_entries_of(&self, ty: Ty) -> Option<(Ty, Ty)> {
+        let Ty::Named { name, args, .. } = ty else {
+            return None;
+        };
+        if self.strings.resolve(name) != "Map" {
+            return None;
+        }
+        let pool = self.boundary.pool();
+        let args = pool.get(args);
+        Some((*args.first()?, *args.get(1)?))
+    }
+
+    /// The one verdict line: `matched` provably not assignable to
+    /// `required` reports the node with both display faces (the
+    /// `assignable` `None` stays silent — an undecidable name-level ask
+    /// under-reports, never fabricates).
+    fn emit_irrefutable(&mut self, at: SourceRange, matched: Ty, required: Ty) {
+        // The verdict: `assignable`'s nominal lattice answers first —
+        // `Some` is the assignability answer itself, so the report fires
+        // on `false`. When it abstains (an unindexed `Object` source
+        // carries no declared edges at the name level) the declared-edge
+        // lattice decides directly — `Object <: List`/`String`/record is
+        // false at every grade, so the oracle's row still lands.
+        // `dynamic`/invalid matched faces keep the official gate's
+        // silence.
+        let verdict = match self.assignable(matched, required, false) {
+            Some(assignable) => !assignable,
+            None => matched != Ty::Dynamic && !self.name_subtype(matched, required),
+        };
+        if verdict {
+            let a0 = self.ty_display(matched);
+            let a1 = self.ty_display(required);
+            self.emit(
+                SemanticCode::PatternTypeMismatchInIrrefutableContext,
+                at,
+                &a0,
+                &a1,
+            );
+        }
+    }
+
     /// The flat record destructure bind (`final (a, b) = pair()`): the
     /// pattern variables carry no written type — the oracle infers each
     /// from the matched record's positional slots
@@ -1814,6 +2417,7 @@ impl<'a> Engine<'a> {
         init_start: u32,
         semi: u32,
     ) -> Vec<(StringId, SourceRange, Ty)> {
+        self.check_irrefutable_destructure(init_start, semi);
         let vars = std::mem::take(&mut self.pattern_bind_vars);
         let records = self.pattern_bind_records;
         let dirty = self.pattern_bind_dirty;
@@ -1900,30 +2504,131 @@ impl<'a> Engine<'a> {
     /// carry no folded value and stay silent — the oracle's
     /// `constant_pattern_with_non_constant_expression` there is the eval
     /// face's row, not this one.
-    pub(crate) fn class_static_const_tail_ty(&self) -> Option<Ty> {
+    pub(crate) fn class_static_const_tail_ty(&mut self) -> Option<Ty> {
         // The member push replaces the qualifier row, so `A` survives only
         // as the member row's container receiver (the same shape
         // [`Self::classify_constant_tail`] reads for the enum tail).
-        let last = self.rows.last()?;
-        let RowShape::Member {
-            recv:
-                Receiver::Container {
-                    name,
-                    kind: ContainerKind::Class,
-                },
-        } = &last.shape
-        else {
-            return None;
-        };
-        let value = self.const_field_values.get(&(*name, last.name))?;
-        // `Created` folds to the container's own type like an enum value
-        // does, but its primitive equality is undecidable here — excluded
-        // before the fold.
-        if matches!(value, ConstantValue::Created(_)) {
-            return None;
+        if let Some(last) = self.rows.last()
+            && let RowShape::Member {
+                recv:
+                    Receiver::Container {
+                        name,
+                        kind: ContainerKind::Class,
+                    },
+            } = &last.shape
+            && let Some(value) = self.const_field_values.get(&(*name, last.name))
+        {
+            // `Created` folds to the container's own type like an enum value
+            // does, but its primitive equality is undecidable here — excluded
+            // before the fold.
+            if !matches!(value, ConstantValue::Created(_)) {
+                let ty = self.folded_ty(value);
+                if ty != Ty::UNKNOWN {
+                    return Some(ty);
+                }
+            }
         }
-        let ty = self.folded_ty(value);
-        (ty != Ty::UNKNOWN).then_some(ty)
+        // The recovered-expression tail (`visitConstantPattern` evaluates
+        // the pattern's expression unconditionally and reads `value.type`,
+        // constant_verifier.dart:140-165): the parser-flagged shapes —
+        // `const 0`, `~0`, `!false`, `const C()`, `const <int>[]`, `const
+        // {}`, `const #a`, `const int`, `const bool.fromEnvironment` —
+        // never arm the literal fold and never leave a class-static tail,
+        // so without this probe their never-matches verdict drops
+        // wholesale. The window is still open at this point (the caller
+        // closes it after the type is answered); the peek applies the
+        // latched prefix operators exactly as the close would and is a
+        // no-op for the later [`ConstCapture::close_constant_pattern`].
+        let node = self.const_capture.peek_constant_pattern_root()?;
+        let static_ty = self
+            .rows
+            .last()
+            .map(|row| self.operand_static_ty(row))
+            .filter(|ty| *ty != Ty::UNKNOWN);
+        match eval(&node, self) {
+            // A produced value is the oracle's DartObject: the gate reads
+            // `value.type` once `hasPrimitiveEquality` accepts it.
+            Verdict::Value(value) => {
+                if !self.const_value_primitive_equality(&value) {
+                    return None;
+                }
+                static_ty
+                    .or_else(|| {
+                        let ty = self.folded_ty(&value);
+                        (ty != Ty::UNKNOWN).then_some(ty)
+                    })
+            }
+            // `Verdict::Constant` — a const expression whose value the
+            // subset does not carry (the `const C()` creation faces the
+            // eval leaves opaque): the oracle still has a DartObject whose
+            // type is the expression's static type; its primitive equality
+            // is the created head's `==`/`hashCode` walk.
+            Verdict::Constant => {
+                let ty = static_ty?;
+                let Ty::Named { name, .. } = ty else {
+                    return Some(ty);
+                };
+                self.created_primitive_equality(name).then_some(ty)
+            }
+            // A miss (`NotConstant`/`Unresolved`/`Fault`) is the oracle's
+            // `value is! DartObjectImpl` path — never-matches stays silent
+            // there even while the const-ness face reports its own row.
+            _ => None,
+        }
+    }
+
+    /// `hasPrimitiveEquality` for a folded value (upstream `value.dart`'s
+    /// per-state answers): the primitive states accept unconditionally;
+    /// collections and records accept when every element does; the enum
+    /// and symbol/type literal states carry the official's own equality;
+    /// a `Created` instance is decided by its container's `==`/`hashCode`
+    /// walk ([`Self::created_primitive_equality`]); the opaque
+    /// `Instance` accepts only on the function tear-off shape (the
+    /// upstream `FunctionState` answer).
+    fn const_value_primitive_equality(&self, value: &ConstantValue) -> bool {
+        match value {
+            ConstantValue::Null
+            | ConstantValue::Bool(_)
+            | ConstantValue::Int(_)
+            | ConstantValue::Double(_)
+            | ConstantValue::Str(_)
+            | ConstantValue::Enum { .. }
+            | ConstantValue::Type(_)
+            | ConstantValue::Symbol(_) => true,
+            ConstantValue::List(elems) | ConstantValue::Set(elems) => elems
+                .iter()
+                .all(|elem| self.const_value_primitive_equality(elem)),
+            ConstantValue::Map(pairs) => pairs.iter().all(|(key, val)| {
+                self.const_value_primitive_equality(key)
+                    && self.const_value_primitive_equality(val)
+            }),
+            ConstantValue::Record { positional, named } => {
+                positional
+                    .iter()
+                    .chain(named.iter().map(|(_, val)| val))
+                    .all(|elem| self.const_value_primitive_equality(elem))
+            }
+            ConstantValue::Created(name) => self.created_primitive_equality(*name),
+            ConstantValue::Instance(kind) => matches!(kind, InstanceKind::Function),
+        }
+    }
+
+    /// `GenericState.hasPrimitiveEquality` at the name level: the
+    /// container's `==` and `hashCode` resolve concretely to `Object`'s —
+    /// at this layer "no override anywhere" ([`Walk::Missing`], the
+    /// stubbed-core walk cannot spell `Object` itself but a real override
+    /// is always in-file) or "the found face is `Object`'s". A found face
+    /// on any other container fails the gate; a broken chain stays
+    /// undecidable and keeps the documented under-report.
+    fn created_primitive_equality(&self, container: StringId) -> bool {
+        let object = self.intern("Object");
+        [self.intern("=="), self.intern("hashCode")]
+            .iter()
+            .all(|member| match self.walk_members(container, *member) {
+                Walk::Missing => true,
+                Walk::Found(_) => self.member_faces.last_origin() == Some(object),
+                Walk::ChainBroken => false,
+            })
     }
 
     /// Whether a local-scope declaration of `name` binds nothing: under the

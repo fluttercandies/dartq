@@ -15,6 +15,7 @@
 //! answering a post-scope read as a local.
 
 use super::*;
+use dartq_scanner::{Keyword, TokenKind};
 
 /// The arm-scope sentinel band of [`LocalDecl::group`] — `u32::MAX - depth`
 /// for a case header's pattern variable (`super::scopes_bodies`'s
@@ -51,6 +52,15 @@ impl Engine<'_> {
                 depth,
                 head_done: false,
                 shadows: Vec::new(),
+                head_mark: self.locals.len(),
+                head_rows_mark: self.rows.len(),
+                head_vars: Vec::new(),
+                head_offset: self
+                    .clause_anchor
+                    .map_or(u32::MAX, |anchor| anchor.offset),
+                member_body: false,
+                member_ended: false,
+                is_default: false,
             });
         }
         if let Some(top) = self.switch_arm_scopes.last_mut() {
@@ -74,22 +84,72 @@ impl Engine<'_> {
                 depth,
                 head_done: false,
                 shadows: Vec::new(),
+                head_mark: self.locals.len(),
+                head_rows_mark: self.rows.len(),
+                head_vars: Vec::new(),
+                head_offset: self
+                    .clause_anchor
+                    .map_or(u32::MAX, |anchor| anchor.offset),
+                member_body: false,
+                member_ended: false,
+                is_default: false,
             });
         }
     }
 
     /// One case head completed: another `begin_case_expression` belongs
-    /// to the NEXT member of the same switch.
+    /// to the NEXT member of the same switch. The head's pattern
+    /// variables freeze into the shared-scope join set — the `(name,
+    /// declared type, is-final)` triples of the `locals` rows the head
+    /// opened over (the official `_SharedCaseScope.addAll` input).
     pub(crate) fn switch_member_head_done(&mut self) {
-        if let Some(top) = self.switch_arm_scopes.last_mut() {
+        let head_rows = self.rows.len();
+        // The clause anchor latches AFTER `switch_member_head_begin` (the
+        // listener sets it once `case_kw` parses), so the head's keyword
+        // offset lands here — `u32::MAX` at begin is only a placeholder.
+        let head_offset = self
+            .clause_anchor
+            .map_or(u32::MAX, |anchor| anchor.offset);
+        let mark = {
+            let Some(top) = self.switch_arm_scopes.last_mut() else {
+                return;
+            };
             top.head_done = true;
+            top.head_rows_mark = head_rows;
+            if head_offset != u32::MAX {
+                top.head_offset = head_offset;
+            }
+            top.head_mark
+        };
+        // `head_mark` is the locals watermark the head opened over; the
+        // rows it added are this head's declared set (the official
+        // `_SharedCaseScope.addAll` input triples).
+        let vars: Vec<(StringId, Option<Ty>, bool)> = self.locals[mark.min(self.locals.len())..]
+            .iter()
+            .filter(|decl| matches!(decl.kind, LocalKind::PatternVariable))
+            .map(|decl| {
+                (
+                    decl.name,
+                    self.local_declared_ty(decl.name),
+                    self.pattern_var_is_final(decl.range.offset),
+                )
+            })
+            .collect();
+        if let Some(top) = self.switch_arm_scopes.last_mut() {
+            top.head_vars = vars;
         }
     }
 
     /// A switch member closes (`end_switch_case`/one switch-expression
     /// arm): its binders go out of scope and the shadowed spellings read
     /// their outer types again. Only the member of the closing switch
-    /// pops — an outer member stays open behind a nested switch.
+    /// closes — an outer member stays open behind a nested switch.
+    ///
+    /// The scope stays ON the stack (#3519): the shared-case-scope join
+    /// reads the trailing run of one depth's scopes as the member group
+    /// feeding the next body, and `member_body` marks that group's
+    /// boundary — the member carried statements when `rows` grew past
+    /// the head-done watermark (`case A: case B:` empty heads never do).
     pub(crate) fn switch_member_end(&mut self) {
         let depth = self.switch.switches.len();
         if self
@@ -97,8 +157,39 @@ impl Engine<'_> {
             .last()
             .is_some_and(|top| top.depth == depth)
         {
-            let member = self.switch_arm_scopes.pop().expect("checked");
-            let shadows = member.shadows;
+            // A `default:` member opens no case head, so no scope of its
+            // own: the previous member's scope is still on top with its
+            // `member_ended` already latched. Its statements belong to the
+            // default member — mark them on a synthetic head (the official
+            // `switchStatementSharedCaseScopeEmpty` join) instead of
+            // corrupting the case scope's `member_body` group boundary.
+            if self
+                .switch_arm_scopes
+                .last()
+                .is_some_and(|top| top.member_ended)
+            {
+                self.switch_arm_scopes.push(SwitchArmScope {
+                    depth,
+                    head_done: true,
+                    shadows: Vec::new(),
+                    head_mark: self.locals.len(),
+                    head_rows_mark: self.rows.len(),
+                    head_vars: Vec::new(),
+                    head_offset: self
+                        .clause_anchor
+                        .map_or(u32::MAX, |anchor| anchor.offset),
+                    member_body: true,
+                    member_ended: true,
+                    is_default: true,
+                });
+                return;
+            }
+            let shadows = {
+                let top = self.switch_arm_scopes.last_mut().expect("checked");
+                top.member_body = self.rows.len() > top.head_rows_mark;
+                top.member_ended = true;
+                std::mem::take(&mut top.shadows)
+            };
             self.restore_var_types(&shadows);
             // The binders retire with the member: the sentinel group names
             // this switch's stack slot exactly, so a later sibling arm's
@@ -117,6 +208,35 @@ impl Engine<'_> {
                 }
             }
         }
+    }
+
+    /// The `final` bit of a pattern variable's spelling: a `final`
+    /// binder reads `isFinal=true` upstream, `var` and unmarked binders
+    /// `false` — the shared-scope `differentFinalityOrType` half of the
+    /// join. A backward scan over the written type spelling finds the
+    /// keyword or bounds the head.
+    fn pattern_var_is_final(&self, name_offset: u32) -> bool {
+        let toks = self.tokens.as_slice();
+        let mut i = toks.partition_point(|t| t.utf16_offset < name_offset);
+        let mut steps = 0u8;
+        while i > 0 && steps < 12 {
+            i -= 1;
+            steps += 1;
+            match toks[i].kind {
+                TokenKind::Keyword(Keyword::Final) => return true,
+                TokenKind::Keyword(Keyword::Var) => return false,
+                TokenKind::Identifier
+                | TokenKind::Keyword(_)
+                | TokenKind::Question
+                | TokenKind::Period
+                | TokenKind::Gt
+                | TokenKind::Lt
+                | TokenKind::GtGt
+                | TokenKind::Comma => {}
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// An `if` condition opens: only patterns inside it belong to the

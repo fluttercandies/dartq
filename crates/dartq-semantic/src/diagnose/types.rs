@@ -1765,10 +1765,46 @@ pub(crate) struct PendingInitVariable {
 /// marks a completed head (a second `begin_case_expression` opens a NEW
 /// member, not another head of the same one), and `shadows` holds the
 /// frame types the member's pattern binders overwrote.
+///
+/// `head_mark`/`head_rows_mark`/`head_vars`/`head_offset`/`member_body`
+/// feed the shared-case-scope join (#3519): the `locals` watermark at
+/// head open, the `rows` watermark at head done (statements after it
+/// mean the member carried a body — the official shared-scope group
+/// boundary), the `(name, declared ty, is-final)` set the head's pattern
+/// declared, and the clause anchor's offset (a member label before it
+/// belongs to the label reason). A closed member's scope STAYS on the
+/// stack as the group's bookkeeping row — [`Self::member_body`] marks
+/// the group's end.
 pub(crate) struct SwitchArmScope {
     pub(crate) depth: usize,
     pub(crate) head_done: bool,
     pub(crate) shadows: Vec<(StringId, Option<Ty>, bool)>,
+    /// The `locals` watermark at head open (`#3519`): the head's pattern
+    /// variables are `locals[head_mark..]` rows of its own kind.
+    pub(crate) head_mark: usize,
+    /// The `rows` watermark at head done: statements after it mean the
+    /// member carried a body — the shared-scope group's boundary.
+    pub(crate) head_rows_mark: usize,
+    /// The `(name, declared ty, is-final)` set the head's pattern
+    /// declared — the official `_SharedCaseScope.addAll` join input.
+    pub(crate) head_vars: Vec<(StringId, Option<Ty>, bool)>,
+    /// The clause anchor's offset at head open (the member-label
+    /// ordering key for the shared-scope reason split).
+    pub(crate) head_offset: u32,
+    /// Whether the member carried statements (`rows` grew past
+    /// [`Self::head_rows_mark`] at member end): the scope stays on the
+    /// stack after its member closes — the trailing run of one depth's
+    /// scopes is the shared-body group this flag bounds.
+    pub(crate) member_body: bool,
+    /// The member's `end_switch_case` already ran once on this scope: a
+    /// SECOND member-end at the same depth is a `default:` member (it
+    /// opens no case head, so no scope of its own) — its statements must
+    /// not mark this scope's `member_body`.
+    pub(crate) member_ended: bool,
+    /// A synthetic `default:` member's head (the official
+    /// `switchStatementSharedCaseScopeEmpty` join — `hasLabel=true` with
+    /// an empty variable set).
+    pub(crate) is_default: bool,
 }
 
 /// F-C: a folded `super.`-selector candidate in the open
@@ -6055,7 +6091,9 @@ impl<'a> Engine<'a> {
     /// index of the first token the type does not own. `carry` is the
     /// shared half-consumed-`>` count: a nested list whose closer lexed
     /// multi-wide (`>>`) leaves a pending `>` for the enclosing list.
-    fn reconstruct_ty_at(&self, start: usize, carry: &mut u32) -> Option<(Ty, usize)> {
+    /// The irrefutable-destructure walk (`scopes_bodies`) reuses it for
+    /// the written element/key/value/object-head spellings.
+    pub(crate) fn reconstruct_ty_at(&self, start: usize, carry: &mut u32) -> Option<(Ty, usize)> {
         use dartq_scanner::TokenKind;
         let tokens = self.tokens.as_slice();
         let head = *tokens.get(start)?;

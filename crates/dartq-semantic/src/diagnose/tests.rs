@@ -22841,3 +22841,11 @@ mod ticket_3503_tests;
 // relational-operand enclosing-scope resolution (referenced-before-decl +
 // non-constant), guard assignment, and the shared-case-scope join.
 #[cfg(test)]
+
+// —— #3519 ——
+// The guarded-pattern scope faces: irrefutable destructure mismatch,
+// relational-operand enclosing-scope resolution (referenced-before-decl +
+// non-constant), guard assignment, and the shared-case-scope join.
+#[cfg(test)]
+#[path = "ticket_3519_tests.rs"]
+mod ticket_3519_tests;
