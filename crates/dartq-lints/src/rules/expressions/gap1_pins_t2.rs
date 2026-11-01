@@ -77,6 +77,24 @@ fn run_semantic_version(source: &str, rule: &str, version: LanguageVersion) -> V
     )
 }
 
+/// One report row as the oracle renders it: 1-based line, 1-based UTF-16
+/// column, UTF-16 length.
+type Row = (u32, u32, u32);
+
+/// [`run_semantic`]'s rows in the oracle's coordinate space.
+fn rows_of(source: &str, rule: &str) -> Vec<Row> {
+    let f = Fixture::parse(source);
+    let mut rows: Vec<Row> = run_semantic(source, rule)
+        .iter()
+        .map(|lint| {
+            let (line, col) = f.lines.line_col_utf16(&f.source, lint.range.start);
+            (line, col, lint.range.end - lint.range.start)
+        })
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
 /// The wave posture: the four rules are silent under the plain run
 /// (the face absent) and report with it mounted.
 #[test]
@@ -103,6 +121,22 @@ fn gap1_t2_rules_require_the_semantic_face() {
         let plain = Fixture::parse(source);
         assert!(plain.run(&one_rule(rule)).is_empty(), "{rule}");
         assert_eq!(run_semantic(source, rule).len(), 1, "{rule}");
+    }
+}
+
+/// The production mount: both `Future`-statement rules read the semantic
+/// fold, so the driver's [`crate::mounts_semantics`] gate must select each
+/// of them on its own. A rule that reads the fold while sitting outside
+/// `SEMANTIC_RULES` never receives it — the rule's whole row set is
+/// dropped with no error and no false positive, the #3527 census gap
+/// (15 `discarded_futures` + 11 `unawaited_futures` rows missing).
+#[test]
+fn future_statement_rules_mount_the_semantic_face() {
+    for rule in ["discarded_futures", "unawaited_futures"] {
+        assert!(
+            crate::mounts_semantics(&one_rule(rule)),
+            "{rule} reads the fold but the mount gate skips it: every row would be dropped"
+        );
     }
 }
 
@@ -169,6 +203,28 @@ fn discarded_futures_sync_faces() {
     }
 }
 
+/// The #3527 oracle fixture, `dart analyze` 3.13.7 verbatim: the dropped
+/// `work()` reports at the callee both in a non-`async` function body
+/// (4:3) and in a constructor body (2:17 — the constructor's own body is
+/// the nearest `FunctionBody`, and it is not `async`); the `async` body
+/// `g` stays silent (that body belongs to `unawaited_futures`, the
+/// polarity that keeps this rule from reporting everywhere), and the
+/// `final c = C();` binding never warns on its own.
+#[test]
+fn discarded_futures_statement_and_constructor_faces() {
+    let source = "Future<int> work() async => 1;\nclass C { C() { work(); } }\nvoid f() {\n  work();\n  final c = C();\n  print(c);\n}\nvoid g() async { work(); }\n";
+    assert_eq!(
+        rows_of(source, "discarded_futures"),
+        vec![(2, 17, 4), (4, 3, 4)]
+    );
+    for lint in run_semantic(source, "discarded_futures") {
+        assert_eq!(
+            lint.message,
+            "'Future'-returning calls in a non-'async' function."
+        );
+    }
+}
+
 /// The async-context faces: a `Future`-typed drop reports in an `async`
 /// body — the `FutureOr` shape with its paired texts — and a sync body,
 /// an `await`, and the nearest-body gate (a sync closure inside an
@@ -213,6 +269,37 @@ fn unawaited_futures_async_faces() {
         // The nearest body decides: the statement sits in a sync
         // closure inside the `async` function.
         "Future<void> f() async {}\nvoid g() async {\n  [1].forEach((_) {\n    f();\n  });\n}\n",
+    ] {
+        assert!(
+            run_semantic(source, "unawaited_futures").is_empty(),
+            "{source}"
+        );
+    }
+}
+
+/// The #3527 fixture seen by the async-side rule: `g`'s body reports at
+/// the callee (8:18), while the sync function `f` (4:3) and the
+/// constructor body (2:17) stay silent for this rule — they belong to
+/// `discarded_futures`. An assignment target and an `await` are the two
+/// statement-level escapes, both silent.
+#[test]
+fn unawaited_futures_statement_and_constructor_faces() {
+    let source = "Future<int> work() async => 1;\nclass C { C() { work(); } }\nvoid f() {\n  work();\n  final c = C();\n  print(c);\n}\nvoid g() async { work(); }\n";
+    assert_eq!(rows_of(source, "unawaited_futures"), vec![(8, 18, 4)]);
+    for lint in run_semantic(source, "unawaited_futures") {
+        assert_eq!(
+            lint.message,
+            "Missing an 'await' for the 'Future' computed by this expression."
+        );
+    }
+
+    for source in [
+        // The assignment root is an escape even in an `async` body
+        // (the root's static type is the `Future` the call returns).
+        "Future<int> work() async => 1;\nFuture<int>? x;\nFuture<void> g() async {\n  x = work();\n}\n",
+        // A local binding is not an expression statement: no report even
+        // in an `async` body.
+        "Future<int> work() async => 1;\nFuture<void> g() async {\n  final x = work();\n}\n",
     ] {
         assert!(
             run_semantic(source, "unawaited_futures").is_empty(),

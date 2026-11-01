@@ -1105,7 +1105,9 @@ pub(crate) use REGISTRATION_GATES as VERSION_GATES;
 /// (`same_file::nullable_extension_member`,
 /// `declarations::bridge_inherited_member` /
 /// `super_formal_provably_unmatched`,
-/// `collections::inferred_binding_type_face`, the flutter domain's
+/// `collections::inferred_binding_type_face`,
+/// `expressions::unused_futures::check` — the `discarded_futures` /
+/// `unawaited_futures` shared walk, the flutter domain's
 /// `spells_framework`/`resolves_user_container`/`chain_spells_root`
 /// refutation faces) — plus `use_build_context_synchronously`, which reads
 /// the fold's `AsyncContextUse` facts through
@@ -1131,6 +1133,7 @@ pub static SEMANTIC_RULES: &[&str] = &[
     "collection_methods_unrelated_type",
     "comment_references",
     "diagnostic_describe_all_properties",
+    "discarded_futures",
     "future_sync_value",
     "implicit_call_tearoffs",
     "invalid_runtime_check_with_js_interop_types",
@@ -1158,6 +1161,7 @@ pub static SEMANTIC_RULES: &[&str] = &[
     "sort_child_properties_last",
     "type_annotate_public_apis",
     "type_init_formals",
+    "unawaited_futures",
     "unnecessary_getters_setters",
     "unnecessary_lambdas",
     "unnecessary_null_aware_operator_on_extension_on_nullable",
