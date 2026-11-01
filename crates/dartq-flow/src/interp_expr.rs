@@ -576,6 +576,12 @@ impl Interp<'_> {
                     let mut expr = Expr::trivial(Ty::UNKNOWN);
                     expr.bool_value = operand.bool_value.map(|b| !b);
                     expr.branches = operand.branches.map(|(t, f)| (f, t));
+                    // The `!` result carries the operand's own split
+                    // (inverted): `current` still sits in the operand's
+                    // true arm, so a value consumer that drops `!(x is T)`
+                    // rejoins both arms exactly like the bare test's value
+                    // context ([`Interp::rejoin_value_split`]).
+                    expr.test_split = operand.test_split;
                     // `!x` is a boolean — non-null by construction (the
                     // `??`/`?.` kills' literal face).
                     expr.non_null_literal = true;
@@ -3081,6 +3087,16 @@ impl Interp<'_> {
                 {
                     self.dead_code(arg_span);
                 }
+                // A condition-valued argument (`f(x is T)`, `f(!(x is T))`)
+                // consumed as a plain value rejoins its split — the official
+                // leaves `_current` recombined at the argument's end, so the
+                // narrowed arm must not leak into the sibling arguments or
+                // the continuation after the call.
+                if self.exprs.last().is_some_and(|arg| arg.test_split)
+                    && let Some(arg) = self.exprs.last().cloned()
+                {
+                    self.rejoin_value_split(&arg);
+                }
                 // This argument's expression is complete: rejoin the
                 // null-shorting IT opened, at its own boundary — official
                 // finishes each argument's shorting before the next one
@@ -3143,7 +3159,13 @@ impl Interp<'_> {
                     return true;
                 }
                 for _ in 0..*count {
-                    self.exprs.pop();
+                    // An argument whose `ArgumentEnd` never fired (recovery
+                    // buffers) still rejoins before the call's value flows
+                    // on — a condition-valued argument consumed as a plain
+                    // value must not leak its narrowed arm past the list.
+                    if let Some(arg) = self.exprs.pop() {
+                        self.rejoin_value_split(&arg);
+                    }
                 }
             }
             Ev::Throw => {

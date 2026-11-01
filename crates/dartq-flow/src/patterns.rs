@@ -625,14 +625,8 @@ impl Interp<'_> {
                         let (matched_arm, unmatched_arm) =
                             self.branch_type_test(var, declared, declared_args, candidate);
                         self.current = matched_arm;
-                        if !self.ops.is_subtype_typed(
-                            matched_ty,
-                            matched_args,
-                            declared,
-                            declared_args,
-                            self.args,
-                            self.names,
-                        ) {
+                        if !self.covers_matched(matched_ty, matched_args, declared, declared_args)
+                        {
                             self.join_unmatched(unmatched_arm);
                         } else if self.ops.is_invalid_typed(
                             matched_ty,
@@ -699,14 +693,8 @@ impl Interp<'_> {
                         let (matched_arm, unmatched_arm) =
                             self.branch_type_test(var, declared, declared_args, candidate);
                         self.current = matched_arm;
-                        if !self.ops.is_subtype_typed(
-                            matched_ty,
-                            matched_args,
-                            declared,
-                            declared_args,
-                            self.args,
-                            self.names,
-                        ) {
+                        if !self.covers_matched(matched_ty, matched_args, declared, declared_args)
+                        {
                             self.join_unmatched(unmatched_arm);
                         } else if self.ops.is_invalid_typed(
                             matched_ty,
@@ -961,10 +949,9 @@ impl Interp<'_> {
             // scrutinee type; the raw pattern head already spells
             // the required type, and no latched type at all may always
             // fail, so both directions join.
-            let covered = self.scrutinee_static_ty().is_some_and(|(ty, frame_args)| {
-                self.ops
-                    .is_subtype_typed(ty, frame_args, known, args, self.args, self.names)
-            });
+            let covered = self
+                .scrutinee_static_ty()
+                .is_some_and(|(ty, frame_args)| self.covers_matched(ty, frame_args, known, args));
             if !covered {
                 self.join_unmatched(live);
             }
@@ -1051,10 +1038,7 @@ impl Interp<'_> {
         if self.sound_flow && self.disjoint_by_nullability(matched, known) {
             self.unreachable_cur();
         }
-        if !self
-            .ops
-            .is_subtype_typed(matched, matched_args, known, args, self.args, self.names)
-        {
+        if !self.covers_matched(matched, matched_args, known, args) {
             self.join_unmatched(unmatched_arm);
         } else if self
             .ops
@@ -1081,6 +1065,52 @@ impl Interp<'_> {
     fn defer_vacuous_object_cover(&mut self, owner: u32) {
         self.vacuous_object = Some((owner, self.current.clone()));
         self.vacuous_fields = self.pattern_binds.clone();
+    }
+
+    /// The pattern cover question under upstream's extension-type erasure
+    /// (flow_analysis.dart:6394-6397, `promoteForPattern`'s single
+    /// `coversMatchedType` line every pattern face shares):
+    /// `isSubtypeOf(extensionTypeErasure(matchedType),
+    /// extensionTypeErasure(knownType))`. An extension type IS a subtype
+    /// of its representation (subtype.dart's declared-interfaces arm,
+    /// :107-114), so `case B _` covers a `BET1` scrutinee whose
+    /// representation is `B` — the case cannot fail, the unmatched chain
+    /// keeps its dead seed, and the switch's post-switch state loses the
+    /// phantom fall-through arm (`body_might_complete_normally` stays
+    /// silent).
+    fn covers_matched(&self, matched: Ty, matched_args: u32, known: Ty, known_args: u32) -> bool {
+        let (matched, matched_args) = self.ext_type_erasure(matched, matched_args);
+        let (known, known_args) = self.ext_type_erasure(known, known_args);
+        self.ops
+            .is_subtype_typed(matched, matched_args, known, known_args, self.args, self.names)
+    }
+
+    /// The name-level `extensionTypeErasure` (type_system.dart:42-63): a
+    /// captured extension-type head unwraps to its representation type as
+    /// written, the extension type's own nullability applying on top —
+    /// `E?` over rep `R` erases to `R?`, and a nullable rep stays
+    /// nullable. Chained extension types recurse (`E2(E1(int))` erases to
+    /// `int`) under the fixed bound walk budget. A head the unit captured
+    /// nothing for — an exotic rep shape (record, function type), or a
+    /// declaration parsed after the executable — stays as spelled: the
+    /// question keeps its name-level answer, the under-report direction.
+    fn ext_type_erasure(&self, mut ty: Ty, mut args: u32) -> (Ty, u32) {
+        let mut budget = crate::interp::BOUND_RECURSION_LIMIT;
+        while budget > 0 {
+            budget -= 1;
+            let Base::Name(id) = ty.base else {
+                break;
+            };
+            let Some(&(rep, rep_args)) = self.closed.extension_reps.get(&id) else {
+                break;
+            };
+            ty = Ty {
+                base: rep.base,
+                nullable: ty.nullable || rep.nullable,
+            };
+            args = rep_args;
+        }
+        (ty, args)
     }
 
     /// Decides a deferred object-pattern vacuous cover at the pattern's
@@ -1433,14 +1463,7 @@ impl Interp<'_> {
         // may always fail, so it joins too.
         if self.pattern.is_some() {
             let covered = self.scrutinee_static_ty().is_some_and(|(ty, frame_args)| {
-                self.ops.is_subtype_typed(
-                    ty,
-                    frame_args,
-                    declared,
-                    declared_args,
-                    self.args,
-                    self.names,
-                )
+                self.covers_matched(ty, frame_args, declared, declared_args)
             });
             if !covered {
                 self.join_unmatched(live);

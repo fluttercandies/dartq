@@ -797,10 +797,12 @@ impl Expr {
 pub(crate) const THIS_RECEIVER: u32 = u32::MAX - 1;
 
 /// Recursion budget for the always-exhaustive bound walk
-/// ([`Interp::is_always_exhaustive`]). A well-formed `extends` chain is
-/// far shorter than this; the budget only bounds the spelling-level cycle
-/// an ill-formed `T extends U, U extends T` would otherwise spin on.
-const BOUND_RECURSION_LIMIT: u8 = 16;
+/// ([`Interp::is_always_exhaustive`]) and the pattern cover question's
+/// extension-type erasure walk ([`crate::patterns`]). A well-formed
+/// `extends` chain is far shorter than this; the budget only bounds the
+/// spelling-level cycle an ill-formed `T extends U, U extends T` would
+/// otherwise spin on.
+pub(crate) const BOUND_RECURSION_LIMIT: u8 = 16;
 
 /// Step budget per recorded event for one executable's replay
 /// ([`Interp::run`]): the structural termination invariant of the

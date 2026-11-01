@@ -318,6 +318,14 @@ pub struct Flow<'t> {
     /// [`ParserListener::begin_class_or_mixin_or_extension_body`] /
     /// `handle_no_extension_body` / `end_extension_declaration` close).
     in_extension_header: bool,
+    /// The extension type whose representation head is still arriving:
+    /// `begin_extension_type_declaration` arms it with the declared
+    /// name's id; the header's first depth-0 type head — the
+    /// representation type as written, the primary constructor's
+    /// parameter annotations arriving after it — spends it. Any
+    /// non-capturable shape in between (a special head, a record or
+    /// function-typed rep, a malformed header's end) disarms it.
+    ext_type_rep_pending: Option<u32>,
     /// The resolved type-operations back-end ([`crate::ty::TypeOps`]) the
     /// consumer mounts through [`Flow::set_ops`] before the parse — the
     /// official `FlowAnalysisTypeOperations` slot. `None` keeps the
@@ -429,6 +437,7 @@ impl<'t> Flow<'t> {
             staged_members: FxHashMap::default(),
             extension_on_head: None,
             in_extension_header: false,
+            ext_type_rep_pending: None,
             pending_label_ref: None,
             pending_labels: Vec::new(),
             pending_label_token: None,
@@ -834,6 +843,44 @@ impl<'t> Flow<'t> {
     pub fn name_lexeme(&self, id: u32) -> &str {
         let index = id as usize;
         &self.names_by_id[index]
+    }
+
+    /// Whether the type head this row spelled opens a function type
+    /// (`int Function(int)`, `io.Directory? Function()`): the return-type
+    /// row fires before `begin_function_type`, so the token walk after the
+    /// qualified chain's head — an optional `?`, then the `Function`
+    /// keyword — decides. A function-typed representation spends the
+    /// capture latch uncaptured: its erased form is no named head the
+    /// cover question could match, and capturing the bare return type
+    /// would over-claim (`case int _` covering a function-repped
+    /// scrutinee).
+    fn rep_head_opens_function(&self, chain_start: Token) -> bool {
+        let mut index = chain_start.id as usize;
+        while let Some(dot) = self.tokens.next(index)
+            && self.tokens.get(dot).map(|t| t.kind) == Some(dartq_scanner::TokenKind::Period)
+        {
+            let Some(tail) = self.tokens.next(dot) else {
+                return false;
+            };
+            if self.tokens.get(tail).map(|t| t.kind) != Some(dartq_scanner::TokenKind::Identifier)
+                || self.tokens.get(tail).is_none_or(|t| t.is_synthetic())
+            {
+                break;
+            }
+            index = tail;
+        }
+        let mut next = match self.tokens.next(index) {
+            Some(next) => next,
+            None => return false,
+        };
+        if self.tokens.get(next).map(|t| t.kind) == Some(dartq_scanner::TokenKind::Question) {
+            next = match self.tokens.next(next) {
+                Some(after) => after,
+                None => return false,
+            };
+        }
+        self.tokens.get(next).map(|t| t.kind)
+            == Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Function))
     }
 
     /// The written-argument tree interned at arena `id` — the cross-crate
@@ -1591,8 +1638,16 @@ impl ParserListener for Flow<'_> {
         &mut self,
         _augment_kw: Option<Token>,
         _extension_keyword: Token,
-        _name: Token,
+        name: Token,
     ) {
+        // The representation latch: the header's first depth-0 type head
+        // is the representation type as written (`extension type
+        // BET1(B)`'s `B`) — the primary constructor's parameter
+        // annotations arrive after it, so the next head spends the latch
+        // into [`Flow::closed`]'s extension-type map (the pattern cover
+        // question's erasure face, flow_analysis.dart:6394-6397).
+        let id = self.name(name);
+        self.ext_type_rep_pending = Some(id);
         self.container_depth += 1;
     }
 
@@ -1605,6 +1660,10 @@ impl ParserListener for Flow<'_> {
         _end: Token,
     ) {
         self.container_depth = self.container_depth.saturating_sub(1);
+        // A malformed header that never produced a head disarms here: a
+        // later declaration's heads must not read as this type's
+        // representation.
+        self.ext_type_rep_pending = None;
     }
 
     // —— bodies ————————————————————————————————————————————————————————
@@ -2097,6 +2156,29 @@ impl ParserListener for Flow<'_> {
         {
             self.extension_on_head = Some((head, nullable));
         }
+        // The extension-type representation latch (armed by
+        // `begin_extension_type_declaration`): the header's first depth-0
+        // type head IS the representation as written — the primary
+        // constructor's parameter annotations arrive after it. A named
+        // head captures into [`Flow::closed`]'s extension-type map (the
+        // pattern cover question's erasure face); anything else — a
+        // special head, a function-typed rep whose return row fires
+        // before `begin_function_type` — spends the latch uncaptured and
+        // the cover question keeps its name-level answer (the
+        // under-report direction).
+        if let Some(pending) = self.ext_type_rep_pending
+            && self.type_arg_groups.is_empty()
+            && !self.tv_in_record
+        {
+            self.ext_type_rep_pending = None;
+            if let crate::ty::Base::Name(head) = base
+                && !self.rep_head_opens_function(name)
+            {
+                self.closed
+                    .extension_reps
+                    .insert(pending, (crate::ty::Ty { base, nullable }, args));
+            }
+        }
     }
 
     fn begin_type_arguments(&mut self, _token: Token) {
@@ -2298,6 +2380,12 @@ impl ParserListener for Flow<'_> {
         _has_named_fields: bool,
     ) {
         self.tv_in_record = false;
+        // A record-typed representation (`extension type R((int, int) p)`)
+        // spells no named head — its field rows ride under `tv_in_record`
+        // and the record's own row bypasses the head latch — so the
+        // representation window disarms: no later declaration's head may
+        // read as this type's rep.
+        self.ext_type_rep_pending = None;
         // The record spelling owns no head in this lattice (a record is
         // neither a named nor a function base), so the type slot it feeds
         // takes the unknown face — the written `?` still rides it, the way

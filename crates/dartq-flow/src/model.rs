@@ -1135,18 +1135,19 @@ fn covers(
     if entry.base == Base::Unknown && !entry.nullable {
         return ops.classify(written) == Classification::NonNullable;
     }
-    // The official's InvalidType recovery (subtype.dart:274 — `T0 is
-    // InvalidType` subtypes everything): a write whose value the layer
-    // cannot type (`x = unresolvedCall()`, `x ??= unknownRhs`) satisfies
-    // every standing promotion — it preserves the chain instead of
-    // demoting what the earlier checks promoted. The unresolved-WRITTEN
-    // face reaches this both ways: as the opaque `Unknown` here, and as
-    // the resolved back-end's `Invalid` through the subtype below, whose
-    // 0c arm answers `Invalid <: promoted` vacuously true — the same
-    // verdict `_demoteViaAssignment`'s `isSubtypeOf(writtenType, promoted)`
-    // takes upstream.
+    // An untypeable write preserves only an equally unspellable entry.
+    // The dominant face of a bare `Unknown` right-hand side is a typed
+    // value this lattice cannot spell (`o = list[i]`'s `dynamic`, an
+    // operator or increment's result): `dynamic <: promoted` fails every
+    // non-top entry, so a spelled promotion demotes exactly like the
+    // official's `isSubtypeOf(writtenType, promoted)` answers over the
+    // real type. The InvalidType recovery (`x ??= unresolvable()`,
+    // `x = nowhere()`) is not resurrected here — it keeps the chain
+    // through the resolved back-end's subtype below, whose 0c arm answers
+    // `Invalid <: promoted` vacuously true (subtype.dart:274) on a
+    // *spelled* invalid face, never through the opaque marker.
     if written.base == Base::Unknown {
-        return true;
+        return entry.base == Base::Unknown;
     }
     // The nullability stand-in for the name-level subtype below: a
     // NULLABLE written value never covers a NON-NULL promotion (official

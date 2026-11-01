@@ -183,17 +183,29 @@ pub(crate) struct Boundary {
     pub(crate) bound: (Ty, u32),
 }
 
-/// The closed-declaration facts a switch scrutinee's always-exhaustive
-/// verdict reads (upstream `TypeSystem.isAlwaysExhaustive`,
-/// type_system.dart:846-888), captured at record time from the unit's own
+/// The closed-declaration facts the switch faces read: the scrutinee's
+/// always-exhaustive verdict (upstream `TypeSystem.isAlwaysExhaustive`,
+/// type_system.dart:846-888) and the pattern cover question's
+/// extension-type erasure, captured at record time from the unit's own
 /// container declarations. A declaration parsed after the executable that
 /// reads it arrives too late — the under-report direction (the verdict
-/// answers `false`, keeping the post-switch state live).
+/// answers `false`, the cover keeps its name-level answer, keeping the
+/// post-switch state live).
 #[derive(Default)]
 pub(crate) struct ClosedNames {
     /// Interned name ids of the unit's `sealed` classes and enums (enums
     /// are sealed by construction, static_type.dart:67).
     pub(crate) names: rustc_hash::FxHashSet<u32>,
+    /// The unit's extension-type declarations: the declared name's id →
+    /// its representation type as written, beside the representation's
+    /// written-argument tree. The pattern cover question erases both
+    /// sides through this map before the subtype verdict (upstream
+    /// `extensionTypeErasure`, type_system.dart:42-63;
+    /// `coversMatchedType`, flow_analysis.dart:6394-6397) — an extension
+    /// type is a subtype of its representation (subtype.dart's
+    /// declared-interfaces arm, :107-114), so a representation-typed case
+    /// covers the extension-type scrutinee.
+    pub(crate) extension_reps: rustc_hash::FxHashMap<u32, (Ty, u32)>,
     /// `bool`'s interned id — `isDartCoreBool` is a name check at this
     /// level; `None` until the recorder interns it.
     pub(crate) bool_name: Option<u32>,
