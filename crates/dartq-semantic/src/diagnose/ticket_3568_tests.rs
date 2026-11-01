@@ -163,3 +163,34 @@ fn bare_statement_eq_operand_miss_reports() {
     );
 }
 
+// —— corpus-shaped over-report guards (#3568 census repair): every row the
+// —— sweep must NOT fabricate — an assignment target's `x = .m()`, a type-
+// —— parameter formal (`C<T>`'s `T`), the `if (` condition, and a left-of-
+// —— `==` shorthand — upstream reads `'_'`/`missing_context` or a context
+// —— this walk cannot re-derive; all keep the under-report.
+#[test]
+fn over_report_guards_stay_silent() {
+    for source in [
+        // `x = .m()` — an assignment, never the declaration's window.
+        "void f() { int x = 0; x = .m(); }\n",
+        // `C(this.x)`'s formal `x: T` — `T` is `C`'s type parameter; the
+        // substitution `T = C` lives in inference, not the written formal.
+        "class C<T> { T x; C(this.x); }\nvoid f() { C<C> c = .new(.member()); }\n",
+        // `if (` arms no shorthand context — `.a` reads `'_'` upstream and
+        // the read arm's verdict is `missing_context` (unimplemented).
+        "void f() { if (.a) {} }\n",
+        // `.new() == C()` — the left shorthand's own context is `'_'`; the
+        // right operand reads `'_'` too (upstream does not push the left
+        // operand's type for a shorthand left).
+        "class C { C(); }\nvoid f() { bool b = .new() == C(); }\n",
+    ] {
+        let r = report_ops(source);
+        assert!(
+            !has_shorthand_row(&r),
+            "no fabricated `dot_shorthand_undefined_member`: {source:?} -> {:?}",
+            rows(&r)
+        );
+    }
+}
+
+
