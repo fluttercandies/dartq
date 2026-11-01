@@ -100,9 +100,20 @@ impl Ty {
         base: Base::Dynamic,
         nullable: false,
     };
+    /// The null literal's type — `Null` itself, NOT `Null?`.
+    ///
+    /// Dart's `Null` is the type of the single value `null` and carries no
+    /// `?` suffix of its own (`Null?` and `Null` are the same type, and the
+    /// analyzer's `Null` has `NullabilitySuffix.none` —
+    /// `type_system.dart:1255`'s `isStrictlyNonNullable` short-circuits on
+    /// `type.isDartCoreNull` before the suffix check). Marking it nullable
+    /// made `null <: Null` false at the name level, so every coverage
+    /// question that compares a null-literal matched value against a `Null`
+    /// required type (`if (null case Null v)`, `switch (null) { case Null(): }`)
+    /// answered "may fail" and kept an else branch upstream reports dead.
     pub const NULL: Ty = Ty {
         base: Base::Null,
-        nullable: true,
+        nullable: false,
     };
     pub const NEVER: Ty = Ty {
         base: Base::Never,

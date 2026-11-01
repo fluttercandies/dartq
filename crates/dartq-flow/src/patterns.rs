@@ -889,13 +889,39 @@ impl Interp<'_> {
             // The non-reference scrutinee's vacuous cover defers exactly
             // like the reference one below: the property sub-patterns
             // decide at the pattern's close.
-            if let Some((ty, frame_args)) = self.frame_scrutinee_ty()
+            if let Some((ty, frame_args)) = self.scrutinee_static_ty()
                 && self
                     .ops
                     .is_invalid_typed(ty, frame_args, self.args, self.names)
             {
                 self.defer_vacuous_object_cover(name);
                 return;
+            }
+            // The `cannotMatch` verdict (`promoteForPattern`'s
+            // `classifyType` legs, flow_analysis.dart:6360-6383): a
+            // null-or-equivalent matched value can never match a
+            // non-nullable head (and the mirror pair) under sound flow.
+            // The verdict is a classification question on the matched
+            // value's STATIC type — upstream builds a synthetic reference
+            // from it — so a standalone context's non-reference scrutinee
+            // answers it too. It kills the MATCHED arm only: the
+            // `matchFailsIfWrongType` join below still feeds the failure
+            // path (upstream's `_current.setUnreachable()` sits beside,
+            // never instead of, the `_unmatched` join).
+            //
+            // The switch kinds are deliberately excluded: their chain and
+            // post-switch reachability are joined by the switch tracker
+            // (`interp_stmt.rs`'s `switch_exhaustive_verdict` join), which
+            // is outside this lane's file partition. Applying the verdict
+            // here without that join deads the code AFTER a
+            // non-exhaustive switch whose only clause cannot match —
+            // residual, tracked with the L-B report.
+            let live = self.current.clone();
+            if self.sound_flow
+                && let Some((ty, _)) = self.standalone_scrutinee_ty()
+                && self.disjoint_by_nullability(ty, known)
+            {
+                self.unreachable_cur();
             }
             // The official `promoteForPattern` runs for a non-reference
             // matched value too (`switch (this.state)` — a property
@@ -908,17 +934,16 @@ impl Interp<'_> {
             // alternative of the switch reads dead (riverpod's
             // `notifier_provider.dart` `_callEncode` — cases after the
             // first went DEAD_CODE). The covers gate is the same subtype
-            // verdict the reference path runs below, over the frame's
-            // latched scrutinee type; the raw pattern head already spells
+            // verdict the reference path runs below, over the latched
+            // scrutinee type; the raw pattern head already spells
             // the required type, and no latched type at all may always
             // fail, so both directions join.
-            let covered = self.frame_scrutinee_ty().is_some_and(|(ty, frame_args)| {
+            let covered = self.scrutinee_static_ty().is_some_and(|(ty, frame_args)| {
                 self.ops
                     .is_subtype_typed(ty, frame_args, known, args, self.args, self.names)
             });
             if !covered {
-                let cur = self.current.clone();
-                self.join_unmatched(cur);
+                self.join_unmatched(live);
             }
             // The dotted-read channel: a promotable property scrutinee
             // (`switch (x.y)` — official `promoteForPattern` runs the same
@@ -1245,6 +1270,39 @@ impl Interp<'_> {
             })
     }
 
+    /// The matched value's STATIC type for a NON-reference scrutinee — the
+    /// face the official `promoteForPattern` reads
+    /// (`flow_analysis.dart:6350-6394`). Upstream never asks the matched
+    /// value for a promotable reference: it builds a *synthetic* reference
+    /// from `matchedType` (`context.createReference(matchedType,
+    /// _current)`), so the coverage and `cannotMatch` verdicts are pure type
+    /// questions and answer for a literal, a select, and a call exactly
+    /// like for a variable.
+    ///
+    /// A statement/expression switch latches the scrutinee's type on its
+    /// frame; a standalone context (if-case, pattern declaration) carries
+    /// the peeked expression's own `(ty, args)` instead. Both are the same
+    /// question, so one accessor answers it — reading only the switch frame
+    /// left every standalone non-reference pattern (`if (null case Null v)`)
+    /// answering "no matched type", which fell into the may-fail join and
+    /// kept the else branch live.
+    fn scrutinee_static_ty(&self) -> Option<(Ty, u32)> {
+        self.frame_scrutinee_ty().or_else(|| self.standalone_scrutinee_ty())
+    }
+
+    /// The standalone contexts' (if-case, pattern declaration) matched-value
+    /// type — the peeked scrutinee expression's own `(ty, args)`. A switch
+    /// carries the same face on its frame ([`Self::frame_scrutinee_ty`]);
+    /// this accessor exists for the verdicts that must stay off the switch
+    /// path (see [`Self::non_var_invalid_scrutinee_covers`]'s `cannotMatch`
+    /// note).
+    fn standalone_scrutinee_ty(&self) -> Option<(Ty, u32)> {
+        self.pattern
+            .as_ref()
+            .filter(|p| matches!(p.kind, PatternKind::IfCase | PatternKind::Decl))
+            .and_then(|p| p.scrutinee_ty)
+    }
+
     /// Whether the open standalone context (if-case, declaration) matches a
     /// non-reference value whose static type is the invalid face.
     fn standalone_scrutinee_invalid(&self) -> bool {
@@ -1289,7 +1347,7 @@ impl Interp<'_> {
     /// live-init posture (the may-fail question has no flow-visible
     /// answer without a promotable reference).
     fn non_var_invalid_scrutinee_covers(&mut self, declared: Ty, declared_args: u32) {
-        if let Some((ty, args)) = self.frame_scrutinee_ty()
+        if let Some((ty, args)) = self.scrutinee_static_ty()
             && self.ops.is_invalid_typed(ty, args, self.args, self.names)
         {
             self.vacuous_cover_kills_chain();
@@ -1303,6 +1361,24 @@ impl Interp<'_> {
         if self.standalone_scrutinee_invalid() {
             return;
         }
+        // The `cannotMatch` verdict (`promoteForPattern`'s `classifyType`
+        // legs, flow_analysis.dart:6360-6383): a null-or-equivalent
+        // matched value can never match a non-nullable required type (and
+        // the mirror pair) under sound flow. Both legs are classification
+        // questions on the matched value's STATIC type — no reference
+        // involved — so a standalone if-case's non-reference scrutinee
+        // answers them the same. The verdict kills the MATCHED arm only;
+        // the failure join below still runs on the pre-verdict state
+        // (upstream keeps the join beside `_current.setUnreachable()`,
+        // never behind it). Switch kinds are excluded for the reason given
+        // in [`Interp::matched_object_pattern`].
+        let live = self.current.clone();
+        if self.sound_flow
+            && let Some((ty, _)) = self.standalone_scrutinee_ty()
+            && self.disjoint_by_nullability(ty, declared)
+        {
+            self.unreachable_cur();
+        }
         // A property scrutinee's type test is refutable like a variable's
         // (the non-var face joins the same `_unmatched` —
         // [`Self::matched_object_pattern`]'s covered gate): a frame-latched
@@ -1312,7 +1388,7 @@ impl Interp<'_> {
         // folds its else dead without the join). No latched type at all
         // may always fail, so it joins too.
         if self.pattern.is_some() {
-            let covered = self.frame_scrutinee_ty().is_some_and(|(ty, frame_args)| {
+            let covered = self.scrutinee_static_ty().is_some_and(|(ty, frame_args)| {
                 self.ops.is_subtype_typed(
                     ty,
                     frame_args,
@@ -1323,8 +1399,7 @@ impl Interp<'_> {
                 )
             });
             if !covered {
-                let cur = self.current.clone();
-                self.join_unmatched(cur);
+                self.join_unmatched(live);
             }
         }
     }
