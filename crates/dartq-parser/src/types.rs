@@ -289,11 +289,17 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
         if self.is_generalized_function_type_at(0) {
             // `Function(...)` with no return type (computeNoTypeGFT,
-            // type_info_impl.dart:747): computeRest is anchored at
-            // beforeStart, one token before `Function`.
+            // type_info_impl.dart:744). The official computeRest is anchored
+            // at beforeStart, whose successor is the `Function` itself, so
+            // its leading-`?` probe never fires and the suffix scan opens ON
+            // `start`; enter the scan there directly. A `start - 1` anchor
+            // through `compute_rest` collapses onto `start` when the type
+            // opens the file (`start` = 0) — the scan then opened on the `(`
+            // and the type degraded to the bare `Function` name, so the
+            // oracle-silent `Function(int) g() {}` read `g` as the member's
+            // body-less follower and reported `missing_function_body` at it.
             let mut complex = self.complex_from_here(TypeParamOrArg::None);
-            let from = complex.start.saturating_sub(1);
-            complex.compute_rest(self, from, required);
+            complex.compute_function_suffixes(self, complex.start, required);
             if complex.gft_has_return_type.is_none() {
                 return if required {
                     TypeInfo::Simple
@@ -765,5 +771,121 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             gft_return_type_has_record_type: false,
             recovered,
         }
+    }
+}
+
+/// Ticket #3489 — a bare `Function(...)` type (no return type,
+/// `computeNoTypeGFT`) that OPENS the file. Every pin was verified against
+/// the oracle (Dart SDK 3.13.7 `dart analyze --format=json` on the one-line
+/// file as a package `lib/` member): the parser tier owns zero rows on the
+/// silent shapes (the oracle's only rows there are the semantic
+/// `return_of_invalid_type` / `body_might_complete_normally`, not this
+/// tier's), and the body-less shape reports exactly at the `;`.
+#[cfg(test)]
+mod tests {
+    use crate::tests::collector::{Collector, Logged, setup};
+
+    fn parse(source: &'static str) -> Collector {
+        let mut p = setup(source);
+        p.parse_unit();
+        std::mem::take(p.listener)
+    }
+
+    /// A silent parse that committed `count` generalized function types:
+    /// `count` `begin_function_type` events, the no-return-type
+    /// `handle_no_type`, `count` `end_function_type` events — the
+    /// `ComplexTypeInfo.parseType` two-pass shape (type_info_impl.dart:616).
+    fn assert_silent_gft(source: &'static str, count: usize) {
+        let c = parse(source);
+        assert!(c.errors.is_empty(), "rows for {source:?}: {:?}", c.errors);
+        let mut expected: Vec<Logged> = vec![("begin", "function_type"); count];
+        expected.push(("handle", "no_type"));
+        expected.extend(std::iter::repeat_n(("end", "function_type"), count));
+        c.assert_sequence(&expected);
+        let begins = c
+            .log
+            .iter()
+            .filter(|e| **e == ("begin", "function_type"))
+            .count();
+        assert_eq!(begins, count, "function types for {source:?}; log: {:?}", c.log);
+    }
+
+    #[test]
+    fn bare_gft_return_type_with_arrow_body_opens_the_file() {
+        // Oracle 3.13.7: parser-tier silent (the sole row is the semantic
+        // `return_of_invalid_type` at `null`). The defect reported
+        // `missing_function_body` at `g` (offset 14).
+        assert_silent_gft("Function(int) g() => null;\n", 1);
+    }
+
+    #[test]
+    fn bare_gft_return_type_with_block_body_opens_the_file() {
+        // Oracle 3.13.7: parser-tier silent (the sole row is the semantic
+        // `body_might_complete_normally` at `}`).
+        assert_silent_gft("Function(int) g() {}\n", 1);
+    }
+
+    #[test]
+    fn nullable_bare_gft_field_list_opens_the_file() {
+        // Oracle 3.13.7: zero diagnostics. The defect reported
+        // `missing_function_body` + `expected_executable` at the `?` and
+        // `missing_const_final_var_or_type` at `f1`.
+        assert_silent_gft("Function()? f1, f2;\n", 1);
+    }
+
+    #[test]
+    fn generic_bare_gft_opens_the_file() {
+        // Oracle 3.13.7: parser-tier silent for both; the `<T>` group is
+        // the validated skip before the `(` probe (type_info_impl.dart
+        // :1097-1101).
+        assert_silent_gft("Function<T>(T) g() {}\n", 1);
+        assert_silent_gft("Function<T>(T)? f1, f2;\n", 1);
+    }
+
+    #[test]
+    fn chained_bare_gft_opens_the_file() {
+        // Oracle 3.13.7: parser-tier silent for both; the first `Function`
+        // IS `start`, so `gftHasReturnType` latches `false` and the second
+        // suffix extends the same type (:1121-1122).
+        assert_silent_gft("Function(int) Function(String) g() {}\n", 2);
+        assert_silent_gft("Function()? Function() g() {}\n", 2);
+    }
+
+    #[test]
+    fn bare_gft_after_a_declaration_is_unchanged() {
+        // Control: the same shape past offset 0 parsed correctly before the
+        // fix (the `start - 1` anchor only collapsed at the file head).
+        // Oracle 3.13.7: parser-tier silent.
+        assert_silent_gft("int x = 0;\nFunction(int) g() {}\n", 1);
+    }
+
+    #[test]
+    fn body_less_bare_gft_function_reports_at_the_semicolon_only() {
+        // Oracle 3.13.7: exactly one `missing_function_body` at 1:18 len 1
+        // — the `;` (offset 17). The defect added a second row at `g`
+        // (offset 14).
+        let c = parse("Function(int) g();\n");
+        assert_eq!(
+            c.errors,
+            vec![("missing_function_body".to_owned(), 17, 18)],
+            "log: {:?}",
+            c.log
+        );
+    }
+
+    #[test]
+    fn function_as_the_declaration_name_stays_a_name() {
+        // Oracle 3.13.7: zero diagnostics — `Function() {}` declares a
+        // function NAMED `Function` (the optional-position follower `{`
+        // is no name, so the suffix loop breaks: "`Function` used as the
+        // name in a function declaration", type_info_impl.dart:1109-1118).
+        // No generalized function type may be committed.
+        let c = parse("Function() {}\n");
+        assert!(c.errors.is_empty(), "rows: {:?}", c.errors);
+        assert!(
+            !c.log.contains(&("begin", "function_type")),
+            "a function type was committed; log: {:?}",
+            c.log
+        );
     }
 }

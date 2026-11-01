@@ -390,13 +390,31 @@ impl ComplexType {
                 return;
             }
         }
-        let mut offset = parser.offset_of(from);
+        let mut offset = from_offset;
         if parser.kind_at(offset + 1) == TokenKind::Question {
             self.before_question = Some(parser.real_id(offset));
             self.end = parser.real_id(offset + 1);
             offset += 1;
         }
-        offset += 1;
+        self.compute_function_suffixes(parser, parser.real_id(offset + 1), required);
+    }
+
+    /// The `Function` loop of `computeRest` (`type_info_impl.dart:1094-1133`)
+    /// opening ON `at`: every `Function [<...>] (...)` suffix (each with its
+    /// own trailing `?`) extends the type. [`Self::compute_rest`] enters it
+    /// past the type-so-far and its `?`; `computeNoTypeGFT` (:744) enters it
+    /// at the type's own first token — the official anchor there is
+    /// `beforeStart`, whose successor is the `Function` itself, so the
+    /// leading-`?` probe is structurally a no-op and only this loop runs. The
+    /// cursor model has no before-token when the type opens the file, so
+    /// that arm cannot be expressed through `compute_rest`. Read-only.
+    pub(crate) fn compute_function_suffixes(
+        &mut self,
+        parser: &Parser<'_, '_, '_, impl ParserListener>,
+        at: TokenId,
+        required: bool,
+    ) {
+        let mut offset = parser.offset_of(at);
         while parser.kind_at(offset) == TokenKind::Keyword(Keyword::Function) {
             let type_variable_start = parser.real_id(offset);
             // Official: `token = computeTypeParamOrArg(token, true).skip(token);
@@ -450,7 +468,6 @@ impl ComplexType {
                 offset += 1;
             }
         }
-        let _ = required;
     }
 
     /// `computeSimpleWithTypeArguments` (`type_info_impl.dart:1048`).
