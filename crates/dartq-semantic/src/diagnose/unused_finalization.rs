@@ -2487,10 +2487,157 @@ impl<'a> Engine<'a> {
         // receiver's access resolving nothing still released the row.
         self.used_names = element_used;
         self.credit_forward_references();
+        self.report_pattern_assignment_binders();
         self.drop_pre_feature_underscore_locals();
         self.suppress_same_line_ignored_usage();
         self.report_unused_imports();
         self.report_deprecated_sdk_libraries();
+    }
+
+    /// The assignment-pattern declaring binder face (#3302): a variable
+    /// pattern that carries `var`/`final` or a written type inside a
+    /// pattern ASSIGNMENT (`(var a) = 1;`, `((a, var b) && r) = (1, 2);`)
+    /// is the compile-time error the parser reports
+    /// (`pattern_assignment_declares_variable`), yet the analyzer mints a
+    /// local element for the binder all the same. That element enters no
+    /// scope — the rest of the block keeps resolving the outer spelling —
+    /// so nothing can ever read it and the unused verifier reports
+    /// `unused_local_variable` at the binder name, at the very range the
+    /// error carries (oracle 3.13.7: a same-spelled read before or after
+    /// the assignment spares nothing, and a wildcard spelling is spared by
+    /// the same `_isNamedWildcard` arms the frame close applies).
+    ///
+    /// The parse-side ledger has no entry to read here: an
+    /// assignment-context binder reaches `handle_declared_variable_pattern`
+    /// but registers no local (that arm is the bare-identifier pattern,
+    /// which declares nothing), so this face re-derives its population
+    /// from the token stream. A plain `=` whose shortest balanced left
+    /// suffix is one bracket expression is a pattern assignment (an
+    /// initializer list's `:`, a `for` head's unterminated group and a
+    /// declaration's own `var (…)` head all fail the balance or the
+    /// declaration-head guard), and inside that span a `var`/`final` head
+    /// or a written-type run at a pattern-element position declares the
+    /// name it introduces. A repeated spelling inside one pattern reports
+    /// once (the first binder — the duplicate already reports
+    /// `duplicate_variable_pattern`).
+    fn report_pattern_assignment_binders(&mut self) {
+        let local = SemanticCode::UnusedLocalVariable;
+        let local_info = local.code_info();
+        let tokens = self.tokens.as_slice();
+        let mut rows: Vec<(SourceRange, StringId)> = Vec::new();
+        let mut staged: FxHashSet<u32> = self
+            .report
+            .usage
+            .iter()
+            .filter(|row| row.code == local_info)
+            .map(|row| row.range.offset)
+            .collect();
+        for (eq, token) in tokens.iter().enumerate() {
+            if token.kind != dartq_scanner::TokenKind::Eq {
+                continue;
+            }
+            let Some((start, end)) = pattern_span_left_of(tokens, eq) else {
+                continue;
+            };
+            if start >= end
+                || start
+                    .checked_sub(1)
+                    .is_some_and(|at| declaration_head(tokens[at].kind))
+            {
+                continue;
+            }
+            let mut seen: FxHashSet<StringId> = FxHashSet::default();
+            for at in start..end {
+                let Some((name_at, name)) = self.declaring_binder_at(tokens, start, at) else {
+                    continue;
+                };
+                if self.is_wildcard(name) || !seen.insert(name) {
+                    continue;
+                }
+                let name_token = &tokens[name_at];
+                let length: u32 = self
+                    .source
+                    .get(name_token.byte_range())
+                    .map(|text| text.chars().map(char::len_utf16).sum::<usize>())
+                    .and_then(|length| u32::try_from(length).ok())
+                    .unwrap_or(0);
+                let range = SourceRange {
+                    offset: name_token.utf16_offset,
+                    length,
+                };
+                if staged.insert(range.offset) {
+                    rows.push((range, name));
+                }
+            }
+        }
+        for (range, name) in rows {
+            let text = self.strings.resolve(name).to_string();
+            self.stage_usage(local, range, &text);
+        }
+    }
+
+    /// The declaring binder introduced at token `at` inside the pattern
+    /// span `start..`: `var a` / `final a` (the keyword declares the next
+    /// identifier) or a written-type leaf (`int a`, `List<int> a`). The
+    /// head must sit at a pattern-element position — right after a
+    /// sub-pattern opener, a field/positional separator, or a
+    /// logical-and/or junction — so an ordinary `a b` adjacency (a named
+    /// field's value, a call's arguments) never reads as a declaration.
+    /// A bare identifier is an ASSIGNED variable, never a binder.
+    fn declaring_binder_at(
+        &self,
+        tokens: &[dartq_scanner::Token],
+        start: usize,
+        at: usize,
+    ) -> Option<(usize, StringId)> {
+        use dartq_scanner::{Keyword, TokenKind};
+        let previous = at.checked_sub(1).filter(|&i| i >= start)?;
+        if !pattern_element_position(tokens[previous].kind) {
+            return None;
+        }
+        let name_at = match tokens[at].kind {
+            TokenKind::Keyword(Keyword::Var | Keyword::Final) => at + 1,
+            TokenKind::Identifier => {
+                // `int a` / `List<int> a`: the written type's run ends at
+                // the declared name. A name that is not an identifier
+                // (another operator, a call's `(`) is a type use, not a
+                // variable pattern.
+                let mut cursor = at + 1;
+                if tokens.get(cursor).map(|t| t.kind) == Some(TokenKind::Lt) {
+                    let mut depth = 0i32;
+                    while let Some(token) = tokens.get(cursor) {
+                        match token.kind {
+                            TokenKind::Lt => depth += 1,
+                            TokenKind::Gt => {
+                                depth -= 1;
+                                cursor += 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                                continue;
+                            }
+                            TokenKind::GtGt => {
+                                depth -= 2;
+                                cursor += 1;
+                                if depth <= 0 {
+                                    break;
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+                }
+                cursor
+            }
+            _ => return None,
+        };
+        if tokens.get(name_at).map(|t| t.kind) != Some(TokenKind::Identifier) {
+            return None;
+        }
+        let name = self.source.get(tokens[name_at].byte_range());
+        Some((name_at, self.intern(name?)))
     }
 
     /// The forward-reference credit (`referenced_before_declaration`,
@@ -5888,6 +6035,79 @@ fn normalize_deprecation(message: &str) -> Option<String> {
     } else {
         Some(format!("{message}."))
     }
+}
+
+/// The shortest bracket-balanced token run ending at the `=` at `eq`: the
+/// left side of a candidate pattern assignment. Walking back from the `=`
+/// the running bracket depth returns to zero at the run's own head — the
+/// opener for a bracketed pattern (`(var a)`, `[var a]`, `{…}`), or the
+/// very first token for a bare expression (`x = …`, where the span is the
+/// single identifier and no binder can hide). An opener at depth zero
+/// (the `(` of a `for` head, whose group never closes before the `=`)
+/// settles below zero and the run is refused, so an ordinary initializer
+/// never reads as a pattern.
+fn pattern_span_left_of(tokens: &[dartq_scanner::Token], eq: usize) -> Option<(usize, usize)> {
+    use dartq_scanner::TokenKind;
+    // One pattern's left side never spans more tokens than this; the cap
+    // keeps a pathological `=` from walking the whole unit.
+    const BACKWARD_CAP: usize = 4096;
+    let floor = eq.saturating_sub(BACKWARD_CAP);
+    let mut depth = 0i32;
+    let mut at = eq;
+    while at > floor {
+        at -= 1;
+        match tokens[at].kind {
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => depth += 1,
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return None;
+        }
+        if depth == 0 {
+            return Some((at, eq));
+        }
+    }
+    None
+}
+
+/// Whether a token at this shape opens a pattern element position: the
+/// head of a sub-pattern, a positional/named separator, or a logical-and
+/// (`&&`) / logical-or (`||`) junction — the only places a variable
+/// pattern may start.
+fn pattern_element_position(kind: dartq_scanner::TokenKind) -> bool {
+    use dartq_scanner::TokenKind;
+    matches!(
+        kind,
+        TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::Comma
+            | TokenKind::Colon
+            | TokenKind::AmpersandAmpersand
+            | TokenKind::BarBar
+    )
+}
+
+/// Whether the token immediately preceding the candidate span makes the
+/// group a DECLARATION pattern's head (`var (a, b) = …`, `final […] = …`)
+/// — those bind through the frame close and the all-or-nothing pattern
+/// group, never through the assignment face. Only the declaration
+/// keywords qualify: a constructor-pattern head (`Square(…) = …`) is an
+/// identifier and belongs to the assignment face like any other pattern.
+fn declaration_head(kind: dartq_scanner::TokenKind) -> bool {
+    use dartq_scanner::{Keyword, TokenKind};
+    matches!(
+        kind,
+        TokenKind::Keyword(
+            Keyword::Var
+                | Keyword::Final
+                | Keyword::Const
+                | Keyword::Late
+                | Keyword::External
+                | Keyword::Covariant
+        )
+    )
 }
 
 #[cfg(test)]

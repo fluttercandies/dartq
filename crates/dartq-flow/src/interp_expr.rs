@@ -2646,14 +2646,32 @@ impl Interp<'_> {
                     // the enum), where this layer's own callee read is an
                     // unknown face. Adopt it so a switch whose scrutinee
                     // is the call answers the always-exhaustive verdict
-                    // on the real return. A null-shorted chain stays out:
-                    // the official `?.`-call result carries the short's
-                    // own `?` on top of the declared return, a face the
-                    // staged row does not spell — keeping the unknown
-                    // under-reports exactly as before.
+                    // on the real return. The signature-unknown function
+                    // face joins the unknown reads: a callable-typed local
+                    // or parameter reads as [`Base::Function`], which by
+                    // contract spells the head only — its return type is
+                    // the semantic layer's answer, so the staged row is
+                    // the sole source of the invocation's static type.
+                    // Without it the call keeps the function type itself:
+                    // `null == nf()` over a `Null Function()` parameter
+                    // folds the comparison `false` (then-branch dead where
+                    // the else is) and `v == nf()` over a non-nullable `v`
+                    // folds nothing at all. A null-shorted chain stays
+                    // out: the official `?.`-call result carries the
+                    // short's own `?` on top of the declared return, a
+                    // face the staged row does not spell — keeping the
+                    // unknown under-reports exactly as before.
                     let callee_key = callee.callee_span.or(callee.read_span);
                     if callee.chain_base.is_none()
-                        && matches!(callee.ty, Ty::UNKNOWN | Ty::UNKNOWN_NULLABLE)
+                        && matches!(
+                            callee.ty,
+                            Ty::UNKNOWN
+                                | Ty::UNKNOWN_NULLABLE
+                                | Ty {
+                                    base: Base::Function,
+                                    nullable: false,
+                                }
+                        )
                         && let Some(span) = callee_key
                         && let Some(&(ty, args)) = self.staged_calls.get(&span.range.offset)
                     {
