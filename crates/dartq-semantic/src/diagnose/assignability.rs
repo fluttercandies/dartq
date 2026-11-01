@@ -3259,6 +3259,20 @@ impl<'a> Engine<'a> {
             }
             _ => self.assignment_target_ty(&target_row),
         };
+        // An unannotated collection literal's row is opaque (`Unknown`):
+        // the target's write type is the context that types it, and a
+        // context its head cannot match leaves the leaves' own upward type
+        // (#3424, [`Self::untyped_literal_ty`]). The literal anchors at its
+        // own brackets — the window's first row is its first leaf, never
+        // the `[`/`{` the oracle's `.at(rightHandSide)` starts at.
+        let range = if from == Ty::Unknown
+            && let Some((ty, anchor)) = self.untyped_literal_ty(&rhs_row, to, range.offset)
+        {
+            from = ty;
+            anchor
+        } else {
+            range
+        };
         // The invalid-source gate (upstream `InvalidType`): a right side
         // whose written head resolves to no type asks no assignability
         // question (probed 3.47.1: `expression = parent` with `AstNode?
@@ -3541,6 +3555,30 @@ impl<'a> Engine<'a> {
         {
             from = self.fn_sig_ty(&sig);
         }
+        // An unannotated collection literal's row is opaque (`Unknown`):
+        // the declared type is the context that types it, and a context
+        // its head cannot match leaves the leaves' own upward type (#3424
+        // — `C<int> c = {3, 1, 4}` over `C<T> implements
+        // LinkedHashSet<T>` asks `Set<int>` against `C<int>`). The stage
+        // anchors at the literal's own span, `const` included (the empty
+        // `[]`'s row is a zero-width `[`, never the oracle's node); the
+        // window's first row proves the literal opens the initializer.
+        let mut anchor = row.range;
+        if from == Ty::Unknown && self.untyped_literals.contains_key(&row.range.offset) {
+            let first = self.rows[mark..]
+                .iter()
+                .find(|candidate| {
+                    !matches!(candidate.shape, RowShape::TypeUse(..))
+                        && !self
+                            .interpolation_child_rows
+                            .contains(&candidate.range.offset)
+                })
+                .map_or(row.range.offset, |candidate| candidate.range.offset);
+            if let Some((ty, span)) = self.untyped_literal_ty(&row, to, first) {
+                from = ty;
+                anchor = span;
+            }
+        }
         // The invalid-source gate: a written head that resolves to no type
         // poisons the whole spelling (upstream `InvalidType`) — probed
         // 3.47.1: `int x = astNodeVal` over an undefined-class parameter
@@ -3614,9 +3652,156 @@ impl<'a> Engine<'a> {
             // (assignment_expression_resolver.dart:694-703's promoted
             // `valueType`); a row with no flow fact suppresses at the
             // teardown.
-            self.stage(StagedKind::Assignment, row.range, from, to, literal);
+            self.stage(StagedKind::Assignment, anchor, from, to, literal);
         }
         self.init_mark = None;
+    }
+
+    /// The untyped collection literal's own static type against the
+    /// declared context `to` (#3424; upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/typed_literal_resolver.dart).
+    /// The downward constraint `L<E> <: K` over the literal's head `L`
+    /// (`setupGenericTypeInference`, `K` the context's `futureOrBase`)
+    /// matches exactly when `K` is a top face or one of `L`'s own
+    /// supertypes — `List`/`Set` reach `Iterable`, every head reaches
+    /// `Object` — and the literal is then assignable by construction (its
+    /// leaves are the element verifier's rows): `None`, the opaque row
+    /// stands. A failed match leaves the arguments to the leaves' upward
+    /// inference ([`Engine::collection_literal_ty`]): `{3, 1, 4}` against
+    /// `C<int>` over `C<T> implements LinkedHashSet<T>` reads `Set<int>`,
+    /// and an empty `{}` takes its side from the context
+    /// ([`Self::empty_literal_is_set`]) — `Set<dynamic>` under
+    /// `SplayTreeSet<int>`, `Map<dynamic, dynamic>` under `int` — and the
+    /// answer carries the literal's own anchor. The literal must be the
+    /// whole right-hand side, whose window opens at the `first` row. An
+    /// invalid context, an undecidable side, and a leaf without an exact
+    /// face answer `None` as well.
+    fn untyped_literal_ty(&self, row: &Row, to: Ty, first: u32) -> Option<(Ty, SourceRange)> {
+        let kind = *self.untyped_literals.get(&row.range.offset)?;
+        // The whole-side gate: the window's first row starts inside the
+        // brackets, and nothing but a `const` keyword widens the literal's
+        // own span — a `?:`/`??` tail, a chained `y = {…}`, a cast, an
+        // `await`, a unary head, or a postfix `!` carries another
+        // expression's type and anchor. The walk starts from the bracket
+        // span itself: the empty `[]`'s row is a zero-width `[`.
+        let own = self.untyped_literal_span(row)?;
+        let span = self.staged_expression_span(own);
+        if first < own.offset || span.offset > own.offset || span.end() != own.end() {
+            return None;
+        }
+        if span.offset < own.offset
+            && self.source[self.byte_of(span.offset)..self.byte_of(own.offset)].trim_end()
+                != "const"
+        {
+            return None;
+        }
+        // `futureOrBase`: a `FutureOr<X>` context matches through `X` (its
+        // `Future<X>` leg never meets a collection head). Each step peels
+        // one written level; the bound only guards a cyclic alias fold.
+        let mut context = self.fold_alias_ty(to);
+        for _ in 0..8 {
+            let base = self.future_or_base(context);
+            if base == context {
+                break;
+            }
+            context = self.fold_alias_ty(base);
+        }
+        let object = self.intern("Object");
+        if matches!(context, Ty::Dynamic | Ty::Void)
+            || matches!(context, Ty::Named { name, .. } if name == object)
+            || self.is_invalid_ty(context)
+        {
+            return None;
+        }
+        let [list, set, map, iterable] = self.collection_heads;
+        let family = match kind {
+            UntypedLiteral::List => list,
+            UntypedLiteral::SetElements => set,
+            UntypedLiteral::MapEntries => map,
+            UntypedLiteral::EmptyBraces => {
+                if self.empty_literal_is_set(context)? {
+                    set
+                } else {
+                    map
+                }
+            }
+        };
+        if let Ty::Named { name, .. } = context
+            && (name == family || (name == iterable && family != map))
+        {
+            return None;
+        }
+        Some((self.collection_literal_ty(row, family)?, span))
+    }
+
+    /// An empty `{}`'s side under a context its head may not match
+    /// (`_fromContextType`'s `asInstanceOf(Iterable)` /
+    /// `asInstanceOf(Map)`): a set literal exactly when the context
+    /// implements `Iterable` and not `Map`; both or neither leave the
+    /// empty literal's map default. A type parameter answers through its
+    /// captured bound (`TypeParameterType.asInstanceOf` reads the bound);
+    /// function, record, `Null`, and `Never` contexts implement neither.
+    /// The implementation ask is the head-level declared walk
+    /// ([`NameWorld::decide_subtype`] — `asInstanceOf` ignores the
+    /// arguments), and a walk cut at an unmodeled head re-asks the core
+    /// face for a definite hit alone (`SplayTreeSet` implements `Set` with
+    /// no element model in reach; the core face's `false` is blind to the
+    /// modeled edges and never decides). An undecidable `Iterable` answer
+    /// is `None` unless the context provably implements `Map` (the map
+    /// side either way); a proven `Iterable` beside an undecidable `Map`
+    /// reads the set side — a type implementing both is a shape no library
+    /// declares in practice.
+    fn empty_literal_is_set(&self, context: Ty) -> Option<bool> {
+        let mut context = context;
+        // The bound chain (`T extends S`, `S extends Iterable<Object>`),
+        // bounded like every parameter-bound walk.
+        for _ in 0..4 {
+            match context {
+                Ty::Named { name, .. } if self.declared_head_is_type_param(name) => {
+                    context = self.fold_alias_ty(self.param_bound(name)?);
+                }
+                _ => break,
+            }
+        }
+        let Ty::Named { name, .. } = context else {
+            return Some(false);
+        };
+        let [list, set, map, iterable] = self.collection_heads;
+        if name == list || name == set || name == iterable {
+            return Some(true);
+        }
+        if name == map {
+            return Some(false);
+        }
+        // A bound chain deeper than the walk stays undecided.
+        if self.declared_head_is_type_param(name) {
+            return None;
+        }
+        let world = self.name_world();
+        let core_hit = |interface: StringId| {
+            implements_interface(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.strings,
+                self.lib,
+                self.file,
+                name,
+                interface,
+                false,
+            ) == Some(true)
+        };
+        let iterable_side = world
+            .decide_subtype(name, iterable)
+            .or_else(|| [iterable, set, list].into_iter().any(core_hit).then_some(true));
+        let map_side = world
+            .decide_subtype(name, map)
+            .or_else(|| core_hit(map).then_some(true));
+        match (iterable_side, map_side) {
+            (Some(true), Some(true)) | (Some(false), _) | (None, Some(true)) => Some(false),
+            (Some(true), _) => Some(true),
+            (None, _) => None,
+        }
     }
 
     /// The default-value assignability face (`invalid_assignment`,
@@ -8887,3 +9072,10 @@ mod ticket_3202_tests;
 #[cfg(test)]
 #[path = "ticket_bounds_tests.rs"]
 mod ticket_bounds_tests;
+
+// The #3424 pins (the untyped collection literal's own upward type under a
+// declared context its head cannot match — the initializer and assignment
+// faces). Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3424_tests.rs"]
+mod ticket_3424_tests;

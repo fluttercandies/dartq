@@ -3389,30 +3389,8 @@ impl<'a> Engine<'a> {
     /// bracket, latched by the listener's `untyped_literals` key — a
     /// miss is no literal at all.
     fn collection_operand_ty(&self, operand: &Row) -> Option<Ty> {
-        let kind = *self.untyped_literals.get(&operand.range.offset)?;
-        let (open_b, close_b) = match kind {
-            UntypedLiteral::List => (b'[', b']'),
-            UntypedLiteral::EmptyBraces
-            | UntypedLiteral::SetElements
-            | UntypedLiteral::MapEntries => (b'{', b'}'),
-        };
+        let (kind, open, close) = self.literal_window(operand)?;
         let bytes = self.source.as_bytes();
-        // The row/key rides the close bracket — except the empty square
-        // literal's, which sits at the `[` itself. Anything else is no
-        // literal window this face reads.
-        let mut close = self.byte_of(operand.range.offset);
-        match bytes.get(close) {
-            Some(&b) if b == close_b => {}
-            Some(&b) if b == open_b => close = matching_bracket_fwd(bytes, close)?,
-            _ => return None,
-        }
-        let open = matching_bracket_back(bytes, close)?;
-        // The walk-back's opener must be the literal's own bracket — a
-        // desynced depth (a bracket inside a leaf string) is no literal
-        // window this face reads.
-        if bytes.get(open) != Some(&open_b) {
-            return None;
-        }
         let (list, set, map) = (
             self.collection_heads[0],
             self.collection_heads[1],
@@ -3442,6 +3420,219 @@ impl<'a> Engine<'a> {
             name: head,
             nullable: false,
             args,
+        })
+    }
+
+    /// The untyped literal's bracket window `(kind, open, close)` — the
+    /// byte offsets of its own brackets. The row/key rides the close
+    /// bracket, except the empty square literal's, which sits at the `[`
+    /// itself (the parser hands the empty list's right as its own `[`).
+    /// A key miss is no literal at all; a byte that is neither bracket,
+    /// or a walk-back landing on a foreign opener (a desynced depth — a
+    /// bracket inside a leaf string), is no window either face reads.
+    fn literal_window(&self, operand: &Row) -> Option<(UntypedLiteral, usize, usize)> {
+        let kind = *self.untyped_literals.get(&operand.range.offset)?;
+        let (open_b, close_b) = match kind {
+            UntypedLiteral::List => (b'[', b']'),
+            UntypedLiteral::EmptyBraces
+            | UntypedLiteral::SetElements
+            | UntypedLiteral::MapEntries => (b'{', b'}'),
+        };
+        let bytes = self.source.as_bytes();
+        let mut close = self.byte_of(operand.range.offset);
+        match bytes.get(close) {
+            Some(&b) if b == close_b => {}
+            Some(&b) if b == open_b => close = matching_bracket_fwd(bytes, close)?,
+            _ => return None,
+        }
+        let open = matching_bracket_back(bytes, close)?;
+        (bytes.get(open) == Some(&open_b)).then_some((kind, open, close))
+    }
+
+    /// The untyped literal's own bracket span (UTF-16, the open bracket
+    /// through the close bracket) — the anchor a wrapper-free literal
+    /// reports at, `const` aside.
+    pub(crate) fn untyped_literal_span(&self, operand: &Row) -> Option<SourceRange> {
+        let (_, open, close) = self.literal_window(operand)?;
+        let (start, end) = (self.utf16_of(open), self.utf16_of(close + 1));
+        Some(SourceRange {
+            offset: start,
+            length: end - start,
+        })
+    }
+
+    /// The untyped collection literal's exact upward-inferred static type
+    /// under a context its own head cannot match (#3424 — upstream Dart
+    /// SDK source, pkg/analyzer/lib/src/dart/resolver/
+    /// typed_literal_resolver.dart `_inferListTypeUpwards` / `_toSetType`
+    /// / `_toMapType`: the failed downward constraint leaves the leaves'
+    /// static types the only bounds on the type arguments). `family` is
+    /// the head the literal resolves to — `List`, `Set`, or `Map`; an
+    /// empty `{}` takes its side from the context, which only the caller
+    /// reads — and every argument is the least upper bound of its leaves,
+    /// `dynamic` when there are none (`{}` reads `Set<dynamic>` or
+    /// `Map<dynamic, dynamic>`). Unlike [`Self::collection_operand_ty`]
+    /// (the `is` face, whose doubt folds to `dynamic` — the under-report
+    /// direction there), the assignment face prints this type in its
+    /// message, so doubt refuses: a leaf no single row spans, an unknown
+    /// leaf type, or a join [`Self::exact_leaf_lub`] cannot spell answers
+    /// `None`.
+    pub(crate) fn collection_literal_ty(&self, operand: &Row, family: StringId) -> Option<Ty> {
+        let (_, open, close) = self.literal_window(operand)?;
+        let bytes = self.source.as_bytes();
+        let mut segments = value_comma_segments(bytes, open + 1, close);
+        // A trailing comma closes the last element: its empty tail (the
+        // whole window of an empty literal) is no leaf.
+        if segments
+            .last()
+            .is_some_and(|&(start, end)| trim_value_ws(bytes, start, end) >= end)
+        {
+            segments.pop();
+        }
+        let args = if family == self.collection_heads[2] {
+            let mut keys = Vec::with_capacity(segments.len());
+            let mut values = Vec::with_capacity(segments.len());
+            for (start, end) in segments {
+                let colon = value_top_level_colon(bytes, start, end)?;
+                keys.push(self.exact_leaf_ty(bytes, start, colon)?);
+                values.push(self.exact_leaf_ty(bytes, colon + 1, end)?);
+            }
+            vec![self.exact_leaf_lub(&keys)?, self.exact_leaf_lub(&values)?]
+        } else {
+            let leaves = segments
+                .into_iter()
+                .map(|(start, end)| self.exact_leaf_ty(bytes, start, end))
+                .collect::<Option<Vec<_>>>()?;
+            vec![self.exact_leaf_lub(&leaves)?]
+        };
+        Some(Ty::Named {
+            name: family,
+            nullable: false,
+            args: self.boundary.intern_list(&args),
+        })
+    }
+
+    /// One leaf's exact static type: the row spanning exactly the trimmed
+    /// segment — the leaf expression's own node row (the last one pushed
+    /// for that span is the outermost) — read through
+    /// [`Self::operand_static_ty`]. A set or map literal's element rows
+    /// stay live; a list literal drains its own into the deferred pass-2
+    /// queue at its close, so both stacks are scanned newest-first, each
+    /// stopping below the leaf's start. A segment no single row spans (a
+    /// spread, a control-flow or null-aware element, an operator
+    /// operand), a nested untyped literal (its type is this face's own
+    /// question, never the `is` face's `dynamic`-folded answer), and an
+    /// unknown type answer `None`.
+    fn exact_leaf_ty(&self, bytes: &[u8], start: usize, end: usize) -> Option<Ty> {
+        let end = end.min(bytes.len());
+        let start = trim_value_ws(bytes, start, end);
+        let end = start + bytes[start..end].trim_ascii_end().len();
+        if start >= end {
+            return None;
+        }
+        let (s16, e16) = (self.utf16_of(start), self.utf16_of(end));
+        let exact = |row: &Row| {
+            row.range.offset == s16
+                && row.range.end() == e16
+                && !matches!(row.shape, RowShape::TypeUse(..))
+        };
+        let row = self
+            .rows
+            .iter()
+            .rev()
+            .take_while(|row| row.range.offset >= s16)
+            .find(|row| exact(row))
+            .or_else(|| {
+                self.deferred_miss_rows
+                    .iter()
+                    .rev()
+                    .take_while(|row| row.range.offset >= s16)
+                    .find(|row| exact(row))
+            })?;
+        if self.untyped_literals.contains_key(&row.range.offset) {
+            return None;
+        }
+        let ty = self.operand_static_ty(row);
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
+    /// The leaves' least upper bound where this layer spells it exactly
+    /// (upstream `TypeSystem.leastUpperBound`, the join the upward
+    /// inference folds its lower bounds to): no leaf leaves the argument
+    /// unconstrained — `dynamic`; a `dynamic` leaf absorbs the join; the
+    /// `Null` legs re-arm `?` on the join of the non-null forms. One form
+    /// keeps itself, an `Object` form absorbs every other, `int` /
+    /// `double` / `num` mixes join at `num`, and distinct `dart:core`
+    /// finals (`int`, `double`, `num`, `bool`, `String`, `Type`) share no
+    /// superinterface below `Object`. Every other mix — user classes whose
+    /// shared supertype needs the depth-ranked walk, distinct generic
+    /// instantiations, function and record shapes — and a `void`,
+    /// `Never`, or unknown leaf answer `None`.
+    fn exact_leaf_lub(&self, leaves: &[Ty]) -> Option<Ty> {
+        if leaves.is_empty() || leaves.contains(&Ty::Dynamic) {
+            return Some(Ty::Dynamic);
+        }
+        let mut nullable = false;
+        let mut forms: Vec<Ty> = Vec::new();
+        for &leaf in leaves {
+            match leaf {
+                Ty::Null => nullable = true,
+                Ty::Named {
+                    nullable: leaf_nullable,
+                    ..
+                }
+                | Ty::Record {
+                    nullable: leaf_nullable,
+                    ..
+                }
+                | Ty::Function {
+                    nullable: leaf_nullable,
+                    ..
+                } => {
+                    nullable |= leaf_nullable;
+                    let form = Self::non_null_form(leaf);
+                    if !forms.contains(&form) {
+                        forms.push(form);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let object = Ty::named(self.intern("Object"));
+        let join = match forms.as_slice() {
+            [] => return Some(Ty::Null),
+            [one] => *one,
+            _ if forms.contains(&object) => object,
+            _ => {
+                let heads = forms
+                    .iter()
+                    .map(|form| match *form {
+                        Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } => Some(name),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let ids = &self.members.primitive_ids;
+                let type_head = self.intern("Type");
+                if heads.iter().all(|head| ids[..3].contains(head)) {
+                    Ty::named(ids[2])
+                } else if heads
+                    .iter()
+                    .all(|head| ids.contains(head) || *head == type_head)
+                {
+                    object
+                } else {
+                    return None;
+                }
+            }
+        };
+        Some(if nullable {
+            Self::nullable_form(join)
+        } else {
+            join
         })
     }
 
