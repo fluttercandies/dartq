@@ -9359,6 +9359,39 @@ impl<'a> Engine<'a> {
         let Intent::Operator(_, op_range) = row.intent else {
             return;
         };
+        // A receiver expression that IS a completed send types as the
+        // invoked signature's return, never the callee's own function type
+        // (`f()[i]` resolves `[]` on `f`'s return, upstream
+        // `method_invocation_resolver.dart` reading the receiver node's
+        // `staticType` — the #3406 swap the merge-time receiver
+        // classification cannot reach through this arm). `call_ends`
+        // keys a completed send by its callee offset and the operand row
+        // keeps the callee's own span (`mark_operator` flips it in place),
+        // so the bare-callee gate is exact — a function-typed operand the
+        // send never consumed (`f[0]` on a tear-off) keeps its own face.
+        let ty = if self
+            .call_ends
+            .binary_search_by_key(&row.range.offset, |(offset, _)| *offset)
+            .is_ok()
+        {
+            match self.callable_result_of(ty) {
+                // A generic callee's result stays unsolved for the value
+                // face, but the definedness question still grounds on the
+                // DECLARED return's container — `maybeIndexable<R, W>(x)?[0]`
+                // resolves `[]` through `extension on Indexable` over the
+                // written signature's return, so the shape's own
+                // `return_ty` is the receiver face the oracle checks.
+                Some(Ty::UNKNOWN) | None => match ty {
+                    Ty::Function { shape, .. } => {
+                        self.boundary.pool().function_shape(shape).return_ty
+                    }
+                    _ => ty,
+                },
+                Some(result) => result,
+            }
+        } else {
+            ty
+        };
         let (read, write) = self.operator_spellings(row);
         let Ty::Named { name, .. } = ty else {
             match ty {
