@@ -327,7 +327,25 @@ fn argument_face(c: &mut Check<'_>) {
     };
     let formals = slice::parameter_assignments::parameter_rows(c, params);
     let pieces = c.collect_direct(arguments);
-    let ranges = slice::arguments(c, &pieces);
+    // A tear-off instantiation argument (`g(c<int>)`, `g(C()<int>)`)
+    // splits in two: the operand's pieces, then the applied
+    // `TypeArguments` with the `TypeApplication` marker the parser emits
+    // for a non-invoked group. The tail joins the operand — one argument,
+    // one formal slot — so the `is_instantiation` skip below sees the
+    // whole value. The marker is the discriminator: a collection literal's
+    // `<T>` prefix opens the next argument and carries none.
+    let mut ranges: Vec<core::ops::Range<usize>> = Vec::new();
+    for range in slice::arguments(c, &pieces) {
+        let run = &pieces[range.clone()];
+        let applied = c.kind(run[0]) == NodeKind::TypeArguments
+            && run
+                .iter()
+                .any(|&piece| c.kind(piece) == NodeKind::TypeApplication);
+        match ranges.last_mut() {
+            Some(prev) if applied => prev.end = range.end,
+            _ => ranges.push(range),
+        }
+    }
     let mut positional = 0usize;
     for range in &ranges {
         // The formal at the dispatch slot: positional by required
@@ -477,6 +495,12 @@ fn collection_face(c: &mut Check<'_>) {
             }
         }
     }
+    // An untyped literal's `NoTypeArguments` leaf sits on its own opening
+    // bracket (`parsePrimary` emits it before the literal) — inside the
+    // span, but no element's piece: kept, it would open the first
+    // element's report at the bracket (`return [c]` reporting `[c`).
+    let bracket = c.head_token(node);
+    rows.retain(|&row| !(c.kind(row) == NodeKind::NoTypeArguments && c.head_token(row) == bracket));
     rows.sort_by_key(|&row| c.byte_span(row).start);
     // The literal's own type arguments (`<void Function()>[c]`): the
     // first `Type` row under the literal's `TypeArguments` child decides

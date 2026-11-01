@@ -4,7 +4,9 @@
 //! plus the rule's doc examples), each asserted against the row the
 //! pinned `dart analyze` 3.13.7 oracle rendered (`conformance/expected.tsv`,
 //! the rule's own rows only). Every case runs before the assertion, so one
-//! report names every diverging case with its `(line, col, len)` rows.
+//! report names every diverging case with its `(line, col, len)` rows. One
+//! composed pin follows the `implicit_call_tearoffs` corpus: shapes one step
+//! past its cases, each row taken from the oracle case it composes.
 //!
 //! The sources mirror the materialized `.case` files byte-for-byte: the
 //! upstream markup cases open with an empty first line, the doc examples
@@ -380,6 +382,38 @@ fn implicit_call_tearoffs_oracle_corpus() {
             "doc_good_1",
             "class Callable {\n  void call() {}\n}\nvoid callIt(void Function() f) {\n  f();\n}\n\ncallIt(Callable().call);\n",
             &[],
+        ),
+    ];
+    assert_corpus(
+        "implicit_call_tearoffs",
+        "Implicit tear-off of the 'call' method.",
+        CASES,
+    );
+}
+
+/// The argument-slot and element-anchor faces one step past the corpus's
+/// single-argument / single-element shapes — each expected row is the
+/// oracle row of the corpus case it composes:
+///
+/// - a tear-off instantiation argument holds one formal slot: `c<int>`
+///   reports whole and the argument after it reads the next formal
+///   (`test_tearoffInstantiation_argumentToFunctionTypeParameter` +
+///   `test_simpleIdentifier_argumentToFunctionTypeParameter_instantiatedTypeArgument`);
+/// - an untyped literal's first element anchors at the element, not at the
+///   bracket, and the later elements keep their own rows
+///   (`test_simpleIdentifier_listLiteral_listOfFunctionTypeContext`).
+#[test]
+fn implicit_call_tearoffs_argument_slots_and_element_anchors() {
+    const CASES: &[Case] = &[
+        (
+            "instantiation_argument_then_value",
+            "\nvoid f(C c) {\n  g(c<int>, c);\n}\nvoid g(void Function(int) f, void Function(int) h) {}\nclass C {\n  void call<T>(T arg) {}\n}\n",
+            &[(3, 5, 6), (3, 13, 1)],
+        ),
+        (
+            "untyped_list_literal_elements",
+            "\nList<void Function()> f(C a, C b) {\n  return [a, b];\n}\nclass C {\n  void call() {}\n}\n",
+            &[(3, 11, 1), (3, 14, 1)],
         ),
     ];
     assert_corpus(
