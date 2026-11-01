@@ -9300,12 +9300,10 @@ impl ParserListener for DiagnoseListener<'_> {
             let Some(pos) = pos else {
                 continue;
             };
-            let ty = Engine::receiver_row_ty(&engine.rows[pos]);
-            let ty = if ty == Ty::UNKNOWN {
-                engine.receiver_static_ty(&engine.rows[pos])
-            } else {
-                ty
-            };
+            // `node.key.staticType` / `node.value.staticType` — the
+            // operand's composite type (see `handle_spread_expression`'s
+            // note), never the row's push-time payload.
+            let ty = engine.operand_static_ty(&engine.rows[pos]);
             if engine.strictly_non_nullable(ty) {
                 // The `_mapEntryKey`/`_mapEntryValue` uniqueNames' verbatim
                 // pair (diagnostic.g.dart invalidNullAwareMapEntryKey/Value
@@ -11415,12 +11413,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // right before the marker event fires.
         let engine = &mut self.engine;
         if let Some(pos) = engine.rows.len().checked_sub(1) {
-            let ty = Engine::receiver_row_ty(&engine.rows[pos]);
-            let ty = if ty == Ty::UNKNOWN {
-                engine.receiver_static_ty(&engine.rows[pos])
-            } else {
-                ty
-            };
+            // `node.value.staticType` — the composite type (see
+            // `handle_spread_expression`'s note): an untyped collection
+            // literal (`?[1, 2]`) answers its inferred `List`, a send its
+            // result rather than the callee's own type.
+            let ty = engine.operand_static_ty(&engine.rows[pos]);
             if engine.strictly_non_nullable(ty) {
                 // The `_element` uniqueName's verbatim pair
                 // (diagnostic.g.dart invalidNullAwareElement :9404-9415):
@@ -11569,12 +11566,28 @@ impl ParserListener for DiagnoseListener<'_> {
         if operator.range.length == 4 {
             let engine = &mut self.engine;
             if let Some(pos) = engine.rows.len().checked_sub(1) {
-                let ty = Engine::receiver_row_ty(&engine.rows[pos]);
-                let ty = if ty == Ty::UNKNOWN {
-                    engine.receiver_static_ty(&engine.rows[pos])
-                } else {
-                    ty
-                };
+                // The gate reads `node.expression.staticType` — the
+                // operand's COMPOSITE type, never the last row's push-time
+                // payload. [`Engine::operand_static_ty`] is that face: a
+                // completed send answers the callee's declared return (or
+                // the implicit `call` method's return for a callable-value
+                // callee), while the row's payload is the CALLEE's own
+                // declared type (`...?f()` over `int? f()` read
+                // `int? Function()`, strictly non-nullable, and reported a
+                // live operator); an untyped collection literal answers its
+                // inferred `List`/`Set`/`Map`, while its row is an opaque
+                // `Value` (`...?[1, 2]` never reported); a `!`-asserted
+                // read answers the assertion's rewritten non-null row type
+                // (`...?e!`); a getter/field read its declared accessor
+                // type. The `?e` element and the `{?k: v}`/`{k: ?v}`
+                // map-entry sites read the same face.
+                //
+                // Neither flow promotion nor a trailing `??` composite is
+                // reachable here: the first needs the teardown join
+                // (`Engine::read_types` fills only after pass 1), the
+                // second stages its join only when the right operand leaves
+                // a row of its own (a folded literal leaves none).
+                let ty = engine.operand_static_ty(&engine.rows[pos]);
                 if engine.strictly_non_nullable(ty) {
                     engine.emit3(
                         SemanticCode::InvalidNullAwareOperator,
