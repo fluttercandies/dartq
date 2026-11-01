@@ -20097,3 +20097,15 @@ mod ticket_3482_tests;
 #[cfg(test)]
 #[path = "ticket_3464_tests.rs"]
 mod ticket_3464_tests;
+
+// —— #3379 —— the `if-case` ELEMENT's pattern scope: the element fires a
+// —— disjoint parser event set (`begin/handle/end*ControlFlow`), so the
+// —— statement-only `pattern_scope` wiring never armed — the condition's
+// —— pattern shadows stayed unconsumed and a shadowing binder's type
+// —— overwrite outlived the element. Registered here via `#[path]`; the
+// —— module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3379_tests.rs"]
+mod ticket_3379_tests;
