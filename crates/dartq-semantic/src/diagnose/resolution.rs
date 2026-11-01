@@ -4333,18 +4333,73 @@ impl<'a> Engine<'a> {
                             ty: Ty::UNKNOWN,
                         });
                     } else {
-                        self.push_row(Row {
-                            name,
-                            range,
-                            qualified: true,
-                            shape: RowShape::TypeUse(
-                                TypeVerdict::Prefixed { prefix, local },
-                                false,
-                            ),
-                            intent: Intent::Read,
-                            write_op: None,
-                            ty: Ty::UNKNOWN,
-                        });
+                        // A real import prefix's member miss routes through
+                        // the resolver's context chain wherever a bare head
+                        // would: the dedicated codes
+                        // (`type_test_with_undefined_name`,
+                        // `cast_to_non_type`,
+                        // `non_type_as_type_argument`,
+                        // `non_type_in_catch_clause`) are the oracle's
+                        // `reportNullOrNonTypeElement` answer for `p.C`
+                        // exactly as for `C` (named_type_resolver.dart
+                        // :720-770 — the `is`/`as`/type-argument/`on`
+                        // context arms never ask the prefix question), so
+                        // the row reports `undefined_class` only in the
+                        // plain positions the `Prefixed` verdict owns (the
+                        // local-head silence and the broken-edge guard ride
+                        // its own fields). `non_type_pos` marks the `is`/`as`
+                        // operand window (`emit_operand_type_miss` consumes
+                        // it); `type_arg_miss_rows` keys the argument face;
+                        // the catch `on` row rides `catch_on_miss_rows` —
+                        // each keyed by the qualified `p.C` span the oracle
+                        // anchors (`_getErrorRange`'s prefix-through-name
+                        // default). A LOCAL prefix head keeps `Prefixed`:
+                        // its miss stays silent in every position.
+                        let catch_on =
+                            self.catch_on_miss_rows.last().copied() == Some(range.offset);
+                        if local
+                            || (!suppressed && self.type_arg_depth == 0 && !catch_on)
+                        {
+                            self.push_row(Row {
+                                name,
+                                range,
+                                qualified: true,
+                                shape: RowShape::TypeUse(
+                                    TypeVerdict::Prefixed { prefix, local },
+                                    false,
+                                ),
+                                intent: Intent::Read,
+                                write_op: None,
+                                ty: Ty::UNKNOWN,
+                            });
+                        } else {
+                            let head_range =
+                                self.pending_prefixed.map(|(head, _)| head).unwrap_or(range);
+                            let qualified = SourceRange {
+                                offset: head_range.offset,
+                                length: range.end() - head_range.offset,
+                            };
+                            if self.type_arg_depth > 0 {
+                                self.type_arg_miss_rows.push(qualified.offset);
+                            }
+                            if catch_on
+                                && let Some(key) = self.catch_on_miss_rows.last_mut()
+                            {
+                                // The listener armed the leaf offset; the
+                                // context-miss lookup keys on the row's own
+                                // offset — the qualified span's open.
+                                *key = qualified.offset;
+                            }
+                            self.push_row(Row {
+                                name,
+                                range: qualified,
+                                qualified: true,
+                                shape: RowShape::TypeUse(TypeVerdict::Missing, suppressed),
+                                intent: Intent::Read,
+                                write_op: None,
+                                ty: Ty::UNKNOWN,
+                            });
+                        }
                     }
                 } else {
                     // The prefixed type resolved: the prefix scope lookup

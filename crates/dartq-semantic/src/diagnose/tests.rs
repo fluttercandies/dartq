@@ -20035,3 +20035,18 @@ mod ticket_3429_tests;
 #[cfg(test)]
 #[path = "ticket_3460_tests.rs"]
 mod ticket_3460_tests;
+
+// The #3428 pins (the live-prefix member miss's context routing): a
+// `p.C` whose prefix resolves but whose member is absent rides
+// `reportNullOrNonTypeElement`'s context chain exactly as a bare `C` does —
+// `type_test_with_undefined_name`/`cast_to_non_type` in the operand window,
+// `non_type_as_type_argument` inside a group, `non_type_in_catch_clause`
+// on a catch `on` type — all anchored at the whole written `p.C` span,
+// while the plain positions keep the `Prefixed` verdict's
+// `undefined_class` (the local-head silence and the broken-edge guard ride
+// its fields). Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3428_tests.rs"]
+mod ticket_3428_tests;
