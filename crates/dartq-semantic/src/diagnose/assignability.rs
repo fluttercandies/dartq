@@ -7972,7 +7972,14 @@ impl<'a> Engine<'a> {
             // the enclosing class's own `E` instantiates independently of
             // this send's solve, and the oracle keeps the mismatch
             // (`StateController<dynamic>` into `StateController<ValueT>`,
-            // #2687 — `dynamic` is not a subtype of the variable).
+            // #2687 — `dynamic` is not a subtype of the variable). A
+            // WRITTEN `Never` slot is no residue either: `Never` answers
+            // `unbound_formal_head` (not primitive, not a collection head,
+            // resolves to no container) but it is a real bottom-type
+            // argument — `A<dynamic>` into `A<Never>` refuses because
+            // `dynamic <: Never` is false (#3589's co19 instantiate-to-
+            // bounds family: the I2B `Never` default lands in a written
+            // arg shape and the oracle reports `invalid_assignment`).
             if f == Ty::Dynamic
                 && matches!(
                     t,
@@ -7984,6 +7991,7 @@ impl<'a> Engine<'a> {
                 )
                 && let Ty::Named { name, .. } = t
                 && !self.type_params.contains(&name)
+                && !self.is_never_ty(t)
                 && self.unbound_formal_head(name)
             {
                 continue;
