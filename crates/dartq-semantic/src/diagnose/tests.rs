@@ -18606,5 +18606,29 @@ mod ticket_3383_tests;
 #[cfg(test)]
 #[path = "ticket_3395_tests.rs"]
 mod ticket_3395_tests;
+
+// The #3398 pins (L-D-E): `Receiver::Created` carries the creation's
+// resolved instance type (`ty: Option<Ty>`), so `member_formals_full`'s
+// Created arm walks `member_recv_env` exactly like `Receiver::Typed` —
+// `Holder<int>(x).set(v)`'s `T value` formal reads `int`, never the
+// greatest-closure face the bare head left. `ty: None` keeps the
+// pre-#3398 under-report until the construction sites populate. The pins
+// exercise the arm directly (a hand-built receiver against a collected
+// fixture) since the population sites land under a different lane.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
 #[path = "ticket_3398_tests.rs"]
 mod ticket_3398_tests;
+
+// The #3385 pins (the `arg_param_trailing_comma` family's recovered formal
+// slot): `end_formal_parameter` dropped the formal whose name token was a
+// parser-inserted synthetic (`void f(, a)`), so the signature's arity came
+// out one short and the oracle's `not_enough_positional_arguments` row went
+// missing. The slot now counts under the empty placeholder spelling while
+// staying out of the name scope. Registered here via `#[path]`; the module
+// stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3385_tests.rs"]
+mod ticket_3385_tests;

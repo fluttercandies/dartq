@@ -5691,8 +5691,22 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // null/synthetic identifier). Such a slot never joins the list's
         // name scope, so two of them never fake a duplicate.
         let name_token = name;
-        let Some((name, range)) = builder.capture_name(name) else {
-            return;
+        // A parser-inserted synthetic name is a RECOVERED slot, not a
+        // discardable one: a stray separator with nothing in front of it
+        // (`void f(, a)`, `void f(a,, b)`) or a name-less `(`-suffix
+        // formal. Upstream's `ensureIdentifier` mints the same zero-width
+        // identifier into the stream, and the recovered
+        // `SimpleFormalParameter` it names stays in the formal list — the
+        // element model counts it, so `topBadStart(, a)` requires two
+        // positional arguments (the `arg_param_trailing_comma` family's
+        // `not_enough_positional_arguments` text). The placeholder is the
+        // empty spelling (the element model's name for a null identifier)
+        // and never joins the list's name scope: `names_a_slot` reads a
+        // synthetic token as neither identifier nor keyword, so two empty
+        // slots never fake a `duplicate_definition` row.
+        let (name, range) = match builder.capture_name(name) {
+            Some(pair) => pair,
+            None => (builder.strings.intern(""), builder.span_of(name_token)),
         };
         let ty = builder.take_armed();
         // The augment capture's own formal row: the written type pair and
