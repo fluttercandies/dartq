@@ -2794,6 +2794,44 @@ impl Interp<'_> {
                         callee.args = args;
                         callee.prop = None;
                     }
+                    // A real invocation's result is never a reference
+                    // operand: the call's static type is the invoked
+                    // element's RETURN type, so `_getExpressionReference`
+                    // answers null upstream and an `is` test on the call
+                    // takes the non-reference arm. The callee flows through
+                    // as the result row, so its own variable slot must be
+                    // dropped here — `nf() is int` reads the invocation's
+                    // type, never `nf`'s declared callable type (the same
+                    // leak fed `condition_operand`, the staged-RHS write's
+                    // promoted-read arm, and `x == nf()`'s reference split).
+                    // The property slot goes with it: the invoked row is no
+                    // property read either (the staged-adoption arm already
+                    // clears it for the same reason), so `x = m()` cannot
+                    // take the promoted-property write face. The
+                    // by-construction non-null face drops too — the call
+                    // evaluates to whatever the return declares, not to the
+                    // callee variable's own proven-non-null value
+                    // (`final f = fn; f() ?? y` keeps `y` when the return
+                    // is nullable).
+                    // The gate is the argument list like the typing faces
+                    // above: a bare `Send` with no `ArgumentsEnd` before it
+                    // types no call and keeps the read's identity (a
+                    // `f<T>` tear-off never even fires `Send` — it is a
+                    // type-argument application — so the gate's real edge
+                    // is every invocation, and the check stays as the
+                    // belt-and-suspenders the sibling faces already keep).
+                    // `super(...)`/`this(...)` constructor sends carry no
+                    // variable reference to begin with (a `this`/`super`
+                    // read tracks the receiver slot, the unresolved member
+                    // read the property one), so clearing hits exactly the
+                    // callable-value head shape.
+                    if matches!(ev, Ev::Send { .. })
+                        && matches!(events.get(i.wrapping_sub(1)), Some(Ev::ArgumentsEnd { .. }))
+                    {
+                        callee.reference = None;
+                        callee.prop = None;
+                        callee.non_null_literal = false;
+                    }
                     self.exprs.push(callee);
                     // The bottom-typed result's exit (official
                     // `recordStaticType`'s `handleExit` on
