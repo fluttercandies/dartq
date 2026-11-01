@@ -72,14 +72,18 @@ fn check(c: &mut Check<'_>) {
 }
 
 /// The receiver extent directly before the selector's dot: `(first,
-/// end)` piece pair over the upstream `realTarget`. A single-piece
-/// receiver — an identifier, a `!` row, a parenthesized expression —
-/// must sit within a one-or-two token gap of the selector (`.x`,
-/// `?.x`, `!.x`, `..x`). A multi-piece member chain (`c.a` — the
-/// preceding access tiles as its own `DotAccess` marker) extends the
-/// receiver to the whole access run, the upstream `realTarget` extent
-/// (`visitPropertyAccess` reports `c.a` whole, not its last selector).
-fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32)> {
+/// end, content_end)` over the upstream `realTarget` — the extent rows
+/// and the UTF-16 offset where the receiver's own content stops (a
+/// statement-leading row adopts its statement window, so the extent's
+/// last token strictly before the selector bounds the content). A
+/// single-piece receiver — an identifier, a `!` row, a parenthesized
+/// expression — must sit within a one-or-two token gap of the selector
+/// (`.x`, `?.x`, `!.x`, `..x`). A multi-piece member chain (`c.a` —
+/// the preceding access tiles as its own `DotAccess` marker) extends
+/// the receiver to the whole access run, the upstream `realTarget`
+/// extent (`visitPropertyAccess` reports `c.a` whole, not its last
+/// selector).
+fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32, u32)> {
     let sel_span = utf16_token_span(c, selector);
     // Drop the selector's own tail: the selector identifier rides its
     // send group, whose pieces all open at the selector token.
@@ -105,11 +109,26 @@ fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32
             | NodeKind::TypeArguments
     ) && end_idx > 0
         && is_chain_piece(c, stripped[end_idx - 1])
-        && abuts(c, stripped[end_idx - 1], c.utf16_span(stripped[end_idx]).start)
+        && abuts(
+            c,
+            stripped[end_idx - 1],
+            c.utf16_span(stripped[end_idx]).start,
+        )
     {
         end_idx -= 1;
     }
     let end = stripped[end_idx];
+    // The content end of the extent's tail row: the last token strictly
+    // before the selector (the walk rides the row's own window, which
+    // may swallow the selector and the statement tail).
+    let mut content_end = c.utf16_span(end).end;
+    for token in c.unit.ast.token_range(end) {
+        let tok_end = utf16_token_span(c, token).end;
+        if tok_end >= sel_span.start {
+            break;
+        }
+        content_end = tok_end;
+    }
     if c.kind(end) == NodeKind::DotAccess {
         // The member-chain tail: the receiver extent is the run of
         // chain pieces ending at the marker (an identifier-led access
@@ -121,7 +140,20 @@ fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32
         {
             first -= 1;
         }
-        return Some((stripped[first], end));
+        return Some((stripped[first], end, content_end));
+    }
+    // A trailing null-assertion marker extends the receiver leftward to
+    // its operand: the upstream `realTarget` is the whole
+    // `PostfixExpression` (`a!` of `a!.b` reports `a!`, not the `!`).
+    if c.kind(end) == NodeKind::NonNullAssert {
+        let mut first = end_idx;
+        while first > 0
+            && is_chain_piece(c, stripped[first - 1])
+            && abuts(c, stripped[first - 1], c.utf16_span(stripped[first]).start)
+        {
+            first -= 1;
+        }
+        return Some((stripped[first], end, content_end));
     }
     if matches!(
         c.kind(end),
@@ -133,28 +165,32 @@ fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32
     ) {
         return None;
     }
-    let span = c.utf16_span(end);
-    let gap = sel_span.start.checked_sub(span.end)?;
-    (gap == 1 || gap == 2).then_some((end, end))
+    let gap = sel_span.start.checked_sub(content_end)?;
+    (gap == 1 || gap == 2).then_some((end, end, content_end))
 }
 
-/// The receiver extent's report end: an access marker's own span
-/// adopts its statement window, so the marker tail ends at its member
-/// name token (the `b` of `a.b` — the upstream `realTarget` extent).
-fn receiver_end_utf16(c: &Check<'_>, end: u32) -> u32 {
-    if c.kind(end) == NodeKind::DotAccess
-        && let Some(name) = c.field(end, PayloadField::Operator).map(|op| op + 1)
-    {
-        return utf16_token_span(c, name).end;
+/// Reads through the transparent `(...)` and trailing `!` wrapper rows
+/// to the expression root (the upstream staticType face: parens are
+/// transparent and `!` promotes — `dynamic!` stays `dynamic`).
+fn unnull(c: &Check<'_>, mut root: u32) -> u32 {
+    loop {
+        root = faces::unparenthesized(c, root);
+        if c.kind(root) != NodeKind::NonNullAssert {
+            return root;
+        }
+        let window = c.children(root);
+        if window.start >= window.end {
+            return root;
+        }
+        root = window.end - 1;
     }
-    c.utf16_span(end).end
 }
 
 /// The receiver extent's static type. A marker tail reads through the
 /// member face — the last marker's name over the extent head's site
 /// (the two-hop `realTarget`, `c.a` of `c.a.foo`; deeper chains stay
 /// the documented under-report). A bare leaf reads at its own flow
-/// row.
+/// row; wrapper tails (`(...)`, `!`) read through to the root row.
 fn receiver_ty(
     c: &Check<'_>,
     analysis: &dartq_semantic::Analysis<'_>,
@@ -168,6 +204,30 @@ fn receiver_ty(
         let name = c.field(end, PayloadField::Operator)? + 1;
         let name = analysis.strings().intern(c.lexeme(name));
         return analysis.member_type(query_site(c, run[start]), name);
+    }
+    // A childless `!` marker's operand is the preceding run piece (the
+    // marker carries no child row); a parenthesized wrapper's operand
+    // lives in its child window.
+    let mut idx = stop;
+    while c.kind(run[idx]) == NodeKind::NonNullAssert && idx > start {
+        idx -= 1;
+    }
+    let end_row = run[idx];
+    let root = unnull(c, end_row);
+    if root != end_row || idx != stop {
+        // The wrapper-collapsed root decides: an identifier root at its
+        // flow row, a root that tiles in the run over its own prefix,
+        // otherwise the wrapper row's child window as the run.
+        if c.kind(root) == NodeKind::Identifier {
+            return analysis.type_of(query_site(c, root));
+        }
+        if let Some(pos) = run.iter().rposition(|&row| row == root) {
+            return faces::expr_type(c, analysis, &run[start..=pos]);
+        }
+        let inner = c.collect_direct(end_row);
+        if !inner.is_empty() {
+            return faces::expr_type(c, analysis, &inner);
+        }
     }
     faces::expr_type(c, analysis, &run[start..=stop])
 }
@@ -226,7 +286,13 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         }
         let function = kids[fi];
         if c.kind(function) != NodeKind::Identifier {
-            let ty = analysis.type_of(query_site(c, function));
+            // Transparent `(...)` wrappers read through to the root row
+            // (the upstream `node.function` staticType): the root's own
+            // fold row answers — an identifier root at its flow row, a
+            // composite root at its first operand's read row (the
+            // `??`-branches' fold starts the expression).
+            let root = faces::unparenthesized(c, function);
+            let ty = analysis.type_of(query_site(c, root));
             if ty.is_some_and(|ty| faces::is_dynamic_or_function(analysis, ty)) {
                 c.report(c.utf16_span(function), &[]);
             }
@@ -265,7 +331,7 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         .flatten();
     let receiver_ty = receiver
         .as_ref()
-        .and_then(|(first, end)| receiver_ty(c, analysis, before, *first, *end));
+        .and_then(|(first, end, _)| receiver_ty(c, analysis, before, *first, *end));
     // An inner chained access (a middle hop — its group seals in the
     // follower's dot) carries no face of its own: the outer dispatch's
     // receiver is this whole extent, and the inner read would consult
@@ -275,7 +341,7 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     {
         return;
     }
-    if let Some((receiver_start, receiver_end)) = receiver
+    if let Some((receiver_start, _, content_end)) = receiver
         && receiver_ty == Some(Ty::Dynamic)
     {
         // The explicit-cast bail (:115).
@@ -283,13 +349,16 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
             return;
         }
         let start = c.utf16_span(receiver_start).start;
-        c.report(start..receiver_end_utf16(c, receiver_end), &[]);
+        c.report(start..content_end, &[]);
         return;
     }
     // The `.call` special case (:119-129): `a.call()` is `a()` — the
     // receiver's own function type decides, and the report lands on
-    // the `call` selector.
-    if member
+    // the `call` selector. An invocation only: the bare tear-off read
+    // (`p.call;`) is the upstream `PropertyAccess` dispatch, where the
+    // special case never applies (a `Function` receiver stays silent).
+    if arguments.is_some()
+        && member
         && c.lexeme(selector) == "call"
         && receiver.is_some()
         && !faces::is_explicit_cast(c, before)
@@ -356,12 +425,13 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     // the childless access markers the chain extent ends at — bounded
     // by the walk's own abutment check.
     let raw = &kids[..pos];
-    let Some((receiver_start, receiver_end)) = chain_receiver(c, raw, selector) else {
+    let Some((receiver_start, receiver_end, content_end)) = chain_receiver(c, raw, selector) else {
         return;
     };
-    if receiver_ty(c, analysis, raw, receiver_start, receiver_end) == Some(Ty::Dynamic) {
+    let ty = receiver_ty(c, analysis, raw, receiver_start, receiver_end);
+    if ty == Some(Ty::Dynamic) {
         let start = c.utf16_span(receiver_start).start;
-        c.report(start..receiver_end_utf16(c, receiver_end), &[]);
+        c.report(start..content_end, &[]);
     }
 }
 
@@ -462,12 +532,24 @@ fn unary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let compound = matches!(c.lexeme(c.head_token(c.node())), "++" | "--");
     let last = *operand.last().unwrap();
     let (start, end) = if compound {
-        // `reportAtNode(root)` — the whole operator expression: a
-        // prefix row (`++a`) opens at its operator, a postfix row
-        // (`a++`) opens at the operator too with the operand tiled
-        // before it — the extent runs from the operand run's first
-        // row to the node's own span end.
-        (c.utf16_span(operand[0]).start, c.utf16_span(c.node()).end)
+        // `reportAtNode(root)` — the whole operator expression: both
+        // tilings place the operand row before the marker (a prefix
+        // row's own window carries only the operator), so the extent is
+        // the operand run and the marker's union. An operand row may
+        // adopt its statement window (the group close rides the `;`) —
+        // clamp at the statement terminator.
+        let marker = c.utf16_span(c.node());
+        let mut op_end = c.utf16_span(last).end;
+        for token in c.unit.ast.token_range(last) {
+            if c.lexeme(token) == ";" {
+                op_end = op_end.min(utf16_token_span(c, token).start);
+                break;
+            }
+        }
+        (
+            c.utf16_span(operand[0]).start.min(marker.start),
+            marker.end.max(op_end),
+        )
     } else {
         // `reportAtNode(operand)`.
         let Some(start) = slice::operand_utf16_start(
@@ -600,4 +682,436 @@ fn cascade_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
 /// concrete function type is not).
 fn is_bare_function(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
     matches!(ty, Ty::Named { name, .. } if analysis.strings().resolve(name) == "Function")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// The whole upstream oracle corpus, pinned case-for-case: the 72
+    /// `AvoidDynamicCallsTest` extraction cases
+    /// (`pkg/linter/test/rules/avoid_dynamic_calls_test.dart`) plus the 4
+    /// `messages.yaml` doc cases — 76 total, `conformance/status.tsv`
+    /// `lint avoid_dynamic_calls 76 …`. Each entry is the exact
+    /// materialized case source (test-file cases carry a leading blank
+    /// line, the doc files do not) and the oracle's
+    /// `(line, column, length)` for every `avoid_dynamic_calls` row
+    /// (`expected.tsv`). Only the rule's own rows are pinned — the
+    /// co-reported `cast_to_non_type` / `non_type_as_type_argument` /
+    /// `undefined_class` rows in `doc_good_1` are other faces.
+    ///
+    /// Every mismatch is collected before the single panic so one run
+    /// shows the whole deviation set.
+    #[test]
+    fn avoid_dynamic_calls_oracle_corpus_pins() {
+        // (case, source, oracle rows as (line, column, length)).
+        let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+            (
+                "AvoidDynamicCallsTest/test_asDynamic_dynamicBinaryExpression",
+                "\nvoid f(Object? a) {\n  (a as dynamic) + 1;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_Function",
+                "\nvoid f(Function p) {\n  p.call();\n}\n",
+                &[(3, 5, 4)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_FunctionBound",
+                "\nvoid f<T extends Function>(T p) {\n  p.call();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_Function_nullAssert",
+                "\nvoid f(Function? p) {\n  p!.call();\n}\n",
+                &[(3, 6, 4)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_Function_nullAware",
+                "\nvoid f(Function? p) {\n  p?.call();\n}\n",
+                &[(3, 6, 4)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_Function_tearoff",
+                "\nvoid f(Function p) {\n  p.call;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_cascade_Function",
+                "\nvoid f(Function p) {\n  p..call();\n}\n",
+                &[(3, 6, 4)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_cascade_functionType",
+                "\nvoid f(void Function() p) {\n  p..call();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_functionType",
+                "\nvoid f(void Function() p) {\n  p.call();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_functionType_tearoff",
+                "\nvoid f(void Function() p) {\n  p.call;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_nullAware_functionType",
+                "\nvoid f(void Function()? p) {\n  p?.call();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_callInvocation_nullAware_functionType_tearoff",
+                "\nvoid f(void Function()? p) {\n  p?.call;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_ampersandAmpersand",
+                "\nvoid f(dynamic a) {\n  a && false;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_caret",
+                "\nvoid f(dynamic a) {\n  a ^ 1;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_lessThan",
+                "\nvoid f(dynamic a) {\n  a < 1;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_lessThanLessThan",
+                "\nvoid f(dynamic a) {\n  a << 1;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_plus",
+                "\nvoid f(dynamic a) {\n  a + 1;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_questionQuestion",
+                "\nvoid f(dynamic a) {\n  a ?? 1;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicBinaryExpression_tildeSlash",
+                "\nvoid f(dynamic a) {\n  a ~/ 1;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCascadedMethodCall",
+                "\nvoid f(dynamic a) {\n  a..b();\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCascadedMethodCall_subsequent",
+                "\nvoid f(dynamic a) {\n  a\n    ..toString()\n    ..b();\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCascadedPropertyAccess",
+                "\nvoid f(dynamic a) {\n  a..b;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCascadedPropertyAccess_subsequent",
+                "\nvoid f(dynamic a) {\n  a\n    ..toString()\n    ..b;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_ampersandEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a &= 1;\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_caretEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a ^= 1; // LINT\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_minusEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a -= 1;\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_pipeEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a |= 1;\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_plusEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a += 1;\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_questionQuestionEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a ??= 1;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_slashEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a /= 1; // LINT\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicCompoundAssignment_starEqualsOperator",
+                "\nvoid f(dynamic a) {\n  a *= 1;\n}\n",
+                &[(3, 3, 6)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicDecrementPostfixOperator",
+                "\nvoid f(dynamic a) {\n  a--;\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicDecrementPrefixOperator",
+                "\nvoid f(dynamic a) {\n  --a;\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicEqualOperator",
+                "\nvoid f(dynamic a) {\n  a == 7;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicImplicitCall",
+                "\nvoid f(dynamic a) {\n  a();\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicIncrementPostfixOperator",
+                "\nvoid f(dynamic a) {\n  a++;\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicIncrementPrefixOperator",
+                "\nvoid f(dynamic a) {\n  ++a;\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicIndexAssignmetOperator",
+                "\nvoid f(dynamic a) {\n  a[1] = 1;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicIndexOperator",
+                "\nvoid f(dynamic a) {\n  a[1];\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicNotEqualOperator",
+                "\nvoid f(dynamic a) {\n  a != 7;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicNullAssertMethodCall",
+                "\nvoid f(dynamic a) {\n  a!.b();\n}\n",
+                &[(3, 3, 2)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicNullAssertPropertyAccess",
+                "\nvoid f(dynamic a) {\n  a!.b;\n}\n",
+                &[(3, 3, 2)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicNullAwareMethodCall",
+                "\nvoid f(dynamic a) {\n  a?.b();\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicNullAwarePropertyAccess",
+                "\nvoid f(dynamic a) {\n  a?.b;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_dynamicUnaryMinusOperator",
+                "\nvoid f(dynamic a) {\n  -a;\n}\n",
+                &[(3, 4, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_functionExpressionInvocation",
+                "\nvoid f(Function? g1, Function g2) {\n  (g1 ?? g2)();\n}\n",
+                &[(3, 3, 10)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_functionExpressionInvocation_asFunction",
+                "\nvoid f(Object? g1, Object? g2) {\n  ((g1 ?? g2) as Function)();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_functionInvocation",
+                "\nvoid f(Function g) {\n  g();\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_functionInvocation_asFunction",
+                "\nvoid f(Object? g) {\n  (g as Function)();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_functionInvocation_parenthesized",
+                "\nvoid f(Function a) {\n  (a)();\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_indexAssignmentExpression",
+                "\nvoid f(dynamic a) {\n  a[1] = 7;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_indexAssignmentExpression_asDynamic",
+                "\nvoid f(Object? a) {\n  (a as dynamic)[1] = 7;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_indexExpression",
+                "\nvoid f(dynamic a) {\n  a[1];\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_indexExpression_asDynamic",
+                "\nvoid f(Object? a) {\n  (a as dynamic)[1];\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_parenthesizedExpression",
+                "\nvoid f(dynamic a) {\n  (a).b;\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier",
+                "\nvoid f(dynamic a) {\n  a.foo;\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_asDynamic",
+                "\nvoid f(Object? a) {\n  (a as dynamic).foo;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_dynamicMethodCall",
+                "\nvoid f(dynamic a) {\n  a.foo();\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_dynamicMethodCall_asDynamic",
+                "\nvoid f(Object? a) {\n  (a as dynamic).foo();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_noSuchMethod",
+                "\nvoid f(dynamic a, Invocation i) {\n  a.noSuchMethod(i);\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_noSuchMethod_withAdditionalPositionalArgument",
+                "\nvoid f(dynamic a, Invocation i) {\n  a.noSuchMethod(i, 7);\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_noSuchMethod_withNamedArgument",
+                "\nvoid f(dynamic a, Invocation i) {\n  a.noSuchMethod(i, p: 7);\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_noSuchMethod_withNamedArgumentBeforePositional",
+                "\nvoid f(dynamic a, Invocation i) {\n  a.noSuchMethod(i, p: 7);\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_runtimeType",
+                "\nvoid f(dynamic a) {\n  a.runtimeType;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_toString",
+                "\nvoid f(dynamic a) {\n  a.toString();\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_toString_withNamedArgument",
+                "\nvoid f(dynamic a) {\n  a.toString(p: 7);\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_prefixedIdentifier_toString_withPositionalArgument",
+                "\nvoid f(dynamic a) {\n  a.toString(7);\n}\n",
+                &[(3, 3, 1)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_propertyAccess",
+                "\nvoid f(C c) {\n  c.a.foo;\n}\nclass C {\n  dynamic a;\n}\n",
+                &[(3, 3, 3)],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_propertyAccess_asDynamic",
+                "\nvoid f(C c) {\n  (c.a as dynamic).foo;\n}\nclass C {\n  Object? a;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_propertyAccess_hashCode",
+                "\nvoid f(C c) {\n  c.a.hashCode;\n}\nclass C {\n  dynamic a;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_propertyAccess_runtimeType",
+                "\nvoid f(C c) {\n  c.a.runtimeType;\n}\nclass C {\n  dynamic a;\n}\n",
+                &[],
+            ),
+            (
+                "AvoidDynamicCallsTest/test_propertyAccess_toStringTearoff",
+                "\nvoid f(C c) {\n  c.a.toString;\n}\nclass C {\n  dynamic a;\n}\n",
+                &[],
+            ),
+            (
+                "doc_bad_0",
+                "void f(dynamic s) {\n  s.length;\n}\n",
+                &[(2, 3, 1)],
+            ),
+            (
+                "doc_bad_1",
+                "void explicitDynamicType(dynamic object) {\n  print(object.foo());\n}\n\nvoid implicitDynamicType(object) {\n  print(object.foo());\n}\n\nabstract class SomeWrapper {\n  T doSomething<T>();\n}\n\nvoid inferredDynamicType(SomeWrapper wrapper) {\n  var object = wrapper.doSomething();\n  print(object.foo());\n}\n\nvoid callDynamic(dynamic function) {\n  function();\n}\n\nvoid functionType(Function function) {\n  function();\n}\n",
+                &[(2, 9, 6), (6, 9, 6), (15, 9, 6), (19, 3, 8), (23, 3, 8)],
+            ),
+            ("doc_good_0", "void f(String s) {\n  s.length;\n}\n", &[]),
+            (
+                "doc_good_1",
+                "void explicitType(Fooable object) {\n  object.foo();\n}\n\nvoid castedType(dynamic object) {\n  (object as Fooable).foo();\n}\n\nabstract class SomeWrapper {\n  T doSomething<T>();\n}\n\nvoid inferredType(SomeWrapper wrapper) {\n  var object = wrapper.doSomething<Fooable>();\n  object.foo();\n}\n\nvoid functionTypeWithParameters(Function() function) {\n  function();\n}\n",
+                &[],
+            ),
+        ];
+        // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+        fn offset(source: &str, line: u32, column: u32) -> u32 {
+            let line_start: usize = source
+                .split_inclusive('\n')
+                .take(line as usize - 1)
+                .map(str::len)
+                .sum();
+            (line_start + column as usize - 1) as u32
+        }
+        let mut mismatches = Vec::new();
+        for (case, source, oracle) in cases {
+            let f = Fixture::parse(source);
+            let mut lints = f.run_semantic(&one_rule("avoid_dynamic_calls"));
+            lints.sort_by_key(|lint| lint.range.start);
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            let want: Vec<(u32, u32)> = oracle
+                .iter()
+                .map(|&(line, column, length)| {
+                    let start = offset(source, line, column);
+                    (start, start + length)
+                })
+                .collect();
+            if got != want {
+                mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
 }
