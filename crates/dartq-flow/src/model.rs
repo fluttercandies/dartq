@@ -1094,7 +1094,12 @@ fn covers(
     // InvalidType` subtypes everything): a write whose value the layer
     // cannot type (`x = unresolvedCall()`, `x ??= unknownRhs`) satisfies
     // every standing promotion — it preserves the chain instead of
-    // demoting what the earlier checks promoted.
+    // demoting what the earlier checks promoted. The unresolved-WRITTEN
+    // face reaches this both ways: as the opaque `Unknown` here, and as
+    // the resolved back-end's `Invalid` through the subtype below, whose
+    // 0c arm answers `Invalid <: promoted` vacuously true — the same
+    // verdict `_demoteViaAssignment`'s `isSubtypeOf(writtenType, promoted)`
+    // takes upstream.
     if written.base == Base::Unknown {
         return true;
     }
@@ -1148,7 +1153,12 @@ fn consider(
     // candidate, the candidate must be a STRICT subtype of the current
     // type (`isValidPromotionStep` — `candidate <: current` and not the
     // reverse), and the candidate must not already be in the running.
-    // Every subtype question compares the instantiated spellings.
+    // Every subtype question compares the instantiated spellings. The
+    // official's invalid-written skip (`isInvalidType(writtenType)` → no
+    // promotion, :4002-4006) sits at the caller ([`State::write`]'s
+    // `is_invalid_typed` gate); a candidate that IS the invalid face is
+    // refused here, by the strict step: `Invalid` subtypes everything, so
+    // the `!c` arm is always false for it.
     let a = ops.is_subtype_typed(written, written_args, candidate, args, arena, names);
     let b = ops.is_subtype_typed(candidate, args, current, current_args, arena, names);
     let c = ops.is_subtype_typed(current, current_args, candidate, args, arena, names);

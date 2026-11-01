@@ -14,7 +14,7 @@
 //! thousands of rows (`ASSIGNMENT_TARGET_VISITS` — the instrumented
 //! `cfg(test)` twin counts them).
 //!
-//! F6 (`resolved_ops.rs`): `tested_head_undefined` consults the
+//! F6 (`resolved_ops.rs`): `tested_arg_undefined` consults the
 //! `undefined_ids` set `observe_names` extends beside the `name_ty`
 //! cache — the same interned `StringId` the scan already computes —
 //! instead of re-interning every probe's spelling (the `id_overloaded`

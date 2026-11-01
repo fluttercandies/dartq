@@ -161,7 +161,7 @@ fn null_literal_operand_stays_silent() {
 /// `void` face here — the `is` target's `handle_void_keyword` never
 /// reaches the armed slot under recovery, so `checked` lands as the
 /// recovery `Named{;}` head and the verdict suppresses — a residual of
-/// `resolved_ops`'s `tested_head_undefined`/`emit_is_type_miss` gap, not
+/// `resolved_ops`'s `tested_arg_undefined`/`emit_is_type_miss` gap, not
 /// the subtype walk.
 
 /// `new C() is C` — the `new` keyword joins the operand's extent

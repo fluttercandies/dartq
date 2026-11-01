@@ -18,10 +18,16 @@
 //! - The invalid-operand is-check promotion: an operand whose written
 //!   annotation resolves nowhere is that `InvalidType`, so `x is int`
 //!   folds constant-true (the else deads) and `x is! int` constant-false
-//!   (the then deads) — while an UNDEFINED tested type never folds
-//!   (#2450 counter-finding): the oracle bails with
-//!   `type_test_with_undefined_name` on the spelling and both branches
-//!   stay live.
+//!   (the then deads). An UNDEFINED tested type folds the same way (the
+//!   `x is Missing` family below): the spelling still reports
+//!   `type_test_with_undefined_name`, and the flow's
+//!   `factor(previous, InvalidType)` is `Never`, so the test-false arm is
+//!   unreachable (`ifFalseIsUnreachable`, flow_analysis.dart:4156-4160)
+//!   exactly as the 3.13.7 oracle reports it — #2490 superseded #2450's
+//!   "the oracle bails, both branches stay live" reading. Only an
+//!   undefined ARGUMENT under a resolved head (`x is Box<Missing>`, the
+//!   official's `Box<InvalidType>`) folds nothing: nothing bottoms there,
+//!   so both arms stay live.
 //!
 //! Oracle provenance: the census probes `/tmp/probe2446/p9_switchdead`
 //! and `p12_isdead` against `dart analyze`, plus the corpus rows
