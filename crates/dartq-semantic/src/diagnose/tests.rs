@@ -18001,3 +18001,16 @@ mod ticket_3297_tests;
 #[cfg(test)]
 #[path = "ticket_3300_tests.rs"]
 mod ticket_3300_tests;
+
+// The #3313 pins (the `undefined_class` / `undefined_method` /
+// `undefined_getter` cluster): the shared member-resolution substrate every
+// face of the family folds — the container lookup a type-use verdict reads
+// and the superclass/mixin/interface member walk each receiver face asks
+// before it reports. The found faces (inherited, mixed-in, interfaced) and
+// the silent-negative faces (a broken supertype chain, a cyclic chain, a
+// non-container name) are pinned together so a change here cannot quietly
+// turn a suppression into a report. Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree.
+#[cfg(test)]
+#[path = "ticket_3313_tests.rs"]
+mod ticket_3313_tests;
