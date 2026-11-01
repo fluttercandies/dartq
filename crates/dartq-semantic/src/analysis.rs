@@ -54,6 +54,7 @@ use crate::library::{
     lookup_scoped, member_lookup, member_lookup_defining, prefixed_container, resolve_container,
     supertype_has_instance_members,
 };
+use crate::member_face::core_member_entry;
 use crate::model::{
     Container, ContainerKind, FnSig, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
@@ -443,27 +444,47 @@ impl<'a> Analysis<'a> {
 
     /// The member face of a `receiver.name` access: the superclass walk
     /// ([`member_lookup`]) from the receiver's resolved type — the
-    /// receiver's read row (a declared-typed identifier, `C c; c.m()`)
-    /// or its own container-name resolution (`C.m()`). Unknown-type
-    /// receivers under-report `None`.
+    /// receiver's read row (a declared-typed identifier, `C c; c.m()`),
+    /// its own container-name resolution (`C.m()`), or the published
+    /// type-reference row of a constructor-invocation head
+    /// (`List.empty().first`, `C.named().g`). Unknown-type receivers
+    /// under-report `None`.
+    ///
+    /// A receiver whose static type is the `Type` metaclass is the
+    /// TypeLiteral face of a container spelling (`List.empty()`'s `List`,
+    /// `p.C`), not a lookup anchor: the metaclass carries no core
+    /// container's members, so the walk starts from the container the
+    /// site's own reference rows name — the getter-vs-tear-off split of
+    /// `List.empty().first` (getter) and `List.empty().where` (method)
+    /// then reaches the container's member face.
     #[must_use]
     pub fn member_of(&self, receiver: SourceRange, name: StringId) -> Option<MemberBinding<'_>> {
         if let Some(Ty::Named {
             name: container, ..
         }) = self.type_of(receiver)
+            && self.strings.resolve(container) != "Type"
         {
             return self.member_on(container, name);
         }
-        let (spelled, target) = row_starting_at(&self.refs, receiver, |row| row.0.offset)
-            .map(|(_, spelled, target)| (*spelled, *target))?;
-        if matches!(target, RefTarget::Decl { .. }) {
+        // The value-read face: a bare reference that resolved to a
+        // declaration names the lookup container. A local, member, or
+        // opaque target carries no container face of its own.
+        if let Some((spelled, RefTarget::Decl { .. })) =
+            row_starting_at(&self.refs, receiver, |row| row.0.offset)
+                .map(|(_, spelled, target)| (*spelled, *target))
+        {
             return self.member_on(spelled, name);
         }
-        None
+        // The type-reference face: a creation head is a TYPE position, so
+        // its container comes from the published `(span, name)` row
+        // ([`Self::member_of`]'s caller contract — the same publication
+        // `creation_type` reads for the constructed face).
+        let container = row_starting_at(&self.type_uses, receiver, |row| row.0.offset)?.1;
+        self.member_on(container, name)
     }
 
     fn member_on(&self, container: StringId, member: StringId) -> Option<MemberBinding<'a>> {
-        let entry = member_lookup(
+        if let Some(entry) = member_lookup(
             self.graph,
             self.namespaces,
             self.index,
@@ -471,7 +492,17 @@ impl<'a> Analysis<'a> {
             self.file,
             container,
             member,
-        )?;
+        ) {
+            return Some(MemberBinding { container, entry });
+        }
+        // The unindexed `dart:core` containers (`List`, `Map`, `Set`, …):
+        // their declarations resolve through the namespace but land on
+        // external units the element index never carries, so the walk
+        // chain-breaks. The name-level kind face answers the member's
+        // kind — the entry is process-static, so it coerces to this
+        // query's lifetime.
+        let entry =
+            core_member_entry(self.strings.resolve(container), self.strings.resolve(member))?;
         Some(MemberBinding { container, entry })
     }
 

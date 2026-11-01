@@ -325,11 +325,13 @@ pub(crate) fn receiver_family(
         return Some(decides);
     }
     let run = expand_wrappers(c, &pieces[..name]);
-    // A wrapper-revealed bare name reads its written type first; an
-    // inferred `var`/`final` binding carries no written face, so the
-    // bridge read row answers (a `var i = Iterable.empty()` receiver's
-    // inferred `Iterable` static type — the official `staticType`).
-    if let [only] = run.as_slice()
+    // A bare-name receiver rides its own send group (`Identifier`,
+    // `NoTypeArguments`, `NoArguments`, `Send`) — the access strip drops
+    // the group tail, so the single-name read below answers (a `var i =
+    // Iterable.empty()` receiver's inferred `Iterable` static type — the
+    // official `staticType`).
+    let stripped = slice::access_run(c, &run);
+    if let [only] = stripped.as_slice()
         && c.kind(*only) == NodeKind::Identifier
     {
         let receiver_name = c.lexeme(c.head_token(*only));

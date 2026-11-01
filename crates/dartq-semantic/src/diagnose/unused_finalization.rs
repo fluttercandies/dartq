@@ -1113,9 +1113,139 @@ impl<'a> Engine<'a> {
             }
             at += 1;
         }
-        // The function-receiver arm: an `extension on Function` face
-        // applies to any function-valued receiver — a bare or
-        // generic-instantiated function reference (`foo.m<int>`,
+        // The function-valued and type-literal receiver heads, built once:
+        // the operator arm below and the member-access arm after it share
+        // them.
+        let mut fn_heads: FxHashSet<StringId> = self
+            .decl_sites
+            .iter()
+            .filter(|s| matches!(s.kind, DeclKind::TopLevelFn))
+            .map(|s| s.name)
+            .collect();
+        let mut type_heads: FxHashSet<StringId> = self
+            .decl_sites
+            .iter()
+            .filter(|s| matches!(s.kind, DeclKind::TypeAlias | DeclKind::Container))
+            .map(|s| s.name)
+            .collect();
+        for frame in &self.frames {
+            fn_heads.extend(frame.local_fn_sigs.keys().copied());
+            for (name, ty) in &frame.var_types {
+                // A local or parameter of the same spelling shadows any
+                // same-spelled declaration: it is the value the receiver
+                // expression names, never the type or the function.
+                fn_heads.remove(name);
+                type_heads.remove(name);
+                if matches!(ty, Ty::Function { .. }) {
+                    fn_heads.insert(*name);
+                }
+            }
+        }
+        // The operator-receiver arm (the #3289 census): the gather visitor
+        // records a member use for every operator access over the extended
+        // type (`visitBinaryExpression`/`visitPrefixExpression`/
+        // `visitPostfixExpression` → `usedElements.addMember`,
+        // unused_local_elements_verifier.dart:59-64/:196-201/:256-267),
+        // but the resolve layer leaves an identifier or literal operand
+        // untyped, so the source bytes and the declaration tables decide
+        // the receiver's head: a string literal is a `String`, a
+        // function-valued identifier is a `Function`, and a type name used
+        // as a value is a `Type`. The operator token must follow whitespace
+        // (a `<` glued to an identifier is a generic instantiation or the
+        // `operator<` declaration head, never a binary operator), and
+        // `credit_face_member`'s guard chain (exactly one accessible face
+        // declares the spelling, the receiver head has no native member of
+        // that spelling, the face's `on` head matches) keeps the credit
+        // over-report-proof.
+        let string_head = self.intern("String");
+        let function_head = self.intern("Function");
+        let type_head = self.intern("Type");
+        let mut scan = 0usize;
+        while scan < bytes.len() {
+            let byte = bytes[scan];
+            // Comments never carry a use: skip a line comment to its
+            // newline and a (nest-aware) block comment to its close so a
+            // doc example like `a < b` credits nothing.
+            if byte == b'/' && bytes.get(scan + 1) == Some(&b'/') {
+                scan += 2;
+                while scan < bytes.len() && bytes[scan] != b'\n' {
+                    scan += 1;
+                }
+                continue;
+            }
+            if byte == b'/' && bytes.get(scan + 1) == Some(&b'*') {
+                scan += 2;
+                let mut depth = 1usize;
+                while scan < bytes.len() && depth > 0 {
+                    if bytes[scan] == b'/' && bytes.get(scan + 1) == Some(&b'*') {
+                        depth += 1;
+                        scan += 2;
+                    } else if bytes[scan] == b'*' && bytes.get(scan + 1) == Some(&b'/') {
+                        depth -= 1;
+                        scan += 2;
+                    } else {
+                        scan += 1;
+                    }
+                }
+                continue;
+            }
+            if byte == b'\'' || byte == b'"' {
+                // A string literal receiver: skip to the closing quote
+                // (backslash escapes consumed) and credit a following
+                // operator.
+                let mut end = scan + 1;
+                while end < bytes.len() && bytes[end] != byte {
+                    if bytes[end] == b'\\' {
+                        end += 1;
+                    }
+                    end += 1;
+                }
+                if let Some(op) = self.binary_operator_after(end.saturating_add(1)) {
+                    self.credit_face_member(&faces, &declarers, op, string_head);
+                }
+                scan = end.saturating_add(1);
+                continue;
+            }
+            if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' {
+                let start = scan;
+                let mut end = scan + 1;
+                while end < bytes.len() {
+                    let next = bytes[end];
+                    if next.is_ascii_alphanumeric() || next == b'_' || next == b'$' {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut cursor = end;
+                let mut spaced = false;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                    spaced = true;
+                }
+                if spaced {
+                    if let Some(op) = self.binary_operator_at(cursor) {
+                        let name = self.intern(&self.source[start..end]);
+                        let head = if fn_heads.contains(&name) {
+                            Some(function_head)
+                        } else if type_heads.contains(&name) {
+                            Some(type_head)
+                        } else {
+                            None
+                        };
+                        if let Some(head) = head {
+                            self.credit_face_member(&faces, &declarers, op, head);
+                        }
+                    }
+                }
+                scan = end;
+                continue;
+            }
+            scan += 1;
+        }
+        // The function-receiver member-access arm: an `extension on
+        // Function` face applies to any function-valued receiver — a bare
+        // or generic-instantiated function reference (`foo.m<int>`,
         // `foo<int>.m()`; the `ExtensionElement` arm of
         // `visitSimpleIdentifier`, unused_local_elements_verifier.dart
         // :341-348, credits `usedElements.members`). The resolve layer
@@ -1124,22 +1254,6 @@ impl<'a> Engine<'a> {
         // function, or a function-typed formal/local, with the source
         // adjacency `head.member` (an optional balanced `<...>`
         // instantiation may sit between) as the application.
-        let mut fn_heads: Vec<StringId> = self
-            .decl_sites
-            .iter()
-            .filter(|s| matches!(s.kind, DeclKind::TopLevelFn))
-            .map(|s| s.name)
-            .collect();
-        for frame in &self.frames {
-            fn_heads.extend(frame.local_fn_sigs.keys().copied());
-            fn_heads.extend(
-                frame
-                    .var_types
-                    .iter()
-                    .filter(|(_, ty)| matches!(ty, Ty::Function { .. }))
-                    .map(|(name, _)| *name),
-            );
-        }
         for &(face, _) in &faces {
             if !matches!(&face.on_ty, Ty::Named { name, .. }
                 if self.strings.resolve(*name) == "Function")
@@ -1203,6 +1317,62 @@ impl<'a> Engine<'a> {
             return true;
         }
         false
+    }
+
+    /// The overloadable operator starting at byte `at`, as its `operator`
+    /// member spelling (`+=` and friends map to the base operator; `<=`,
+    /// `>=`, `==`, `!=` are their own operators). `None` for a non-operator
+    /// token — `=` alone, `=>`, `&&`, `||`, `??`, and punctuation are never
+    /// `operator` declarations, so they never carry a member use. Longest
+    /// spellings match first (`<<=` never reads as `<`).
+    fn binary_operator_at(&self, at: usize) -> Option<StringId> {
+        const TABLE: &[(&str, &str)] = &[
+            ("<<=", "<<"),
+            (">>=", ">>"),
+            ("~/=", "~/"),
+            ("+=", "+"),
+            ("-=", "-"),
+            ("*=", "*"),
+            ("/=", "/"),
+            ("%=", "%"),
+            ("&=", "&"),
+            ("|=", "|"),
+            ("^=", "^"),
+            ("<<", "<<"),
+            (">>", ">>"),
+            ("<=", "<="),
+            (">=", ">="),
+            ("==", "=="),
+            ("!=", "!="),
+            ("~/", "~/"),
+            ("+", "+"),
+            ("-", "-"),
+            ("*", "*"),
+            ("/", "/"),
+            ("%", "%"),
+            ("<", "<"),
+            (">", ">"),
+            ("&", "&"),
+            ("|", "|"),
+            ("^", "^"),
+        ];
+        let rest = self.source.as_bytes().get(at..)?;
+        for &(token, member) in TABLE {
+            if rest.starts_with(token.as_bytes()) {
+                return Some(self.intern(member));
+            }
+        }
+        None
+    }
+
+    /// The operator member at the first non-whitespace byte from `from`.
+    fn binary_operator_after(&self, from: usize) -> Option<StringId> {
+        let bytes = self.source.as_bytes();
+        let mut at = from;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        self.binary_operator_at(at)
     }
 
     /// Whether the index application opened at `open` (the `[` byte) is a

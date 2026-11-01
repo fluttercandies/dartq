@@ -17888,3 +17888,84 @@ mod ticket_3257_tests;
 #[cfg(test)]
 #[path = "ticket_3290_tests.rs"]
 mod ticket_3290_tests;
+
+// The #3282 pins (the `assignment_to_final` / `assignment_to_final_local` /
+// `assignment_to_final_no_setter` emit path: the write's setter lookup
+// misses while the plain spelling resolves a `final` field, an explicit
+// getter, or a `final` local/formal — `AssignmentVerifier.verify`'s
+// recovery arm plus `checkFinalAlreadyAssigned`). Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3282_tests.rs"]
+mod ticket_3282_tests;
+
+// The #3288 pins (the `dead_code` emit layer's tail shaping — a `for`
+// header's `)` never rides a dead run, a collection tail carries its
+// closers and the statement terminator — plus the dead-clause containment
+// pass that drops the dead code a reported-dead catch clause subsumes).
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3288_tests.rs"]
+mod ticket_3288_tests;
+
+// The #3289 pins (the `unused_element` operator-receiver credit: an
+// identifier or literal operand that the resolve layer leaves untyped is
+// classified from the source bytes and the declaration tables — a string
+// literal is a `String`, a function-valued identifier a `Function`, a type
+// name used as a value a `Type` — and folded through the existing
+// `credit_face_member` guard chain). Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3289_tests.rs"]
+mod ticket_3289_tests;
+
+// The #3292 pins (the constructor-invocation receiver's container face: a
+// `Type`-typed receiver no longer shorts the member walk, and the
+// unindexed `dart:core` containers answer their name-level member KIND —
+// the getter-vs-tear-off split behind five `unnecessary_statements`
+// residuals — plus the C-style `for` condition's anchor, which must be the
+// condition expression and never the updater region). Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3292_tests.rs"]
+mod ticket_3292_tests;
+
+// The #3279 pins (the `conflicting_static_and_instance` enum arm's probe /
+// target split: an enum constant is a static member, so it is a probe but
+// never a target — `enum E { one, two }` stays silent while a static
+// member colliding with an own or inherited instance member still reports,
+// with the enum itself as the rendered owner). Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3279_tests.rs"]
+mod ticket_3279_tests;
+
+// The #3294 pins (`type_argument_not_matching_bounds` face census): the
+// reachable verdict arms — written annotation/alias arguments, clause and
+// class-type-alias heads, a bare alias right-hand side, creation and call
+// arguments, dependent bounds, function-typed arguments, the super-bounded
+// silence, and the in-bounds regression — plus the group-less bare-head and
+// generic-function-type gaps as ignored pins naming the module that owns
+// each one. Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3294_tests.rs"]
+mod ticket_3294_tests;
+
+// The #3295 pins (UNDEF): the `undefined_operator` / `undefined_identifier`
+// shapes the cluster pass re-measured at HEAD — builtin `bool` operator
+// faces, the index read/write spelling split, an extension spelling
+// rescuing a member miss, the triple-shift spelling, the `dynamic`
+// silent-negative receiver, and the identifier faces (bare miss, the
+// wildcard `_` read under and without `wildcard-variables`, its
+// frame-local twin, the top-level `_` the gate must not reach, and a label
+// reference). Registered here via `#[path]`; the module stays inside the
+// `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3295_tests.rs"]
+mod ticket_3295_tests;

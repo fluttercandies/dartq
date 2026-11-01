@@ -1147,6 +1147,52 @@ pub(crate) fn overridden_member_context(
     }]
 }
 
+/// The byte offset of every `for` header's closing `)` (#3288).
+///
+/// The official dead-run tail clamps to the last updater inside a `for`
+/// head (`flowEnd`'s `ForParts` arm, `node = parent.updaters.last`,
+/// dead_code_verifier.dart:309-310), so the header's own `)` is never part
+/// of the reported node: a run that ends at the last updater must not
+/// swallow it. Only the header's `)` is exempt — an argument list's `)`
+/// still folds when the dead node covers the enclosing call.
+fn for_header_closers(tokens: &TokenTable) -> FxHashSet<u32> {
+    let toks = tokens.as_slice();
+    let mut closers = FxHashSet::default();
+    for (i, token) in toks.iter().enumerate() {
+        if !matches!(
+            token.kind,
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::For)
+        ) {
+            continue;
+        }
+        if toks
+            .get(i + 1)
+            .is_none_or(|t| t.kind != dartq_scanner::TokenKind::OpenParen)
+        {
+            continue;
+        }
+        let mut depth = 0u32;
+        for t in &toks[i + 1..] {
+            match t.kind {
+                dartq_scanner::TokenKind::OpenParen => depth += 1,
+                dartq_scanner::TokenKind::CloseParen => {
+                    let Some(rest) = depth.checked_sub(1) else {
+                        break;
+                    };
+                    depth = rest;
+                    if depth == 0 {
+                        closers.insert(t.utf16_offset);
+                        break;
+                    }
+                }
+                dartq_scanner::TokenKind::Eof => break,
+                _ => {}
+            }
+        }
+    }
+    closers
+}
+
 /// [`diagnose_unit`]'s whole pipeline, exposed for the query face: the
 /// same fold, with the intermediates kept instead of dropped.
 #[allow(clippy::too_many_arguments)] // the analysis context, one field each
@@ -1311,6 +1357,9 @@ pub fn fold_unit_with_ops<'t>(
     // engine reads the table across pass 2 (`resolve_rows`'s
     // `unchecked_use_of_nullable_value` arm consults it before reporting).
     let mut dead_windows: Vec<SourceRange> = Vec::new();
+    // The `for` headers' `)`s (#3288): the dead-run tail never absorbs one
+    // (see the tail-run gate below).
+    let for_header_closers = for_header_closers(tokens);
     for fact in &facts {
         match *fact {
             FlowFact::DeadCode { span } => {
@@ -1417,22 +1466,68 @@ pub fn fold_unit_with_ops<'t>(
                     {
                         range.length -= 1;
                     }
-                    // The group-closer fold: the row covers the dead run
-                    // up to the literal's `]`/`)`/`}` — only when the
-                    // closer immediately follows the fact's end.
-                    if mid_expression_anchor
-                        && let Some(close) = tokens.as_slice().iter().find(|t| {
+                    // The tail run (#3288): the official row ends at the
+                    // flow-ending NODE's end (`flowEnd`'s
+                    // `length = node.end - offset`,
+                    // dead_code_verifier.dart:321), so a dead run that ends
+                    // a collection element carries the literal's closers,
+                    // and a run that ends a statement carries its `;`. Two
+                    // gates keep the run inside the dead node:
+                    //
+                    // * a `for` header's `)` closes a LIVE statement head —
+                    //   the `ForParts` arm clamps the dead tail to the last
+                    //   updater (`node = parent.updaters.last`, :309-310),
+                    //   never the header's `)`;
+                    // * once a collection closer is absorbed, a following
+                    //   `)` belongs to an enclosing call the dead node does
+                    //   not cover — the run stops at the `]`.
+                    let mut absorbed_collection = false;
+                    loop {
+                        let Some(close) = tokens
+                            .as_slice()
+                            .iter()
+                            .find(|t| !t.is_synthetic() && t.utf16_offset == range.end())
+                        else {
+                            break;
+                        };
+                        let fold = match close.kind {
+                            dartq_scanner::TokenKind::CloseSquare
+                            | dartq_scanner::TokenKind::CloseCurly => {
+                                absorbed_collection = true;
+                                true
+                            }
+                            dartq_scanner::TokenKind::CloseParen => {
+                                !absorbed_collection
+                                    && !for_header_closers.contains(&close.utf16_offset)
+                            }
+                            _ => false,
+                        };
+                        if !(fold && mid_expression_anchor) {
+                            break;
+                        }
+                        range.length += close.byte_len;
+                    }
+                    // The statement terminator rides a collection tail
+                    // (`[for (;; 1) ...[throw '', 2]];` rows `2]];`). The
+                    // tail's last character decides, not this pass's own
+                    // folds: the flow fact may already end past a closer.
+                    let ends_with_closer = tokens.as_slice().iter().any(|t| {
+                        !t.is_synthetic()
+                            && matches!(
+                                t.kind,
+                                dartq_scanner::TokenKind::CloseSquare
+                                    | dartq_scanner::TokenKind::CloseCurly
+                            )
+                            && t.utf16_offset + t.byte_len == range.end()
+                    });
+                    if ends_with_closer
+                        && let Some(semi) = tokens.as_slice().iter().find(|t| {
                             !t.is_synthetic()
-                                && matches!(
-                                    t.kind,
-                                    dartq_scanner::TokenKind::CloseSquare
-                                        | dartq_scanner::TokenKind::CloseParen
-                                        | dartq_scanner::TokenKind::CloseCurly
-                                )
+                                && t.kind == dartq_scanner::TokenKind::Semicolon
                                 && t.utf16_offset == range.end()
                         })
                     {
-                        range.length += close.byte_len;
+                        range.length += semi.byte_len;
                     }
                 }
                 let code = SemanticCode::DeadCode;
@@ -2280,6 +2375,15 @@ pub fn fold_unit_with_ops<'t>(
     let mut staged = std::mem::take(&mut report.usage);
     staged.sort_by_key(|d| d.range.offset);
     report.diagnostics = merge_source_ordered(report.diagnostics, staged);
+    // The #3288 dead-clause containment pass runs on the joined list: a
+    // catch clause the clause-level families have already reported dead
+    // subsumes every unreachable node inside it — the official verifier
+    // keeps `_deadCatchClauseRanges` and returns before latching a new
+    // dead node whose offset falls inside one
+    // (`dead_code_verifier.dart:449-455`, "we don't want to report
+    // additional dead code inside of already dead code"). The nested
+    // `if (false) {}` of a dead clause therefore never yields its own row.
+    suppress_dead_code_inside_dead_clauses(&mut report.diagnostics);
     // The #2336 InvalidType-scrutinee gate runs once the parse-time
     // emissions (the covering rows in `diagnostics`, the per-case rows
     // staged into `usage`) share one list: a switch whose scrutinee type
@@ -3626,6 +3730,40 @@ pub(crate) fn access_kind(intent: &Intent) -> UncheckedNullableKind {
 /// row identifies its own variant from the text alone.
 const UNCHECKED_FUNCTION_TEXT: &str =
     "The function can't be unconditionally invoked because it can be 'null'.";
+
+/// The #3288 dead-clause containment pass — a dead clause subsumes its body.
+///
+/// When a run of catch clauses is dead (`dead_code_catch_following_catch`)
+/// or an `on`-clause can never run (`dead_code_on_catch_subtype`), every
+/// unreachable node inside that clause is part of the same dead region, and
+/// the official verifier reports the clause row only: `_deadCatchClauseRanges`
+/// records each reported clause and `_checkForDeadCode` returns before
+/// latching a new dead node whose offset falls inside one
+/// (dead_code_verifier.dart:449-455 — "we don't want to report additional
+/// dead code inside of already dead code"). Without the gate the flow
+/// layer's own fact for a nested `if (false) {}` inside the dead clause
+/// would surface as a second `dead_code` row the oracle never emits.
+fn suppress_dead_code_inside_dead_clauses(diagnostics: &mut Vec<Diagnostic>) {
+    let clause_names = [
+        SemanticCode::DeadCodeCatchFollowingCatch.code_info().name,
+        SemanticCode::DeadCodeOnCatchSubtype.code_info().name,
+    ];
+    let dead_name = SemanticCode::DeadCode.code_info().name;
+    let regions: Vec<SourceRange> = diagnostics
+        .iter()
+        .filter(|row| clause_names.contains(&row.code.name))
+        .map(|row| row.range)
+        .collect();
+    if regions.is_empty() {
+        return;
+    }
+    diagnostics.retain(|row| {
+        row.code.name != dead_name
+            || !regions
+                .iter()
+                .any(|region| row.range.offset >= region.offset && row.range.offset < region.end())
+    });
+}
 
 /// The #3284 callee-face gate — the function-variant row's soundness check.
 ///

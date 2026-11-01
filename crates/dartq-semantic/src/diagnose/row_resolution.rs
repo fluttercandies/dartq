@@ -28,6 +28,49 @@ enum SendPosition {
 /// inside rayon's 2 MB worker stacks; real chains are tens of links.
 const RECV_WALK_DEPTH_CAP: u32 = 1024;
 
+/// The declaration face behind a bare local's write target (#3282) — the
+/// assignment-to-final-local arm's read of the declaration header.
+#[derive(Clone, Copy)]
+enum FinalLocalFace {
+    /// Not a `final` declaration, or one whose own row owns the write
+    /// (`const` → `assignment_to_const`; `late` → the late-final row;
+    /// `var`/plain → writable).
+    Other,
+    /// A `final` local or formal. `assigned` marks a declaration that is
+    /// not definitely unassigned at a later write: an initializer, a formal
+    /// parameter (bound on entry), or a for-in loop variable.
+    Final { assigned: bool },
+}
+
+/// Whether the token kind after a bare name turns it into a WRITE: the
+/// assignment operators (`=`, `op=`, `??=`), the increment/decrement
+/// suffixes, or the for-in head's `in` (the loop assigns its target).
+fn is_write_follower(kind: Option<dartq_scanner::TokenKind>) -> bool {
+    use dartq_scanner::TokenKind;
+    matches!(
+        kind,
+        Some(
+            TokenKind::Eq
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
+                | TokenKind::TildeSlashEq
+                | TokenKind::LtLtEq
+                | TokenKind::GtGtEq
+                | TokenKind::GtGtGtEq
+                | TokenKind::AmpersandEq
+                | TokenKind::BarEq
+                | TokenKind::CaretEq
+                | TokenKind::QuestionQuestionEq
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus
+                | TokenKind::Keyword(dartq_scanner::Keyword::In)
+        )
+    )
+}
+
 /// The `dart:async` class face the member tables lack: `Stream`'s own
 /// declared instance surface (upstream Dart SDK source,
 /// sdk/lib/async/stream.dart — `map`/`where`/`listen`/`first`/…; the
@@ -2061,6 +2104,23 @@ impl<'a> Engine<'a> {
                 if !self.self_scope_rows.contains(&row.range.offset) {
                     self.used_names.insert(row.name);
                 }
+                // The assignment-to-* family's local arm (#3282): a write to
+                // a `final` local or formal reports `assignment_to_final_local`
+                // (`checkFinalAlreadyAssigned`), and the for-in loop target
+                // (`for (i in xs)`) is that family's write even though the
+                // row model carries it as a read. The increment applications
+                // (`x++`, `--x`) assign their operand the same way. The
+                // local-hit gate keeps the token probes off every non-local
+                // row.
+                if self.local_decl_at_read.contains_key(&row.range.offset) {
+                    let for_each = self.for_each_target(row.range);
+                    if matches!(row.intent, Intent::Write | Intent::ReadWrite)
+                        || for_each
+                        || self.increment_operand(row)
+                    {
+                        self.report_assignment_to_final_local(row, for_each);
+                    }
+                }
                 // The nullable implicit-`this` receiver (#2926 F2): a bare
                 // send inside `extension E on A?` that the push-time latch
                 // marked as resolving through the `on` face answers the
@@ -2127,6 +2187,14 @@ impl<'a> Engine<'a> {
                                 landing.map(|(file, origin)| (file, row.name, origin)),
                             );
                         }
+                        // The implicit-`this` setter-miss face (#3282): a
+                        // `final` field or an explicit getter of the
+                        // enclosing container reached by the bare spelling.
+                        self.report_setter_less_implicit_write(row, container);
+                    } else if self.increment_operand(row) {
+                        // The increment twin (`x++` inside the container):
+                        // the operand assigns the implicit-`this` member.
+                        self.report_setter_less_implicit_write(row, container);
                     } else if let Walk::Found(entry) = self.walk_members(container, row.name) {
                         let landing = self.last_landing();
                         let kind = Self::member_ref_kind(&row.intent, entry.kind);
@@ -4877,6 +4945,33 @@ impl<'a> Engine<'a> {
             // `Extension` exclusion is the resolved kind's, not the row's.
             self.check_member_unused_result(row, container, &Receiver::Unknown, true);
             return;
+        }
+        // The assignment-to-* family (#3282): the static write's setter
+        // lookup missed while the plain name declares a getter-backed face —
+        // a `final` static field (`assignment_to_final`) or an explicit
+        // getter (`assignment_to_final_no_setter`, naming the DECLARING
+        // container the resolved face projects from). The row is claimed
+        // here, so the `undefined_setter` tail below never sees it.
+        if write
+            && !defined
+            && let Some(entry) = resolved.members.get(&row.name)
+        {
+            let (kind, is_final, name_range) = (entry.kind, entry.is_final, entry.name_range);
+            if self.report_setter_less_write(row, kind, is_final, name_range, Some((owner, container)))
+            {
+                return;
+            }
+        }
+        // The increment twin on a static face (`C.x++`), #3282: the operand
+        // assigns the member its plain spelling resolves.
+        if !write
+            && self.increment_operand(row)
+            && let Some(entry) = resolved.members.get(&row.name)
+            && (entry.kind == MemberKind::Getter
+                || (entry.kind == MemberKind::Field && entry.is_final))
+        {
+            let (kind, is_final, name_range) = (entry.kind, entry.is_final, entry.name_range);
+            self.report_setter_less_write(row, kind, is_final, name_range, Some((owner, container)));
         }
         if defined {
             // The compound-write read face: a write satisfied through the
@@ -8264,6 +8359,381 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The assignment-to-* family's member-side verdict (#3282): the write's
+    /// `name=` lookup missed and the plain spelling resolved `kind` at
+    /// `landing`. Upstream's `AssignmentVerifier.verify` takes the recovery
+    /// element instead of a member miss (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/assignment_verifier.dart:63-87): a getter
+    /// whose variable is a field-or-variable declaration reports
+    /// `assignment_to_final` (`'{0}' can't be used as a setter because it's
+    /// final.`), while an accessor-origin getter — an explicit `get`
+    /// declaration, `isOriginGetterSetter` true — reports
+    /// `assignment_to_final_no_setter` naming the DECLARING container
+    /// (`variable.enclosingElement.displayName`). Both anchor at the
+    /// written name (`at(node)`). `false` for a face this family does not
+    /// own (a method: `assignment_to_method`'s; a `const` field:
+    /// `assignment_to_const`'s), leaving the row's usual path untouched.
+    fn report_setter_less_write(
+        &mut self,
+        row: &Row,
+        kind: MemberKind,
+        is_final: bool,
+        name_range: SourceRange,
+        landing: Option<(FileId, StringId)>,
+    ) -> bool {
+        let name_text = self.strings.resolve(row.name);
+        match kind {
+            MemberKind::Field if is_final => {
+                // The model's `is_final` folds `const` (the assignment-to-
+                // const row) and `late final` (whose uninitialized form
+                // still declares a `name=` setter) into one flag. A
+                // same-file declaration answers both from its own header;
+                // a foreign one keeps the model convention (a `final`
+                // field has no setter — the same reading the override
+                // faces apply). Either carve-out still CLAIMS the row: the
+                // write resolved a getter-backed face, so the member-miss
+                // tail's `undefined_setter` would be a false row — the
+                // sibling family's own code stays the honest omission.
+                if landing.is_some_and(|(file, _)| file == self.file)
+                    && !self.field_declares_no_setter(name_range)
+                {
+                    return true;
+                }
+                self.emit(SemanticCode::AssignmentToFinal, row.range, name_text, "");
+                true
+            }
+            MemberKind::Getter => {
+                let class_text = landing.map_or_else(String::new, |(_, origin)| {
+                    self.strings.resolve(origin).to_string()
+                });
+                self.emit(
+                    SemanticCode::AssignmentToFinalNoSetter,
+                    row.range,
+                    name_text,
+                    &class_text,
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the field declaration whose name token sits at `name_range`
+    /// declares no setter — a plain `final` field. The two `is_final`
+    /// carve-outs are read from the declaration's own header: a `const`
+    /// member owns `assignment_to_const`, and a `late final` declarator
+    /// without an initializer still induces a `name=` setter (upstream
+    /// `definesSetter`: `!is_final || (isLate && isFinal && !hasInit)` —
+    /// the collector's own induced-setter rule). A declaration outside this
+    /// file, or one whose captured span is missing, keeps the model's
+    /// `final`-implies-no-setter reading.
+    fn field_declares_no_setter(&self, name_range: SourceRange) -> bool {
+        if name_range == MemberEntry::MISSING_NAME_RANGE {
+            return true;
+        }
+        let tokens = self.tokens.as_slice();
+        let Some(at) = self.token_index_at(name_range.offset) else {
+            return true;
+        };
+        let mut late = false;
+        // The group header (`[abstract] [external] [static] [late]
+        // [final|const|var] Type`) precedes the FIRST declarator; a
+        // trailing declarator (`final int a, b;`) walks back over its
+        // comma and siblings to the same head. The walk stops at the
+        // group's own boundaries.
+        let mut cursor = at;
+        while let Some(prev) = cursor.checked_sub(1) {
+            if at - prev > 32 {
+                break;
+            }
+            match tokens[prev].kind {
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Late) => late = true,
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Const) => return false,
+                dartq_scanner::TokenKind::Semicolon
+                | dartq_scanner::TokenKind::OpenCurly
+                | dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::Function => break,
+                _ => {}
+            }
+            cursor = prev;
+        }
+        if !late {
+            return true;
+        }
+        // `late final int x;` declares the setter; an initializer
+        // (`late final int x = 0;`) does not.
+        matches!(
+            tokens.get(at + 1).map(|token| token.kind),
+            Some(dartq_scanner::TokenKind::Eq)
+        )
+    }
+
+    /// The bare-write twin of [`Self::report_setter_less_write`] over an
+    /// implicit-`this` member face: the write resolves the setter spelling
+    /// first (`bare_write_target_exists`'s rule), and a miss there falls
+    /// back to the plain name — a `final` field or an explicit getter the
+    /// assignment-to-* family owns. Called from the bare row's
+    /// `RefTarget::Member` arm, where the pass-2 walk re-reads the face.
+    fn report_setter_less_implicit_write(&mut self, row: &Row, container: StringId) {
+        let setter = self.setter_spelling(row.name);
+        if self.member_found(container, setter, false) {
+            return;
+        }
+        let Walk::Found(entry) = self.walk_members(container, row.name) else {
+            return;
+        };
+        let landing = self.last_landing();
+        let (kind, is_final, name_range) = (entry.kind, entry.is_final, entry.name_range);
+        self.report_setter_less_write(row, kind, is_final, name_range, landing);
+    }
+
+    /// The increment/decrement twin of
+    /// [`Self::report_setter_less_implicit_write`]: `x++`/`--x` assigns its
+    /// operand, so a `final` field or an explicit getter the operand
+    /// resolves reports through the same family. The read face's own
+    /// bookkeeping has already run; this only answers the setter question.
+    fn report_increment_target(&mut self, row: &Row, container: StringId, super_walk: bool) {
+        let setter = self.setter_spelling(row.name);
+        if self.member_found(container, setter, super_walk) {
+            return;
+        }
+        let walk = if super_walk {
+            self.walk_super(container, row.name)
+        } else {
+            self.walk_members(container, row.name)
+        };
+        let Walk::Found(entry) = walk else {
+            return;
+        };
+        let landing = self.last_landing();
+        let (kind, is_final, name_range) = (entry.kind, entry.is_final, entry.name_range);
+        self.report_setter_less_write(row, kind, is_final, name_range, landing);
+    }
+
+    /// The byte offset's token index, `None` when no token starts there.
+    fn token_index_at(&self, utf16: u32) -> Option<usize> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < utf16);
+        tokens
+            .get(at)
+            .is_some_and(|token| token.utf16_offset == utf16)
+            .then_some(at)
+    }
+
+    /// Whether the bare row at `range` is a for-in loop's existing-variable
+    /// target (`for (i in xs)` — the identifier directly before the head's
+    /// `in`). That shape is a WRITE per iteration upstream
+    /// (`ForEachPartsWithIdentifier`), and its final-local verdict reports
+    /// unconditionally (`isForEachIdentifier`, `checkFinalAlreadyAssigned`
+    /// :395-425), so the row model's read intent never decides it.
+    fn for_each_target(&self, range: SourceRange) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < range.end());
+        matches!(
+            tokens.get(at).map(|token| token.kind),
+            Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In))
+        )
+    }
+
+    /// Whether the row at `range` is an increment/decrement operand
+    /// (`x++`, `--x`): those applications assign their operand — upstream
+    /// routes them through the same finality consults
+    /// (`increment_or_decrement_resolver.dart`'s compound-write resolve),
+    /// while the row model leaves the operand a plain read. A member row
+    /// spans only the selector, so the PREFIX spelling is read from the
+    /// receiver's own start (`++c.x` puts the token before `c`).
+    fn increment_operand(&self, row: &Row) -> bool {
+        let tokens = self.tokens.as_slice();
+        let incdec = |kind: Option<dartq_scanner::TokenKind>| {
+            matches!(
+                kind,
+                Some(
+                    dartq_scanner::TokenKind::PlusPlus | dartq_scanner::TokenKind::MinusMinus
+                )
+            )
+        };
+        let after = tokens.partition_point(|token| token.utf16_offset < row.range.end());
+        if incdec(tokens.get(after).map(|token| token.kind)) {
+            return true;
+        }
+        let start = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+            .ok()
+            .map(|index| self.member_reads[index].recv_span)
+            .filter(|span| span.length > 0)
+            .map_or(row.range.offset, |span| span.offset);
+        let before = tokens.partition_point(|token| token.utf16_offset < start);
+        incdec(
+            before
+                .checked_sub(1)
+                .and_then(|index| tokens.get(index))
+                .map(|token| token.kind),
+        )
+    }
+
+    /// The assignment-to-final-local family (#3282): a write (or for-in
+    /// target) whose declaration is a `final` local or formal that is not
+    /// definitely unassigned at the write. The declaration facts come from
+    /// [`Self::final_local_face`]; the verdict mirrors
+    /// `AssignmentExpressionShared.checkFinalAlreadyAssigned` (upstream Dart
+    /// SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver
+    /// .dart:395-425): `late` locals and the `const` rows own their own
+    /// codes, and a `final int x;` declaration's first write is the legal
+    /// one (reporting starts once the variable can be assigned).
+    fn report_assignment_to_final_local(&mut self, row: &Row, for_each: bool) {
+        let Some(&decl) = self.local_decl_at_read.get(&row.range.offset) else {
+            return;
+        };
+        // The declaration token itself (a declared loop variable's binder,
+        // a pattern binder's own name) is not a write to an existing local.
+        if decl == row.range.offset {
+            return;
+        }
+        let FinalLocalFace::Final { assigned } = self.final_local_face(decl) else {
+            return;
+        };
+        if !assigned
+            && !for_each
+            && !self.has_prior_write(row.name, decl, row.range.offset)
+        {
+            return;
+        }
+        let name_text = self.strings.resolve(row.name);
+        self.emit(
+            SemanticCode::AssignmentToFinalLocal,
+            row.range,
+            name_text,
+            "",
+        );
+    }
+
+    /// The declaration face behind a bare local's name token (#3282): the
+    /// header keywords (`final`/`const`/`late`/`var`), the `this.`/`super.`
+    /// filed-formal receiver, and the two facts that make the FIRST write
+    /// legal — an initializer, or a formal parameter (bound on entry) — plus
+    /// the for-in loop variable the `in` token introduces.
+    fn final_local_face(&self, decl: u32) -> FinalLocalFace {
+        let tokens = self.tokens.as_slice();
+        let Some(at) = self.token_index_at(decl) else {
+            return FinalLocalFace::Other;
+        };
+        // A field/super formal (`this.x`, `super.a`) is a final local
+        // regardless of any written keyword (the initializing-formal
+        // scope's rule, language spec 10.6.1).
+        if let Some(receiver) = at.checked_sub(2)
+            && tokens.get(at - 1).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
+            && matches!(
+                tokens[receiver].kind,
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::This | dartq_scanner::Keyword::Super
+                )
+            )
+        {
+            return FinalLocalFace::Final { assigned: true };
+        }
+        let mut is_final = false;
+        let mut formal = false;
+        let mut cursor = at;
+        while let Some(prev) = cursor.checked_sub(1) {
+            if at - prev > 32 {
+                break;
+            }
+            let token = &tokens[prev];
+            match token.kind {
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final) => {
+                    is_final = true;
+                }
+                // `const` owns `assignment_to_const`; `late` (with or
+                // without an initializer) owns the late-final row; `var`
+                // is not final at all.
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Const
+                    | dartq_scanner::Keyword::Late
+                    | dartq_scanner::Keyword::Var,
+                ) => return FinalLocalFace::Other,
+                dartq_scanner::TokenKind::OpenParen => {
+                    // A `(` after a name/type head opens a formal list; the
+                    // parameter is bound on entry, so a later write is not
+                    // its first assignment.
+                    formal = matches!(
+                        tokens.get(prev.wrapping_sub(1)).map(|t| t.kind),
+                        Some(
+                            dartq_scanner::TokenKind::Identifier
+                                | dartq_scanner::TokenKind::CloseParen
+                                | dartq_scanner::TokenKind::CloseSquare
+                                | dartq_scanner::TokenKind::Question
+                        )
+                    );
+                    break;
+                }
+                dartq_scanner::TokenKind::Semicolon
+                | dartq_scanner::TokenKind::OpenCurly
+                | dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::Function
+                | dartq_scanner::TokenKind::Eq
+                | dartq_scanner::TokenKind::Comma => break,
+                _ => {}
+            }
+            cursor = prev;
+        }
+        if !is_final {
+            return FinalLocalFace::Other;
+        }
+        // A parameter is always assigned; a declarator's `=` (or a pattern
+        // group's trailing `=`) initializes it; a for-in loop variable is
+        // bound by the loop.
+        let mut assigned = formal;
+        let mut probe = at + 1;
+        let mut steps = 0;
+        while let Some(token) = tokens.get(probe) {
+            steps += 1;
+            if steps > 8 {
+                break;
+            }
+            match token.kind {
+                dartq_scanner::TokenKind::Eq
+                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In) => {
+                    assigned = true;
+                    break;
+                }
+                dartq_scanner::TokenKind::Comma
+                | dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => probe += 1,
+                _ => break,
+            }
+        }
+        FinalLocalFace::Final { assigned }
+    }
+
+    /// Whether the same spelling took a write between the declaration at
+    /// `decl` and the row at `write` — the model's stand-in for the flow
+    /// layer's "not definitely unassigned" (`isDefinitelyUnassigned` is
+    /// false once ANY path assigns). A token counts when it is an
+    /// assignment target (`x =`, `x +=`, `x++`, `++x`) or a for-in head
+    /// (`x in`).
+    fn has_prior_write(&self, name: StringId, decl: u32, write: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let lexeme = self.strings.resolve(name);
+        let start = tokens.partition_point(|token| token.utf16_offset <= decl);
+        let end = tokens.partition_point(|token| token.utf16_offset < write);
+        (start..end).any(|at| {
+            tokens[at].kind == dartq_scanner::TokenKind::Identifier
+                && self.tokens.lexeme(self.source, at) == lexeme
+                && (is_write_follower(tokens.get(at + 1).map(|t| t.kind))
+                    || matches!(
+                        tokens.get(at.wrapping_sub(1)).map(|t| t.kind),
+                        Some(
+                            dartq_scanner::TokenKind::PlusPlus
+                                | dartq_scanner::TokenKind::MinusMinus
+                        )
+                    ))
+        })
+    }
+
     pub(crate) fn member_defined(
         &mut self,
         container: StringId,
@@ -8280,9 +8750,11 @@ impl<'a> Engine<'a> {
         // satisfies the write cleanly, while a same-named getter or method
         // hit still leaves `undefined_setter` silent — the oracle routes it
         // to the assignment-to-* family (`assignment_to_final_no_setter` on
-        // a getter, `assignment_to_method` on a method), decided elsewhere.
-        // `undefined_setter` fires only when neither spelling declares
-        // anything.
+        // a getter, `assignment_to_method` on a method). The two
+        // finality rows this pass owns report below
+        // ([`Self::report_setter_less_write`]); the method/type rows stay
+        // with their own families. `undefined_setter` fires only when
+        // neither spelling declares anything.
         let found = if write {
             let named = if super_walk {
                 self.walk_super(container, row.name)
@@ -8295,7 +8767,12 @@ impl<'a> Engine<'a> {
             // landing snapshot reads before the setter probe can move the
             // face memo's origin cell.
             let named_hit = if let Walk::Found(entry) = &named {
-                Some((self.last_landing(), entry.kind))
+                Some((
+                    self.last_landing(),
+                    entry.kind,
+                    entry.is_final,
+                    entry.name_range,
+                ))
             } else {
                 None
             };
@@ -8309,9 +8786,21 @@ impl<'a> Engine<'a> {
                     kind,
                     landing.map(|(file, origin)| (file, setter, origin)),
                 );
-            } else if let Some((Some((file, origin)), MemberKind::Field)) = named_hit {
+            } else if let Some((Some((file, origin)), MemberKind::Field, _, _)) = named_hit {
                 let kind = Self::member_ref_kind(&row.intent, MemberKind::Field);
                 self.note_member_ref(row, kind, Some((file, row.name, origin)));
+            }
+            // The assignment-to-* family (#3282): the setter lookup missed
+            // while the plain name resolved a getter-backed face — a `final`
+            // field (no induced setter) or an explicit getter (no setter at
+            // all). The oracle's `AssignmentVerifier.verify` reports there
+            // instead of a member miss, so the row is claimed here and the
+            // caller's miss tail never sees it.
+            if !setter_hit
+                && let Some((landing, kind, is_final, name_range)) = named_hit
+                && self.report_setter_less_write(row, kind, is_final, name_range, landing)
+            {
+                return true;
             }
             matches!(named, Walk::Found(_)) || setter_hit
         } else {
@@ -8357,6 +8846,14 @@ impl<'a> Engine<'a> {
             }
             matches!(walk, Walk::Found(_))
         };
+        // The increment/decrement operand face (#3282): `x++`/`--x` assigns
+        // the member its plain spelling resolves, so a `final` field or an
+        // explicit getter reports through the assignment-to-* family exactly
+        // as a `=` write does. The read face's bookkeeping above already
+        // ran; this only answers the setter question.
+        if !write && self.increment_operand(row) {
+            self.report_increment_target(row, container, super_walk);
+        }
         if found {
             // The nullable-dereference face (nullable_dereference_verifier
             // .dart report): an interface member reached through a

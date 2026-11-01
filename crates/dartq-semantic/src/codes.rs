@@ -238,6 +238,31 @@ pub enum SemanticCode {
     EnumWithoutConstants,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
+    /// `'{0}' can't be used as a setter because it's final.` — the write's
+    /// `name=` lookup missed and the plain-name recovery is a
+    /// variable-backed accessor whose variable is a FIELD-or-variable
+    /// declaration (not an accessor declaration): a `final` instance/static
+    /// field, a `final`/`abstract final`/`external final` field, a
+    /// top-level `final` variable, or an implicit-getter-only extension
+    /// field (`assignment_verifier.dart` `verify`'s `GetterElement` arm,
+    /// `variable is FieldElement && variable.isOriginGetterSetter` false;
+    /// upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/assignment_verifier.dart:63-87).
+    AssignmentToFinal,
+    /// `The final variable '{0}' can only be set once.` — a write to a
+    /// `final` local variable or formal that is not definitely unassigned
+    /// at the write (`AssignmentExpressionShared.checkFinalAlreadyAssigned`,
+    /// upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver
+    /// .dart:395-425). The `late` locals and the for-each identities report
+    /// their own codes.
+    AssignmentToFinalLocal,
+    /// `There isn't a setter named '{0}' in class '{1}'.` — the same
+    /// setter-miss recovery, on a getter that comes from an ACCESSOR
+    /// declaration (an explicit `int get x` in a class, mixin, enum, or
+    /// extension): `isOriginGetterSetter` true
+    /// (`assignment_verifier.dart`:63-87).
+    AssignmentToFinalNoSetter,
     /// `The integer literal is being used as a double, but can't be
     /// represented as a 64-bit double without overflow or loss of
     /// precision: '{0}'.` — an integer literal whose double context
@@ -1980,6 +2005,15 @@ impl SemanticCode {
             ),
             Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
+            Self::AssignmentToFinal => ("assignment_to_final", "ASSIGNMENT_TO_FINAL"),
+            Self::AssignmentToFinalLocal => (
+                "assignment_to_final_local",
+                "ASSIGNMENT_TO_FINAL_LOCAL",
+            ),
+            Self::AssignmentToFinalNoSetter => (
+                "assignment_to_final_no_setter",
+                "ASSIGNMENT_TO_FINAL_NO_SETTER",
+            ),
             Self::IntegerLiteralImpreciseAsDouble => (
                 "integer_literal_imprecise_as_double",
                 "INTEGER_LITERAL_IMPRECISE_AS_DOUBLE",
@@ -3395,6 +3429,18 @@ impl SemanticCode {
             | Self::ExtensionOverrideArgumentNotAssignable
             | Self::ReturnOfInvalidType(_)
             | Self::InvalidNullAwareOperator => self.message3(a0, a1, ""),
+            // The assignment-to-* family (messages.yaml's
+            // assignmentToFinal/assignmentToFinalLocal/assignmentToFinalNoSetter
+            // rows; `{0}` is the written name, `{1}` the declaring class).
+            Self::AssignmentToFinal => {
+                format!("'{a0}' can't be used as a setter because it's final.")
+            }
+            Self::AssignmentToFinalLocal => {
+                format!("The final variable '{a0}' can only be set once.")
+            }
+            Self::AssignmentToFinalNoSetter => {
+                format!("There isn't a setter named '{a0}' in class '{a1}'.")
+            }
             // Three-argument rows route through `message3` — including the
             // #498 two/three-tier missing-implementation shapes and the
             // getter/method conflict row.
@@ -4758,6 +4804,17 @@ impl SemanticCode {
             Self::UnnecessaryImport => {
                 Some("Try removing the import directive.".to_string())
             }
+            // The assignment-to-* family's verbatim oracle correctionMessages
+            // (messages.yaml's assignmentToFinal/assignmentToFinalLocal/
+            // assignmentToFinalNoSetter rows; `{0}` is the written name).
+            Self::AssignmentToFinal => Some(format!(
+                "Try finding a different setter, or making '{a2}' non-final."
+            )),
+            Self::AssignmentToFinalLocal => Some(format!("Try making '{a2}' non-final.")),
+            Self::AssignmentToFinalNoSetter => Some(
+                "Try correcting the name to reference an existing setter, or declare the setter."
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -4873,6 +4930,9 @@ mod tests {
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
             SemanticCode::EnumWithoutConstants,
             SemanticCode::InvalidAssignment,
+            SemanticCode::AssignmentToFinal,
+            SemanticCode::AssignmentToFinalLocal,
+            SemanticCode::AssignmentToFinalNoSetter,
             SemanticCode::InvalidUseOfVisibleForTemplateMember,
             SemanticCode::ArgumentTypeNotAssignable,
             SemanticCode::ExtensionOverrideArgumentNotAssignable,
@@ -5731,6 +5791,12 @@ mod tests {
             | SemanticCode::AnonymousMethodWrongParameterList
             | SemanticCode::AnonymousMethodWrongParameterType
             | SemanticCode::ArgumentTypeNotAssignable
+            // The #3282 assignment-to-* family: the inline `message` arms
+            // above are the template source (no `registry_message` call
+            // site), and the descriptor round-trips through `code_info()`.
+            | SemanticCode::AssignmentToFinal
+            | SemanticCode::AssignmentToFinalLocal
+            | SemanticCode::AssignmentToFinalNoSetter
             // The #2784/#2867 augmentation faces — none registry-backed (the
             // dartq-diagnostics table predates them; the inline `message`
             // arms above are the sole template source).

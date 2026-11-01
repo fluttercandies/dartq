@@ -47,15 +47,15 @@ fn check(c: &mut Check<'_>) {
     let op = c.lexeme(op_token);
     // Right literal first (:64-71); the length access must sit on the
     // other operand (`_isLengthAccess`).
-    let (value, constant_on_right, length_pieces) =
+    let (value, constant_on_right, marker) =
         if let Some(value) = super::prefer_contains::int_value(c, &right, 0) {
-            (value, true, length_marker(c, &left).map(|_| &left))
+            (value, true, length_marker(c, &left))
         } else if let Some(value) = super::prefer_contains::int_value(c, &left, 0) {
-            (value, false, length_marker(c, &right).map(|_| &right))
+            (value, false, length_marker(c, &right))
         } else {
             return;
         };
-    let Some(_length_pieces) = length_pieces else {
+    let Some(marker) = marker else {
         return;
     };
     // The const-context bails (:93-108): a const constructor initializer
@@ -86,24 +86,45 @@ fn check(c: &mut Check<'_>) {
     };
     // The official span is the binary expression itself
     // (`reportAtNode(expression)`) — the whole comparison, operator and
-    // both operands. The container's own covered span anchors at its
-    // delta-tile operator, never the operand head, so the extent reads
-    // the run bounds: the left operand's token-adjacent tail's earliest
-    // head (a constructor-initializer's `x = ` target group tiles ahead
-    // of the operand — the contiguous tail drops it) through the right
-    // operand's last value row. That head can still be a member row's own
-    // start (`[].length` anchors at `length`), so the chain walks back to
-    // the receiver — the expression's first token, which is what the
-    // oracle reports.
-    let start = match slice::operand_start_token(c, &left, op_token) {
-        Some(token) => crate::rules::utf16_token_span(c, receiver_chain_start(c, token)).start,
-        None => slice::run_utf16_start(c, &left).unwrap_or_else(|| c.utf16_span(node).start),
+    // both operands. When the length access is the left operand, the
+    // expression head is the member chain's first token: the walk seeds
+    // at the marker (a tail-min head would read the owner-side strays of
+    // a constructor-initializer's `x = ` target group) and the earliest
+    // wrapping `(...)` row's head wins over the walk's literal-brace
+    // stop (`({1: 2}.length)` opens at `(`). When the constant is the
+    // left operand, its run seals token-adjacent to the operator (`-1`
+    // tiles [LiteralInt, UnaryPrefix] with the negating leaf last), so
+    // the tail cut answers the constant's first token.
+    let start = if constant_on_right {
+        let chain = receiver_chain_start(c, c.head_token(marker));
+        let wrapped = left
+            .iter()
+            .filter(|&&row| c.kind(row) == NodeKind::ParenthesizedExpression)
+            .map(|&row| crate::rules::utf16_token_span(c, c.head_token(row)).start)
+            .min();
+        match wrapped {
+            Some(paren_start) => paren_start.min(crate::rules::utf16_token_span(c, chain).start),
+            None => crate::rules::utf16_token_span(c, chain).start,
+        }
+    } else {
+        match slice::operand_start_token(c, &left, op_token) {
+            Some(token) => crate::rules::utf16_token_span(c, receiver_chain_start(c, token)).start,
+            None => slice::run_utf16_start(c, &left).unwrap_or_else(|| c.utf16_span(node).start),
+        }
     };
     let end = match right.last() {
         Some(&tail) if c.kind(tail) == NodeKind::DotAccess => {
             crate::rules::utf16_token_span(c, c.head_token(tail)).end
         }
-        Some(&tail) => c.utf16_span(tail).end,
+        // A negated literal seals with the prefix leaf after it (`-1`
+        // tiles [LiteralInt, UnaryPrefix] and the prefix leaf covers the
+        // operator alone), so the tail's own span ends at `-`; the oracle
+        // row runs to the run's last token — the maximum piece end.
+        Some(&tail) => right
+            .iter()
+            .map(|&piece| c.utf16_span(piece).end)
+            .max()
+            .unwrap_or_else(|| c.utf16_span(tail).end),
         None => c.utf16_span(node).end,
     };
     c.report_texts(start..end, problem, correction.unwrap_or_default(), &[]);
@@ -185,6 +206,15 @@ fn length_marker(c: &Check<'_>, pieces: &[u32]) -> Option<u32> {
     // `[].length + 1`, a trailing expression piece) leaves `length`
     // mid-run and is not the access.
     let after = &pieces[pieces.iter().position(|&row| row == tail)? + 1..];
+    // The cast face's named type tiles its own spelling (`as int` keeps
+    // an `Identifier` row beside the `Type` row) — part of the `as`
+    // wrapper the official `_drillDownTo` walks through, never an
+    // operand tail.
+    let type_heads: Vec<u32> = after
+        .iter()
+        .filter(|&&row| c.kind(row) == NodeKind::Type)
+        .map(|&row| c.head_token(row))
+        .collect();
     if after.iter().any(|&row| {
         !slice::is_send_group_piece(c, row)
             && !matches!(
@@ -194,6 +224,7 @@ fn length_marker(c: &Check<'_>, pieces: &[u32]) -> Option<u32> {
                     | NodeKind::Type
                     | NodeKind::TypeArguments
             )
+            && !(c.kind(row) == NodeKind::Identifier && type_heads.contains(&c.head_token(row)))
     }) {
         return None;
     }
@@ -220,6 +251,12 @@ fn length_marker(c: &Check<'_>, pieces: &[u32]) -> Option<u32> {
     .then_some(tail)
 }
 
+/// The member `var`/`final`/`const` `ModSet` bit (bridge `mod_bits`,
+/// `VAR_FINAL_OR_CONST = 1 << 6`). The constructor row anchors at the
+/// declared name (bridge `begin_constructor`), so the bit — not a head
+/// lexeme — is the only read of its `const`.
+const VAR_FINAL_OR_CONST_MEMBER_BIT: u16 = 1 << 6;
+
 /// The constructor-initializer bail (:93-102): inside an initializer
 /// whose constructor is const the comparison is exempt (a non-const
 /// constructor's initializer proceeds).
@@ -233,7 +270,9 @@ fn in_const_constructor_initializer(c: &Check<'_>) -> bool {
             // The initializer's constructor is the enclosing declaration.
             for &outer in path {
                 if c.kind(outer) == NodeKind::Constructor {
-                    return c.lexeme(c.head_token(outer)) == "const";
+                    return dartq_ast::mod_flags(c.unit.ast, outer)
+                        & VAR_FINAL_OR_CONST_MEMBER_BIT
+                        != 0;
                 }
             }
             return false;

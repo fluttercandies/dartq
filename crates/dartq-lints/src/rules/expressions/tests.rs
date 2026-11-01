@@ -1211,6 +1211,268 @@ fn prefer_is_empty_receiver_face_decides_literal_receivers() {
     assert_eq!(f.run(&one_rule("prefer_is_empty")).len(), 1);
 }
 
+/// The whole upstream oracle corpus (`PreferIsEmptyTest`, 47 cases, plus the
+/// four `messages.yaml` doc cases — 51, `conformance/status.tsv`
+/// `lint prefer_is_empty 51 35 16`): each entry is the exact materialized
+/// case source (the `PreferIsEmptyTest` files carry a leading blank line, the
+/// doc files do not) and the oracle's `(line, column, length)` for every
+/// `prefer_is_empty` row. The semantic face is mounted — the sweep runs the
+/// full engine. Every mismatch is collected before the single panic so one
+/// run shows the whole deviation set. The one engine-capability residual
+/// (`iterableLength_notEq_zero`, the inferred `Iterable.empty()` receiver)
+/// is pinned separately in
+/// [`prefer_is_empty_oracle_corpus_inferred_receiver_pin`].
+#[test]
+fn prefer_is_empty_oracle_corpus_pins() {
+    // (case, source, oracle rows as (line, column, length)).
+    let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+        (
+            "listLength_asInt_greaterThan_zero",
+            "\nvar x = ([].length as int) > 0;\n",
+            &[(2, 9, 22)],
+        ),
+        (
+            "listLength_eqEq_negativeOne",
+            "\nvar x = [].length == -1;\n",
+            &[(2, 9, 15)],
+        ),
+        ("listLength_eqEq_one", "\nvar x = [].length == 1;\n", &[]),
+        ("listLength_eqEq_zero", "\nvar x = [].length == 0;\n", &[(2, 9, 14)]),
+        (
+            "listLength_greaterThan_negativeOne",
+            "\nvar x = [].length > -1;\n",
+            &[(2, 9, 14)],
+        ),
+        ("listLength_greaterThan_one", "\nvar x = [].length > 1;\n", &[]),
+        (
+            "listLength_greaterThan_one_boolTarget",
+            "\nbool x = [].length > 1;\n",
+            &[],
+        ),
+        (
+            "listLength_greaterThan_zero",
+            "\nvar x = [].length > 0;\n",
+            &[(2, 9, 13)],
+        ),
+        (
+            "listLength_greaterThan_zero_inConditional",
+            "\nvar x = [].length > 0 ? 7 : 6;\n",
+            &[(2, 9, 13)],
+        ),
+        (
+            "listLength_greaterThan_zero_inConstructorAssertInitializer",
+            "\nclass A {\n  final List<String> x;\n  const A(this.x) : assert(x.length > 0);\n}\n",
+            &[],
+        ),
+        (
+            "listLength_greaterThanEq_negativeOne",
+            "\nvar x = [].length >= -1;\n",
+            &[(2, 9, 15)],
+        ),
+        (
+            "listLength_greaterThanEq_one",
+            "\nvar x = [].length >= 1;\n",
+            &[(2, 9, 14)],
+        ),
+        (
+            "listLength_greaterThanEq_zero",
+            "\nvar x = [].length >= 0;\n",
+            &[(2, 9, 14)],
+        ),
+        (
+            "listLength_lessThan_negativeOne",
+            "\nvar x = [].length < -1;\n",
+            &[(2, 9, 14)],
+        ),
+        ("listLength_lessThan_one", "\nvar x = [].length < 1;\n", &[(2, 9, 13)]),
+        (
+            "listLength_lessThan_variable",
+            "\nvar zero  = 0;\nvar x = [].length < zero;\n",
+            &[],
+        ),
+        ("listLength_lessThan_zero", "\nvar x = [].length < 0;\n", &[(2, 9, 13)]),
+        (
+            "listLength_lessThanEq_negativeOne",
+            "\nvar x = [].length <= -1;\n",
+            &[(2, 9, 15)],
+        ),
+        ("listLength_lessThanEq_one", "\nvar x = [].length <= 1;\n", &[]),
+        ("listLength_lessThanEq_zero", "\nvar x = [].length <= 0;\n", &[(2, 9, 14)]),
+        (
+            "listLength_notEq_negativeOne",
+            "\nvar x = [].length != -1;\n",
+            &[(2, 9, 15)],
+        ),
+        ("listLength_notEq_one", "\nvar x = [].length != 1;\n", &[]),
+        ("listLength_notEq_zero", "\nvar x = [].length != 0;\n", &[(2, 9, 14)]),
+        (
+            "listLength_plusExpression_greaterThan_zero",
+            "\nvar x = [].length + 1 > 0;\n",
+            &[],
+        ),
+        (
+            "mapLength_parenthesized_eqEq_zero",
+            "\nvar x = ({1: 2}.length) == 0;\n",
+            &[(2, 9, 20)],
+        ),
+        (
+            "negativeOne_eqEq_listLength",
+            "\nvar x = -1 == [].length;\n",
+            &[(2, 9, 15)],
+        ),
+        (
+            "negativeOne_greaterThan_listLength",
+            "\nvar x = -1 > [].length;\n",
+            &[(2, 9, 14)],
+        ),
+        (
+            "negativeOne_greaterThanEq_listLength",
+            "\nvar x = -1 >= [].length;\n",
+            &[(2, 9, 15)],
+        ),
+        (
+            "negativeOne_lessThan_listLength",
+            "\nvar x = -1 < [].length;\n",
+            &[(2, 9, 14)],
+        ),
+        (
+            "negativeOne_lessThanEq_listLength",
+            "\nvar x = -1 <= [].length;\n",
+            &[(2, 9, 15)],
+        ),
+        (
+            "negativeOne_notEq_listLength",
+            "\nvar x = -1 != [].length;\n",
+            &[(2, 9, 15)],
+        ),
+        ("one_eqEq_listLength", "\nvar x = 1 == [].length;\n", &[]),
+        (
+            "one_greaterThan_listLength",
+            "\nvar x = 1 > [].length;\n",
+            &[(2, 9, 13)],
+        ),
+        ("one_greaterThanEq_listLength", "\nvar x = 1 >= [].length;\n", &[]),
+        ("one_lessThan_listLength", "\nvar x = 1 < [].length;\n", &[]),
+        (
+            "one_lessThanEq_listLength",
+            "\nvar x = 1 <= [].length;\n",
+            &[(2, 9, 14)],
+        ),
+        ("one_notEq_listLength", "\nvar x = 1 != [].length;\n", &[]),
+        (
+            "stringLength_eqEq_zero_inConstructorInitializer",
+            "\nclass C {\n  final bool x;\n  C(String s) : x = s.length == 0;\n}\n",
+            &[(4, 21, 13)],
+        ),
+        (
+            "stringLength_greaterThan_zero_constructorAssertInitializer",
+            "\nclass C {\n  final String s;\n  const C(this.s) : assert(s.length > 0);\n}\n",
+            &[],
+        ),
+        (
+            "variable_lessThan_listLength",
+            "\nvar zero = 0;\nvar x = zero < [].length;\n",
+            &[],
+        ),
+        ("zero_eqEq_listLength", "\nvar x = 0 == [].length;\n", &[(2, 9, 14)]),
+        (
+            "zero_greaterThan_listLength",
+            "\nvar x = 0 > [].length;\n",
+            &[(2, 9, 13)],
+        ),
+        (
+            "zero_greaterThanEq_listLength",
+            "\nvar x = 0 >= [].length;\n",
+            &[(2, 9, 14)],
+        ),
+        (
+            "zero_lessThan_listLength",
+            "\nvar x = 0 < [].length;\n",
+            &[(2, 9, 13)],
+        ),
+        (
+            "zero_lessThanOrEq_listLength",
+            "\nvar x = 0 <= [].length;\n",
+            &[(2, 9, 14)],
+        ),
+        ("zero_notEq_listLength", "\nvar x = 0 != [].length;\n", &[(2, 9, 14)]),
+        (
+            "doc_bad_0",
+            "int f(Iterable<int> p) => p.length == 0 ? 0 : p.first;\n",
+            &[(1, 27, 13)],
+        ),
+        (
+            "doc_bad_1",
+            "if (lunchBox.length == 0) return 'so hungry...';\nif (words.length != 0) return words.join(' ');\n",
+            &[],
+        ),
+        (
+            "doc_good_0",
+            "void f(Iterable<int> p) => p.isEmpty ? 0 : p.first;\n",
+            &[],
+        ),
+        (
+            "doc_good_1",
+            "if (lunchBox.isEmpty) return 'so hungry...';\nif (words.isNotEmpty) return words.join(' ');\n",
+            &[],
+        ),
+    ];
+    // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+    fn offset(source: &str, line: u32, column: u32) -> u32 {
+        let line_start: usize = source
+            .split_inclusive('\n')
+            .take(line as usize - 1)
+            .map(str::len)
+            .sum();
+        (line_start + column as usize - 1) as u32
+    }
+    let mut mismatches = Vec::new();
+    for (case, source, oracle) in cases {
+        let f = Fixture::parse(source);
+        let mut lints = f.run_semantic(&one_rule("prefer_is_empty"));
+        lints.sort_by_key(|lint| lint.range.start);
+        let got: Vec<(u32, u32)> = lints
+            .iter()
+            .map(|lint| (lint.range.start, lint.range.end))
+            .collect();
+        let want: Vec<(u32, u32)> = oracle
+            .iter()
+            .map(|&(line, column, length)| {
+                let start = offset(source, line, column);
+                (start, start + length)
+            })
+            .collect();
+        if got != want {
+            mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// The corpus's one engine-capability residual — upstream
+/// `test_iterableLength_notEq_zero`, oracle row `(3, 9, 13)`. The official
+/// `_isLengthAccess` reads the receiver's `staticType`; dartq's
+/// typed-receiver gate answers the same read through `Analysis::type_of`,
+/// whose read-types table carries no row for an untyped (`var`) binding's
+/// use site — the initializer-inference capability lives in the semantic
+/// engine. The gate is wired for it (the bare-name arm answers the moment
+/// `type_of` does). Ignore-flip when the semantic layer records inferred
+/// variable types.
+#[test]
+#[ignore = "engine capability: read-types row for untyped variable uses"]
+fn prefer_is_empty_oracle_corpus_inferred_receiver_pin() {
+    let f = Fixture::parse("\nvar i = Iterable.empty();\nvar x = i.length != 0;\n");
+    let mut lints = f.run_semantic(&one_rule("prefer_is_empty"));
+    lints.sort_by_key(|lint| lint.range.start);
+    let got: Vec<(u32, u32)> = lints
+        .iter()
+        .map(|lint| (lint.range.start, lint.range.end))
+        .collect();
+    // The oracle row: `i.length != 0` — line 3, column 9, length 13
+    // (offsets 35..48 after the materialized leading blank line).
+    assert_eq!(got, vec![(35, 48)]);
+}
+
 // —— prefer_is_not_empty ———————————————————————————————————————————————
 
 /// `test/rules/prefer_is_not_empty_test.dart` `test_notIsEmpty` — the

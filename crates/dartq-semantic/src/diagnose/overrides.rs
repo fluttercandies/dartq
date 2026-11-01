@@ -2852,16 +2852,24 @@ impl<'a> Engine<'a> {
     ///    `extension_conflicting_static_and_instance`; `values` is exempt
     ///    on ACCESSORS only (a `values` METHOD still collides).
     /// 2. The ENUM getMember arm — an enum's static member that collides
-    ///    with an interface member (its own constants, an inherited
-    ///    `index`/`hashCode`/`toString`, the implicit `Enum`/`Object`
-    ///    faces) reports `conflictingClassName` = the enum's own name.
+    ///    with an INTERFACE member (an own instance member, an inherited
+    ///    one, the implicit `Enum`/`Object` faces) reports one row whose
+    ///    `conflictingClassName` is the enum's own name — the interface
+    ///    member's declaring container never renders
+    ///    (`ConflictStaticInheritedFoo`/`ConflictEnumValueInheritedFoo`
+    ///    both name the enum). An enum constant is a static member, so it
+    ///    is a PROBE here but never a target: the interface map
+    ///    (`InheritanceManager3._getTypeMembers`) drops every static
+    ///    member, so `enum E { one, two }` stays silent while
+    ///    `enum E { foo; int get foo => 42; }` reports at the constant.
     /// 3. The INHERITED arm (`ErrorVerifier._checkForConflictingClassMembers`,
-    ///    error_verifier.dart:3548-3642) — each static member probes
-    ///    `getInherited(name)` then `getInherited(name=)`; a non-static hit
-    ///    reports `conflictingClassName` = the found owner (`Object`/
-    ///    `Enum`/superclass/constraint included). Both an own row and an
-    ///    inherited row can fire for one member (upstream emits each
-    ///    independently).
+    ///    error_verifier.dart:3548-3642 — an arm no enum declaration
+    ///    reaches; its three call sites are class/mixin/extension-type) —
+    ///    each static member probes `getInherited(name)` then
+    ///    `getInherited(name=)`; a non-static hit reports
+    ///    `conflictingClassName` = the found owner (`Object`/superclass/
+    ///    constraint included). Both an own row and an inherited row can
+    ///    fire for one member (upstream emits each independently).
     pub(crate) fn check_conflicting_static_and_instance(&mut self) {
         let Some((container, container_kind)) = self.container_context() else {
             return;
@@ -2882,12 +2890,20 @@ impl<'a> Engine<'a> {
             })
             .map(|site| self.bare_name(site.name))
             .collect();
-        // The implicit `Enum`/`Object` instance members an enum's static
-        // member can collide with through `_getInterfaceMember` — the
-        // walk has no model rows for them (they live on dart:core's
-        // `Enum`/`Object`), so the own-name arm and the inherited probe
-        // both fall back to this fixed set.
-        const IMPLICIT_OBJECT_ENUM: [&str; 6] = [
+        // The implicit `Object` instance members a static member can
+        // collide with through `getInherited` — the walk has no model rows
+        // for them (they live on dart:core's `Object`), so the probe falls
+        // back to this fixed set. `index` is `Enum`'s, so an enum's probe
+        // set adds it on top (a class inherits no `index`; the enum's own
+        // constants are static and answer neither probe).
+        const IMPLICIT_OBJECT: [&str; 5] = [
+            "hashCode",
+            "toString",
+            "noSuchMethod",
+            "runtimeType",
+            "==",
+        ];
+        const IMPLICIT_ENUM: [&str; 6] = [
             "index",
             "hashCode",
             "toString",
@@ -2897,20 +2913,18 @@ impl<'a> Engine<'a> {
         ];
         let values = self.intern("values");
         let is_enum = container_kind == ContainerKind::Enum;
-        // The enum's own constants also answer `_getInterfaceMember`'s
-        // instance-member probe (a constant IS a static field whose
-        // induced getter joins the enum's instance surface upstream) —
-        // captured here so the inherited probe can consult them.
-        let enum_constants: FxHashSet<StringId> = if is_enum {
-            self.index
-                .get(self.file)
-                .and_then(|elements| elements.container(container))
-                .map(|decl| decl.enum_constants.iter().copied().collect())
-                .unwrap_or_default()
+        let implicit: &[&str] = if is_enum {
+            &IMPLICIT_ENUM
         } else {
-            FxHashSet::default()
+            &IMPLICIT_OBJECT
         };
-        // The static member sites, in declaration order.
+        // The static member sites, in declaration order. An enum constant
+        // is one of them (a constant IS a static field, and its induced
+        // getter joins `_checkEnumStatic`'s accessor walk) — but it is
+        // only ever a PROBE. Nothing static answers a probe: the interface
+        // map drops every static member (`InheritanceManager3
+        // ._getTypeMembers`), so a constant collides with its container's
+        // INSTANCE surface only, never with itself or a sibling.
         let sites: Vec<(SourceRange, StringId, bool)> = self
             .decl_sites
             .iter()
@@ -2963,27 +2977,66 @@ impl<'a> Engine<'a> {
                 }
                 continue;
             }
-            // Arm 1 — own-scope. `values` accessors are exempt; every
-            // other bare name in the instance scope collides.
-            if base != values || !accessor {
-                if instance_names.contains(&base) {
-                    self.emit(
+            // `values` is exempt on ACCESSORS only
+            // (member_duplicate_definition_verifier.dart:436-458 reads the
+            // accessor face): a static field named `values` never reports,
+            // a method still does. Written getters/setters land in the
+            // model under the method kind, so only field sites carry the
+            // flag here.
+            let values_accessor = base == values && accessor;
+            // Arm 1 — own-scope instance members. The decl-site view is
+            // the authoritative one: the member map's keep-first row for
+            // a colliding pair is the static member itself, so an instance
+            // member of the same bare name survives only here.
+            let own_hit = instance_names.contains(&base);
+            if is_enum {
+                // `_checkEnumStatic` probes the enum's INTERFACE once per
+                // static member — own instance members, inherited members
+                // (`getMember`), the implicit `Enum`/`Object` faces — and
+                // reports a single row whose `conflictingClassName` is the
+                // enum's own name. Both halves of `_getInterfaceMember`
+                // (the getter face, then the `name=` face) are interface
+                // lookups, so the strictly-above climb covers what arm 1's
+                // decl-site view does not.
+                let inherited_hit = matches!(
+                    self.walk_from(container, base, true),
+                    Walk::Found(entry) if !entry.is_static
+                );
+                let setter_spelling = self.setter_spelling(base);
+                let setter_hit = matches!(
+                    self.walk_from(container, setter_spelling, true),
+                    Walk::Found(entry) if !entry.is_static
+                );
+                let implicit_hit = implicit.iter().any(|member| self.intern(member) == base);
+                if !values_accessor
+                    && (own_hit || inherited_hit || setter_hit || implicit_hit)
+                {
+                    self.emit3(
                         SemanticCode::ConflictingStaticAndInstance,
                         range,
                         &container_text,
                         &base_text,
+                        &container_text,
                     );
                 }
+                continue;
             }
-            // Arms 2+3 — the interface/inherited probe. Enums read the
-            // whole member surface (own + inherited); every other kind
-            // reads strictly above the container (`skip_own`).
-            let inherited = if is_enum {
-                self.walk_members(container, base)
-            } else {
-                self.walk_from(container, base, true)
-            };
-            let found = match inherited {
+            // Arm 1 — own-scope. `values` accessors are exempt; every
+            // other bare name in the instance scope collides.
+            if own_hit && !values_accessor {
+                self.emit(
+                    SemanticCode::ConflictingStaticAndInstance,
+                    range,
+                    &container_text,
+                    &base_text,
+                );
+            }
+            // Arm 3 — the inherited probe. Every non-enum kind reads
+            // strictly above the container (`skip_own`): the interface
+            // arm and the inherited arm are independent upstream, so a
+            // member with both an own and an inherited collision reports
+            // twice.
+            let found = match self.walk_from(container, base, true) {
                 Walk::Found(entry) => Some(entry),
                 _ => None,
             };
@@ -3006,43 +3059,16 @@ impl<'a> Engine<'a> {
                 );
                 continue;
             }
-            // The implicit `Enum`/`Object` faces and the enum's own
-            // constants answer the same probe without model rows.
-            let implicit_hit = IMPLICIT_OBJECT_ENUM
-                .iter()
-                .any(|member| self.intern(member) == base)
-                || enum_constants.contains(&base);
-            if implicit_hit {
-                let owner = if is_enum {
-                    container_text.clone()
-                } else {
-                    // The implicit member's owner (`Object`/`Enum`), not
-                    // the declaring container — the `Enum.index`/
-                    // `Object.toString` faces render the supertype name.
-                    if IMPLICIT_OBJECT_ENUM
-                        .iter()
-                        .any(|member| self.intern(member) == base)
-                    {
-                        if self
-                            .index
-                            .get(self.file)
-                            .and_then(|elements| elements.container(container))
-                            .is_some_and(|decl| decl.kind == ContainerKind::Enum)
-                        {
-                            "Enum".to_string()
-                        } else {
-                            "Object".to_string()
-                        }
-                    } else {
-                        container_text.clone()
-                    }
-                };
+            // The implicit `Object` faces answer the same probe without
+            // model rows (dart:core owns them); their declaring container
+            // is what renders.
+            if implicit.iter().any(|member| self.intern(member) == base) {
                 self.emit3(
                     SemanticCode::ConflictingStaticAndInstance,
                     range,
                     &container_text,
                     &base_text,
-                    &owner,
+                    "Object",
                 );
                 continue;
             }

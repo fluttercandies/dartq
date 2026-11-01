@@ -44,10 +44,11 @@
 //!   membership queries only, so the init-batch permutation is
 //!   unobservable.
 
-use crate::model::Ty;
+use crate::model::{MemberEntry, MemberKind, Ty};
 use crate::switch_tracker::CORE_SUPERTYPES;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::FxHashMap;
+use std::sync::LazyLock;
 
 /// Members of `dart:core` `Object`: defined on every class-shaped receiver
 /// the M1 walk can reach (the superclass chain ends at an unindexed root).
@@ -837,6 +838,253 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 14] = [
         ],
     ),
 ];
+
+/// The GETTER spellings of each [`CORE_TYPE_MEMBERS`] row — the member-kind
+/// split the lint faces read (`unnecessary_statements`' getter-vs-tear-off
+/// verdict, the cascade section's `staticType is FunctionType` gate). Every
+/// other identifier spelling of a row is a method; a `name=` spelling is a
+/// setter; an operator spelling claims no kind at all (the operator faces
+/// keep their own tables, and a fabricated method `==` would silence
+/// `unrelated_type_equality_checks`' non-`bool` arm).
+///
+/// Sourced from the reference SDK's declarations (`sdk/lib/core/*.dart`,
+/// `sdk/lib/collection/queue.dart`, `sdk/lib/async/future.dart`) plus the
+/// unconditional platform extensions the rows already fold
+/// (`firstOrNull`/`indexed`/`nonNulls`/`asNameMap`/`wait`). A getter
+/// missing from this table answers `Method`, so the table must stay
+/// complete for every row's getter face — the incomplete direction is the
+/// over-report one (`List.empty().first;` reported as a tear-off).
+pub(crate) const CORE_TYPE_GETTERS: [(&str, &[&str]); 14] = [
+    ("Object", &["hashCode", "runtimeType"]),
+    ("Iterator", &["current", "hashCode", "runtimeType"]),
+    (
+        "int",
+        &[
+            "bitLength",
+            "isEven",
+            "isOdd",
+            "isFinite",
+            "isInfinite",
+            "isNaN",
+            "isNegative",
+            "sign",
+            "hashCode",
+            "runtimeType",
+        ],
+    ),
+    (
+        "double",
+        &[
+            "isFinite",
+            "isInfinite",
+            "isNaN",
+            "isNegative",
+            "sign",
+            "hashCode",
+            "runtimeType",
+        ],
+    ),
+    (
+        "num",
+        &[
+            "isFinite",
+            "isInfinite",
+            "isNaN",
+            "isNegative",
+            "sign",
+            "hashCode",
+            "runtimeType",
+        ],
+    ),
+    (
+        "String",
+        &[
+            "codeUnits",
+            "isEmpty",
+            "isNotEmpty",
+            "length",
+            "runes",
+            "hashCode",
+            "runtimeType",
+        ],
+    ),
+    ("bool", &["hashCode", "runtimeType"]),
+    (
+        "Iterable",
+        &[
+            "asNameMap",
+            "first",
+            "firstOrNull",
+            "hashCode",
+            "indexed",
+            "isEmpty",
+            "isNotEmpty",
+            "iterator",
+            "last",
+            "lastOrNull",
+            "length",
+            "nonNulls",
+            "runtimeType",
+            "single",
+            "singleOrNull",
+            "wait",
+        ],
+    ),
+    (
+        "List",
+        &[
+            "asNameMap",
+            "first",
+            "firstOrNull",
+            "hashCode",
+            "indexed",
+            "isEmpty",
+            "isNotEmpty",
+            "iterator",
+            "last",
+            "lastOrNull",
+            "length",
+            "nonNulls",
+            "reversed",
+            "runtimeType",
+            "single",
+            "singleOrNull",
+            "wait",
+        ],
+    ),
+    (
+        "Map",
+        &[
+            "entries",
+            "hashCode",
+            "isEmpty",
+            "isNotEmpty",
+            "keys",
+            "length",
+            "runtimeType",
+            "values",
+        ],
+    ),
+    (
+        "Set",
+        &[
+            "asNameMap",
+            "first",
+            "firstOrNull",
+            "hashCode",
+            "indexed",
+            "isEmpty",
+            "isNotEmpty",
+            "iterator",
+            "last",
+            "lastOrNull",
+            "length",
+            "nonNulls",
+            "runtimeType",
+            "single",
+            "singleOrNull",
+            "wait",
+        ],
+    ),
+    ("Future", &["asStream", "hashCode", "runtimeType"]),
+    ("FutureOr", &["asStream", "hashCode", "runtimeType"]),
+    (
+        "Queue",
+        &[
+            "asNameMap",
+            "first",
+            "firstOrNull",
+            "hashCode",
+            "indexed",
+            "isEmpty",
+            "isNotEmpty",
+            "iterator",
+            "last",
+            "lastOrNull",
+            "length",
+            "nonNulls",
+            "runtimeType",
+            "single",
+            "singleOrNull",
+            "wait",
+        ],
+    ),
+];
+
+/// The member kind a name-level core container answers for `member`:
+/// `None` when the container is outside the core face, the spelling is
+/// absent from its row, or the spelling is an operator (`==`, `[]`, `+`, …)
+/// — an operator's kind is never claimed here, the operator faces keep
+/// their own tables.
+pub(crate) fn core_member_kind(container: &str, member: &str) -> Option<MemberKind> {
+    let row = CORE_TYPE_MEMBERS
+        .iter()
+        .find(|(head, _)| *head == container)?
+        .1;
+    if !row.contains(&member) {
+        return None;
+    }
+    if !member.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if member.ends_with('=') {
+        return Some(MemberKind::Setter);
+    }
+    let getters = CORE_TYPE_GETTERS
+        .iter()
+        .find(|(head, _)| *head == container)?
+        .1;
+    Some(if getters.contains(&member) {
+        MemberKind::Getter
+    } else {
+        MemberKind::Method
+    })
+}
+
+/// The synthesized entry a core member answers through. Only the KIND is
+/// claimed — every declared type stays [`Ty::Unknown`], so
+/// [`member_entry_type`](crate::analysis) keeps its under-report `None` and
+/// the cascade face's `staticType is FunctionType` gate answers through the
+/// kind alone (a core getter returning a function type is not spelled by
+/// this face; the under-report direction keeps the section silent).
+fn core_entry(kind: MemberKind) -> &'static MemberEntry {
+    fn bare(kind: MemberKind) -> MemberEntry {
+        MemberEntry {
+            kind,
+            is_static: false,
+            is_abstract: false,
+            is_external: false,
+            is_final: false,
+            type_params: 0,
+            type_param_names: Box::new([]),
+            type_param_bounds: Box::new([]),
+            var_ty: Ty::Unknown,
+            return_ty: Ty::Unknown,
+            formals: None,
+            annotations: Box::new([]),
+            name_range: MemberEntry::MISSING_NAME_RANGE,
+        }
+    }
+    static GETTER: LazyLock<MemberEntry> = LazyLock::new(|| bare(MemberKind::Getter));
+    static METHOD: LazyLock<MemberEntry> = LazyLock::new(|| bare(MemberKind::Method));
+    static SETTER: LazyLock<MemberEntry> = LazyLock::new(|| bare(MemberKind::Setter));
+    match kind {
+        MemberKind::Getter => &GETTER,
+        // A core row carries no field — the method entry stands in for the
+        // unreachable arm.
+        MemberKind::Method | MemberKind::Field => &METHOD,
+        MemberKind::Setter => &SETTER,
+    }
+}
+
+/// The entry the analysis query face answers for `container.member`: the
+/// SDK containers resolve through the namespace but land on unindexed
+/// (external) units, so [`member_lookup`](crate::library::member_lookup)
+/// chain-breaks and the getter-vs-tear-off split would be unreachable
+/// (`List.empty().first` vs `List.empty().where`).
+pub(crate) fn core_member_entry(container: &str, member: &str) -> Option<&'static MemberEntry> {
+    core_member_kind(container, member).map(core_entry)
+}
 
 /// The dart:core primitives whose assignability the name level decides: a
 /// value typed by one of these names never fits another (the types are
