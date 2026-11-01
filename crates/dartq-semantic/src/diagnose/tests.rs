@@ -22644,6 +22644,17 @@ mod ticket_3434_tests;
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3516 —— a cross-unit `augment` fragment's declarations join the merged
+// —— element face: enum constants (read face + switch witness set),
+// —— constructor selectors, `const`-constructor presence, the implicit
+// —— default (suppressed by a part-declared named constructor, kept by an
+// —— introduction-declared one) and the `with` supertype edge. Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3516_tests.rs"]
+mod ticket_3516_tests;
+
 // —— #3402 —— a call site's static type is the send's result, resolved
 // —— through the callee's declared return — an alias-typed local's
 // —— invocation answers the substituted signature's return, and the send

@@ -60,8 +60,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::collector::{DUP_GETTER, DUP_OTHER, DUP_PAIR, DUP_SETTER};
 use crate::model::{
-    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, DuplicateDecl, FileElements,
-    FnShapeId, MemberEntry, MemberKind, MicroKind, RecordShapeId, TopDecl, Ty,
+    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, DuplicateDecl, FileElements, Formals,
+    FnShapeId, MemberEntry, MemberKind, MicroKind, NameMap, RecordShapeId, TopDecl, Ty,
 };
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
@@ -255,8 +255,12 @@ struct ElementFragments {
     /// order.
     fragments: Box<[FileId]>,
     /// One face per unit of the element, file-ordered: that unit's own row
-    /// with the other fragments' portable members folded in. Empty for an
-    /// introduction-less element.
+    /// with every other fragment's declarations folded in — members (#3418)
+    /// and, since #3516, the columns an augmentation can grow: enum
+    /// constants, constructor selectors and formals, `const`-constructor
+    /// presence, the `extends` gap and the `with`/`implements`/`on` edges
+    /// ([`admit_fragment`]), plus the re-derived implicit default
+    /// ([`CtorDeclarations`]). Empty for an introduction-less element.
     faces: Box<[(FileId, Container)]>,
 }
 
@@ -375,13 +379,41 @@ fn build_fragments(
                             .map(|(member, entry)| (*member, sanitize_entry(entry))),
                     );
                 }
-                faces.push((
-                    owner,
-                    Container {
-                        members: rows.into_iter().collect(),
-                        ..base.clone()
-                    },
-                ));
+                // The element's OTHER columns fold the same way (#3516) —
+                // `members` alone left an `augment` fragment's enum
+                // constants, constructors, `const`-ability, superclass edge
+                // and `with`/`implements`/`on` edges invisible to every
+                // lookup made in another unit. The seed is the
+                // introduction's row (the element's identity: kind,
+                // modifiers, type parameters, metadata) and each fragment
+                // adds its declarations in element order, the owner's own
+                // fragment verbatim and every other one sanitized
+                // ([`admit_fragment`]).
+                let mut face = Container {
+                    members: rows.into_iter().collect(),
+                    ..base.clone()
+                };
+                // A face belonging to a fragment unit reads the
+                // introduction's constructor tables across a pool boundary.
+                if owner != intro {
+                    let ctor_formals = sanitize_formal_table(&face.ctor_formals);
+                    let factory_formals = sanitize_formal_table(&face.factory_formals);
+                    face.ctor_formals = ctor_formals;
+                    face.factory_formals = factory_formals;
+                }
+                let mut ctors = CtorDeclarations::of(&base, name);
+                for &other in &owners {
+                    if other == intro {
+                        continue;
+                    }
+                    let Some(source) = index.get(other).and_then(|e| e.container(name)) else {
+                        continue;
+                    };
+                    admit_fragment(&mut face, source, other != owner);
+                    ctors.admit(source, name);
+                }
+                face.has_unnamed_constructor = ctors.settled();
+                faces.push((owner, face));
             }
             faces.sort_by_key(|(file, _)| *file);
         }
@@ -613,6 +645,144 @@ fn sanitize_entry(entry: &MemberEntry) -> MemberEntry {
     entry
 }
 
+/// [`sanitize_entry`]'s constructor-table half: every pool-carrying declared
+/// type of one formal list rewritten to `Ty::Unknown`. Names, positions, the
+/// required bit and the naming mode ride the shared tables, so only the
+/// declared types are lost — the same under-report-never-panic posture the
+/// member gate takes.
+fn sanitize_formals(formals: &Formals) -> Box<Formals> {
+    let mut formals = formals.clone();
+    for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+        if !ty_is_pool_free(formal.ty) {
+            formal.ty = Ty::Unknown;
+        }
+    }
+    Box::new(formals)
+}
+
+/// A `Container::ctor_formals`/`factory_formals` table with every list run
+/// through [`sanitize_formals`] — the cross-pool gate for the columns #3516
+/// folds into the merged face.
+fn sanitize_formal_table(table: &NameMap<Box<Formals>>) -> NameMap<Box<Formals>> {
+    table
+        .iter()
+        .map(|(selector, formals)| (*selector, sanitize_formals(formals)))
+        .collect()
+}
+
+/// `base` followed by every name of `add` it lacks — a fragment's
+/// declaration-order list joined onto the element's (enum constants,
+/// constructor selectors, clause edges). The same rule the same-unit fold
+/// applies (`collector::Builder::fold_fragment`).
+fn union_names(base: &[StringId], add: &[StringId]) -> Box<[StringId]> {
+    let mut names: Vec<StringId> = base.to_vec();
+    for name in add {
+        if !names.contains(name) {
+            names.push(*name);
+        }
+    }
+    names.into_boxed_slice()
+}
+
+/// Folds one `augment` fragment's declarations into the element's face — the
+/// library-layer half of `collector::Builder::fold_fragment`, for the
+/// fragments that live in another unit of the same library. The columns an
+/// augmentation can grow join the element's: enum constants in declaration
+/// order, the constructor selectors and their formals (keep-first — the
+/// element's own spelling wins), `const`-constructor presence, the `extends`
+/// gap, and the `with`/`implements`/`on` edges (`augment class C with M {}`
+/// in a part file makes `C().m()` resolve). Columns the introduction owns
+/// alone (kind, modifiers, type parameters, metadata, representation
+/// formals) stay untouched. `foreign` applies the cross-pool gate to the
+/// formal tables; the name-only columns need none.
+fn admit_fragment(face: &mut Container, fragment: &Container, foreign: bool) {
+    face.enum_constants = union_names(&face.enum_constants, &fragment.enum_constants);
+    face.constructors = union_names(&face.constructors, &fragment.constructors);
+    let formals = |table: &NameMap<Box<Formals>>| -> Vec<(StringId, Box<Formals>)> {
+        table
+            .iter()
+            .map(|(selector, list)| {
+                let list = if foreign {
+                    sanitize_formals(list)
+                } else {
+                    list.clone()
+                };
+                (*selector, list)
+            })
+            .collect()
+    };
+    face.ctor_formals = face
+        .ctor_formals
+        .iter()
+        .cloned()
+        .chain(formals(&fragment.ctor_formals))
+        .collect();
+    face.factory_formals = face
+        .factory_formals
+        .iter()
+        .cloned()
+        .chain(formals(&fragment.factory_formals))
+        .collect();
+    face.has_const_constructor |= fragment.has_const_constructor;
+    // `extends` is one edge — the introduction's superclass stands, a
+    // fragment's fills the gap; the other three are lists the fragment adds
+    // to.
+    face.superclass = face.superclass.or(fragment.superclass);
+    face.with_clause = union_names(&face.with_clause, &fragment.with_clause);
+    face.implements_clause = union_names(&face.implements_clause, &fragment.implements_clause);
+    face.on_clause = union_names(&face.on_clause, &fragment.on_clause);
+}
+
+/// One element's constructor declarations across the fragments folded so far
+/// — the cross-unit half of the implicit-default rule: the default exists
+/// only when NO fragment declares a constructor, so `class C {}` in one unit
+/// plus `augment class C { C.named(); }` in another leaves `C()` undefined
+/// (oracle `new_with_undefined_constructor_default`).
+///
+/// A finished [`Container`] cannot answer that through
+/// `has_unnamed_constructor` alone — an explicit `C()` and the implicit
+/// default both read `true` with an empty selector list — so the facts come
+/// off the columns a declaration leaves behind: the constructor tables key
+/// the unnamed face by the container's own name (`C()` and `C.new()` alike),
+/// and any table row proves a declaration even when it registers no selector
+/// (`factory H()` inside `class G`).
+#[derive(Default)]
+struct CtorDeclarations {
+    /// Some fragment declares a constructor (named or unnamed).
+    declared: bool,
+    /// Some fragment declares an EXPLICIT unnamed constructor.
+    explicit_unnamed: bool,
+}
+
+impl CtorDeclarations {
+    /// The element's facts with its introduction's row folded in.
+    fn of(container: &Container, name: StringId) -> Self {
+        let mut facts = Self::default();
+        facts.admit(container, name);
+        facts
+    }
+
+    /// Folds one more fragment's row into the element's facts.
+    fn admit(&mut self, container: &Container, name: StringId) {
+        let declares = !container.constructors.is_empty()
+            || !container.ctor_formals.is_empty()
+            || !container.factory_formals.is_empty();
+        self.declared |= declares;
+        self.explicit_unnamed |= container.ctor_formals.contains_key(&name)
+            || container.factory_formals.contains_key(&name)
+            // A named selector alongside the unnamed flag can only mean an
+            // explicit unnamed constructor was declared as well.
+            || (container.has_unnamed_constructor && declares);
+    }
+
+    /// The merged implicit-default flag: an explicit unnamed constructor
+    /// anywhere, or no constructor anywhere (the element synthesizes the
+    /// default off its empty constructor list).
+    fn settled(&self) -> bool {
+        self.explicit_unnamed || !self.declared
+    }
+}
+
 /// The kind tag of a name in a library face: a known [`MicroKind`], or
 /// [`ScopeKind::External`] when the declaring file is outside the indexed
 /// set — present, but kind-sensitive diagnostics must be suppressed.
@@ -823,9 +993,10 @@ pub(crate) fn owner_library(
 /// the superclass walk's next hop).
 ///
 /// An augmented container answers its merged fragment face on both arms
-/// (#3418): the element's members are the introduction's plus every
-/// fragment's, so a lookup written in any unit of the library — the
-/// introduction's or an `augment` head's — sees the same set
+/// (#3418, #3516): the element's declarations are the introduction's plus
+/// every fragment's — members, enum constants, constructors, superclass and
+/// clause edges — so a lookup written in any unit of the library, the
+/// introduction's or an `augment` head's, sees the same set
 /// ([`ElementFragments`], which also states the cross-pool gate the merge
 /// obeys).
 ///
