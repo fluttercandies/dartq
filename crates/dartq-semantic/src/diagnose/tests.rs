@@ -8757,7 +8757,6 @@ fn overridden_member_context_degrades_on_a_missing_span() {
         is_abstract: false,
         is_external: false,
         is_final: false,
-        covariant: false,
         type_params: 0,
         type_param_names: Box::new([]),
         type_param_bounds: Box::default(),
@@ -18423,6 +18422,16 @@ mod ticket_3343_tests;
 #[path = "ticket_3345_tests.rs"]
 mod ticket_3345_tests;
 
+// The #3269 pins (the #3252 covariant-field residual): the group latch's
+// reset between field groups, the `covariant` bit's persist/restore round
+// trip, and the induced-setter verdict on the plain concrete-field shape
+// (`covariant num x = 0;` silences the `set x(int)` override row a plain
+// `num x` draws). Registered here via `#[path]`; the module stays inside
+// the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3269_tests.rs"]
+mod ticket_3269_tests;
+
 // The #3356 pins (the `unnecessary_type_check` /
 // `unnecessary_null_comparison` operand-static-type faces): the untyped-row
 // arm (`untyped_operand_ty`) reaching the is-check and `== null` walks, the
@@ -18432,3 +18441,26 @@ mod ticket_3345_tests;
 #[cfg(test)]
 #[path = "ticket_3356_tests.rs"]
 mod ticket_3356_tests;
+
+// The #3341 pins (the `type_alias_cannot_reference_itself` residual): the
+// syntactic self-reference walk (direct right-hand reference, co-alias
+// pair, class-bound descent, the non-recursive negative) and the fold's
+// `dynamic` collapse of a self-referencing alias. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3341_tests.rs"]
+mod ticket_3341_tests;
+
+// The #3355 pins (the `missing_required_argument` coverage walk + the
+// `use_of_void_result` residual faces absorbed from #3350): the six
+// invocation emit sites' required-named coverage (`required` named formal
+// with no same-named argument reports at the callee entity), the
+// extension-override argument's `E(v()).g` void-receiver row
+// (extension_member_resolver.dart:287-288), and the member send
+// `v().sel()` receiver anchoring at `v` rather than the `.sel` selector.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3355_tests.rs"]
+mod ticket_3355_tests;
