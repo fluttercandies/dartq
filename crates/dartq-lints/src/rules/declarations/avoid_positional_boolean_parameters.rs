@@ -9,15 +9,19 @@ use crate::rules::{
 };
 use dartq_ast::mod_flags;
 
-/// Official:
+/// Official (pinned 3.13.7):
 /// `pkg/linter/lib/src/rules/avoid_positional_boolean_parameters.dart`
 /// — the FIRST positional parameter whose type is `bool` reports at the
-/// parameter (:50-54, `firstWhereOrNull(_isBoolean)` +
+/// parameter (:46-50, `firstWhereOrNull(_isBoolean)` +
 /// `reportAtNode(parameterToLint)`). Public declarations only
-/// (:51/:62/:82/:93); getters, setters, and operators skip (:76-78); a
-/// fixed signature (an augmentation or an override, :79 + the
-/// extensions :129-151) skips, and a generic function type inside a
-/// fixed signature skips (:116-126). The augmentation skip keeps the
+/// (:51/:60/:80/:91); setters skip (a getter's null parameter list is
+/// inert, :75-88); operators skip; a fixed signature (an augmentation or
+/// an override, :79 + `_isOverridingMember` :85-97 + the extension
+/// :99-108) skips. A local function rides the pinned
+/// `visitFunctionDeclaration` too (the analyzer AST nests the
+/// `FunctionDeclaration` inside its statement node), and
+/// `visitGenericFunctionType` (:71-73) has NO fixed-signature walk (a
+/// `Function(bool)` always checks). The augmentation skip keeps the
 /// ORIGINAL declaration of an augmented member lintable — an augmenting
 /// part's `augment A(bool b)` stays silent while the plain `A(bool b)`
 /// it augments reports. Message: `diagnostic.g.dart`
@@ -56,9 +60,8 @@ fn check(c: &mut Check<'_>) {
             check_params(c, node, class_like_row(c));
         }
         NodeKind::FunctionType => {
-            if in_fixed_signature(c, node) {
-                return; // (:116-126)
-            }
+            // The pinned `visitGenericFunctionType` (:71-73) checks
+            // unconditionally — no fixed-signature walk upstream.
             check_params(c, node, None);
         }
         NodeKind::Constructor
@@ -218,22 +221,6 @@ fn fixed_signature(c: &Check<'_>, method: u32) -> bool {
         })
 }
 
-/// `_isInFixedSignature` (:116-126): the walk stops at a body region
-/// (not fixed) or a `MethodDeclaration` (its own fixed face); any
-/// other container keeps climbing.
-fn in_fixed_signature(c: &Check<'_>, node: u32) -> bool {
-    let mut current = node;
-    while let Some(parent) = c.unit.ast.parent(current) {
-        match c.kind(parent) {
-            NodeKind::BlockBody | NodeKind::ExpressionBody => return false,
-            NodeKind::Method => return fixed_signature(c, parent),
-            _ => {}
-        }
-        current = parent;
-    }
-    false
-}
-
 /// The owning class-like row (the field-formal reads need it).
 fn class_like_row(c: &Check<'_>) -> Option<u32> {
     c.path[..c.path.len() - 1].iter().rev().copied().find(|&a| {
@@ -243,3 +230,209 @@ fn class_like_row(c: &Check<'_>) -> Option<u32> {
         )
     })
 }
+
+/// The #3308 oracle-corpus pins: every single-file upstream case (the
+/// exact materialized conformance sources) with the oracle's own-row
+/// spans; the three cross-file augmentation faces are residuals per the
+/// test's doc.
+#[cfg(test)]
+mod tests {
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// The whole upstream oracle corpus — `AvoidPositionalBooleanParametersTest`
+    /// (29 cases, `pkg/linter/test/rules/avoid_positional_boolean_parameters_test.dart`)
+    /// plus the two `messages.yaml` doc-bad and two doc-good cases: 33 total,
+    /// `conformance/status.tsv` `lint avoid_positional_boolean_parameters 33 17 16`.
+    /// Each entry is the exact materialized case source and the oracle's
+    /// `(line, column, length)` for every rule row; only the rule's own rows
+    /// are pinned (co-reported `unused_element` faces are other diagnostics).
+    ///
+    /// 30 single-file cases pinned (13 oracle rows), every mismatch collected before the single panic.
+    /// Cross-file residuals not representable in a single-source fixture (oracle rows on `lib/a.dart`): test_augmentationConstructor#0, test_augmentationFunction#0, test_augmentationMethod#0.
+    #[test]
+    fn avoid_positional_boolean_parameters_oracle_corpus_pins() {
+        // (case, source, oracle rows as (line, column, length)).
+        let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
+            (
+                "test_anonymousFunction#0",
+                "\nvoid f(List<bool> list) {\n  list.where((bool e) => e);\n}",
+                &[],
+            ),
+            (
+                "test_constructorPrivate_positionalOptional#0",
+                "\nclass C {\n  // ignore: unused_element_parameter\n  C._named([bool p = false]);\n}",
+                &[],
+            ),
+            (
+                "test_constructor_fieldFormalParameter_named#0",
+                "\nclass C {\n  bool p;\n  C.named({this.p = false});\n}",
+                &[],
+            ),
+            (
+                "test_constructor_fieldFormalParameter_positional#0",
+                "\nclass C {\n  bool p;\n  C.named(this.p);\n}",
+                &[(4, 11, 6)],
+            ),
+            (
+                "test_constructor_named_withDefault#0",
+                "\nclass C {\n  C.named({bool p = false}) {\n  }\n}",
+                &[],
+            ),
+            (
+                "test_constructor_positional#0",
+                "\nclass C {\n  C.named(bool a) {\n  }\n}",
+                &[(3, 11, 6)],
+            ),
+            (
+                "test_constructor_primary_declaringParameter#0",
+                "\nclass C(final bool p);",
+                &[(2, 9, 12)],
+            ),
+            (
+                "test_extensionMethod#0",
+                "\nextension Ext on int {\n  void f([bool p = false]) {}\n}",
+                &[(3, 11, 14)],
+            ),
+            (
+                "test_extensionMethod_unnamed#0",
+                "\nextension on int {\n  // ignore: unused_element, unused_element_parameter\n  void f([bool p = false]) {}\n}",
+                &[(4, 11, 14)],
+            ),
+            (
+                "test_instanceMethod_named#0",
+                "\nclass C {\n  void m({bool p = true}) {}\n}",
+                &[],
+            ),
+            (
+                "test_instanceMethod_overrideExtends_positionalOptional#0",
+                "\nclass C {\n  void m([bool p = false]) {}\n}\nclass D extends C {\n  @override\n  void m([bool p = false]) {}\n}",
+                &[(3, 11, 14)],
+            ),
+            (
+                "test_instanceMethod_overrideImplements_positionalOptional#0",
+                "\nclass C {\n  void m([bool p = false]) {}\n}\nabstract class D implements C {\n  @override\n  void m([bool p = false]) {}\n}",
+                &[(3, 11, 14)],
+            ),
+            (
+                "test_instanceMethod_positional#0",
+                "\nclass A {\n  void m(bool p) {}\n}",
+                &[(3, 10, 6)],
+            ),
+            (
+                "test_instanceMethod_positionalOptional#0",
+                "\nclass C {\n  void m([bool p = false]) {}\n}",
+                &[(3, 11, 14)],
+            ),
+            (
+                "test_instanceSetter#0",
+                "\nclass C {\n  set m(bool p) {}\n}",
+                &[],
+            ),
+            (
+                "test_operator_indexAssignment#0",
+                "\nclass C {\n  void operator []=(int index, bool value) {}\n}",
+                &[],
+            ),
+            (
+                "test_operator_minus#0",
+                "\nclass C {\n  void operator -(bool value) {}\n}",
+                &[],
+            ),
+            (
+                "test_operator_plus#0",
+                "\nclass C {\n  void operator +(bool value) {\n  }\n}",
+                &[],
+            ),
+            (
+                "test_staticMethod_namedWithDefault#0",
+                "\nclass B {\n  static void m({bool p = false}) {}\n}",
+                &[],
+            ),
+            (
+                "test_staticMethod_positional#0",
+                "\nclass B {\n  static void m(bool p) {}\n}",
+                &[(3, 17, 6)],
+            ),
+            (
+                "test_topLevelPrivate#0",
+                "\n// ignore: unused_element\nvoid _f(bool p) {}",
+                &[],
+            ),
+            (
+                "test_topLevel_namedParameter#0",
+                "\nvoid f({bool p = false}) {}",
+                &[],
+            ),
+            (
+                "test_topLevel_namedParameter_defaultValue#0",
+                "\nvoid f({bool p = false}) {}",
+                &[],
+            ),
+            (
+                "test_topLevel_positionalParameter#0",
+                "\nvoid f(bool p) {}",
+                &[(2, 8, 6)],
+            ),
+            (
+                "test_typedef_named#0",
+                "\ntypedef T = Function({bool p});",
+                &[],
+            ),
+            (
+                "test_typedef_positional#0",
+                "\ntypedef T = Function(bool p);",
+                &[(2, 22, 6)],
+            ),
+            (
+                "doc_bad_0",
+                "void f(bool b) {}",
+                &[(1, 8, 6)],
+            ),
+            (
+                "doc_bad_1",
+                "Task(true);\nTask(false);\nListBox(false, true, true);\nButton(false);",
+                &[],
+            ),
+            (
+                "doc_good_0",
+                "void f({bool b = false}) {}",
+                &[],
+            ),
+            (
+                "doc_good_1",
+                "Task.oneShot();\nTask.repeating();\nListBox(scroll: true, showScrollbars: true);\nButton(ButtonState.enabled);",
+                &[],
+            ),
+        ];
+        // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
+        fn offset(source: &str, line: u32, column: u32) -> u32 {
+            let line_start: usize = source
+                .split_inclusive('\n')
+                .take(line as usize - 1)
+                .map(str::len)
+                .sum();
+            (line_start + column as usize - 1) as u32
+        }
+        let mut mismatches = Vec::new();
+        for (case, source, oracle) in cases {
+            let f = Fixture::parse(source);
+            let mut lints = f.run(&one_rule("avoid_positional_boolean_parameters"));
+            lints.sort_by_key(|lint| lint.range.start);
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            let mut want: Vec<(u32, u32)> = oracle
+                .iter()
+                .map(|&(line, column, length)| {
+                    let start = offset(source, line, column);
+                    (start, start + length)
+                })
+                .collect();
+            want.sort_unstable();
+            if got != want {
+                mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }}
