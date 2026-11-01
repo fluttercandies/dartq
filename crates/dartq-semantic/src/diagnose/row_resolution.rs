@@ -1818,7 +1818,7 @@ impl<'a> Engine<'a> {
         };
         let (read, write) = self.operator_spellings(row);
         match recv {
-            Receiver::This { container, .. } => {
+            Receiver::This { container, kind } => {
                 // Inside `extension E on T`/`extension type E(T)`, `this`
                 // carries the `on` type's static face — the operator
                 // resolves through `T`'s member table, not `E`'s
@@ -1842,20 +1842,47 @@ impl<'a> Engine<'a> {
                 // spelling is a method invocation on the nullable receiver.
                 let nullable = self.nullable_this_receiver(&recv)
                     && !self.null_aware_members.contains(&row.range.offset);
+                // An extension applicable to the nullable `this` type
+                // resolves the spelling WITHOUT dereferencing it (upstream
+                // `type_property_resolver`'s `_lookupExtension` runs ahead of
+                // the member consult, and the declaration's receiver type is
+                // the written `on` type — `this`, exactly), so a face
+                // declaring the spelling stands the row down: `this[0]`
+                // inside `extension E on A? { operator [](int i) }` is E's
+                // own application, never an `A?` dereference. Every applied
+                // spelling must resolve that way — a spelling only the
+                // instance face carries still dereferences the nullable
+                // receiver.
+                let this_ty = self.this_static_ty(container, kind);
+                let mut extension_resolves_all = true;
                 let mut missing: Vec<String> = Vec::new();
                 for spelling in [read, write].into_iter().flatten() {
                     if matches!(self.walk_members(resolved, spelling), Walk::Missing) {
                         missing.push(self.strings.resolve(spelling).to_string());
                     }
+                    if nullable
+                        && !matches!(
+                            self.extension_application(resolved, this_ty, spelling, false, true),
+                            ExtensionApp::Single
+                        )
+                    {
+                        extension_resolves_all = false;
+                    }
                 }
                 if nullable {
-                    // The receiver's own dereference reports once at the
-                    // operator token, under the base spelling the send
-                    // applied (`this[0]` and `this[0] = v` both name `[]` —
-                    // the oracle's one row per operator access).
-                    let applied = read.or(write).map(|s| self.strings.resolve(s));
-                    if let Some(text) = applied {
-                        self.emit_unchecked_nullable(op_range, text, UncheckedNullableKind::Method);
+                    if !extension_resolves_all {
+                        // The receiver's own dereference reports once at the
+                        // operator token, under the base spelling the send
+                        // applied (`this[0]` and `this[0] = v` both name `[]`
+                        // — the oracle's one row per operator access).
+                        let applied = read.or(write).map(|s| self.strings.resolve(s));
+                        if let Some(text) = applied {
+                            self.emit_unchecked_nullable(
+                                op_range,
+                                text,
+                                UncheckedNullableKind::Method,
+                            );
+                        }
                     }
                     return;
                 }
@@ -1954,11 +1981,18 @@ impl<'a> Engine<'a> {
             // index-result / compound chain on the row's own span. The
             // dynamic/unknown faces stay silent inside the shared check;
             // a potentially-nullable face takes the `isNullable` tail's
-            // unchecked row instead (the bare operand's own gate).
+            // unchecked row instead (the bare operand's own gate), unless
+            // an applicable extension owns the spelling — the same
+            // application-first ordering the typed arm's
+            // [`Self::check_operator_expr`] keeps (upstream
+            // `binary_expression_resolver`'s `isNullable` tail runs on the
+            // operand's resolved type, and the resolution consults the
+            // applicable extensions before any dereference is read).
             Receiver::Unknown => {
                 if let Some(ty) = self.recv_expression_ty(row.range) {
                     if self.potentially_nullable(ty)
                         && !self.null_aware_members.contains(&row.range.offset)
+                        && !self.operator_face_extension_resolved(ty, row)
                     {
                         let Intent::Operator(op, _) = row.intent else {
                             return;
@@ -4278,6 +4312,7 @@ impl<'a> Engine<'a> {
             Receiver::Created {
                 name,
                 kind: ContainerKind::Class,
+                ..
             } => Some(Ty::named(*name)),
             _ => None,
         })?;
@@ -7989,6 +8024,7 @@ impl<'a> Engine<'a> {
             Receiver::Created {
                 name,
                 kind: ContainerKind::Class,
+                ..
             } => (*name, Ty::named(*name), false),
             _ => return None,
         };
