@@ -125,15 +125,15 @@ void f(G<int> g) {
     );
 }
 
-/// The under-report face, pinned as hard as the positive one: a creation
-/// whose instantiation the machinery never published (the argument-solved
-/// `G.value(1)`) answers `Unknown`, and an unknown source stages no
-/// assignment row. A fabricated face here — the raw `G`, the to-bounds
-/// `G<dynamic>`, any invented argument set — would compare against the
-/// `String` slot and report a row the oracle never reports from that
-/// spelling.
+/// The argument-solved spelling publishes its instantiation too: `G.value(1)`
+/// solves `T = int` from the call, so the created `G<int>` reaches the
+/// assignment staging and reports the `String`-slot mismatch the oracle
+/// reports. (This pin's inverse used to assert the under-report — the solve
+/// was computed then discarded before it could publish; #3415's named-selector
+/// rider lands the `call_type_args` latch that lets `creation_row_ty` resolve
+/// it, so the face now reports.)
 #[test]
-fn unpublished_instantiation_adds_no_row() {
+fn argument_solved_instantiation_reports_the_mismatch() {
     let source = r#"
 class G<T> {
   G.value(T t);
@@ -143,14 +143,11 @@ void f(String s) {
 }
 "#;
     let report = report_ops(source);
+    let rows = rows_of(&report, "invalid_assignment");
+    assert_eq!(rows.len(), 1, "{:#?}", report.diagnostics);
+    let message = &rows[0].2;
     assert!(
-        rows_of(&report, "invalid_assignment").is_empty(),
-        "{:#?}",
-        report.diagnostics
-    );
-    assert!(
-        rows_of(&report, "argument_type_not_assignable").is_empty(),
-        "{:#?}",
-        report.diagnostics
+        message.contains("'G<int>'") && message.contains("'String'"),
+        "{message}"
     );
 }

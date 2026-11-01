@@ -10752,6 +10752,12 @@ impl<'a> Engine<'a> {
         // class's own. The declared return face rides along for the
         // substituted-return write at the close (the row borrow must not
         // reach the emits below).
+        // The named-selector creation's class segment (`G.value(1)` → the
+        // `G` row's own offset): the creation latches key on it, so the
+        // argument-solved instantiation below publishes there for the
+        // readers that resolve a created row's type (`creation_row_ty`, and
+        // through it `callee_return_ty`'s generic-constructor arm).
+        let mut creation_head: Option<u32> = None;
         let (creation_container, mut return_face) = match &row.shape {
             RowShape::Bare(BareInfo::Container {
                 name,
@@ -10761,10 +10767,29 @@ impl<'a> Engine<'a> {
                 self.top_level_decl(row.name).map(|decl| decl.return_ty),
             ),
             RowShape::Bare(BareInfo::Plain { .. }) if row.qualified => {
-                let recv = callee
-                    .checked_sub(1)
-                    .and_then(|index| self.rows.get(index))
-                    .map_or(Receiver::Unknown, |below| self.argument_receiver(below));
+                let below = callee.checked_sub(1).and_then(|index| self.rows.get(index));
+                let recv = below.map_or(Receiver::Unknown, |below| self.argument_receiver(below));
+                // Only a CLASS-HEAD receiver whose selector names a DECLARED
+                // constructor is a creation of that head: a static member on
+                // the same head (`G.make(1)`) keeps its declared return, and
+                // an instance receiver (`C().m(1)`) is no creation — its
+                // send must never type the inner creation.
+                if let (Receiver::Container {
+                    name,
+                    kind: ContainerKind::Class,
+                }, Some(below)) = (&recv, below)
+                    && resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        *name,
+                    )
+                    .is_some_and(|(decl, _)| self.ctor_face_exists(decl, *name, row.name))
+                {
+                    creation_head = Some(below.range.offset);
+                }
                 let container = match recv {
                     Receiver::Created {
                         name,
@@ -12045,7 +12070,7 @@ impl<'a> Engine<'a> {
         // it in the oracle — flat_buffers.dart's context-solved
         // `Offset(_tail)` stays on the fully-solved path alone).
         if let Some(container) = creation_container
-            && unnamed_creation
+            && (unnamed_creation || creation_head.is_some())
             && let Some(params) = &exec_params
         {
             let mentions_param = |ty: Ty| {
@@ -12070,7 +12095,26 @@ impl<'a> Engine<'a> {
                     .args
                     .borrow_mut()
                     .named(container, false, &args);
-                self.pending_send_ty = Some((callee, ty));
+                if unnamed_creation {
+                    // The unnamed creation's fold REPLACES the callee row,
+                    // so the solve rides the row-indexed slot and the fold
+                    // adopts it as the created row's type.
+                    self.pending_send_ty = Some((callee, ty));
+                } else if let Some(head) = creation_head {
+                    // A NAMED-selector creation (`G.value(1)`) has no fold
+                    // to adopt a row-indexed slot — the dot merge replaces
+                    // its selector row. The solve publishes where every
+                    // created row's TYPE READER looks instead:
+                    // `call_type_args`, keyed on the class segment's own
+                    // offset, which `creation_row_ty` (and through it
+                    // `callee_return_ty`'s generic-constructor arm) resolves
+                    // the created instance through. The argument-derived
+                    // instantiation is a decided face, not a to-bounds
+                    // fill: nothing publishes unless every slot solved (or
+                    // the head is provably unconstrainable), so an
+                    // undecided send keeps its `Unknown` under-report.
+                    self.publish_creation_instantiation(head, ty);
+                }
             }
         }
     }
@@ -12877,11 +12921,23 @@ impl<'a> Engine<'a> {
         }
         // The completed send's static type (upstream `node.recordStaticType
         // (returnType)`): read once, ahead of both the dead-flow exit below
-        // and the write-back onto the row.
+        // and the write-back onto the row. The read is
+        // [`Self::operand_static_ty`] — the ONE fact every verdict over this
+        // row consumes ([`Self::value_operand_ty`]'s `is` operand, the
+        // null-comparison faces), which answers the row's own post-fold face
+        // (a function type's return, the implicit-`call` return, a solved
+        // instantiation) and falls back to `callee_return_ty` for a row that
+        // still holds none. Reading the verdict's own fact here is what
+        // keeps the flow send fold and the verdicts from disagreeing
+        // (#3415: the fold above writes a function-typed formal's return
+        // onto the row, so `intFunction() is int` types `int` at the verdict
+        // while a `callee_return_ty`-only read answered `Unknown` and staged
+        // nothing into the recorder — the oracle's `dead_code` rows for the
+        // unsatisfiable arm went missing).
         let send_result = self
             .rows
             .get(callee)
-            .map_or(Ty::UNKNOWN, |row| self.callee_return_ty(row));
+            .map_or(Ty::UNKNOWN, |row| self.operand_static_ty(row));
         // The function-position face (`function_expression_invocation_
         // resolver.dart:131`): the invoked expression's own static type —
         // pre-invocation, so no callee-result enrichment here.

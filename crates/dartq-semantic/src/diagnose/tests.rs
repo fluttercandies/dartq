@@ -19801,3 +19801,37 @@ mod ticket_3411_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
+
+// The #3415 pins (the send close's staging source and the named-selector
+// creation's published instantiation): the flow send fold now reads the
+// same operand-static-type fact every verdict over the row reads, so a
+// function-typed formal's call result deads the arm the oracle deads, and a
+// genuinely undecidable result still stages nothing; a named constructor's
+// argument-solved instantiation publishes where the created row's type
+// readers resolve it, while an unsolved one stays `Unknown`. Registered
+// here via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3415_tests.rs"]
+mod ticket_3415_tests;
+
+// The #3420 pins (a member read off a created chain): the member merge's
+// non-`this`/`super`/`typed` receiver arm holds the receiver's STATIC TYPE
+// only, so a folded creation's declared accessor face was never consulted
+// and the merged row published `Unknown` — a `T?` slot read off
+// `Box<int>(1)` typed nothing at all. `record_field_ty` now answers a named
+// receiver type's declared field/getter instantiated with that type's
+// written arguments, so the read reaches `int?` and its consumers stage the
+// rows the oracle stages; an undecided instantiation keeps the under-report.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3418 pins (an augmented element's member face is the union of its
+// fragments'): `resolve_container` answers the merged face from either
+// anchor, so a member written in the introducing unit resolves inside an
+// `augment` body and vice versa, a member declared in neither still
+// reports, and the merge is independent of the library's unit order.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
