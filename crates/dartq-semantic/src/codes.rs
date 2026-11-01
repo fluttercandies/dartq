@@ -455,6 +455,55 @@ pub enum SemanticCode {
     /// :12650-12658; `CaseExpression`'s constant requirement,
     /// constant_verifier.dart's switch-case visit).
     NonConstantCaseExpression,
+    /// `Constant values from a deferred library can't be used as a case
+    /// expression.` — a legacy (`< 3.0`, patterns disabled) switch-statement
+    /// `case e:` whose constant-evaluation produced a value carried by a
+    /// deferred-imported library (`nonConstantCaseExpressionFromDeferredLibrary`,
+    /// diagnostic.g.dart:12406-12419; the `SwitchCase` arm of
+    /// evaluation.dart's `_invalidConstantForEntity`, :2129-2130).
+    NonConstantCaseExpressionFromDeferredLibrary,
+    /// `The switch case expression type '{0}' can't override the '=='
+    /// operator.` — a legacy (`< 3.0`, patterns disabled) switch-statement
+    /// `case e:` whose constant value's type has non-primitive equality
+    /// (`caseExpressionTypeImplementsEquals`, diagnostic.g.dart
+    /// :1708-1717; `validateExpression`'s `hasPrimitiveEquality` fail arm,
+    /// constant_verifier.dart:1155-1164).
+    CaseExpressionTypeImplementsEquals,
+    /// `The switch case expression type '{0}' must be a subtype of the
+    /// switch expression type '{1}'.` — a legacy (`< 3.0`, patterns
+    /// disabled) switch-statement `case e:` whose expression's static type
+    /// is not a subtype of the scrutinee's
+    /// (`caseExpressionTypeIsNotSwitchExpressionSubtype`,
+    /// diagnostic.g.dart:1728-1738; the shared type analyzer's
+    /// `caseExpressionTypeMismatch` site,
+    /// shared_type_analyzer.dart:39-53, gated `!patternsEnabled` at
+    /// type_analyzer.dart:533-547).
+    CaseExpressionTypeIsNotSwitchExpressionSubtype,
+    /// `Missing case clause for '{0}'.` — a legacy (`< 3.0`, patterns
+    /// disabled) switch statement over an enum type that neither covers
+    /// every enum constant nor carries a `default` clause; also fires with
+    /// `null` as `{0}` over a nullable enum scrutinee that lacks a
+    /// `case null:` (`missingEnumConstantInSwitch`, diagnostic.g.dart
+    /// :10567-10578; `_checkForMissingEnumConstantInSwitch`,
+    /// error_verifier.dart:5870-5937, gated `!Feature.patterns` at :5871).
+    MissingEnumConstantInSwitch,
+    /// `The 'case' shouldn't complete normally.` — a legacy (`< 3.0`,
+    /// patterns disabled) switch member (other than the last) whose body
+    /// can complete normally — the case falls through to the next member
+    /// (`switchCaseCompletesNormally`, diagnostic.g.dart:15865-15874; the
+    /// shared type analyzer's `switchCaseCompletesNormally` site,
+    /// shared_type_analyzer.dart:240-247, gated `!patternsEnabled` at
+    /// type_analyzer.dart:2312-2317).
+    SwitchCaseCompletesNormally,
+    /// `A break label resolves to the 'case' or 'default' statement.` —
+    /// a `break L;` whose label `L` is declared on a `SwitchMember` (the
+    /// label sits between `case` heads). NOT version-gated: upstream emits
+    /// it at every language version (`breakLabelOnSwitchMember`,
+    /// diagnostic.g.dart:1542-1551; `visitBreakStatement`,
+    /// error_verifier.dart:497-505; `LabelFragment.onSwitchMember` is set
+    /// whenever the label is attached to a switch member,
+    /// element_binding_visitor.dart:660-666).
+    BreakLabelOnSwitchMember,
     /// `Key expressions in map patterns must be constants.` — a
     /// `MapPatternEntry`'s key expression that fails const-evaluation
     /// (`nonConstantMapPatternKey`, diagnostic.g.dart:12776-12783;
@@ -2315,6 +2364,30 @@ impl SemanticCode {
                 "non_constant_case_expression",
                 "NON_CONSTANT_CASE_EXPRESSION",
             ),
+            Self::NonConstantCaseExpressionFromDeferredLibrary => (
+                "non_constant_case_expression_from_deferred_library",
+                "NON_CONSTANT_CASE_EXPRESSION_FROM_DEFERRED_LIBRARY",
+            ),
+            Self::CaseExpressionTypeImplementsEquals => (
+                "case_expression_type_implements_equals",
+                "CASE_EXPRESSION_TYPE_IMPLEMENTS_EQUALS",
+            ),
+            Self::CaseExpressionTypeIsNotSwitchExpressionSubtype => (
+                "case_expression_type_is_not_switch_expression_subtype",
+                "CASE_EXPRESSION_TYPE_IS_NOT_SWITCH_EXPRESSION_SUBTYPE",
+            ),
+            Self::MissingEnumConstantInSwitch => (
+                "missing_enum_constant_in_switch",
+                "MISSING_ENUM_CONSTANT_IN_SWITCH",
+            ),
+            Self::SwitchCaseCompletesNormally => (
+                "switch_case_completes_normally",
+                "SWITCH_CASE_COMPLETES_NORMALLY",
+            ),
+            Self::BreakLabelOnSwitchMember => (
+                "break_label_on_switch_member",
+                "BREAK_LABEL_ON_SWITCH_MEMBER",
+            ),
             Self::ConstantPatternWithNonConstantExpression => (
                 "constant_pattern_with_non_constant_expression",
                 "CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
@@ -3185,6 +3258,7 @@ impl SemanticCode {
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
+            | Self::MissingEnumConstantInSwitch
             | Self::DeadCode
             // The dead-coalesce row (`type: DiagnosticType.STATIC_WARNING`,
             // diagnostic.g.dart:3619-3628).
@@ -3703,6 +3777,30 @@ impl SemanticCode {
             }
             Self::NonConstantCaseExpression => {
                 "Case expressions must be constant.".to_string()
+            }
+            // diagnostic.g.dart:12410-12414 (the deferred-library arm).
+            Self::NonConstantCaseExpressionFromDeferredLibrary => {
+                "Constant values from a deferred library can't be used as a case expression.".to_string()
+            }
+            // diagnostic.g.dart:1710-1711.
+            Self::CaseExpressionTypeImplementsEquals => {
+                format!("The switch case expression type '{a0}' can't override the '==' operator.")
+            }
+            // diagnostic.g.dart:1730-1733.
+            Self::CaseExpressionTypeIsNotSwitchExpressionSubtype => {
+                format!("The switch case expression type '{a0}' must be a subtype of the switch expression type '{a1}'.")
+            }
+            // diagnostic.g.dart:10569.
+            Self::MissingEnumConstantInSwitch => {
+                format!("Missing case clause for '{a0}'.")
+            }
+            // diagnostic.g.dart:15868.
+            Self::SwitchCaseCompletesNormally => {
+                "The 'case' shouldn't complete normally.".to_string()
+            }
+            // diagnostic.g.dart:1545-1546.
+            Self::BreakLabelOnSwitchMember => {
+                "A break label resolves to the 'case' or 'default' statement.".to_string()
             }
             Self::NonConstantMapPatternKey => {
                 "Key expressions in map patterns must be constants.".to_string()
@@ -4803,6 +4901,22 @@ impl SemanticCode {
                 "Try composing instead of inheriting, or refer to the documentation of \
                  '{a2}' for more information."
             )),
+            // The #3559 legacy-switch rows' verbatim oracle
+            // correctionMessages (diagnostic.g.dart — the deferred-library,
+            // missing-enum-constant and completes-normally rows; the
+            // remaining legacy rows declare none and fall through to
+            // `None`).
+            Self::NonConstantCaseExpressionFromDeferredLibrary => Some(
+                "Try re-writing the switch as a series of if statements, or changing the import to not be deferred."
+                    .to_string(),
+            ),
+            Self::MissingEnumConstantInSwitch => Some(
+                "Try adding a case clause for the missing constant, or adding a default clause."
+                    .to_string(),
+            ),
+            Self::SwitchCaseCompletesNormally => {
+                Some("Try adding 'break', 'return', or 'throw'.".to_string())
+            }
             // The #612 variance rows' verbatim oracle correctionMessages
             // (diagnostic.g.dart:18503-18505, :18775-18778, :18813-18816).
             Self::WrongTypeParameterVariancePosition => Some(
@@ -5633,6 +5747,13 @@ mod tests {
             SemanticCode::InitializingFormalForNonExistentField,
             SemanticCode::SuperFormalParameterWithoutAssociatedNamed,
             SemanticCode::SuperFormalParameterWithoutAssociatedPositional,
+            // The #3559 legacy-switch cluster.
+            SemanticCode::NonConstantCaseExpressionFromDeferredLibrary,
+            SemanticCode::CaseExpressionTypeImplementsEquals,
+            SemanticCode::CaseExpressionTypeIsNotSwitchExpressionSubtype,
+            SemanticCode::MissingEnumConstantInSwitch,
+            SemanticCode::SwitchCaseCompletesNormally,
+            SemanticCode::BreakLabelOnSwitchMember,
         ];
         for code in codes {
             let info = code.code_info();
@@ -6403,6 +6524,14 @@ mod tests {
             | SemanticCode::ConstantPatternNeverMatchesValueType
             | SemanticCode::ConstantPatternWithNonConstantExpression
             | SemanticCode::NonConstantCaseExpression
+            // The #3559 legacy-switch cluster: none registry-backed (the
+            // inline `message` arms are the sole template source).
+            | SemanticCode::NonConstantCaseExpressionFromDeferredLibrary
+            | SemanticCode::CaseExpressionTypeImplementsEquals
+            | SemanticCode::CaseExpressionTypeIsNotSwitchExpressionSubtype
+            | SemanticCode::MissingEnumConstantInSwitch
+            | SemanticCode::SwitchCaseCompletesNormally
+            | SemanticCode::BreakLabelOnSwitchMember
             | SemanticCode::NonConstantMapPatternKey
             | SemanticCode::CouldNotInfer
             | SemanticCode::CreationWithNonType

@@ -30,13 +30,12 @@
 //! with each class's own parameter renamed where the snapshot's
 //! name-keyed parameter registry would fold a class parameter into a
 //! face's parameter of the same spelling (a class parameter's name is
-//! local to its class, so the oracle verdicts carry over). Pins 2 and 3
-//! (interface-only bounds) reach the structural step-5 projection and
-//! decide there; pins 1 and 4 carry function-typed bounds, which the
-//! structural world cannot map yet (`map_ty_strict`'s `Ty::Function`
-//! arm answers `None`, so `strict_face_params` declines and the
-//! name-level pair test decides, silent) — both bodies stay as ignored
-//! live specifications for that translation.
+//! local to its class, so the oracle verdicts carry over). All four
+//! extension faces spell function-typed bounds or arguments, which map
+//! column by column since #3562 gave `map_ty_strict`'s `Ty::Function`
+//! arm a structural face. Pin 4 decides through that face; pin 1 stays
+//! an ignored live spec because the RECEIVER side of its fixture
+//! degrades (see its own note) — the bound map is no longer the gate.
 
 use super::test_rig::{assert_silent, code_names, report_ops, rows, types_for};
 use dartq_types::{TypeKind, UninternedType};
@@ -73,15 +72,17 @@ fn assert_ambiguity_template(report: &super::FileReport, member: &str) {
 /// Oracle (3.13.7, #3487 probe): `ambiguous_extension_member_access` at
 /// the access.
 ///
-/// Ignored live spec: the strict step-5 projection cannot reach this
-/// face yet — the function-typed bound maps no structural shape
-/// (`map_ty_strict`'s `Ty::Function` arm answers `None`, so
-/// `strict_face_params` declines the whole face and the name-level pair
-/// test orders it, silent). The to-bounds switch cannot engage here
-/// until the function-shape translation lands; this body is the
-/// specification that translation must keep.
+/// The strict projection reaches this pair's bound since #3562 mapped the
+/// function-typed bound (`map_ty_strict`'s `Ty::Function` arm), so the
+/// to-bounds switch is no longer the gate. The remaining one is the
+/// RECEIVER: `A<void Function(dynamic)>` arrives at the extension gate
+/// with its function-typed argument degraded to `dynamic` (the flow read
+/// face spells no signature for a function type in an argument position),
+/// and `A<dynamic>` is not a subtype of `A<void Function(dynamic)>` — so
+/// `E2` is never applicable and the access keeps a single candidate. This
+/// body is the specification the receiver face must keep.
 #[test]
-#[ignore = "function-typed bounds map no structural face yet — the name-level pair test decides"]
+#[ignore = "receiver face degrades `A<void Function(dynamic)>` to `A<dynamic>` — E2 never becomes applicable"]
 fn function_formal_cycle_reports_ambiguity() {
     let report = report_ops(
         "class A<T> {} \
@@ -157,15 +158,10 @@ fn nullable_leaf_reports_ambiguity() {
 /// Oracle (3.13.7, #3487 probe): `ambiguous_extension_member_access` at
 /// the access.
 ///
-/// Ignored live spec: the strict step-5 projection cannot reach this
-/// face yet — the function-typed bound maps no structural shape
-/// (`map_ty_strict`'s `Ty::Function` arm answers `None`, so
-/// `strict_face_params` declines the whole face and the name-level pair
-/// test orders it, silent). The to-bounds switch cannot engage here
-/// until the function-shape translation lands; this body is the
-/// specification that translation must keep.
+/// The strict projection reaches this face since #3562 mapped the
+/// function-typed bound (`map_ty_strict`'s `Ty::Function` arm), so the
+/// to-bounds switch decides it instead of the name-level pair test.
 #[test]
-#[ignore = "function-typed bounds map no structural face yet — the name-level pair test decides"]
 fn acyclic_formal_reports_ambiguity() {
     let report = report_ops(
         "class B<S, T> {} \

@@ -349,6 +349,16 @@ pub(super) fn report_ops_augment_intro_experiments(
     augment_rig(main, augment_source, experiments).0
 }
 
+/// [`report_ops_augment`] with experiments on, returning the AUGMENTING
+/// unit's report (the unit the augmentation rows anchor at).
+pub(super) fn report_ops_augment_experiments(
+    main: &str,
+    augment_source: &str,
+    experiments: &[dartq_language::Feature],
+) -> FileReport {
+    augment_rig(main, augment_source, experiments).1
+}
+
 /// The shared two-unit augmentation rig: the intro unit's report first, the
 /// augment unit's second.
 fn augment_rig(

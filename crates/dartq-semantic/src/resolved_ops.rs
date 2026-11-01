@@ -70,7 +70,7 @@ use dartq_types::{
 
 use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
-use crate::model::{ArgListId, ArgPool, ContainerKind, FnSig, MemberKind, MicroKind, Ty};
+use crate::model::{ArgListId, ArgPool, ContainerKind, FnShapeId, FnSig, MemberKind, MicroKind, Ty};
 
 /// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
 /// and bare `Function`). Each snapshot owns its id space.
@@ -3733,11 +3733,12 @@ impl<'a> ResolvedTypeOps<'a> {
     // `Invalid` or the opaque decl so flow probes keep an answer — this
     // map answers `Some` only where the snapshot carries a REAL fact:
     // registered containers and builtins, declared type parameters, the
-    // unit kinds. Anything else (the `Ty::Unknown` sentinel, a
-    // `non_containers` spelling, an unresolvable head, a record or
-    // function shape, an arity mismatch) maps `None` and the caller
-    // degrades to the name-level logic — the `Invalid` arm's vacuous
-    // `true` must never leak into the applicability/specificity gates.
+    // unit kinds, and function shapes whose every column maps. Anything
+    // else (the `Ty::Unknown` sentinel, a `non_containers` spelling, an
+    // unresolvable head, a record shape, a generic signature, an arity
+    // mismatch) maps `None` and the caller degrades to the name-level
+    // logic — the `Invalid` arm's vacuous `true` must never leak into
+    // the applicability/specificity gates.
 
     /// Maps a diagnosing `Ty` to the snapshot's `TypeId`, `None` where the
     /// structural world carries no fact for it.
@@ -3757,12 +3758,63 @@ impl<'a> ResolvedTypeOps<'a> {
                 nullable,
                 args,
             } => self.map_named_strict(name, nullable, args, pool),
-            // The structural snapshot models records and functions, but
-            // the diagnosing `Ty` shapes live in a different pool — the
-            // shape translation is M2 work and the caller's name-level
-            // read answers for them today (the fallback discipline).
-            Ty::Record { .. } | Ty::Function { .. } => None,
+            // A function shape has a structural face in the snapshot
+            // lattice (`UninternedFunction`), so it maps column by column
+            // instead of declining the whole extension face (#3562:
+            // `X extends void Function(X)` left `strict_face_params`
+            // answering `None`, and the ambiguous pair stayed silent
+            // before step 5 ran). Record shapes still answer `None` — the
+            // name-level read decides them.
+            Ty::Function { shape, nullable } => self.map_function_strict(shape, nullable, pool),
+            Ty::Record { .. } => None,
         }
+    }
+
+    /// The `Ty::Function` arm of [`Self::map_ty_strict`]: every column
+    /// maps through the strict chain, so one unbacked column (an
+    /// unresolved head, an `Invalid` leaf) declines the whole shape and
+    /// the caller keeps the name-level read. A signature declaring its
+    /// own `<T>` group refuses — its binder's parameter facts have no
+    /// build-time face here. Named formals carry no required-ness in the
+    /// diagnosing shape, so the interned members read optional: the
+    /// subtype walk only ever matches named formals by name, and the
+    /// required set of the named group never joins it.
+    fn map_function_strict(
+        &self,
+        shape: FnShapeId,
+        nullable: bool,
+        pool: &ArgPool,
+    ) -> Option<TypeId> {
+        let shape = pool.function_shape(shape);
+        if shape.type_params != 0 {
+            return None;
+        }
+        let return_type = self.map_ty_strict(shape.return_ty, pool)?;
+        let mut positional = Vec::with_capacity(shape.positional.len());
+        for &formal in &shape.positional {
+            positional.push(self.map_ty_strict(formal, pool)?);
+        }
+        let mut named = Vec::with_capacity(shape.named.len());
+        for &(formal_name, formal) in &shape.named {
+            named.push(NamedMember {
+                name: self.strings.resolve(formal_name).to_string(),
+                ty: self.map_ty_strict(formal, pool)?,
+                required: false,
+            });
+        }
+        self.snapshot
+            .table
+            .intern_function(
+                UninternedFunction {
+                    return_type,
+                    type_parameters: Vec::new(),
+                    positional,
+                    named,
+                    required_positional: u32::from(shape.required_positional),
+                },
+                nullable,
+            )
+            .ok()
     }
 
     /// The `Ty::Named` arm of [`Self::map_ty_strict`]: a type parameter, the

@@ -4279,7 +4279,22 @@ impl<'a> Engine<'a> {
                         .collect()
                 })
                 .unwrap_or_default();
-            return Some(self.tear_off_fn_ty(&sig, &type_params));
+            let face = self.tear_off_fn_ty(&sig, &type_params);
+            // The same broken-capture gate as the member face: a
+            // prefix-sentinel or `Unknown` leaf in the captured
+            // declaration re-reads the written signature from the
+            // source, the captured counts gating the candidate.
+            if self.has_prefix_sentinel(face)
+                && let Some(rebuilt) = self.source_top_level_signature(
+                    operand.name,
+                    sig.positional.len(),
+                    sig.named.len(),
+                    type_params.len(),
+                )
+            {
+                return Some(rebuilt);
+            }
+            return Some(face);
         }
         // The enclosing-container member face: the unqualified read of a
         // method/getter/field of `this`'s container (`m0` inside the
@@ -4312,6 +4327,57 @@ impl<'a> Engine<'a> {
         match entry.kind {
             MemberKind::Method => {
                 let formals = entry.formals.as_deref()?;
+                // A broken annotation capture (a prefix-sentinel or
+                // `Unknown` leaf anywhere in the captured face — the
+                // armed walk's `p.T` degradation) re-reads the member's
+                // own written signature from the source: the return
+                // annotation before the name, the formals group after
+                // it, both with the honest required/optional/named
+                // split. The captured formal COUNTS gate the rebuild —
+                // a mis-split parse declines back to the captured face.
+                let broken = entry.return_ty == Ty::Unknown
+                    || self.has_prefix_sentinel(entry.return_ty)
+                    || formals
+                        .positional
+                        .iter()
+                        .any(|formal| self.has_prefix_sentinel(formal.ty))
+                    || formals
+                        .named
+                        .iter()
+                        .any(|formal| self.has_prefix_sentinel(formal.ty))
+                    || entry
+                        .type_param_bounds
+                        .iter()
+                        .any(|bound| self.has_prefix_sentinel(*bound));
+                if broken
+                    && entry.name_range != MemberEntry::MISSING_NAME_RANGE
+                    && let Some((type_params, return_ty, positional, required, named)) =
+                        self.source_member_signature(entry)
+                    && positional.len() == formals.positional.len()
+                    && named.len() == formals.named.len()
+                    && type_params.len() == usize::from(entry.type_params)
+                {
+                    let ty = if type_params.is_empty() {
+                        self.boundary.args.borrow_mut().function_required(
+                            0,
+                            required,
+                            return_ty,
+                            &positional,
+                            &named,
+                            false,
+                        )
+                    } else {
+                        self.boundary.args.borrow_mut().function_generic_required(
+                            &type_params,
+                            required,
+                            return_ty,
+                            &positional,
+                            &named,
+                            false,
+                        )
+                    };
+                    return Some(self.boundary.canonical_dotted_ty(ty));
+                }
                 let named: Vec<(StringId, Ty)> = formals
                     .named
                     .iter()
@@ -5008,9 +5074,11 @@ impl<'a> Engine<'a> {
         // The capture gate mirrors `function_shape_sig`'s: only a
         // function-RHS alias's own file-side capture can answer — a named
         // RHS (`AliasRhs::Named`) or a head with no capture keeps the
-        // caller's ordinary path.
+        // caller's ordinary path. A SAME-FILE typedef whose capture
+        // dropped out (a `p.T`-leafed formal poisons the tree) re-reads
+        // the written RHS from the source instead.
         let Some((params, ..)) = self.bounds.alias_fn_shape(name) else {
-            return None;
+            return self.source_alias_fn_ty(name, args, nullable);
         };
         let param_count = params.len();
         let args = if args == ArgListId::EMPTY {
@@ -5159,6 +5227,922 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Whether a pooled face still carries a prefix-sentinel leaf — the
+    /// bare `Named{p}` a `p.T<p.U>` spelling degrades to inside a
+    /// declaration-tree capture when the collector's armed walk poisons
+    /// the annotation (the same face the `Named` arms above recover from
+    /// the written spelling). Walks returns, formals, type-parameter
+    /// bounds, and argument lists at every depth; an `Unknown` return is
+    /// the same broken-capture signal (the whole annotation tree refused,
+    /// not one leaf).
+    fn has_prefix_sentinel(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Unknown => true,
+            Ty::Named { name, args, .. } => {
+                if args == ArgListId::EMPTY {
+                    !self.strings.resolve(name).contains('.')
+                        && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
+                } else {
+                    let list = self.boundary.args.borrow().get(args).to_vec();
+                    list.iter().any(|&arg| self.has_prefix_sentinel(arg))
+                }
+            }
+            Ty::Function { shape, .. } => {
+                if shape == crate::model::FnShapeId::EMPTY {
+                    return false;
+                }
+                let (names, ret, pos, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params_named.to_vec(),
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                self.has_prefix_sentinel(ret)
+                    || pos.iter().any(|&formal| self.has_prefix_sentinel(formal))
+                    || named
+                        .iter()
+                        .any(|(_, formal)| self.has_prefix_sentinel(*formal))
+                    || names
+                        .iter()
+                        .any(|(_, bound)| bound.is_some_and(|b| self.has_prefix_sentinel(b)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Splits `text` at depth-0 `sep` characters, quote- and
+    /// escape-aware — the parameter/type-parameter list splitter for the
+    /// written-signature recoveries (a default expression may carry
+    /// commas, strings, and nested groups).
+    fn split_top_commas(text: &str, sep: char) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth: u32 = 0;
+        let mut quote: Option<char> = None;
+        let mut start = 0;
+        for (index, ch) in text.char_indices() {
+            if let Some(q) = quote {
+                if ch == '\\' {
+                    // The escape and its target ride inside the piece.
+                } else if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' | '[' | '{' | '<' => depth += 1,
+                ')' | ']' | '}' | '>' => depth = depth.saturating_sub(1),
+                c if c == sep && depth == 0 => {
+                    parts.push(&text[start..index]);
+                    start = index + ch.len_utf8();
+                }
+                _ => {}
+            }
+        }
+        parts.push(&text[start..]);
+        parts
+    }
+
+    /// The `(inner, after_close)` slice of the balanced group opening at
+    /// `open` — quote- and escape-aware, nesting every bracket kind. The
+    /// written-signature recoveries read formal and type-parameter groups
+    /// straight out of the source with it; `None` when the group never
+    /// closes (a truncated source cannot produce, but the walk stays
+    /// honest anyway).
+    fn balanced_group(text: &str, open: usize) -> Option<(&str, usize)> {
+        let bytes = text.as_bytes();
+        let opener = *bytes.get(open)?;
+        let closer = match opener {
+            b'(' => b')',
+            b'[' => b']',
+            b'{' => b'}',
+            b'<' => b'>',
+            _ => return None,
+        };
+        let mut depth: u32 = 0;
+        let mut quote: Option<u8> = None;
+        let mut index = open;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(q) = quote {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == q {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && byte == closer {
+                        return Some((&text[open + 1..index], index + 1));
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// [`Self::parse_spelled_ty`] with an alias-parameter substitution at
+    /// the leaves: a bare identifier spelling a substituted parameter
+    /// reads the use-site argument's face (`typedef F2<T> = List<T>
+    /// Function(int)` under `x is F2<bool>` — the RHS's `T` IS `bool`),
+    /// at any argument depth. Everything else matches the unprefixed
+    /// parser verbatim.
+    fn parse_spelled_leaf(
+        &self,
+        text: &str,
+        subst: &FxHashMap<StringId, Ty>,
+    ) -> Option<Ty> {
+        let text = text.trim();
+        let (text, nullable) = text.strip_suffix('?').map_or((text, false), |t| (t, true));
+        // A whole-leaf substitution must be the bare parameter spelling.
+        if !text.is_empty()
+            && !nullable
+            && text
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+            && let Some(ty) = subst.get(&self.intern(text))
+        {
+            return Some(*ty);
+        }
+        let Some(open) = text.find('<') else {
+            if text.is_empty()
+                || !text
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
+            {
+                return None;
+            }
+            // The keyword types carry dedicated variants — a written
+            // annotation's `void`/`dynamic`/`Never`/`Null` return or
+            // formal reads the same face the captured columns keep.
+            return Some(match text {
+                "void" if !nullable => Ty::Void,
+                "dynamic" if !nullable => Ty::Dynamic,
+                "Never" if !nullable => Ty::Never,
+                "Null" if !nullable => Ty::Null,
+                _ => Ty::Named {
+                    name: self.intern(text),
+                    nullable,
+                    args: ArgListId::EMPTY,
+                },
+            });
+        };
+        if !text.ends_with('>') {
+            return None;
+        }
+        let inner = &text[open + 1..text.len() - 1];
+        let mut parts: Vec<Ty> = Vec::new();
+        for piece in Self::split_top_commas(inner, ',') {
+            parts.push(self.parse_spelled_leaf(piece, subst)?);
+        }
+        let head_text = text[..open].trim();
+        if head_text.is_empty()
+            || !head_text
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
+        {
+            return None;
+        }
+        Some(Ty::Named {
+            name: self.intern(head_text),
+            nullable,
+            args: self.boundary.intern_list(&parts),
+        })
+    }
+
+    /// Parses a written function-type literal (`[ret] Function<tp>?(...)
+    /// [Function<tp>?(...)]*`, the grammar's `functionTypeTail` chain —
+    /// upstream Dart SDK source, pkg/_fe_analyzer_shared/... grammar)
+    /// from the head of `text`, returning the face and the consumed
+    /// length: the recoveries feed it source slices whose tail (the `;`
+    /// of a typedef RHS, the `)` of a verdict span) is not part of the
+    /// type, so the parse must bound itself. Reading left to right, the
+    /// FIRST tail's formals are the INNERMOST return's and each further
+    /// tail wraps (`int Function() Function()` is a function returning
+    /// `int Function()`, the last tail outermost). Every shape interns
+    /// through the `_required` producers — the honest
+    /// required-positional/optional split is type identity
+    /// (`FnShape::required_positional`), which `fn_face_sig` reads back
+    /// from the shape. `None` declines the whole recovery (under-report).
+    fn parse_fn_literal_at(
+        &self,
+        text: &str,
+        subst: &FxHashMap<StringId, Ty>,
+    ) -> Option<(Ty, usize)> {
+        // The first depth-0 `Function` followed by `<`/`(` bounds the
+        // return part; a `Function` deeper inside a group or argument is
+        // a leaf's own spelling, not the boundary.
+        let bytes = text.as_bytes();
+        let mut depth: u32 = 0;
+        let mut quote: Option<u8> = None;
+        let mut tail_at: Option<usize> = None;
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(q) = quote {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == q {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth == 0
+                && byte == b'F'
+                && text[index..].starts_with("Function")
+                && !matches!(bytes.get(index.wrapping_sub(1)), Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'))
+            {
+                let mut after = index + "Function".len();
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if matches!(bytes.get(after), Some(b'<' | b'(')) {
+                    tail_at = Some(index);
+                    break;
+                }
+            }
+            index += 1;
+        }
+        let tail_at = tail_at?;
+        let head = text[..tail_at].trim();
+        let mut ty = if head.is_empty() {
+            // A bare tail chain reads the `dynamic` return.
+            Ty::Dynamic
+        } else {
+            // The return head is either a named leaf or a nested chain
+            // (`int Function() Function() Function()`).
+            match self.parse_fn_literal_at(head, subst) {
+                Some((inner, _)) => inner,
+                None => self.parse_spelled_leaf(head, subst)?,
+            }
+        };
+        let mut index = tail_at;
+        let mut nullable = false;
+        loop {
+            // Each tail: `Function`, optional `<...>` group, `(...)`
+            // group, optional trailing `?` on the outermost level.
+            index += "Function".len();
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let mut type_params: Vec<(StringId, Option<Ty>)> = Vec::new();
+            if bytes.get(index) == Some(&b'<')
+                && let Some((inner, after)) = Self::balanced_group(text, index)
+            {
+                type_params = self.parse_tp_group(inner, subst)?;
+                index = after;
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+            }
+            let open = index;
+            if bytes.get(index) != Some(&b'(') {
+                return None;
+            }
+            let (inner, after) = Self::balanced_group(text, open)?;
+            let (positional, required, named) = self.parse_fn_params(inner, subst)?;
+            ty = if type_params.is_empty() {
+                self.boundary.args.borrow_mut().function_required(
+                    0,
+                    required,
+                    ty,
+                    &positional,
+                    &named,
+                    false,
+                )
+            } else {
+                self.boundary.args.borrow_mut().function_generic_required(
+                    &type_params,
+                    required,
+                    ty,
+                    &positional,
+                    &named,
+                    false,
+                )
+            };
+            index = after;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'?') {
+                nullable = true;
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+            }
+            if text[index..].starts_with("Function") {
+                let mut after = index + "Function".len();
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if !matches!(bytes.get(after), Some(b'<' | b'(')) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if let Ty::Function { shape, .. } = ty
+            && nullable
+        {
+            ty = Ty::Function { shape, nullable };
+        }
+        Some((ty, index))
+    }
+
+    /// Parses a parameter group's inner text into the formal columns:
+    /// leading required positionals, then ONE trailing `[...]`
+    /// (optional positional) or `{...}` (named) section. A formal is
+    /// `Type [name] [= default]` (named: `[required] Type name [=
+    /// default]`); the name strips from the trailing identifier, the
+    /// default from the first depth-0 `=`, and the remaining head parses
+    /// as a leaf or a nested function literal (`void Function() f`).
+    fn parse_fn_params(
+        &self,
+        inner: &str,
+        subst: &FxHashMap<StringId, Ty>,
+    ) -> Option<(Vec<Ty>, u16, Vec<(StringId, Ty)>)> {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return Some((Vec::new(), 0, Vec::new()));
+        }
+        // The optional/named section is ONE trailing bracket group — the
+        // first depth-0 `[`/`{` (a default expression's own brackets and
+        // strings sit deeper). Everything before it is the required
+        // positional run.
+        let bytes = inner.as_bytes();
+        let mut depth: u32 = 0;
+        let mut quote: Option<u8> = None;
+        let mut section_open: Option<(usize, bool)> = None;
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(q) = quote {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == q {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'[' if depth == 0 => {
+                    section_open = Some((index, false));
+                    depth += 1;
+                }
+                b'{' if depth == 0 => {
+                    section_open = Some((index, true));
+                    depth += 1;
+                }
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            index += 1;
+        }
+        let (positional_text, section) = match section_open {
+            Some((open, named)) => {
+                let head = inner[..open].trim();
+                let group = Self::balanced_group(inner, open)?;
+                if !inner[group.1..].trim().is_empty() {
+                    return None;
+                }
+                (head, Some((group.0, named)))
+            }
+            None => (inner, None),
+        };
+        let mut positional: Vec<Ty> = Vec::new();
+        for piece in Self::split_top_commas(positional_text, ',') {
+            if piece.trim().is_empty() {
+                continue;
+            }
+            positional.push(self.parse_formal_ty(piece, subst, false)?.1);
+        }
+        let required = u16::try_from(positional.len()).ok()?;
+        let named: Vec<(StringId, Ty)> = match section {
+            None => Vec::new(),
+            Some((group, false)) => {
+                if !group.trim().is_empty() {
+                    positional.extend(
+                        Self::split_top_commas(group, ',')
+                            .into_iter()
+                            .filter(|piece| !piece.trim().is_empty())
+                            .map(|piece| self.parse_formal_ty(piece, subst, false).map(|(_, ty)| ty))
+                            .collect::<Option<Vec<_>>>()?,
+                    );
+                }
+                Vec::new()
+            }
+            Some((group, true)) => Self::split_top_commas(group, ',')
+                .into_iter()
+                .filter(|piece| !piece.trim().is_empty())
+                .map(|piece| {
+                    let (name, ty) = self.parse_formal_ty(piece, subst, true)?;
+                    Some((name?, ty))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
+        Some((positional, required, named))
+    }
+
+    /// One formal's type and stripped name: strips a leading `required `
+    /// (named formals), a trailing `= default` (the first depth-0 `=`),
+    /// and the trailing name identifier — what remains is the type head
+    /// (`int x` → `int`, `List<int> x` → `List<int>`, bare `int` stays
+    /// whole). A formal that is itself a function literal (`void
+    /// Function() f`) recurses into [`Self::parse_fn_literal_at`]. The
+    /// name returns beside the type — the named column keys by it.
+    fn parse_formal_ty(
+        &self,
+        piece: &str,
+        subst: &FxHashMap<StringId, Ty>,
+        named: bool,
+    ) -> Option<(Option<StringId>, Ty)> {
+        let mut head = piece.trim();
+        if named && let Some(rest) = head.strip_prefix("required ") {
+            head = rest.trim();
+        }
+        // The default tail splits at the FIRST depth-0 `=` — a default
+        // expression's own `=`s, commas, and strings sit inside the
+        // groups the depth walk carries.
+        if let Some(eq) = Self::depth0_eq(head) && !head[..eq].trim_end().is_empty() {
+            head = head[..eq].trim();
+        }
+        let bytes = head.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let mut name = None;
+        if end > 0
+            && matches!(bytes[end - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
+        {
+            let mut start = end - 1;
+            while start > 0
+                && matches!(bytes[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
+            {
+                start -= 1;
+            }
+            if start > 0 {
+                name = Some(self.intern(&head[start..end]));
+                head = head[..start].trim_end();
+            }
+        }
+        if head.is_empty() {
+            return None;
+        }
+        let ty = if let Some((ty, consumed)) = self.parse_fn_literal_at(head, subst)
+            && consumed == head.len()
+        {
+            ty
+        } else {
+            self.parse_spelled_leaf(head, subst)?
+        };
+        Some((name, ty))
+    }
+
+    /// The byte index of the first depth-0, quote-aware `=` in `text`
+    /// — the formal-default separator. `None` when every `=` hides
+    /// inside a group, string, or argument list.
+    fn depth0_eq(text: &str) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut depth: u32 = 0;
+        let mut quote: Option<u8> = None;
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(q) = quote {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == q {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                b'=' if depth == 0 => return Some(index),
+                _ => {}
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// A type-parameter group's inner text (`T`, `T extends num`): the
+    /// name with its written bound — the bound the
+    /// `relateTypeParameters` equality leg of the generic verdict asks.
+    fn parse_tp_group(
+        &self,
+        inner: &str,
+        subst: &FxHashMap<StringId, Ty>,
+    ) -> Option<Vec<(StringId, Option<Ty>)>> {
+        let mut params: Vec<(StringId, Option<Ty>)> = Vec::new();
+        for piece in Self::split_top_commas(inner, ',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (name_text, bound) = match piece.find("extends") {
+                Some(at) if at > 0 && piece.as_bytes()[at - 1].is_ascii_whitespace() => {
+                    let name = piece[..at].trim();
+                    let bound = self.parse_spelled_leaf(&piece[at + "extends".len()..], subst);
+                    if bound.is_none() {
+                        return None;
+                    }
+                    (name, bound)
+                }
+                _ => (piece, None),
+            };
+            if name_text.is_empty()
+                || !name_text
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+            {
+                return None;
+            }
+            params.push((self.intern(name_text), bound));
+        }
+        Some(params)
+    }
+
+    /// The written type annotation ending immediately before
+    /// `name_offset`, function-literal aware — [`Self::backward_ty_text`]
+    /// for signatures whose return annotation is itself a function type
+    /// (`int Function([core.List<core.int> x]) mm`): the walk carries
+    /// balanced `(...)`/`[...]`/`{...}` groups on a stack (a `(...)` may
+    /// carry commas and defaults inside), tracks the generic `<...>`
+    /// depth only outside those groups, and stops at any other character
+    /// — a `;`, `{`, `=`, or `(` of the enclosing declaration. Leading
+    /// modifier words trim; a remaining head that starts with a statement
+    /// keyword vetoes (the `return f2(` a call site would otherwise
+    /// misread as `return`-the-type).
+    fn backward_type_text(&self, name_offset: u32) -> Option<String> {
+        self.backward_type_text_at_byte(self.byte_of(name_offset))
+    }
+
+    /// [`Self::backward_type_text`] anchored at a byte index (the
+    /// top-level occurrence scan works in bytes).
+    fn backward_type_text_at_byte(&self, name_end: usize) -> Option<String> {
+        const MODIFIERS: &[&str] = &[
+            "static", "final", "const", "late", "var", "external", "covariant", "factory",
+            "abstract",
+        ];
+        const KEYWORDS: &[&str] = &[
+            "return", "throw", "new", "await", "yield", "assert", "else", "case", "in", "is",
+            "as", "do", "on", "when", "get", "set", "operator", "extension", "typedef", "class",
+            "enum", "mixin", "switch", "default", "while", "for", "if", "try", "catch",
+        ];
+        let bytes = self.source.as_bytes();
+        let mut end = name_end;
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return None;
+        }
+        let mut stack: Vec<u8> = Vec::new();
+        let mut angle: u32 = 0;
+        let mut start = end;
+        while start > 0 {
+            let ch = bytes[start - 1];
+            match ch {
+                b')' | b']' | b'}' => {
+                    stack.push(ch);
+                    start -= 1;
+                }
+                b'(' | b'[' | b'{' => {
+                    if !matches!(
+                        (stack.last(), ch),
+                        (Some(b')'), b'(') | (Some(b']'), b'[') | (Some(b'}'), b'{')
+                    ) {
+                        break;
+                    }
+                    stack.pop();
+                    start -= 1;
+                }
+                b'>' => {
+                    angle += 1;
+                    start -= 1;
+                }
+                b'<' => {
+                    if angle == 0 {
+                        break;
+                    }
+                    angle -= 1;
+                    start -= 1;
+                }
+                b',' if !stack.is_empty() || angle > 0 => start -= 1,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$' | b'.' | b'?' => {
+                    start -= 1;
+                }
+                _ => break,
+            }
+        }
+        if start == end {
+            return None;
+        }
+        let mut text = self.source[start..end].trim().to_string();
+        loop {
+            let first = text.split_whitespace().next().unwrap_or_default();
+            if MODIFIERS.contains(&first) {
+                text = text[first.len()..].trim_start().to_string();
+            } else {
+                break;
+            }
+        }
+        let first = text.split_whitespace().next().unwrap_or_default();
+        if first.is_empty() || KEYWORDS.contains(&first) {
+            return None;
+        }
+        Some(text)
+    }
+
+    /// Parses a recovered annotation slice as one type: a function
+    /// literal consumed whole, else a named leaf (`T`, `p.T<args>`, `T?`).
+    fn parse_annotation_ty(&self, text: &str) -> Option<Ty> {
+        if let Some((ty, consumed)) = self.parse_fn_literal_at(text, &FxHashMap::default())
+            && consumed == text.trim().len()
+        {
+            return Some(ty);
+        }
+        self.parse_spelled_leaf(text, &FxHashMap::default())
+    }
+
+    /// The member's declared signature re-read from the written source
+    /// when the captured face carries a broken annotation (a
+    /// prefix-sentinel or `Unknown` return — the collector's armed walk
+    /// degrades `p.T` leaves inside declaration trees): `name_range`
+    /// anchors the member's own name token, [`Self::backward_type_text`]
+    /// recovers the return annotation verbatim, and the group after the
+    /// (optional `<...>` and) name re-reads the formals with their
+    /// honest required/optional/named split. The upstream verdict reads
+    /// the declaration's resolved `FunctionType` — this is that face,
+    /// re-derived where the capture lost it.
+    fn source_member_signature(
+        &self,
+        entry: &MemberEntry,
+    ) -> Option<(Vec<(StringId, Option<Ty>)>, Ty, Vec<Ty>, u16, Vec<(StringId, Ty)>)> {
+        let name_end = self.byte_of(entry.name_range.end());
+        let bytes = self.source.as_bytes();
+        let mut index = name_end;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let mut type_params: Vec<(StringId, Option<Ty>)> = Vec::new();
+        if bytes.get(index) == Some(&b'<')
+            && let Some((inner, after)) = Self::balanced_group(self.source, index)
+        {
+            type_params = self.parse_tp_group(inner, &FxHashMap::default())?;
+            index = after;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+        }
+        if bytes.get(index) != Some(&b'(') {
+            return None;
+        }
+        let (inner, _) = Self::balanced_group(self.source, index)?;
+        let (positional, required, named) = self.parse_fn_params(inner, &FxHashMap::default())?;
+        let return_text = self.backward_type_text(entry.name_range.offset)?;
+        let return_ty = self.parse_annotation_ty(&return_text)?;
+        Some((type_params, return_ty, positional, required, named))
+    }
+
+    /// The top-level function's declared signature re-read from source
+    /// under the same broken-capture gate (`TopDecl` carries no position,
+    /// so the declaration is the word-boundary occurrence whose backward
+    /// scan lands a real annotation and whose formals match the captured
+    /// signature's counts — a call site answers no backward type or a
+    /// keyword, and a mismatched arity declines). The first passing
+    /// occurrence wins; every miss keeps the captured face
+    /// (under-report).
+    fn source_top_level_signature(
+        &self,
+        name: StringId,
+        positional_count: usize,
+        named_count: usize,
+        tp_count: usize,
+    ) -> Option<Ty> {
+        let name_text = self.strings.resolve(name);
+        let bytes = self.source.as_bytes();
+        let mut search = 0;
+        while let Some(found) = self.source[search..].find(name_text) {
+            let at = search + found;
+            search = at + name_text.len();
+            let before_ok = at == 0
+                || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+            let after_name = at + name_text.len();
+            let after_ok = after_name >= bytes.len()
+                || !matches!(bytes[after_name], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let mut index = after_name;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let mut type_params: Vec<(StringId, Option<Ty>)> = Vec::new();
+            if bytes.get(index) == Some(&b'<')
+                && let Some((inner, after)) = Self::balanced_group(self.source, index)
+            {
+                let Some(params) = self.parse_tp_group(inner, &FxHashMap::default()) else {
+                    continue;
+                };
+                type_params = params;
+                index = after;
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+            }
+            if bytes.get(index) != Some(&b'(') {
+                continue;
+            }
+            let Some((inner, after_group)) = Self::balanced_group(self.source, index) else {
+                continue;
+            };
+            let Some((positional, required, named)) =
+                self.parse_fn_params(inner, &FxHashMap::default())
+            else {
+                continue;
+            };
+            if positional.len() != positional_count
+                || named.len() != named_count
+                || type_params.len() != tp_count
+            {
+                continue;
+            }
+            // The declaration's body opener separates it from calls: a
+            // call site with a backward-readable context still ends its
+            // group with `;` or an operator, never a body.
+            let mut after = after_group;
+            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            if self.source[after..].starts_with("async") {
+                after += "async".len();
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+            }
+            if !matches!(bytes.get(after), Some(b'=' | b'{' | b';')) {
+                continue;
+            }
+            let Some(return_text) = self.backward_type_text_at_byte(at) else {
+                continue;
+            };
+            let Some(return_ty) = self.parse_annotation_ty(&return_text) else {
+                continue;
+            };
+            let ty = if type_params.is_empty() {
+                self.boundary.args.borrow_mut().function_required(
+                    0,
+                    required,
+                    return_ty,
+                    &positional,
+                    &named,
+                    false,
+                )
+            } else {
+                self.boundary.args.borrow_mut().function_generic_required(
+                    &type_params,
+                    required,
+                    return_ty,
+                    &positional,
+                    &named,
+                    false,
+                )
+            };
+            return Some(self.boundary.canonical_dotted_ty(ty));
+        }
+        None
+    }
+
+    /// The typedef's function RHS re-read from the written source when
+    /// the file-side `index.aliases` capture dropped out (a `p.T`-leafed
+    /// formal in the RHS poisons the capture — `typedef F2b<T> = List<T>
+    /// Function(int, [core.List<core.int> x])`): the `<...>` group after
+    /// the alias name reads its own parameters, the RHS after `=` parses
+    /// as a function literal with the alias parameters substituted by
+    /// the use-site arguments (`F2b<T>` under `m2 is F2b<T>` — the
+    /// RHS's `T` IS the class parameter), mirroring the oracle's
+    /// alias-instantiation the verdict then asks. A bare use reads each
+    /// parameter's written bound (the
+    /// `instantiateTypeFormalsToBounds` face); a boundless bare
+    /// parameter or a non-function RHS declines (under-report).
+    fn source_alias_fn_ty(
+        &self,
+        name: StringId,
+        args: ArgListId,
+        nullable: bool,
+    ) -> Option<Ty> {
+        let name_text = self.strings.resolve(name);
+        let bytes = self.source.as_bytes();
+        let mut search = 0;
+        while let Some(found) = self.source[search..].find("typedef") {
+            let at = search + found;
+            search = at + "typedef".len();
+            let before_ok = at == 0
+                || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+            let mut index = at + "typedef".len();
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if !before_ok || !self.source[index..].starts_with(name_text) {
+                continue;
+            }
+            let after_name = index + name_text.len();
+            let after_ok = after_name >= bytes.len()
+                || !matches!(bytes[after_name], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+            if !after_ok {
+                continue;
+            }
+            index = after_name;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let mut params: Vec<(StringId, Option<Ty>)> = Vec::new();
+            if bytes.get(index) == Some(&b'<')
+                && let Some((inner, after)) = Self::balanced_group(self.source, index)
+            {
+                params = self.parse_tp_group(inner, &FxHashMap::default())?;
+                index = after;
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+            }
+            if bytes.get(index) != Some(&b'=') {
+                continue;
+            }
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let subst: FxHashMap<StringId, Ty> = if args == ArgListId::EMPTY {
+                params
+                    .iter()
+                    .map(|&(name, bound)| bound.map(|bound| (name, bound)))
+                    .collect::<Option<FxHashMap<StringId, Ty>>>()?
+            } else {
+                let list = self.boundary.args.borrow().get(args).to_vec();
+                if list.len() != params.len() {
+                    return None;
+                }
+                params
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .zip(list)
+                    .collect()
+            };
+            let (ty, _) = self.parse_fn_literal_at(&self.source[index..], &subst)?;
+            let ty = match ty {
+                Ty::Function {
+                    shape,
+                    nullable: parsed,
+                } => Ty::Function {
+                    shape,
+                    nullable: nullable || parsed,
+                },
+                other => other,
+            };
+            return Some(self.boundary.canonical_dotted_ty(ty));
+        }
+        None
+    }
+
     /// already produced. `None` for a non-function or nullable face.
     /// `required` overrides the map answer for a caller that knows the
     /// face's own written site (`check_type_check`'s `last_fn_seal` match)
@@ -5182,9 +6166,19 @@ impl<'a> Engine<'a> {
                 shape.named.to_vec(),
             )
         };
+        // The shape's own `required_positional` is the last resort: it
+        // equals the positional count for every split-blind producer
+        // (`ArgPool::function`'s all-required reading) and carries the
+        // honest written count for the `_required` producers (the source
+        // recoveries below), which build outside an `&mut self` that
+        // could record the engine map.
+        let shape_required = {
+            let pool = self.boundary.pool();
+            pool.function_shape(shape).required_positional
+        };
         let required_positional = required
             .or_else(|| self.fn_shape_required.get(&shape).copied())
-            .unwrap_or_else(|| u16::try_from(positional.len()).unwrap_or(u16::MAX));
+            .unwrap_or(shape_required);
         // A named shape carries its parameter spellings (and bounds)
         // through `type_params_named`; a count-only face keeps the
         // anonymous entries `function_shape_sig` produces.
@@ -5219,7 +6213,15 @@ impl<'a> Engine<'a> {
         if let Some(sig) = self.local_fn_sig(operand.name) {
             return Some(Box::new(sig.clone()));
         }
-        if let Some(sig) = self.tear_off_sig(operand) {
+        // A captured declaration sig carrying a broken-annotation leaf
+        // (the `p.T` truncation) declines in favor of the operand FACE's
+        // own sig — the source-recovered face the tear-off path built
+        // spells every leaf the ask compares.
+        if let Some(sig) = self.tear_off_sig(operand)
+            && !self.has_prefix_sentinel(sig.return_ty)
+            && sig.positional.iter().all(|formal| !self.has_prefix_sentinel(*formal))
+            && sig.named.iter().all(|(_, formal, _)| !self.has_prefix_sentinel(*formal))
+        {
             return Some(sig);
         }
         self.fn_face_sig(operand_ty, None)
@@ -6090,6 +7092,36 @@ impl<'a> Engine<'a> {
                 nullable: false,
                 args: ArgListId::EMPTY,
             };
+        }
+        // A written function-literal target whose pooled face still
+        // carries a prefix-sentinel leaf at ANY depth (the return-level
+        // arm above recovers the head alone; the formals' `p.T` leaves
+        // truncate the same way one level down) re-reads the whole
+        // literal from the verdict span — the written spelling after the
+        // `is`/`is!` keyword parses with every leaf intact (`int
+        // Function([core.List<core.int> x]) Function()`), the same face
+        // the operand's own source recovery spells. The parse bounds
+        // itself structurally, so the span's trailing `)` never joins.
+        if let Ty::Function { .. } = checked
+            && self.has_prefix_sentinel(checked)
+        {
+            let start = self.byte_of(at.offset);
+            let end = self.byte_of(at.end());
+            let span_text = &self.source[start..end];
+            let is_at = span_text
+                .rfind(" is! ")
+                .or_else(|| span_text.rfind(" is "))
+                .map(|pos| pos + if span_text[pos..].starts_with(" is! ") { 5 } else { 4 });
+            if let Some(keyword_end) = is_at {
+                let tail = &span_text[keyword_end..];
+                let trimmed = tail.trim_start();
+                let skip = tail.len() - trimmed.len();
+                if let Some((recovered, _)) =
+                    self.parse_fn_literal_at(&span_text[keyword_end + skip..], &FxHashMap::default())
+                {
+                    checked = self.canonical_function_ty(recovered);
+                }
+            }
         }
         // `TypeSystem::type_check_verdict`'s first gate — an
         // `InvalidType` operand is informative before every other arm

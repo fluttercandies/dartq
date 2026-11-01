@@ -388,6 +388,7 @@ mod extension_types;
 mod ffi;
 mod index_result;
 mod invocation;
+mod legacy_switch;
 mod listener;
 mod never_send;
 mod operand_face;

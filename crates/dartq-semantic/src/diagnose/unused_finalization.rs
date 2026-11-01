@@ -307,6 +307,15 @@ impl<'a> Engine<'a> {
     /// no arguments, then the inverted-type row when the super-bounded pass
     /// ran — both anchored at the checked `NamedType`'s own span.
     fn emit_bounded_issue(&mut self, issue: crate::bounds::BoundedIssue) {
+        // The main row anchors the offending argument's own extent: a
+        // bare `Function` head grows through its formals group (#3571 —
+        // the whole written TypeAnnotation the oracle's
+        // `_typeArgumentErrorNode` anchors); every other captured face
+        // already spans whole. The offset never moves, so the batch's
+        // pre-emit offset sort stays honest.
+        let range = self
+            .written_function_literal_span(issue.range)
+            .unwrap_or(issue.range);
         let mut context = Vec::new();
         if let Some(raw) = &issue.raw_instantiated {
             context.push(ContextMessage {
@@ -332,7 +341,7 @@ impl<'a> Engine<'a> {
         if context.is_empty() {
             self.emit3(
                 SemanticCode::TypeArgumentNotMatchingBounds,
-                issue.range,
+                range,
                 &issue.argument,
                 &issue.parameter,
                 &issue.bound,
@@ -340,7 +349,7 @@ impl<'a> Engine<'a> {
         } else {
             self.emit3_with_context(
                 SemanticCode::TypeArgumentNotMatchingBounds,
-                issue.range,
+                range,
                 &issue.argument,
                 &issue.parameter,
                 &issue.bound,

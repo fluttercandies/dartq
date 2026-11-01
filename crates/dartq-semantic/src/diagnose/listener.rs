@@ -8644,27 +8644,65 @@ impl ParserListener for DiagnoseListener<'_> {
         // unapplied null-check candidates never cross into the next clause.
         engine.last_case_object_head = None;
         engine.null_check_binder_candidates.clear();
+        // The legacy head's const verdict, folded for the pre-patterns
+        // verifier (`SwitchCtx::legacy_cases`): `Value` keeps its constant,
+        // `Constant` stays opaque, every other verdict already reported at
+        // its own span.
+        let mut legacy: Option<ConstantValue> = None;
+        let mut deferred: Option<SourceRange> = None;
         if engine.const_capture.top_is_constant_pattern()
             && let Some(node) = engine.const_capture.close_constant_pattern()
         {
-            match eval(&node, engine) {
-                Verdict::Value(_) | Verdict::Constant => {}
-                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
-                    // The same `InvalidType` early-return shape as the
-                    // constant-pattern face: a resolution verdict already
-                    // anchored inside the expression's span suppresses the
-                    // generic row (constant_verifier.dart:134-136).
-                    let already_answered = engine.report.diagnostics.iter().any(|d| {
-                        d.range.offset >= span.offset
-                            && d.range.end() <= span.end()
-                            && d.range.length > 0
-                            && d.range != span
-                    });
-                    if !already_answered {
-                        engine.emit(SemanticCode::NonConstantCaseExpression, span, "", "");
+            let head_span = node.span;
+            // A constant through a deferred import's prefix fails
+            // const-eval upstream (`evaluation.dart`'s
+            // `_getDeferredLibraryError` answers `InvalidConstant` at the
+            // prefix — before value production, so the deferred row
+            // preempts every verdict the subset folds: value, opaque,
+            // generic non-constant, and a same-head fault alike) and
+            // anchors at the prefix token.
+            deferred = engine.legacy_deferred_span(&node);
+            if let Some(prefix_span) = deferred {
+                engine.emit(
+                    SemanticCode::NonConstantCaseExpressionFromDeferredLibrary,
+                    prefix_span,
+                    "",
+                    "",
+                );
+            } else {
+                match eval(&node, engine) {
+                    Verdict::Value(value) => legacy = Some(value),
+                    Verdict::Constant => {}
+                    Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                        // The same `InvalidType` early-return shape as the
+                        // constant-pattern face: a resolution verdict already
+                        // anchored inside the expression's span suppresses the
+                        // generic row (constant_verifier.dart:134-136).
+                        let already_answered = engine.report.diagnostics.iter().any(|d| {
+                            d.range.offset >= span.offset
+                                && d.range.end() <= span.end()
+                                && d.range.length > 0
+                                && d.range != span
+                        });
+                        if !already_answered {
+                            engine.emit(SemanticCode::NonConstantCaseExpression, span, "", "");
+                        }
                     }
+                    Verdict::Fault(fault, span) => engine.emit_const_fault(fault, span),
                 }
-                Verdict::Fault(fault, span) => engine.emit_const_fault(fault, span),
+            }
+            // A legacy-verifier entry exists per HEAD, verdict or not: the
+            // opaque `Constant` carries `None`, the reported-non-constant
+            // verdicts carry the same `None` upstream's
+            // `expressionValue is! DartObjectImpl` skip implies.
+            if !engine.patterns_enabled
+                && let Some(ctx) = engine.switch.switches.last_mut()
+            {
+                ctx.legacy_cases.push(crate::switch_tracker::LegacyCase {
+                    span: head_span,
+                    value: legacy.take(),
+                    deferred,
+                });
             }
         }
         let root = engine.close_case_sink();

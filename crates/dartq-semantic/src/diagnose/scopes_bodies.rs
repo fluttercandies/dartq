@@ -1103,65 +1103,665 @@ impl<'a> Engine<'a> {
     /// (`x == .a`, `.a = v`) keep their silence: their context is the
     /// operand/assignment face's, not the declaration's — the under-report
     /// direction every other operand-context shorthand keeps.
+    ///
+    /// Each row resolves against the context ITS position computes
+    /// ([`Self::shorthand_ctx_at`]): a shorthand directly under `=` reads
+    /// the declaration's armed annotation, while an operand/pattern/
+    /// argument shorthand inside the same initializer reads its own
+    /// parent's face (#3568 — `E e = (m == .x)` resolves `.x` against the
+    /// left operand's type, not `E`).
     pub(crate) fn resolve_decl_shorthands(&mut self) {
         let Some(mark) = self.init_mark else {
             return;
         };
-        let context = self.shorthand_context_ty();
-        let context_text = self
-            .pending_decl_ty
-            .map(|ty| self.ty_display(ty))
-            .unwrap_or_default();
         for index in mark..self.rows.len() {
-            let row = self.rows[index].clone();
-            if !row.qualified
-                || !matches!(row.shape, RowShape::Bare(_))
-                || row.ty != Ty::UNKNOWN
-                || !self.dot_shorthand_context(row.range.offset)
-            {
-                continue;
+            self.verdict_shorthand_at(index, true);
+        }
+    }
+
+    /// The shared shorthand verdict (#3433's two-arm rule, widened to every
+    /// computable position by #3568): the row resolves against its position's
+    /// context — a hit upgrades the row to the member's declared face, a
+    /// named-context miss reports the context head's NAME (upstream
+    /// `dotShorthandUndefinedGetter`/`...UndefinedInvocation` spell
+    /// `typeReference.name`/`receiver.displayName` — `List<int>` reports
+    /// `'List'`), and a weaker context reports the invocation arm's visited
+    /// schema text (`'_'`, `dynamic`, `bool`, a written schema) while the
+    /// read arm stays silent (the `missing_context` sibling is
+    /// unimplemented).
+    ///
+    /// `frame_live` marks rows whose innermost executable still sits on the
+    /// frame stack (`self.rows`): `return`/`=>` positions then read the
+    /// live frame's return face. A deferred row's executable already
+    /// closed — its verdict ran at the closer's own sweep, so a re-sweep
+    /// keeps the context-free answer instead of borrowing the enclosing
+    /// frame's return.
+    fn verdict_shorthand_at(&mut self, index: usize, live: bool) {
+        let row = self.rows[index].clone();
+        if !self.is_shorthand_head(&row) {
+            return;
+        }
+        let (resolve, schema) = self.shorthand_ctx_at(&row, live);
+        let invoke = row.intent == Intent::Invoke;
+        let resolved = resolve.and_then(|ctx| {
+            let Ty::Named {
+                name: head,
+                nullable,
+                args,
+            } = ctx
+            else {
+                return None;
+            };
+            self.shorthand_member_ty(head, nullable, args, row.name)
+        });
+        match (resolved, invoke) {
+            (Some(ty), _) => {
+                self.rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
+                self.rows[index].ty = ty;
             }
-            let invoke = row.intent == Intent::Invoke;
-            if !matches!(row.intent, Intent::Read | Intent::Invoke) {
-                continue;
-            }
-            let resolved = context.and_then(|ctx| {
-                let Ty::Named {
-                    name: head,
-                    nullable,
-                    args,
-                } = ctx
-                else {
-                    return None;
+            (None, true) => {
+                // The invocation arm reports unconditionally once its
+                // context is not an accessible interface type
+                // (method_invocation_resolver.dart:290-304): a named head
+                // spells its own name, every weaker context the schema it
+                // was visited under.
+                let text = match resolve {
+                    Some(Ty::Named { name, .. }) => self.strings.resolve(name).to_string(),
+                    _ => schema,
                 };
-                self.shorthand_member_ty(head, nullable, args, row.name)
-            });
-            match (resolved, invoke) {
-                (Some(ty), _) => {
-                    self.rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
-                    self.rows[index].ty = ty;
+                self.emit_shorthand_undefined_member(row.range, &text);
+            }
+            (None, false) => {
+                // The property-access arm reports only on a named context
+                // head (`dotShorthandUndefinedGetter` at the selector); every
+                // weaker context — none, invalid, a non-interface shape —
+                // reads `missing_context` upstream (suppressed here).
+                if let Some(Ty::Named { name, .. }) = resolve {
+                    let text = self.strings.resolve(name).to_string();
+                    self.emit_shorthand_undefined_member(row.range, &text);
                 }
-                (None, true) => {
-                    // The invocation arm reports unconditionally once its
-                    // context is not an accessible interface type
-                    // (method_invocation_resolver.dart:290-304) — a written
-                    // context displays it, a context-free shorthand `_`.
-                    let text = if context.is_some() || self.pending_decl_ty.is_some() {
-                        context_text.as_str()
-                    } else {
-                        "_"
-                    };
-                    self.emit_shorthand_undefined_member(row.range, text);
+            }
+        }
+    }
+
+    /// The un-merged leading-dot selector gate shared by every shorthand
+    /// sweep: `qualified` (the selector fold), `Bare(_)` (no receiver merged),
+    /// `ty == Unknown` (never verdicted — the once-only marker), and the
+    /// byte-level `.`-opener probe.
+    fn is_shorthand_head(&self, row: &Row) -> bool {
+        row.qualified
+            && matches!(row.shape, RowShape::Bare(_))
+            && row.ty == Ty::UNKNOWN
+            && matches!(row.intent, Intent::Read | Intent::Invoke)
+            && self.dot_shorthand_context(row.range.offset)
+    }
+
+    /// The body-end shorthand sweep (#3568): runs at every executable body's
+    /// close ([`Self::stage_body_completion`], before the frame pops and —
+    /// for literals — before the interior rows drain), verdicting every
+    /// unresolved shorthand head the initializer pass never reached: operand
+    /// (`x == .a`), pattern (`case .a`, `case == .a`, switch-expression
+    /// arms), argument (`take(.a)`), return (`return .a`), condition
+    /// (`if (.a)`), `??`-right, collection-element, and assignment-target
+    /// positions. `self.rows` rows carry live frames; deferred rows
+    /// (closed literal interiors) re-run only the frame-free positions —
+    /// their frame-bound verdicts were decided at their own close.
+    fn sweep_body_shorthands(&mut self) {
+        for index in 0..self.rows.len() {
+            let owner_live = self
+                .frames
+                .iter()
+                .rev()
+                .find(|frame| frame.row_mark <= index)
+                .is_some_and(|frame| matches!(frame.kind, FrameKind::Executable { .. }));
+            self.verdict_shorthand_at(index, owner_live);
+        }
+        for index in 0..self.deferred_miss_rows.len() {
+            let row = self.deferred_miss_rows[index].clone();
+            if !self.is_shorthand_head(&row) {
+                continue;
+            }
+            let (resolve, schema) = self.shorthand_ctx_at(&row, false);
+            self.verdict_deferred_shorthand(index, &row, resolve, schema);
+        }
+    }
+
+    /// The shorthand's per-position context (#3568): the type the shorthand
+    /// resolves against plus the schema text the weaker verdicts render.
+    /// Upstream arms the context while walking into the shorthand
+    /// (`pushDotShorthandContext` on the `==` right operand
+    /// — binary_expression_resolver.dart:112 — the parent's `contextType`
+    /// on every other node); this row-level pass recomputes it from the
+    /// token before the shorthand's `.`.
+    ///
+    /// The `(resolve, schema)` pair carries upstream's two answers:
+    /// `resolve` is `Some` for a decidable context (`Ty::Named` — the
+    /// member walk's head; a weaker shape — `dynamic`, `bool`, a written
+    /// non-interface schema) and `None` when nothing armed a context (the
+    /// read arm's `missing_context`, the invoke arm's `'_'`). `schema` is
+    /// the context's display text — `'_'` under `None`, the type's own
+    /// display under `Some`.
+    fn shorthand_ctx_at(&self, row: &Row, live: bool) -> (Option<Ty>, String) {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        // The `.` before the selector name: the selector token sits at
+        // `row.range.offset`; the token immediately before it is the dot.
+        let name_idx = toks.partition_point(|t| t.utf16_offset < row.range.offset);
+        let Some(dot_idx) = name_idx.checked_sub(1) else {
+            return (None, "_".to_string());
+        };
+        let Some(prev_idx) = dot_idx.checked_sub(1) else {
+            return (None, "_".to_string());
+        };
+        let prev = toks[prev_idx];
+        // The row whose written expression ends just before `token`'s
+        // offset — the operand/context expression the position reads.
+        // Searched from the shorthand's own index backward in `self.rows`,
+        // then the deferred tail.
+        let operand_row_before = |engine: &Self, end: u32, before: usize| -> Option<Row> {
+            engine
+                .rows
+                .iter()
+                .take(before)
+                .rev()
+                .find(|c| {
+                    let span = engine.staged_expression_span(c.range);
+                    engine.trivia_between(span.end(), end)
+                })
+                .or_else(|| {
+                    engine.deferred_miss_rows.iter().rev().find(|c| {
+                        let span = engine.staged_expression_span(c.range);
+                        engine.trivia_between(span.end(), end)
+                    })
+                })
+                .cloned()
+        };
+        // The row index of the shorthand itself within `self.rows` (the
+        // deferred rows fall back to the deferred-window search only).
+        let self_index = self
+            .rows
+            .iter()
+            .position(|c| c.range == row.range)
+            .unwrap_or(self.rows.len());
+        let operand_ty_before = |engine: &Self, end: u32| -> Option<Ty> {
+            operand_row_before(engine, end, self_index)
+                .map(|c| engine.operand_static_ty(&c))
+                .filter(|ty| *ty != Ty::UNKNOWN)
+        };
+        let ty_pair = |engine: &Self, ty: Ty| -> (Option<Ty>, String) {
+            (Some(ty), engine.ty_display(ty))
+        };
+        match prev.kind {
+            // `x == .a` / `x != .a` — the right operand's context is the
+            // LEFT operand's static type
+            // (binary_expression_resolver.dart:112-116).
+            TK::EqEq | TK::BangEq => match operand_ty_before(self, prev.utf16_offset) {
+                Some(ty) => ty_pair(self, ty),
+                // `case == .a` / `case != .a`: the relational pattern's `==`
+                // has no left operand — the context is the scrutinee's
+                // matched type.
+                None => self.scrutinee_ctx_at(prev_idx),
+            },
+            // `case .a:` / `case .a =>` — the constant pattern's expression
+            // resolves against the matched type (the scrutinee's static
+            // type — analyzeConstantPattern's `matchedValueType`,
+            // type_analyzer.dart:522).
+            TK::Keyword(Kw::Case) => self.case_scrutinee_ctx(prev_idx),
+            // `return .a` / `=> .a` — the innermost executable's declared
+            // return face; a deferred row's executable already closed
+            // (`live == false`), so it keeps the context-free answer.
+            TK::Keyword(Kw::Return | Kw::Yield) | TK::Function => {
+                if !live {
+                    (None, "_".to_string())
+                } else {
+                    self.return_ctx()
                 }
-                (None, false) => {
-                    // The property-access arm reports only on a named
-                    // context head (`dotShorthandUndefinedGetter` at the
-                    // selector); every weaker context — none, invalid, a
-                    // non-interface shape — reads `missing_context`
-                    // upstream (suppressed here).
-                    if matches!(context, Some(Ty::Named { .. })) {
-                        self.emit_shorthand_undefined_member(row.range, &context_text);
+            }
+            // `if (.a)` / `while (.a)` conditions arm `bool`.
+            TK::Keyword(Kw::If | Kw::While) => ty_pair(self, Ty::named(self.intern("bool"))),
+            // `for (x in .a)` — the iterable's `in` position.
+            TK::Keyword(Kw::In) => ty_pair(self, Ty::named(self.intern("Iterable"))),
+            // `throw .a` — a thrown value arms no shorthand context.
+            TK::Keyword(Kw::Throw) => (None, "_".to_string()),
+            // `await .a` — the awaited expression's own context.
+            TK::Keyword(Kw::Await) => (None, "_".to_string()),
+            // `(`, `,` — argument-list or collection/record positions.
+            TK::OpenParen | TK::Comma => self.group_ctx_at(row, prev_idx, operand_row_before),
+            // `:` — a conditional branch, a named-argument label's value
+            // (`f(name: .a)`), or a map entry's value.
+            TK::Colon => self.colon_ctx_at(row, prev_idx, operand_row_before),
+            // `=` — a declaration initializer (the group's armed
+            // annotation) or an assignment target (`x = .a` — the target's
+            // declared type).
+            TK::Eq => self.eq_ctx_at(prev_idx, operand_row_before),
+            // `=>` handled above with `return`. `?` — a conditional branch
+            // or a `??` right operand; both arm the enclosing expression's
+            // own context — under-report keeps the under-known face.
+            TK::Question => (None, "_".to_string()),
+            // `{`, `[` — a collection/set literal element. A typed
+            // collection's element type is the context; untyped keeps the
+            // under-report.
+            TK::OpenCurly | TK::OpenSquare => self.collection_ctx_at(row, prev_idx),
+            // `const .a` / `new .a` — a const-context shorthand resolves
+            // against the enclosing declaration's context like the `=`
+            // position; with none armed the read arm stays silent.
+            TK::Keyword(Kw::Const | Kw::New) => self.shorthand_decl_ctx(),
+            _ => (None, "_".to_string()),
+        }
+    }
+
+    /// The declaration-initializer context for a shorthand under `const`/
+    /// `new`: the armed group annotation (the same face
+    /// [`Self::shorthand_context_ty`] answers).
+    fn shorthand_decl_ctx(&self) -> (Option<Ty>, String) {
+        match self.shorthand_context_ty() {
+            Some(ty) => (Some(ty), self.ty_display(ty)),
+            None => (None, "_".to_string()),
+        }
+    }
+
+    /// The scrutinee's matched type for a `case == .a` relational pattern:
+    /// the `case` token before the `==` selects the same scrutinee face a
+    /// `case .a` constant pattern reads.
+    fn scrutinee_ctx_at(&self, op_idx: usize) -> (Option<Ty>, String) {
+        let toks = self.tokens.as_slice();
+        let Some(case_idx) = op_idx.checked_sub(1) else {
+            return (None, "_".to_string());
+        };
+        if toks[case_idx].kind != TokenKind::Keyword(Keyword::Case) {
+            return (None, "_".to_string());
+        }
+        self.case_scrutinee_ctx(case_idx)
+    }
+
+    /// The matched type behind a `case` token: `if (v case .a)` reads `v`'s
+    /// static type (the expression directly before `case`); a switch-case
+    /// head's `case .a:` reads the enclosing `switch (…)`'s scrutinee —
+    /// scanned back over the case group to the `switch` keyword's own
+    /// parenthesized expression.
+    fn case_scrutinee_ctx(&self, case_idx: usize) -> (Option<Ty>, String) {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let Some(before_idx) = case_idx.checked_sub(1) else {
+            return (None, "_".to_string());
+        };
+        // `if (v case .a)` / a nested pattern operand: the expression
+        // directly before `case` is the matched value.
+        let operand_ty = |engine: &Self, end: u32| -> Option<Ty> {
+            engine
+                .rows
+                .iter()
+                .chain(engine.deferred_miss_rows.iter())
+                .rev()
+                .find(|c| {
+                    let span = engine.staged_expression_span(c.range);
+                    engine.trivia_between(span.end(), end)
+                })
+                .map(|c| engine.operand_static_ty(c))
+                .filter(|ty| *ty != Ty::UNKNOWN)
+        };
+        match toks[before_idx].kind {
+            // `{`/`:`/`=>`/`&&`/`||`/`(` or `,` — a switch-case head (or a
+            // nested pattern inside one): the scrutinee is the enclosing
+            // `switch`/`if-case` group's own value. Scan back for the
+            // `switch`/`if` keyword whose `(` encloses the value.
+            TK::OpenCurly | TK::Colon | TK::Function | TK::AmpersandAmpersand
+            | TK::BarBar | TK::OpenParen | TK::Comma => {
+                let mut depth = 0i32;
+                for idx in (0..=before_idx).rev() {
+                    match toks[idx].kind {
+                        TK::CloseCurly | TK::CloseParen | TK::CloseSquare => depth += 1,
+                        TK::OpenCurly | TK::OpenParen | TK::OpenSquare => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        TK::Keyword(Kw::Switch | Kw::If) if depth == 0 => {
+                            // The `(` after `switch`/`if` holds the
+                            // scrutinee expression; its row's static type
+                            // is the matched type. `if (v case …)`'s `v`
+                            // is read below through the before-`case`
+                            // operand — the scan here only owns the
+                            // switch head shape.
+                            let value_end = toks
+                                .get(idx + 1)
+                                .filter(|t| t.kind == TK::OpenParen)
+                                .map(|t| t.utf16_offset);
+                            if let Some(open) = value_end
+                                && let Some(close) =
+                                    self.tokens.matching_end(idx + 1)
+                            {
+                                let end = toks[close].utf16_offset;
+                                let start = open;
+                                if let Some(ty) = self
+                                    .rows
+                                    .iter()
+                                    .chain(self.deferred_miss_rows.iter())
+                                    .filter(|c| {
+                                        c.range.offset > start && c.range.end() <= end
+                                    })
+                                    .last()
+                                    .map(|c| self.operand_static_ty(c))
+                                    .filter(|ty| *ty != Ty::UNKNOWN)
+                                {
+                                    return (Some(ty), self.ty_display(ty));
+                                }
+                            }
+                            return (None, "_".to_string());
+                        }
+                        _ => {}
                     }
+                }
+                (None, "_".to_string())
+            }
+            // `if (v case .a)` — the value is the expression right before
+            // `case`.
+            _ => match operand_ty(self, toks[case_idx].utf16_offset) {
+                Some(ty) => (Some(ty), self.ty_display(ty)),
+                None => (None, "_".to_string()),
+            },
+        }
+    }
+
+    /// The innermost live executable's return context (`return .a`,
+    /// `=> .a`, `yield .a`): the declared return latched on the frame, a
+    /// closure literal's armed context return.
+    fn return_ctx(&self) -> (Option<Ty>, String) {
+        let ty = self.frames.iter().rev().find_map(|frame| match &frame.kind {
+            FrameKind::Executable { ret, ctx_ret, .. } => {
+                ret.as_ref().map(|exec| exec.ty).or(*ctx_ret)
+            }
+            _ => None,
+        });
+        match ty {
+            Some(ty) if ty != Ty::UNKNOWN => {
+                let folded = self.future_or_base(self.fold_alias_ty(ty));
+                (Some(folded), self.ty_display(folded))
+            }
+            _ => (None, "_".to_string()),
+        }
+    }
+
+    /// `(`, `,` context: a call/`new` argument reads the paired parameter's
+    /// type; inside `if (`/`while (`/`for (` it is the condition's own
+    /// face; a parenthesized/grouped or record element keeps the under-
+    /// report unless a schema supplies one.
+    fn group_ctx_at(
+        &self,
+        _row: &Row,
+        prev_idx: usize,
+        operand_row_before: impl Fn(&Self, u32, usize) -> Option<Row>,
+    ) -> (Option<Ty>, String) {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let prev = toks[prev_idx];
+        // Find the argument group's open `(`: for a `,` the scan walks back
+        // past balanced groups counting top-level commas; for `(` the
+        // shorthand is the group's first element.
+        let open_idx = match prev.kind {
+            TK::OpenParen => Some(prev_idx),
+            TK::Comma => {
+                let mut depth = 0i32;
+                let mut found = None;
+                for idx in (0..prev_idx).rev() {
+                    match toks[idx].kind {
+                        TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                        TK::OpenParen => {
+                            if depth == 0 {
+                                found = Some(idx);
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        TK::OpenSquare | TK::OpenCurly => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                found
+            }
+            _ => None,
+        };
+        let Some(open_idx) = open_idx else {
+            return (None, "_".to_string());
+        };
+        // `if (`/`while (`/`for (`/`switch (` — the condition/scrutinee
+        // face, not an argument's.
+        let before_open = open_idx.checked_sub(1);
+        if let Some(kw) = before_open.and_then(|i| toks.get(i)).map(|t| t.kind) {
+            match kw {
+                TK::Keyword(Kw::If | Kw::While) => {
+                    return (Some(Ty::named(self.intern("bool"))), "bool".to_string());
+                }
+                TK::Keyword(Kw::For | Kw::Switch) => return (None, "_".to_string()),
+                TK::Keyword(Kw::Assert) => {
+                    return (Some(Ty::named(self.intern("bool"))), "bool".to_string());
+                }
+                _ => {}
+            }
+        }
+        // The argument position's parameter type: the callee is the row
+        // whose span abuts `(` — count positional arguments between `(` and
+        // the shorthand to index the formals; a named label (`name:` right
+        // before the shorthand) selects the named formal.
+        let callee = operand_row_before(self, toks[open_idx].utf16_offset, self.rows.len());
+        let Some(callee) = callee else {
+            return (None, "_".to_string());
+        };
+        let formals = self.callee_formals_for(&callee);
+        let Some(formals) = formals else {
+            return (None, "_".to_string());
+        };
+        // Positional index: top-level commas between `(` and the
+        // shorthand's `.`.
+        let mut depth = 0i32;
+        let mut positional = 0usize;
+        let dot_offset = toks[prev_idx + 1].utf16_offset;
+        for t in &toks[open_idx + 1..] {
+            if t.utf16_offset >= dot_offset {
+                break;
+            }
+            match t.kind {
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => depth += 1,
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth -= 1,
+                TK::Comma if depth == 0 => positional += 1,
+                _ => {}
+            }
+        }
+        // A named argument's label (`name: .a`): the identifier right
+        // before the shorthand's `.` is the name, the `:` before it is the
+        // label mark.
+        if prev.kind == TK::Identifier
+            && let Some(colon_idx) = prev_idx.checked_sub(1)
+            && toks[colon_idx].kind == TK::Colon
+        {
+            let name = self.intern(&self.source[toks[prev_idx].byte_range()]);
+            if let Some(f) = formals.named_formal(name) {
+                let ty = f.ty;
+                if ty != Ty::UNKNOWN {
+                    return (Some(ty), self.ty_display(ty));
+                }
+            }
+            return (None, "_".to_string());
+        }
+        if let Some(f) = formals.positional.get(positional) {
+            let ty = f.ty;
+            if ty != Ty::UNKNOWN {
+                return (Some(ty), self.ty_display(ty));
+            }
+        }
+        (None, "_".to_string())
+    }
+
+    /// `:` context — a named-argument label's value (`f(name: .a)` — the
+    /// paired named formal), a conditional-expression branch (the
+    /// enclosing context), or a map entry's value (the map's value type).
+    fn colon_ctx_at(
+        &self,
+        _row: &Row,
+        prev_idx: usize,
+        operand_row_before: impl Fn(&Self, u32, usize) -> Option<Row>,
+    ) -> (Option<Ty>, String) {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        // `name: .a` — an identifier directly before the `:` is a named
+        // argument label; the callee's named formal supplies the context.
+        if let Some(name_idx) = prev_idx.checked_sub(1)
+            && toks[name_idx].kind == TK::Identifier
+            && let Some(open) = self.enclosing_group_open(name_idx)
+        {
+            let callee =
+                operand_row_before(self, toks[open].utf16_offset, self.rows.len());
+            if let Some(callee) = callee
+                && let Some(formals) = self.callee_formals_for(&callee)
+            {
+                let name = self.intern(&self.source[toks[name_idx].byte_range()]);
+                if let Some(f) = formals.named_formal(name)
+                    && f.ty != Ty::UNKNOWN
+                {
+                    return (Some(f.ty), self.ty_display(f.ty));
+                }
+            }
+            return (None, "_".to_string());
+        }
+        // `? a : .b` — the conditional's branches resolve against the
+        // enclosing context; the under-report keeps the under-known face.
+        (None, "_".to_string())
+    }
+
+    /// `=` context: `E e = .a` reads the declaration group's armed
+    /// annotation ([`Self::shorthand_context_ty`]); `x = .a` reads the
+    /// assignment target's declared type (the left operand's static type).
+    fn eq_ctx_at(
+        &self,
+        eq_idx: usize,
+        operand_row_before: impl Fn(&Self, u32, usize) -> Option<Row>,
+    ) -> (Option<Ty>, String) {
+        let toks = self.tokens.as_slice();
+        // Inside the open initializer window the declaration's context
+        // owns the shorthand (`E e = .a`).
+        if let Some(mark) = self.init_mark
+            && let Some(row) = operand_row_before(self, toks[eq_idx].utf16_offset, self.rows.len())
+        {
+            // A declarator name row directly before `=` means the
+            // shorthand is the initializer — the armed annotation owns it.
+            let _ = mark;
+            let _ = row;
+        }
+        // `x = .a` / `o.f = .a`: the target's type is the context.
+        if let Some(target) =
+            operand_row_before(self, toks[eq_idx].utf16_offset, self.rows.len())
+        {
+            let ty = self.operand_static_ty(&target);
+            if ty != Ty::UNKNOWN {
+                return (Some(ty), self.ty_display(ty));
+            }
+        }
+        self.shorthand_decl_ctx()
+    }
+
+    /// `{`/`[` element context — a typed collection's element type.
+    fn collection_ctx_at(&self, _row: &Row, _open_idx: usize) -> (Option<Ty>, String) {
+        (None, "_".to_string())
+    }
+
+    /// The innermost open group token index enclosing `idx` (`(` or `[`
+    /// or `{`, depth-0 backward scan).
+    fn enclosing_group_open(&self, idx: usize) -> Option<usize> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let mut depth = 0i32;
+        for i in (0..idx).rev() {
+            match toks[i].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => {
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The callee row's formal table — a bare callee resolves the
+    /// enclosing container's member (an implicit `this.m` call) then the
+    /// top-level declaration; a member row walks its receiver's face.
+    fn callee_formals_for(&self, callee: &Row) -> Option<Formals> {
+        match &callee.shape {
+            RowShape::Member { recv } => self
+                .member_formals_full(recv, callee.name)
+                .map(|f| f.into_owned()),
+            RowShape::Bare(_) => {
+                // An unqualified call inside a container resolves the
+                // member through `this`.
+                let this_recv = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find_map(|f| match &f.kind {
+                        FrameKind::Container { name, kind, .. } => {
+                            Some(Receiver::This {
+                                container: *name,
+                                kind: *kind,
+                            })
+                        }
+                        _ => None,
+                    });
+                if let Some(recv) = this_recv
+                    && let Some(f) = self.member_formals_full(&recv, callee.name)
+                {
+                    return Some(f.into_owned());
+                }
+                self.top_level_decl(callee.name)
+                    .and_then(|d| d.formals.as_deref().cloned())
+            }
+            RowShape::Receiver(recv) => self
+                .member_formals_full(recv, callee.name)
+                .map(|f| f.into_owned()),
+            _ => None,
+        }
+    }
+
+    /// The deferred row's verdict — the shared rule applied to a row that
+    /// already left the live stack (the upgrade writes the deferred slot,
+    /// not `self.rows`).
+    fn verdict_deferred_shorthand(&mut self, index: usize, row: &Row, resolve: Option<Ty>, schema: String) {
+        let invoke = row.intent == Intent::Invoke;
+        let resolved = resolve.and_then(|ctx| {
+            let Ty::Named {
+                name: head,
+                nullable,
+                args,
+            } = ctx
+            else {
+                return None;
+            };
+            self.shorthand_member_ty(head, nullable, args, row.name)
+        });
+        match (resolved, invoke) {
+            (Some(ty), _) => {
+                self.deferred_miss_rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
+                self.deferred_miss_rows[index].ty = ty;
+            }
+            (None, true) => {
+                let text = match resolve {
+                    Some(Ty::Named { name, .. }) => self.strings.resolve(name).to_string(),
+                    _ => schema,
+                };
+                self.emit_shorthand_undefined_member(row.range, &text);
+            }
+            (None, false) => {
+                if let Some(Ty::Named { name, .. }) = resolve {
+                    let text = self.strings.resolve(name).to_string();
+                    self.emit_shorthand_undefined_member(row.range, &text);
                 }
             }
         }
@@ -5882,6 +6482,10 @@ impl<'a> Engine<'a> {
     /// return type already reports its own face — no second row here
     /// (:661-681, the `_isLegalReturnType` shape).
     pub(crate) fn stage_body_completion(&mut self, get_or_set: Option<Token>, end: Token) {
+        // The body's statements are complete at the executable's end
+        // event — verdict the shorthand heads the initializer pass never
+        // reached while the frame's return face is still live (#3568).
+        self.sweep_body_shorthands();
         if get_or_set.and_then(|t| self.text_of(t)) == Some("set") {
             return;
         }
@@ -6004,6 +6608,12 @@ impl<'a> Engine<'a> {
         is_async: bool,
         generator: bool,
     ) {
+        // A local function's frame releases at `pop_frame` without a
+        // `stage_body_completion` call — the shorthand sweep rides the
+        // same close so `case`/argument/`==` heads inside the body
+        // verdict (#3568). The popped frame's own `ret` is already
+        // gone; `return`-positioned heads keep the context-free arm.
+        self.sweep_body_shorthands();
         let Some(brace) = brace else {
             return;
         };

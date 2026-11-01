@@ -11336,7 +11336,7 @@ impl<'a> Engine<'a> {
             if dominated {
                 continue;
             }
-            let display = self.extension_display(face);
+            let display = self.extension_display(face, face_file);
             // An `on` clause naming the face's OWN type parameter
             // (`extension<T> on T`) instantiates that parameter to the
             // receiver, so a nullable receiver is admitted SAFELY when the
@@ -12193,21 +12193,56 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The display pair of one applicable face: the element shape
-    /// (`extension E on C`, the `ExtensionElement` toString — the official
-    /// two-variant argument, `ambiguous_extension_member_access_test.dart:54`)
-    /// and the resolver's inline shape (`extension 'E'` / `unnamed extension
-    /// on 'C'`, `extension_member_resolver.dart:119-124`).
-    pub(crate) fn extension_display(&self, face: &ExtensionFace) -> (String, String) {
+    /// The display pair of one applicable face: the element shape — the
+    /// `ExtensionElement` toString (`extension E1<X extends num> on A<X>`:
+    /// the `extension` keyword, the optional name, the type-parameter group,
+    /// then the full extended type with its arguments and nullability;
+    /// upstream Dart SDK source, pkg/analyzer/lib/src/dart/element/
+    /// display_string_builder.dart:117-125 `writeExtensionElement` with
+    /// `TypeParameterElementImpl.appendTo`'s `name extends bound`) — the
+    /// official two-variant argument, and the resolver's inline shape
+    /// (`extension 'E'` — name only — or `unnamed extension on 'C'` with
+    /// the full extended type, upstream Dart SDK source, pkg/analyzer/
+    /// lib/src/dart/resolver/extension_member_resolver.dart:119-124).
+    /// The face's `on_ty` (not the bare-head `on_type` spelling) renders
+    /// the `on` clause — the oracle displays the declared type verbatim,
+    /// arguments and `?` included, its own type-parameter leaves spelled.
+    pub(crate) fn extension_display(&self, face: &ExtensionFace, face_file: FileId) -> (String, String) {
+        let on_ty = self.boundary.ty(face_file, face.on_ty);
+        let bounds: Vec<Ty> = face
+            .type_param_bounds
+            .iter()
+            .map(|&bound| self.boundary.ty(face_file, bound))
+            .collect();
+        let pool = self.boundary.pool();
+        let on_type = on_ty.render(&self.strings, &pool);
         let name = face.name.map(|n| self.strings.resolve(n).to_string());
-        let on_type = self
-            .strings
-            .resolve(face.on_type.expect("an applicable face has an on type"))
-            .to_string();
-        let element = match &name {
-            Some(name) => format!("extension {name} on {on_type}"),
-            None => format!("extension on {on_type}"),
+        let params: Vec<String> = face
+            .type_param_names
+            .iter()
+            .zip(bounds)
+            .map(|(&param, bound)| {
+                let mut text = self.strings.resolve(param).to_string();
+                // `Ty::Dynamic` is the absent-bound marker — an unbounded
+                // parameter writes its name alone.
+                if !matches!(bound, Ty::Dynamic) {
+                    text.push_str(" extends ");
+                    text.push_str(&bound.render(&self.strings, &pool));
+                }
+                text
+            })
+            .collect();
+        let mut element = match &name {
+            Some(name) => format!("extension {name}"),
+            None => "extension".to_string(),
         };
+        if !params.is_empty() {
+            element.push('<');
+            element.push_str(&params.join(", "));
+            element.push('>');
+        }
+        element.push_str(" on ");
+        element.push_str(&on_type);
         let inline = match name {
             Some(name) => format!("extension '{name}'"),
             None => format!("unnamed extension on '{on_type}'"),

@@ -7350,6 +7350,12 @@ impl<'a> Engine<'a> {
             return;
         }
         let rows = self.bounds.check_creation_inference(self.strings, head);
+        // The `couldNotInfer` row anchors the whole constructor-name
+        // chain (`B.named()` spans 7, the unnamed `B()` form keeps the
+        // bare head) — the oracle writes at the creation node's
+        // ConstructorName. The twin below keeps the head anchor (the
+        // `_typeArgumentErrorNode` NamedType face).
+        let chain = self.written_name_chain_span(range).unwrap_or(range);
         for row in &rows {
             let detail = format!(
                 "\n\nTried to infer '{}' for '{}' which doesn't work:\n  \
@@ -7358,7 +7364,7 @@ impl<'a> Engine<'a> {
                 row.seed, row.parameter, row.parameter, row.raw_bound, row.bound
             );
             let message = SemanticCode::CouldNotInfer.message(&row.parameter, &detail);
-            self.emit_message_with_correction(SemanticCode::CouldNotInfer, range, message);
+            self.emit_message_with_correction(SemanticCode::CouldNotInfer, chain, message);
         }
         if !emit_twin {
             return;
@@ -7372,6 +7378,59 @@ impl<'a> Engine<'a> {
                 &row.bound,
             );
         }
+    }
+
+    /// The written extent of a constructor-name chain: the anchor grown
+    /// through a `.selector` continuation (`B.named()` spans 7, the bare
+    /// `B` head alone spans the unnamed form) — the whole ConstructorName
+    /// the oracle's `couldNotInfer` report anchors. `None` when no
+    /// `.ident` follows the anchor.
+    pub(crate) fn written_name_chain_span(&self, anchor: SourceRange) -> Option<SourceRange> {
+        let mut at = self.skip_whitespace(anchor.end());
+        if self.byte_at(at) != Some(b'.') {
+            return None;
+        }
+        at = self.skip_whitespace(at + 1);
+        let mut end = at;
+        while self
+            .byte_at(end)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        {
+            end += 1;
+        }
+        if end == at {
+            return None;
+        }
+        Some(SourceRange {
+            offset: anchor.offset,
+            length: end - anchor.offset,
+        })
+    }
+
+    /// The written extent of a function-type-literal type argument: the
+    /// captured `Function` keyword head grown through its formals group
+    /// (`Function()` spans 10, not the 8-char head) — the whole written
+    /// TypeAnnotation the oracle's `_typeArgumentErrorNode` anchors. A
+    /// nullable literal already spans past its suffix through the
+    /// capture's question face, and a bare `Function` class argument is
+    /// always followed by the group's `,`/`>` (a generic invocation's
+    /// argument list only opens past the `>`), so both keep their
+    /// captured face. `None` for every span the shape does not fit.
+    pub(crate) fn written_function_literal_span(&self, span: SourceRange) -> Option<SourceRange> {
+        if span.length != 8 {
+            return None;
+        }
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < span.end());
+        let open = tokens.get(at)?;
+        if open.utf16_offset != span.end() || open.kind != dartq_scanner::TokenKind::OpenParen {
+            return None;
+        }
+        let close = tokens.get(self.tokens.matching_end(at)?)?;
+        Some(SourceRange {
+            offset: span.offset,
+            length: close.utf16_offset + 1 - span.offset,
+        })
     }
 
     /// The invocation-site type-argument bounds face (#2869,
@@ -7431,9 +7490,16 @@ impl<'a> Engine<'a> {
                 .and_then(|written| self.subst_params(written, &map))
                 .unwrap_or(judged);
             let bound_text = self.ty_display(shown);
+            // The anchor is the written argument's own extent: a bare
+            // `Function` head grows through its formals group — the whole
+            // TypeAnnotation `_typeArgumentErrorNode` anchors (#3571);
+            // every other captured face already spans whole.
+            let span = self
+                .written_function_literal_span(args.spans[index])
+                .unwrap_or(args.spans[index]);
             self.emit3(
                 SemanticCode::TypeArgumentNotMatchingBounds,
-                args.spans[index],
+                span,
                 &argument,
                 &parameter,
                 &bound_text,

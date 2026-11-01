@@ -5906,9 +5906,12 @@ impl<'a> Engine<'a> {
         // `_validateSwitchExhaustiveness` only under `Feature.patterns`, and
         // a switch expression cannot exist before 3.0), so no reachability,
         // no covering gap, no dead member bodies — and nothing retained for
-        // the teardown re-decision.
+        // the teardown re-decision. The pre-patterns verifier's own rows
+        // (primitive equality, the type-mismatch gate, the enum-constant
+        // coverage walk) run off the same closed context
+        // ([`Self::report_legacy_switch`]).
         if !self.patterns_enabled {
-            self.switch.switches.pop_discard();
+            self.report_legacy_switch();
             return;
         }
         let Some(ctx) = self.switch.switches.pop() else {

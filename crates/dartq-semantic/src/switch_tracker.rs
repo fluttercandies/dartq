@@ -51,6 +51,9 @@ impl SwitchStack {
                 pending_root: None,
                 if_case_member_scrutinee: None,
                 has_invalid_type: ctx.has_invalid_type,
+                // The retained copy serves the teardown's patterns-era
+                // re-verdict; legacy facts die with the open context.
+                legacy_cases: Vec::new(),
             });
         }
         ctx
@@ -190,6 +193,7 @@ impl SwitchTracker {
             pending_root: None,
             if_case_member_scrutinee: member_scrutinee,
             has_invalid_type: false,
+            legacy_cases: Vec::new(),
         });
         self.case_sink_open = true;
         self.if_case_window = true;
@@ -254,6 +258,7 @@ impl SwitchTracker {
             pending_root: None,
             if_case_member_scrutinee: None,
             has_invalid_type: false,
+            legacy_cases: Vec::new(),
         });
     }
 
@@ -712,6 +717,35 @@ pub(crate) enum NameTy {
     Unknown(u64),
 }
 
+/// One legacy-era (`< 3.0`, patterns disabled) statement-case head's
+/// evaluated head expression: the expression span and its const verdict —
+/// the input the pre-patterns verifier's three per-head rows read
+/// (`_validateSwitchStatement_nullSafety`'s primitive-equality gate, the
+/// shared analyzer's type-mismatch gate, and the enum-constant coverage
+/// walk — upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/constant/constant_verifier.dart:1145-1182 and
+/// pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart,
+/// `analyzeConstantPattern`'s `caseExpressionTypeMismatch` arm). `None`
+/// verdicts — a non-constant head already reported at its own span — carry
+/// no entry.
+pub(crate) struct LegacyCase {
+    /// The head expression's span (the per-head rows' anchor — upstream
+    /// anchors `at(expression)`, the whole expression node).
+    pub(crate) span: SourceRange,
+    /// The evaluated head constant. `None` when the verdict was the
+    /// opaque `Verdict::Constant` (a constant the subset does not fold):
+    /// the enum coverage walk and the value-typed checks cannot read it,
+    /// matching upstream's `expressionValue is! DartObjectImpl` skip.
+    pub(crate) value: Option<crate::const_eval::ConstantValue>,
+    /// The head referenced a deferred-import prefix: the identifier's own
+    /// span (upstream's `errorTarget` — `evaluation.dart`'s
+    /// `_getDeferredLibraryError` anchors the prefix). The
+    /// `non_constant_case_expression_from_deferred_library` row already
+    /// emitted at the head's close; the field marks the case so the
+    /// switch-close pass runs no further checks on it.
+    pub(crate) deferred: Option<SourceRange>,
+}
+
 /// One completed case: its coverage restriction, the guard flag, the
 /// token the diagnostics anchor to (`case` for statement cases, `=>` for
 /// expression cases), and — statement cases, last head of a member — the
@@ -764,6 +798,13 @@ pub(crate) struct SwitchCtx {
     /// (constant_verifier.dart:1070, set by `createStaticType`) skips the
     /// whole reachability/covering pass.
     pub(crate) has_invalid_type: bool,
+    /// The legacy-era head facts: one entry per completed statement-case
+    /// head while `patterns_enabled` is off ([`LegacyCase`]). Separate
+    /// from `cases` because a head's evaluated constant is not name-level
+    /// coverage — the space model would have no leaf for it. Empty under
+    /// patterns (the constant window never opens) and popped unread with
+    /// the context either way.
+    pub(crate) legacy_cases: Vec<LegacyCase>,
 }
 
 /// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
