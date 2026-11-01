@@ -1915,6 +1915,26 @@ impl<'a> Engine<'a> {
                     &name_text,
                 );
             }
+            // The one annotation upstream honours on the element/member
+            // faces is `@pragma('vm:entry-point')`
+            // (`_hasPragmaVmEntryPoint`, unused_local_elements_verifier.dart
+            // :1179-1181, read by `_isUsedElement` :971 and `_isUsedMember`
+            // :981); `@JS` spares the CLASS element alone
+            // (`visitClassDeclaration` :82-93 → `ElementMetadata.hasJS`,
+            // element.dart:8572-8581). Every other annotation spares
+            // nothing: the annotated-private corpus reports for
+            // `@visibleForTesting`, the `@Deprecated.*` family and
+            // `@Preview` alike, so a blanket "any annotation spares" gate
+            // under-reports the whole `invalid_visibility_annotation` /
+            // `invalid_deprecated_*` families. Both gates stay
+            // spelling-level — the declaration site keeps the annotation
+            // names, not their argument text — so a `@pragma('…')` of any
+            // argument spares (the safe under-report direction).
+            let pragma_spared = site.annotated
+                && site
+                    .annotations
+                    .iter()
+                    .any(|name| self.annotation_named(*name, "pragma"));
             match site.kind {
                 DeclKind::TopLevelFn | DeclKind::TopLevelVar | DeclKind::TypeAlias => {
                     // A nameless recovery site never claims the slot
@@ -1932,7 +1952,7 @@ impl<'a> Engine<'a> {
                     // name), and a written setter reads its own write
                     // credit set — the accessor is the credited element.
                     let is_setter_site = bare != site.name;
-                    if !site.annotated
+                    if !pragma_spared
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
                         && (shadowed || !top_level_used.contains(&bare))
                         && !(is_setter_site && top_level_setter_writes.contains(&bare))
@@ -2002,7 +2022,23 @@ impl<'a> Engine<'a> {
                                     + usize::from(c.has_unnamed_constructor)
                                     > 0
                             });
-                    if !site.annotated
+                    // The `@JS` metadata gate spares the CLASS element
+                    // (`visitClassDeclaration` adds it to
+                    // `usedElements.elements`, unused_local_elements_verifier
+                    // .dart:82-93 → `ElementMetadata.hasJS`,
+                    // element.dart:8572-8581; the `package:js` and
+                    // `dart:js_interop` `JS` constructors). An enum, mixin or
+                    // extension type carries no such gate upstream.
+                    let js_spared = site.annotated
+                        && site
+                            .annotations
+                            .iter()
+                            .any(|name| self.annotation_named(*name, "JS"))
+                        && self
+                            .container_kind_of(site.name)
+                            .is_some_and(|kind| kind == ContainerKind::Class);
+                    if !js_spared
+                        && !pragma_spared
                         && self.is_private_name(site.name)
                         && !element_used.contains(&bare)
                         && !enum_declares_ctor
@@ -2024,16 +2060,22 @@ impl<'a> Engine<'a> {
                     // handles joined against this container's supertype
                     // closure (`Sub`'s read of an inherited `_f` counts;
                     // a sibling class's same-spelled field does not).
-                    let eligible = !site.annotated
-                        && (self.is_private_name(site.name)
-                            // A nameless recovery field maps a null name to
-                            // PRIVATE upstream (`ElementImpl.isPrivate`'s
-                            // `name == null → true`, element.dart:2179) —
-                            // the same gate the top-level arm applies, so
-                            // the `<unnamed>` member reports like a private
-                            // field rather than reading public.
-                            || self.is_nameless(site.name)
-                            || (self.is_private_name(container) && is_static));
+                    // No annotation spares a field: `_visitFieldElement`
+                    // routes through `_isReadMember`
+                    // (unused_local_elements_verifier.dart:1030-1055), which
+                    // consults the read sets alone — neither the `@JS` gate
+                    // nor `_hasPragmaVmEntryPoint` is reachable from it
+                    // (probed: a `@pragma('vm:entry-point')` field still
+                    // reports).
+                    let eligible = self.is_private_name(site.name)
+                        // A nameless recovery field maps a null name to
+                        // PRIVATE upstream (`ElementImpl.isPrivate`'s
+                        // `name == null → true`, element.dart:2179) — the
+                        // same gate the top-level arm applies, so the
+                        // `<unnamed>` member reports like a private field
+                        // rather than reading public.
+                        || self.is_nameless(site.name)
+                        || (self.is_private_name(container) && is_static);
                     if !eligible {
                         continue;
                     }
@@ -2197,7 +2239,7 @@ impl<'a> Engine<'a> {
                                 && self.pattern_field_read_of(container, bare)),
                     };
                     let spared = unnamed_face_owns
-                        || site.annotated
+                        || pragma_spared
                         || (!self.is_nameless(site.name)
                             && self.is_publicly_accessible(site.name, site.kind, false))
                         || member_used
@@ -2251,7 +2293,7 @@ impl<'a> Engine<'a> {
                         let ctor_used = member_used_elements
                             .contains(&(self.file, container, site.name));
                         let spared = !multi
-                            || site.annotated
+                            || pragma_spared
                             || (!self.is_nameless(site.name)
                                 && self.is_publicly_accessible(
                                     site.name,
@@ -2444,17 +2486,25 @@ impl<'a> Engine<'a> {
                         entry.name_range,
                         entry.kind,
                         entry.is_static,
-                        !entry.annotations.is_empty(),
+                        // The `_isUsedMember` pragma gate alone
+                        // (`_hasPragmaVmEntryPoint`,
+                        // unused_local_elements_verifier.dart:1180-1181):
+                        // every other annotation on an extension member
+                        // spares nothing.
+                        entry
+                            .annotations
+                            .iter()
+                            .any(|annotation| self.annotation_named(annotation.name, "pragma")),
                     ));
                 }
             }
         }
-        for (face_index, spelling, range, kind, is_static, annotated) in extension_members {
+        for (face_index, spelling, range, kind, is_static, pragma_spared) in extension_members {
             if range == MemberEntry::MISSING_NAME_RANGE || face_index == u32::MAX {
                 continue;
             }
             let bare = self.bare_name(spelling);
-            let spared = annotated
+            let spared = pragma_spared
                 || self
                     .extension_member_used
                     .contains(&(self.file, face_index, spelling))
@@ -5423,6 +5473,16 @@ impl<'a> Engine<'a> {
         self.pending_annotations
             .iter()
             .any(|a| self.strings.resolve(a.name) == spelling)
+    }
+
+    /// Whether the annotation's own name is `spelling`, compared on its last
+    /// dotted segment — `@JS`, `@js.JS` and `@meta.JS` alike (the unused
+    /// verifier's two metadata gates, `ElementMetadata.hasJS` /
+    /// `hasPragmaVmEntryPoint`, element.dart:8572-8581 and :8662-8671,
+    /// resolve the annotation's constructor; the declaration site keeps the
+    /// written spelling, so the segment is the observable proxy).
+    fn annotation_named(&self, name: StringId, spelling: &str) -> bool {
+        self.strings.resolve(name).rsplit('.').next() == Some(spelling)
     }
 
     // —— the discarded-value machine (`use_result_verifier.dart`) ————————
