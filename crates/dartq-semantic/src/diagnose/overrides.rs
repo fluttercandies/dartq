@@ -2057,26 +2057,54 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether any direct super-face carries a same-named non-static member
-    /// (the oracle's transitive `getOverridden`, via [`Engine::face_member`]'s
-    /// per-face climb). An unresolvable face simply contributes nothing —
-    /// except an unindexed dart:core interface, whose declared members the
-    /// frozen [`CORE_INTERFACE_MEMBERS`] face answers (a user-declared
-    /// same-named container resolves indexed and wins the face first).
-    /// `container` is the declaring container whose clauses wrote the faces
-    /// (the prefixed-clause probe's writer key).
+    /// (the oracle's transitive `getOverridden` — upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/override_verifier.dart:135`
+    /// `currentClass.element.getOverridden(name)`, which reads the element's
+    /// interface map, so the implicit supertype is part of the face set —
+    /// via [`Engine::face_member`]'s per-face climb). An unresolvable face
+    /// simply contributes nothing — except an unindexed dart:core interface,
+    /// whose declared members the frozen [`CORE_INTERFACE_MEMBERS`] face
+    /// answers (a user-declared same-named container resolves indexed and
+    /// wins the face first). `container` is the declaring container whose
+    /// clauses wrote the faces (the prefixed-clause probe's writer key).
+    ///
+    /// The implicit supertype joins the face set exactly as
+    /// [`Self::check_override`] seeds it: `element.supertype` is never null
+    /// for a class (`Object`), an enum's is `Enum` (its `index`/`toString`
+    /// face answers the `@override` presence check — `enum E { @override
+    /// int get index }` is a real override), and an `on`-less mixin
+    /// constrains `Object`. Their members resolve through
+    /// [`Engine::frozen_top_member`]'s frozen signatures when the element
+    /// index carries no `Object`/`Enum` container.
     pub(crate) fn face_member_any(
         &self,
         decl: &Container,
         container: StringId,
         spelling: StringId,
     ) -> bool {
-        let mut faces = Vec::new();
-        faces.extend(decl.superclass);
+        let mut faces = Vec::with_capacity(
+            usize::from(decl.superclass.is_some())
+                + decl.with_clause.len()
+                + decl.implements_clause.len()
+                + decl.on_clause.len(),
+        );
+        match decl.superclass {
+            Some(superclass) => faces.push(superclass),
+            None => match decl.kind {
+                ContainerKind::Class => faces.push(self.intern("Object")),
+                ContainerKind::Enum => faces.push(self.intern("Enum")),
+                ContainerKind::Mixin if decl.on_clause.is_empty() => {
+                    faces.push(self.intern("Object"))
+                }
+                _ => {}
+            },
+        }
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
         faces.into_iter().any(|face| {
             self.face_member(container, face, spelling).is_some()
+                || self.frozen_top_member(face, spelling).is_some()
                 || self.face_member_frozen(container, face, spelling)
         })
     }

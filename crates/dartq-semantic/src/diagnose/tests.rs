@@ -19919,3 +19919,17 @@ mod ticket_3418_tests;
 #[cfg(test)]
 #[path = "ticket_3417_tests.rs"]
 mod ticket_3417_tests;
+
+// The #3259 pins (the `@override` presence face's implicit supertype):
+// `face_member_any` now seeds `Object` for a superclass-less class or an
+// `on`-less mixin and `Enum` for an enum — the faces `element.supertype`
+// always carries and the oracle's `getOverridden` interface map always
+// walks (upstream `override_verifier.dart:135`). An enum's `@override int
+// get index` overrides `Enum.index` and stays silent; a member whose name
+// no face carries still reports. Registered here via `#[path]`; the module
+// stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+
+#[cfg(test)]
+#[path = "ticket_3259_tests.rs"]
+mod ticket_3259_tests;
