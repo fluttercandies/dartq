@@ -4954,6 +4954,7 @@ impl<'a> Engine<'a> {
                         2 => MemberKind::Getter,
                         _ => MemberKind::Method,
                     },
+                    is_augment: false,
                     is_static: false,
                     is_abstract: *r#abstract,
                     is_external: false,
@@ -4991,6 +4992,7 @@ impl<'a> Engine<'a> {
                         2 => MemberKind::Getter,
                         _ => MemberKind::Method,
                     },
+                    is_augment: false,
                     is_static: false,
                     is_abstract: *r#abstract,
                     is_external: false,
@@ -6447,6 +6449,7 @@ impl<'a> Engine<'a> {
         };
         let entry = |kind, ret: &str, params: &[&str]| MemberEntry {
             kind,
+            is_augment: false,
             is_static: false,
             is_abstract: false,
             is_external: false,
