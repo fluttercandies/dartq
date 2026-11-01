@@ -4349,6 +4349,15 @@ impl<'a> Engine<'a> {
                         .type_param_bounds
                         .iter()
                         .any(|bound| self.has_prefix_sentinel(*bound));
+                if std::env::var_os("DQ3567_TRACE").is_some() {
+                    eprintln!(
+                        "[3567] member broken={} captured-return={} formals-pos={} formals-named={}",
+                        broken,
+                        self.render_ty(entry.return_ty),
+                        formals.positional.len(),
+                        formals.named.len()
+                    );
+                }
                 if broken
                     && entry.name_range != MemberEntry::MISSING_NAME_RANGE
                     && let Some((type_params, return_ty, positional, required, named)) =
@@ -4376,7 +4385,11 @@ impl<'a> Engine<'a> {
                             false,
                         )
                     };
-                    return Some(self.boundary.canonical_dotted_ty(ty));
+                    let ty = self.boundary.canonical_dotted_ty(ty);
+                    if std::env::var_os("DQ3567_TRACE").is_some() {
+                        eprintln!("[3567] member rebuild ok: {}", self.render_ty(ty));
+                    }
+                    return Some(ty);
                 }
                 let named: Vec<(StringId, Ty)> = formals
                     .named
@@ -7119,7 +7132,18 @@ impl<'a> Engine<'a> {
                 if let Some((recovered, _)) =
                     self.parse_fn_literal_at(&span_text[keyword_end + skip..], &FxHashMap::default())
                 {
+                    if std::env::var_os("DQ3567_TRACE").is_some() {
+                        eprintln!(
+                            "[3567] literal re-parse fired: {}",
+                            self.render_ty(recovered)
+                        );
+                    }
                     checked = self.canonical_function_ty(recovered);
+                } else if std::env::var_os("DQ3567_TRACE").is_some() {
+                    eprintln!(
+                        "[3567] literal re-parse DECLINED span={:?} tail={:?}",
+                        span_text, trimmed
+                    );
                 }
             }
         }
@@ -7207,6 +7231,13 @@ impl<'a> Engine<'a> {
             .unwrap_or(operand_ty);
         let operand_ty =
             self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
+        if std::env::var_os("DQ3567_TRACE").is_some() {
+            eprintln!(
+                "[3567] verdict operand={} checked={}",
+                self.render_ty(operand_ty),
+                self.render_ty(checked)
+            );
+        }
         if operand_ty == Ty::Unknown
             || matches!(operand_ty, Ty::Named { name, .. } if !self.strings.resolve(name).contains('.') && matches!(self.resolve_bare(name).1, RefTarget::Prefix))
             || self.is_invalid_ty(operand_ty)

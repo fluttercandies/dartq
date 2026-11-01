@@ -162,3 +162,4 @@ fn bare_statement_eq_operand_miss_reports() {
         rows(&r)
     );
 }
+

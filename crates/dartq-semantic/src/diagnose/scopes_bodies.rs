@@ -1546,10 +1546,16 @@ impl<'a> Engine<'a> {
             }
         }
         // The argument position's parameter type: the callee is the row
-        // whose span abuts `(` — count positional arguments between `(` and
-        // the shorthand to index the formals; a named label (`name:` right
-        // before the shorthand) selects the named formal.
-        let callee = operand_row_before(self, toks[open_idx].utf16_offset, self.rows.len());
+        // whose NAME abuts `(` — the staged span widens through the call
+        // itself, so the raw range end answers here (`f(.a)`'s `f` ends
+        // at `(`; `staged_expression_span` would swallow `f(.a)` whole).
+        let callee = self
+            .rows
+            .iter()
+            .chain(self.deferred_miss_rows.iter())
+            .rev()
+            .find(|c| self.trivia_between(c.range.end(), toks[open_idx].utf16_offset))
+            .cloned();
         let Some(callee) = callee else {
             return (None, "_".to_string());
         };
@@ -1615,8 +1621,13 @@ impl<'a> Engine<'a> {
             && toks[name_idx].kind == TK::Identifier
             && let Some(open) = self.enclosing_group_open(name_idx)
         {
-            let callee =
-                operand_row_before(self, toks[open].utf16_offset, self.rows.len());
+            let callee = self
+                .rows
+                .iter()
+                .chain(self.deferred_miss_rows.iter())
+                .rev()
+                .find(|c| self.trivia_between(c.range.end(), toks[open].utf16_offset))
+                .cloned();
             if let Some(callee) = callee
                 && let Some(formals) = self.callee_formals_for(&callee)
             {
