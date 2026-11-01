@@ -230,12 +230,72 @@ pub enum SemanticCode {
     /// `enumInstantiatedToBoundsIsNotWellBounded`, diagnostic.g.dart
     /// :4910-4919).
     EnumInstantiatedToBoundsIsNotWellBounded,
+    /// `Typedefs can't reference themselves directly or recursively via
+    /// another typedef.` — a type alias whose right-hand side mentions the
+    /// alias itself, directly, through a co-alias, or through a
+    /// class/mixin type-parameter bound (`TypeAliasSelfReferenceFinder`,
+    /// upstream Dart SDK source, `pkg/analyzer/lib/src/summary2/
+    /// type_alias.dart:10-133`; the row anchors at the declaration's name
+    /// token, `_checkForTypeAliasCannotReferenceItself`,
+    /// error_verifier.dart:7116-7127; the template is
+    /// `typeAliasCannotReferenceItself`, diagnostic.g.dart:16041-16051).
+    TypeAliasCannotReferenceItself,
     /// `The enum must have at least one enum constant.` — a non-augmentation
     /// enum declaration whose element list is empty
     /// (`enumWithoutConstants`, diagnostic.g.dart:4966-4974; the emit site
     /// is `error_verifier.dart`'s enum-declaration check, which reports at
     /// `node.namePart.typeName` when `!isAugmentation && constants.isEmpty`).
     EnumWithoutConstants,
+    /// `'{0}' must have a method body because '{1}' is an enum.` — an enum
+    /// declaring a bodyless member whose name has no concrete
+    /// implementation anywhere on its interface (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/inheritance_override.dart:912-946
+    /// `_reportConcreteClassWithAbstractMember`'s enum arm; the row anchors
+    /// at the whole member declaration, `.at(member)`).
+    EnumWithAbstractMember,
+    /// `A concrete instance member named '{0}' can't be declared in a class
+    /// that implements 'Enum'.` / `... can't be inherited from '{1}' in a
+    /// class that implements 'Enum'.` — one registry code
+    /// (`illegal_concrete_enum_member`), two upstream unique names
+    /// (`_checkIllegalConcreteEnumMemberDeclaration` /
+    /// `_checkIllegalConcreteEnumMemberInheritance`,
+    /// inheritance_override.dart:785-826). The declaration arm anchors at
+    /// the member name token; the inheritance arm at the class name token
+    /// with the declaring class as `{1}` (the empty `a1` selects the
+    /// declaration text).
+    IllegalConcreteEnumMember,
+    /// `An instance member named 'values' can't be declared in a class that
+    /// implements 'Enum'.` / `... can't be inherited from '{0}' in a class
+    /// that implements 'Enum'.` — one registry code
+    /// (`illegal_enum_values`), two upstream unique names
+    /// (`_checkIllegalEnumValuesDeclaration` /
+    /// `_checkIllegalEnumValuesInheritance`,
+    /// inheritance_override.dart:842-866). The declaration arm anchors at the
+    /// member name token; the inheritance arm at the class name token with
+    /// the declaring class as `{0}` (the empty `a0` selects the declaration
+    /// text).
+    IllegalEnumValues,
+    /// `A member named 'values' can't be declared in an enum.` — an enum
+    /// declaration carrying any member called `values` (the
+    /// `_checkValuesDeclarationInEnum` face of
+    /// member_duplicate_definition_verifier.dart:585-589), anchored at the
+    /// member name token.
+    ValuesDeclarationInEnum,
+    /// `The class doesn't have a concrete implementation of the super-invoked
+    /// member '{0}'.` (the setter shape carries the sibling text `... the
+    /// super-invoked setter '{0}'.`) — a mixin application whose superclass
+    /// face lacks a concrete implementation of a member the mixin invokes
+    /// through `super` (error_verifier.dart:6128-6175
+    /// `_checkForMixinSuperInvokedMembers`). Anchored at the `with` clause's
+    /// mixin type. The `a1` slot carries the `setter` marker for the setter
+    /// text (the `UndefinedEnumConstructor` sentinel idiom).
+    MixinApplicationNoConcreteSuperInvokedMember,
+    /// `'{0}' can't be mixed onto '{1}' because '{1}' doesn't implement
+    /// '{2}'.` — the applying class's supertype fails one of the mixin's
+    /// `on` constraints and no earlier mixin satisfies it
+    /// (error_verifier.dart:6076-6116 `_checkForMixinSuperclassConstraints`),
+    /// anchored at the `with` clause's mixin name token.
+    MixinApplicationNotImplementedInterface,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
     /// `'{0}' can't be used as a setter because it's final.` — the write's
@@ -418,6 +478,23 @@ pub enum SemanticCode {
     /// `_invalidConstantForMethodInvocation` site,
     /// `evaluation.dart:2197-2212`).
     ConstEvalMethodInvocation,
+    /// `Constant expressions don't support 'for' elements.` — a `for`
+    /// element inside a const collection literal (`evaluation.dart`
+    /// `_buildListConstant`'s `case ForElement() => InvalidConstant
+    /// .forEntity(entity: element, locatableDiagnostic:
+    /// diag.constEvalForElement)`; the registry row is
+    /// `constEvalForElement`). The row anchors at the whole `for` element.
+    ConstEvalForElement,
+    /// `A dot shorthand can't be used where there is no context type.` — a
+    /// leading-dot name expression whose enclosing declaration writes no
+    /// context type (`dotShorthandMissingContext`; the row anchors at the
+    /// whole `.name` shorthand).
+    DotShorthandMissingContext,
+    /// `The static getter '{0}' isn't defined for the context type '{1}'.`
+    /// — a dot-shorthand member the context type cannot answer (the getter
+    /// and invocation faces share this code —
+    /// `dotShorthandUndefinedGetter` / `dotShorthandUndefinedInvocation`).
+    DotShorthandUndefinedMember,
     /// `The compile-time constant expression depends on itself.`
     RecursiveCompileTimeConstant,
     /// `Invalid constant value.` — a node in a constructor-initializer
@@ -2025,7 +2102,32 @@ impl SemanticCode {
                 "enum_instantiated_to_bounds_is_not_well_bounded",
                 "ENUM_INSTANTIATED_TO_BOUNDS_IS_NOT_WELL_BOUNDED",
             ),
+            Self::TypeAliasCannotReferenceItself => (
+                "type_alias_cannot_reference_itself",
+                "TYPE_ALIAS_CANNOT_REFERENCE_ITSELF",
+            ),
             Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
+            Self::EnumWithAbstractMember => (
+                "enum_with_abstract_member",
+                "ENUM_WITH_ABSTRACT_MEMBER",
+            ),
+            Self::IllegalConcreteEnumMember => (
+                "illegal_concrete_enum_member",
+                "ILLEGAL_CONCRETE_ENUM_MEMBER",
+            ),
+            Self::IllegalEnumValues => ("illegal_enum_values", "ILLEGAL_ENUM_VALUES"),
+            Self::ValuesDeclarationInEnum => (
+                "values_declaration_in_enum",
+                "VALUES_DECLARATION_IN_ENUM",
+            ),
+            Self::MixinApplicationNoConcreteSuperInvokedMember => (
+                "mixin_application_no_concrete_super_invoked_member",
+                "MIXIN_APPLICATION_NO_CONCRETE_SUPER_INVOKED_MEMBER",
+            ),
+            Self::MixinApplicationNotImplementedInterface => (
+                "mixin_application_not_implemented_interface",
+                "MIXIN_APPLICATION_NOT_IMPLEMENTED_INTERFACE",
+            ),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
             Self::AssignmentToFinal => ("assignment_to_final", "ASSIGNMENT_TO_FINAL"),
             Self::AssignmentToFinalLocal => (
@@ -2134,6 +2236,15 @@ impl SemanticCode {
             Self::ConstEvalMethodInvocation => (
                 "const_eval_method_invocation",
                 "CONST_EVAL_METHOD_INVOCATION",
+            ),
+            Self::ConstEvalForElement => ("const_eval_for_element", "CONST_EVAL_FOR_ELEMENT"),
+            Self::DotShorthandMissingContext => (
+                "dot_shorthand_missing_context",
+                "DOT_SHORTHAND_MISSING_CONTEXT",
+            ),
+            Self::DotShorthandUndefinedMember => (
+                "dot_shorthand_undefined_member",
+                "DOT_SHORTHAND_UNDEFINED_MEMBER",
             ),
             Self::RecursiveCompileTimeConstant => (
                 "recursive_compile_time_constant",
@@ -3180,6 +3291,12 @@ impl SemanticCode {
             Self::EnumInstantiatedToBoundsIsNotWellBounded => {
                 "The result of instantiating the enum to bounds is not well-bounded.".to_string()
             }
+            // The alias self-reference row carries no arguments either
+            // (diagnostic.g.dart:16044-16046).
+            Self::TypeAliasCannotReferenceItself => {
+                "Typedefs can't reference themselves directly or recursively via another typedef."
+                    .to_string()
+            }
             // The #314 residue family: the one-argument rows and the four
             // no-argument member faces, verbatim
             // (diagnostic.g.dart:12061/:13806-13855).
@@ -3381,6 +3498,40 @@ impl SemanticCode {
             Self::EnumWithoutConstants => {
                 "The enum must have at least one enum constant.".to_string()
             }
+            // The #3373 enum member-set faces. The declaration and
+            // inheritance arms share one registry code: the inheritance
+            // arm's non-empty class slot selects its text.
+            Self::EnumWithAbstractMember => format!(
+                "'{a0}' must have a method body because '{a1}' is an enum."
+            ),
+            Self::IllegalConcreteEnumMember if a1.is_empty() => format!(
+                "A concrete instance member named '{a0}' can't be declared in a class that implements 'Enum'."
+            ),
+            Self::IllegalConcreteEnumMember => format!(
+                "A concrete instance member named '{a0}' can't be inherited from '{a1}' in a class that implements 'Enum'."
+            ),
+            Self::IllegalEnumValues if a0.is_empty() => {
+                "An instance member named 'values' can't be declared in a class that implements 'Enum'."
+                    .to_string()
+            }
+            Self::IllegalEnumValues => format!(
+                "An instance member named 'values' can't be inherited from '{a0}' in a class that implements 'Enum'."
+            ),
+            Self::ValuesDeclarationInEnum => {
+                "A member named 'values' can't be declared in an enum.".to_string()
+            }
+            // The setter shape rides the `a1` marker (`setter`); the
+            // member shape leaves it empty.
+            Self::MixinApplicationNoConcreteSuperInvokedMember if a1 == "setter" => format!(
+                "The class doesn't have a concrete implementation of the super-invoked setter '{a0}'."
+            ),
+            Self::MixinApplicationNoConcreteSuperInvokedMember => format!(
+                "The class doesn't have a concrete implementation of the super-invoked member '{a0}'."
+            ),
+            // The three-placeholder template renders through
+            // [`SemanticCode::message3`]; this two-slot entry renders the
+            // empty third placeholder (the emit site always passes it).
+            Self::MixinApplicationNotImplementedInterface => self.message3(a0, a1, ""),
             Self::ConstEvalThrowsException => {
                 "Evaluation of this constant expression throws an exception.".to_string()
             }
@@ -3395,6 +3546,15 @@ impl SemanticCode {
             Self::ConstEvalMethodInvocation => {
                 "Methods can't be invoked in constant expressions.".to_string()
             }
+            Self::ConstEvalForElement => {
+                "Constant expressions don't support 'for' elements.".to_string()
+            }
+            Self::DotShorthandMissingContext => {
+                "A dot shorthand can't be used where there is no context type.".to_string()
+            }
+            Self::DotShorthandUndefinedMember => format!(
+                "The static getter '{a0}' isn't defined for the context type '{a1}'."
+            ),
             Self::RecursiveCompileTimeConstant => {
                 "The compile-time constant expression depends on itself.".to_string()
             }
@@ -4110,6 +4270,12 @@ impl SemanticCode {
     #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub fn message3(self, a0: &str, a1: &str, a2: &str) -> String {
         match self {
+            // The #3373 mixin-application constraint row: the mixin type,
+            // the applying supertype (rendered twice by the template), then
+            // the unsatisfied constraint (error_verifier.dart:6107-6114).
+            Self::MixinApplicationNotImplementedInterface => {
+                format!("'{a0}' can't be mixed onto '{a1}' because '{a1}' doesn't implement '{a2}'.")
+            }
             // The three-plus-name final-constructor variant
             // (diagnostic.g.dart:6917 — the third slot the remaining count).
             Self::FinalNotInitializedConstructor => {
@@ -4731,6 +4897,17 @@ impl SemanticCode {
             Self::EnumWithoutConstants => {
                 Some("Try declaring an enum constant.".to_string())
             }
+            // The #3373 face corrections. The mixin-constraint row's `{0}`
+            // is the mixin type name; the super-invoked row carries none.
+            Self::EnumWithAbstractMember => Some(format!("Try adding a body to '{a2}'.")),
+            Self::IllegalConcreteEnumMember | Self::IllegalEnumValues
+            | Self::ValuesDeclarationInEnum => {
+                Some("Try using a different name.".to_string())
+            }
+            Self::MixinApplicationNotImplementedInterface => {
+                Some(format!("Try extending the class '{a2}'."))
+            }
+            Self::MixinApplicationNoConcreteSuperInvokedMember => None,
             // The `non_constant_map_pattern_key` correction
             // (diagnostic.g.dart / messages.yaml `nonConstantMapPatternKey`).
             Self::NonConstantMapPatternKey => {
@@ -4969,6 +5146,7 @@ mod tests {
             SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
             SemanticCode::TypeArgumentNotMatchingBounds,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
+            SemanticCode::TypeAliasCannotReferenceItself,
             SemanticCode::EnumWithoutConstants,
             SemanticCode::ConstConstructorWithNonFinalField,
             SemanticCode::InvalidAssignment,
@@ -5014,6 +5192,9 @@ mod tests {
             SemanticCode::ConstEvalThrowsIdbze,
             SemanticCode::ConstEvalPrimitiveEquality,
             SemanticCode::ConstEvalMethodInvocation,
+            SemanticCode::ConstEvalForElement,
+            SemanticCode::DotShorthandMissingContext,
+            SemanticCode::DotShorthandUndefinedMember,
             SemanticCode::RecursiveCompileTimeConstant,
             SemanticCode::InvalidConstant,
             SemanticCode::InvalidOverride,
@@ -5323,6 +5504,9 @@ mod tests {
         SemanticCode::ConstEvalThrowsIdbze,
         SemanticCode::ConstEvalPrimitiveEquality,
         SemanticCode::ConstEvalMethodInvocation,
+        SemanticCode::ConstEvalForElement,
+        SemanticCode::DotShorthandMissingContext,
+        SemanticCode::DotShorthandUndefinedMember,
         SemanticCode::RecursiveCompileTimeConstant,
         SemanticCode::InvalidConstant,
         SemanticCode::InvalidOverride,
@@ -5871,11 +6055,14 @@ mod tests {
             | SemanticCode::BodyMightCompleteNormallyNullable
             | SemanticCode::CastFromNullAlwaysFails
             | SemanticCode::CastFromNullableAlwaysFails
+            | SemanticCode::ConstEvalForElement
             | SemanticCode::ConstEvalMethodInvocation
             | SemanticCode::ConstEvalPrimitiveEquality
             | SemanticCode::ConstEvalThrowsException
             | SemanticCode::ConstEvalThrowsIdbze
             | SemanticCode::ConstEvalTypeBool
+            | SemanticCode::DotShorthandMissingContext
+            | SemanticCode::DotShorthandUndefinedMember
             | SemanticCode::ConstEvalTypeBoolInt
             | SemanticCode::ConstEvalTypeBoolNumString
             | SemanticCode::ConstEvalTypeInt
@@ -5897,6 +6084,10 @@ mod tests {
             | SemanticCode::DeadNullAwareExpression
             | SemanticCode::DuplicateDefinition
             | SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded
+            // The #3341 alias self-reference row: an inline `message` arm
+            // (no `registry_message` call site — the name reaches
+            // `analyzer-codes.tsv` as metadata only).
+            | SemanticCode::TypeAliasCannotReferenceItself
             | SemanticCode::EnumWithoutConstants
             | SemanticCode::EqualElementsInConstSet
             | SemanticCode::EqualElementsInSet
@@ -6154,6 +6345,15 @@ mod tests {
             | SemanticCode::UnnecessaryImport
             | SemanticCode::MissingRequiredParam(MissingRequiredParamShape::Plain)
             | SemanticCode::MissingRequiredParam(MissingRequiredParamShape::WithDetails)
+            // The #3373 enum member-set and mixin-application rows: the
+            // inline `message`/`message3` arms above are the sole template
+            // source.
+            | SemanticCode::EnumWithAbstractMember
+            | SemanticCode::IllegalConcreteEnumMember
+            | SemanticCode::IllegalEnumValues
+            | SemanticCode::ValuesDeclarationInEnum
+            | SemanticCode::MixinApplicationNoConcreteSuperInvokedMember
+            | SemanticCode::MixinApplicationNotImplementedInterface
             => code.code_info(),
         }
     }
@@ -6201,6 +6401,7 @@ mod tests {
             SemanticCode::BodyMightCompleteNormallyNullable,
             SemanticCode::CastFromNullAlwaysFails,
             SemanticCode::CastFromNullableAlwaysFails,
+            SemanticCode::ConstEvalForElement,
             SemanticCode::ConstEvalMethodInvocation,
             SemanticCode::ConstEvalPrimitiveEquality,
             SemanticCode::ConstEvalThrowsException,
@@ -6224,8 +6425,11 @@ mod tests {
             SemanticCode::DeadCodeCatchFollowingCatch,
             SemanticCode::DeadCodeOnCatchSubtype,
             SemanticCode::DeadNullAwareExpression,
+            SemanticCode::DotShorthandMissingContext,
+            SemanticCode::DotShorthandUndefinedMember,
             SemanticCode::DuplicateDefinition,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
+            SemanticCode::TypeAliasCannotReferenceItself,
             SemanticCode::EnumWithoutConstants,
             SemanticCode::EqualElementsInSet,
             SemanticCode::EqualKeysInMap,
@@ -6445,6 +6649,13 @@ mod tests {
             SemanticCode::UnnecessaryImport,
             SemanticCode::MissingRequiredParam(MissingRequiredParamShape::Plain),
             SemanticCode::MissingRequiredParam(MissingRequiredParamShape::WithDetails),
+            // The #3373 enum member-set and mixin-application rows.
+            SemanticCode::EnumWithAbstractMember,
+            SemanticCode::IllegalConcreteEnumMember,
+            SemanticCode::IllegalEnumValues,
+            SemanticCode::ValuesDeclarationInEnum,
+            SemanticCode::MixinApplicationNoConcreteSuperInvokedMember,
+            SemanticCode::MixinApplicationNotImplementedInterface,
         ]
     }
 

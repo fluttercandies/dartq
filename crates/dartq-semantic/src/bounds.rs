@@ -343,6 +343,157 @@ fn tree_any_head(tree: &TypeTree, pred: &dyn Fn(StringId) -> bool) -> bool {
     pred(tree.head) || tree.args.iter().any(|arg| tree_any_head(arg, pred))
 }
 
+/// The syntactic alias self-reference walk (upstream
+/// `TypeAliasSelfReferenceFinder`/`_Finder`, `pkg/analyzer/lib/src/
+/// summary2/type_alias.dart:10-133`). A typedef's right-hand side — its
+/// return type, its formals, any nested type argument, and the written
+/// bounds of the declaration's own parameters — is scanned for the typedef
+/// itself: a `NamedType` whose head names the typedef reports
+/// (`typeNode == self`, :95-100); one whose head names another typedef
+/// descends into that typedef's parameters and right-hand side (:117-124);
+/// one whose head names a class or mixin descends into that declaration's
+/// type-parameter bounds (:101-116). The descent is name-keyed and
+/// visited-guarded, so a co-alias cycle terminates. A head shadowed by an
+/// in-scope type parameter resolves to the parameter's element upstream and
+/// descends nothing (:86-88); a poisoned tree ends the descent (the shape
+/// never resolved, so no `typeNode` exists); a head this file did not
+/// capture is left alone — the under-report direction, never a false
+/// positive.
+struct SelfReferenceState {
+    /// The typedef being checked (`self` in the upstream finder).
+    self_name: StringId,
+    /// The declarations the walk already descended (upstream's identity
+    /// `visited` set, keyed here by declaring name).
+    visited: FxHashSet<StringId>,
+    has_self: bool,
+}
+
+impl SelfReferenceState {
+    /// One typedef's visit: the written bounds of its own parameters
+    /// first, then its right-hand side (`_Finder.functionTypeAlias` /
+    /// `.genericTypeAlias`, :39-47).
+    fn alias(&mut self, index: &BoundsIndex, name: StringId) {
+        let Some(capture) = index.aliases.get(&name) else {
+            return;
+        };
+        let mut scope: Vec<StringId> = capture.params.iter().map(|(name, _, _)| *name).collect();
+        for (_, bound, poisoned) in &capture.params {
+            if !*poisoned
+                && let Some(tree) = bound
+            {
+                self.tree(index, tree, &scope);
+            }
+        }
+        match &*capture.rhs {
+            AliasRhs::Named(tree) => self.tree(index, tree, &scope),
+            AliasRhs::Fn {
+                ret,
+                positional,
+                named,
+                type_params,
+                ..
+            } => {
+                // The right-hand function type declares its own variables:
+                // their bounds and its columns sit in that inner scope.
+                if !type_params.is_empty() {
+                    scope.extend(type_params.iter().map(|(name, _, _)| *name));
+                }
+                for (_, bound, poisoned) in type_params {
+                    if !*poisoned
+                        && let Some(tree) = bound
+                    {
+                        self.tree(index, tree, &scope);
+                    }
+                }
+                if let Some(tree) = ret {
+                    self.tree(index, tree, &scope);
+                }
+                for tree in positional.iter().chain(named.iter().map(|(_, tree, _)| tree)) {
+                    self.tree(index, tree, &scope);
+                }
+            }
+        }
+    }
+
+    /// One class/mixin declaration's visit: the written bounds of its type
+    /// parameters (`_typeParameterList`, :74-80). Its supertypes stay out —
+    /// the upstream arm descends the declaration's parameters only — and so
+    /// do enums: `EnumDeclaration` is not an arm of the walk (:101-116), so
+    /// a bound spelled under an enum's header never flags an alias.
+    fn container(&mut self, index: &BoundsIndex, name: StringId) {
+        let Some(capture) = index.containers.get(&name) else {
+            return;
+        };
+        if capture.is_enum {
+            return;
+        }
+        for (bound, poisoned) in &capture.bounds {
+            if !*poisoned
+                && let Some(tree) = bound
+            {
+                self.tree(index, tree, &capture.params);
+            }
+        }
+    }
+
+    /// One `TypeAnnotation` visit (`_visit`, :82-132). `scope` carries the
+    /// type-parameter names in scope at the node — a head matching one of
+    /// them is the parameter's element upstream, not a declaration.
+    fn tree(&mut self, index: &BoundsIndex, tree: &TypeTree, scope: &[StringId]) {
+        if self.has_self || tree.poisoned {
+            return;
+        }
+        if let Some((positional, named)) = &tree.record {
+            for field in positional.iter().chain(named.iter().map(|(_, ty)| ty)) {
+                self.tree(index, field, scope);
+            }
+            return;
+        }
+        if let Some(function) = &tree.function {
+            let mut inner: Vec<StringId> = Vec::new();
+            if !function.type_params_named.is_empty() {
+                inner.extend_from_slice(scope);
+                inner.extend(function.type_params_named.iter().map(|(name, _)| *name));
+            }
+            let scope: &[StringId] = if inner.is_empty() { scope } else { &inner };
+            for (_, bound) in &function.type_params_named {
+                if let Some(tree) = bound {
+                    self.tree(index, tree, scope);
+                }
+            }
+            if let Some(tree) = &function.ret {
+                self.tree(index, tree, scope);
+            }
+            for tree in function
+                .positional
+                .iter()
+                .chain(function.named.iter().map(|(_, tree)| tree))
+            {
+                self.tree(index, tree, scope);
+            }
+            return;
+        }
+        let head = tree.head;
+        if scope.contains(&head) {
+            return;
+        }
+        if head == self.self_name {
+            self.has_self = true;
+            return;
+        }
+        if index.aliases.contains_key(&head) {
+            if self.visited.insert(head) {
+                self.alias(index, head);
+            }
+        } else if index.containers.contains_key(&head) && self.visited.insert(head) {
+            self.container(index, head);
+        }
+        for arg in &tree.args {
+            self.tree(index, arg, scope);
+        }
+    }
+}
+
 /// Maps an alias's captured RHS in the alias's own parameter scope: the
 /// expansion keeps the alias's parameter ids as its leaves, so a use
 /// site substitutes the written arguments into it (the official
@@ -1763,6 +1914,43 @@ impl<'a> Bounds<'a> {
             self.walk_children(strings, &tree, &scope, ScopeKind::Decl, false, &mut issues);
         }
         issues
+    }
+
+    /// The alias self-reference face (#3341): every captured typedef whose
+    /// right-hand side mentions the typedef itself, directly or through
+    /// another typedef / a class-or-mixin type-parameter bound
+    /// ([`SelfReferenceState`]). The order is unspecified — the caller
+    /// anchors each row at the declaration's name token
+    /// (`_checkForTypeAliasCannotReferenceItself`, error_verifier.dart:
+    /// 7116-7127) and source order follows from those anchors.
+    pub(crate) fn check_alias_self_references(&self) -> Vec<StringId> {
+        self.index
+            .aliases
+            .keys()
+            .copied()
+            .filter(|name| self.alias_self_reference(*name))
+            .collect()
+    }
+
+    /// Whether `name`'s typedef references itself — the single-declaration
+    /// form of [`Self::check_alias_self_references`], read by the alias
+    /// fold: a self-referencing alias instantiates to `dynamic` instead of
+    /// unfolding into itself (`TypeAliasElementImpl.instantiateImpl`,
+    /// pkg/analyzer/lib/src/dart/element/element.dart:11277-11288, which
+    /// answers `DynamicTypeImpl` when the fragment's `hasSelfReference` is
+    /// set). A name this file did not capture answers `false` (the
+    /// under-report direction — the fold keeps its written shape).
+    pub(crate) fn alias_self_reference(&self, name: StringId) -> bool {
+        if !self.index.aliases.contains_key(&name) {
+            return false;
+        }
+        let mut state = SelfReferenceState {
+            self_name: name,
+            visited: FxHashSet::default(),
+            has_self: false,
+        };
+        state.alias(&self.index, name);
+        state.has_self
     }
 
     /// The nested-`NamedType` walk: upstream's verifier visits every

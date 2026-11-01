@@ -98,6 +98,14 @@ impl<'a> Engine<'a> {
         }
         let (mut head, mut head_nullable) = (name, nullable);
         for _ in 0..8 {
+            // A self-referencing alias never unfolds: it instantiates to
+            // `dynamic` (`TypeAliasElementImpl.instantiateImpl`,
+            // element.dart:11277-11288 — the `hasSelfReference` arm), so
+            // `typedef F = F Function();` reads `dynamic` at every use
+            // instead of the right-hand side that mentions itself.
+            if self.bounds.alias_self_reference(head) {
+                return Ty::Dynamic;
+            }
             let Some(rhs) = self.alias_rhs(head) else {
                 break;
             };
@@ -189,6 +197,12 @@ impl<'a> Engine<'a> {
         let mut seen: FxHashSet<StringId> = FxHashSet::default();
         let (mut cur, mut cur_nullable, mut cur_args) = (name, nullable, args);
         for _ in 0..8 {
+            // The parameterized twin of the bare fold's collapse: a
+            // self-referencing alias instantiates to `dynamic` instead of
+            // substituting into a right-hand side that mentions itself.
+            if self.bounds.alias_self_reference(cur) {
+                return Some(Ty::Dynamic);
+            }
             if !seen.insert(cur) {
                 return None;
             }

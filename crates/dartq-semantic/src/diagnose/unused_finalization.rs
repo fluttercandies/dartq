@@ -309,6 +309,26 @@ impl<'a> Engine<'a> {
         for issue in issues {
             self.emit_bounded_issue(issue);
         }
+        // The #3341 alias self-reference face: the oracle reports at the
+        // typedef's name token, one row per self-referencing declaration
+        // (`_checkForTypeAliasCannotReferenceItself`, error_verifier.dart:
+        // 7116-7127), so a co-alias pair reports on both declarations.
+        let self_referencing = self.bounds.check_alias_self_references();
+        if !self_referencing.is_empty() {
+            let mut rows: Vec<SourceRange> = self
+                .decl_sites
+                .iter()
+                .filter(|site| {
+                    matches!(site.kind, DeclKind::TypeAlias)
+                        && self_referencing.contains(&site.name)
+                })
+                .map(|site| site.range)
+                .collect();
+            rows.sort_by_key(|range| range.offset);
+            for range in rows {
+                self.emit(SemanticCode::TypeAliasCannotReferenceItself, range, "", "");
+            }
+        }
         for check in std::mem::take(&mut self.pending_bounded_checks) {
             match check {
                 PendingBoundedCheck::Site {
