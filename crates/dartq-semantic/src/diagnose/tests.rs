@@ -22618,6 +22618,16 @@ mod ticket_3434_tests;
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3475 —— the displayed-type boundary: `ty_display` fills
+// —— instantiate-to-bounds at every nesting depth (named arguments,
+// —— function return/formals, record fields), and the type-argument bounds
+// —— row's Function-typed arguments keep their own display. Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3475_tests.rs"]
+mod ticket_3475_tests;
+
 // —— #3490 —— the pattern never-match verdict reads the canonical `Null`
 // face: the written `Null` capture is normalized before `canBeSubtypeOf`
 // and the Null arms decide over the potentially-nullable opposite face, so

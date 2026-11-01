@@ -6169,14 +6169,153 @@ impl<'a> Engine<'a> {
     /// `DartType.getDisplayString`, whose resolved `staticType` for a bare
     /// parameterized head is always the instantiate-to-bounds
     /// instantiation (`G` renders `G<A<dynamic>>`, never `G`; upstream
-    /// Dart SDK source, `type.dart` `instantiateTypeFormalsToBounds`).
+    /// Dart SDK source, `type.dart` `instantiateTypeFormalsToBounds`) —
+    /// at EVERY nesting depth, because the resolution instantiates each
+    /// written annotation: a `List<G>` argument displays `List<G<num>>`,
+    /// a function formal `G` displays `G<num>`, a record field likewise.
+    /// Every message slot this pass renders (the type-argument bounds
+    /// face's argument and bound, the assignment faces, the covering
+    /// rows) resolves through this one function.
     /// The bind sites (`bind_declared_type`/`bind_parameter_type`) already
     /// store the instantiated face, so this fill is the catch-all belt for
     /// a raw `Named{_, EMPTY}` arriving through a channel no bind site
     /// owns — display-only: the judgment `Ty` the verdict compared keeps
     /// its own face.
     pub(crate) fn ty_display(&self, ty: Ty) -> String {
-        self.render_ty(self.instantiated_head_ty(ty))
+        self.render_ty(self.display_filled_ty(ty))
+    }
+
+    /// `ty` with every raw parameterized head replaced by its
+    /// instantiate-to-bounds face — the head itself plus every head its
+    /// argument list, record fields, or function shape spells
+    /// ([`Self::INSTANTIATE_DEPTH_CAP`] bounds the descent: a
+    /// self-referential bound (`class G<T extends G>`) has no finite
+    /// instantiation, and the raw head it would keep re-enters the same
+    /// fill). A spine that changed re-interns; an already-filled type —
+    /// every judgment-side slot — walks to its leaves and allocates
+    /// nothing.
+    fn display_filled_ty(&self, ty: Ty) -> Ty {
+        self.display_filled_ty_at(ty, 0)
+    }
+
+    /// The nesting cap of [`Self::display_filled_ty`]: a written type
+    /// deeper than this keeps the raw head at that depth (the same
+    /// under-report direction the rest of the display faces take), and the
+    /// self-referential-bound cycle terminates there.
+    const INSTANTIATE_DEPTH_CAP: u32 = 16;
+
+    fn display_filled_ty_at(&self, ty: Ty, depth: u32) -> Ty {
+        if depth >= Self::INSTANTIATE_DEPTH_CAP {
+            return ty;
+        }
+        let depth = depth + 1;
+        let ty = self.instantiated_head_ty(ty);
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if args == ArgListId::EMPTY {
+                    return ty;
+                }
+                let written = self.boundary.pool().get(args).to_vec();
+                let filled: Vec<Ty> = written
+                    .iter()
+                    .map(|arg| self.display_filled_ty_at(*arg, depth))
+                    .collect();
+                if filled == written {
+                    return ty;
+                }
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &filled)
+            }
+            Ty::Record { shape, nullable } => {
+                // The pool guard drops before the recursive walk: the fill
+                // re-enters `instantiated_head_ty`, whose own `borrow_mut`
+                // would panic the cell.
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                let filled_positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|field| self.display_filled_ty_at(*field, depth))
+                    .collect();
+                let filled_named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, field)| (*name, self.display_filled_ty_at(*field, depth)))
+                    .collect();
+                if filled_positional == positional && filled_named == named {
+                    return ty;
+                }
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&filled_positional, &filled_named, nullable)
+            }
+            Ty::Function { shape, nullable } => {
+                let (type_params, type_param_count, return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params_named.to_vec(),
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let filled_params: Vec<(StringId, Option<Ty>)> = type_params
+                    .iter()
+                    .map(|(param, bound)| {
+                        (*param, bound.map(|b| self.display_filled_ty_at(b, depth)))
+                    })
+                    .collect();
+                let filled_return = self.display_filled_ty_at(return_ty, depth);
+                let filled_positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|formal| self.display_filled_ty_at(*formal, depth))
+                    .collect();
+                let filled_named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, formal)| (*name, self.display_filled_ty_at(*formal, depth)))
+                    .collect();
+                if filled_return == return_ty
+                    && filled_positional == positional
+                    && filled_named == named
+                    && filled_params == type_params
+                {
+                    return ty;
+                }
+                let mut pool = self.boundary.args.borrow_mut();
+                if type_params.is_empty() {
+                    // The count-only shape (`ArgPool::function`'s producer)
+                    // keeps its count: the group has no names to display,
+                    // but the re-interned slot must not merge with the
+                    // count-less degenerate face.
+                    pool.function(
+                        type_param_count,
+                        filled_return,
+                        &filled_positional,
+                        &filled_named,
+                        nullable,
+                    )
+                } else {
+                    pool.function_generic(
+                        &filled_params,
+                        filled_return,
+                        &filled_positional,
+                        &filled_named,
+                        nullable,
+                    )
+                }
+            }
+            _ => ty,
+        }
     }
 
     /// The function-subtype decision (`_isFunctionSubtypeOf`,
