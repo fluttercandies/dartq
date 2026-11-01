@@ -213,10 +213,6 @@ pub(crate) struct PatternState {
     pub scrutinee_pending: bool,
     /// The pattern's `when`-guard expression, if one fired.
     pub guard: Option<crate::interp_expr::Expr>,
-    /// The state at `GuardBegin`: the guard-false arm for the close's
-    /// unmatched join (the guard-true arm is `current` itself — the
-    /// guard's own events ran on it).
-    pub pre_guard: Option<State>,
     /// Pattern-declared variables awaiting scope flush (name id, final).
     pub pending_decls: Vec<(u32, bool)>,
     /// The bindings the pattern's variables shadowed in the innermost
@@ -2821,8 +2817,20 @@ impl<'o> Interp<'o> {
     /// standing here is a strictly OUTER dead arm's — the outermost
     /// arm's close owns the single official row
     /// ([`Interp::arm_dead_depth`]).
-    pub(crate) fn dead_arm_row(&mut self, arm_start: u32, arm_end: u32) {
-        if self.reachable() || self.arm_dead_depth >= 1 {
+    ///
+    /// `entered_dead` is the CALLER's own entry latch (`then_dead_entry` /
+    /// `else_dead_entry` / `rhs_dead_entry` / the switch alternative's
+    /// `arm_dead_entry`) and the only gate: an arm the walk ENTERED dead
+    /// reports, an arm that ran live and merely ENDED unreachable (a
+    /// `throw`/`Never` value, `_ => throw 'x'`) does not — the official
+    /// `flowEnd` finds no first dead node in it, and any dead construct
+    /// inside reports on its own. Deriving the latch from the state here
+    /// was wrong in both directions: an open interval misses a dead arm
+    /// whose first node carries no interior poll (`true ? x : x`'s bare
+    /// read), and the end state cannot tell a live-entered `throw` arm
+    /// from a dead-entered one.
+    pub(crate) fn dead_arm_row(&mut self, arm_start: u32, arm_end: u32, entered_dead: bool) {
+        if !entered_dead || self.arm_dead_depth >= 1 {
             return;
         }
         if let Some(window) = &mut self.dead {
@@ -2833,8 +2841,8 @@ impl<'o> Interp<'o> {
                 window.extend(arm_end);
                 return;
             }
+            self.dead = None;
         }
-        self.dead = None;
         if arm_end > arm_start {
             self.emit(FlowFact::DeadCode {
                 span: TokenSpan {

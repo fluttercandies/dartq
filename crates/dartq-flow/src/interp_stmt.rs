@@ -1069,8 +1069,8 @@ impl Interp<'_> {
                 };
                 if arm_dead_entry {
                     self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
+                    self.dead_arm_row(begin.range.offset, *end, true);
                 }
-                self.dead_arm_row(begin.range.offset, *end);
                 // Official decision order (flow_analysis.dart:1776-1786):
                 // pattern → guard → `switch_endAlternative` → body. The
                 // parser delivers the guard after the pattern-close anchor

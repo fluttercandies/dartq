@@ -291,6 +291,7 @@ impl Interp<'_> {
                             let promoted = self.prop_promoted(THIS_RECEIVER, slot);
                             if promoted && self.reachable() {
                                 self.emit(FlowFact::PromotedPropertyRead { span: *token });
+                                self.emit_prop_read_type(slot, *token);
                             } else if self.reachable() {
                                 // The non-promoted mirror (upstream
                                 // `_getNonPromotionReasons`'s property
@@ -920,7 +921,7 @@ impl Interp<'_> {
                             // strictly outer arm's, which is exactly the
                             // fold condition `dead_arm_row` reads.
                             self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                            self.dead_arm_row(op_span.range.offset, *end);
+                            self.dead_arm_row(op_span.range.offset, *end, true);
                         }
                     }
                     let right = self.pop_value();
@@ -1004,7 +1005,7 @@ impl Interp<'_> {
                         // dead-arm contribution drops before the row —
                         // `dead_arm_row` reads the OUTER arms only.
                         self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                        self.dead_arm_row(op_span.range.offset, *end);
+                        self.dead_arm_row(op_span.range.offset, *end, true);
                     }
                     let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
@@ -1128,7 +1129,7 @@ impl Interp<'_> {
                     };
                     if rhs_dead_entry && let Some(op_span) = op_span {
                         self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                        self.dead_arm_row(op_span.range.offset, *end);
+                        self.dead_arm_row(op_span.range.offset, *end, true);
                     }
                     let right = self.pop_value();
                     let left = self.pop_value();
@@ -1154,7 +1155,7 @@ impl Interp<'_> {
                     };
                     if rhs_dead_entry && let Some(op_span) = op_span {
                         self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                        self.dead_arm_row(op_span.range.offset, *end);
+                        self.dead_arm_row(op_span.range.offset, *end, true);
                     }
                     self.exprs.pop();
                     self.exprs.pop();
@@ -1349,6 +1350,63 @@ impl Interp<'_> {
                         expr.branches = Some((if_true.clone(), if_false.clone()));
                         expr.test_split = true;
                         self.cond_split_var = Some(var);
+                    }
+                } else if let Some(slot) = operand.prop {
+                    // The property-reference arm (official
+                    // `tryPromoteForTypeCheck` reached through
+                    // `isExpression_end`'s `_getExpressionReference` — the
+                    // operand's `_PropertyReference` carries the property's
+                    // promotion key exactly like a variable's): `x.f is B`
+                    // promotes the `(receiver, f)` slot to the gated
+                    // candidate, the unmatched arm carries the factored
+                    // remainder. The flow layer cannot spell the member's
+                    // declared type, so the slot's standing chain head —
+                    // the non-null marker when never promoted — is the
+                    // `previous` the candidate gate and the factor read;
+                    // the semantic layer's eligibility verdict
+                    // (`isPropertyPromotable`) stays the consumer's gate,
+                    // exactly like the null-check face.
+                    let receiver = self.props[slot as usize].0;
+                    let model = self.current.prop(slot);
+                    if self.prop_target_captured(receiver) || model.captured() {
+                        // The write-capture bail (official
+                        // `info.writeCaptured`, flow_analysis.dart:4136-4138):
+                        // no promotion stands and the returned info is
+                        // trivial — both arms keep the pre-test state.
+                        let cur = self.current.clone();
+                        expr.branches = Some((cur.clone(), cur));
+                    } else {
+                        let invalid_tested = self
+                            .ops
+                            .is_invalid_typed(tested, tested_args, self.args, self.names);
+                        let unspellable_tested = tested.base == Base::Unknown
+                            && !self.ops.is_resolved_seam();
+                        let promoted = if invalid_tested || unspellable_tested {
+                            None
+                        } else {
+                            self.prop_promotion_candidate(slot, tested, tested_args)
+                        };
+                        let (matched, unmatched) = if invalid_tested {
+                            (
+                                self.current.clone(),
+                                self.current.clone().set_unreachable(&mut self.reach),
+                            )
+                        } else if unspellable_tested {
+                            (
+                                self.current.clone(),
+                                self.current.clone(),
+                            )
+                        } else {
+                            self.branch_prop_type_test(slot, tested, tested_args, promoted)
+                        };
+                        let (if_true, if_false) = if is_not {
+                            (unmatched, matched)
+                        } else {
+                            (matched, unmatched)
+                        };
+                        self.current = if_true.clone();
+                        expr.branches = Some((if_true.clone(), if_false.clone()));
+                        expr.test_split = true;
                     }
                 } else {
                     let cur = self.current.clone();
@@ -1552,6 +1610,25 @@ impl Interp<'_> {
                             self.ops,
                             &mut self.lists,
                             var,
+                            None,
+                            Some((promoted, self.as_cast_args)),
+                            self.args,
+                            self.names,
+                        );
+                    } else if let Some(slot) = operand.prop
+                        && let Some(promoted) =
+                            self.prop_promotion_candidate(slot, cast_ty, self.as_cast_args)
+                    {
+                        // The property cast arm (official
+                        // `tryPromoteForTypeCast` on the operand's
+                        // `_PropertyReference`, flow_analysis.dart:4088-4102):
+                        // `x.f as B` promotes the slot to the gated
+                        // candidate — the write-capture bail lives inside
+                        // `finish_prop_type_test`'s model check.
+                        self.current = self.current.clone().finish_prop_type_test(
+                            self.ops,
+                            &mut self.lists,
+                            slot,
                             None,
                             Some((promoted, self.as_cast_args)),
                             self.args,
@@ -2136,7 +2213,7 @@ impl Interp<'_> {
                     // arm's own dead-arm contribution drops BEFORE the
                     // row so the gate reads the outer arms only.
                     self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                    self.dead_arm_row(then_begin.range.offset, *then_end);
+                    self.dead_arm_row(then_begin.range.offset, *then_end, then_dead_entry);
                 } else {
                     // A mid-arm death — a Never-operand cast whose type is
                     // the first dead node (`(throw 0) as T`): official
@@ -2197,7 +2274,7 @@ impl Interp<'_> {
                     // arm's own dead-arm contribution drops BEFORE the
                     // row so the gate reads the outer arms only.
                     self.arm_dead_depth = self.arm_dead_depth.saturating_sub(1);
-                    self.dead_arm_row(else_begin.range.offset, *arm_end);
+                    self.dead_arm_row(else_begin.range.offset, *arm_end, else_dead_entry);
                 } else {
                     // The else arm's mid-arm cast-tail death (the then arm's
                     // twin above).
@@ -2488,6 +2565,7 @@ impl Interp<'_> {
                     let member_span = member_value.read_span.unwrap_or(*member);
                     if promoted && self.reachable() {
                         self.emit(FlowFact::PromotedPropertyRead { span: member_span });
+                        self.emit_prop_read_type(slot, member_span);
                     } else if self.reachable() {
                         // The non-promoted mirror (upstream
                         // `_getNonPromotionReasons`'s property arm): the
@@ -3273,6 +3351,7 @@ impl Interp<'_> {
                     if self.reachable() {
                         if promoted {
                             self.emit(FlowFact::PromotedPropertyRead { span });
+                            self.emit_prop_read_type(slot, span);
                         } else {
                             // The non-promoted mirror ([`Ev::DotAccess`]'s
                             // own arm): the slot's cleared promoted types
@@ -3555,7 +3634,7 @@ impl Interp<'_> {
                 if then_dead_entry
                     && let Some(then_start) = self.coll_if.last().map(|f| f.then_start)
                 {
-                    self.dead_arm_row(then_start, *then_end);
+                    self.dead_arm_row(then_start, *then_end, then_dead_entry);
                 }
                 if let Some(Frame::Branch { branch, .. }) = self.stack.last() {
                     // The else-element begins under the condition-false
@@ -3602,7 +3681,7 @@ impl Interp<'_> {
                         } else {
                             frame.then_start
                         };
-                        self.dead_arm_row(anchor, *arm_end);
+                        self.dead_arm_row(anchor, *arm_end, arm_dead_entry);
                     }
                 }
                 let Some(Frame::Branch { branch, .. }) = self.stack.pop() else {
@@ -4124,6 +4203,158 @@ impl Interp<'_> {
                 self.ops,
                 &mut self.lists,
                 var,
+                Some((tested, tested_args)),
+                factored.map(|ty| (ty, factored_args)),
+                self.args,
+                self.names,
+            )
+        };
+        (matched, unmatched)
+    }
+
+    /// The property slot's promotion-chain head with its written-argument
+    /// tree — the `previous` of upstream's `_PropertyReference._type`
+    /// (the promoted type when one stands, the member's static type
+    /// otherwise). The member's declared type is element data this layer
+    /// deliberately does not carry, so an unpromoted slot answers the
+    /// potentially-nullable unknown marker — the same face the read
+    /// itself wears ([`Expr::prop`]'s marker pair).
+    fn prop_previous(&self, slot: u32) -> (Ty, u32) {
+        let model = self.current.prop(slot);
+        if model.promoted == crate::model::NIL {
+            (Ty::UNKNOWN_NULLABLE, crate::ty::EMPTY_ARGS)
+        } else {
+            (
+                self.lists.head(model.promoted),
+                self.lists.head_args(model.promoted),
+            )
+        }
+    }
+
+    /// The promotion target for a type check on a property slot — the
+    /// `_PropertyReference` arm of upstream `tryPromoteForTypeCheck`'s
+    /// true branch (`flow_analysis.dart:4137-4151`), the same
+    /// [`TypeOps::try_promote_to_typed`] gate the variable candidate runs
+    /// (`to <: from` on the instantiated spellings). `from` is the slot's
+    /// standing head: the marker pair the read face carries — a spelled
+    /// prior promotion re-decides under the real name, and the
+    /// undecidable cross-base question over the unknown marker keeps the
+    /// lattice's optimistic answer (the official's `dynamic`-previous
+    /// promotion).
+    fn prop_promotion_candidate(&mut self, slot: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
+        match tested.base {
+            Base::Unknown | Base::Dynamic | Base::Void => None,
+            _ => {
+                let (previous, previous_args) = self.prop_previous(slot);
+                self.ops.try_promote_to_typed(
+                    tested,
+                    tested_args,
+                    previous,
+                    previous_args,
+                    self.args,
+                    self.names,
+                )
+            }
+        }
+    }
+
+    /// The promoted-property read's flow-type row (#3430): when the
+    /// slot's standing chain head spells a real type (a type test's
+    /// gated candidate — `x.f is B` publishes `B`, never the non-null
+    /// marker), the read joins the [`FlowFact::ReadType`] table at its
+    /// member token exactly like a promoted variable read — the
+    /// receiver-expression face every downstream consumer re-derives
+    /// (`recv_expression_ty`/`read_type_at` answer `B` for `x.f`, so a
+    /// chained `x.f.m` resolves `m` on the promoted type). A marker
+    /// promotion (the `!= null`/`!` face's opaque head) spells nothing
+    /// the consumer cannot already see — no row.
+    fn emit_prop_read_type(&mut self, slot: u32, span: TokenSpan) {
+        let model = self.current.prop(slot);
+        if model.promoted == crate::model::NIL {
+            return;
+        }
+        let ty = self.lists.head(model.promoted);
+        if !matches!(ty.base, Base::Name(_) | Base::Function) {
+            return;
+        }
+        self.emit(FlowFact::ReadType {
+            span,
+            ty,
+            args: self.lists.head_args(model.promoted),
+        });
+    }
+
+    /// A successful type test on a property slot: returns (matched,
+    /// unmatched) states — the [`Interp::branch_type_test`] shape reached
+    /// through [`State::finish_prop_type_test`] on the slot's model. The
+    /// matched arm promotes to the gated candidate; the unmatched arm
+    /// promotes to the factored remainder — shape-preserving at this
+    /// seam, so the remainder keeps the previous chain head's rows — and
+    /// a bottom remainder marks it unreachable (the official
+    /// `ifFalseIsUnreachable` arm). The invalid-tested shortcut of the
+    /// variable face does not repeat: `IsEnd` decides the invalid face
+    /// before calling here.
+    fn branch_prop_type_test(
+        &mut self,
+        slot: u32,
+        tested: Ty,
+        tested_args: u32,
+        promoted: Option<Ty>,
+    ) -> (State, State) {
+        let (previous, previous_args) = self.prop_previous(slot);
+        let matched = self.current.clone().finish_prop_type_test(
+            self.ops,
+            &mut self.lists,
+            slot,
+            Some((tested, tested_args)),
+            promoted.map(|ty| (ty, tested_args)),
+            self.args,
+            self.names,
+        );
+        let factored = self.ops.factor_typed(
+            previous,
+            previous_args,
+            tested,
+            tested_args,
+            self.args,
+            self.names,
+        );
+        let unmatched = if self.ops.is_bottom(factored) {
+            // The bottom-remainder arm: `x.f is! T` over a slot already
+            // proved `T` leaves nothing below (the official
+            // `ifFalseIsUnreachable`, sound-mode only — a pre-3.9 unit
+            // keeps the else live with the chain untouched).
+            if self.sound_flow {
+                self.current.clone().set_unreachable(&mut self.reach)
+            } else {
+                self.current.clone()
+            }
+        } else {
+            // Official `isValidPromotionStep` on the remainder, the same
+            // arm [`Interp::branch_type_test`] runs.
+            let factored_args = previous_args;
+            let factored = if self.sound_flow {
+                if self.ops.is_subtype_typed(
+                    previous,
+                    previous_args,
+                    factored,
+                    factored_args,
+                    self.args,
+                    self.names,
+                ) {
+                    None
+                } else {
+                    Some(factored)
+                }
+            } else if (factored, factored_args) == (previous, previous_args) {
+                None
+            } else {
+                Some(factored)
+            };
+            self.current.clone().finish_prop_type_test(
+                self.ops,
+                &mut self.lists,
+                slot,
                 Some((tested, tested_args)),
                 factored.map(|ty| (ty, factored_args)),
                 self.args,

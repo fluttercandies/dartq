@@ -121,7 +121,6 @@ impl Interp<'_> {
                             scrutinee_ty,
                             scrutinee_pending: peeked.is_some(),
                             guard: None,
-                            pre_guard: None,
                             pending_decls: Vec::new(),
                             shadowed: Vec::new(),
                             cannot_fail: true,
@@ -164,15 +163,31 @@ impl Interp<'_> {
                     self.stand_down_may_fail();
                     return;
                 };
-                // A NON-reference matched value's equality check joins the
-                // chain upstream all the same (`promoteForEquality` keys on
-                // the matched value's TYPE, not its shape) — the flow
-                // lattice cannot answer it without a promotable reference,
-                // so the undecided face keeps the may-fail posture (the
-                // kill stands down — `case 1:` over `b ? 1 : 2` keeps the
-                // later members live).
+                // A NON-reference matched value's equality check runs on
+                // the matched value's TYPE (`_equalityCheck` takes the
+                // static types, `flow_analysis.dart:7226-7270`):
+                //   * two `Null`-equivalent operands answer
+                //     `_GuaranteedEqual` — the pattern always matches, the
+                //     handler performs NO update, so `current` stays live
+                //     and the chain keeps its (unreachable) seed: the
+                //     following alternative reads dead
+                //     (`if (expr<Null>() case null) … else …` rows the
+                //     else);
+                //   * every other pair is `_NoEqualityInformation` and
+                //     joins the live state (the kill stands down —
+                //     `case 1:` over `b ? 1 : 2` keeps the later members
+                //     live).
                 let Some(var) = self.pattern_scrutinee() else {
-                    self.stand_down_may_fail();
+                    let matched_ty = self
+                        .pattern
+                        .as_ref()
+                        .and_then(|p| p.scrutinee_ty)
+                        .or_else(|| self.frame_scrutinee_ty());
+                    let guaranteed_equal = matched_ty.is_some_and(|(ty, _)| ty.base == Base::Null)
+                        && constant.ty.base == Base::Null;
+                    if !guaranteed_equal {
+                        self.stand_down_may_fail();
+                    }
                     return;
                 };
                 // Official `constantPattern_end` →
@@ -701,13 +716,6 @@ impl Interp<'_> {
                 // must not read as the head region's end (the dispatcher's
                 // group-boundary clear checks this depth).
                 self.guard_depth += 1;
-                // Snapshot the pre-guard state: the guard's own events run
-                // on `current` next and leave it on the guard-true arm, so
-                // this snapshot is the guard-false arm for the close's
-                // unmatched join.
-                if let Some(pattern) = self.pattern.as_mut() {
-                    pattern.pre_guard = Some(self.current.clone());
-                }
             }
             Ev::GuardEnd => {
                 self.guard_depth = self.guard_depth.saturating_sub(1);
@@ -1131,14 +1139,19 @@ impl Interp<'_> {
         }
     }
 
-    /// Stands the open pattern's cannot-fail posture down without a join:
-    /// a face the lattice cannot answer (a constant over a non-reference
-    /// matched value, a dynamic head with refutable fields) may fail
-    /// upstream, so the clause close's chain kill must not fire on it.
+    /// The undecided may-fail face: a pattern the flow lattice cannot
+    /// answer (a constant over a non-reference matched value, a dynamic
+    /// head with refutable fields) MIGHT fail upstream, so its current
+    /// state joins the clause's unmatched chain exactly as the official
+    /// `_NoEqualityInformation` arm does (`_unmatched = _join(_unmatched!,
+    /// _current)`, upstream `pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+    /// flow_analysis.dart:7434-7437`), and the cannot-fail posture stands
+    /// down with it. Standing the posture down WITHOUT the join left the
+    /// chain at its unreachable seed, so the following alternative (an
+    /// if-case's `else`, the next member) read dead.
     fn stand_down_may_fail(&mut self) {
-        if let Some(pattern) = self.pattern.as_mut() {
-            pattern.cannot_fail = false;
-        }
+        let cur = self.current.clone();
+        self.join_unmatched(cur);
     }
 
     /// The empty-map pattern's coverage question (official
@@ -1535,7 +1548,6 @@ impl Interp<'_> {
             scrutinee_ty: None,
             scrutinee_pending: false,
             guard: None,
-            pre_guard: None,
             pending_decls: Vec::new(),
             shadowed: Vec::new(),
             cannot_fail: true,
@@ -1675,16 +1687,25 @@ impl Interp<'_> {
 
     /// Applies a pattern's guard to split matched/unmatched, returning the
     /// chained unmatched state plus the pattern's final cannot-fail
-    /// posture (official `_popPattern`, fed by the clause's `guardInfo` —
-    /// flow_analysis.dart:8004-8042: the guard's true state becomes the
-    /// clause's matched state, the false state joins the unmatched chain).
-    /// The guard's own events ran on `current` between `GuardBegin` and
-    /// `GuardEnd` — its last branching event (e.g. the type-test's
-    /// `IsEnd`, `interp_expr.rs`) left `current` on the true arm — so
-    /// `current` IS the guard's ifTrue state and the `GuardBegin`
-    /// snapshot is its ifFalse. The guard can fail, so its join stands
-    /// the cannot-fail posture down (the pattern context is already
-    /// taken out of `self` here, so the posture latches locally).
+    /// posture (official `_popPattern(guardInfo)`,
+    /// flow_analysis.dart:7785-7793: `_current = guardInfo.ifTrue;
+    /// unmatched = _join(_unmatched, guardInfo.ifFalse)`).
+    ///
+    /// The split reads the guard expression's own branch info
+    /// ([`Interp::cond_split`]), never a pre-guard snapshot: `guardInfo`
+    /// is the *expression's* ifTrue/ifFalse pair, and only that pair
+    /// carries the constant fold. A `when false` guard therefore kills the
+    /// clause's matched arm (`0` in `case one when false => 0` is the
+    /// oracle's `dead_code` row) while its guard-false arm keeps the chain
+    /// live; a `when !false` guard keeps the matched arm live and joins an
+    /// unreachable guard-false arm — a no-op — so the chain keeps whatever
+    /// the PATTERN left. A guard can never make later alternatives
+    /// unreachable on its own.
+    ///
+    /// The guard may fail on any non-constant value, so a reachable
+    /// guard-false arm also stands the cannot-fail posture down (the
+    /// pattern context is already taken out of `self` here, so the
+    /// posture latches locally).
     fn apply_pattern_exit(
         &mut self,
         mut pattern: PatternState,
@@ -1693,12 +1714,10 @@ impl Interp<'_> {
         let mut unmatched = pattern.unmatched;
         let mut cannot_fail = pattern.cannot_fail && pattern.saw_node;
         if (has_guard || matches!(pattern.kind, PatternKind::Switch | PatternKind::SwitchExpr))
-            && pattern.guard.take().is_some()
+            && let Some(guard) = pattern.guard.take()
         {
-            let if_false = pattern
-                .pre_guard
-                .take()
-                .unwrap_or_else(|| self.current.clone());
+            let (if_true, if_false) = self.cond_split(&guard);
+            self.current = if_true;
             if self.reach.locally_reachable(if_false.reach) {
                 cannot_fail = false;
             }

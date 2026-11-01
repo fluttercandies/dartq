@@ -343,8 +343,8 @@ use crate::bounds::{Bounds, Clause, TypeTree};
 use crate::codes::{ArgCountShape, ExecKind, SemanticCode, SuperShape, UncheckedNullableKind};
 use crate::collector::container_modifiers;
 use crate::const_eval::{
-    BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, Expr, IdentVerdict, UnOp, Verdict,
-    collect_not_potentially_constant, eval,
+    BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, Expr, IdentVerdict, InstanceKind,
+    UnOp, Verdict, collect_not_potentially_constant, eval,
 };
 use crate::const_tracker::ConstTracker;
 use crate::library::{
@@ -2154,8 +2154,65 @@ pub fn fold_unit_with_ops<'t>(
     // matched type (`getMatchedValueType`'s head) — the narrowed type can
     // never equal the constant where the declared type could. The rows
     // stage into the usage tail like their parse-time siblings.
+    // The oracle's dead-node short-circuit (`deadNodeReported`): a
+    // constant pattern inside an unreachable clause never reaches the
+    // verifier — the clause's `unreachable_switch_case` row answers
+    // instead. The parse-time rows staged straight into `usage` carry no
+    // clause link, so the dead windows are re-derived from the completed
+    // switch contexts: an unreachable `case` anchor runs through the next
+    // case's anchor.
+    let dead_case = SemanticCode::UnreachableSwitchCase.code_info().name;
+    let dead_anchors: FxHashSet<u32> = report
+        .diagnostics
+        .iter()
+        .chain(report.usage.iter())
+        .filter(|d| d.code.name == dead_case)
+        .map(|d| d.range.offset)
+        .collect();
+    let mut dead_windows: Vec<(u32, u32)> = Vec::new();
+    if !dead_anchors.is_empty() {
+        for ctx in &engine.switch.switches.completed {
+            for (index, case) in ctx.cases.iter().enumerate() {
+                if dead_anchors.contains(&case.anchor.offset) {
+                    // The clause's head start is `flow_anchor` (the `case`
+                    // keyword for statements, the pattern's first token on
+                    // the expression path) — the diagnostic anchor `=>`
+                    // sits after an expression case's pattern and would
+                    // exclude the constant node from its own window.
+                    let start = case.flow_anchor.offset.min(case.anchor.offset);
+                    let end = ctx
+                        .cases
+                        .get(index + 1)
+                        .map(|next| next.flow_anchor.offset.min(next.anchor.offset))
+                        .unwrap_or(u32::MAX);
+                    dead_windows.push((start, end));
+                }
+            }
+        }
+        if !dead_windows.is_empty() {
+            let never = SemanticCode::ConstantPatternNeverMatchesValueType
+                .code_info()
+                .name;
+            report.usage.retain(|d| {
+                d.code.name != never
+                    || !dead_windows
+                        .iter()
+                        .any(|&(start, end)| d.range.offset >= start && d.range.offset < end)
+            });
+        }
+    }
     let pending_matched = std::mem::take(&mut engine.pending_matched);
     for cand in pending_matched {
+        // The oracle's dead-node short-circuit (`deadNodeReported`):
+        // a constant pattern inside an unreachable clause never reaches
+        // the verifier — the unreachable_switch_case row answers instead.
+        if engine.in_dead_window(cand.at)
+            || dead_windows
+                .iter()
+                .any(|&(start, end)| cand.clause.offset >= start && cand.clause.offset < end)
+        {
+            continue;
+        }
         let matched = matched_types
             .iter()
             .rev()
@@ -2164,9 +2221,30 @@ pub fn fold_unit_with_ops<'t>(
         let Some(matched) = matched else {
             continue;
         };
-        if engine.constant_never_matches(cand.constant, matched) {
+        // The expression's recovered static type (`value.type` in the
+        // oracle, constant_verifier.dart:140-165): a composite constant
+        // (`case 1 == 2:`) arms the LAST literal's type while the parsed
+        // expression's own type is the fold's (`bool`) — the candidate's
+        // `constant` is wrong whenever the fold answered differently. The
+        // folded `Value` row spans the whole expression node (the operand
+        // rows it drained are strictly smaller), so the widest row inside
+        // the pattern's span re-reads it — `operand_static_ty` answering
+        // the `typeOrThrow` face the oracle's gate reads.
+        let constant = engine
+            .rows
+            .iter()
+            .filter(|row| {
+                row.range.offset >= cand.at.offset
+                    && row.range.end() <= cand.at.end()
+                    && matches!(row.shape, RowShape::Value | RowShape::Record(..))
+            })
+            .max_by_key(|row| row.range.length)
+            .map(|row| engine.operand_static_ty(row))
+            .filter(|ty| *ty != Ty::UNKNOWN)
+            .unwrap_or(cand.constant);
+        if engine.constant_never_matches(constant, matched) {
             let a0 = engine.ty_display(matched);
-            let a1 = engine.ty_display(cand.constant);
+            let a1 = engine.ty_display(constant);
             // The row stages into the TAKEN report's usage tail: the
             // engine's own report left with `let mut report` above, so an
             // `engine.stage_typed` push here would land in the fresh
@@ -7375,3 +7453,26 @@ mod ticket_3213_tests;
 /// boundary/hex/negated/overflow sections, and the `int`-typed silence.
 #[cfg(test)]
 mod ticket_3211_tests;
+
+#[cfg(test)]
+#[path = "diagnose/ticket_3518_pins.rs"]
+mod ticket_3518_pins;
+
+/// The #3512 pins: the bare `Function` head's callable-class acceptance
+/// runs ONE member-face proof for the bare head and a written
+/// instantiation alike (`Function b = C1<int>()` accepts; a class with no
+/// `call`, a `static call`, a `call` getter and a nullable receiver keep
+/// rejecting).
+#[cfg(test)]
+#[path = "diagnose/ticket_3512_tests.rs"]
+mod ticket_3512_tests;
+
+/// The #3520 pins: `constant_pattern_never_matches_value_type` runs on
+/// the RECOVERED constant's type — `visitConstantPattern` evaluates the
+/// parser-flagged expression unconditionally (`!false`, `const Class()`,
+/// `const <int>[]`, `const #a`, `const int`, `const 1 == 2`), the eval
+/// faults and dead clauses keep their suppression, and the armed
+/// composite re-reads the folded row's own type at the teardown join.
+#[cfg(test)]
+#[path = "diagnose/ticket_3520_tests.rs"]
+mod ticket_3520_tests;

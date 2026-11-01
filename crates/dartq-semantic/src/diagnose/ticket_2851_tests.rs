@@ -91,16 +91,41 @@ fn literal_true_deads_the_whole_else_statement() {
     assert_dead_row(&report, start, (end - start + 1) as u32);
 }
 
-/// A const VARIABLE condition does not fold (`const k = false; if (k)`):
-/// the oracle's booleanLiteral face folds literal expressions only — a
-/// const local's read carries no branch info (the
-/// `deadBlock_if_debugConst_*` census cases are silent on both sides).
-/// This is the over-fold guard.
+/// A TOP-LEVEL `const` condition is not folded: the read of a file-scope
+/// constant is not a tracked local, so its `ExpressionInfo` carries no
+/// branch pair and both arms stay live. This is the over-fold guard, and
+/// it is the face the `deadBlock_if_debugConst_*` census cases pin
+/// (`diagnostics/dead_code/DeadCodeTestCases_Language212/
+/// test_deadBlock_if_debugConst_simpleIdentifier#0`: file body
+/// `const bool DEBUG = false; f() { if(DEBUG) {} }`, `expected.tsv` = `-`).
+///
+/// Oracle (`~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze` over the
+/// fixture below plus a local-const sibling): the file reports ONE
+/// `dead_code` row, and it is the LOCAL-const one — nothing for this
+/// shape, empty or non-empty then-block.
 #[test]
-fn const_variable_condition_stays_live() {
-    let fixture = "f() {\n  const k = false;\n  if (k) {\n    1;\n  }\n}\n";
+fn top_level_const_condition_stays_live() {
+    let fixture = "const bool DEBUG = false;\nvoid f() {\n  if (DEBUG) {\n    1;\n  }\n}\n";
     let report = report_ops(fixture);
     assert!(dead_rows(&report).is_empty(), "{:#?}", rows(&report));
+}
+
+/// A LOCAL `const` condition IS folded: a local constant is a tracked
+/// local, so its read carries the constant's branch pair
+/// (`booleanLiteral`, flow_analysis.dart:5364-5375) and the unchosen arm
+/// is the first dead node. The row anchors at the then-block's `{` and
+/// spans the block node.
+///
+/// Oracle (`dart analyze --format=machine` over the fixture below):
+/// `lib/main.dart|3|10|12|Dead code.` — the `{` at column 10 (line 3 of
+/// the fixture) with length 12, i.e. `{` through the closing `}`. Our row
+/// is that exact triple.
+#[test]
+fn local_const_condition_deads_the_then_block() {
+    let fixture = "void f() {\n  const k = false;\n  if (k) {\n    1;\n  }\n}\n";
+    let report = report_ops(fixture);
+    let start = at(fixture, "if (k) {") + "if (k) ".len();
+    assert_dead_row(&report, start, 12);
 }
 
 /// An unchosen collection-if element reports at the ELEMENT's own extent,

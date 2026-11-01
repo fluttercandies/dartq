@@ -215,6 +215,12 @@ impl SwitchTracker {
                 NameTy::Named(name, nullable) | NameTy::NamedArgs(name, nullable, _) => {
                     Restriction::Named(name, nullable)
                 }
+                // A `Null` matched type is one value: the type-free
+                // pattern covers it whole, and a written `Null` type test
+                // with no leaf (the typed-wildcard face) is that same
+                // space — never the empty one, which reported a bare
+                // `switch (null) { case Null _: }` as non-exhaustive.
+                NameTy::Null => Restriction::Null,
                 // A record/function context (a name-level sentinel) has no
                 // head to name: the type-free pattern covers exactly that
                 // context type, which [`collect_singles`] lowers verbatim.
@@ -959,7 +965,12 @@ fn collect_singles(
         // Typed leaves (`X`, `X?`, `E.c`, `true`/`false`): one type-test
         // single (official `convertTypePattern`/`convertConstantPattern`).
         Restriction::Named(name, nullable) => {
-            out.push(Single::full(NameTy::Named(*name, *nullable)));
+            // A written `Null` type test IS the `Null` static type
+            // (static_type.dart:21), so `Null _` and the `null` constant
+            // cover one space (the subsumption pins of #3518).
+            out.push(Single::full(
+                world.fold_written_null(&NameTy::Named(*name, *nullable)),
+            ));
         }
         Restriction::NamedArgs(name, nullable, args) => {
             out.push(Single::full(NameTy::NamedArgs(*name, *nullable, *args)));
@@ -1189,8 +1200,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     // A type lattice: several arms legitimately answer plain `true`.
     #[allow(clippy::match_same_arms)]
     fn is_subtype_of(&self, sub: &NameTy, sup: &NameTy) -> bool {
-        let sub = &self.extension_erasure(&self.fold_written_never(sub));
-        let sup = &self.extension_erasure(&self.fold_written_never(sup));
+        let sub = &self.fold_written_null(&self.extension_erasure(&self.fold_written_never(sub)));
+        let sup = &self.fold_written_null(&self.extension_erasure(&self.fold_written_never(sup)));
         if sub == sup {
             return true;
         }
@@ -1390,6 +1401,20 @@ impl<'a> NameWorld<'a> {
     fn fold_written_never(&self, ty: &NameTy) -> NameTy {
         match ty {
             NameTy::Named(name, false) if self.strings.resolve(*name) == "Never" => NameTy::Never,
+            other => *other,
+        }
+    }
+
+    /// The written-`Null` fold, the sibling of [`Self::fold_written_never`]:
+    /// `Null _` spells its type test as `Named("Null", false)`, while the
+    /// canonical leaf the lattice (and the `null` constant pattern) speaks
+    /// is [`NameTy::Null`]. Without the fold the two spellings cover
+    /// different spaces, so `null` followed by `Null _` under-claims the
+    /// subsumption (and the reverse order over-claims it). The same
+    /// local-shadowing caveat as the `Never` fold applies.
+    fn fold_written_null(&self, ty: &NameTy) -> NameTy {
+        match ty {
+            NameTy::Named(name, false) if self.strings.resolve(*name) == "Null" => NameTy::Null,
             other => *other,
         }
     }
@@ -2476,10 +2501,19 @@ impl<'a> NameWorld<'a> {
     }
 
     /// `_isContainedIn(type, space)` (upstream Dart SDK source,
-    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:490-500,
+    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:660-698,
     /// the cast-pattern containment test): every value of `ty` is matched by
-    /// `space`, where a type-free leaf covers the case's `context`. The
-    /// property columns of an object single are not walked here (a cast
+    /// `space`, where a type-free leaf covers the case's `context`.
+    ///
+    /// A union is ONE space, not a set of independent alternatives: a
+    /// sealed/enum `ty` is contained when the union covers its whole
+    /// closed subtype set (`expandSealedSubtypes`, shared.dart:682-696 —
+    /// `(A() || B()) as M` over sealed `M` is contained, so the cast's
+    /// throw path covers the rest and the whole context is matched). The
+    /// per-part walk alone answered "some single part contains `ty`",
+    /// which never holds for a supertype against its own subtypes.
+    ///
+    /// The property columns of an object single are not walked here (a cast
     /// whose sub-pattern constrains fields answers the conservative `false`,
     /// so the row keeps the narrower space — never a false full coverage).
     pub(crate) fn contained_in(
@@ -2490,12 +2524,29 @@ impl<'a> NameWorld<'a> {
     ) -> bool {
         match space {
             Restriction::NamedContext => self.is_subtype_of(&ty, &context),
-            Restriction::Union(parts) => parts
-                .iter()
-                .any(|part| self.contained_in(ty, part, context)),
+            Restriction::Union(parts) => {
+                if parts
+                    .iter()
+                    .any(|part| self.contained_in(ty, part, context))
+                {
+                    return true;
+                }
+                if !self.is_sealed(&ty) {
+                    return false;
+                }
+                let subtypes = self.subtypes(&ty);
+                !subtypes.is_empty()
+                    && subtypes
+                        .iter()
+                        .all(|sub| parts.iter().any(|part| self.contained_in(*sub, part, context)))
+            }
             Restriction::Null => matches!(ty, NameTy::Null),
-            Restriction::Object(name, _) => {
-                self.is_subtype_of(&ty, &NameTy::Named(*name, false))
+            // The official `_isContainedIn` gate is `_isUnrestricted(single)`
+            // (shared.dart:660-671): a single whose property columns carry
+            // constraints proves only its own narrowed region — `A(b: true)
+            // as A` covers `A(b: true)`, never the whole context.
+            Restriction::Object(name, fields) => {
+                fields.is_empty() && self.is_subtype_of(&ty, &NameTy::Named(*name, false))
             }
             _ => leaf_ty(space).is_some_and(|leaf| self.is_subtype_of(&ty, &leaf)),
         }
