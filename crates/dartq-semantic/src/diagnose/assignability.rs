@@ -3135,7 +3135,35 @@ impl<'a> Engine<'a> {
     /// `Unknown` where the oracle's `staticType` is the instantiated
     /// container), and a `??`/`?:` tail (the join of its two operand
     /// rows). Everything unresolved keeps the under-report `Unknown`.
+    ///
+    /// An `await` operand's expression-level static type is
+    /// `flatten(operand)` (`analyzeAwaitExpression`,
+    /// type_analyzer.dart:542-548). The close-time row rewrite holds only
+    /// the STORED `ty`: an invocation operand re-decides through
+    /// [`Self::expression_row_ty`]'s send face and spells the raw
+    /// `Future<T>` again, so the flatten re-applies over the operand
+    /// extent — the same on-demand read the argument face runs
+    /// (`flush_argument`/`flush_unclaimed`). Only the OUTER row takes it:
+    /// the `??`/`?:` left operand below is a sub-expression of the same
+    /// awaited operand, whose own static type upstream does not flatten.
     fn rhs_expression_ty(&self, row: &Row) -> Ty {
+        let ty = self.rhs_row_ty(row);
+        if ty != Ty::UNKNOWN
+            && self
+                .await_operand_extents
+                .iter()
+                .any(|&(start, end)| row.range.offset >= start && row.range.end() <= end)
+        {
+            self.flatten(ty)
+        } else {
+            ty
+        }
+    }
+
+    /// `rhs_expression_ty`'s undecorated face — the `??`/`?:` recursion
+    /// reads sub-expression types, which stay unflattened inside an
+    /// `await` operand (the flatten belongs to the whole expression).
+    fn rhs_row_ty(&self, row: &Row) -> Ty {
         let mut ty = self.expression_row_ty(row);
         if ty == Ty::UNKNOWN {
             ty = match &row.shape {
@@ -3151,7 +3179,7 @@ impl<'a> Engine<'a> {
             };
         }
         if let Some((left, ifnull)) = self.binary_join_operands(row) {
-            let left_ty = self.rhs_expression_ty(left);
+            let left_ty = self.rhs_row_ty(left);
             if left_ty != Ty::UNKNOWN && ty != Ty::UNKNOWN {
                 return self.join_operand_ty(left_ty, ty, ifnull);
             }
