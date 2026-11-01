@@ -70,6 +70,12 @@ impl<'a> Engine<'a> {
     /// finals — the top-level final spelling stays parser-owned, the CFE's
     /// shared `finalNotInitialized` face fires there); instance-field
     /// entries stay latched for the container's end.
+    ///
+    /// The declaration heads exempt both faces: `abstract`/`external`
+    /// (`visitTopLevelVariableDeclaration`'s group gate,
+    /// error_verifier.dart:2088-2092) and `late` (the staged latch never
+    /// arms) — an `external int x;` is implemented outside the library and
+    /// owns no initializer obligation.
     pub(crate) fn flush_init_variables(&mut self) {
         let mut index = 0usize;
         while index < self.pending_init_variables.len() {
@@ -98,6 +104,20 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             }
+            // The top-level group gate (`visitTopLevelVariableDeclaration`:
+            // `node.abstractKeyword == null && node.externalKeyword == null
+            // && !variableList.isLate`, error_verifier.dart:2088-2092): the
+            // face covers both the `final_not_initialized` and the
+            // `not_initialized_non_nullable_variable` rows, so it decides
+            // before the split. A static field's bits reach this point
+            // through the member model above (the `exempt` check); a
+            // top-level variable has no model row, so its head is read off
+            // the token stream.
+            if check.container.is_none()
+                && self.decl_head_exempts_init(check.range.offset)
+            {
+                continue;
+            }
             // The top-level final face is the parser's (the shared CFE
             // `finalNotInitialized` rider on the field parse).
             if check.is_final && !check.is_static {
@@ -107,10 +127,14 @@ impl<'a> Engine<'a> {
             if check.is_final {
                 self.emit(SemanticCode::FinalNotInitialized, check.range, &name, "");
             } else {
-                // The staged entry's loose nullability gate is re-decided on
-                // the collected declared type (`FutureOr<int?> v` is
-                // nullable — `isNullable` recurses the argument,
-                // type_system.dart:1220-1222).
+                // The staged entry's written-head gate is re-decided on the
+                // collected declared type — the oracle reads
+                // `element.type`, not the annotation (`dynamic`/`void`/
+                // `Null`/`FutureOr<T?>` never report; `isNullable`
+                // recurses the `FutureOr` argument, type_system.dart:
+                // 1220-1233). An uncaptured (`Unknown`) type keeps the
+                // written-head verdict: the staged gate already cleared
+                // the explicit `?` spellings.
                 let var_ty = match check.container {
                     Some(container) => self
                         .index
@@ -124,7 +148,7 @@ impl<'a> Engine<'a> {
                         .and_then(|elements| elements.decl(check.name))
                         .map(|decl| decl.var_ty),
                 };
-                if var_ty.is_some_and(|ty| self.future_or_nullable(ty)) {
+                if var_ty.is_some_and(|ty| ty != Ty::Unknown && self.written_nullable(ty)) {
                     continue;
                 }
                 self.emit(
@@ -140,7 +164,7 @@ impl<'a> Engine<'a> {
     /// The lexeme of the token starting exactly at `offset` (UTF-16), or
     /// `None` when no token begins there — a recovered/synthetic anchor
     /// never lands on a real token boundary.
-    fn lexeme_at(&self, offset: u32) -> Option<&'a str> {
+    pub(crate) fn lexeme_at(&self, offset: u32) -> Option<&'a str> {
         let tokens = self.tokens.as_slice();
         let at = tokens.partition_point(|token| token.utf16_offset < offset);
         if tokens.get(at).is_some_and(|token| token.utf16_offset == offset) {
@@ -152,7 +176,7 @@ impl<'a> Engine<'a> {
 
     /// The token immediately AFTER the one starting at `offset` — the
     /// `.name` selector of a named primary-constructor head reads it.
-    fn token_after(&self, offset: u32) -> Option<SourceRange> {
+    pub(crate) fn token_after(&self, offset: u32) -> Option<SourceRange> {
         let tokens = self.tokens.as_slice();
         let at = tokens.partition_point(|token| token.utf16_offset <= offset);
         tokens.get(at).map(|token| SourceRange {
@@ -162,51 +186,60 @@ impl<'a> Engine<'a> {
         })
     }
 
-    /// Whether the written type is a `FutureOr<T>` whose `T` is nullable —
-    /// the one nullable shape the staged entries' loose potentially-non-
-    /// nullable gate can carry into the flush (`FutureOr<int?> v`,
-    /// `FutureOr` bare = `FutureOr<dynamic>`). Name-matched only (a user
-    /// `FutureOr` in scope shadows the dart:async spelling — the
-    /// under-report direction).
-    fn future_or_nullable(&self, ty: Ty) -> bool {
-        let Ty::Named {
-            name,
-            nullable,
-            args,
-        } = ty
-        else {
-            return false;
-        };
-        if nullable || self.strings.resolve(name) != "FutureOr" {
-            return false;
-        }
-        if args == crate::model::ArgListId::EMPTY {
-            // `FutureOr` bare is `FutureOr<dynamic>` — nullable.
-            return true;
-        }
-        let pool = self.boundary.args.borrow();
-        pool.get(args)
-            .first()
-            .is_none_or(|arg| self.written_nullable(*arg))
-    }
-
-    /// The name-level `isNullable` (type_system.dart:1208-1224): the
+    /// The name-level `isNullable` (type_system.dart:1208-1233): the
     /// `?`-suffixed and `dynamic`/`Null`/`void`/`Unknown` faces are
-    /// nullable, `FutureOr<T>` recurses its argument, everything else is
-    /// not.
+    /// nullable, a `FutureOr<T>` recurses its argument (`FutureOr` bare
+    /// reads `FutureOr<dynamic>`), everything else is not. `FutureOr` is
+    /// name-matched: a user type shadowing the dart:async spelling takes
+    /// the generic arm, which is the under-report direction.
     fn written_nullable(&self, ty: Ty) -> bool {
         match ty {
             Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
             Ty::Named {
-                name,
-                nullable,
-                args,
-            } => {
-                nullable || self.future_or_nullable(Ty::Named { name, nullable, args })
+                name, nullable, ..
+            } if nullable || self.strings.resolve(name) != "FutureOr" => nullable,
+            Ty::Named {
+                args: crate::model::ArgListId::EMPTY,
+                ..
+            } => true,
+            Ty::Named { args, .. } => {
+                let arg = {
+                    let pool = self.boundary.args.borrow();
+                    pool.get(args).first().copied()
+                };
+                arg.is_none_or(|arg| self.written_nullable(arg))
             }
             Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => nullable,
             Ty::Never => false,
         }
+    }
+
+    /// Whether the top-level declaration head of the variable named at
+    /// `name_offset` carries `abstract` or `external` — upstream's group
+    /// gate for both uninitialized faces (`visitTopLevelVariableDeclaration`,
+    /// error_verifier.dart:2088-2092). The model carries no modifier row
+    /// for a top-level variable, so the head is read off the token stream:
+    /// the scan opens after the previous declaration boundary and stops at
+    /// the group's first `=` — an initializer can hold a bare `external`
+    /// identifier (`var y = external;` is legal), a head cannot.
+    fn decl_head_exempts_init(&self, name_offset: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < name_offset);
+        let mut start = at as isize - 1;
+        while start >= 0 {
+            match self.tokens.lexeme(self.source, start as usize) {
+                ";" | "{" | "}" => break,
+                _ => start -= 1,
+            }
+        }
+        for index in (start + 1).max(0) as usize..at {
+            match self.tokens.lexeme(self.source, index) {
+                "abstract" | "external" => return true,
+                "=" | ";" | "}" => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Whether the constructor head starting at `head` (its class-name
@@ -243,6 +276,11 @@ impl<'a> Engine<'a> {
     /// and duplicate-named fields join no constructor row (upstream
     /// `checkElement`'s already-reported guard).
     pub(crate) fn flush_init_instance_fields(&mut self, container: StringId) {
+        // The const-constructor declaration face (#3293) reads the complete
+        // field set and constructor set of the class, both closed by this
+        // point — every early return below belongs to the
+        // initialization rows alone.
+        self.flush_const_ctor_non_final_face(container);
         // The generative constructor set: every declared constructor rides a
         // `begin_constructor` site; factories register no head anchor (their
         // provisional is `None`) and stay out of the generative walks. The
@@ -445,18 +483,19 @@ impl<'a> Engine<'a> {
             if check.is_final {
                 finals.push((name, check.range));
             } else {
-                // The staged entry's loose nullability gate is re-decided on
-                // the collected declared type: `FutureOr<T>` is nullable
-                // when T is (`isNullable`, type_system.dart:1220-1222 —
-                // `FutureOr<int?> v` is no required-initialization face),
-                // a verdict the name-level written-type arm cannot reach.
+                // The staged entry's written-head gate is re-decided on the
+                // collected declared type: `FutureOr<T>` is nullable when T
+                // is (`isNullable`, type_system.dart:1220-1233 —
+                // `FutureOr<int?> v` is no required-initialization face), a
+                // verdict the name-level written-type arm cannot reach. An
+                // uncaptured type keeps that arm's verdict.
                 let var_ty = self
                     .index
                     .get(self.file)
                     .and_then(|elements| elements.container(container))
                     .and_then(|decl| decl.members.get(&check.name))
                     .map(|entry| entry.var_ty);
-                if var_ty.is_some_and(|ty| self.future_or_nullable(ty)) {
+                if var_ty.is_some_and(|ty| ty != Ty::Unknown && self.written_nullable(ty)) {
                     continue;
                 }
                 non_finals.push((name, check.range));
