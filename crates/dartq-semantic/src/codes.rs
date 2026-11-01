@@ -1896,39 +1896,6 @@ pub enum SemanticCode {
     /// `augmentationInducedSetterAlreadyComplete`) ride one analyzer name
     /// (`sharedName`); the shape enum picks the message.
     AugmentationAlreadyComplete(AlreadyCompleteShape),
-    // —— #3569: the body-completeness and const/default faces of the
-    //    augmentations experiment (`error_verifier.dart`
-    //    `_checkForFunctionBodyCompleteness` /
-    //    `_checkForIncompleteInducedAccessors` /
-    //    `_checkForConstVariableAugmentation*` /
-    //    `_checkForDefaultValueAlreadySpecifiedInAugmentationChain`; all
-    //    `COMPILE_TIME_ERROR`, all `hasPublishedDocs: false`,
-    //    diagnostic.g.dart) ————————————————————————————————————————————
-    /// `The function or member '{0}' must have a body after all
-    /// augmentations are applied.` — an introductory executable whose
-    /// fragment chain has more than one fragment and none is complete, at
-    /// the declaration's name token.
-    FunctionNotCompleteAfterAugmentations,
-    /// `The getter induced by '{0}' must have a body after all
-    /// augmentations are applied.` — the abstract variable's induced-getter
-    /// chain grew through augmentations and stays incomplete, at the
-    /// variable's name token.
-    InducedGetterNotCompleteAfterAugmentations,
-    /// `The setter induced by '{0}' must have a body after all
-    /// augmentations are applied.` — the non-final abstract variable's
-    /// induced-setter counterpart, same anchor.
-    InducedSetterNotCompleteAfterAugmentations,
-    /// `Const variables can't be augmented.` — an augmentation resolves
-    /// against a `const` variable target, at the augmenting name token.
-    AugmentsConstantVariable,
-    /// `Variable augmentations can't be const.` — a variable augmentation
-    /// writes the `const` keyword, at the variable's name token.
-    ConstantVariableAugmentation,
-    /// `The default value for this optional parameter was already specified
-    /// in the augmentation chain.` — an augmentation's optional formal
-    /// repeats a default a preceding fragment already wrote, at the `=`
-    /// separator.
-    DefaultValueAlreadySpecifiedInAugmentationChain,
     // —— #2993: the whole-face-missing emitters (one contiguous append
     //    block; every row's tier and verbatim text pinned against the
     //    3.13.7 registry, diagnostic.g.dart) —————————————————————————————
@@ -2826,31 +2793,6 @@ impl SemanticCode {
                 "declaration_already_complete",
                 "DECLARATION_ALREADY_COMPLETE",
             ),
-            // The #3569 completeness/const/default faces (one registry name
-            // per row — no shared names upstream).
-            Self::FunctionNotCompleteAfterAugmentations => (
-                "function_not_complete_after_augmentations",
-                "FUNCTION_NOT_COMPLETE_AFTER_AUGMENTATIONS",
-            ),
-            Self::InducedGetterNotCompleteAfterAugmentations => (
-                "induced_getter_not_complete_after_augmentations",
-                "INDUCED_GETTER_NOT_COMPLETE_AFTER_AUGMENTATIONS",
-            ),
-            Self::InducedSetterNotCompleteAfterAugmentations => (
-                "induced_setter_not_complete_after_augmentations",
-                "INDUCED_SETTER_NOT_COMPLETE_AFTER_AUGMENTATIONS",
-            ),
-            Self::AugmentsConstantVariable => {
-                ("augments_constant_variable", "AUGMENTS_CONSTANT_VARIABLE")
-            }
-            Self::ConstantVariableAugmentation => (
-                "constant_variable_augmentation",
-                "CONSTANT_VARIABLE_AUGMENTATION",
-            ),
-            Self::DefaultValueAlreadySpecifiedInAugmentationChain => (
-                "default_value_already_specified_in_augmentation_chain",
-                "DEFAULT_VALUE_ALREADY_SPECIFIED_IN_AUGMENTATION_CHAIN",
-            ),
             // The #743 W1-micro cluster. The NaN pair keeps one registry
             // name (sharedName `unnecessaryNanComparison`; the polarity
             // lives in the message shape), like the null-comparison pair.
@@ -3213,14 +3155,6 @@ impl SemanticCode {
                 // `enumWithoutConstants` carries no published docs
                 // (diagnostic.g.dart:4966-4974 — no `hasPublishedDocs` flag).
                 | Self::EnumWithoutConstants
-                // The #3569 augmentation rows all carry
-                // `hasPublishedDocs: false` (messages.yaml).
-                | Self::FunctionNotCompleteAfterAugmentations
-                | Self::InducedGetterNotCompleteAfterAugmentations
-                | Self::InducedSetterNotCompleteAfterAugmentations
-                | Self::AugmentsConstantVariable
-                | Self::ConstantVariableAugmentation
-                | Self::DefaultValueAlreadySpecifiedInAugmentationChain
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -4569,25 +4503,6 @@ impl SemanticCode {
             }
             Self::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedSetter) => {
                 "The setter induced by this augmentation is complete, but the setter being augmented is already complete.".to_string()
-            }
-            // The #3569 faces (messages.yaml, verbatim).
-            Self::FunctionNotCompleteAfterAugmentations => {
-                format!("The function or member '{a0}' must have a body after all augmentations are applied.")
-            }
-            Self::InducedGetterNotCompleteAfterAugmentations => {
-                format!("The getter induced by '{a0}' must have a body after all augmentations are applied.")
-            }
-            Self::InducedSetterNotCompleteAfterAugmentations => {
-                format!("The setter induced by '{a0}' must have a body after all augmentations are applied.")
-            }
-            Self::AugmentsConstantVariable => {
-                "Const variables can't be augmented.".to_string()
-            }
-            Self::ConstantVariableAugmentation => {
-                "Variable augmentations can't be const.".to_string()
-            }
-            Self::DefaultValueAlreadySpecifiedInAugmentationChain => {
-                "The default value for this optional parameter was already specified in the augmentation chain.".to_string()
             }
             // The #2993 whole-face-missing rows (verbatim 3.13.7 registry
             // texts; the with-details shape is the registry's
@@ -6464,14 +6379,6 @@ mod tests {
             | SemanticCode::AugmentationTypeParameterName
             | SemanticCode::AugmentationWithoutDeclaration(_)
             | SemanticCode::TypedefAugmentation
-            // The #3569 faces ride the same inline-template posture (no
-            // `registry_message` call site).
-            | SemanticCode::FunctionNotCompleteAfterAugmentations
-            | SemanticCode::InducedGetterNotCompleteAfterAugmentations
-            | SemanticCode::InducedSetterNotCompleteAfterAugmentations
-            | SemanticCode::AugmentsConstantVariable
-            | SemanticCode::ConstantVariableAugmentation
-            | SemanticCode::DefaultValueAlreadySpecifiedInAugmentationChain
             | SemanticCode::BodyMightCompleteNormally
             | SemanticCode::BodyMightCompleteNormallyNullable
             | SemanticCode::CastFromNullAlwaysFails
