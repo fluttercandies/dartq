@@ -19992,3 +19992,18 @@ mod ticket_3433_tests;
 #[cfg(test)]
 #[path = "ticket_3443_tests.rs"]
 mod ticket_3443_tests;
+
+// —— #3378 —— the augment fragment's member scope joins the introduced
+// —— element's across the library's units: upstream keys the duplicate
+// —— context on the merged element's first fragment
+// —— (`member_duplicate_definition_verifier.dart` `_checkClassMembers`),
+// —— so a member a cross-unit fragment repeats reports at the fragment's
+// —— declaration, a fragment getter pairs with the introduction's setter,
+// —— and the merged face stays identical whichever unit order the library
+// —— declared its fragments in. Registered here via `#[path]`; the module
+// —— stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// —— resolves.
+
+#[cfg(test)]
+#[path = "ticket_3378_tests.rs"]
+mod ticket_3378_tests;

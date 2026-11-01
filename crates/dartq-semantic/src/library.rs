@@ -58,9 +58,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 
+use crate::collector::{DUP_GETTER, DUP_OTHER, DUP_PAIR, DUP_SETTER};
 use crate::model::{
-    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, FileElements, FnShapeId, MemberEntry,
-    MicroKind, RecordShapeId, TopDecl, Ty,
+    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, DuplicateDecl, FileElements,
+    FnShapeId, MemberEntry, MemberKind, MicroKind, RecordShapeId, TopDecl, Ty,
 };
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
@@ -82,6 +83,13 @@ pub struct ElementIndex {
     /// One cell per `LibraryId::index`, holding that library's fragment sets;
     /// `None` is a library whose containers are never augmented.
     fragments: OnceLock<Vec<OnceLock<Option<Box<[ElementFragments]>>>>>,
+    /// Per-library merged-fragment `duplicate_definition` enrichment
+    /// (#3378): one cell per `LibraryId::index`, parallel to
+    /// [`Self::fragments`]. Each `library_fragments` build populates its
+    /// own cell with the units that gained rows. `get` scans the cells —
+    /// the number of libraries is small and `get` already walks the file
+    /// table.
+    enriched_by_file: OnceLock<Vec<OnceLock<Option<FxHashMap<FileId, Arc<FileElements>>>>>>,
 }
 
 impl ElementIndex {
@@ -93,11 +101,24 @@ impl ElementIndex {
         // already resolved; both caches are pure functions of the model set.
         self.augmented = OnceLock::new();
         self.fragments = OnceLock::new();
+        self.enriched_by_file = OnceLock::new();
     }
 
-    /// The model of `file`, if analyzed.
+    /// The model of `file`, if analyzed. When the fragment layer has run,
+    /// the enriched variant wins: it carries the merged-fragment duplicate
+    /// rows the per-unit collector cannot see (#3378). A unit with no
+    /// appended rows has no entry — the raw model answers.
     #[must_use]
     pub fn get(&self, file: FileId) -> Option<&FileElements> {
+        if let Some(cells) = self.enriched_by_file.get() {
+            for cell in cells.iter() {
+                if let Some(Some(map)) = cell.get()
+                    && let Some(arc) = map.get(&file)
+                {
+                    return Some(arc.as_ref());
+                }
+            }
+        }
         self.files.get(&file).map(Arc::as_ref)
     }
 
@@ -185,7 +206,17 @@ impl ElementIndex {
             .get_or_init(|| (0..graph.len()).map(|_| OnceLock::new()).collect());
         cells
             .get(lib.index() as usize)?
-            .get_or_init(|| build_fragments(graph, self, lib))
+            .get_or_init(|| {
+                let (fragments, enriched) = build_fragments(graph, self, lib)?;
+                // Populate the per-lib enriched cell for `get` (#3378).
+                let enriched_cells = self.enriched_by_file.get_or_init(|| {
+                    (0..graph.len()).map(|_| OnceLock::new()).collect()
+                });
+                if let Some(cell) = enriched_cells.get(lib.index() as usize) {
+                    let _ = cell.set(if enriched.is_empty() { None } else { Some(enriched) });
+                }
+                Some(fragments)
+            })
             .as_deref()
     }
 }
@@ -251,11 +282,19 @@ fn writes_container_fragment(aug: &AugmentDecl) -> bool {
 /// the build is independent of which unit triggered it and of the order the
 /// units were collected in (a fragment declaring first and one declaring
 /// last produce the same face).
+///
+/// Returns `(fragments, enriched)` — the merged-fragment
+/// `duplicate_definition` enrichment per unit (#3378): cloned
+/// `FileElements` carrying the `DuplicateDecl` rows the merged claim
+/// evaluation found. Empty when no unit gains a row.
 fn build_fragments(
     graph: &LibraryGraph,
     index: &ElementIndex,
     lib: LibraryId,
-) -> Option<Box<[ElementFragments]>> {
+) -> Option<(
+    Box<[ElementFragments]>,
+    FxHashMap<FileId, Arc<FileElements>>,
+)> {
     let units = graph.unit_files(lib);
     // name → (unit, that unit's `augment`-head commits) in library order.
     let mut order: FxHashMap<StringId, Vec<(FileId, usize)>> = FxHashMap::default();
@@ -316,9 +355,12 @@ fn build_fragments(
                     continue;
                 };
                 // The owner's own rows keep their own pool; every other
-                // fragment contributes its portable rows only. `NameMap`'s
-                // from-iterator keeps the FIRST row of a duplicate spelling,
-                // so the owner's own declaration wins over a fragment's.
+                // fragment contributes its members with pool-carrying `Ty`s
+                // sanitized to `Ty::Unknown` — the name resolves (the
+                // fragment scope merge), the foreign slot is never readable
+                // through this face. `NameMap`'s from-iterator keeps the
+                // FIRST row of a duplicate spelling, so the owner's own
+                // declaration wins over a fragment's.
                 let mut rows: Vec<(StringId, MemberEntry)> = own.members.iter().cloned().collect();
                 for &other in &owners {
                     if other == owner {
@@ -330,8 +372,7 @@ fn build_fragments(
                     rows.extend(
                         face.members
                             .iter()
-                            .filter(|(_, entry)| entry_is_portable(entry))
-                            .map(|(member, entry)| (*member, entry.clone())),
+                            .map(|(member, entry)| (*member, sanitize_entry(entry))),
                     );
                 }
                 faces.push((
@@ -356,7 +397,155 @@ fn build_fragments(
         });
     }
     elements.sort_by_key(|element| element.name);
-    Some(elements.into_boxed_slice())
+
+    // ── #3378: merged-fragment duplicate evaluation ──────────────────────
+    // Upstream keys `_checkClassMembers` on `fragment.element
+    // .firstFragment` — the merged element's context — so a member the
+    // augment fragment repeats reports `duplicate_definition` at the
+    // fragment's declaration. The per-unit collector cannot see the other
+    // fragments; this pass replays the merged claim scope over every
+    // fragment's members in element order (introduction first, then
+    // fragments in library unit order) and collects the `DuplicateDecl`
+    // rows the unit-local pass could not produce.
+    //
+    // # Claim shapes (mirroring `member_dup_claim`, collector.rs:953-981)
+    //
+    // `MemberKind` maps to the claim bits the collector's call sites use:
+    // field → `DUP_GETTER` + `DUP_SETTER` when `defines_setter`
+    // (approximated by `!is_final` — the `late final` split is a
+    // same-unit concern the merged pass cannot reach); getter →
+    // `DUP_GETTER`; setter → `DUP_SETTER`; method → `DUP_OTHER`. The
+    // scope key is the `members` map key verbatim — for a setter this is
+    // the `name=` spelling rather than the stripped bare name upstream
+    // uses, so an explicit `set foo` after a field's induced `foo` setter
+    // is the one cross-unit claim pair the merged pass cannot normalize
+    // (documented residual).
+    // DUP_* constants imported from collector.rs — the single source of
+    // truth for the member-scope claim bits.
+    let mut enriched: FxHashMap<FileId, Arc<FileElements>> = FxHashMap::default();
+    for element in &elements {
+        let Some(intro) = element.intro else {
+            continue;
+        };
+        // `(claims, claiming_unit)` per name — a collision reports only
+        // when the prior claim came from a DIFFERENT unit (the unit-local
+        // `member_scopes` already reports same-unit collisions).
+        let mut instance: FxHashMap<StringId, (u8, FileId)> = FxHashMap::default();
+        let mut statics: FxHashMap<StringId, (u8, FileId)> = FxHashMap::default();
+        let mut appended: Vec<(FileId, Vec<DuplicateDecl>)> = Vec::new();
+        // Claims in element order: introduction first, then fragments in
+        // library unit order — the same sequence upstream's merged
+        // `_InstanceElementContext` walks.
+        let claim_order: Vec<FileId> = std::iter::once(intro)
+            .chain(element.fragments.iter().copied().filter(|f| *f != intro))
+            .collect();
+        for unit in claim_order {
+            let Some(elements) = index.get(unit) else {
+                continue;
+            };
+            let Some(container) = elements.container(element.name) else {
+                continue;
+            };
+            // Source order within the fragment — `members` is name-sorted,
+            // so restore the declaration sequence by `name_range`.
+            let mut members: Vec<(&StringId, &MemberEntry)> =
+                container.members.iter().map(|(k, v)| (k, v)).collect();
+            members.sort_by_key(|(_, entry)| entry.name_range.offset);
+            let mut unit_dups: Vec<DuplicateDecl> = Vec::new();
+            for (name, entry) in members {
+                let claims: &[u8] = match entry.kind {
+                    MemberKind::Field => {
+                        // An enum constant claims only the getter face
+                        // (upstream `_checkClassMembers` pushes the
+                        // constant's induced getter into the static
+                        // scope — collector.rs:3929-3931). A non-final
+                        // field claims its induced getter+setter pair;
+                        // `final`/`late final` with initializer claims
+                        // getter only.
+                        if container.kind == ContainerKind::Enum || entry.is_final {
+                            &[DUP_GETTER]
+                        } else {
+                            &[DUP_GETTER, DUP_SETTER]
+                        }
+                    }
+                    MemberKind::Getter => &[DUP_GETTER],
+                    MemberKind::Setter => &[DUP_SETTER],
+                    MemberKind::Method => &[DUP_OTHER],
+                };
+                let scope = if entry.is_static {
+                    &mut statics
+                } else {
+                    &mut instance
+                };
+                // Claims a fragment (non-intro) member makes always report —
+                // augment members neither check nor claim in the unit-local
+                // `member_scopes`, so the unit-local pass could not have
+                // seen the collision. An intro member's own unit claims
+                // already reported same-unit collisions.
+                let is_fragment_member = unit != intro;
+                for &claim in claims {
+                    let prior = scope.get(name).copied();
+                    match prior {
+                        None => {
+                            scope.insert(*name, (claim, unit));
+                        }
+                        Some((DUP_GETTER, prior_unit)) if claim == DUP_SETTER => {
+                            scope.insert(*name, (DUP_PAIR, prior_unit));
+                        }
+                        Some((DUP_SETTER, prior_unit)) if claim == DUP_GETTER => {
+                            scope.insert(*name, (DUP_PAIR, prior_unit));
+                        }
+                        Some((_, prior_unit)) if prior_unit != unit || is_fragment_member => {
+                            // Mirror `record_duplicate`'s absorption
+                            // (collector.rs:904-913): a field's getter and
+                            // setter claims each collide at the same name
+                            // token, and the oracle's pipeline folds those
+                            // two reports into one row — only a
+                            // back-to-back identical repeat is absorbed.
+                            let row = DuplicateDecl {
+                                name: *name,
+                                range: entry.name_range,
+                            };
+                            if unit_dups.last() != Some(&row) {
+                                unit_dups.push(row);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !unit_dups.is_empty() {
+                appended.push((unit, unit_dups));
+            }
+        }
+        // Merge the appended rows into each unit's enriched model. A unit
+        // already enriched by a previous element extends its row set rather
+        // than re-cloning from raw — `insert` would drop the earlier rows.
+        for (unit, dups) in appended {
+            let elements = if let Some(existing) = enriched.get(&unit) {
+                let mut elements = (**existing).clone();
+                let mut all: Vec<DuplicateDecl> =
+                    elements.duplicates.iter().copied().collect();
+                all.extend(dups);
+                all.sort_by_key(|d| d.range.offset);
+                elements.duplicates = all.into_boxed_slice();
+                elements
+            } else {
+                let Some(raw) = index.files.get(&unit) else {
+                    continue;
+                };
+                let mut elements = (**raw).clone();
+                let mut all: Vec<DuplicateDecl> =
+                    elements.duplicates.iter().copied().collect();
+                all.extend(dups);
+                all.sort_by_key(|d| d.range.offset);
+                elements.duplicates = all.into_boxed_slice();
+                elements
+            };
+            enriched.insert(unit, Arc::new(elements));
+        }
+    }
+    Some((elements.into_boxed_slice(), enriched))
 }
 
 /// Whether `ty` reads identically through every unit's argument pool: the
@@ -390,6 +579,38 @@ fn entry_is_portable(entry: &MemberEntry) -> bool {
                 .chain(formals.named.iter())
                 .all(|formal| ty_is_pool_free(formal.ty))
         })
+}
+
+/// `entry` with every pool-carrying `Ty` rewritten to `Ty::Unknown` — the
+/// member joins another unit's merged face for name resolution, but the
+/// foreign argument-pool slot is never exposed: the merged face reads a
+/// `Ty::Unknown` where the original interned into the declaring unit's
+/// [`crate::model::ArgPool`] (an out-of-range slot would panic). Pool-free
+/// entries return a verbatim clone.
+fn sanitize_entry(entry: &MemberEntry) -> MemberEntry {
+    if entry_is_portable(entry) {
+        return entry.clone();
+    }
+    let mut entry = entry.clone();
+    if !ty_is_pool_free(entry.var_ty) {
+        entry.var_ty = Ty::Unknown;
+    }
+    if !ty_is_pool_free(entry.return_ty) {
+        entry.return_ty = Ty::Unknown;
+    }
+    for bound in entry.type_param_bounds.iter_mut() {
+        if !ty_is_pool_free(*bound) {
+            *bound = Ty::Unknown;
+        }
+    }
+    if let Some(formals) = entry.formals.as_mut() {
+        for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+            if !ty_is_pool_free(formal.ty) {
+                formal.ty = Ty::Unknown;
+            }
+        }
+    }
+    entry
 }
 
 /// The kind tag of a name in a library face: a known [`MicroKind`], or

@@ -106,10 +106,10 @@ const OPERATORS_WITH_ONE_PARAMETER: [&str; 16] = [
 /// (a setter `foo` claims `foo`, not `foo=`) and merges a lone getter
 /// with a lone setter into a getter/setter pair — every other
 /// combination collides (member_duplicate_definition_verifier.dart:297-346).
-const DUP_GETTER: u8 = 1;
-const DUP_SETTER: u8 = 2;
-const DUP_OTHER: u8 = 4;
-const DUP_PAIR: u8 = DUP_GETTER | DUP_SETTER;
+pub(crate) const DUP_GETTER: u8 = 1;
+pub(crate) const DUP_SETTER: u8 = 2;
+pub(crate) const DUP_OTHER: u8 = 4;
+pub(crate) const DUP_PAIR: u8 = DUP_GETTER | DUP_SETTER;
 
 /// An open container on the capture stack.
 #[expect(
