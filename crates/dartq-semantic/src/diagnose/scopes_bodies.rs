@@ -5921,7 +5921,40 @@ impl<'a> Engine<'a> {
         if *generator || (*is_async && !self.legal_async_return(declared)) {
             return;
         }
+        // The SYNC completion question folds a written-but-unresolved
+        // head to the silent face: upstream's `returnType` is
+        // `InvalidType` there (`isNullable` admits it, so the verdict's
+        // `FutureOr`-base arm swallows it without a row) — the same
+        // stand-in an absent annotation already latches. The async
+        // question keeps the written head instead: `InvalidType` is a
+        // top face upstream (legal through `Future<Never> <: T`), and
+        // the `FutureOr<futureValueType(S)>` context reads it through
+        // `futureValueType`'s `Object?` arm — folding to `Unknown` here
+        // would skip a row the oracle still reports.
+        let declared = if *is_async {
+            declared
+        } else {
+            self.invalid_return_fold(declared)
+        };
         self.insert_body_completion(end.range, declared, *body_brace, *is_async, anchor);
+    }
+
+    /// The sync completion question's `InvalidType` stand-in
+    /// (`checkForBodyMayCompleteNormally`'s `isNullable` admission,
+    /// resolver.dart:584-603): a `Named` head that resolves to no type in
+    /// scope — an undefined name, a non-type element, a member of the
+    /// enclosing container — is upstream `InvalidType` and asks no
+    /// nullability question. Folding it to `Ty::UNKNOWN` (the same
+    /// stand-in an omitted return annotation latches) silences both
+    /// twins uniformly; the nullable arm asks no scope question of its
+    /// own, so an unresolved `D?` otherwise reported the warning the
+    /// oracle never produces. A head that resolves — primitives, frame
+    /// type parameters, real declarations — keeps its written face.
+    fn invalid_return_fold(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Named { name, .. } if !self.named_type_is_type(name) => Ty::UNKNOWN,
+            _ => ty,
+        }
     }
 
     /// The `body_completions` row insert shared by the named-executable end
@@ -5998,6 +6031,14 @@ impl<'a> Engine<'a> {
         if generator || (is_async && !self.legal_async_return(declared)) {
             return;
         }
+        // The same `InvalidType` fold [`Engine::stage_body_completion`]
+        // applies: only the sync question (the async arm reads the
+        // written head through `futureValueType`'s `Object?` face).
+        let declared = if is_async {
+            declared
+        } else {
+            self.invalid_return_fold(declared)
+        };
         self.insert_body_completion(end_range, declared, Some(brace), is_async, anchor);
     }
 
