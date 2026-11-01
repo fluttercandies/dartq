@@ -19948,3 +19948,18 @@ mod ticket_3259_tests;
 #[cfg(test)]
 #[path = "ticket_3432_tests.rs"]
 mod ticket_3432_tests;
+
+// The #3423 pins (a potentially nullable receiver's operator resolves
+// through the applicable extension before the nullability verdict): the fold
+// asks the covering `on ?` face first, so `extension on int? { int
+// operator +(Null o) }` over `int? x; x + null` stays silent instead of
+// reporting the head's member face, and its declared return is never
+// numerically refined. The compound twin still diverges on two faces outside
+// this ticket (the row_resolution.rs nullable gate's spelling and the
+// assignability.rs refinement) and is recorded as an ignored pin.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+
+#[cfg(test)]
+#[path = "ticket_3423_tests.rs"]
+mod ticket_3423_tests;

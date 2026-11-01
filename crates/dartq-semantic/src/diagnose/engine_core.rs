@@ -6985,19 +6985,119 @@ impl<'a> Engine<'a> {
         );
     }
 
+    /// The operator signature an applicable extension declares for a
+    /// potentially nullable receiver: `int? x; x + null` over `extension
+    /// on int? { int operator +(Null o) => 0; }`, where the extension owns
+    /// the operator and the oracle reports nothing.
+    ///
+    /// The nullable branch of the property consult runs the `Object` face,
+    /// then the applicable-extension face, and only then reads the
+    /// nullability verdict (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/type_property_resolver.dart:
+    /// 98-110 — `_lookupExtension(receiverType)` precedes the
+    /// `uncheckedOperatorInvocationOfNullableValue` report), so a face
+    /// whose `on` type covers the nullable spelling resolves before any
+    /// dereference is read. Only the covering verdict counts:
+    /// [`ExtensionApp::UnsafeSingle`] is the non-null projection alone,
+    /// which `applicableTo`'s subtype ask rejects for a nullable receiver
+    /// (`int? <: int` fails) — `extension on int` over `int? x; x + null`
+    /// keeps the dereference report and the recovery `num` formal.
+    ///
+    /// `None` = no covering face (the interface face and the nullability
+    /// verdict decide). `Some((formal, return))` = the extension owns the
+    /// operator; either half is [`Ty::UNKNOWN`] when the name level cannot
+    /// read the declaration — a generic face spells its own parameters
+    /// (`extension E<T> on T?`), and a spelling several declarations in the
+    /// winning file claim answers no single signature. The verdict stays
+    /// authoritative in that case, so callers report nothing: the operator
+    /// RESOLVED, and the member faces below would invent
+    /// `undefined_operator`/`argument_type_not_assignable` rows against a
+    /// face the oracle never consults.
+    fn nullable_extension_operator_sig(&mut self, recv: Ty, op: StringId) -> Option<(Ty, Ty)> {
+        let Ty::Named {
+            name,
+            nullable: true,
+            ..
+        } = recv
+        else {
+            return None;
+        };
+        // An unbound type-parameter head resolves nothing at name level
+        // (its bound already reached the caller through `bound_face`).
+        if self.type_params.contains(&name) || self.pending_type_params.contains(&name) {
+            return None;
+        }
+        if !matches!(
+            self.extension_application(name, recv, op, false, true),
+            ExtensionApp::Single
+        ) {
+            return None;
+        }
+        let unknown = (Ty::UNKNOWN, Ty::UNKNOWN);
+        // The application latched its winning face's declaring file, its
+        // spellings and name (the single-slot `ext_ref`, written only at a
+        // single-face conclusion). One face per declaration means the latch
+        // plus the spelled member identifies it.
+        let Some((face_file, spelling, face_name, kind)) = self.members.ext_ref.get() else {
+            return Some(unknown);
+        };
+        // A field's read face declares no operator invocation.
+        if kind != MemberKind::Method {
+            return Some(unknown);
+        }
+        let Some(elements) = self.index.get(face_file) else {
+            return Some(unknown);
+        };
+        let mut winners = elements.extension_faces().iter().filter(|face| {
+            face.members.contains_key(&spelling)
+                && if face_name == StringId::NONE {
+                    face.name.is_none()
+                } else {
+                    face.name == Some(face_name)
+                }
+        });
+        let (Some(face), None) = (winners.next(), winners.next()) else {
+            return Some(unknown);
+        };
+        // A generic face's declared spelling mentions its own parameters,
+        // which the name level cannot instantiate against the receiver.
+        if !face.type_param_names.is_empty() {
+            return Some(unknown);
+        }
+        let Some(entry) = face.members.get(&spelling) else {
+            return Some(unknown);
+        };
+        let Some(formal) = entry
+            .formals
+            .as_deref()
+            .and_then(|formals| formals.positional.first())
+        else {
+            return Some(unknown);
+        };
+        // A face declared in another file interns its types in that file's
+        // pool: project both halves into the diagnosing pool.
+        let boundary = &self.boundary;
+        Some((
+            boundary.ty(face_file, formal.ty),
+            boundary.ty(face_file, entry.return_ty),
+        ))
+    }
+
     /// The resolved binary-operator signature of `left OP right`: the
     /// `(param type, result type)` pair the oracle's resolved element
     /// declares (`_resolveUserDefinableType`,
     /// binary_expression_resolver.dart:479-515 reads
     /// `element.returnType`). The arm order mirrors the oracle's property
-    /// resolution: an exact SDK row (`int.&`, `String.+`) first, then the
-    /// user container's declared operator, then the `num`-inheritance
-    /// fiction for the undeclared real-core `int`/`double` receivers (the
-    /// SDK declarations are external, unreachable by the member walk).
-    /// Unresolved receivers, absent operators (`undefined_operator`
-    /// reports its own row), `dynamic`, and `Never` answer `None` — the
-    /// under-report direction.
-    pub(crate) fn binary_operator_sig(&self, op: &str, left: &Row) -> Option<(Ty, Ty)> {
+    /// resolution: an applicable extension over a nullable receiver first
+    /// (the nullable branch consults it before reading the dereference,
+    /// [`Self::nullable_extension_operator_sig`]), then an exact SDK row
+    /// (`int.&`, `String.+`), then the user container's declared operator,
+    /// then the `num`-inheritance fiction for the undeclared real-core
+    /// `int`/`double` receivers (the SDK declarations are external,
+    /// unreachable by the member walk). Unresolved receivers, absent
+    /// operators (`undefined_operator` reports its own row), `dynamic`, and
+    /// `Never` answer `None` — the under-report direction.
+    pub(crate) fn binary_operator_sig(&mut self, op: &str, left: &Row) -> Option<(Ty, Ty)> {
         // A type-parameter receiver resolves the operator on its BOUND's
         // interface (#2349: `S extends int` answers `int.+`, `T extends
         // num` answers `num.+`); an unbound parameter keeps the written
@@ -7012,6 +7112,12 @@ impl<'a> Engine<'a> {
             || self.pending_type_params.contains(&name)
         {
             return None;
+        }
+        // The nullable receiver's ordering: the extension face resolves the
+        // operator before the head's interface face stands in for it.
+        let spelling = self.intern(op);
+        if let Some(signature) = self.nullable_extension_operator_sig(left_ty, spelling) {
+            return Some(signature);
         }
         let recv_text = self.strings.resolve(name);
         if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
@@ -7465,26 +7571,41 @@ impl<'a> Engine<'a> {
             Ty::UNKNOWN
         } else {
             let op_text = self.strings.resolve(op).to_string();
-            match self.binary_operator_sig(&op_text, &left) {
-                Some((formal, declared)) => {
-                    // The argument face: the right operand against the
-                    // resolved formal — same gating as
-                    // [`Self::check_equals_argument`], minus the
-                    // nullable-formal promotion (the generic call passes
-                    // the declared formal unchanged).
-                    self.check_binary_argument(right_ty, formal, &right);
-                    if left_ty == Ty::Dynamic {
-                        // `d + 1` on `dynamic` keeps the dynamic face
-                        // (binary_expression_resolver.dart:501-502).
-                        Ty::Dynamic
-                    } else {
-                        // The refinement's own `num?` receiver gate
-                        // decides — unconditional here.
-                        let face = self.operand_face(&right, right_ty);
-                        self.refine_numeric_binary(&op_text, left_ty, face, declared)
+            // A potentially nullable receiver resolves through an applicable
+            // extension face BEFORE the nullability verdict (the ordering
+            // [`Self::nullable_extension_operator_sig`] documents), and an
+            // extension-declared operator is never numerically refined:
+            // `_refineNumericInvocationTypeNullSafe` answers the declared
+            // type unchanged for an `ExtensionElement` encloser
+            // (`extension on int? { int operator +(Null) }` over `int?`/`Null`
+            // stays `int`, not the ladder's `double`; upstream Dart SDK
+            // source, pkg/analyzer/lib/src/dart/element/type_system.dart:
+            // 2266-2277).
+            if let Some((formal, declared)) = self.nullable_extension_operator_sig(left_ty, op) {
+                self.check_binary_argument(right_ty, formal, &right);
+                declared
+            } else {
+                match self.binary_operator_sig(&op_text, &left) {
+                    Some((formal, declared)) => {
+                        // The argument face: the right operand against the
+                        // resolved formal — same gating as
+                        // [`Self::check_equals_argument`], minus the
+                        // nullable-formal promotion (the generic call passes
+                        // the declared formal unchanged).
+                        self.check_binary_argument(right_ty, formal, &right);
+                        if left_ty == Ty::Dynamic {
+                            // `d + 1` on `dynamic` keeps the dynamic face
+                            // (binary_expression_resolver.dart:501-502).
+                            Ty::Dynamic
+                        } else {
+                            // The refinement's own `num?` receiver gate
+                            // decides — unconditional here.
+                            let face = self.operand_face(&right, right_ty);
+                            self.refine_numeric_binary(&op_text, left_ty, face, declared)
+                        }
                     }
+                    None => Ty::UNKNOWN,
                 }
-                None => Ty::UNKNOWN,
             }
         };
         let _ = op_range;
