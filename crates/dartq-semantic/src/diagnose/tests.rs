@@ -18552,3 +18552,57 @@ mod ticket_3367_tests;
 #[cfg(test)]
 #[path = "ticket_3382_tests.rs"]
 mod ticket_3382_tests;
+
+// The #3375 pins (the recon's C12 prefix/combinator faces): the clause-carry
+// lookup faces this crate owns — shown keyword-spelled members (`show hide,
+// show hide ugly`), the bare and prefixed show/hide twins, and the
+// `p.Foo`/`p.Bar` class face with the bare-scope prefix-spelling rule —
+// pinned against the oracle rows with a hand-built capture. The family's
+// 21 rows root outside `library.rs` (the diet-walk capture gate
+// `dartq-engine/src/l1.rs` `is_name_token`, the diagnose emission sites,
+// the unquoted-imports feature posture, the pattern-face routing); those
+// stay residual and are documented in the pin module. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3375_tests.rs"]
+mod ticket_3375_tests;
+
+// The #3388 pins (recon bucket C's `creation_args.rs` half): the created
+// row's type reader — the written `<...>` group's precedence, the send's
+// published solved instantiation, the instantiate-to-bounds fill for a raw
+// head, and the non-generic no-op arm — plus the single-parameter context
+// seed's working argument face. The multi-parameter context face (the
+// context solution must pin a covariant parameter ahead of the argument
+// constraints the way upstream's `inferTypeParameterFromAll` does) roots
+// in `diagnose/invocation.rs`'s `creation_call_site_ty` and stays residual
+// against that lane; the pin module records the anchors. Registered here
+// via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3388_tests.rs"]
+mod ticket_3388_tests;
+
+// The #3383 pins (the typedef-alias binder-bound feed): `flatten_rhs`'s
+// function arm minted fresh binder ids but dropped the signature's
+// written bounds (`ParamFacts { bound: None }`), so `typedef F<X> = void
+// Function<Y extends X>()` used as `F<num>` never fed `Y`'s bound —
+// upstream rebinds each signature's parameter group fresh per use with
+// the substituted bound (type_algebra.dart's freshCopy + visitFunctionType).
+// The pins read the expanded bound's binder facts out of the mounted
+// snapshot (`types_for`). Registered here via `#[path]`; the module stays
+// inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3383_tests.rs"]
+mod ticket_3383_tests;
+
+// The #3395 pins (L-D-1, the extension-applicability face of the
+// `unchecked_use_of_nullable_value` EXTRA cluster): the emit gates that
+// decided on the receiver's nullability alone now ask
+// `extension_application` first, so a nullable-target extension that
+// defines the member (or the operator) stands the row down. Registered
+// here via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3395_tests.rs"]
+mod ticket_3395_tests;
