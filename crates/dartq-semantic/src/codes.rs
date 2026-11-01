@@ -4268,11 +4268,6 @@ impl SemanticCode {
             Self::AugmentationAlreadyComplete(AlreadyCompleteShape::InducedSetter) => {
                 "The setter induced by this augmentation is complete, but the setter being augmented is already complete.".to_string()
             }
-            // `{0}` is the literal's lexeme, `-`-prefixed under an
-            // immediately-negated operand (messages.yaml:9355).
-            Self::IntegerLiteralImpreciseAsDouble => {
-                format!("The integer literal is being used as a double, but can't be represented as a 64-bit double without overflow or loss of precision: '{a0}'.")
-            }
             // The #2993 whole-face-missing rows (verbatim 3.13.7 registry
             // texts; the with-details shape is the registry's
             // `missingRequiredParamWithDetails` template with its literal

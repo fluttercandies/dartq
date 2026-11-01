@@ -4732,32 +4732,56 @@ impl ParserListener for DiagnoseListener<'_> {
             .send_return_staging
             .take()
             .and_then(|(offset, ty)| {
-                let Ty::Named {
-                    name,
-                    nullable,
-                    args,
-                } = ty
-                else {
-                    return None;
+                // The unit-kind returns (`Null` of `Null Function() nf`,
+                // `dynamic`/`void`/`Never` of the same signature) spell no
+                // written name but the flow lattice carries them: the
+                // callable-typed callee's head reads `Base::Function`,
+                // whose nullability the name-level fold cannot answer —
+                // the staged row is the invocation's only static-type
+                // source, so the `null == nf()` equality and the
+                // `nf() is int` check fold on the real return.
+                // `FlowBase::Null` (never the `Name("Null")` spelling) is
+                // the only face both type-ops backends read identically:
+                // `NameTypeOps::classify` answers `NullOrEquivalent` on
+                // the identity, while the same `Name` walks as an opaque
+                // class and folds `null == nf()` backwards. The
+                // spellable-only contract keeps `Ty::Function`,
+                // `Ty::Record` and the free-parameter `Unknown` out —
+                // under-report stands ahead of a fabricated face.
+                let (base, nullable, tree) = match ty {
+                    Ty::Named {
+                        name,
+                        nullable,
+                        args,
+                    } => {
+                        let tree = staged_arg_tree(
+                            &self.engine.boundary.args.borrow(),
+                            &self.engine.strings,
+                            args,
+                        )?;
+                        let lexeme = self.engine.strings.resolve(name).to_string();
+                        (Some(lexeme), nullable, tree)
+                    }
+                    Ty::Null => (None, false, Vec::new()),
+                    Ty::Dynamic => (None, true, Vec::new()),
+                    Ty::Void => (None, false, Vec::new()),
+                    Ty::Never => (None, false, Vec::new()),
+                    Ty::Function { .. } | Ty::Record { .. } | Ty::Unknown => return None,
                 };
-                let tree = staged_arg_tree(
-                    &self.engine.boundary.args.borrow(),
-                    &self.engine.strings,
-                    args,
-                )?;
-                let lexeme = self.engine.strings.resolve(name).to_string();
-                Some((offset, nullable, lexeme, tree))
+                Some((offset, base, nullable, tree, ty))
             });
-        if let Some((offset, nullable, lexeme, tree)) = staged_call {
-            let base = self.flow().intern_name(&lexeme);
-            self.flow().stage_call_result(
-                offset,
-                FlowTy {
-                    base: FlowBase::Name(base),
-                    nullable,
+        if let Some((offset, lexeme, nullable, tree, ty)) = staged_call {
+            let base = match lexeme {
+                Some(lexeme) => FlowBase::Name(self.flow().intern_name(&lexeme)),
+                None => match ty {
+                    Ty::Null => FlowBase::Null,
+                    Ty::Dynamic => FlowBase::Dynamic,
+                    Ty::Void => FlowBase::Void,
+                    Ty::Never => FlowBase::Never,
+                    _ => FlowBase::Unknown,
                 },
-                tree,
-            );
+            };
+            self.flow().stage_call_result(offset, FlowTy { base, nullable }, tree);
         } else if let Some((offset, name)) = self.engine.send_invalid_staging.take() {
             // The genuinely-unresolved head's Invalid face (#2860): the
             // setter certified the call head resolves nowhere (the send's

@@ -15748,3 +15748,13 @@ mod ticket_2990_tests;
 #[cfg(test)]
 #[path = "ticket_3208_tests.rs"]
 mod ticket_3208_tests;
+
+/// The #3436 pins (the callable-typed callee's unit-kind return staging:
+/// `Null Function() nf`'s `null == nf()` and `nf() is int` folds, the
+/// `dynamic`/`void`/`Never` twins, and the under-report posture for
+/// `Function`/`Record`/`Unknown` returns). Registered here, not in
+/// `tests.rs` (other lanes' file), via `#[path]`.
+
+#[cfg(test)]
+#[path = "ticket_3436_tests.rs"]
+mod ticket_3436_tests;
