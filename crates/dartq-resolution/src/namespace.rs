@@ -11,16 +11,18 @@
 //! namespace and per-prefix tables; at the memory charter's red line (10⁵
 //! libraries in 0.5–8 GB) that duplication dominates — every consumer of
 //! `dart:core` held its own map over the same thousand-plus names. This
-//! shape stores one 16-byte row per import directive in four flat arrays
+//! shape stores one 16-byte row per import directive in flat arrays
 //! ([`Namespaces`]): the row carries the `as` prefix id, the resolved
-//! target, and a range over the directive's combinator clauses. A lookup
-//! composes the namespace on the fly — walk the library's rows in directive
-//! source order, filter each through its clauses, and probe the target's
-//! export scope in the graph. Memory is O(import directives), bounded by
-//! the input; there are no per-library maps and no string work on the hot
-//! path (rows are interned ids; clause name sets arrive sorted and
-//! setter-expanded from [`crate::library_graph::Combinators::build`], so
-//! filtering is binary search over `u32`s).
+//! target, and a range over the directive's combinator clauses, while two
+//! small index arrays mark where each library's rows start and where each
+//! writing unit's run starts. A lookup composes the namespace on the fly —
+//! walk the applicable rows in directive source order, filter each through
+//! its clauses, and probe the target's export scope in the graph. Memory is
+//! O(import directives), bounded by the input; there are no per-library maps
+//! and no string work on the hot path (rows are interned ids; clause name
+//! sets arrive sorted and setter-expanded from
+//! [`crate::library_graph::Combinators::build`], so filtering is binary
+//! search over `u32`s).
 //!
 //! The oracle filters during construction (`NamespaceBuilder
 //!.createImportNamespaceForDirective` + `_applyCombinators`,
@@ -43,16 +45,41 @@
 //! paid only on the ambiguous (error) path; hits and misses allocate
 //! nothing.
 //!
+//! # The combined import scope (enhanced parts)
+//!
+//! A Dart file's import scope is its own: "each Dart file … defines a
+//! combined import scope which extends the scope chain of the parent file's
+//! combined import scope with its own imports and import prefixes … each
+//! scope able to shadow names of its enclosing scope" (the `parts-with-imports`
+//! rule; upstream `CombinedScopeForFile` / `LibraryFragmentScope` chains every
+//! fragment over its parent). The rows are therefore regrouped by the unit
+//! that wrote them ([`crate::library_graph::LibraryGraph::import_runs`]) and
+//! a use-site lookup walks that chain
+//! ([`Namespaces::lookup_in_file`]): the file's own imports, then its parent
+//! part's, up to the library file, then the library-wide rows (the implicit
+//! `dart:core` prelude). A name imported by one part resolves in that part and
+//! its sub-parts only — never in a sibling part or the library file.
+//!
+//! The chain is exact shadowing, not merging: the first scope that carries
+//! the name decides. The library-level entry points ([`Namespaces::lookup`],
+//! [`Namespaces::lookup_prefixed`]) start at the defining unit, which is the
+//! whole scope of a single-file library and of the classic part shape (a
+//! classic part writes no directives, so its combined scope *is* its
+//! parent's).
+//!
+//! # Lookup order
+//!
 //! Lookup order is the oracle's scope chain (`LibraryFragmentScope.lookup`,
 //! scope.dart:419-433): the name-coupled locals layer first (a local face
-//! under either spelling of a base name shadows imports for both), then
-//! prefixes (the `_prefixElements` branch of `_lookupCombined` returns the
-//! prefix unconditionally, before the import namespace — scope.dart:455-471),
-//! then the un-prefixed imports in first-come-wins per-import composition.
-//! Bare `_` never hits the prefix branch: with `wildcard_variables` (Dart
-//! 3.7+ default-on; pinned here) `_shouldTryPrefixElement` skips it
-//! (scope.dart:486-494). The deeper chain (type-parameter scopes,
-//! part-local scopes) is the semantic layer's.
+//! under either spelling of a base name shadows imports for both), then —
+//! per scope of the combined import scope chain — prefixes (the
+//! `_prefixElements` branch of `_lookupCombined` returns the prefix
+//! unconditionally, before the import namespace — scope.dart:455-471), then
+//! the un-prefixed imports in first-come-wins per-import composition. Bare
+//! `_` never hits the prefix branch: with `wildcard_variables` (Dart 3.7+
+//! default-on; pinned here) `_shouldTryPrefixElement` skips it
+//! (scope.dart:486-494). The deeper chain (type-parameter scopes, part-local
+//! scopes) is the semantic layer's.
 //!
 //! # Why no merge cache
 //!
@@ -168,12 +195,21 @@ struct FilterClause {
 /// metric).
 #[derive(Debug)]
 pub struct Namespaces {
-    /// All import rows, grouped by library in [`LibraryId`] order, source
-    /// order within a library — the composition's iteration order.
+    /// All import rows, grouped by library in [`LibraryId`] order — and,
+    /// within a library, by the unit that wrote them: the library-wide rows
+    /// first, then one run per writing unit in ascending file order
+    /// ([`LibraryGraph::import_runs`]). This is the composition's iteration
+    /// order.
     rows: Vec<ImportRow>,
     /// Per-library offsets into `rows`: library `i` occupies
     /// `rows[offs[i]..offs[i+1]]`; `len == graph.len + 1`.
     offs: Vec<u32>,
+    /// Per-library offsets into `runs`; `len == graph.len + 1`.
+    run_offs: Vec<u32>,
+    /// The per-unit runs of the libraries, flattened: `(file, first row)`,
+    /// ascending by file within a library, each run ending where the next
+    /// starts or at the library's row end.
+    runs: Vec<(FileId, u32)>,
     /// All combinator clauses, grouped by row in row order.
     clauses: Vec<FilterClause>,
     /// All clause name ids (sorted, deduplicated, setter-expanded within
@@ -194,14 +230,19 @@ impl Namespaces {
     pub fn build(graph: &LibraryGraph) -> Self {
         let mut rows: Vec<ImportRow> = Vec::new();
         let mut offs: Vec<u32> = Vec::with_capacity(graph.len() + 1);
+        let mut run_offs: Vec<u32> = Vec::with_capacity(graph.len() + 1);
+        let mut runs: Vec<(FileId, u32)> = Vec::new();
         let mut clauses: Vec<FilterClause> = Vec::new();
         let mut filter_names: Vec<u32> = Vec::new();
         offs.push(0);
+        run_offs.push(0);
         for index in 0..graph.len() {
             // Positional walk: `offs` is indexed by LibraryId (the
             // graph's library iteration order is contractually
             // unspecified, only `0..len` addressing is).
-            for edge in graph.import_edges(LibraryId::from_index(index)) {
+            let lib = LibraryId::from_index(index);
+            let base = u32::try_from(rows.len()).expect("more than u32::MAX import directives");
+            for edge in graph.import_edges(lib) {
                 // The prefix registers unconditionally, target resolved or
                 // not: `_buildLibraryImportPrefixes` (element.dart:7529-7536)
                 // sweeps every import's prefix with no resolution gating,
@@ -237,33 +278,52 @@ impl Namespaces {
                     ),
                 });
             }
+            // The per-unit runs, shifted onto the global row array: the
+            // graph already regrouped the rows (library-wide first, then one
+            // run per writing unit), so only the boundaries travel.
+            for &(file, start) in graph.import_runs(lib) {
+                runs.push((file, base + start));
+            }
+            run_offs.push(u32::try_from(runs.len()).expect("more than u32::MAX import runs"));
             offs.push(u32::try_from(rows.len()).expect("more than u32::MAX import directives"));
         }
         Self {
             rows,
             offs,
+            run_offs,
+            runs,
             clauses,
             filter_names,
         }
     }
 
     /// The steady-state memory of the compact tables, counted as
-    /// `size_of` sums over the four arrays (the memory charter's counted
+    /// `size_of` sums over the stored arrays (the memory charter's counted
     /// metric; allocator overhead and the graph's own edges excluded).
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.rows.len() * size_of::<ImportRow>()
             + self.offs.len() * size_of::<u32>()
+            + self.run_offs.len() * size_of::<u32>()
+            + self.runs.len() * size_of::<(FileId, u32)>()
             + self.clauses.len() * size_of::<FilterClause>()
             + self.filter_names.len() * size_of::<u32>()
     }
 
     /// Bare-name lookup in `lib`'s scope chain (`LibraryFragmentScope.lookup`,
-    /// scope.dart:419-433): the name-coupled locals layer first, then a
-    /// registered prefix — the `_prefixElements` branch of `_lookupCombined`
-    /// returns the prefix unconditionally, before the import namespace
-    /// (scope.dart:455-471) — then the un-prefixed imports composed
-    /// first-come-wins.
+    /// scope.dart:419-433): the name-coupled locals layer first, then the
+    /// library's **combined import scope** — a registered prefix (the
+    /// `_prefixElements` branch of `_lookupCombined` returns the prefix
+    /// unconditionally, before the import namespace, scope.dart:455-471) and
+    /// then the un-prefixed imports, composed first-come-wins.
+    ///
+    /// The combined import scope is a chain over the library's files: the
+    /// library file's own imports, then each part's own imports on top
+    /// ([`Self::lookup_in_file`]). This entry point is the library question —
+    /// it starts at the defining unit, which is the whole scope for the
+    /// single-file libraries and for the classic part shape (a part file
+    /// carries no directives of its own, so its combined scope *is* its
+    /// parent's).
     ///
     /// The locals link is all-or-nothing per base name: `_lookupLibrary`
     /// hands back the getter/setter pair and `_lookupCombined` is never
@@ -280,27 +340,45 @@ impl Namespaces {
     /// from — a caller bug (ids only come from that graph).
     #[must_use]
     pub fn lookup(&self, graph: &LibraryGraph, lib: LibraryId, name: StringId) -> Lookup {
-        match graph.local(lib, name) {
-            LocalLookup::Found(file) => return Lookup::Found(NamespaceEntry::Decl(file)),
-            LocalLookup::Shadowed => return Lookup::NotFound,
-            LocalLookup::Absent => {}
+        let start = graph.unit_files(lib).first().copied();
+        self.scope_lookup(graph, lib, start, NO_PREFIX, name)
+    }
+
+    /// Bare-name lookup at one use site: the locals layer, then `file`'s
+    /// **combined import scope** — `file`'s own imports and prefixes, then
+    /// its parent file's combined scope, up the part tree to the library
+    /// file, and finally the library-wide rows.
+    ///
+    /// This is the enhanced-parts rule the spec states for the scope chain
+    /// of a file: "each Dart file extends the scope chain of the parent
+    /// file's combined import scope with its own imports and import
+    /// prefixes … each scope able to shadow names of its enclosing scope"
+    /// (upstream `CombinedScopeForFile` / `LibraryFragmentScope`, chaining
+    /// every fragment over its parent). A name imported by a part resolves
+    /// in that part and its sub-parts only; a name imported by a sibling
+    /// part or by the library file does not resolve in it. Shadowing is
+    /// strict per scope: the first scope of the chain that carries the name
+    /// decides, so an inner hit is never merged with an outer one.
+    ///
+    /// `file` outside `lib`'s unit set asks the library question and
+    /// resolves through [`Self::lookup`] — inventing a per-file scope for a
+    /// file the graph never registered would silently drop every import.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::lookup`].
+    #[must_use]
+    pub fn lookup_in_file(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        file: Option<FileId>,
+        name: StringId,
+    ) -> Lookup {
+        match self.scope_start(graph, lib, file) {
+            Some(start) => self.scope_lookup(graph, lib, Some(start), NO_PREFIX, name),
+            None => self.lookup(graph, lib, name),
         }
-        let rows = self.rows_of(lib);
-        // Prefix branch: unconditional on registration, ahead of any
-        // imported top-level name (scope.dart:455-471) — hence a separate
-        // pass before the import walk. The wildcard gate skips it for bare
-        // `_` (scope.dart:486-494).
-        if graph.wildcard_prefix(lib) != Some(name)
-            && rows.iter().any(|row| row.prefix == name.index())
-        {
-            return Lookup::Found(NamespaceEntry::Prefix);
-        }
-        fold(
-            graph,
-            rows.iter()
-                .filter(|row| row.prefix == NO_PREFIX)
-                .filter_map(|row| self.probe(graph, row, name)),
-        )
     }
 
     /// `prefix.name` lookup in `lib`: the prefix's merged table, whenever the
@@ -308,7 +386,10 @@ impl Namespaces {
     /// declaration (`p.x` goes through `PrefixScope`, scope.dart:352-357,
     /// regardless of bare-name collisions). "Merged" is composed here the
     /// same way as the bare namespace: the same-prefix imports in directive
-    /// source order, combinators applied per import, first-come-wins.
+    /// source order, combinators applied per import, first-come-wins, over
+    /// the library's combined import scope chain (the defining unit's, for
+    /// this library-level entry — [`Self::lookup_prefixed_in_file`] is the
+    /// use-site form).
     ///
     /// Returns [`Lookup::NotFound`] when `prefix` is not a registered prefix
     /// of `lib`, or registers no `name` (a `p.x` through a non-prefix is not
@@ -325,20 +406,198 @@ impl Namespaces {
         prefix: StringId,
         name: StringId,
     ) -> Lookup {
+        let start = graph.unit_files(lib).first().copied();
+        let hit = self.scope_lookup(graph, lib, start, prefix.index(), name);
+        // A prefix an enhanced part registered is still THE prefix of every
+        // use site that resolved `p` as a prefix in its own scope, and this
+        // entry point carries no use site to ask ([`Self::lookup_prefixed_in_file`]
+        // does). Spanning the library's per-unit runs restores the merged
+        // per-prefix table those callers expect; the chain gate on the bare
+        // name already decided whether `p` is visible at the use site.
+        if !matches!(hit, Lookup::NotFound) || self.runs_of(lib).is_empty() {
+            return hit;
+        }
         let prefix = prefix.index();
         fold(
             graph,
-            self.rows_of(lib)
-                .iter()
+            self.file_rows(lib)
                 .filter(|row| row.prefix == prefix)
                 .filter_map(|row| self.probe(graph, row, name)),
         )
     }
 
-    /// `lib`'s row range — the CSR slice its imports occupy.
-    fn rows_of(&self, lib: LibraryId) -> &[ImportRow] {
+    /// `prefix.name` lookup at one use site: the same chain as
+    /// [`Self::lookup_in_file`], restricted to `prefix`'s imports — an
+    /// import prefix belongs to the file that wrote the `as` clause, so a
+    /// part's prefix resolves in that part and its sub-parts only (the
+    /// `scope_A07_t01` shape: `import … as l1;` in a part does not put `l1`
+    /// in the library file's scope).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::lookup`].
+    #[must_use]
+    pub fn lookup_prefixed_in_file(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        file: Option<FileId>,
+        prefix: StringId,
+        name: StringId,
+    ) -> Lookup {
+        match self.scope_start(graph, lib, file) {
+            Some(start) => self.scope_lookup(graph, lib, Some(start), prefix.index(), name),
+            None => self.lookup_prefixed(graph, lib, prefix, name),
+        }
+    }
+
+    /// The chain's starting unit: `file` when it is a registered unit of
+    /// `lib`, `None` when the caller asked a library question (no file, or a
+    /// file this library does not own) — the answer is then
+    /// [`Self::lookup`]'s, the defining unit's scope.
+    fn scope_start(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        file: Option<FileId>,
+    ) -> Option<FileId> {
+        file.filter(|&file| graph.library_of_file(file) == Some(lib))
+    }
+
+    /// The locals layer plus the combined import scope walk — the whole
+    /// bare/prefixed lookup body once the chain start is known.
+    fn scope_lookup(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        start: Option<FileId>,
+        prefix: u32,
+        name: StringId,
+    ) -> Lookup {
+        // The locals layer answers for bare names only: `p.x` is the
+        // prefix's table (a local `p` declaration is the semantic layer's
+        // misuse diagnosis, never a namespace hit).
+        if prefix == NO_PREFIX {
+            match graph.local(lib, name) {
+                LocalLookup::Found(file) => return Lookup::Found(NamespaceEntry::Decl(file)),
+                LocalLookup::Shadowed => return Lookup::NotFound,
+                LocalLookup::Absent => {}
+            }
+        }
+        self.walk(graph, lib, start, prefix, name)
+    }
+
+    /// Walks `lib`'s combined import scope from `start` up the part tree,
+    /// then through the library-wide rows: per scope, the prefix branch
+    /// (bare names only, [`NO_PREFIX`] marks the bare walk) and then the
+    /// import composition, stopping at the first scope that carries the name
+    /// — the chain's strict shadowing.
+    ///
+    /// The part tree is cycle-broken at graph build, so the walk terminates;
+    /// the hop bound over the library's unit count is a belt-and-braces stop
+    /// for the termination invariant.
+    fn walk(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        start: Option<FileId>,
+        prefix: u32,
+        name: StringId,
+    ) -> Lookup {
+        let bare = prefix == NO_PREFIX;
+        let wildcard = graph.wildcard_prefix(lib);
+        let mut current = start;
+        let mut hops = 0;
+        let limit = graph.unit_files(lib).len().max(1);
+        while let Some(file) = current {
+            if let Some(rows) = self.rows_of_file(lib, file) {
+                if bare
+                    && wildcard != Some(name)
+                    && rows.iter().any(|row| row.prefix == name.index())
+                {
+                    return Lookup::Found(NamespaceEntry::Prefix);
+                }
+                match self.compose(graph, rows, prefix, name) {
+                    Lookup::NotFound => {}
+                    hit => return hit,
+                }
+            }
+            current = graph.part_parent(lib, file);
+            hops += 1;
+            if hops > limit {
+                break;
+            }
+        }
+        // The library-wide rows close the chain: the implicit `dart:core`
+        // prelude and the synthetic SDK/dependency faces belong to every
+        // file of the library, so they sit outermost.
+        let wide = self.library_rows(lib);
+        if bare && wildcard != Some(name) && wide.iter().any(|row| row.prefix == name.index()) {
+            return Lookup::Found(NamespaceEntry::Prefix);
+        }
+        self.compose(graph, wide, prefix, name)
+    }
+
+    /// Folds one scope's rows into a lookup outcome: the prefix filter (a
+    /// `p.name` probe reads only the imports that registered `p`; the bare
+    /// walk reads the un-prefixed ones), the per-row combinator filter, and
+    /// the target's export-scope probe — the merge rules of [`fold`].
+    fn compose(
+        &self,
+        graph: &LibraryGraph,
+        rows: &[ImportRow],
+        prefix: u32,
+        name: StringId,
+    ) -> Lookup {
+        fold(
+            graph,
+            rows.iter()
+                .filter(|row| row.prefix == prefix)
+                .filter_map(|row| self.probe(graph, row, name)),
+        )
+    }
+
+    /// The library-wide rows of `lib` — the head of its row range, up to the
+    /// first per-unit run (the whole range when the library has no runs).
+    fn library_rows(&self, lib: LibraryId) -> &[ImportRow] {
         let index = lib.index() as usize;
-        &self.rows[self.offs[index] as usize..self.offs[index + 1] as usize]
+        let start = self.offs[index] as usize;
+        let end = self
+            .runs_of(lib)
+            .first()
+            .map_or(self.offs[index + 1], |&(_, start)| start) as usize;
+        &self.rows[start..end]
+    }
+
+    /// The rows one unit wrote, `None` when the unit wrote none.
+    fn rows_of_file(&self, lib: LibraryId, file: FileId) -> Option<&[ImportRow]> {
+        let index = lib.index() as usize;
+        let runs = self.runs_of(lib);
+        let position = runs.binary_search_by_key(&file, |&(file, _)| file).ok()?;
+        let start = runs[position].1 as usize;
+        let end = runs
+            .get(position + 1)
+            .map_or(self.offs[index + 1], |&(_, start)| start) as usize;
+        Some(&self.rows[start..end])
+    }
+
+    /// `lib`'s per-unit run slice.
+    fn runs_of(&self, lib: LibraryId) -> &[(FileId, u32)] {
+        let index = lib.index() as usize;
+        &self.runs[self.run_offs[index] as usize..self.run_offs[index + 1] as usize]
+    }
+
+    /// Every per-unit row of `lib`, in run order — the library-wide rows
+    /// excluded (they are [`Self::library_rows`]).
+    fn file_rows(&self, lib: LibraryId) -> impl Iterator<Item = &ImportRow> + '_ {
+        let runs = self.runs_of(lib);
+        let end = self.offs[lib.index() as usize + 1];
+        runs.iter()
+            .enumerate()
+            .flat_map(move |(position, &(_, start))| {
+                let stop = runs.get(position + 1).map_or(end, |&(_, start)| start);
+                self.rows[start as usize..stop as usize].iter()
+            })
     }
 
     /// One row's contribution to a composition walk: combinator filter, then
@@ -521,6 +780,39 @@ mod tests {
                     combinators,
                 },
             );
+        }
+
+        /// [`Self::import`] as one unit of a multi-file library wrote it — a
+        /// per-file import row ([`LibraryGraphBuilder::import_in`]).
+        fn import_in(
+            &mut self,
+            lib: LibraryId,
+            file: FileId,
+            target: Option<LibraryId>,
+            prefix: Option<&str>,
+            combinators: Combinators,
+        ) {
+            let prefix = prefix.map(|p| self.strings.intern(p));
+            self.builder.import_in(
+                lib,
+                file,
+                ImportEdge {
+                    target,
+                    prefix,
+                    deferred: false,
+                    combinators,
+                },
+            );
+        }
+
+        /// Registers `file` as one compilation unit of `lib`.
+        fn unit(&mut self, lib: LibraryId, file: FileId) {
+            self.builder.unit(lib, file);
+        }
+
+        /// Registers the `part`-include edge `includer` → `included`.
+        fn part(&mut self, lib: LibraryId, includer: FileId, included: FileId) {
+            self.builder.part(lib, includer, included);
         }
 
         fn settle(self) -> (&'static StringTable, LibraryGraph, Namespaces) {
@@ -1111,6 +1403,186 @@ mod tests {
         assert_eq!(
             namespaces.lookup_prefixed(&graph, consumer, strings.intern("p"), strings.intern("x")),
             Lookup::NotFound
+        );
+    }
+
+    /// The enhanced-parts chain (co19 `scope_A07_t01`): each file's combined
+    /// import scope is its own imports over its parent's. A part's import
+    /// resolves in that part and in its sub-parts, never in the library file
+    /// and never sideways; the library-level question answers the library
+    /// file's own scope.
+    #[test]
+    fn part_scopes_chain_up_the_part_tree() {
+        let mut rig = Rig::new();
+        let lib = rig.builder.intern("package:a/a.dart");
+        let imported1 = rig.builder.intern("package:l1/l1.dart");
+        let imported2 = rig.builder.intern("package:l2/l2.dart");
+        let a = rig.file("a.dart");
+        let part1 = rig.file("part1.dart");
+        let part2 = rig.file("part2.dart");
+        let l1_file = rig.file("lib1.dart");
+        let l2_file = rig.file("lib2.dart");
+        rig.declare(imported1, "libVar", l1_file);
+        rig.declare(imported2, "counter", l2_file);
+        rig.unit(lib, a);
+        rig.unit(lib, part1);
+        rig.unit(lib, part2);
+        rig.part(lib, a, part1);
+        rig.part(lib, part1, part2);
+        rig.import_in(lib, part1, Some(imported1), None, Combinators::unfiltered());
+        rig.import_in(lib, part2, Some(imported2), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+        let lib_var = strings.intern("libVar");
+        let counter = strings.intern("counter");
+
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(a), lib_var),
+            Lookup::NotFound,
+            "the library file wrote no import: it does not inherit a part's"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part1), lib_var),
+            Lookup::Found(NamespaceEntry::Decl(l1_file)),
+            "part1's own import"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part2), lib_var),
+            Lookup::Found(NamespaceEntry::Decl(l1_file)),
+            "a sub-part inherits its includer's combined scope"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part1), counter),
+            Lookup::NotFound,
+            "a sub-part's import never reaches its includer"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part2), counter),
+            Lookup::Found(NamespaceEntry::Decl(l2_file)),
+            "part2's own import"
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, lib, lib_var),
+            Lookup::NotFound,
+            "the library-level lookup answers the library file's scope"
+        );
+    }
+
+    /// co19 `scope_A02_t04`: `show`/`hide` filter per import, across the part
+    /// boundary — a filtered-out name stays out even when a sibling part
+    /// imports the same library under a different combinator.
+    #[test]
+    fn part_show_hide_filters_across_the_boundary() {
+        let mut rig = Rig::new();
+        let lib = rig.builder.intern("package:a/a.dart");
+        let lib1 = rig.builder.intern("package:l1/l1.dart");
+        let lib2 = rig.builder.intern("package:l2/l2.dart");
+        let a = rig.file("a.dart");
+        let part1 = rig.file("part1.dart");
+        let part2 = rig.file("part2.dart");
+        let f1 = rig.file("lib1.dart");
+        let f2 = rig.file("lib2.dart");
+        rig.declare(lib1, "libVar", f1);
+        rig.declare(lib1, "LibClass", f1);
+        rig.declare(lib2, "libId", f2);
+        rig.unit(lib, a);
+        rig.unit(lib, part1);
+        rig.unit(lib, part2);
+        rig.part(lib, a, part1);
+        rig.part(lib, part1, part2);
+        let strings = rig.strings;
+        let show_lib_class = Combinators::new(
+            [CombinatorClause::Show(Box::from([
+                strings.intern("LibClass")
+            ]))],
+            strings,
+        );
+        let hide_lib_id = Combinators::new(
+            [CombinatorClause::Hide(Box::from([strings.intern("libId")]))],
+            strings,
+        );
+        let show_lib_id = Combinators::new(
+            [CombinatorClause::Show(Box::from([strings.intern("libId")]))],
+            strings,
+        );
+        rig.import_in(lib, part1, Some(lib1), None, show_lib_class);
+        rig.import_in(lib, part1, Some(lib2), None, hide_lib_id);
+        rig.import_in(lib, part2, Some(lib2), None, show_lib_id);
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part1), strings.intern("LibClass")),
+            Lookup::Found(NamespaceEntry::Decl(f1)),
+            "the shown name resolves"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part1), strings.intern("libVar")),
+            Lookup::NotFound,
+            "`show LibClass` drops the rest of lib1"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part1), strings.intern("libId")),
+            Lookup::NotFound,
+            "`hide libId` drops it for part1"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part2), strings.intern("libId")),
+            Lookup::Found(NamespaceEntry::Decl(f2)),
+            "part2's own `show libId` brings it back"
+        );
+    }
+
+    /// An import prefix belongs to the file that wrote the `as` clause: the
+    /// library file does not see a part's `l1`, and `l1.x` resolves only from
+    /// that part's chain. The library-level prefixed entry — which carries no
+    /// use site — keeps spanning every file's prefixes (the callers that use
+    /// it already gated the bare name on their own scope).
+    #[test]
+    fn part_prefix_is_confined_to_its_file() {
+        let mut rig = Rig::new();
+        let lib = rig.builder.intern("package:a/a.dart");
+        let imported = rig.builder.intern("package:l2/l2.dart");
+        let a = rig.file("a.dart");
+        let part1 = rig.file("part1.dart");
+        let f = rig.file("lib2.dart");
+        rig.declare(imported, "lib2Func", f);
+        rig.unit(lib, a);
+        rig.unit(lib, part1);
+        rig.part(lib, a, part1);
+        rig.import_in(
+            lib,
+            part1,
+            Some(imported),
+            Some("l1"),
+            Combinators::unfiltered(),
+        );
+        let (strings, graph, namespaces) = rig.settle();
+        let prefix = strings.intern("l1");
+        let leaf = strings.intern("lib2Func");
+
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(a), prefix),
+            Lookup::NotFound,
+            "the library file never wrote `as l1`"
+        );
+        assert_eq!(
+            namespaces.lookup_in_file(&graph, lib, Some(part1), prefix),
+            Lookup::Found(NamespaceEntry::Prefix),
+            "part1 registered it"
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed_in_file(&graph, lib, Some(a), prefix, leaf),
+            Lookup::NotFound,
+            "`l1.lib2Func` does not resolve from the library file"
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed_in_file(&graph, lib, Some(part1), prefix, leaf),
+            Lookup::Found(NamespaceEntry::Decl(f)),
+            "`l1.lib2Func` resolves from part1"
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed(&graph, lib, prefix, leaf),
+            Lookup::Found(NamespaceEntry::Decl(f)),
+            "the library-level prefixed entry spans every file's prefixes"
         );
     }
 }

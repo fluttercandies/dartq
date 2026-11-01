@@ -422,6 +422,11 @@ fn expand_names(names: &[StringId], strings: &StringTable) -> Box<[StringId]> {
 /// oracle sweeps every import's prefix with no resolution gating,
 /// `element.dart:7529-7536`; the name-table filter is
 /// `DirectiveUriWithLibraryImpl`, `scope.dart:530-535`).
+///
+/// Which **file** of the library wrote the directive is not part of the edge:
+/// the builder records it beside the row ([`LibraryGraphBuilder::import`]
+/// for a library-wide row, [`LibraryGraphBuilder::import_in`] for a
+/// per-file one), and [`LibraryGraph::import_runs`] exposes the grouping.
 #[derive(Clone, Debug)]
 pub struct ImportEdge {
     /// The imported library, or `None` when it contributes nothing.
@@ -566,6 +571,18 @@ struct NodeBuilder {
     units: Vec<FileId>,
     decls: Vec<(StringId, FileId)>,
     imports: Vec<ImportEdge>,
+    /// The unit each entry of `imports` was written in, parallel to it:
+    /// `None` for a library-wide row ([`LibraryGraphBuilder::import`]),
+    /// `Some(file)` for a per-file row
+    /// ([`LibraryGraphBuilder::import_in`]). Consumed and dropped by
+    /// [`LibraryGraphBuilder::finish`], which regroups the rows and retains
+    /// only the run boundaries ([`LibraryNode::import_runs`]).
+    import_owners: Vec<Option<FileId>>,
+    /// The `part`-include edges — `(includer, included)` pairs registered
+    /// through [`LibraryGraphBuilder::part`]: the library's part tree, which
+    /// [`LibraryGraphBuilder::finish`] freezes into the enhanced-parts scope
+    /// chain ([`LibraryGraph::part_parent`]). Transient.
+    part_links: Vec<(FileId, FileId)>,
     exports: Vec<ExportEdge>,
     /// Class declarations with their modifier flags, keyed by name — the
     /// cross-library modifier facts ([`LibraryGraph::class_modifiers`]).
@@ -607,6 +624,8 @@ impl<'t> LibraryGraphBuilder<'t> {
             units: Vec::new(),
             decls: Vec::new(),
             imports: Vec::new(),
+            import_owners: Vec::new(),
+            part_links: Vec::new(),
             exports: Vec::new(),
             classes: Vec::new(),
         });
@@ -695,8 +714,52 @@ impl<'t> LibraryGraphBuilder<'t> {
     }
 
     /// Records `lib`'s resolved `import` directive, in source order.
+    ///
+    /// A row registered here is **library-wide**: it joins the combined
+    /// import scope of every file of the library — the shape of a
+    /// single-unit library, of the synthetic SDK/dependency nodes (whose one
+    /// "file" is the node), and of the implicit `dart:core` prelude
+    /// ([`Self::seed_implicit_core`]). A directive whose writing file is
+    /// known belongs to that file alone: [`Self::import_in`].
     pub fn import(&mut self, lib: LibraryId, edge: ImportEdge) {
-        self.nodes[lib.index() as usize].imports.push(edge);
+        let node = &mut self.nodes[lib.index() as usize];
+        node.imports.push(edge);
+        node.import_owners.push(None);
+    }
+
+    /// Records `lib`'s resolved `import` directive **written in `file`** —
+    /// the enhanced-parts per-file import scope. The row contributes its
+    /// (combinator-filtered) names to `file`'s combined import scope and to
+    /// the scopes of `file`'s sub-parts, never to a sibling part's or to the
+    /// including library file's (the spec's combined import scope: "each
+    /// Dart file … extends the scope chain of the parent file's combined
+    /// import scope with its own imports and import prefixes"; upstream
+    /// `CombinedScopeForFile` / `LibraryFragmentScope`, chaining each file
+    /// over its parent). The chain itself is the part tree —
+    /// [`Self::part`] — walked at lookup time by
+    /// [`crate::namespace::Namespaces`].
+    ///
+    /// Rows keep directive source order within a file; [`Self::finish`]
+    /// regroups them for the lookup face.
+    pub fn import_in(&mut self, lib: LibraryId, file: FileId, edge: ImportEdge) {
+        let node = &mut self.nodes[lib.index() as usize];
+        node.imports.push(edge);
+        node.import_owners.push(Some(file));
+    }
+
+    /// Records one `part`-include edge of `lib`: `includer` declares
+    /// `part '<included>'` and `included` is a compilation unit of the same
+    /// library ([`Self::unit`]). The edges are the library's part tree and,
+    /// with the per-file import rows, the enhanced-parts scope chain
+    /// ([`LibraryGraph::part_parent`]).
+    ///
+    /// Registration is first-wins per included file, and an edge that would
+    /// close a cycle is dropped at [`Self::finish`] — a malformed include
+    /// chain must never make a scope walk spin.
+    pub fn part(&mut self, lib: LibraryId, includer: FileId, included: FileId) {
+        self.nodes[lib.index() as usize]
+            .part_links
+            .push((includer, included));
     }
 
     /// Seeds the implicit `dart:core` import every Dart library carries
@@ -882,11 +945,17 @@ impl<'t> LibraryGraphBuilder<'t> {
                 for &file in &node.units {
                     file_lib.entry(file).or_insert(lib);
                 }
+                // The scope faces: the part tree first (it reads the unit
+                // set), then the import runs regrouped by writing unit.
+                let part_parents = part_parents(&node.part_links, &node.units);
+                let (imports, import_runs) = group_imports(node.imports, node.import_owners);
                 LibraryNode {
                     uri: node.uri,
                     name: node.name,
                     units: node.units,
-                    imports: node.imports,
+                    imports,
+                    import_runs,
+                    part_parents,
                     exports: node.exports,
                     export_scope,
                     locals: local_slots,
@@ -903,6 +972,93 @@ impl<'t> LibraryGraphBuilder<'t> {
             extensions: self.extensions,
         }
     }
+}
+
+/// Regroups one library's import rows by the unit that wrote them — the
+/// runs the enhanced-parts scope chain composes lookups from.
+///
+/// Library-wide rows (`None`) keep their source order and stay first; the
+/// per-unit rows follow grouped by file in ascending [`FileId`] order, and a
+/// stable sort keeps each group's directive source order intact. When every
+/// row is library-wide — a single-unit library, a synthetic SDK/dependency
+/// node — the rows pass through untouched and no run is reported, so the
+/// common shape pays nothing.
+///
+/// Returns the regrouped rows and the run starts `(file, first row index)`.
+fn group_imports(
+    rows: Vec<ImportEdge>,
+    owners: Vec<Option<FileId>>,
+) -> (Vec<ImportEdge>, Vec<(FileId, u32)>) {
+    if owners.iter().all(Option::is_none) {
+        return (rows, Vec::new());
+    }
+    let mut order: Vec<u32> =
+        (0..u32::try_from(rows.len()).expect("more than u32::MAX imports")).collect();
+    order.sort_by_key(|&row| owners[row as usize]);
+    let mut runs: Vec<(FileId, u32)> = Vec::new();
+    for (position, &row) in order.iter().enumerate() {
+        if let Some(file) = owners[row as usize]
+            && runs.last().map(|&(last, _)| last) != Some(file)
+        {
+            runs.push((
+                file,
+                u32::try_from(position).expect("more than u32::MAX imports"),
+            ));
+        }
+    }
+    let mut slots: Vec<Option<ImportEdge>> = rows.into_iter().map(Some).collect();
+    let regrouped: Vec<ImportEdge> = order
+        .iter()
+        .map(|&row| {
+            slots[row as usize]
+                .take()
+                .expect("each row index is visited once")
+        })
+        .collect();
+    (regrouped, runs)
+}
+
+/// Freezes one library's part tree into the scope-chain parent map: each
+/// `part`-include edge whose two ends are units of the library contributes
+/// `(included, includer)`, first registration wins per included file, and an
+/// edge that would close a cycle is dropped — upstream climbs with the same
+/// guard (`PartOfUriKnownFileKind.library`'s visited set) and the engine's
+/// membership walk applies it too, and a malformed include chain must never
+/// make a scope walk spin (the termination invariant). The result is sorted
+/// by part file so [`LibraryGraph::part_parent`] is one binary search.
+fn part_parents(links: &[(FileId, FileId)], units: &[FileId]) -> Vec<(FileId, FileId)> {
+    if links.is_empty() {
+        return Vec::new();
+    }
+    let mut parents: Vec<(FileId, FileId)> = Vec::new();
+    for &(includer, included) in links {
+        if includer == included
+            || !units.contains(&included)
+            || !units.contains(&includer)
+            || parents.iter().any(|&(part, _)| part == included)
+        {
+            continue;
+        }
+        // Cycle guard: climb from the includer over the links accepted so
+        // far; reaching `included` means this edge would close a loop. The
+        // hop bound is the accepted-link count — a tree path never exceeds
+        // it.
+        let mut cursor = includer;
+        let mut hops = 0;
+        while cursor != included && hops <= parents.len() {
+            match parents.iter().find(|&&(part, _)| part == cursor) {
+                Some(&(_, parent)) => cursor = parent,
+                None => break,
+            }
+            hops += 1;
+        }
+        if cursor == included {
+            continue;
+        }
+        parents.push((included, includer));
+    }
+    parents.sort_unstable_by_key(|&(part, _)| part);
+    parents
 }
 
 /// Builds one library's locals layer: per-spelling slots with precomputed
@@ -1050,6 +1206,18 @@ struct LibraryNode {
     /// (`RuleContext.allUnits`, fed by the `_libraryFiles` insertion order).
     units: Vec<FileId>,
     imports: Vec<ImportEdge>,
+    /// The import rows grouped by the unit that wrote them — the enhanced-
+    /// parts scope runs. Library-wide rows come first in source order, then
+    /// one run per writing unit in ascending [`FileId`] order, each run
+    /// keeping its directive source order. The entries are `(file, first row
+    /// index)`: a run ends where the next one starts, or at `imports.len()`
+    /// ([`LibraryGraph::import_runs`]). Empty when every row is
+    /// library-wide, the single-unit and synthetic-node shape.
+    import_runs: Vec<(FileId, u32)>,
+    /// The part tree, frozen: `(part file, including file)` sorted by part
+    /// for binary search, first-wins and cycle-broken
+    /// ([`LibraryGraph::part_parent`]).
+    part_parents: Vec<(FileId, FileId)>,
     exports: Vec<ExportEdge>,
     export_scope: FxHashMap<StringId, ExportEntry>,
     /// The locals layer: per-spelling slots with base-name coupling,
@@ -1156,10 +1324,41 @@ impl LibraryGraph {
         self.extensions.contains(&(file, name))
     }
 
-    /// The resolved import edges of `lib`, in directive source order.
+    /// The resolved import edges of `lib`, in directive source order —
+    /// **grouped by the unit that wrote them**: the library-wide rows
+    /// ([`LibraryGraphBuilder::import`]) first, then one run per writing unit
+    /// in ascending [`FileId`] order ([`LibraryGraph::import_runs`]). For a
+    /// library whose rows are all library-wide — a single-unit library, a
+    /// synthetic SDK/dependency node — this is exactly the directive source
+    /// order it always was.
     #[must_use]
     pub fn import_edges(&self, lib: LibraryId) -> &[ImportEdge] {
         &self.nodes[lib.index() as usize].imports
+    }
+
+    /// The per-unit import runs of `lib`: `(file, first row index)` pairs
+    /// over [`Self::import_edges`], ascending by file, each run ending where
+    /// the next starts or at the edge count. Empty when every row is
+    /// library-wide. The enhanced-parts scope chain
+    /// ([`crate::namespace::Namespaces::lookup_in_file`]) walks these runs
+    /// from a file up its part tree.
+    #[must_use]
+    pub fn import_runs(&self, lib: LibraryId) -> &[(FileId, u32)] {
+        &self.nodes[lib.index() as usize].import_runs
+    }
+
+    /// The file that declares `part` inside `lib` — one hop up the
+    /// enhanced-parts scope chain; `None` when `part` is the library's
+    /// defining unit or is not a part of `lib` at all (an unregistered file,
+    /// a malformed include, or a link dropped by the cycle guard). One
+    /// binary search over the library's part links.
+    #[must_use]
+    pub fn part_parent(&self, lib: LibraryId, part: FileId) -> Option<FileId> {
+        let parents = &self.nodes[lib.index() as usize].part_parents;
+        parents
+            .binary_search_by_key(&part, |&(part, _)| part)
+            .ok()
+            .map(|index| parents[index].1)
     }
 
     /// The resolved export edges of `lib`, in directive source order.

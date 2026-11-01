@@ -1900,7 +1900,12 @@ fn export_graph_diagnostics(
                     };
                     let dartq_resolution::Lookup::Found(
                         dartq_resolution::NamespaceEntry::Decl(alias_file),
-                    ) = resolved.namespaces().lookup(&resolved.graph, member_lib, leaf)
+                    ) = resolved.namespaces().lookup_in_file(
+                        &resolved.graph,
+                        member_lib,
+                        Some(entry.file),
+                        leaf,
+                    )
                     else {
                         continue;
                     };
@@ -2074,7 +2079,13 @@ fn interface_cycle_diagnostics(
             .chain(container.implements_clause.iter())
             .chain(container.on_clause.iter())
             .filter_map(|&edge| {
-                match resolved.namespaces().lookup(&resolved.graph, lib, edge) {
+                // The clause name is written in `file`, so it resolves in
+                // that file's combined import scope (a part's own imports
+                // chain up its part tree).
+                match resolved
+                    .namespaces()
+                    .lookup_in_file(&resolved.graph, lib, Some(file), edge)
+                {
                     dartq_resolution::Lookup::Found(
                         dartq_resolution::NamespaceEntry::Decl(target),
                     ) => Some((target, edge)),
@@ -2098,7 +2109,12 @@ fn interface_cycle_diagnostics(
             edge.is_some_and(|&edge| {
                 edge == name
                     && matches!(
-                        resolved.namespaces().lookup(&resolved.graph, graph_lib, edge),
+                        resolved.namespaces().lookup_in_file(
+                            &resolved.graph,
+                            graph_lib,
+                            Some(file),
+                            edge
+                        ),
                         dartq_resolution::Lookup::Found(
                             dartq_resolution::NamespaceEntry::Decl(target),
                         ) if target == file
@@ -2371,9 +2387,15 @@ struct LibraryRows {
     /// kind face, `error_verifier.dart:4850` `element is ExtensionElement`);
     /// extension types stay plain declarations, as upstream does.
     decls: Vec<(StringId, FileId, Option<ClassModifiers>, bool)>,
-    /// Resolved import edges in directive source order; the implicit core
-    /// import joins at merge time, in front of these.
-    imports: Vec<ImportEdge>,
+    /// Resolved import edges in directive source order, each paired with the
+    /// member file that wrote it — the enhanced-parts per-file import scope
+    /// (`LibraryGraphBuilder::import_in`); the implicit core import joins at
+    /// merge time, in front of these.
+    imports: Vec<(FileId, ImportEdge)>,
+    /// The library's part-include edges `(includer, included)` — the part
+    /// tree the namespace layer walks for the combined import scope
+    /// (`LibraryGraphBuilder::part`).
+    parts: Vec<(FileId, FileId)>,
     /// Resolved export edges in directive source order.
     exports: Vec<ExportEdge>,
 }
@@ -2714,6 +2736,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
             let mut row = LibraryRows {
                 decls: Vec::new(),
                 imports: Vec::new(),
+                parts: Vec::new(),
                 exports: Vec::new(),
             };
             for file in member_files(info) {
@@ -2744,14 +2767,22 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                                         .and_then(|name| sdk_faces.get(name).copied())
                                 })
                                 .flatten();
-                            row.imports.push(ImportEdge {
-                                target: sdk_target.or_else(|| {
-                                    graph_target(state, &graph_ids, &dep_nodes, directive.target)
-                                }),
-                                prefix: directive.prefix,
-                                deferred: directive.deferred,
-                                combinators: directive.combinators.clone(),
-                            });
+                            row.imports.push((
+                                file,
+                                ImportEdge {
+                                    target: sdk_target.or_else(|| {
+                                        graph_target(
+                                            state,
+                                            &graph_ids,
+                                            &dep_nodes,
+                                            directive.target,
+                                        )
+                                    }),
+                                    prefix: directive.prefix,
+                                    deferred: directive.deferred,
+                                    combinators: directive.combinators.clone(),
+                                },
+                            ));
                         }
                         DirectiveKind::Export => {
                             // The import arm's `dart:` resolution on the
@@ -2774,6 +2805,17 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                                 }),
                                 combinators: directive.combinators.clone(),
                             });
+                        }
+                        // The part tree: an include only chains when its
+                        // target is a member of this library (the claim
+                        // walk's verdict, already folded into `parts`).
+                        DirectiveKind::Part => {
+                            let ResolvedTarget::Resolved(target) = directive.target else {
+                                continue;
+                            };
+                            if target != file && info.parts.contains(&target) {
+                                row.parts.push((file, target));
+                            }
                         }
                         _ => {}
                     }
@@ -2830,8 +2872,16 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                 },
             );
         }
-        for edge in row.imports {
-            builder.import(graph_id, edge);
+        // Every directive joins the graph against the file that wrote it: the
+        // combined import scope is per file (a part's imports are that part's
+        // and its sub-parts' alone), so the rows carry their unit and the part
+        // tree rides beside them (`import_in` / `part`). The implicit core
+        // edge above stays library-wide — every file inherits it.
+        for (file, edge) in row.imports {
+            builder.import_in(graph_id, file, edge);
+        }
+        for (includer, included) in row.parts {
+            builder.part(graph_id, includer, included);
         }
         for edge in row.exports {
             builder.export(graph_id, edge);
@@ -5106,8 +5156,9 @@ mod tests {
                                         .and_then(|name| sdk_faces.get(name).copied())
                                 })
                                 .flatten();
-                            builder.import(
+                            builder.import_in(
                                 graph_id,
+                                file,
                                 ImportEdge {
                                     target: sdk_target.or_else(|| {
                                         graph_target(
@@ -5122,6 +5173,18 @@ mod tests {
                                     combinators: directive.combinators.clone(),
                                 },
                             );
+                        }
+                        // The part tree, exactly as the parallel pass folds it:
+                        // an include chains only when its target is a member of
+                        // this library.
+                        DirectiveKind::Part => {
+                            let ResolvedTarget::Resolved(target) = directive.target else {
+                                continue;
+                            };
+                            let info = state.libraries.info(library).expect("live library");
+                            if target != file && info.parts.contains(&target) {
+                                builder.part(graph_id, file, target);
+                            }
                         }
                         DirectiveKind::Export => {
                             let sdk_target = (directive.target == ResolvedTarget::External)
@@ -5193,6 +5256,18 @@ mod tests {
                 format!("{:?}", oracle.import_edges(built_id)),
                 "import edges of {uri}"
             );
+            assert_eq!(
+                format!("{:?}", built.graph.import_runs(built_id)),
+                format!("{:?}", oracle.import_runs(built_id)),
+                "import runs of {uri}"
+            );
+            for file in built.graph.unit_files(built_id) {
+                assert_eq!(
+                    built.graph.part_parent(built_id, *file),
+                    oracle.part_parent(built_id, *file),
+                    "part parent of a unit of {uri}"
+                );
+            }
             assert_eq!(
                 format!("{:?}", built.graph.export_edges(built_id)),
                 format!("{:?}", oracle.export_edges(built_id)),

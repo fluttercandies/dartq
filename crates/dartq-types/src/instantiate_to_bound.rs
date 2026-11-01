@@ -50,6 +50,16 @@
 //! the declaration's own bound list (a type alias's shape, for one) must ask
 //! the algorithm directly instead of seeding a shared table with a value
 //! another same-spelled parameter would then read.
+//!
+//! Alias contract: the fixed point never sees an alias. It is handed the
+//! bound as the element model stores it — already expanded, `X extends F<X>`
+//! over `typedef F<T> = List<T>` arriving as `List<X>` (upstream keeps the
+//! alias only as a decoration on the expanded type, `type_system.dart:786`
+//! reads `typeParameter.bound`). [`crate::TypeKind`] carries no alias kind,
+//! so a bound provider that cannot expand a typedef head must report the
+//! parameter unbounded (`None`) and accept the `dynamic` default; feeding the
+//! alias's own parameter leaves through instead would ground a foreign
+//! parameter the fixed point has no candidates for.
 
 use rustc_hash::FxHashSet;
 
@@ -674,3 +684,10 @@ mod tests {
         ));
     }
 }
+
+// The #3311 pins (a formal's bound written through a `typedef` alias) live
+// beside the algorithm they fix, registered here so the module resolves
+// against this file's own imports.
+#[cfg(test)]
+#[path = "ticket_3311_tests.rs"]
+mod ticket_3311_tests;
