@@ -1,47 +1,39 @@
-//! Instantiate-to-bound: the type-parameter defaults fixpoint.
+//! Instantiate-to-bound: the type-parameter defaults computation.
 //!
-//! Direct port of `instantiateTypeFormalsToBounds`
-//! (`pkg/analyzer/lib/src/dart/element/type_system.dart:762-838`), the
-//! algorithm of dart-lang/sdk#27526 (comment 260021397): start each
-//! parameter at its declared bound (unbounded reads `dynamic`,
-//! `type_system.dart:786`), then repeatedly substitute defaulted parameters
-//! into the remaining "partial" defaults until a fixed point; parameters
-//! whose defaults still mention free parameters at the fixed point are
-//! *malbounded* and get the Phi substitution (each uncompleted parameter
-//! replaced by `dynamic`, each completed one by its default,
-//! type_system.dart:816-838).
+//! Direct port of the NDBD algorithm the oracle uses to compute
+//! `TypeParameterElementImpl.defaultType` — `DefaultTypesBuilder.
+//! _computeDefaultType` (`pkg/analyzer/lib/src/summary2/
+//! default_types_builder.dart:128-187`), the same algorithm `calculateBounds`
+//! spells out for the kernel side (`pkg/kernel/lib/src/bounds_checks.dart:
+//! 213-295`), implementing the `-->m`-relation spec of
+//! dart-lang/sdk#27526: start each parameter at its declared bound
+//! (unbounded reads `dynamic`, default_types_builder.dart:136-140), build
+//! the reference graph among the parameters, rewrite every strongly
+//! connected component's own bounds through the substitution that maps the
+//! component's members to `dynamic` (default_types_builder.dart:144-162),
+//! then substitute each parameter's resolved bound through every bound in
+//! declaration order so no parameter leaf survives
+//! (default_types_builder.dart:164-180).
 //!
-//! The free-parameter test is `getFreeParameters`
+//! The component rewrite is *scoped to the component*: a parameter outside
+//! a cycle whose bound mentions a cycle member keeps its parameter leaf
+//! through the SCC pass and completes in the grounding sweep with the
+//! member's substituted default — `X extends A<X>, Y extends X` yields
+//! `Y = A<dynamic>`, not `dynamic`. That is the difference from the
+//! fixpoint-plus-Phi reading of `instantiateTypeFormalsToBounds`
+//! (`type_system.dart:735-811`), whose fallback maps *every* uncompleted
+//! parameter to `dynamic` (type_system.dart:793-804) and so loses the
+//! dependent's bound entirely.
+//!
+//! The free-parameter test behind the `-->m` edges is `getFreeParameters`
 //! (type_system.dart:567-610): a structure walk that respects function
 //! types' binders — a parameter declared by a nested function type is
 //! bound there, not free — and honors the optional candidate set.
 //!
-//! Iteration-order note: the official progress loop scans
-//! `partials.keys` (Dart insertion order) and restarts on the first
-//! completion. The fixed point is order-independent — a parameter
-//! completes exactly when every free parameter of its partial default is
-//! already ground, and completed substitutions on disjoint parameters
-//! commute — so the loop below scans the parameters in declaration order
-//! and restarts identically; only the *completion schedule* could differ,
-//! which nothing observes. The malbounded set is likewise order-independent
-//! (it is exactly the set of defaults whose free parameters form a cycle
-//! among non-ground values).
-//!
 //! The interface entry point is `instantiateInterfaceToBounds`
-//! (type_system.dart:719-731) with `_defaultTypeArguments`
-//! (type_system.dart:1811-1820) reading each parameter's computed default.
-//!
-//! The fixed point IS the dependency-graph step the language spec spells out
-//! per stage (the `-->m` relation and its strongly connected components):
-//! a parameter whose bound mentions a peer completes only once that peer
-//! defaults (`X extends Y`, `Y extends num` ground both to `num`), and a
-//! bound that mentions its own parameter — `X extends A<X>`,
-//! `X extends FutureOr<X>`, `X extends Comparable<X>`; a one-parameter SCC —
-//! never completes, so the Phi substitution rewrites every member of the
-//! cycle to the already-completed defaults (`dynamic` for the stuck ones).
-//! The answer for `X` is therefore its *substituted* bound (`A<dynamic>`),
-//! reached without ever recursing on the bound itself. [`get_free_parameters`]
-//! is what keeps the walk finite: it never descends through a parameter leaf.
+//! (type_system.dart:687-698) with `_defaultTypeArguments`
+//! (type_system.dart:1822-1829) reading each parameter's computed
+//! `defaultType` — exactly the value this port produces.
 //!
 //! [`instantiate_type_formals_to_bounds_with`] takes the bound lookup as a
 //! closure because a declaration's bounds do not always live in one facts
@@ -51,15 +43,15 @@
 //! the algorithm directly instead of seeding a shared table with a value
 //! another same-spelled parameter would then read.
 //!
-//! Alias contract: the fixed point never sees an alias. It is handed the
+//! Alias contract: the algorithm never sees an alias. It is handed the
 //! bound as the element model stores it — already expanded, `X extends F<X>`
 //! over `typedef F<T> = List<T>` arriving as `List<X>` (upstream keeps the
-//! alias only as a decoration on the expanded type, `type_system.dart:786`
-//! reads `typeParameter.bound`). [`crate::TypeKind`] carries no alias kind,
+//! alias only as a decoration on the expanded type; the bound read is
+//! `typeParameter.bound`). [`crate::TypeKind`] carries no alias kind,
 //! so a bound provider that cannot expand a typedef head must report the
 //! parameter unbounded (`None`) and accept the `dynamic` default; feeding the
 //! alias's own parameter leaves through instead would ground a foreign
-//! parameter the fixed point has no candidates for.
+//! parameter the algorithm has no candidates for.
 
 use rustc_hash::FxHashSet;
 
@@ -77,16 +69,18 @@ use crate::variance::ParamFactsTable;
 pub struct BoundsInstantiation {
     /// One default per input parameter, in input order.
     pub defaults: Vec<TypeId>,
-    /// `true` when some defaults were completed only by the Phi
-    /// substitution (type_system.dart:816-838) — the caller reports the
-    /// malbounded-ness error; the partial types are still returned.
+    /// `true` when some parameter's bound reaches a cycle — the official
+    /// `partials.isNotEmpty → hasError[0] = true` (type_system.dart:
+    /// 785-788): cycle members and their dependents were completed only by
+    /// the component rewrite and grounding sweep. The caller reports the
+    /// malbounded-ness error; the substituted types are still returned.
     pub malbounded: bool,
 }
 
-/// `instantiateTypeFormalsToBounds` (`type_system.dart:762-838`) over the
-/// facts snapshot — the bound of each parameter is its declared bound, or
-/// the unbounded `dynamic` face. See the module docs for the algorithm and
-/// the iteration-order note.
+/// `instantiateTypeFormalsToBounds` over the facts snapshot — the bound of
+/// each parameter is its declared bound, or the unbounded `dynamic` face
+/// (default_types_builder.dart:136-140). See the module docs for the
+/// algorithm.
 #[must_use]
 pub fn instantiate_type_formals_to_bounds(
     table: &TypeTable,
@@ -98,18 +92,28 @@ pub fn instantiate_type_formals_to_bounds(
     })
 }
 
-/// The same fixed point with the bound lookup supplied by the caller —
+/// The same instantiation with the bound lookup supplied by the caller —
 /// `None` for an unbounded parameter (the implicit `dynamic`,
-/// type_system.dart:786). The algorithm is identical: no SCC is materialized,
-/// the progress loop completes every parameter reachable through ground
-/// peers, and the survivors are exactly the cycle members, rewritten by the
-/// Phi substitution (see the module docs).
+/// default_types_builder.dart:136-140). The algorithm is the oracle's NDBD
+/// shape that computes `TypeParameterElementImpl.defaultType` — the value
+/// `_defaultTypeArguments` reads for every raw-type instantiation
+/// (`_computeDefaultType`, default_types_builder.dart:128-187; the kernel
+/// twin is `calculateBounds`, bounds_checks.dart:213-295): materialize the
+/// `-->m` relation, rewrite each strongly connected component's own bounds
+/// through the component's dynamic substitution, then ground every bound by
+/// substituting each parameter's resolved default in declaration order. A
+/// parameter *outside* a cycle whose bound mentions a cycle member therefore
+/// completes with the member's substituted default (`X extends A<X>`,
+/// `Y extends X` yields `Y = A<dynamic>`) — not with `dynamic`, the
+/// all-or-nothing Phi answer the fixpoint port used to give
+/// (type_system.dart:793-804 maps every uncompleted parameter to
+/// `dynamic`); see the module docs.
 ///
 /// # Panics
 ///
-/// Panics on the two ordering invariants of the fixed-point loop — a
-/// defaulted parameter always came from the input list, and every input
-/// parameter completes; both are pinned by `expect`s.
+/// Panics on the one ordering invariant of the `-->m` build — a free
+/// parameter of a declared bound always came from the input list (the
+/// candidate set is exactly the input), pinned by an `expect`.
 #[must_use]
 pub fn instantiate_type_formals_to_bounds_with(
     table: &TypeTable,
@@ -126,74 +130,165 @@ pub fn instantiate_type_formals_to_bounds_with(
 
     let dynamic = table.intern(UninternedType::Dynamic, false);
     let all: FxHashSet<TypeParamId> = parameters.iter().copied().collect();
-    // "all ground" — completed defaults, keyed like the official maps.
-    let mut defaults: Vec<(TypeParamId, TypeId)> = Vec::with_capacity(count);
-    // "not ground" — in declaration (insertion) order.
-    let mut partials: Vec<(TypeParamId, TypeId)> = Vec::with_capacity(count);
-
-    for &parameter in parameters {
-        let bound = bound_of(parameter).unwrap_or(dynamic);
-        partials.push((parameter, bound));
+    let mut index_of: rustc_hash::FxHashMap<TypeParamId, usize> =
+        rustc_hash::FxHashMap::default();
+    for (i, &parameter) in parameters.iter().enumerate() {
+        index_of.insert(parameter, i);
     }
 
-    // The progress loop (type_system.dart:791-812): scan in order; a
-    // partial with no free parameters is ground, one whose free parameters
-    // are all defaulted gets substituted; either way it completes and the
-    // scan restarts.
-    let mut has_progress = true;
-    while has_progress {
-        has_progress = false;
-        for index in 0..partials.len() {
-            let (parameter, value) = partials[index];
-            let Some(free) = get_free_parameters(table, &all, value) else {
-                defaults.push((parameter, value));
-                partials.remove(index);
-                has_progress = true;
-                break;
-            };
-            if free.iter().all(|p| defaults.iter().any(|(d, _)| d == p)) {
-                let map: Vec<(TypeParamId, TypeId)> = defaults.clone();
-                let ground = table.substitute(value, &map);
-                defaults.push((parameter, ground));
-                partials.remove(index);
-                has_progress = true;
-                break;
+    // `bounds[i]` is parameter `i`'s declared bound, or `dynamic` when
+    // unbounded (default_types_builder.dart:136-140).
+    let mut bounds: Vec<TypeId> = parameters
+        .iter()
+        .map(|&p| bound_of(p).unwrap_or(dynamic))
+        .collect();
+
+    // The `-->m` relation (default_types_builder.dart:375-428 —
+    // `_TypeParametersGraph._collectReferencesFrom`): `dependents[i]` lists
+    // the indices of the parameters whose bounds reference `parameters[i]`.
+    // [`get_free_parameters`] already restricts occurrences to the input
+    // set and honors nested function-type binders, the counterpart of the
+    // official `TypeParameterType` arm restricted by `_parameterToIndex`;
+    // a set dedupes repeated occurrences (`X` under two arg positions).
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (j, &bound) in bounds.iter().enumerate() {
+        let Some(free) = get_free_parameters(table, &all, bound) else {
+            continue;
+        };
+        let mut seen: FxHashSet<TypeParamId> = FxHashSet::default();
+        for tp in free {
+            if seen.insert(tp) {
+                let i = index_of
+                    .get(&tp)
+                    .copied()
+                    .expect("free parameter is a candidate");
+                dependents[i].push(j);
             }
         }
     }
 
-    // Malbounded fallback (type_system.dart:814-838): build the Phi
-    // substitution — every uncompleted parameter to `dynamic`, every
-    // completed one to its default — with the domain COMPLETE before any
-    // partial is rewritten (the official fills domain/range first, then
-    // substitutes).
-    let malbounded = !partials.is_empty();
-    if malbounded {
-        let mut map: Vec<(TypeParamId, TypeId)> = defaults.clone();
-        for (parameter, _) in &partials {
-            map.push((*parameter, dynamic));
+    // The component pass (default_types_builder.dart:142-162): each
+    // strongly connected component's own bounds are rewritten through the
+    // substitution mapping the component's members to `dynamic`. The
+    // rewrite is scoped to the component — a peer bound that merely
+    // mentions a member keeps its parameter leaf for the grounding sweep.
+    let components = strong_components(&dependents);
+    let mut cyclic = vec![false; count];
+    for component in &components {
+        let is_cycle = component.len() > 1
+            || component
+                .iter()
+                .any(|&i| dependents[i].contains(&i));
+        if is_cycle {
+            for &i in component {
+                cyclic[i] = true;
+            }
         }
-        for (parameter, value) in &partials {
-            let default = table.substitute(*value, &map);
-            defaults.push((*parameter, default));
+        let map: Vec<(TypeParamId, TypeId)> = component
+            .iter()
+            .map(|&i| (parameters[i], dynamic))
+            .collect();
+        for &i in component {
+            bounds[i] = table.substitute(bounds[i], &map);
         }
     }
 
-    let mut ordered: Vec<Option<TypeId>> = vec![None; count];
-    for (parameter, default) in defaults {
-        let slot = parameters
-            .iter()
-            .position(|&p| p == parameter)
-            .expect("parameter came from the input");
-        ordered[slot] = Some(default);
+    // `malbounded` is the official `partials.isNotEmpty → hasError[0]`
+    // (type_system.dart:785-788): a parameter is malbounded when it sits in
+    // a cycle or depends on one — the dependents-walk forward from cyclic
+    // members marks exactly the set the old fixpoint left ungrounded.
+    let malbounded = cyclic.iter().any(|&c| c);
+
+    // The grounding sweep (default_types_builder.dart:164-180): in
+    // declaration order, substitute each parameter's resolved bound through
+    // every bound. Every parameter leaf is eliminated exactly once, so
+    // dependents of a cycle complete with the member's substituted default
+    // transitively (`X extends A<X>`, `Y extends X`, `Z extends Y` grounds
+    // all three to `A<dynamic>`).
+    for i in 0..count {
+        let map = [(parameters[i], bounds[i])];
+        for bound in bounds.iter_mut() {
+            *bound = table.substitute(*bound, &map);
+        }
     }
+
     BoundsInstantiation {
-        defaults: ordered
-            .into_iter()
-            .map(|d| d.expect("every parameter completed"))
-            .collect(),
+        defaults: bounds,
         malbounded,
     }
+}
+
+/// `computeStrongComponents` (`pkg/kernel/lib/util/graph.dart:35-93`) — the
+/// Dijkstra path-based strong-component algorithm the oracle's
+/// `DefaultTypesBuilder` consumes (default_types_builder.dart:142-143).
+/// `dependents[i]` are the out-neighbors of `i` (upstream `_edges`); the
+/// component order is the official emission order, which the component pass
+/// is indifferent to — each component's substitution is scoped to its own
+/// members' bounds.
+fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn visit(
+        vertex: usize,
+        dependents: &[Vec<usize>],
+        count: &mut usize,
+        preorder: &mut [usize],
+        unassigned: &mut Vec<usize>,
+        candidates: &mut Vec<usize>,
+        assigned: &mut [bool],
+        result: &mut Vec<Vec<usize>>,
+    ) {
+        preorder[vertex] = *count;
+        *count += 1;
+        unassigned.push(vertex);
+        candidates.push(vertex);
+        for &neighbor in &dependents[vertex] {
+            if preorder[neighbor] == usize::MAX {
+                visit(
+                    neighbor, dependents, count, preorder, unassigned, candidates, assigned,
+                    result,
+                );
+            } else if !assigned[neighbor] {
+                while preorder[*candidates.last().expect("path is nonempty")]
+                    > preorder[neighbor]
+                {
+                    candidates.pop();
+                }
+            }
+        }
+        if *candidates.last().expect("path is nonempty") == vertex {
+            let mut component = Vec::new();
+            while let Some(top) = unassigned.pop() {
+                component.push(top);
+                assigned[top] = true;
+                if top == vertex {
+                    break;
+                }
+            }
+            result.push(component);
+            candidates.pop();
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut count = 0usize;
+    let mut preorder = vec![usize::MAX; dependents.len()];
+    let mut unassigned = Vec::new();
+    let mut candidates = Vec::new();
+    let mut assigned = vec![false; dependents.len()];
+    for vertex in 0..dependents.len() {
+        if preorder[vertex] == usize::MAX {
+            visit(
+                vertex,
+                dependents,
+                &mut count,
+                &mut preorder,
+                &mut unassigned,
+                &mut candidates,
+                &mut assigned,
+                &mut result,
+            );
+        }
+    }
+    result
 }
 
 /// `getFreeParameters` (`type_system.dart:567-610`): the free type

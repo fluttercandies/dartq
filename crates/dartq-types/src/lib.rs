@@ -109,6 +109,8 @@ mod ticket_3030_tests;
 mod ticket_3031_tests;
 #[cfg(test)]
 mod ticket_3383_tests;
+#[cfg(test)]
+mod ticket_3442_tests;
 
 pub use error::TypeError;
 pub use exhaustive::{
