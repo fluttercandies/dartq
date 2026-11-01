@@ -2154,13 +2154,19 @@ pub fn fold_unit_with_ops<'t>(
     // matched type (`getMatchedValueType`'s head) — the narrowed type can
     // never equal the constant where the declared type could. The rows
     // stage into the usage tail like their parse-time siblings.
-    // The oracle's dead-node short-circuit (`deadNodeReported`): a
-    // constant pattern inside an unreachable clause never reaches the
-    // verifier — the clause's `unreachable_switch_case` row answers
-    // instead. The parse-time rows staged straight into `usage` carry no
-    // clause link, so the dead windows are re-derived from the completed
+    // The oracle's dead-node short-circuit covers the DEFERRED
+    // re-decision only: `visitConstantPattern` still evaluates the
+    // constant inside an unreachable clause and reports never-matches
+    // against the case's own matched type (the oracle's `case null:` after
+    // `case true || null:` reports beside its `unreachable_switch_case`
+    // and `dead_code` rows). What the deferred join must not do is
+    // re-decide a passing candidate with the flow's NARROWED matched type
+    // and manufacture a row the oracle's per-case verdict never produced —
+    // the dead `case null:` over `A?` stays silent upstream because
+    // `Null` can equal `A?` at the clause, while the promotion-narrowed
+    // `A` would say never. The dead windows come from the completed
     // switch contexts: an unreachable `case` anchor runs through the next
-    // case's anchor.
+    // case's head start.
     let dead_case = SemanticCode::UnreachableSwitchCase.code_info().name;
     let dead_anchors: FxHashSet<u32> = report
         .diagnostics
@@ -2188,17 +2194,6 @@ pub fn fold_unit_with_ops<'t>(
                     dead_windows.push((start, end));
                 }
             }
-        }
-        if !dead_windows.is_empty() {
-            let never = SemanticCode::ConstantPatternNeverMatchesValueType
-                .code_info()
-                .name;
-            report.usage.retain(|d| {
-                d.code.name != never
-                    || !dead_windows
-                        .iter()
-                        .any(|&(start, end)| d.range.offset >= start && d.range.offset < end)
-            });
         }
     }
     let pending_matched = std::mem::take(&mut engine.pending_matched);
