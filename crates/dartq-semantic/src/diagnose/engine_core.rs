@@ -6680,10 +6680,14 @@ impl<'a> Engine<'a> {
             SemanticCode::UnnecessaryNullComparisonFalse
         };
         // The oracle anchors at the operator-through-`null` extent (`==
-        // null` / `null ==`), never the compared operand alone.
+        // null` / `null ==`), never the compared operand alone. The
+        // operator token itself is read from the table: an operand row
+        // ends at its own node's head face, so a completed send's row
+        // ends at the callee identifier and the gap over its argument
+        // list (`intFunction() == null`) must not widen the anchor.
         let op = self
-            .trimmed_span(operand.range.end(), null_row.range.offset)
-            .or_else(|| self.trimmed_span(null_row.range.end(), operand.range.offset));
+            .comparison_operator_span(operand.range.end(), null_row.range.offset)
+            .or_else(|| self.comparison_operator_span(null_row.range.end(), operand.range.offset));
         let range = match op {
             Some(op) => {
                 let offset = op.offset.min(null_row.range.offset);
@@ -6695,6 +6699,34 @@ impl<'a> Engine<'a> {
             None => operand.range,
         };
         self.stage_usage(code, range, "");
+    }
+
+    /// The `==`/`!=` token inside the gap `[from, to)` the two operand
+    /// rows leave: the operator is the anchor the invariant-null-
+    /// comparison row opens at (`reportStartEnd`, the operator through the
+    /// `null` operand). Reading the token beats trimming the whole gap —
+    /// a send operand's row ends at the callee identifier, so the gap also
+    /// holds the invocation's argument list (`intFunction() == null`), and
+    /// a comment between the leaves is invisible to the token table either
+    /// way. `None` when the interval holds no equality token (a nested
+    /// expression the rows do not cover — the caller keeps its fallback).
+    fn comparison_operator_span(&self, from: u32, to: u32) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        let head = tokens.partition_point(|token| token.utf16_offset < from);
+        tokens[head..]
+            .iter()
+            .take_while(|token| token.utf16_offset < to)
+            .find(|token| {
+                matches!(
+                    token.kind,
+                    dartq_scanner::TokenKind::EqEq | dartq_scanner::TokenKind::BangEq
+                )
+            })
+            .map(|token| SourceRange {
+                offset: token.utf16_offset,
+                // `==`/`!=` are ASCII: the byte length is the UTF-16 length.
+                length: token.byte_len,
+            })
     }
 
     /// `unnecessary_nan_comparison` (`visitBinaryOperatorInvocation`'s

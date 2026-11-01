@@ -19659,3 +19659,27 @@ mod ticket_3407_tests;
 // lands. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
+
+// The #3392 pins (the equality/type-check operand faces over top-level
+// bare reads and completed sends): the verdicts already resolve both
+// operand shapes, and the invariant-null-comparison row anchors at the
+// operator through the `null` operand — a send operand's row ends at the
+// callee identifier, so its argument list must not widen the anchor
+// (`intFn() == null` reports `== null`, not `() == null`). A `dynamic`
+// operand types no constant and stays silent. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// The #3392 pins (the equality/type-check operand faces over top-level
+// bare reads and completed sends): the verdicts already resolve both
+// operand shapes, and the invariant-null-comparison row anchors at the
+// operator through the `null` operand — a send operand's row ends at the
+// callee identifier, so its argument list must not widen the anchor
+// (`intFn() == null` reports `== null`, not `() == null`). A `dynamic`
+// operand types no constant and stays silent. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3392_tests.rs"]
+mod ticket_3392_tests;
