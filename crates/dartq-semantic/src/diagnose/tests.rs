@@ -22500,6 +22500,14 @@ mod ticket_3379_tests;
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
 
+// —— #3508 —— the three `finalize_usage` arms that iterated the drained
+// —— `self.rows`: the missing-write setter/top-level credit, the
+// —— `_isReadIdentifier` write-offsets gate, and the shorthand-ctor
+// —— selector credit re-derive from `refs`/`member_refs`/`member_reads`.
+// —— Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
 // —— #3455 —— the `undefined_*` code-choice faces: a `foo<int>` generic
 // —— instantiation head reports `undefined_method` naming `this`'s type
 // —— (an extension answers its `on` type) and keeps `undefined_identifier`
@@ -22573,3 +22581,110 @@ mod ticket_3437_tests;
 #[cfg(test)]
 #[path = "ticket_3438_tests.rs"]
 mod ticket_3438_tests;
+
+// —— #3430 —— a type test's gated candidate published on the receiver
+// —— face: `x._f is String` resolves a chained `x._f.m` on the promoted
+// —— `String` (never the declared `Object?`), through class bodies,
+// —— extension bodies, and the `as`-cast arm. Registered here via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3434 —— an `augment` fragment's members join the merged element face
+// —— of the declaration it augments: the introduction's body reads the
+// —— fragment's fields/methods/statics, enum constants join the witness set,
+// —— constructors, `with` edges and the implicit-default gate follow the
+// —— union, and the override face sees the fragment's member. Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3475 —— the displayed-type boundary: `ty_display` fills
+// —— instantiate-to-bounds at every nesting depth (named arguments,
+// —— function return/formals, record fields), and the type-argument bounds
+// —— row's Function-typed arguments keep their own display. Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3490 —— the pattern never-match verdict reads the canonical `Null`
+// face: the written `Null` capture is normalized before `canBeSubtypeOf`
+// and the Null arms decide over the potentially-nullable opposite face, so
+// `null case Null` stops reporting and the cast-pattern triple (unnecessary
+// / never-matches / always-throws) matches the oracle. Registered here via
+// `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3469 — alias-headed bounds: the alias parameters' stored variance is
+// —— the typedef one (their occurrences in the aliased body), so the
+// —— instantiate-to-bound defaults ground the way the oracle's do, and a
+// —— written bound naming a bare generic alias decides the type-argument
+// —— faces. Registered here via `#[path]`; the module stays inside the
+// —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3516 —— a cross-unit `augment` fragment's declarations join the merged
+// —— element face: enum constants (read face + switch witness set),
+// —— constructor selectors, `const`-constructor presence, the implicit
+// —— default (suppressed by a part-declared named constructor, kept by an
+// —— introduction-declared one) and the `with` supertype edge. Registered
+// —— here via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3402 —— a call site's static type is the send's result, resolved
+// —— through the callee's declared return — an alias-typed local's
+// —— invocation answers the substituted signature's return, and the send
+// —— feeds the next member/send face transitively. Registered here via
+// —— `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3449 —— a cascade section over a non-bare target (`f()..x`,
+// —— `C()..x`) checks members against the target's own value face. The
+// —— defined section stays silent; the missing one reports on the
+// —— target's type. Registered here via `#[path]`; the module stays
+// —— inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// —— resolves.
+#[cfg(test)]
+
+// —— #3457 —— the extension consult and instance-member faces route
+// —— receivers the named-container walk never owned: a type-variable
+// —— receiver resolves through its bound (`<unknown>` display, nullable
+// —— bound reports unchecked, extension-through-bound applies), and a
+// —— `FutureOr` receiver checks its nullable face against the `on`
+// —— constraint. Registered here via `#[path]`; the module stays inside
+// —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3400 —— a const constructor's `x = e` field-initializer RHS runs
+// —— the potentially-constant scan at the list's close: formals bound
+// —— opaque minus wildcards, instance-member reads report
+// —— `invalid_constant` beside `implicit_this_reference_in_initializer`,
+// —— non-const top-level reads report `invalid_constant`. Registered here
+// —— via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3504 —— `return_of_invalid_type` inside an extension member reads
+// —— the member's own declared return annotation, never the extension's
+// —— `on` type: the operator member's `ret` latches before its annotation
+// —— parses, so the armed `on` type is the stale slot's content — the
+// —— latch drops it and `Engine::arm_return_span` backfills only a
+// —— completion that starts before the declaring name. Registered here
+// —— via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+
+// —— #3504 —— `return_of_invalid_type` inside an extension member reads
+// —— the member's own declared return annotation, never the extension's
+// —— `on` type: the operator member's `ret` latches before its annotation
+// —— parses, so the armed `on` type is the stale slot's content — the
+// —— latch drops it and `Engine::arm_return_span` backfills only a
+// —— completion that starts before the declaring name. Registered here
+// —— via `#[path]`; the module stays inside the `diagnose` subtree so
+// —— `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3504_tests.rs"]
+mod ticket_3504_tests;

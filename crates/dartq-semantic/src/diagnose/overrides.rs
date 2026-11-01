@@ -8025,8 +8025,9 @@ impl<'a> Engine<'a> {
         let tok_span = |i: usize| {
             let tok = toks.get(i)?;
             Some(SourceRange {
-                offset: tok.byte_offset,
-                length: tok.byte_len,
+                offset: tok.utf16_offset,
+                length: self.utf16_of((tok.byte_offset + tok.byte_len) as usize)
+                    - tok.utf16_offset,
             })
         };
         let mut i = start;
@@ -8053,7 +8054,7 @@ impl<'a> Engine<'a> {
             }
             _ => {
                 let first = self.intern_checked(i)?;
-                let head_start = toks.get(i)?.byte_offset;
+                let head_start = toks.get(i)?.utf16_offset;
                 i += 1;
                 // A prefixed clause face (`p.C`): the prefix stays the
                 // spelling's head, the local name becomes the leaf — the
@@ -8067,7 +8068,9 @@ impl<'a> Engine<'a> {
                 } else {
                     (None, first)
                 };
-                let head_end = toks.get(i - 1)?.byte_offset + toks.get(i - 1)?.byte_len;
+                let last = toks.get(i - 1)?;
+                let head_end =
+                    self.utf16_of((last.byte_offset + last.byte_len) as usize);
                 let mut args: Vec<Ty> = Vec::new();
                 if lex_at(i) == Some("<") {
                     i = self.scan_type_args(i, &mut args)?;
@@ -10345,3 +10348,10 @@ mod ticket_3001_tests;
 #[cfg(test)]
 #[path = "ticket_2515_tests.rs"]
 mod ticket_2515_tests;
+
+/// The #3484 pins: `scan_clause_type`'s clause-entry spans are UTF-16
+/// [`SourceRange`]s — BMP wide characters, astral surrogate pairs, CRLF
+/// breaks, prefixed faces, and the name-anchored control row.
+#[cfg(test)]
+#[path = "ticket_3484_tests.rs"]
+mod ticket_3484_tests;
