@@ -522,6 +522,9 @@ impl Interp<'_> {
                     // Nor a by-construction non-null value: the matched
                     // value comes from the scrutinee's runtime rows.
                     non_null: false,
+                    // A pattern binder declares no formal, so it carries no
+                    // implicit-`dynamic` declaration face.
+                    implicit_dynamic: false,
                 };
                 let shadowed = self.bound_var(*name);
                 // The stacked-head alias (official `switchStatement_

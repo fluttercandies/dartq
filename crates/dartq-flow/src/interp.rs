@@ -65,6 +65,21 @@ pub(crate) struct VarMeta {
     /// write clears it ([`Interp::apply_write`]), like the SSA node of a
     /// mutable local.
     pub non_null: bool,
+    /// The variable's static type is `dynamic` although its lattice slot
+    /// stays [`Ty::UNKNOWN`]: an implicitly typed FORMAL's element type is
+    /// `dynamicType` upstream (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:799-814`
+    /// — a formal with no annotation and no function-typed suffix lands the
+    /// `element.type is InvalidTypeImpl` arm and takes
+    /// `_typeProvider.dynamicType`), and `Ty::UNKNOWN` is this layer's
+    /// suppress-everything stand-in for it. The read-type query row
+    /// ([`crate::facts::FlowFact::ReadType`]) publishes [`Ty::DYNAMIC`] for
+    /// such a variable while the lattice keeps the unknown slot, so a
+    /// consumer asking for the static type at a read tells "known `dynamic`"
+    /// (a dynamic receiver the dynamic-call lints report) apart from "we
+    /// don't know" (silent). Promotion, reachability and nullability
+    /// questions keep reading [`VarMeta::ty`] and stay unchanged.
+    pub implicit_dynamic: bool,
 }
 
 /// One lexical scope frame: name id to variable id.

@@ -827,16 +827,25 @@ impl<'a> Engine<'a> {
         }))
     }
 
-    /// A container member's declared field type from a clean walk
-    /// (`Unknown` for executables and broken chains). The answer folds
-    /// through a type alias first — the member read's static type is the
-    /// resolved interface type (`c.f as int` over `IntAlias f` is dead).
-    /// The fold is idempotent, so the promotable-field substitution that
-    /// reads these rows' types re-folds harmlessly (#1409).
+    /// A container member's declared read type from a clean walk (`Unknown`
+    /// for executables and broken chains): a field answers its declared (or
+    /// inferred) type, a getter its declared return — the static type of the
+    /// property read upstream, where `c.bad` over `void get bad` is `void`.
+    /// The answer folds through a type alias first — the member read's static
+    /// type is the resolved interface type (`c.f as int` over `IntAlias f` is
+    /// dead). The fold is idempotent, so the promotable-field substitution
+    /// that reads these rows' types re-folds harmlessly (#1409).
     pub(crate) fn member_declared_ty(&self, container: StringId, member: StringId) -> Ty {
         match self.walk_members(container, member) {
             Walk::Found(entry) if entry.kind == MemberKind::Field => {
                 self.fold_alias_ty(self.field_model_ty(container, member, entry.var_ty))
+            }
+            // A getter read's declared type is its return; staging only
+            // fields made every getter-read argument read as `Unknown`
+            // (`E(c.bad)` over `void get bad` never reached the void-argument
+            // face).
+            Walk::Found(entry) if entry.kind == MemberKind::Getter => {
+                self.fold_alias_ty(entry.return_ty)
             }
             _ => Ty::UNKNOWN,
         }

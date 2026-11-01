@@ -144,9 +144,31 @@ impl Interp<'_> {
                             // above: a plain assignment's target read
                             // retracts with it (the target identifier is a
                             // write, not a read).
+                            //
+                            // An unpromoted read of an implicitly typed
+                            // FORMAL publishes `dynamic`, not the lattice's
+                            // suppress face: the formal's element type is
+                            // `dynamicType` upstream (upstream Dart SDK
+                            // source, pkg/analyzer/lib/src/dart/resolver/
+                            // resolution_visitor.dart:799-814), so the
+                            // static type at such a read is a KNOWN
+                            // `dynamic` — a dynamic receiver the dynamic-call
+                            // faces report — never "we don't know". The
+                            // lattice slot keeps `Unknown` (no promotion,
+                            // reachability or nullability verdict moves).
+                            let query_ty = if ty == Ty::UNKNOWN
+                                && self
+                                    .vars
+                                    .get(var as usize)
+                                    .is_some_and(|meta| meta.implicit_dynamic)
+                            {
+                                Ty::DYNAMIC
+                            } else {
+                                ty
+                            };
                             self.emit(FlowFact::ReadType {
                                 span: *token,
-                                ty,
+                                ty: query_ty,
                                 args,
                             });
                             // The why-not-promoted row (upstream

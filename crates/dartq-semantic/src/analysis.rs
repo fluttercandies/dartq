@@ -251,7 +251,11 @@ impl<'a> Analysis<'a> {
     /// stands, declared otherwise — in the semantic `Ty` space.
     /// `expr` must be the read's own identifier span; inferred-type reads
     /// (`var x = …`) answer [`Ty::Unknown`] (the name-level reality the
-    /// fold shares).
+    /// fold shares). An untyped formal's read is the exception: its declared
+    /// type IS `dynamic` upstream (an implicitly typed formal's element type,
+    /// `pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart:799-814`),
+    /// so it answers [`Ty::Dynamic`] — "known `dynamic`", a receiver the
+    /// dynamic-call faces report — never the silent unknown face.
     #[must_use]
     pub fn type_of(&self, expr: SourceRange) -> Option<Ty> {
         row_starting_at(&self.read_types, expr, |row| row.0.offset).map(|(_, ty)| *ty)

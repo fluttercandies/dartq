@@ -19649,6 +19649,17 @@ mod ticket_3407_tests;
 // stays inside the `diagnose` subtree.
 #[cfg(test)]
 
+// The #3374 pins (the implicit-`dynamic` static type at a read): an untyped
+// formal's element type is `dynamicType` upstream
+// (`resolver/resolution_visitor.dart:799-814`), so the read-type query must
+// answer `dynamic` for its unpromoted reads — the input the dynamic-receiver
+// lints (`avoid_dynamic_calls`) report on — while a genuinely unknown read
+// keeps the silent `Unknown` face. Registered here via `#[path]`; the module
+// stays inside the `diagnose` subtree.
+#[cfg(test)]
+#[path = "ticket_3374_tests.rs"]
+mod ticket_3374_tests;
+
 // The #3384 residual pins (recon bucket A2's display face): a written
 // function type's own type-parameter group displays in DECLARATION order
 // with each bound's explicit type arguments spelled (`void Function<X
@@ -19683,3 +19694,14 @@ mod ticket_3407_tests;
 #[cfg(test)]
 #[path = "ticket_3392_tests.rs"]
 mod ticket_3392_tests;
+
+// The #3412 pins (the generic constructor send's static type): a dot-send
+// on a class head is an instance creation upstream, so the invocation
+// node's type is the CREATED instance — the arm reads the instantiation
+// the creation machinery published for the class segment (a written
+// `<...>` group, a solved fold) instead of answering `Unknown`, and a
+// creation it published nothing for keeps the unknown under-report so no
+// fabricated face stages rows the oracle never reports. Registered here
+// via `#[path]`; the module stays inside the `diagnose` subtree so
+// `crate::diagnose::test_rig` resolves.
+#[cfg(test)]

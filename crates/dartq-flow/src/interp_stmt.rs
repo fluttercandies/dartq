@@ -1352,6 +1352,10 @@ impl Interp<'_> {
                     // `final`/`const` and the fold carried one.
                     const_bool: None,
                     non_null: false,
+                    // A local declarator's declared type reaches the read
+                    // rows through the initializer inference below, never
+                    // through the implicit-`dynamic` formal face.
+                    implicit_dynamic: false,
                 };
                 // The declaration's type slot closes with the first variable
                 // it declares. A later `Type` event inside the list belongs
@@ -1693,10 +1697,22 @@ impl Interp<'_> {
             }
             Ev::Formal {
                 name,
-                this_or_super: _,
+                this_or_super,
                 token,
             } => {
-                let ty = match self.pending_ty.take() {
+                // The declaration's static type is `dynamic` when neither an
+                // annotation nor a context-schema inference typed it: upstream
+                // leaves such a formal's element type at the `InvalidTypeImpl`
+                // default and the resolver overwrites it with `dynamicType`
+                // (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/resolver/resolution_visitor.dart
+                // :799-814) — the `implicitDynamicType` face a lint sees as a
+                // `dynamic` receiver. The lattice keeps the suppress face
+                // `Ty::UNKNOWN` for it (`implicit_dynamic`), and the read-type
+                // query row publishes the dynamic claim. A `this.x`/`super.x`
+                // formal takes its target's type instead, so it never claims
+                // the implicit-`dynamic` face.
+                let (ty, implicit_dynamic) = match self.pending_ty.take() {
                     // The context-inferred formal face (official
                     // `_inferFormalParameters`): an implicitly typed
                     // formal of an open function literal arrives with
@@ -1709,12 +1725,18 @@ impl Interp<'_> {
                     // type adopts the staged spelling exactly like the
                     // `var`-declarator window's `meta.ty` adoption
                     // (#2140).
-                    None | Some(Ty::UNKNOWN) => self
+                    None | Some(Ty::UNKNOWN) => match self
                         .inferred_locals
                         .get(&token.range.offset)
-                        .map(|&(ty, _)| ty)
-                        .unwrap_or(Ty::UNKNOWN),
-                    Some(ty) => ty,
+                    {
+                        Some(&(ty, _)) => (ty, false),
+                        // No inference decided it: the implicit `dynamic`
+                        // face (`function_expression_resolver.dart:106`
+                        // only overwrites a formal whose type is still
+                        // `DynamicType`).
+                        None => (Ty::UNKNOWN, true),
+                    },
+                    Some(ty) => (ty, false),
                 };
                 let args = std::mem::take(&mut self.pending_ty_args);
                 let written = std::mem::take(&mut self.pending_ty_written);
@@ -1731,6 +1753,7 @@ impl Interp<'_> {
                     // An inferred formal's value arrives from the caller
                     // too: nothing here proves it non-null.
                     non_null: false,
+                    implicit_dynamic: implicit_dynamic && !this_or_super,
                 };
                 self.declare_var(*name, meta, true);
             }
