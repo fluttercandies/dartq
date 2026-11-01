@@ -329,6 +329,11 @@ impl<'a> Face<'a> {
                 self.field("function");
                 let shape = self.args.function_shape(shape);
                 self.usize(shape.type_params as usize);
+                // The required/optional positional split is type identity
+                // (`Function(int)` != `Function([int])`), so it joins the
+                // digest — otherwise an element whose signature changed
+                // only in that split would read unchanged.
+                self.usize(shape.required_positional as usize);
                 self.ty(shape.return_ty);
                 for ty in shape.positional.iter() {
                     self.ty(*ty);

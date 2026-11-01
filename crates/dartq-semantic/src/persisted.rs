@@ -121,6 +121,9 @@ pub struct PersistedAnonMethod {
     pub first_named: bool,
     pub first_optional: bool,
     pub param_ty: Option<PersistedParamType>,
+    pub end: u32,
+    pub is_expression: bool,
+    pub first_param: Option<PersistedRange>,
 }
 
 /// The written parameter type and its anchor span (the
@@ -191,6 +194,13 @@ pub enum PersistedTy {
         return_ty: Box<PersistedTy>,
         positional: Vec<PersistedTy>,
         named: Vec<(u32, PersistedTy)>,
+        /// The required-positional count — the shape's `[...]` boundary,
+        /// an identity column. Additive after the format shipped:
+        /// `default` so a pre-column payload decodes with the all-required
+        /// reading its writer interned (every positional formal required),
+        /// never a wrong split.
+        #[serde(default)]
+        required_positional: Option<u16>,
     },
 }
 
@@ -734,7 +744,14 @@ impl<'a> Slice<'a> {
                 // across producers (intern order varies by run). Decode
                 // re-interns canonically, so identity survives: a differently
                 // ordered payload costs a spurious cache miss, never a wrong hit.
-                let (type_params, type_params_named, return_ty, positional, named) = {
+                let (
+                    type_params,
+                    type_params_named,
+                    return_ty,
+                    required_positional,
+                    positional,
+                    named,
+                ) = {
                     let shape = self.type_args.function_shape(shape);
                     (
                         shape.type_params,
@@ -744,6 +761,7 @@ impl<'a> Slice<'a> {
                             .map(|(n, b)| (*n, *b))
                             .collect::<Vec<_>>(),
                         shape.return_ty,
+                        shape.required_positional,
                         shape.positional.to_vec(),
                         shape
                             .named
@@ -765,6 +783,7 @@ impl<'a> Slice<'a> {
                         .into_iter()
                         .map(|(name, ty)| (self.id(name), self.ty(&ty)))
                         .collect(),
+                    required_positional: Some(required_positional),
                 }
             }
         }
@@ -1003,6 +1022,9 @@ impl PersistedElements {
                     ty: s.ty(&ty),
                     range: PersistedRange::of(range),
                 }),
+                end: entry.end,
+                is_expression: entry.is_expression,
+                first_param: entry.first_param.map(PersistedRange::of),
             })
             .collect();
         let wildcard_duplicates = elements
@@ -1249,6 +1271,9 @@ impl PersistedElements {
                             param.range.source_range(),
                         )
                     }),
+                    end: entry.end,
+                    is_expression: entry.is_expression,
+                    first_param: entry.first_param.map(|range| range.source_range()),
                 })
                 .collect(),
             wildcard_duplicates: self
@@ -1648,6 +1673,7 @@ fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
             return_ty,
             positional,
             named,
+            required_positional,
         } => {
             let return_ty = into_ty(*return_ty, ids, pool);
             let positional: Vec<Ty> = positional
@@ -1662,12 +1688,30 @@ fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
                 .into_iter()
                 .map(|(name, bound)| (ids[name as usize], bound.map(|b| into_ty(b, ids, pool))))
                 .collect();
+            // A pre-column payload decoded no split: every positional
+            // formal reads required, the identity those binaries interned.
+            let required_positional = required_positional
+                .unwrap_or_else(|| u16::try_from(positional.len()).unwrap_or(u16::MAX));
             if names.is_empty() && type_params > 0 {
                 // A pre-column payload: the count-only identity, exactly
                 // as the writing binary interned it.
-                pool.function(type_params, return_ty, &positional, &named, nullable)
+                pool.function_required(
+                    type_params,
+                    required_positional,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                )
             } else {
-                pool.function_generic(&names, return_ty, &positional, &named, nullable)
+                pool.function_generic_required(
+                    &names,
+                    required_positional,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                )
             }
         }
     }
@@ -1857,6 +1901,9 @@ mod tests {
                 first_named: false,
                 first_optional: false,
                 param_ty: None,
+                end: range.end(),
+                is_expression: true,
+                first_param: None,
             },
             crate::model::AnonMethodInvocation {
                 punctuation: range,
@@ -1866,6 +1913,9 @@ mod tests {
                 first_named: false,
                 first_optional: false,
                 param_ty: Some((int, range)),
+                end: range.end(),
+                is_expression: true,
+                first_param: Some(range),
             },
         ]);
 

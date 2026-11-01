@@ -395,12 +395,6 @@ pub fn instantiate_type_formals_to_bounds_directed(
 /// parameters before the fill. As in the default face, a nested generic
 /// function type's binder bounds live in [`ParamFactsTable`], outside the
 /// substitution.
-#[allow(
-    dead_code,
-    reason = "the semantic layer's extension-specificity projection is the \
-              first caller (#3487); the crate root re-exports it when that \
-              routing lands"
-)]
 #[must_use]
 pub fn instantiate_type_formals_to_bounds_fixpoint(
     table: &TypeTable,

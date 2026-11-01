@@ -32,18 +32,7 @@
 //! `lj` read `List<List<int>>` (the spread operand's whole type as the
 //! leaf), a false error.
 
-use super::test_rig::{CORE_PRELUDE, assert_silent, code_names, report_ops};
-
-/// Offset of `needle` inside the first occurrence of `line`.
-fn at(source: &str, line: &str, needle: &str) -> u32 {
-    let line_at = source
-        .find(line)
-        .unwrap_or_else(|| panic!("fixture has {line:?}"));
-    let needle_at = line
-        .find(needle)
-        .unwrap_or_else(|| panic!("{line:?} has {needle:?}"));
-    (line_at + needle_at) as u32
-}
+use super::test_rig::{assert_silent, code_names, report_ops};
 
 /// The `(code, offset, len)` rows of `fixture`'s `argument_type_not_assignable`
 /// and `return_of_invalid_type` verdicts — the false-error faces these

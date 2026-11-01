@@ -74,6 +74,11 @@ pub(crate) struct FnTree {
     /// diagnose-side capture carries — both producers intern identical
     /// written shapes to one slot.
     pub type_params_named: Vec<(StringId, Option<TypeTree>)>,
+    /// How many of [`FnTree::positional`] the required group holds — the
+    /// `[...]` boundary the level latched, `positional.len()` when the
+    /// shape spelled no optional group. Joins the interned identity
+    /// (`int Function(int)` and `int Function([int])` are distinct types).
+    pub required_positional: u16,
     /// Positional formal types in source order.
     pub positional: Vec<TypeTree>,
     /// Named formals `(name, type)`, written order.
@@ -121,6 +126,7 @@ impl TypeTree {
         ret: Option<Box<TypeTree>>,
         type_params: u16,
         type_params_named: Vec<(StringId, Option<TypeTree>)>,
+        required_positional: u16,
         positional: Vec<TypeTree>,
         named: Vec<(StringId, TypeTree)>,
         nullable: bool,
@@ -143,6 +149,7 @@ impl TypeTree {
                 ret,
                 type_params,
                 type_params_named,
+                required_positional,
                 positional,
                 named,
             }),
@@ -175,6 +182,11 @@ pub(crate) struct Level {
     /// Function levels only: the node count when the formal list opened —
     /// everything before it is the written return type.
     formal_mark: usize,
+    /// Function levels only: the node count when the optional-positional
+    /// `[` group opened — the positional entries before it are the
+    /// required group. `None` = no optional group was spelled, so every
+    /// positional formal is required.
+    optional_mark: Option<usize>,
     /// Function levels only: the type-variable group's count, latched
     /// while the group is open.
     type_params: u16,
@@ -262,6 +274,7 @@ impl TreeSink {
             function: false,
             named_count: 0,
             formal_mark: 0,
+            optional_mark: None,
             type_params: 0,
             type_vars: Vec::new(),
             bounds: Vec::new(),
@@ -284,6 +297,7 @@ impl TreeSink {
             function: false,
             named_count: 0,
             formal_mark: 0,
+            optional_mark: None,
             type_params: 0,
             type_vars: Vec::new(),
             bounds: Vec::new(),
@@ -306,6 +320,7 @@ impl TreeSink {
             function: true,
             named_count: 0,
             formal_mark: 0,
+            optional_mark: None,
             type_params: 0,
             type_vars: Vec::new(),
             bounds: Vec::new(),
@@ -328,6 +343,24 @@ impl TreeSink {
             && level.function
         {
             level.formal_mark = level.nodes.len();
+        }
+    }
+
+    /// An optional-formal group opened under a captured function level
+    /// (`begin_optional_formal_parameters`): `[` latches the
+    /// required/optional boundary, so the formals captured before it are
+    /// the required positional segment and the ones after it the optional
+    /// tail. `{` (the named group) leaves the boundary unset — every
+    /// positional formal written before it is required.
+    pub(crate) fn function_optional_group(&mut self, opener: &str) {
+        if opener != "[" {
+            return;
+        }
+        if let Some(level) = self.stack.last_mut()
+            && level.function
+            && level.optional_mark.is_none()
+        {
+            level.optional_mark = Some(level.nodes.len());
         }
     }
 
@@ -502,10 +535,23 @@ impl TreeSink {
             .into_iter()
             .map(|(name, mark)| (name, level.bounds.get(mark).cloned()))
             .collect();
+        // The required/optional split: a `[` group latched the node count
+        // at the boundary (pre-drain coordinates, the same space
+        // `formal_mark` lives in), so the positional entries before it are
+        // the required segment. No group = every positional formal is
+        // required (a `{...}` named group leaves its positionals required).
+        let positional_len = positional.len();
+        let required_positional = level
+            .optional_mark
+            .map_or(positional_len, |optional| {
+                optional.saturating_sub(level.formal_mark)
+            })
+            .min(positional_len);
         let node = TypeTree::function_node(
             ret,
             level.type_params,
             type_params_named,
+            required_positional.min(u16::MAX as usize) as u16,
             positional,
             named,
             nullable,

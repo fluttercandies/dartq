@@ -38,7 +38,7 @@
 //! augment-before-intro ordering is not applied.
 
 use dartq_diagnostics::{Diagnostic, Severity};
-use dartq_resolution::{LibraryGraph, LibraryId};
+use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -46,7 +46,7 @@ use crate::codes::{AlreadyCompleteShape, ReturnShape, SemanticCode, WithoutDecla
 use crate::library::ElementIndex;
 use crate::model::{
     AugKind, AugmentDecl, AugmentFormal, Container, ContainerKind, FileElements, Formal, Formals,
-    MemberKind, Ty,
+    MemberKind, MicroKind, Ty,
 };
 
 /// The variable family — a `Field`/`TopLevelVar` declaration and the
@@ -347,6 +347,17 @@ pub(super) fn augmentation_diagnostics(
             populate(&mut table, graph, index, lib, unit, elements, strings);
         }
     }
+    // The canonical-type context: the oracle compares the resolved types
+    // (a typedef spells its expansion, `p.C` names the same element `C`
+    // does), so each written annotation canonicalizes through the writing
+    // file's scope while its own spelling stays for the message text.
+    let namespaces = Namespaces::build(graph);
+    let canon = Canon {
+        graph,
+        namespaces: &namespaces,
+        index,
+        strings,
+    };
     for (aug_index, aug) in own.augmentations().iter().enumerate() {
         // A type alias augmentation never merges: the parser reports the
         // shape outright (upstream `parser_impl.dart` reports
@@ -380,7 +391,7 @@ pub(super) fn augmentation_diagnostics(
             AugKind::Field | AugKind::TopLevelVar | AugKind::Getter | AugKind::Setter
         );
         if variable_family {
-            process_variable(&mut out, file, aug, &chain, own, index, strings);
+            process_variable(&mut out, file, aug, &chain, own, index, strings, &canon);
         } else {
             // The merge rule: the last fragment's kind must match and must
             // not be a named mixin application.
@@ -410,7 +421,7 @@ pub(super) fn augmentation_diagnostics(
                         | AugKind::ExtensionType
                 );
                 if header_kind {
-                    check_header(&mut out, file, own, index, strings, aug, intro, run);
+                    check_header(&mut out, file, own, index, aug, intro, run, &canon);
                 } else {
                     // The already-complete check runs against the chain's
                     // completeness state before the shape checks (upstream
@@ -418,7 +429,9 @@ pub(super) fn augmentation_diagnostics(
                     // `_checkForFunctionAlreadyComplete`).
                     check_already_complete(&mut out, file, aug, run);
                     if !intro.is_augment {
-                        check_member_shape(&mut out, file, own, index, strings, aug, intro);
+                        check_member_shape(
+                            &mut out, file, own, index, strings, aug, intro, run, &canon,
+                        );
                     }
                 }
                 // An augmentation-only executable chain: the body checks
@@ -488,6 +501,7 @@ fn process_variable(
     own: &FileElements,
     index: &ElementIndex,
     strings: &StringTable,
+    canon: &Canon<'_>,
 ) {
     let accessor_family = |kind: AugKind| {
         matches!(
@@ -540,7 +554,7 @@ fn process_variable(
         // getter's return comparison at the variable's name, the induced
         // setter's presence row when the resolved setter chain is empty,
         // and each induced accessor's already-complete row.
-        check_variable_augment(out, file, aug, generation, own, index, strings);
+        check_variable_augment(out, file, aug, generation, own, index, strings, canon);
     } else {
         // A getter/setter augment merges onto its accessor sub-chain: the
         // already-complete row (the augment fragment complete against a
@@ -554,13 +568,16 @@ fn process_variable(
             && let Some(face) = intro_face(intro_elements, intro, aug)
         {
             let (intro_names, intro_bounds) = face.type_params();
+            let aug_params = aug_param_names(aug, own);
             check_type_param_rows(
                 out,
                 file,
                 own,
+                intro,
                 intro_elements,
-                strings,
+                canon,
                 aug,
+                &aug_params,
                 intro_names,
                 intro_bounds,
             );
@@ -571,13 +588,28 @@ fn process_variable(
                     own,
                     intro_elements,
                     strings,
+                    canon,
                     aug,
                     &face,
+                    intro,
                     false,
                     span,
                 );
             }
-            check_formals(out, file, own, intro_elements, strings, aug, face.formals());
+            check_formals(
+                out,
+                file,
+                own,
+                intro_elements,
+                index,
+                strings,
+                canon,
+                aug,
+                &aug_params,
+                intro_params(intro_elements, aug, &face),
+                face.formals(),
+                &sub,
+            );
         }
     }
 }
@@ -596,6 +628,7 @@ fn check_variable_augment(
     own: &FileElements,
     index: &ElementIndex,
     strings: &StringTable,
+    canon: &Canon<'_>,
 ) {
     let getter_chain: Vec<&Entry> = generation
         .iter()
@@ -653,8 +686,10 @@ fn check_variable_augment(
             own,
             intro_elements,
             strings,
+            canon,
             aug,
             &face,
+            intro,
             true,
             aug.name_range,
         );
@@ -672,14 +707,15 @@ fn check_header(
     file: FileId,
     own: &FileElements,
     index: &ElementIndex,
-    strings: &StringTable,
     aug: &AugmentDecl,
     intro: &Entry,
     run: &[&Entry],
+    canon: &Canon<'_>,
 ) {
     let Some(intro_elements) = index.get(intro.unit) else {
         return;
     };
+    let aug_params = aug_param_names(aug, own);
     if intro.is_augment {
         let Some(intro_aug) = intro_elements.augmentations().get(intro.aug_index) else {
             return;
@@ -694,9 +730,11 @@ fn check_header(
             out,
             file,
             own,
+            intro,
             intro_elements,
-            strings,
+            canon,
             aug,
+            &aug_params,
             &intro_names,
             &intro_bounds,
         );
@@ -737,9 +775,11 @@ fn check_header(
             out,
             file,
             own,
+            intro,
             intro_elements,
-            strings,
+            canon,
             aug,
+            &aug_params,
             intro_names,
             intro_bounds,
         );
@@ -777,6 +817,8 @@ fn check_member_shape(
     strings: &StringTable,
     aug: &AugmentDecl,
     intro: &Entry,
+    run: &[&Entry],
+    canon: &Canon<'_>,
 ) {
     let Some(intro_elements) = index.get(intro.unit) else {
         return;
@@ -784,6 +826,7 @@ fn check_member_shape(
     let Some(face) = intro_face(intro_elements, intro, aug) else {
         return;
     };
+    let aug_params = aug_param_names(aug, own);
     match aug.kind {
         AugKind::Constructor => {
             let checks = [
@@ -791,7 +834,20 @@ fn check_member_shape(
                 ("factory", aug.factory_kw, intro.is_factory),
             ];
             check_modifiers(out, file, aug, &checks);
-            check_formals(out, file, own, intro_elements, strings, aug, face.formals());
+            check_formals(
+                out,
+                file,
+                own,
+                intro_elements,
+                index,
+                strings,
+                canon,
+                aug,
+                &aug_params,
+                intro_params(intro_elements, aug, &face),
+                face.formals(),
+                run,
+            );
         }
         AugKind::Function | AugKind::Method => {
             let (intro_names, intro_bounds) = face.type_params();
@@ -799,9 +855,11 @@ fn check_member_shape(
                 out,
                 file,
                 own,
+                intro,
                 intro_elements,
-                strings,
+                canon,
                 aug,
+                &aug_params,
                 intro_names,
                 intro_bounds,
             );
@@ -812,13 +870,28 @@ fn check_member_shape(
                     own,
                     intro_elements,
                     strings,
+                    canon,
                     aug,
                     &face,
+                    intro,
                     false,
                     span,
                 );
             }
-            check_formals(out, file, own, intro_elements, strings, aug, face.formals());
+            check_formals(
+                out,
+                file,
+                own,
+                intro_elements,
+                index,
+                strings,
+                canon,
+                aug,
+                &aug_params,
+                intro_params(intro_elements, aug, &face),
+                face.formals(),
+                run,
+            );
         }
         _ => {}
     }
@@ -1091,9 +1164,11 @@ fn check_type_param_rows(
     out: &mut Vec<Diagnostic>,
     file: FileId,
     own: &FileElements,
+    intro: &Entry,
     intro_unit: &FileElements,
-    strings: &StringTable,
+    canon: &Canon<'_>,
     aug: &AugmentDecl,
+    aug_params: &[StringId],
     intro_names: &[StringId],
     intro_bounds: &[Ty],
 ) {
@@ -1128,7 +1203,20 @@ fn check_type_param_rows(
         }
         if let Some((bound, span)) = param.bound {
             let intro_bound = intro_bounds.get(index).copied().unwrap_or(Ty::Dynamic);
-            if render(bound, own, strings) != render(intro_bound, intro_unit, strings) {
+            // The bound pair judges canonical types (upstream
+            // `boundNode.typeOrThrow != firstBound`): a typedef spelling and
+            // an import-prefixed one compare by expansion/element, never by
+            // written name.
+            let aug_bound = canon_ty(bound, file, own, aug_params, canon, CANON_DEPTH);
+            let intro_canon = canon_ty(
+                intro_bound,
+                intro.unit,
+                intro_unit,
+                intro_names,
+                canon,
+                CANON_DEPTH,
+            );
+            if aug_bound != intro_canon {
                 let code = SemanticCode::AugmentationTypeParameterBound;
                 out.push(row(file, span, code, code.message("", "")));
             }
@@ -1149,8 +1237,10 @@ fn check_return(
     own: &FileElements,
     intro_unit: &FileElements,
     strings: &StringTable,
+    canon: &Canon<'_>,
     aug: &AugmentDecl,
     face: &Face<'_>,
+    intro: &Entry,
     induced: bool,
     anchor: SourceRange,
 ) {
@@ -1158,14 +1248,39 @@ fn check_return(
         return;
     };
     let (expected_ty, is_setter) = face.return_face();
-    let expected = match expected_ty {
-        Ty::UNKNOWN if is_setter => "void".to_string(),
-        _ => render(expected_ty, intro_unit, strings),
+    // The judged side: the oracle's `actualType == expectedType` compares
+    // resolved types — `p.C` names the element `C` does, a typedef spells
+    // its expansion — and an unwritten/invalid face is the oracle's
+    // `dynamic`/`InvalidType` bail. The aug side's own type parameters are
+    // in scope; the intro face's are.
+    let aug_params = aug_param_names(aug, own);
+    let intro_params = intro_params(intro_unit, aug, face);
+    let Some(actual) = canon_top(actual_ty, file, own, &aug_params, canon) else {
+        return;
     };
-    let actual = render(actual_ty, own, strings);
-    if actual == expected {
+    let (actual_canon, expected_canon) = match (expected_ty, is_setter) {
+        (Ty::UNKNOWN, true) => (actual, "void".to_string()),
+        (Ty::UNKNOWN, false) => (actual, "dynamic".to_string()),
+        _ => {
+            let Some(expected) =
+                canon_top(expected_ty, intro.unit, intro_unit, &intro_params, canon)
+            else {
+                return;
+            };
+            (actual, expected)
+        }
+    };
+    if actual_canon == expected_canon {
         return;
     }
+    // The written side: the oracle's `getDisplayString` prints the resolved
+    // element's spelling — a typedef keeps its alias name, a prefixed head
+    // drops the prefix.
+    let expected = match expected_ty {
+        Ty::UNKNOWN if is_setter => "void".to_string(),
+        _ => display_ty(expected_ty, intro_unit, strings),
+    };
+    let actual = display_ty(actual_ty, own, strings);
     let shape = if induced {
         ReturnShape::InducedGetter
     } else {
@@ -1182,14 +1297,20 @@ fn check_return(
 /// finally the named extra/missing passes (which run regardless of the
 /// positional shape). No parameter list on the augmentation skips the
 /// whole pass.
+#[expect(clippy::too_many_arguments)] // one column per check input
 fn check_formals(
     out: &mut Vec<Diagnostic>,
     file: FileId,
     own: &FileElements,
     intro_unit: &FileElements,
+    index: &ElementIndex,
     strings: &StringTable,
+    canon: &Canon<'_>,
     aug: &AugmentDecl,
+    aug_params: &[StringId],
+    intro_params: Vec<StringId>,
     intro_formals: Option<&Formals>,
+    run: &[&Entry],
 ) {
     let Some((_, right_paren)) = aug.parens else {
         return;
@@ -1242,11 +1363,35 @@ fn check_formals(
     }
     let shape_matches = cur_required == first_required && cur_optional == first_optional;
     if shape_matches {
-        // Every non-wildcard positional name must match the preceding
-        // fragments' same-index name (upstream
-        // `augmentationPositionalFormalParameterName`; the intro's row is
-        // the decisive preceding name for the single-intro chains the
-        // fixtures carry).
+        // Every non-wildcard positional name must match a preceding
+        // fragment's same-index name (upstream `precedingFragments` —
+        // the intro plus every earlier augment fragment of this chain):
+        // the first preceding fragment with a different non-wildcard name
+        // owns the row's expected name.
+        let preceding_names: Vec<Vec<Option<StringId>>> = run
+            .iter()
+            .map(|entry| {
+                if entry.is_augment {
+                    index
+                        .get(entry.unit)
+                        .and_then(|elements| elements.augmentations().get(entry.aug_index))
+                        .map(|decl| {
+                            decl.formals
+                                .iter()
+                                .filter(|f| f.required_positional || f.optional_positional)
+                                .map(|f| f.name)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    first
+                        .positional
+                        .iter()
+                        .map(|f| Some(f.name))
+                        .collect()
+                }
+            })
+            .collect();
         for (index, cur) in cur_positional.iter().enumerate() {
             let Some(cur_name) = cur.name else {
                 continue;
@@ -1254,24 +1399,41 @@ fn check_formals(
             if strings.resolve(cur_name) == "_" {
                 continue;
             }
-            let Some(prev) = first.positional.get(index).map(|f| f.name) else {
-                continue;
-            };
-            if prev == cur_name || strings.resolve(prev) == "_" {
-                continue;
+            for names in &preceding_names {
+                let Some(Some(prev)) = names.get(index) else {
+                    continue;
+                };
+                if *prev == cur_name || strings.resolve(*prev) == "_" {
+                    continue;
+                }
+                let code = SemanticCode::AugmentationPositionalFormalParameterName;
+                let message = code.message(strings.resolve(cur_name), strings.resolve(*prev));
+                out.push(row(file, cur.entity(), code, message));
+                break;
             }
-            let code = SemanticCode::AugmentationPositionalFormalParameterName;
-            let message = code.message(strings.resolve(cur_name), strings.resolve(prev));
-            out.push(row(file, cur.entity(), code, message));
         }
         // The positional pairs: covariant, required (named-only — a
         // positional pair never carries `required` on either side), then
         // the written-type comparison.
+        let intro_unit_id = run.first().map_or(file, |entry| entry.unit);
         for (index, cur) in cur_positional.iter().enumerate() {
             let Some(first_param) = first.positional.get(index) else {
                 continue;
             };
-            check_pair(out, file, own, intro_unit, strings, cur, first_param, false);
+            check_pair(
+                out,
+                file,
+                own,
+                intro_unit_id,
+                intro_unit,
+                strings,
+                canon,
+                aug_params,
+                &intro_params,
+                cur,
+                first_param,
+                false,
+            );
         }
     }
     // The named passes run regardless of the positional shape (upstream
@@ -1295,10 +1457,24 @@ fn check_formals(
             cur_named.push((name, param));
         }
     }
+    let intro_unit_id = run.first().map_or(file, |entry| entry.unit);
     for (name, cur) in &cur_named {
         match first_named.iter().find(|(candidate, _)| candidate == name) {
             Some((_, first_param)) => {
-                check_pair(out, file, own, intro_unit, strings, cur, first_param, true);
+                check_pair(
+                    out,
+                    file,
+                    own,
+                    intro_unit_id,
+                    intro_unit,
+                    strings,
+                    canon,
+                    aug_params,
+                    &intro_params,
+                    cur,
+                    first_param,
+                    true,
+                );
             }
             None => {
                 let code = SemanticCode::AugmentationNamedFormalParameterExtra;
@@ -1321,12 +1497,17 @@ fn check_formals(
 /// `checkFormalParameterPair`'s order. An unwritten intro type compares as
 /// `dynamic` (the oracle's parameter type); the augmentation's omitted
 /// type never reports.
+#[expect(clippy::too_many_arguments)] // one column per check input
 fn check_pair(
     out: &mut Vec<Diagnostic>,
     file: FileId,
     own: &FileElements,
+    intro_unit_id: FileId,
     intro_unit: &FileElements,
     strings: &StringTable,
+    canon: &Canon<'_>,
+    aug_params: &[StringId],
+    intro_params: &[StringId],
     cur: &AugmentFormal,
     first: &Formal,
     named: bool,
@@ -1356,12 +1537,29 @@ fn check_pair(
         }
     }
     if let (Some(actual_ty), Some(span)) = (cur.ty, cur.ty_range) {
-        let expected = match first.ty {
-            Ty::UNKNOWN => "dynamic".to_string(),
-            ty => render(ty, intro_unit, strings),
+        // The judged side: resolved-type equality like the return pair —
+        // `p.C` and `C` name one element, a typedef spells its expansion;
+        // an unwritten/invalid expected face is `dynamic` and an invalid
+        // actual face is the oracle's `InvalidType` bail.
+        let matches = match first.ty {
+            Ty::UNKNOWN => canon_top(actual_ty, file, own, aug_params, canon)
+                .is_some_and(|actual| actual == "dynamic"),
+            expected_ty => {
+                match (
+                    canon_top(actual_ty, file, own, aug_params, canon),
+                    canon_top(expected_ty, intro_unit_id, intro_unit, intro_params, canon),
+                ) {
+                    (Some(actual), Some(expected)) => actual == expected,
+                    _ => false,
+                }
+            }
         };
-        let actual = render(actual_ty, own, strings);
-        if actual != expected {
+        if !matches {
+            let expected = match first.ty {
+                Ty::UNKNOWN => "dynamic".to_string(),
+                ty => display_ty(ty, intro_unit, strings),
+            };
+            let actual = display_ty(actual_ty, own, strings);
             let code = SemanticCode::AugmentationFormalParameterTypeMismatch;
             let message = code.message(&actual, &expected);
             out.push(row(file, span, code, message));
@@ -1415,14 +1613,648 @@ fn intro_face<'e>(
     }
 }
 
-/// Renders a written type through its owning unit's argument pool; the
-/// model's unknown sentinel spells `dynamic` (the oracle's element type
-/// for an unwritten annotation).
-fn render(ty: Ty, unit: &FileElements, strings: &StringTable) -> String {
+/// The canonical-type judgment context (upstream `TypeImpl ==` semantics):
+/// each written annotation resolves through its own file's combined scope —
+/// an import-prefixed `p.C` names the same declaration `C` does, a typedef
+/// name expands through its captured right-hand side — and the compared
+/// string is that canonical form while the message text keeps the written
+/// spelling (the written/judged split: the oracle's `getDisplayString`
+/// prints the resolved element, its `==` the resolved identity).
+struct Canon<'a> {
+    graph: &'a LibraryGraph,
+    namespaces: &'a Namespaces,
+    index: &'a ElementIndex,
+    strings: &'a StringTable,
+}
+
+/// The alias-expansion recursion budget: a chain of co-aliases spends one
+/// unit per hop; an exhausted chain reads the oracle's `InvalidType` (the
+/// suppress direction, never a fabricated pair).
+const CANON_DEPTH: u8 = 8;
+
+/// The canonical signature of `ty` as a compared type: `None` when the
+/// whole written type is the oracle's `InvalidType` (an unwritten slot or
+/// a head its own file cannot resolve) — the callers' suppress arm, the
+/// upstream `actualType is InvalidType || expectedType is InvalidType`
+/// early return.
+fn canon_top(
+    ty: Ty,
+    file: FileId,
+    unit: &FileElements,
+    params: &[StringId],
+    cx: &Canon<'_>,
+) -> Option<String> {
+    let mut out = String::new();
+    match canon_into(&mut out, ty, file, unit, params, &[], cx, CANON_DEPTH) {
+        Leaf::Resolved => Some(out),
+        Leaf::Invalid => None,
+    }
+}
+
+/// The canonical signature for a nested slot (a type argument, a bound, a
+/// column inside a function type): an unresolvable leaf compares as the
+/// shared `?invalid` marker — two InvalidType occurrences are the same
+/// singleton upstream and judge equal, while an invalid leaf never equals
+/// a resolved one.
+fn canon_ty(
+    ty: Ty,
+    file: FileId,
+    unit: &FileElements,
+    params: &[StringId],
+    cx: &Canon<'_>,
+    depth: u8,
+) -> String {
+    let mut out = String::new();
+    match canon_into(&mut out, ty, file, unit, params, &[], cx, depth) {
+        Leaf::Resolved => out,
+        Leaf::Invalid => "?invalid".to_string(),
+    }
+}
+
+/// Whether a canonical leaf resolved: `Invalid` carries the oracle's
+/// `InvalidType` semantics (a suppress at the compared type's root, an
+/// equal-to-itself marker inside).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leaf {
+    Resolved,
+    Invalid,
+}
+
+/// One canonical leaf onto `out`: the head's resolved identity (its
+/// declaring file plus its declared name — prefix spellings and same-name
+/// imports land on one spelling), the written arguments canonicalized the
+/// same way, and the `?` projection. A bare name the writing file cannot
+/// resolve reads its own declaration's type-parameter scope first — a
+/// parameter leaf compares by name — then the namespace; a miss is
+/// `Invalid`.
+#[expect(clippy::too_many_arguments)]
+fn canon_into(
+    out: &mut String,
+    ty: Ty,
+    file: FileId,
+    unit: &FileElements,
+    params: &[StringId],
+    sig: &[StringId],
+    cx: &Canon<'_>,
+    depth: u8,
+) -> Leaf {
     match ty {
+        Ty::Unknown => return Leaf::Invalid,
+        Ty::Null => out.push_str("Null"),
+        Ty::Dynamic => out.push_str("dynamic"),
+        Ty::Never => out.push_str("Never"),
+        Ty::Void => out.push_str("void"),
+        Ty::Named {
+            name,
+            nullable,
+            args,
+        } => {
+            let spelling = cx.strings.resolve(name);
+            match canon_head(spelling, file, params, sig, cx) {
+                Head::Invalid => return Leaf::Invalid,
+                Head::Param => {
+                    out.push_str("param:");
+                    out.push_str(spelling);
+                }
+                Head::SigParam(position) => {
+                    out.push_str("param:@");
+                    out.push_str(&position.to_string());
+                }
+                Head::Alias(decl_file, decl_name) => {
+                    // The written arguments canonicalize in the use site's
+                    // scope BEFORE the substitution walks the alias's own
+                    // right-hand side — through `canon_into` so the
+                    // signature's own variables still encode by position
+                    // (a nested `Function<T>(A<T>)` keeps its `param:@0`).
+                    let canon_args: Vec<String> = unit
+                        .type_args
+                        .get(args)
+                        .iter()
+                        .map(|arg| {
+                            let mut text = String::new();
+                            match canon_into(
+                                &mut text,
+                                *arg,
+                                file,
+                                unit,
+                                params,
+                                sig,
+                                cx,
+                                depth.saturating_sub(1),
+                            ) {
+                                Leaf::Resolved => text,
+                                Leaf::Invalid => "?invalid".to_string(),
+                            }
+                        })
+                        .collect();
+                    if canon_alias(out, decl_file, decl_name, &canon_args, cx, depth.saturating_sub(1))
+                        == Leaf::Invalid
+                    {
+                        return Leaf::Invalid;
+                    }
+                    if nullable {
+                        out.push('?');
+                    }
+                }
+                Head::Named(decl_file, decl_name) => {
+                    out.push_str("decl:");
+                    out.push_str(&decl_file.index().to_string());
+                    out.push(':');
+                    out.push_str(cx.strings.resolve(decl_name));
+                    let list = unit.type_args.get(args);
+                    if !list.is_empty() {
+                        out.push('<');
+                        for (index, arg) in list.iter().enumerate() {
+                            if index > 0 {
+                                out.push(',');
+                            }
+                            if canon_into(out, *arg, file, unit, params, sig, cx, depth)
+                                == Leaf::Invalid
+                            {
+                                out.push_str("?invalid");
+                            }
+                        }
+                        out.push('>');
+                    }
+                    if nullable {
+                        out.push('?');
+                    }
+                }
+            }
+        }
+        Ty::Record { shape, nullable } => {
+            let shape = unit.type_args.record_shape(shape);
+            out.push('(');
+            let mut first = true;
+            for field in shape.positional.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_into(out, *field, file, unit, params, sig, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+            }
+            for (field_name, field) in shape.named.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_into(out, *field, file, unit, params, sig, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+                out.push(' ');
+                out.push_str(cx.strings.resolve(*field_name));
+            }
+            out.push(')');
+            if nullable {
+                out.push('?');
+            }
+        }
+        Ty::Function { shape, nullable } => {
+            let shape = unit.type_args.function_shape(shape);
+            // The signature's own variables alpha-rename (upstream
+            // `relateTypeFormals` — `<T>T -> T` equals `<U>U -> U`), so the
+            // columns judge each variable by position, never by spelling;
+            // the signature's own bound group judges by position too.
+            let inner: Vec<StringId> =
+                shape.type_params_named.iter().map(|(name, _)| *name).collect();
+            if canon_into(out, shape.return_ty, file, unit, params, &inner, cx, depth)
+                == Leaf::Invalid
+            {
+                out.push_str("?invalid");
+            }
+            out.push_str(" Function");
+            if !shape.type_params_named.is_empty() {
+                out.push('<');
+                for (index, (_, bound)) in shape.type_params_named.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&index.to_string());
+                    if let Some(bound) = bound {
+                        out.push_str(" extends ");
+                        if canon_into(out, *bound, file, unit, params, &inner, cx, depth)
+                            == Leaf::Invalid
+                        {
+                            out.push_str("?invalid");
+                        }
+                    }
+                }
+                out.push('>');
+            }
+            out.push('(');
+            let mut first = true;
+            for formal in shape.positional.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_into(out, *formal, file, unit, params, &inner, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+            }
+            for (formal_name, formal) in shape.named.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_into(out, *formal, file, unit, params, &inner, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+                out.push(' ');
+                out.push_str(cx.strings.resolve(*formal_name));
+            }
+            out.push(')');
+            out.push_str(&format!("/{}", shape.required_positional));
+            if nullable {
+                out.push('?');
+            }
+        }
+    }
+    Leaf::Resolved
+}
+
+/// The head resolution of one `Ty::Named` leaf: the written spelling's
+/// declaration identity in `file`'s scope, an in-scope type parameter, a
+/// typedef to expand, or the unresolvable (`InvalidType`) face.
+enum Head {
+    /// Resolved to a non-alias declaration: (declaring file, declared name).
+    Named(FileId, StringId),
+    /// Resolved to a `MicroKind::TypeAlias` declaration: the judged type is
+    /// its right-hand side with the written arguments substituted.
+    Alias(FileId, StringId),
+    /// A declaration-scope type parameter (compares by spelling across
+    /// fragments).
+    Param,
+    /// The enclosing signature's own type parameter, by position (upstream
+    /// `relateTypeFormals` alpha-renames — `<T>T -> T` equals `<U>U -> U`).
+    SigParam(usize),
+    /// Unresolvable — the oracle's `InvalidType`.
+    Invalid,
+}
+
+/// Resolves `spelling` (the interned head's text — `p.C` carries its dot)
+/// in `file`'s scope: a bare name checks the param scope before the
+/// namespace (parameters shadow declarations), then the combined import
+/// scope; a prefixed name splits at the first dot and walks the prefix's
+/// table. A typedef answer surfaces `Head::Alias` for the caller's
+/// substitution expansion; a non-type declaration (function, variable,
+/// prefix) is the oracle's `InvalidType`.
+fn canon_head(
+    spelling: &str,
+    file: FileId,
+    params: &[StringId],
+    sig: &[StringId],
+    cx: &Canon<'_>,
+) -> Head {
+    let (prefix, leaf) = match spelling.split_once('.') {
+        Some((prefix, leaf)) => (Some(prefix), leaf),
+        None => (None, spelling),
+    };
+    let name = cx.strings.intern(leaf);
+    if prefix.is_none() {
+        if let Some(position) = sig.iter().position(|param| *param == name) {
+            return Head::SigParam(position);
+        }
+        if params.contains(&name) {
+            return Head::Param;
+        }
+    }
+    let lib = match cx.graph.library_of_file(file) {
+        Some(lib) => lib,
+        None => return Head::Invalid,
+    };
+    let lookup = match prefix {
+        Some(prefix) => cx.namespaces.lookup_prefixed_in_file(
+            cx.graph,
+            lib,
+            Some(file),
+            cx.strings.intern(prefix),
+            name,
+        ),
+        None => cx
+            .namespaces
+            .lookup_in_file(cx.graph, lib, Some(file), name),
+    };
+    match lookup {
+        Lookup::Found(NamespaceEntry::Decl(decl_file)) => match cx
+            .index
+            .get(decl_file)
+            .and_then(|elements| elements.decl(name))
+        {
+            Some(decl) if decl.kind == MicroKind::TypeAlias => Head::Alias(decl_file, name),
+            Some(decl)
+                if matches!(
+                    decl.kind,
+                    MicroKind::TopLevelFn | MicroKind::TopLevelVar | MicroKind::TypeParam
+                ) =>
+            {
+                // A spelling that resolves to a non-type declaration is no
+                // type upstream — `InvalidType`.
+                Head::Invalid
+            }
+            Some(_) | None => {
+                // An indexed declaration face (container/enum/mixin/
+                // extension) or an unindexed decl row (the SDK projection's
+                // names-only grade) — identity by declaring file + name.
+                Head::Named(decl_file, name)
+            }
+        },
+        Lookup::Found(NamespaceEntry::Prefix) | Lookup::Ambiguous(_) | Lookup::NotFound => {
+            Head::Invalid
+        }
+    }
+}
+
+/// The typedef-expansion pass of [`canon_into`]'s `Ty::Named` arm: the
+/// head resolved to a `MicroKind::TypeAlias` declaration, so the judged
+/// type is the alias's right-hand side with the written arguments
+/// substituted for the alias's own parameters — canonicalized in the
+/// declaring file's scope and pool.
+fn canon_alias(
+    out: &mut String,
+    decl_file: FileId,
+    decl_name: StringId,
+    args: &[String],
+    cx: &Canon<'_>,
+    depth: u8,
+) -> Leaf {
+    if depth == 0 {
+        return Leaf::Invalid;
+    }
+    let Some(elements) = cx.index.get(decl_file) else {
+        return Leaf::Invalid;
+    };
+    let Some(decl) = elements.decl(decl_name) else {
+        return Leaf::Invalid;
+    };
+    // The substitution table: the alias's declared parameters map to the
+    // use site's written arguments (already canonicalized in the use
+    // site's scope); a parameter the site never spelled reads `dynamic`
+    // (the instantiate-to-bounds default's first approximation — the model
+    // has no bound walk here).
+    let mut subst: FxHashMap<StringId, String> = FxHashMap::default();
+    for (index, param) in decl.type_param_names.iter().enumerate() {
+        let text = args.get(index).cloned().unwrap_or_else(|| "dynamic".to_string());
+        subst.insert(*param, text);
+    }
+    canon_alias_ty(
+        out,
+        decl.var_ty,
+        decl_file,
+        elements,
+        &subst,
+        cx,
+        depth.saturating_sub(1),
+    )
+}
+
+/// The alias right-hand side's canonical walk: `var_ty`'s slots index the
+/// DECLARING unit's pool, parameter leaves splice the substitution text,
+/// and every other head resolves in the declaring file's own scope.
+fn canon_alias_ty(
+    out: &mut String,
+    ty: Ty,
+    decl_file: FileId,
+    decl_unit: &FileElements,
+    subst: &FxHashMap<StringId, String>,
+    cx: &Canon<'_>,
+    depth: u8,
+) -> Leaf {
+    match ty {
+        Ty::Unknown => return Leaf::Invalid,
+        Ty::Null => out.push_str("Null"),
+        Ty::Dynamic => out.push_str("dynamic"),
+        Ty::Never => out.push_str("Never"),
+        Ty::Void => out.push_str("void"),
+        Ty::Named {
+            name,
+            nullable,
+            args,
+        } => {
+            if let Some(text) = subst.get(&name) {
+                out.push_str(text);
+            } else {
+                let spelling = cx.strings.resolve(name);
+                match canon_head(spelling, decl_file, &[], &[], cx) {
+                    Head::Invalid => return Leaf::Invalid,
+                    Head::Param | Head::SigParam(_) => {
+                        out.push_str("param:");
+                        out.push_str(spelling);
+                    }
+                    Head::Named(file_id, decl_name) => {
+                        out.push_str("decl:");
+                        out.push_str(&file_id.index().to_string());
+                        out.push(':');
+                        out.push_str(cx.strings.resolve(decl_name));
+                        let list = decl_unit.type_args.get(args);
+                        if !list.is_empty() {
+                            out.push('<');
+                            for (index, arg) in list.iter().enumerate() {
+                                if index > 0 {
+                                    out.push(',');
+                                }
+                                if canon_alias_ty(
+                                    out, *arg, decl_file, decl_unit, subst, cx, depth,
+                                ) == Leaf::Invalid
+                                {
+                                    out.push_str("?invalid");
+                                }
+                            }
+                            out.push('>');
+                        }
+                    }
+                    Head::Alias(file_id, decl_name) => {
+                        // A co-alias in the RHS expands the same way (a
+                        // typedef inside a typedef's expansion is still a
+                        // typedef — depth-bounded); its written arguments
+                        // canonicalize through the SAME substitution the
+                        // enclosing RHS carries.
+                        let canon_args: Vec<String> = decl_unit
+                            .type_args
+                            .get(args)
+                            .iter()
+                            .map(|arg| {
+                                let mut text = String::new();
+                                match canon_alias_ty(
+                                    &mut text, *arg, decl_file, decl_unit, subst, cx, depth,
+                                ) {
+                                    Leaf::Resolved => text,
+                                    Leaf::Invalid => "?invalid".to_string(),
+                                }
+                            })
+                            .collect();
+                        if canon_alias(out, file_id, decl_name, &canon_args, cx, depth.saturating_sub(1))
+                            == Leaf::Invalid
+                        {
+                            out.push_str("?invalid");
+                        }
+                    }
+                }
+            }
+            if nullable {
+                out.push('?');
+            }
+        }
+        Ty::Record { shape, nullable } => {
+            let shape = decl_unit.type_args.record_shape(shape);
+            out.push('(');
+            let mut first = true;
+            for field in shape.positional.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_alias_ty(out, *field, decl_file, decl_unit, subst, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+            }
+            for (field_name, field) in shape.named.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_alias_ty(out, *field, decl_file, decl_unit, subst, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+                out.push(' ');
+                out.push_str(cx.strings.resolve(*field_name));
+            }
+            out.push(')');
+            if nullable {
+                out.push('?');
+            }
+        }
+        Ty::Function { shape, nullable } => {
+            let shape = decl_unit.type_args.function_shape(shape);
+            if canon_alias_ty(out, shape.return_ty, decl_file, decl_unit, subst, cx, depth)
+                == Leaf::Invalid
+            {
+                out.push_str("?invalid");
+            }
+            out.push_str(" Function(");
+            let mut first = true;
+            for formal in shape.positional.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_alias_ty(out, *formal, decl_file, decl_unit, subst, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+            }
+            for (formal_name, formal) in shape.named.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if canon_alias_ty(out, *formal, decl_file, decl_unit, subst, cx, depth)
+                    == Leaf::Invalid
+                {
+                    out.push_str("?invalid");
+                }
+                out.push(' ');
+                out.push_str(cx.strings.resolve(*formal_name));
+            }
+            out.push(')');
+            out.push_str(&format!("/{}", shape.required_positional));
+            if nullable {
+                out.push('?');
+            }
+        }
+    }
+    Leaf::Resolved
+}
+
+/// The written-spelling display of `ty` for a message slot: the resolved
+/// head's leaf name (a prefixed `p.C` prints `C` — the oracle's
+/// `getDisplayString` writes the element's name, never the import prefix)
+/// with the written arguments rendered the same way; every other shape
+/// reads `Ty::render`'s official form.
+fn display_ty(ty: Ty, unit: &FileElements, strings: &StringTable) -> String {
+    match ty {
+        Ty::Named {
+            name,
+            nullable,
+            args,
+        } => {
+            let spelling = strings.resolve(name);
+            let leaf = spelling.rsplit('.').next().unwrap_or(spelling);
+            let mut text = leaf.to_owned();
+            let list = unit.type_args.get(args);
+            if !list.is_empty() {
+                text.push('<');
+                for (index, arg) in list.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&display_ty(*arg, unit, strings));
+                }
+                text.push('>');
+            }
+            if nullable {
+                text.push('?');
+            }
+            text
+        }
         Ty::UNKNOWN => "dynamic".to_string(),
         _ => ty.render(strings, &unit.type_args),
     }
+}
+
+/// The in-scope type-parameter names of the augmentation's own spelling:
+/// its declared `<T, …>` group plus, for a member augment inside an
+/// `augment class C<T>`, the enclosing container fragment's group — the
+/// scope a member's written `T` resolves to.
+fn aug_param_names(aug: &AugmentDecl, own: &FileElements) -> Vec<StringId> {
+    let mut names: Vec<StringId> = aug.type_params.iter().map(|p| p.name).collect();
+    if let Some(container) = aug.container {
+        for decl in own.augmentations() {
+            if decl.container.is_none()
+                && decl.name == container
+                && matches!(
+                    decl.kind,
+                    AugKind::Class
+                        | AugKind::Mixin
+                        | AugKind::Enum
+                        | AugKind::Extension
+                        | AugKind::ExtensionType
+                )
+            {
+                names.extend(decl.type_params.iter().map(|p| p.name));
+            }
+        }
+    }
+    names
+}
+
+/// The intro face's in-scope type-parameter names: the face's own group
+/// plus, for a member or constructor face, the declaring container's
+/// group — the scope the intro's written `T` resolves to.
+fn intro_params(intro_unit: &FileElements, aug: &AugmentDecl, face: &Face<'_>) -> Vec<StringId> {
+    let (names, _) = face.type_params();
+    let mut out: Vec<StringId> = names.to_vec();
+    if let Some(container_name) = aug.container
+        && let Some(container) = intro_unit.container(container_name)
+    {
+        out.extend_from_slice(&container.type_param_names);
+    }
+    out
 }
 
 fn row(file: FileId, range: SourceRange, code: SemanticCode, message: String) -> Diagnostic {
@@ -1536,3 +2368,9 @@ fn factory_body_diagnostics(
 #[cfg(test)]
 #[path = "ticket_3201_tests.rs"]
 mod ticket_3201_tests;
+
+// The #3556 pins — canonical-type comparison for the shape checks
+// (written/judged split) and the preceding-fragment chain.
+#[cfg(test)]
+#[path = "ticket_3556_tests.rs"]
+mod ticket_3556_tests;

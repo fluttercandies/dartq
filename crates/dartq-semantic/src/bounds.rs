@@ -1269,6 +1269,27 @@ impl<'a> Bounds<'a> {
         }
     }
 
+    /// An optional-formal group opened under a captured function level:
+    /// `[` latches the required/optional boundary on the sink's function
+    /// level, so the interned shape carries the written split (`int
+    /// Function(int)` and `int Function([int])` are distinct types). A
+    /// no-op unless the open window's top level is a function level.
+    pub(crate) fn function_optional_group(&mut self, opener: &str) {
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_optional_group(opener);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.function_optional_group(opener);
+        } else if let Some(alias) = self.alias.as_mut()
+            && alias.sink_fn_levels > 0
+        {
+            alias.sink.function_optional_group(opener);
+        } else if let Some(site) = self.site.as_mut()
+            && self.alias.is_none()
+        {
+            site.function_optional_group(opener);
+        }
+    }
+
     /// One function-level formal closed: its name pairs with the type
     /// node that just landed (the sink guards itself).
     pub(crate) fn function_formal_end(&mut self, named: bool, name: Option<StringId>) {
@@ -1487,8 +1508,12 @@ impl<'a> Bounds<'a> {
     /// `[` or `{` opened inside the formals region: the group's spelling
     /// selects the named list; the positional group latches the
     /// required-positional count (optional formals follow it). Bound
-    /// windows gate the same as [`Self::alias_leaf`].
+    /// windows gate the same as [`Self::alias_leaf`]. The capture-tree
+    /// sinks latch the same split first — a written annotation shape is
+    /// interned from their trees, so its identity carries the boundary
+    /// whether or not an alias RHS is open.
     pub(crate) fn alias_optional_group(&mut self, opener: &str) {
+        self.function_optional_group(opener);
         if self.bound_sink.is_some() {
             return;
         }
@@ -2427,9 +2452,29 @@ impl<'a> Bounds<'a> {
                 // display re-runs the same inversion. The extension-type
                 // face skips the pass upstream too. A bare head keys the
                 // raw-type context row on the i2b instantiation.
-                let inverted = allow_super
-                    .then(|| snapshot.display(replace_top_bottom(&system, instantiation)));
+                let inverted_ty = allow_super.then(|| replace_top_bottom(&system, instantiation));
+                let inverted = inverted_ty.map(|ty| snapshot.display(ty));
                 let raw_instantiated = raw.then(|| snapshot.display(instantiation));
+                // The message's bound is the WRITTEN spelling, substituted
+                // the way the failing pass substituted its types (#3510):
+                // an alias-headed bound keeps the alias decoration the
+                // oracle prints (`'A<dynamic>'`, display_string_builder
+                // .dart:379-382), which the snapshot's fully expanded
+                // model drops. The substitution source is the pass that
+                // produced the reported issues — the inverted
+                // instantiation where the super pass ran, the written one
+                // otherwise.
+                let subst_source = inverted_ty.unwrap_or(instantiation);
+                let mut subst: FxHashMap<StringId, TypeId> = FxHashMap::default();
+                if let TypeKind::Interface { args: arg_range, .. } =
+                    snapshot.table.get(subst_source).kind()
+                {
+                    for (index, param) in head_params.iter().enumerate() {
+                        if index < arg_range.len() {
+                            subst.insert(*param, snapshot.table.arg(arg_range.offset() + index));
+                        }
+                    }
+                }
                 issues
                     .into_iter()
                     .map(|issue| BoundedIssue {
@@ -2437,7 +2482,11 @@ impl<'a> Bounds<'a> {
                         site,
                         argument: snapshot.display(issue.argument),
                         parameter: snapshot.param_text(issue.parameter),
-                        bound: snapshot.display(issue.bound),
+                        bound: head_bounds
+                            .get(issue.index)
+                            .and_then(|(tree, _)| tree.as_ref())
+                            .and_then(|tree| snapshot.display_written_bound(tree, &subst))
+                            .unwrap_or_else(|| snapshot.display(issue.bound)),
                         inverted_type: inverted.clone(),
                         raw_instantiated: raw_instantiated.clone(),
                     })
@@ -2582,6 +2631,58 @@ impl<'a> Bounds<'a> {
                 .params
                 .iter()
                 .map(|(param, bound, poisoned)| (*param, bound.clone(), *poisoned))
+                .collect(),
+        )
+    }
+
+    /// The judgment face of [`Self::container_params`] /
+    /// [`Self::alias_params`] (#3510): the head's type parameters (name,
+    /// bound, poison bit) in declaration order, each bound as the tree the
+    /// snapshot maps it to and spells back — the shape the verdict reads.
+    /// A bound naming a bare generic alias arrives instantiated to the
+    /// alias's bounds and expanded through its RHS (`class E<T extends A>`
+    /// over `typedef A<X> = C<X, X>` reads `C<dynamic, dynamic>`), an
+    /// applied alias expands with its written arguments, a bare generic
+    /// container instantiates to bounds (`List` reads `List<dynamic>`), a
+    /// function-shaped expansion rides back as a function-form node — the
+    /// official `typeParameter.bound` the subtype test consumes
+    /// (`_checkForTypeArgumentNotMatchingBounds`,
+    /// type_arguments_verifier.dart:366-373, over the alias-instantiated
+    /// `NamedType` resolution, named_type_resolver.dart:305-310). The
+    /// written tree stays the MESSAGE face: the oracle's display keeps the
+    /// alias decoration (`'A<dynamic>'`), which the expansion drops —
+    /// consumers render from [`Self::container_params`] and judge from
+    /// here. A bound the snapshot cannot model (a poisoned tree, an
+    /// unregistered head, an alias that never expanded) keeps its written
+    /// tree — the pre-expansion reading, the under-report direction.
+    /// `None` when the head has no capture.
+    pub(crate) fn expanded_params(
+        &self,
+        strings: &'a StringTable,
+        name: StringId,
+    ) -> Option<Vec<(StringId, Option<TypeTree>, bool)>> {
+        let written = self
+            .container_params(name)
+            .or_else(|| self.alias_params(name))?;
+        let snapshot = self.snapshot(strings);
+        let Some(&decl) = snapshot.registry.get(&name) else {
+            return Some(written);
+        };
+        let ctx = snapshot.ctx();
+        let names: Vec<StringId> = written.iter().map(|(param, _, _)| *param).collect();
+        let scope = ctx.decl_scope(decl, &names);
+        Some(
+            written
+                .into_iter()
+                .map(|(param, bound, poisoned)| {
+                    let judged = match &bound {
+                        Some(tree) if !poisoned => ctx
+                            .map_tree(tree, &scope)
+                            .and_then(|ty| snapshot.tree_of(ty)),
+                        _ => None,
+                    };
+                    (param, judged.or(bound), poisoned)
+                })
                 .collect(),
         )
     }
@@ -3237,14 +3338,6 @@ impl MapCtx<'_, '_> {
                         .is_some_and(|&decl| self.alias_decls.contains(&decl));
                 match self.registry.get(&tree.head) {
                     Some(&decl) if !alias_shadowed => {
-                        // An alias declaration without an expansion (a chain
-                        // still pending, a cycle, a poisoned RHS) is not
-                        // modelable as an interface: the hierarchy has no
-                        // such declaration. `None` = the enclosing check
-                        // suppresses (the under-report direction).
-                        if self.alias_decls.contains(&decl) {
-                            return None;
-                        }
                         // An alias head expands to its captured RHS with the
                         // written arguments substituted in (the official
                         // resolves the alias element and instantiates it —
@@ -3253,7 +3346,13 @@ impl MapCtx<'_, '_> {
                         // decision order observes only the expanded shape;
                         // the alias identity itself never outlives the map
                         // (the under-report posture: an unexpanded alias
-                        // suppresses its check).
+                        // suppresses its check). This arm runs BEFORE the
+                        // unexpanded-alias refusal below (#3510): with the
+                        // refusal hoisted above it, every alias head —
+                        // expanded or not — answered `None`, so no
+                        // alias-headed bound, supertype, or argument ever
+                        // reached a verdict (`class E<T extends A>` over
+                        // `typedef A<X> = C<X, X>` read its bound `dynamic`).
                         if let Some(&expansion) = self.alias_expansions.get(&decl) {
                             let params = self.decl_params.get(&decl)?;
                             let args = if tree.args.len() == params.len() {
@@ -3270,6 +3369,14 @@ impl MapCtx<'_, '_> {
                             let map: Vec<(TypeParamId, TypeId)> =
                                 params.iter().copied().zip(args).collect();
                             return Some(self.table.substitute(expansion, &map));
+                        }
+                        // An alias declaration without an expansion (a chain
+                        // still pending, a cycle, a poisoned RHS) is not
+                        // modelable as an interface: the hierarchy has no
+                        // such declaration. `None` = the enclosing check
+                        // suppresses (the under-report direction).
+                        if self.alias_decls.contains(&decl) {
+                            return None;
                         }
                         let params = self.decl_params.get(&decl)?;
                         let args = if tree.args.len() == params.len() {
@@ -3926,15 +4033,70 @@ impl<'a> Snapshot<'a> {
         }
     }
 
+    /// The message face of a WRITTEN bound tree (#3510): the spelling the
+    /// oracle prints, where an alias head keeps its identity
+    /// (`'A<dynamic>'` — `getDisplayString` writes the alias decoration,
+    /// display_string_builder.dart:379-382) while the verdict compares the
+    /// expansion. `subst` maps the checked head's parameter names to the
+    /// failing pass's argument types; a leaf naming one renders that
+    /// argument, and a bare generic head (alias or container) renders its
+    /// instantiate-to-bounds form — the same fill `display` applies to a
+    /// raw head. `None` where the written spelling cannot render (a
+    /// poisoned, function-form, or record node — their expanded display is
+    /// the alias-free shape already — or a head the registry and the
+    /// substitution both miss): the caller keeps the expanded display.
+    fn display_written_bound(
+        &self,
+        tree: &TypeTree,
+        subst: &FxHashMap<StringId, TypeId>,
+    ) -> Option<String> {
+        if tree.poisoned || tree.record.is_some() || tree.function.is_some() {
+            return None;
+        }
+        let text = self.strings.resolve(tree.head);
+        let suffix = if tree.nullable { "?" } else { "" };
+        if tree.args.is_empty() {
+            if let Some(&ty) = subst.get(&tree.head) {
+                return Some(format!("{}{suffix}", self.display(ty)));
+            }
+            let decl = *self.registry.get(&tree.head)?;
+            let params = self.decl_params.get(&decl)?;
+            if params.is_empty() {
+                return Some(format!("{text}{suffix}"));
+            }
+            // A bare parameterized head displays its instantiate-to-bounds
+            // form — an alias's own parameters ground by their stored
+            // (typedef) variances, `A<Wrap<Never>>` never `A<dynamic>` by
+            // accident.
+            let defaults = instantiate_type_formals_to_bounds(&self.table, &self.facts, params);
+            let rendered: Vec<String> = defaults
+                .defaults
+                .iter()
+                .map(|&ty| self.display(ty))
+                .collect();
+            return Some(format!("{text}<{}>{suffix}", rendered.join(", ")));
+        }
+        let rendered: Vec<String> = tree
+            .args
+            .iter()
+            .map(|arg| self.display_written_bound(arg, subst))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{text}<{}>{suffix}", rendered.join(", ")))
+    }
+
     /// The written-tree projection of a snapshot type (#2838): the ITB
     /// defaults ride back to the engine as the trees it converts with its
     /// own written-face discipline (`tree_ty`), so the defaulted
     /// arguments compare exactly like written ones. The names re-intern
     /// canonically (the declaration and parameter display texts are the
     /// written spellings), `FutureOr` keeps its written head spelling,
-    /// and a kind the written world cannot spell (a function or record
-    /// default — the snapshot's bounds never intern one — or the error
-    /// sentinel) answers `None`: the caller keeps the silence.
+    /// and a function type spells as a function-form node (#3510 — an
+    /// expanded function-shaped alias bound rides back whole: the return,
+    /// the formal columns, the signature's own type variables unbounded,
+    /// the required split; named formals carry no `required` flag, the
+    /// same reading the capture takes). A kind the written world cannot
+    /// spell (a record default or the error sentinel) answers `None`: the
+    /// caller keeps the silence.
     fn tree_of(&self, ty: TypeId) -> Option<TypeTree> {
         let range = SourceRange {
             offset: 0,
@@ -3968,7 +4130,44 @@ impl<'a> Snapshot<'a> {
                 }
                 tree
             }
-            TypeKind::Function { .. } | TypeKind::Record { .. } | TypeKind::Invalid => {
+            TypeKind::Function { signature } => {
+                let sig = self.table.signature(signature);
+                let ret = self.tree_of(sig.return_type)?;
+                let type_parameters = self.table.function_type_parameters(sig.type_parameters);
+                let mut type_params_named = Vec::with_capacity(type_parameters.len());
+                for id in type_parameters {
+                    let text = self.param_text(id);
+                    if text.is_empty() {
+                        return None;
+                    }
+                    type_params_named.push((self.strings.intern(&text), None));
+                }
+                let mut positional = Vec::with_capacity(sig.positional.len());
+                for index in 0..sig.positional.len() {
+                    positional.push(self.tree_of(self.table.arg(sig.positional.offset() + index))?);
+                }
+                let mut named = Vec::new();
+                for member in self.table.named_members(sig.named) {
+                    named.push((self.strings.intern(&member.name), self.tree_of(member.ty)?));
+                }
+                TypeTree {
+                    head: StringId::NONE,
+                    nullable: t.is_nullable(),
+                    args: Vec::new(),
+                    record: None,
+                    function: Some(FnTree {
+                        ret: Some(Box::new(ret)),
+                        type_params: u16::try_from(type_params_named.len()).ok()?,
+                        type_params_named,
+                        required_positional: u16::try_from(sig.required_positional).ok()?,
+                        positional,
+                        named,
+                    }),
+                    range,
+                    poisoned: false,
+                }
+            }
+            TypeKind::Record { .. } | TypeKind::Invalid => {
                 return None;
             }
         };

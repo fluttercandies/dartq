@@ -529,12 +529,12 @@ impl FnShapeId {
 }
 
 /// One interned function-type shape: the type-parameter count, the return
-/// type, the positional formal types in source order, and the named
-/// formal set. Named formals canonicalize sorted by name — named-formal
-/// identity is a name *set* (the subtype rule matches named formals by
-/// name, `subtype.dart:86-171`), so equal shapes intern to one slot
-/// regardless of written order. Positional formals carry no names: they
-/// are display decoration, not type identity.
+/// type, the required-positional split, the positional formal types in
+/// source order, and the named formal set. Named formals canonicalize
+/// sorted by name — named-formal identity is a name *set* (the subtype
+/// rule matches named formals by name, `subtype.dart:86-171`), so equal
+/// shapes intern to one slot regardless of written order. Positional
+/// formals carry no names: they are display decoration, not type identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnShape {
     /// The type-parameter count (`<T, U>` group).
@@ -557,6 +557,20 @@ pub struct FnShape {
     /// The declared return type ([`Ty::Dynamic`] for a bare
     /// `Function(...)` head — the implicit return).
     pub return_ty: Ty,
+    /// How many of [`FnShape::positional`] are REQUIRED positionals — the
+    /// leading segment; the rest sit in the written `[...]` group. The
+    /// split is type identity, not decoration: the official
+    /// `FunctionTypeImpl` equality compares each formal's
+    /// `isPositional`/`isOptional` flag
+    /// (`pkg/analyzer/lib/src/dart/element/type.dart` `_equalParameters`),
+    /// so `int Function(int)` and `int Function([int])` are two distinct
+    /// types, and `_isFunctionSubtypeOf` answers `false` for a required
+    /// source formal against an optional target formal
+    /// (`pkg/analyzer/lib/src/dart/element/subtype.dart`). Equals
+    /// [`FnShape::positional`]`.len()` for a shape whose producer recorded
+    /// no `[...]` group — the all-required reading, which is also what a
+    /// producer with no spelling to read (a count-only rebuild) answers.
+    pub required_positional: u16,
     /// Positional formal types in source order.
     pub positional: Box<[Ty]>,
     /// Named formals `(name, type)`, sorted by [`StringId`] at intern.
@@ -628,6 +642,7 @@ impl Default for ArgPool {
                 type_params: 0,
                 type_params_named: Box::new([]),
                 return_ty: Ty::Dynamic,
+                required_positional: 0,
                 positional: Box::new([]),
                 named: Box::new([]),
             }],
@@ -679,6 +694,15 @@ impl ArgPool {
     #[must_use]
     pub fn get(&self, id: ArgListId) -> &[Ty] {
         &self.lists[id.0 as usize]
+    }
+
+    /// [`Self::get`] without the panic: `None` when `id` is out of range.
+    /// For paths a malformed or foreign-pool `Ty` can reach through user
+    /// input — an out-of-range id there is a stale-slot symptom to answer
+    /// conservatively, never a process crash (#3526).
+    #[must_use]
+    pub fn get_checked(&self, id: ArgListId) -> Option<&[Ty]> {
+        self.lists.get(id.0 as usize).map(|list| &**list)
     }
 
     /// Interns one record field shape canonically (named fields sort by
@@ -744,6 +768,13 @@ impl ArgPool {
     /// as its size, the names and bounds are not recorded and the display
     /// under-reports the group. The with-names producer is
     /// [`ArgPool::function_generic`].
+    ///
+    /// Every positional formal reads required — the all-required face the
+    /// split-blind producers answer. A producer that spelled the `[...]`
+    /// group passes the honest count through
+    /// [`ArgPool::function_required`] instead: the split is identity
+    /// ([`FnShape::required_positional`]), so the two spellings must not
+    /// merge.
     pub fn function(
         &mut self,
         type_params: u16,
@@ -752,8 +783,40 @@ impl ArgPool {
         named: &[(StringId, Ty)],
         nullable: bool,
     ) -> Ty {
+        self.function_required(
+            type_params,
+            all_required(positional),
+            return_ty,
+            positional,
+            named,
+            nullable,
+        )
+    }
+
+    /// [`ArgPool::function`] with the written required-positional count:
+    /// the shape keeps the count beside its positional column (the leading
+    /// required segment, the rest the optional group), so
+    /// `int Function(int)` and `int Function([int])` intern to distinct
+    /// slots — the official `FunctionType` identity
+    /// ([`FnShape::required_positional`]).
+    pub fn function_required(
+        &mut self,
+        type_params: u16,
+        required_positional: u16,
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty)],
+        nullable: bool,
+    ) -> Ty {
         Ty::Function {
-            shape: self.intern_function(type_params, &[], return_ty, positional, named),
+            shape: self.intern_function(
+                type_params,
+                required_positional,
+                &[],
+                return_ty,
+                positional,
+                named,
+            ),
             nullable,
         }
     }
@@ -762,7 +825,8 @@ impl ArgPool {
     /// written (`void Function<T extends B>(...)`) — the display carries
     /// the group verbatim, the official `FunctionType` display form. The
     /// count derives from the slice; every written-annotation producer
-    /// routes here.
+    /// routes here. Every positional formal reads required — see
+    /// [`ArgPool::function`] and [`ArgPool::function_generic_required`].
     pub fn function_generic(
         &mut self,
         type_params: &[(StringId, Option<Ty>)],
@@ -771,9 +835,32 @@ impl ArgPool {
         named: &[(StringId, Ty)],
         nullable: bool,
     ) -> Ty {
+        self.function_generic_required(
+            type_params,
+            all_required(positional),
+            return_ty,
+            positional,
+            named,
+            nullable,
+        )
+    }
+
+    /// [`ArgPool::function_generic`] with the written required-positional
+    /// count — the generic-annotation spelling of
+    /// [`ArgPool::function_required`].
+    pub fn function_generic_required(
+        &mut self,
+        type_params: &[(StringId, Option<Ty>)],
+        required_positional: u16,
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty)],
+        nullable: bool,
+    ) -> Ty {
         Ty::Function {
             shape: self.intern_function(
                 type_params.len().min(u16::MAX as usize) as u16,
+                required_positional,
                 type_params,
                 return_ty,
                 positional,
@@ -790,10 +877,13 @@ impl ArgPool {
     /// are distinct shapes while reorders share one slot. `names` rides
     /// the shape's own type-parameter group verbatim (empty for the
     /// count-only producer, [`ArgPool::function`]) and joins identity, so
-    /// distinct spellings never merge.
+    /// distinct spellings never merge. `required_positional` joins
+    /// identity too — the required/optional split of the positional
+    /// column ([`FnShape::required_positional`]).
     pub(crate) fn intern_function(
         &mut self,
         type_params: u16,
+        required_positional: u16,
         names: &[(StringId, Option<Ty>)],
         return_ty: Ty,
         positional: &[Ty],
@@ -815,11 +905,19 @@ impl ArgPool {
             sorted.sort_by_key(|(name, _)| *name);
             sorted.as_slice()
         };
-        let hash = hash_function(type_params, names, return_ty, positional, named);
+        let hash = hash_function(
+            type_params,
+            required_positional,
+            names,
+            return_ty,
+            positional,
+            named,
+        );
         if let Some(slots) = self.function_at.get(&hash) {
             for &slot in slots {
                 let shape = &self.functions[slot as usize];
                 if shape.type_params == type_params
+                    && shape.required_positional == required_positional
                     && &*shape.type_params_named == names
                     && shape.return_ty == return_ty
                     && &*shape.positional == positional
@@ -834,6 +932,7 @@ impl ArgPool {
             type_params,
             type_params_named: Box::from(names),
             return_ty,
+            required_positional,
             positional: Box::from(positional),
             named: Box::from(named),
         });
@@ -875,6 +974,13 @@ fn hash_args(args: &[Ty]) -> u64 {
     hasher.finish()
 }
 
+/// The all-required positional count of a shape whose producer recorded no
+/// optional group — the count the split-blind intern entries
+/// ([`ArgPool::function`], [`ArgPool::function_generic`]) hand the pool.
+fn all_required(positional: &[Ty]) -> u16 {
+    positional.len().min(u16::MAX as usize) as u16
+}
+
 /// The canonical-shape hash of one record type: positional children in
 /// order, then the (already sorted) named pairs. Children are canonical,
 /// so the id fold needs no recursion.
@@ -894,6 +1000,7 @@ fn hash_record(positional: &[Ty], named: &[(StringId, Ty)]) -> u64 {
 /// canonical, so the id fold needs no recursion.
 fn hash_function(
     type_params: u16,
+    required_positional: u16,
     names: &[(StringId, Option<Ty>)],
     return_ty: Ty,
     positional: &[Ty],
@@ -901,6 +1008,7 @@ fn hash_function(
 ) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     type_params.hash(&mut hasher);
+    required_positional.hash(&mut hasher);
     for (name, bound) in names {
         name.hash(&mut hasher);
         bound.hash(&mut hasher);
@@ -2126,6 +2234,24 @@ pub struct AnonMethodInvocation {
     /// `anonymous_method_wrong_parameter_type` anchor (`resolver.dart`
     /// reports at `declaredParameterType`).
     pub param_ty: Option<(Ty, SourceRange)>,
+    /// The invocation's end offset (the body's last token end). Together
+    /// with [`Self::punctuation`] it spells the body extent
+    /// `punctuation.end()..end` — the region whose `this` keyword and
+    /// unqualified names bind the anonymous method's receiver (the
+    /// implicit form) or its injected first formal (the explicit form),
+    /// `resolver.dart:2031-2055`.
+    pub end: u32,
+    /// The body is an expression body (`=> e`); a block body (`{ ... }`)
+    /// owns its own `return` statements (upstream
+    /// `error_verifier.dart:408-425` swaps the enclosing executable for
+    /// the anonymous method's own inferred-return context there).
+    pub is_expression: bool,
+    /// The first formal's name token span, present only when the written
+    /// list survives the shape check (exactly one required positional) and
+    /// that formal is unannotated with no function-typed suffix — the slot
+    /// the receiver's static type injects into (`resolver.dart:1988-1997`,
+    /// `parameter.declaredFragment?.element.type = parameterType`).
+    pub first_param: Option<SourceRange>,
 }
 
 /// Everything one compilation unit contributes to the semantic model.
@@ -2289,9 +2415,15 @@ impl FileElements {
             return false;
         }
         if strings.resolve(name) == "FutureOr" && self.container(name).is_none() {
+            // The `FutureOr` argument read tolerates a slot the handed pool
+            // never interned: a `Ty` that crossed a pool boundary without
+            // projection (the #3531/#3526 crash class — an out-of-range
+            // `ArgListId` indexes another universe) answers `false`, the
+            // conservative under-report arm the depth budget shares, rather
+            // than panic on user input.
             return pool
-                .get(args)
-                .first()
+                .get_checked(args)
+                .and_then(|list| list.first())
                 .is_some_and(|&arg| self.strictly_non_nullable_within(strings, arg, pool, depth - 1));
         }
         match self.container(name) {

@@ -38,7 +38,7 @@
 //! Oracle answers `not_iterable_spread` at `1` and `not_map_spread` at
 //! `[1]` — dartq reported nothing before this fix.
 
-use super::test_rig::{assert_silent, code_names, report_ops};
+use super::test_rig::{CORE_PRELUDE, code_names, report_ops};
 
 /// Offset of `needle` inside the first occurrence of `line`.
 fn at(source: &str, line: &str, needle: &str) -> u32 {
@@ -76,7 +76,10 @@ fn not_iterable_spread_fires_on_int_operand() {
     let fixture = format!("{l1}{l2}");
     let rows = rows_for(&fixture, &["not_iterable_spread"]);
     assert_eq!(rows.len(), 1, "expected one not_iterable_spread: {rows:?}");
-    let operand_at = at(&fixture, "var a", "i");
+    // Diagnostic offsets count from the prelude-augmented source's start,
+    // so the anchor walks the prefixed text.
+    let source = format!("{CORE_PRELUDE}{fixture}");
+    let operand_at = at(&source, l2, "i");
     assert_eq!(rows[0].1, operand_at, "row must anchor at the operand");
 }
 

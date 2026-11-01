@@ -1,5 +1,30 @@
 use super::*;
 
+/// One optional-parameter row held for the fold-tail augmentation-chain
+/// verdict (#3557): `parameterElement.hasDefaultValue` is the MERGED
+/// element's flag, so a `missing_default_value_for_parameter` candidate can
+/// be silenced by a default clause written on a fragment the parse has not
+/// reached yet (`void f([int a]);` before `augment void f([int a = 0]) {}`).
+struct DeferredDefault {
+    /// `MissingDefaultValueForParameter` or its `*Positional` sibling.
+    code: SemanticCode,
+    /// The parameter name token's span — the row anchor and the chain
+    /// lookup's owner fingerprint.
+    range: SourceRange,
+    /// The parameter's name (fragments match parameters by name).
+    param: StringId,
+}
+
+/// The current unit's deferred optional-parameter rows: staged at the
+/// executable's body event, drained by [`Engine::finalize_default_checks`]
+/// at the fold tail. Thread-local rather than an engine field so the fold
+/// state stays untouched — a sequential fold drains it before the next
+/// unit parses.
+thread_local! {
+    static DEFERRED_DEFAULTS: std::cell::RefCell<Vec<DeferredDefault>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The frozen `dart:collection` list-base face (upstream Dart SDK source,
 /// `sdk/lib/collection/list.dart` — `abstract mixin class ListBase<E>
 /// implements List<E>`, `typedef ListMixin<E> = ListBase<E>`): every
@@ -2710,10 +2735,6 @@ impl<'a> Engine<'a> {
     /// (`end_constructor` never clears it), so a sibling `;`-method after
     /// a `;` ctor would false-positive off the stale site.
     pub(crate) fn flush_default_checks(&mut self, body_present: bool) {
-        if self.open_exec_augment {
-            self.pending_default_checks.clear();
-            return;
-        }
         let ctor_open = self.ctor_pending.is_some();
         let checks = std::mem::take(&mut self.pending_default_checks);
         for check in checks {
@@ -2746,9 +2767,213 @@ impl<'a> Engine<'a> {
             } else {
                 SemanticCode::MissingDefaultValueForParameterPositional
             };
-            let name = self.strings.resolve(check.name).to_string();
-            self.stage_usage(code, check.name_range, &name);
+            // The merged element answers `parameterElement.hasDefaultValue`
+            // (error_verifier.dart:8385): a default written on ANY fragment
+            // of the augmentation chain silences the row — including a
+            // fragment the parse has not reached yet. With the feature on
+            // the rows defer to [`Self::finalize_default_checks`]; with it
+            // off `augment` never lexes, no chain exists, and the row emits
+            // here (the oracle's plain-declaration arm).
+            if self.augmentations_enabled {
+                DEFERRED_DEFAULTS.with(|queue| {
+                    queue.borrow_mut().push(DeferredDefault {
+                        code,
+                        range: check.name_range,
+                        param: check.name,
+                    });
+                });
+            } else {
+                let name = self.strings.resolve(check.name).to_string();
+                self.stage_usage(code, check.name_range, &name);
+            }
         }
+    }
+
+    /// The fold-tail verdict for the staged optional-parameter rows
+    /// (upstream `parameterElement.hasDefaultValue` is the merged element's
+    /// flag — one fragment's written default settles every fragment of the
+    /// chain, error_verifier.dart `_checkUseOfDefaultValuesInParameters`).
+    /// Runs once per unit inside [`Self::verify_enum_member_set`], after all
+    /// `augment` declarations are captured.
+    pub(crate) fn finalize_default_checks(&mut self) {
+        let pending = DEFERRED_DEFAULTS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+        for item in pending {
+            if !self.chain_supplies_default(&item) {
+                let name = self.strings.resolve(item.param).to_string();
+                self.stage_usage(item.code, item.range, &name);
+            }
+        }
+    }
+
+    /// Whether any fragment of the item's augmentation chain supplies a
+    /// default for the same-named parameter — the `hasDefaultValue` merge.
+    /// The chain key resolves like the augmentation verifier's
+    /// (`augment_key`): a member augment keys `(container, name, static)`,
+    /// a top-level executable keys `name`. Intro fragments read the model's
+    /// own formal tables (`Formal::default_value`); same-file augment
+    /// fragments detect the written `=`/`:` clause by token scan — a
+    /// cross-file augment's default stays undetected (no token table rides
+    /// the index), the documented under-coverage of this face.
+    fn chain_supplies_default(&self, item: &DeferredDefault) -> bool {
+        let own = self.index.get(self.file);
+        // The owner key: an `augment` formal matches by its name-token span;
+        // an introductory formal resolves to the nearest preceding
+        // executable declaration site.
+        let mut owner: Option<(Option<StringId>, StringId, bool, bool)> = None;
+        if let Some(elements) = own {
+            'aug: for aug in elements.augmentations() {
+                if !matches!(
+                    aug.kind,
+                    crate::model::AugKind::Function
+                        | crate::model::AugKind::Method
+                        | crate::model::AugKind::Getter
+                        | crate::model::AugKind::Setter
+                        | crate::model::AugKind::Constructor
+                ) {
+                    continue;
+                }
+                for formal in aug.formals.iter() {
+                    if formal.name_range.offset == item.range.offset {
+                        owner = Some((
+                            aug.container,
+                            aug.name,
+                            aug.is_static,
+                            aug.kind == crate::model::AugKind::Constructor,
+                        ));
+                        break 'aug;
+                    }
+                }
+            }
+        }
+        if owner.is_none() {
+            for site in self.decl_sites.iter() {
+                if site.range.offset >= item.range.offset {
+                    continue;
+                }
+                owner = match site.kind {
+                    DeclKind::Member {
+                        kind,
+                        container,
+                        is_static,
+                    } if kind != MemberKind::Field => {
+                        Some((Some(container), site.name, is_static, false))
+                    }
+                    DeclKind::TopLevelFn => Some((None, site.name, false, false)),
+                    DeclKind::Constructor { container } => {
+                        Some((Some(container), site.name, false, true))
+                    }
+                    _ => owner,
+                };
+            }
+        }
+        let Some((container, name, is_static, ctor)) = owner else {
+            return false;
+        };
+        let units = self.graph.unit_files(self.lib);
+        let own_pos = units
+            .iter()
+            .position(|&unit| unit == self.file)
+            .unwrap_or(units.len());
+        for (position, &unit) in units.iter().enumerate() {
+            if position > own_pos {
+                break;
+            }
+            let Some(elements) = self.index.get(unit) else {
+                continue;
+            };
+            // The introductory fragment's formal table (model-side
+            // `default_value` carries the written clause).
+            let intro_formals = match (container, ctor) {
+                (Some(owner_name), true) => elements
+                    .container(owner_name)
+                    .and_then(|found| {
+                        found
+                            .ctor_formals
+                            .get(&name)
+                            .or_else(|| found.factory_formals.get(&name))
+                            .map(|formals| formals.as_ref())
+                    }),
+                (Some(owner_name), false) => elements
+                    .container(owner_name)
+                    .and_then(|found| found.members.get(&name))
+                    .and_then(|entry| entry.formals.as_deref()),
+                (None, _) => elements
+                    .decl(name)
+                    .and_then(|decl| decl.formals.as_deref()),
+            };
+            if let Some(formals) = intro_formals
+                && formals
+                    .positional
+                    .iter()
+                    .chain(formals.named.iter())
+                    .any(|formal| {
+                        formal.name == item.param && formal.default_value.is_some()
+                    })
+            {
+                return true;
+            }
+            for aug in elements.augmentations() {
+                if !matches!(
+                    aug.kind,
+                    crate::model::AugKind::Function
+                        | crate::model::AugKind::Method
+                        | crate::model::AugKind::Getter
+                        | crate::model::AugKind::Setter
+                        | crate::model::AugKind::Constructor
+                ) || aug.container != container
+                    || aug.name != name
+                    || (aug.kind == crate::model::AugKind::Constructor) != ctor
+                    || (!ctor && aug.is_static != is_static)
+                {
+                    continue;
+                }
+                // Same-file augment formals expose the default clause only
+                // through the token stream — scan between the parameter's
+                // name and its closing delimiter.
+                if unit != self.file {
+                    continue;
+                }
+                for formal in aug.formals.iter() {
+                    if formal.name == Some(item.param)
+                        && self.augment_formal_has_default(formal.name_range)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the augment-fragment formal whose name token sits at
+    /// `name_range` carries a default clause: tokens between the name and
+    /// the parameter's closing delimiter at paren depth 0, `=` (new style)
+    /// or `:` (legacy style) mark it.
+    fn augment_formal_has_default(&self, name_range: SourceRange) -> bool {
+        if name_range.offset == u32::MAX {
+            return false;
+        }
+        let tokens = self.tokens.as_slice();
+        let mut at = tokens
+            .partition_point(|token| token.utf16_offset < name_range.offset + name_range.length);
+        let mut depth: i32 = 0;
+        while let Some(token) = tokens.get(at) {
+            let text = &self.source[token.byte_range()];
+            match text {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                "," | ";" if depth == 0 => return false,
+                "=" | ":" if depth == 0 => return true,
+                _ => {}
+            }
+            at += 1;
+        }
+        false
     }
 
     /// Whether the executable header holding the formal at `name_range` was

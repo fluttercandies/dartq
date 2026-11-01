@@ -77,6 +77,10 @@ impl<'a> Engine<'a> {
     /// enum member-set faces and, when it carries a `with` clause, the
     /// mixin-application face.
     pub(crate) fn verify_enum_member_set(&mut self) {
+        // The staged optional-parameter rows await the fold tail: the
+        // merged augmentation chain (every `augment` declaration now
+        // captured) decides each one's default coverage before it emits.
+        self.finalize_default_checks();
         // One run per uniquely-named container: an augmentation's
         // `augment enum E` notes a second container site for the same name,
         // and the faces must report once.
@@ -200,14 +204,42 @@ impl<'a> Engine<'a> {
     /// `_reportConcreteClassWithAbstractMember`'s enum arm: a bodyless member
     /// the enum declares while its interface carries no concrete
     /// implementation of that name reports at the whole declaration
-    /// (inheritance_override.dart:912-946).
+    /// (inheritance_override.dart:912-946). A member written `augment` is a
+    /// fragment, not a declaration — upstream skips it in the interface walk
+    /// (`interfaceElement.baseElement.isAugmentationWithoutAugmentedDeclaration`,
+    /// :431-435), so the face stays silent while the `augmentations` feature
+    /// is on (with it off the keyword never lexes and the member reports as
+    /// an ordinary abstract declaration).
     fn verify_enum_abstract_members(&mut self, name: StringId, container: &'a Container) {
         let enclosing = self.display_of(name);
+        let augment_spans: FxHashSet<u32> = if self.augmentations_enabled {
+            self.index
+                .get(self.file)
+                .map(|unit| {
+                    unit.augmentations()
+                        .iter()
+                        .filter(|aug| {
+                            matches!(
+                                aug.kind,
+                                crate::model::AugKind::Method
+                                    | crate::model::AugKind::Getter
+                                    | crate::model::AugKind::Setter
+                                    | crate::model::AugKind::Field
+                            ) && aug.container == Some(name)
+                        })
+                        .map(|aug| aug.name_range.offset)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            FxHashSet::default()
+        };
         let mut rows: Vec<(SourceRange, String)> = Vec::new();
         for (member, entry) in container.members.iter() {
             if entry.name_range.offset == MISSING_SPAN
                 || entry.is_static
                 || !entry.is_abstract
+                || augment_spans.contains(&entry.name_range.offset)
             {
                 continue;
             }

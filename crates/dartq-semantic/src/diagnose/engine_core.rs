@@ -3643,7 +3643,19 @@ impl<'a> Engine<'a> {
         if start >= end {
             return None;
         }
-        let (s16, e16) = (self.utf16_of(start), self.utf16_of(end));
+        // A spread element's leaf is its operand — the `...`/`...?` prefix
+        // is not part of the operand's own row span, so the exact match
+        // below starts after it. The element face the leaf contributes is
+        // the operand's ELEMENT type (`_computeElementType`'s iterable
+        // arm), which [`Self::spread_element_ty`] reads.
+        let spread_prefix = bytes[start..end].starts_with(b"...");
+        let operand_start = if spread_prefix {
+            let skip = 3 + usize::from(bytes.get(start + 3) == Some(&b'?'));
+            trim_value_ws(bytes, start + skip, end)
+        } else {
+            start
+        };
+        let (s16, e16) = (self.utf16_of(operand_start), self.utf16_of(end));
         let exact = |row: &Row| {
             row.range.offset == s16
                 && row.range.end() == e16
@@ -3664,6 +3676,9 @@ impl<'a> Engine<'a> {
             })?;
         if self.untyped_literals.contains_key(&row.range.offset) {
             return None;
+        }
+        if spread_prefix {
+            return self.spread_element_ty(row);
         }
         let ty = self.operand_static_ty(row);
         (ty != Ty::UNKNOWN).then_some(ty)
@@ -3808,17 +3823,102 @@ impl<'a> Engine<'a> {
             return None;
         }
         let (s16, e16) = (self.utf16_of(start), self.utf16_of(end));
-        self.rows
+        // A leaf's own row may live on either stack: the enclosing list
+        // literal drains its element rows into the deferred pass-2 queue
+        // at close (`handle_literal_list`'s drain), so both stacks are
+        // scanned newest-first, each stopping below the leaf's start. A
+        // spread element (`...expr`) contributes the spread operand's
+        // ELEMENT type (upstream `typed_literal_resolver.dart`
+        // `_computeElementType`'s iterable arm) — the operand's own row
+        // reads the iterable whole, never the element. The operand's row
+        // sits inside the leaf span (the `...` prefix is not part of it),
+        // so the span scan finds it.
+        let spread = bytes[start..end].starts_with(b"...");
+        let in_span = |row: &Row| {
+            row.range.offset >= s16
+                && row.range.end() <= e16
+                && !matches!(row.shape, RowShape::TypeUse(..))
+        };
+        let row = self
+            .rows
             .iter()
             .rev()
-            .find(|row| {
-                row.range.offset >= s16
-                    && row.range.end() <= e16
-                    && !matches!(row.shape, RowShape::TypeUse(..))
-            })
-            .map(|row| row.ty)
-            .filter(|ty| *ty != Ty::UNKNOWN && *ty != Ty::Dynamic)
+            .find(|row| in_span(row))
+            .or_else(|| self.deferred_miss_rows.iter().rev().find(|row| in_span(row)))?;
+        if spread {
+            // The spread's element face: `Iterable`'s first argument where
+            // the operand's head reaches it, `dynamic` where it does not
+            // (a `Map`, a non-collection, an unspellable shape all read
+            // `dynamic` upstream — `_computeElementType`'s else arm).
+            return self.spread_element_ty(row);
+        }
+        let ty = row.ty;
+        (ty != Ty::UNKNOWN && ty != Ty::Dynamic)
+            .then_some(ty)
             .or_else(|| self.literal_leaf_ty(bytes, start, end))
+    }
+
+    /// The spread element's inferred type (`typed_literal_resolver.dart`
+    /// `_computeElementType`'s spread arm): `Iterable`'s first argument
+    /// where the operand's head reaches `Iterable`/`List`/`Set` through
+    /// its declared superchain, `dynamic` where it does not. A `Map`
+    /// operand, a non-collection operand, and an unspellable head all read
+    /// `dynamic` — the oracle's `else` arm, never a more specific type.
+    /// The operand's own row is the spread's value row (the `...` prefix
+    /// is not part of it); a `Named` head with a resolved `Iterable` first
+    /// argument answers that argument.
+    fn spread_element_ty(&self, row: &Row) -> Option<Ty> {
+        let Ty::Named { name, args, .. } = self.operand_static_ty(row) else {
+            return None;
+        };
+        let iterable_heads = [
+            self.collection_heads[3],
+            self.collection_heads[0],
+            self.collection_heads[1],
+        ];
+        let first = || {
+            self.boundary
+                .pool()
+                .get(args)
+                .first()
+                .copied()
+                .filter(|ty| *ty != Ty::UNKNOWN)
+        };
+        if iterable_heads.contains(&name) {
+            return first().or(Some(Ty::Dynamic));
+        }
+        // A user head reaching `Iterable` through `extends`/`with`/
+        // `implements` answers the same first argument — the clause's
+        // written arguments live only in source, so the first-position
+        // substitution is exact for every single-parameter wrapper chain.
+        let mut queue: Vec<StringId> = vec![name];
+        let mut seen: FxHashSet<StringId> = FxHashSet::from_iter([name]);
+        while let Some(current) = queue.pop() {
+            let Some((decl, _)) = crate::library::resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                current,
+            ) else {
+                continue;
+            };
+            let supers = decl
+                .superclass
+                .into_iter()
+                .chain(decl.with_clause.iter().copied())
+                .chain(decl.implements_clause.iter().copied());
+            for next in supers {
+                if iterable_heads.contains(&next) {
+                    return first().or(Some(Ty::Dynamic));
+                }
+                if seen.insert(next) {
+                    queue.push(next);
+                }
+            }
+        }
+        Some(Ty::Dynamic)
     }
 
     /// The leaf segment's own literal spelling, byte-read (`1` → `int`,

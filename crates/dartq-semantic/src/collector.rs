@@ -320,6 +320,9 @@ struct PendingAnonMethod {
     /// written `int` of `int g(String)` is the return type, not the
     /// parameter's type — upstream skips the type check for those.
     param_fn_typed: bool,
+    /// The first formal's name token span (latched with the shape bits);
+    /// the seal gates it on the surviving-list conditions.
+    param_name: Option<SourceRange>,
 }
 
 /// The clause family a buffered header-window name belongs to; the parser's
@@ -1373,8 +1376,18 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|(name, bound)| (name, bound.map(|b| self.arg_ty(b))))
             .collect();
-        self.type_args
-            .function_generic(&type_params, ret, &positional, &named, tree.nullable)
+        // The written required/optional split joins the interned identity —
+        // the same column the diagnose-side capture seals at its own
+        // `end_function_type`, so both producers of one spelling share a
+        // slot while `int Function(int)` and `int Function([int])` never do.
+        self.type_args.function_generic_required(
+            &type_params,
+            fn_tree.required_positional,
+            ret,
+            &positional,
+            &named,
+            tree.nullable,
+        )
     }
 
     /// One argument subtree. The head canonicalizes exactly like the
@@ -5586,10 +5599,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             formals.positional.iter().map(|f| leaf(f.ty)).collect();
                         let named: Vec<(StringId, Ty)> =
                             formals.named.iter().map(|f| (f.name, leaf(f.ty))).collect();
+                        // The `[...]` split rides the synthesized shape:
+                        // each positional formal's captured `required`
+                        // flag is the written boundary, so `typedef fx([int
+                        // c])` is `dynamic Function([int])`, never
+                        // `dynamic Function(int)`.
+                        let required_positional = u16::try_from(
+                            formals.positional.iter().filter(|f| f.required).count(),
+                        )
+                        .unwrap_or(u16::MAX);
                         let return_ty = leaf(pending.return_ty);
-                        builder
-                            .type_args
-                            .function(0, return_ty, &positional, &named, false)
+                        builder.type_args.function_required(
+                            0,
+                            required_positional,
+                            return_ty,
+                            &positional,
+                            &named,
+                            false,
+                        )
                     } else {
                         Ty::UNKNOWN
                     }
@@ -5651,6 +5678,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             param_ty: None,
             param_seen: false,
             param_fn_typed: false,
+            param_name: None,
         });
     }
 
@@ -5669,13 +5697,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         &mut self,
         _begin: Token,
         _function_definition: Option<Token>,
-        _end: Token,
-        _is_expression: bool,
+        end: Token,
+        is_expression: bool,
     ) {
         let builder = &mut self.builder;
         let Some(pending) = builder.pending_anon.pop() else {
             return;
         };
+        let body_end = end.range.end();
         let (open, close) = match pending.parens {
             Some((open, Some(close))) => (open, close),
             // A bail between the list's `(` and `)` leaves the pair
@@ -5689,9 +5718,28 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     first_named: false,
                     first_optional: false,
                     param_ty: None,
+                    end: body_end,
+                    is_expression,
+                    first_param: None,
                 });
                 return;
             }
+        };
+        // The first formal's name rides whenever the first formal is a
+        // plain required positional with no written annotation and no
+        // function-typed suffix — the exact `resolver.dart:1988-1997`
+        // injection condition. The formal COUNT never gates it: a
+        // multi-formal list is a `wrong_parameter_list` error upstream,
+        // but the injection still runs (the extra formals keep meaningful
+        // analysis, resolver.dart:2017-2021).
+        let first_param = if !pending.first_named
+            && !pending.first_optional
+            && !pending.param_fn_typed
+            && pending.param_ty.is_none()
+        {
+            pending.param_name
+        } else {
+            None
         };
         builder.anon_methods.push(AnonMethodInvocation {
             punctuation: pending.punctuation,
@@ -5701,6 +5749,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             first_named: pending.first_named,
             first_optional: pending.first_optional,
             param_ty: pending.param_ty,
+            end: body_end,
+            is_expression,
+            first_param,
         });
     }
 
@@ -5937,6 +5988,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // function-typed suffix already flagged itself: the armed head is
         // its return type, not the checked type.
         let builder = &mut self.builder;
+        // #3419: the first formal's name span — read before the mutable
+        // pending borrow below takes the builder.
+        let name_span = builder.span_of(name);
         if let Some(pending) = builder.pending_anon.last_mut()
             && !pending.param_seen
             && builder.formal_depth == pending.list_depth
@@ -5947,6 +6001,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
             );
             pending.first_optional = !matches!(kind, FormalParameterKind::RequiredPositional);
+            // The slot the receiver's static type injects into when the
+            // formal carries no written annotation and no function-typed
+            // suffix (the seal below owns the surviving-list gating).
+            pending.param_name = Some(name_span);
             if !pending.param_fn_typed
                 && let (Some(ty), Some(range)) = (builder.armed_ty, builder.armed_ty_range)
                 && ty != Ty::UNKNOWN

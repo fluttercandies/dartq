@@ -38,13 +38,14 @@ impl ArgPool {
             }
             Ty::Named { .. } => leaf(ty),
             Ty::Function { shape, nullable } => {
-                let (return_ty, positional, named) = {
+                let (return_ty, required_positional, positional, named) = {
                     let fn_shape = self.function_shape(shape);
                     if fn_shape.type_params != 0 {
                         return ty;
                     }
                     (
                         fn_shape.return_ty,
+                        fn_shape.required_positional,
                         fn_shape.positional.to_vec(),
                         fn_shape.named.to_vec(),
                     )
@@ -61,7 +62,14 @@ impl ArgPool {
                 if new_return == return_ty && new_positional == positional && new_named == named {
                     ty
                 } else {
-                    self.function(0, new_return, &new_positional, &new_named, nullable)
+                    self.function_required(
+                        0,
+                        required_positional,
+                        new_return,
+                        &new_positional,
+                        &new_named,
+                        nullable,
+                    )
                 }
             }
             Ty::Record { shape, nullable } => {

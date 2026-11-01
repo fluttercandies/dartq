@@ -18,10 +18,30 @@
 //! co-tenant seams and stay out of scope here.
 
 use crate::diagnose::test_rig::{code_names, report_ops, rows};
+use crate::diagnose::types::FileReport;
 
 /// The message the oracle spells for every face — parameterless
 /// (messages.yaml:19638 `useOfVoidResult`).
 const VOID_MSG: &str = "This expression has a type of 'void' so its value can't be used.";
+
+/// Asserts `report`'s `use_of_void_result` rows are exactly `expected` —
+/// `(offset, length)` in fixture coordinates, each spelling [`VOID_MSG`] —
+/// and that every other row carries one of `others`, the remaining codes
+/// the 3.13.7 oracle reports on the fixture. The rig may lack one of
+/// those rows, never add a code the oracle does not report.
+fn assert_void_rows(report: &FileReport, expected: &[(usize, u32)], others: &[&str]) {
+    let prelude = crate::diagnose::test_rig::CORE_PRELUDE.len();
+    let mut voids = Vec::new();
+    for d in &report.diagnostics {
+        if d.code.name == "use_of_void_result" {
+            assert_eq!(d.message, VOID_MSG, "{:?}", rows(report));
+            voids.push((d.range.offset as usize - prelude, d.range.length));
+        } else {
+            assert!(others.contains(&d.code.name), "{:?}", rows(report));
+        }
+    }
+    assert_eq!(voids, expected, "{:?}", rows(report));
+}
 
 /// A `void f()`-returning callee and a `void v`-typed read both fold the
 /// `Void` static type; the binary LEFT operand is checked for every
@@ -42,36 +62,29 @@ fn ticket_3164_binary_left_invocation_anchors_method_name() {
     assert_eq!(diagnostic.range.length, 1, "{:?}", rows(&report));
 }
 
-/// A `void`-typed identifier operand anchors at its own expression span
-/// (error_detection_helpers.dart:254 `.at(expression)`), and the
-/// non-`MethodInvocation` arm covers reads of `void`-typed formals —
-/// `void v` declared by the function type's parameter. A send through
-/// the `void Function()` formal is a `FunctionExpressionInvocation` —
-/// its anchor is the whole `f()`, not the `f` name token.
+/// A `void`-typed local read as the binary LEFT operand anchors at its own
+/// expression span (error_detection_helpers.dart:254 `.at(expression)`) —
+/// `v` inside `v + 1`, length 1. The declaration `var v = f()` reports
+/// nothing: the local's type is inferred from the initializer, so the
+/// write type is `void` and `checkForAssignableExpressionAtType`'s
+/// `expectedStaticType is! VoidType` gate
+/// (variable_declaration_resolver.dart:104 →
+/// error_detection_helpers.dart:107) skips the void use. The 3.13.7
+/// oracle answers that single row beside
+/// `main_first_positional_parameter_type` (the `void Function()` formal)
+/// and `unchecked_use_of_nullable_value` (the `+` on a `void` receiver).
 #[test]
 fn ticket_3164_binary_left_identifier_anchors_expression() {
-    let fixture =
-        "void main(void Function() f) {\n  var v = f();\n  v + 1;\n}";
+    let fixture = "void main(void Function() f) {\n  var v = f();\n  v + 1;\n}";
     let report = report_ops(fixture);
-    let names = code_names(&report);
-    assert!(
-        names.iter().all(|name| *name == "use_of_void_result"),
-        "{:?}",
-        rows(&report)
+    assert_void_rows(
+        &report,
+        &[(fixture.find("v + 1").unwrap(), 1)],
+        &[
+            "main_first_positional_parameter_type",
+            "unchecked_use_of_nullable_value",
+        ],
     );
-    assert_eq!(names.len(), 2, "{:?}", rows(&report));
-    for diagnostic in &report.diagnostics {
-        assert_eq!(diagnostic.message, VOID_MSG);
-    }
-    // `f()` inside `var v = f()` anchors at the whole send (a
-    // `FunctionExpressionInvocation`'s `.at(expression)`); `v` inside
-    // `v + 1` anchors at the `v` read itself.
-    let prelude = crate::diagnose::test_rig::CORE_PRELUDE.len();
-    let f_at = prelude + fixture.find("f()").unwrap();
-    let v_at = prelude + fixture.find("v + 1").unwrap();
-    assert_eq!(report.diagnostics[0].range.offset as usize, f_at, "{:?}", rows(&report));
-    assert_eq!(report.diagnostics[0].range.length, 3, "{:?}", rows(&report));
-    assert_eq!(report.diagnostics[1].range.offset as usize, v_at, "{:?}", rows(&report));
 }
 
 /// `&&`/`||` check the RIGHT operand too (error_verifier.dart:469-470 —
@@ -151,27 +164,24 @@ fn ticket_3164_null_assert_operand_anchors_whole_bang_expression() {
 }
 
 /// A `void` identifier under `!` fires the same way — the `x!` whole
-/// span, not the bare `x`.
+/// span, not the bare `x`. `var v = f()` reports nothing (its inferred
+/// `void` write type gates the void use off, as in the binary-left pin
+/// above). The 3.13.7 oracle answers that single row beside
+/// `main_first_positional_parameter_type` and an `unused_local_variable`
+/// on `v`.
 #[test]
 fn ticket_3164_null_assert_identifier_anchors_bang_span() {
-    let fixture =
-        "void main(void Function() f) {\n  var v = f();\n  v!;\n}";
+    let fixture = "void main(void Function() f) {\n  var v = f();\n  v!;\n}";
     let report = report_ops(fixture);
-    let names = code_names(&report);
-    assert!(
-        names.iter().all(|name| *name == "use_of_void_result"),
-        "{:?}",
-        rows(&report)
-    );
-    assert_eq!(names.len(), 2, "{:?}", rows(&report));
     // `v!` — operand `v` plus `!`, length 2.
-    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v!").unwrap();
-    assert_eq!(
-        report.diagnostics[1].range.offset as usize, offset,
-        "{:?}",
-        rows(&report)
+    assert_void_rows(
+        &report,
+        &[(fixture.find("v!").unwrap(), 2)],
+        &[
+            "main_first_positional_parameter_type",
+            "unused_local_variable",
+        ],
     );
-    assert_eq!(report.diagnostics[1].range.length, 2, "{:?}", rows(&report));
 }
 
 /// Statement conditions consume the operand's value —

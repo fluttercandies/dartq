@@ -1558,6 +1558,47 @@ pub enum SemanticCode {
     /// (`ambiguous_set_or_map_literal_both`, diagnostic.g.dart:414; the
     /// same `_inferSetOrMapLiteralType` decision).
     AmbiguousSetOrMapLiteralBoth,
+    /// `The element type '{0}' can't be assigned to the set type '{1}'.`
+    /// — a set literal element whose static type is not assignable to the
+    /// set's element type (`set_element_type_not_assignable`,
+    /// diagnostic.g.dart; literal_element_verifier.dart `_verifyElement`'s
+    /// set arm). The nullability twin shares the name and the message (the
+    /// `uniqueName` split) — one variant covers both faces.
+    SetElementTypeNotAssignable,
+    /// `Spread elements in list or set literals must implement
+    /// 'Iterable'.` — a `...expr` element in a list or set literal whose
+    /// operand's static type has no `Iterable` face
+    /// (`not_iterable_spread`, diagnostic.g.dart;
+    /// literal_element_verifier.dart `_verifySpreadForListOrSet`).
+    NotIterableSpread,
+    /// `Spread elements in map literals must implement 'Map'.` — a
+    /// `...expr` element in a map literal whose operand's static type has
+    /// no `Map` face (`not_map_spread`, diagnostic.g.dart;
+    /// literal_element_verifier.dart `_verifySpreadForMap`).
+    NotMapSpread,
+    /// `The Null-typed expression can't be used with a non-null-aware
+    /// spread.` — a `...expr` element whose operand's static type is
+    /// `Null` (a null-aware `...?` spread is legal and stays silent)
+    /// (`not_null_aware_null_spread`, diagnostic.g.dart;
+    /// literal_element_verifier.dart `_verifySpreadForListOrSet` /
+    /// `_verifySpreadForMap`).
+    NotNullAwareNullSpread,
+    /// `A list or a set is expected in this spread.` — a `const` list or
+    /// set literal's `...expr` element whose operand is not a constant
+    /// list or set (`const_spread_expected_list_or_set`,
+    /// diagnostic.g.dart; constant_verifier.dart `_validateListOrSetSpread`).
+    ConstSpreadExpectedListOrSet,
+    /// `A map is expected in this spread.` — a `const` map literal's
+    /// `...expr` element whose operand is not a constant map
+    /// (`const_spread_expected_map`, diagnostic.g.dart;
+    /// constant_verifier.dart `_validateMapSpread`).
+    ConstSpreadExpectedMap,
+    /// `Expressions can't be used in a map literal.` — a non-entry
+    /// expression element in a map literal (a bare expression, not a
+    /// `key: value` entry, not a spread, not a control-flow element)
+    /// (`expression_in_map`, diagnostic.g.dart;
+    /// literal_element_verifier.dart `_verifyElement`'s map arm).
+    ExpressionInMap,
     // —— The `dart:ffi` verifier family (`ffi_verifier.dart`) ————————————
     /// `Classes extending 'AbiSpecificInteger' must have exactly one const
     /// constructor, no other members, and no type parameters.` —
@@ -3043,6 +3084,26 @@ impl SemanticCode {
                 "ambiguous_set_or_map_literal_both",
                 "AMBIGUOUS_SET_OR_MAP_LITERAL_BOTH",
             ),
+            // The #3534 spread/collection-element family: nullability twins
+            // share the name and machine form (the `uniqueName` split) — the
+            // base variant covers both report faces.
+            Self::SetElementTypeNotAssignable => (
+                "set_element_type_not_assignable",
+                "SET_ELEMENT_TYPE_NOT_ASSIGNABLE",
+            ),
+            Self::NotIterableSpread => ("not_iterable_spread", "NOT_ITERABLE_SPREAD"),
+            Self::NotMapSpread => ("not_map_spread", "NOT_MAP_SPREAD"),
+            Self::NotNullAwareNullSpread => {
+                ("not_null_aware_null_spread", "NOT_NULL_AWARE_NULL_SPREAD")
+            }
+            Self::ConstSpreadExpectedListOrSet => (
+                "const_spread_expected_list_or_set",
+                "CONST_SPREAD_EXPECTED_LIST_OR_SET",
+            ),
+            Self::ConstSpreadExpectedMap => {
+                ("const_spread_expected_map", "CONST_SPREAD_EXPECTED_MAP")
+            }
+            Self::ExpressionInMap => ("expression_in_map", "EXPRESSION_IN_MAP"),
             // The #2993 whole-face-missing rows (both required-param
             // shapes print the shared analyzer name).
             Self::InvalidAnnotationTarget => {
@@ -4345,6 +4406,25 @@ impl SemanticCode {
             Self::AmbiguousSetOrMapLiteralBoth => {
                 "The literal can't be either a map or a set because it contains at least one literal map entry or a spread operator spreading a 'Map', and at least one element which is neither of these.".to_string()
             }
+            Self::SetElementTypeNotAssignable => {
+                format!("The element type '{a0}' can't be assigned to the set type '{a1}'.")
+            }
+            Self::NotIterableSpread => {
+                "Spread elements in list or set literals must implement 'Iterable'.".to_string()
+            }
+            Self::NotMapSpread => {
+                "Spread elements in map literals must implement 'Map'.".to_string()
+            }
+            Self::NotNullAwareNullSpread => {
+                "The Null-typed expression can't be used with a non-null-aware spread.".to_string()
+            }
+            Self::ConstSpreadExpectedListOrSet => {
+                "A list or a set is expected in this spread.".to_string()
+            }
+            Self::ConstSpreadExpectedMap => "A map is expected in this spread.".to_string(),
+            Self::ExpressionInMap => {
+                "Expressions can't be used in a map literal.".to_string()
+            }
             // The #2784 augmentation faces (messages.yaml, the
             // `augmentation*` block:1829-2014 — templates transcribed
             // verbatim; `a0`/`a1` carry the `_withArguments` order).
@@ -5201,6 +5281,11 @@ impl SemanticCode {
             Self::AmbiguousSetOrMapLiteralBoth => Some(
                 "Try removing or changing some of the elements so that all of the elements are consistent."
                     .to_string(),
+            ),
+            // The #3534 expression-in-map row's verbatim oracle
+            // correctionMessage (diagnostic.g.dart).
+            Self::ExpressionInMap => Some(
+                "Try removing the expression or converting it to be a map entry.".to_string(),
             ),
             // `{a2}` is the closest valid double, printed as an exact
             // integer (the oracle's `BigInt.from(nearestValidDouble)`
@@ -6549,6 +6634,16 @@ mod tests {
             | SemanticCode::YieldEachOfInvalidType
             | SemanticCode::AmbiguousSetOrMapLiteralEither
             | SemanticCode::AmbiguousSetOrMapLiteralBoth
+            // The #3534 spread/collection-element rows: none
+            // registry-backed (the dartq-diagnostics table predates them;
+            // the inline `message` arms are the sole template source).
+            | SemanticCode::SetElementTypeNotAssignable
+            | SemanticCode::NotIterableSpread
+            | SemanticCode::NotMapSpread
+            | SemanticCode::NotNullAwareNullSpread
+            | SemanticCode::ConstSpreadExpectedListOrSet
+            | SemanticCode::ConstSpreadExpectedMap
+            | SemanticCode::ExpressionInMap
             | SemanticCode::AbiSpecificIntegerInvalid
             | SemanticCode::AbiSpecificIntegerMappingExtra
             | SemanticCode::AbiSpecificIntegerMappingMissing
@@ -6865,6 +6960,13 @@ mod tests {
             SemanticCode::YieldEachOfInvalidType,
             SemanticCode::AmbiguousSetOrMapLiteralEither,
             SemanticCode::AmbiguousSetOrMapLiteralBoth,
+            SemanticCode::SetElementTypeNotAssignable,
+            SemanticCode::NotIterableSpread,
+            SemanticCode::NotMapSpread,
+            SemanticCode::NotNullAwareNullSpread,
+            SemanticCode::ConstSpreadExpectedListOrSet,
+            SemanticCode::ConstSpreadExpectedMap,
+            SemanticCode::ExpressionInMap,
             SemanticCode::AbiSpecificIntegerInvalid,
             SemanticCode::AbiSpecificIntegerMappingExtra,
             SemanticCode::AbiSpecificIntegerMappingMissing,

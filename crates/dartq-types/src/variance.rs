@@ -292,11 +292,6 @@ pub fn variance_in_type(
 /// time, so the walk already sees the expanded shape — including the
 /// recursion-recovery covariance the official `_visit` set falls back to
 /// (an unresolvable alias never reaches the walk at all).
-#[allow(
-    dead_code,
-    reason = "the semantic layer's alias-defaults pass (#3469) is the first \
-              caller; the crate root re-exports it when that wiring lands"
-)]
 #[must_use]
 pub fn typedef_parameter_variances(
     table: &TypeTable,

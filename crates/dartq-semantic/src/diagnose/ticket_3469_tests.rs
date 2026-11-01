@@ -70,18 +70,15 @@ fn alias_parameter_defaults_ground_by_typedef_variance() {
 /// 'A<dynamic>' of the type parameter 'T'. - type_argument_not_matching_bounds`
 /// (1 row, at the written annotation).
 ///
-/// Ignored: the annotation/creation faces read the *written* bound tree a
-/// container capture hands out, so a raw generic alias head reaches the
-/// subtype question unexpanded — the expanded-tree accessor is #3510, and
-/// this body is its live specification.
+/// Live since #3510: the annotation face judges the snapshot-expanded
+/// bound and renders the written alias decoration.
 #[test]
-#[ignore = "raw generic alias-headed bounds need the expanded-tree accessor — #3510"]
 fn bare_class_shaped_alias_bound_decides_the_annotation() {
     let report = report_ops(
         "class C<X, Y> {}\n\
          typedef A<X> = C<X, X>;\n\
          class E<T extends A> {}\n\
-         void f(E<int> e) { print(e); }\n",
+         void f(E<int> e) {}\n",
     );
     assert_eq!(
         code_names(&report),
@@ -98,10 +95,9 @@ fn bare_class_shaped_alias_bound_decides_the_annotation() {
 /// (the creation), both `'int' doesn't conform to the bound 'A<dynamic>' of
 /// the type parameter 'T'. - type_argument_not_matching_bounds`.
 ///
-/// Ignored with its annotation twin above: the same written-tree handoff is
-/// what the creation face reads, and #3510 owns the fix.
+/// Live since #3510, with its annotation twin above: the creation face
+/// reads the same split (judged expansion, written message).
 #[test]
-#[ignore = "raw generic alias-headed bounds need the expanded-tree accessor — #3510"]
 fn bare_class_shaped_alias_bound_decides_the_creation() {
     let report = report_ops(
         "class C<X, Y> {}\n\

@@ -2954,6 +2954,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Some(name) = name {
                     engine.push_bare(name, token.range);
                     engine.const_capture.identifier(name, token.range);
+                    // #3419 — a bare read inside an implicit-formals
+                    // anonymous-method body that the scope resolved onto
+                    // the enclosing container's member map is an implicit
+                    // `this.` on the RECEIVER, not the container's member:
+                    // the row rewrites to a pass-2 miss and the
+                    // enclosing-`this` staging below stands down (the
+                    // receiver's own face is staged at pass 2).
+                    let anon_rewritten = engine.rewrite_anon_bare_row(name, token.range);
                     // The implicit-this member read's declared face (the
                     // #2292 `this`-stage sibling): a bare identifier the
                     // scope cannot answer may resolve to an instance
@@ -2966,7 +2974,9 @@ impl ParserListener for DiagnoseListener<'_> {
                     // scope resolution answers first. Only the spellable
                     // named shapes ride (the same gate the `this` stage
                     // applies); anything else keeps the unknown face.
-                    if let Some((container, kind)) = engine.container_context() {
+                    if let Some((container, kind)) = engine.container_context()
+                        && !anon_rewritten
+                    {
                         let mut face =
                             engine.accessor_face_for(&Receiver::This { container, kind }, name);
                         // A member the enclosing class declares itself reads
@@ -4639,6 +4649,73 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— receivers and selectors ——————————————————————————————————————
 
     fn handle_this_expression(&mut self, token: Token, context: IdentifierContext) {
+        // #3419 — `this` inside an implicit-formals anonymous-method body
+        // (`x.{ ... }` / `x.=> e`) IS the receiver: `_thisType` wraps the
+        // body and the `ThisContext.instanceMemberBody` guard makes the
+        // keyword legal in every enclosing context (resolver.dart
+        // :2031-2046, error_verifier.dart:400-406 — a static, top-level or
+        // initializer context still binds the receiver). The keyword
+        // receiver push is bypassed whole — no enclosing-container row, no
+        // `invalid_reference_to_this` — and the receiver row classifies
+        // typed only on the promotion-free literal faces (a declared face
+        // may be stale against a flow promotion, and a member row frozen
+        // with a stale `Typed` receiver never re-decides in pass 2); the
+        // pass-2 walk re-derives every other face from the read-type row
+        // `stage_anon_method_bodies` joins at the keyword's span.
+        if let Some(entry) = self
+            .engine
+            .anon_method_body_at(token.range.offset)
+            .filter(|entry| entry.parens.is_none())
+        {
+            let this_ty = self.engine.anon_this_ty(entry);
+            let literal_ty = self.engine.anon_receiver_literal_ty(entry);
+            // The flow side's staged channel (#2292's sibling): the same
+            // offset-keyed adoption `Ev::This` reads.
+            if let Some(Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            }) = this_ty
+            {
+                let lexeme = self.engine.strings.resolve(name).to_string();
+                let base = self.flow().intern_name(&lexeme);
+                self.flow().stage_this_type(
+                    token.range.offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable,
+                    },
+                );
+            }
+            self.flow().handle_this_expression(token, context);
+            let engine = &mut self.engine;
+            // The query face's `this` publication (#1869-2): the reference
+            // row binds the keyword; the receiver's face answers `type_of`.
+            engine.refs.push(UnitRef {
+                range: token.range,
+                name: engine.intern("this"),
+                target: RefTarget::This,
+            });
+            if let Some(ty) = this_ty {
+                engine.query_type_rows.push((token.range, ty));
+            }
+            let recv = match literal_ty {
+                Some(ty @ Ty::Named { name, .. }) => Receiver::Typed { type_name: name, ty },
+                _ => Receiver::Unknown,
+            };
+            engine.push_row(Row {
+                name: engine.intern(""),
+                range: token.range,
+                qualified: false,
+                shape: RowShape::Receiver(recv),
+                intent: Intent::Read,
+                write_op: None,
+                ty: Ty::UNKNOWN,
+            });
+            engine.const_capture.this_or_super(token.range);
+            return;
+        }
+
         // The static type of `this` rides the flow layer's staged side
         // channel (#2292): the same answer `push_keyword_receiver` reads —
         // `this_static_ty` over the enclosing container, an extension's
@@ -6842,6 +6919,13 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.ur_seal_used();
         engine.nsm_return_closed(has_expression, end);
         let mark = engine.return_mark.take();
+        // #3419 — a return directly inside an anonymous-method block body
+        // answers to the body's own inferred return type upstream, never
+        // the enclosing executable: both the enclosing check and the
+        // enclosing closure-return attribution stand down.
+        if engine.anon_body_owns_return(begin.range.offset) {
+            return;
+        }
         if !has_expression {
             // Bare `return;` is a `void` expression in the oracle's matrix.
             engine.check_return(Ty::Void, end.range, false);
@@ -9233,6 +9317,10 @@ impl ParserListener for DiagnoseListener<'_> {
                 // at the enclosing site).
                 let failed =
                     engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
+                // The const spread-shape face: a `...expr` operand that
+                // evaluates to a non-list/set value reports
+                // `const_spread_expected_list_or_set`.
+                engine.check_const_spread_shapes(left, right, &elements, false);
                 let payload = engine
                     .literal_payload(&elements)
                     .map(|values| ConstantValue::List(values.into()));
@@ -9257,6 +9345,11 @@ impl ParserListener for DiagnoseListener<'_> {
         });
         engine.check_collection_void_elements(left, right, element, None, None);
         engine.check_list_literal_elements(left, right);
+        // The spread-element verifier (`_verifySpreadForListOrSet`): each
+        // `...`-led leaf's operand answers the iterable-compatibility and
+        // element-assignability asks against the list's declared or
+        // inferred element type.
+        engine.check_spread_elements(left, right, SpreadLiteralKind::List);
         // The literal folds to one expression node upstream: its element
         // rows belong to the node, not the stack — drain them into the
         // deferred pass-2 queue exactly like the send fold does, so the
@@ -9426,12 +9519,49 @@ impl ParserListener for DiagnoseListener<'_> {
                                 failed = failed.or(at);
                             }
                         }
+                        // The const spread-shape face: a `...expr`
+                        // operand that evaluates to a non-map value
+                        // reports `const_spread_expected_map`. The staged
+                        // entries carry no non-Entry operand (the
+                        // map-resolved split dropped them), so the
+                        // row-level fallback answers the shape ask.
+                        engine.check_const_spread_shapes(left, right, &[], true);
                         let payload = engine.map_payload(&entries);
                         engine.push_literal_value(failed, right.range, InstanceKind::Map, payload);
                     }
                     SetOrMap::Set(elements) => {
-                        let failed = engine
-                            .check_const_elements(SemanticCode::NonConstantSetElement, &elements);
+                        // The literal's own resolution decides the element
+                        // code: a `:`-led entry anywhere in the leaves
+                        // makes the literal a map upstream, so a
+                        // non-Entry element (a bare expression, a spread)
+                        // reports `non_constant_map_element` instead of
+                        // `non_constant_set_element` — the parser's
+                        // `has_set_entry` only reflects the first simple
+                        // entry's colon, not the resolved kind.
+                        let has_entry = {
+                            let bytes = engine.source.as_bytes();
+                            let start = engine.byte_of(left.range.end());
+                            let end = engine.byte_of(right.range.offset);
+                            literal_comma_segments(bytes, start, end)
+                                .into_iter()
+                                .any(|(s, e)| {
+                                    let s = trim_trivia(bytes, s, e);
+                                    s < e && top_level_colon(bytes, s, e).is_some()
+                                })
+                        };
+                        let element_code = if has_entry {
+                            SemanticCode::NonConstantMapElement
+                        } else {
+                            SemanticCode::NonConstantSetElement
+                        };
+                        let failed =
+                            engine.check_const_elements(element_code, &elements);
+                        // The const spread-shape face: a `...expr` operand
+                        // that evaluates to a non-map value reports
+                        // `const_spread_expected_map`.
+                        engine.check_const_spread_shapes(
+                            left, right, &elements, has_entry,
+                        );
                         let payload = engine
                             .literal_payload(&elements)
                             .map(|values| ConstantValue::Set(values.into()));
@@ -9528,6 +9658,36 @@ impl ParserListener for DiagnoseListener<'_> {
             if let [k, v] = args.as_slice() {
                 engine.check_map_literal_entries(left, right, *k, *v);
             }
+            // The spread-element verifier (`_verifySpreadForListOrSet` /
+            // `_verifySpreadForMap`) and the `expression_in_map` face run
+            // on the live element rows before the drain below.
+            match args.len() {
+                1 => engine.check_spread_elements(left, right, SpreadLiteralKind::Set),
+                2 => {
+                    engine.check_spread_elements(left, right, SpreadLiteralKind::Map);
+                    engine.check_expression_in_map(left, right);
+                }
+                _ => {}
+            }
+            // The literal folds to one expression node upstream: its
+            // element rows belong to the node, not the stack — drain them
+            // into the deferred pass-2 queue exactly like the list
+            // literal's close does, so the enclosing single-row faces
+            // (`x = <int>{1}`'s `invalid_assignment`, `init_mark`'s
+            // `rows.len() == mark + 1` window) see the literal's own row
+            // alone. Element checks above already read their rows; the
+            // drained rows still owe their own reports through pass 2.
+            let literal_end = right.range.end();
+            let split = engine
+                .rows
+                .iter()
+                .position(|row| {
+                    row.range.offset > left.range.offset && row.range.end() <= literal_end
+                })
+                .unwrap_or(engine.rows.len());
+            for row in engine.rows.drain(split..) {
+                engine.deferred_miss_rows.push(row);
+            }
             engine.push_typed_value_row(range, ty);
             return;
         }
@@ -9557,6 +9717,19 @@ impl ParserListener for DiagnoseListener<'_> {
         // literal_element_verifier.dart).
         if let Some((k, v)) = engine.map_entry_context(left) {
             engine.check_map_literal_entries(left, right, k, v);
+        }
+        // The spread-element verifier and the `expression_in_map` face run
+        // on the resolved kind (upstream `literal_element_verifier.dart`
+        // `_verifyElement`'s dispatch).
+        match kind {
+            UntypedLiteral::SetElements => {
+                engine.check_spread_elements(left, right, SpreadLiteralKind::Set);
+            }
+            UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
+                engine.check_spread_elements(left, right, SpreadLiteralKind::Map);
+                engine.check_expression_in_map(left, right);
+            }
+            _ => {}
         }
         engine.push_value_row(right);
         // The row sits at the `}` — the is-check verdict anchors the
@@ -9817,11 +9990,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 // SDK source, pkg/analyzer/lib/src/dart/resolver/
                 // record_literal_resolver.dart:159 `.at(field)`). The field
                 // window drains below, so the reports happen while its rows
-                // still stand — one per `void` field, in source order. A
-                // NAMED field anchors on the `RecordLiteralNamedField` node
-                // (`name: value`): the named fields are the trailing
-                // `named.len()` field rows (positional fields precede
-                // them), the others anchor on the expression itself.
+                // still stand — one per `void` field, in source order. The
+                // anchor is the FIELD NODE's extent, never the value row's
+                // own token: a declared-method send's row spells only the
+                // callee name (`v` of `v()`), so the value widens through
+                // its completed send / member chain first. A NAMED field is
+                // a `RecordLiteralNamedField` (`name: value` — the trailing
+                // `named.len()` field rows, positional fields precede
+                // them), so its extent re-opens at the label.
                 let void_fields = positional.iter().filter(|ty| **ty == Ty::Void).count()
                     + named.iter().filter(|entry| entry.1 == Ty::Void).count();
                 if void_fields > 0 {
@@ -10827,6 +11003,44 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some(primary) = self.engine.name_of(name)
         {
             self.engine.primary_formals.insert(primary);
+        }
+        // #3419 — the explicit-formal receiver injection: the anonymous
+        // method's first plain required positional formal (no written
+        // annotation, no function-typed suffix — the collector's
+        // `first_param` latch) carries the RECEIVER's static type
+        // upstream (the element type is set before the body resolves,
+        // promoted to non-null under `?.`/`?..`). The engine-side bind
+        // rides the enclosing frame (the body opens none of its own);
+        // the flow side stages the same face on the formal's own token
+        // so the body's promotions see it — only the argument-less
+        // named shape stages (the flow lattice's spellability gate, the
+        // #2843 pattern).
+        if member_kind == dartq_parser::MemberKind::AnonymousMethod
+            && let Some(this_ty) = self
+                .engine
+                .anon_method_body_at(name.range.offset)
+                .filter(|entry| entry.first_param == Some(name.range))
+                .and_then(|entry| self.engine.anon_this_ty(entry))
+            && let Some(name_id) = self.engine.name_of(name)
+        {
+            self.engine.bind_var_type(name_id, this_ty);
+            if let Ty::Named {
+                name: ty_name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } = this_ty
+            {
+                let lexeme = self.engine.strings.resolve(ty_name).to_string();
+                let base = self.flow().intern_name(&lexeme);
+                self.flow().stage_inferred_local(
+                    name.range.offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable,
+                    },
+                    Vec::new(),
+                );
+            }
         }
         self.flow().end_formal_parameter(
             var_or_final,
@@ -13162,6 +13376,431 @@ impl Engine<'_> {
         ret.as_ref().map(|r| r.ty)
     }
 
+    /// The spread-element verifier's ladder over a literal's `...`-led
+    /// leaf segments (upstream `literal_element_verifier.dart`
+    /// `_verifySpreadForListOrSet` :238-335 and `_verifySpreadForMap`
+    /// :337-391). `kind` decides which ladder runs and which expected
+    /// types the element-assignability asks read: `List`/`Set` for
+    /// `asInstanceOf(Iterable)` → `not_iterable_spread` and
+    /// `set_element_type_not_assignable` (the list twin is already covered
+    /// by `check_list_literal_elements`'s own `...` arm), `Map` for
+    /// `asInstanceOf(Map)` → `not_map_spread` and
+    /// `map_key_type_not_assignable`/`map_value_type_not_assignable`.
+    ///
+    /// The operand's static type answers the ladder's asks: `Dynamic`
+    /// folds silently (the strict-casts tier is not modeled here),
+    /// `Never` is silent, `Null` fires `not_null_aware_null_spread` unless
+    /// the `...?` null-aware form wrote it, and a non-`Iterable`/`Map`
+    /// operand fires the iterability row. An `Iterable`/`Map` operand
+    /// then asks each element side's assignability against the literal's
+    /// declared or context-inferred type arguments.
+    fn check_spread_elements(&mut self, left: Token, right: Token, kind: SpreadLiteralKind) {
+        let bytes = self.source.as_bytes();
+        for (s, e) in self.literal_leaves(left, right) {
+            let s = trim_ws(bytes, s, e);
+            if !bytes[s..].starts_with(b"...") {
+                continue;
+            }
+            let null_aware = bytes.get(s + 3) == Some(&b'?');
+            let operand_start = trim_ws(
+                bytes,
+                s + 3 + usize::from(null_aware),
+                e,
+            );
+            if operand_start >= e {
+                continue;
+            }
+            let (s16, e16) = (self.utf16_of(operand_start), self.utf16_of(e));
+            let operand_range = SourceRange {
+                offset: s16,
+                length: e16 - s16,
+            };
+            let Some((operand_ty, _)) = self.leaf_completion_row(s16, e16) else {
+                continue;
+            };
+            let operand_ty = if operand_ty == Ty::UNKNOWN {
+                self.rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.range.offset >= s16 && row.range.end() <= e16)
+                    .map(|row| self.operand_static_ty(row))
+                    .unwrap_or(Ty::UNKNOWN)
+            } else {
+                operand_ty
+            };
+            // Dynamic folds silently (the strict-casts tier is not
+            // modeled); Never is silent (upstream `isSubtypeOf(exprType,
+            // Never)` → return).
+            if operand_ty == Ty::Dynamic || self.is_never_ty(operand_ty) {
+                continue;
+            }
+            // Subtype-of-`Null` (upstream `isSubtypeOf(expressionType,
+            // nullNone)`): `Null` itself and a parameter bound to `Null`
+            // (`X extends Null` — `param_bound` answers `Null`, whose own
+            // subtype ask closes true). `...?` admits the null side
+            // silently; `...` reports `not_null_aware_null_spread`.
+            if self.assignable(operand_ty, Ty::Null, false) == Some(true) {
+                if !null_aware {
+                    self.emit(
+                        SemanticCode::NotNullAwareNullSpread,
+                        operand_range,
+                        "",
+                        "",
+                    );
+                }
+                continue;
+            }
+            let Ty::Named {
+                name: head,
+                args,
+                nullable,
+            } = operand_ty
+            else {
+                // A function/record/void operand is never an Iterable or
+                // Map — the iterability row fires.
+                let code = match kind {
+                    SpreadLiteralKind::Map => SemanticCode::NotMapSpread,
+                    _ => SemanticCode::NotIterableSpread,
+                };
+                self.emit(code, operand_range, "", "");
+                continue;
+            };
+            if nullable {
+                // A nullable operand is never `Iterable`/`Map` — the
+                // iterability row fires (upstream `asInstanceOf` answers
+                // null for `S?` receiver types).
+                let code = match kind {
+                    SpreadLiteralKind::Map => SemanticCode::NotMapSpread,
+                    _ => SemanticCode::NotIterableSpread,
+                };
+                self.emit(code, operand_range, "", "");
+                continue;
+            }
+            match kind {
+                SpreadLiteralKind::List | SpreadLiteralKind::Set => {
+                    // `asInstanceOf(Iterable)` asks whether the operand's
+                    // head reaches `Iterable`/`List`/`Set` through its
+                    // declared superchain.
+                    if !self.head_reaches_iterable(head) {
+                        self.emit(
+                            SemanticCode::NotIterableSpread,
+                            operand_range,
+                            "",
+                            "",
+                        );
+                        continue;
+                    }
+                    // The element type asks assignability: the iterable's
+                    // first argument against the literal's declared or
+                    // inferred element type. The list-side check already
+                    // runs in `check_list_literal_elements` (its own
+                    // `...` arm), so only the set side's code fires here.
+                    if kind == SpreadLiteralKind::Set {
+                        let element_ty = {
+                            let pool = self.boundary.args.borrow();
+                            pool.get(args).first().copied().unwrap_or(Ty::UNKNOWN)
+                        };
+                        if element_ty != Ty::UNKNOWN
+                            && let Some(expected) =
+                                self.literal_set_or_map_element(left, right)
+                            && self.assignable(element_ty, expected, false) == Some(false)
+                        {
+                            let (a0, a1) =
+                                (self.ty_display(element_ty), self.ty_display(expected));
+                            self.emit(
+                                SemanticCode::SetElementTypeNotAssignable,
+                                operand_range,
+                                &a0,
+                                &a1,
+                            );
+                        }
+                    }
+                }
+                SpreadLiteralKind::Map => {
+                    // `asInstanceOf(Map)` asks whether the operand's head
+                    // reaches `Map`.
+                    if !self.head_reaches_map(head) {
+                        self.emit(SemanticCode::NotMapSpread, operand_range, "", "");
+                        continue;
+                    }
+                    // The key/value types ask assignability against the
+                    // literal's declared or context-inferred type
+                    // arguments (`_verifySpreadForMap`'s
+                    // `mapKeyType`/`mapValueType` gates).
+                    let map_args = self.boundary.pool().get(args).to_vec();
+                    if let [k, v] = map_args.as_slice() {
+                        let (expected_key, expected_value) =
+                            self.literal_map_key_value(left, right);
+                        if let Some(expected) = expected_key
+                            && self.assignable(*k, expected, false) == Some(false)
+                        {
+                            let (a0, a1) = (self.ty_display(*k), self.ty_display(expected));
+                            self.emit(
+                                SemanticCode::MapKeyTypeNotAssignable,
+                                operand_range,
+                                &a0,
+                                &a1,
+                            );
+                        }
+                        if let Some(expected) = expected_value
+                            && self.assignable(*v, expected, false) == Some(false)
+                        {
+                            let (a0, a1) = (self.ty_display(*v), self.ty_display(expected));
+                            self.emit(
+                                SemanticCode::MapValueTypeNotAssignable,
+                                operand_range,
+                                &a0,
+                                &a1,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the operand's declared head reaches `Iterable`/`List`/`Set`
+    /// through its superchain (`_verifySpreadForListOrSet`'s
+    /// `asInstanceOf(Iterable)` ask).
+    fn head_reaches_iterable(&self, head: StringId) -> bool {
+        let iterable_heads = [
+            self.collection_heads[3],
+            self.collection_heads[0],
+            self.collection_heads[1],
+        ];
+        if iterable_heads.contains(&head) {
+            return true;
+        }
+        self.head_reaches_family(head, &iterable_heads)
+    }
+
+    /// Whether the operand's declared head reaches `Map` through its
+    /// superchain (`_verifySpreadForMap`'s `asInstanceOf(Map)` ask).
+    fn head_reaches_map(&self, head: StringId) -> bool {
+        let map_head = self.collection_heads[2];
+        if head == map_head {
+            return true;
+        }
+        self.head_reaches_family(head, &[map_head])
+    }
+
+    /// The declared-superchain walk: `extends`/`with`/`implements` edges
+    /// from `resolve_container`, BFS to any target head.
+    fn head_reaches_family(&self, head: StringId, targets: &[StringId]) -> bool {
+        let mut queue: Vec<StringId> = vec![head];
+        let mut seen: FxHashSet<StringId> = FxHashSet::from_iter([head]);
+        while let Some(current) = queue.pop() {
+            let Some((decl, _)) = crate::library::resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                current,
+            ) else {
+                continue;
+            };
+            let supers = decl
+                .superclass
+                .into_iter()
+                .chain(decl.with_clause.iter().copied())
+                .chain(decl.implements_clause.iter().copied());
+            for next in supers {
+                if targets.contains(&next) {
+                    return true;
+                }
+                if seen.insert(next) {
+                    queue.push(next);
+                }
+            }
+        }
+        false
+    }
+
+    /// The literal's inferred or declared element type for the
+    /// set-element assignability ask: a typed `<E>{...}` reads `E` from
+    /// its own written group; an untyped `{...}` in a `Set<E>` context
+    /// reads `E` from `literal_context_ty`.
+    fn literal_set_or_map_element(&mut self, left: Token, right: Token) -> Option<Ty> {
+        let _ = right;
+        if let Some((_, Ty::Named { args, .. })) = self.typed_set_or_map_literal_ty(left)
+            && let Some(elem) = self.boundary.pool().get(args).first().copied()
+        {
+            return Some(elem);
+        }
+        if let Ty::Named { name, args, .. } = self.literal_context_ty(left)?
+            && name == self.collection_heads[1]
+            && let Some(elem) = self.boundary.pool().get(args).first().copied()
+        {
+            return Some(elem);
+        }
+        None
+    }
+
+    /// The literal's declared or context-inferred map key/value pair for
+    /// the spread map-side assignability asks: a typed `<K, V>{...}` reads
+    /// its own written arguments; an untyped `{...}` in a `Map<K, V>`
+    /// context reads the context's arguments.
+    fn literal_map_key_value(&mut self, left: Token, right: Token) -> (Option<Ty>, Option<Ty>) {
+        let _ = right;
+        if let Some((_, Ty::Named { args, .. })) = self.typed_set_or_map_literal_ty(left) {
+            let args = self.boundary.pool().get(args).to_vec();
+            if let [k, v] = args.as_slice() {
+                return (Some(*k), Some(*v));
+            }
+        }
+        if let Some(Ty::Named { name, args, .. }) = self.literal_context_ty(left)
+            && name == self.collection_heads[2]
+        {
+            let args = self.boundary.pool().get(args).to_vec();
+            if let [k, v] = args.as_slice() {
+                return (Some(*k), Some(*v));
+            }
+        }
+        (None, None)
+    }
+
+    /// The const spread-shape verifier (upstream `constant_verifier.dart`
+    /// `_validateListOrSetSpread` :1401-1417 and `_validateMapSpread`
+    /// :1561-1589): a `const` list/set literal's `...expr` operand must
+    /// evaluate to a constant list or set, a `const` map literal's to a
+    /// constant map. Elements whose evaluation fails already reported
+    /// through the site-default element code (`non_constant_*_element`);
+    /// a `Verdict::Value` of the wrong shape reports the const-spread
+    /// code at the operand's span. `Constant`/`Unresolved` verdicts are
+    /// silent (the oracle's unknown-value posture).
+    ///
+    /// When the staged `Node` list does not carry the operand (a
+    /// map-resolved `SetOrMap` drops non-Entry elements), the operand's
+    /// row-level static type answers the same shape ask: a `List`/`Set`/
+    /// `Iterable` head or a provably non-`Map` head reports, a `Map` or
+    /// unspellable head stays silent.
+    fn check_const_spread_shapes(
+        &mut self,
+        left: Token,
+        right: Token,
+        elements: &[crate::const_eval::Node],
+        map: bool,
+    ) {
+        let bytes = self.source.as_bytes();
+        for (s, e) in self.literal_leaves(left, right) {
+            let s = trim_ws(bytes, s, e);
+            if !bytes[s..].starts_with(b"...") {
+                continue;
+            }
+            let operand_start = trim_ws(
+                bytes,
+                s + 3 + usize::from(bytes.get(s + 3) == Some(&b'?')),
+                e,
+            );
+            if operand_start >= e {
+                continue;
+            }
+            let s16 = self.utf16_of(operand_start);
+            let node = elements.iter().find(|n| n.span.offset == s16);
+            match node {
+                Some(node) => {
+                    let verdict = eval(node, self);
+                    let code = match (&verdict, map) {
+                        (
+                            Verdict::Value(
+                                ConstantValue::List(_) | ConstantValue::Set(_),
+                            ),
+                            false,
+                        ) => continue,
+                        (Verdict::Value(ConstantValue::Map(_)), true) => continue,
+                        (Verdict::Value(_), false) => {
+                            SemanticCode::ConstSpreadExpectedListOrSet
+                        }
+                        (Verdict::Value(_), true) => SemanticCode::ConstSpreadExpectedMap,
+                        _ => continue,
+                    };
+                    self.emit(code, node.span, "", "");
+                }
+                None => {
+                    // The staged nodes do not carry this operand (a
+                    // map-resolved `SetOrMap` drops non-Entry elements):
+                    // the row's static type answers the shape ask.
+                    let e16 = self.utf16_of(e);
+                    let Some((ty, range)) = self
+                        .rows
+                        .iter()
+                        .rev()
+                        .find(|row| {
+                            row.range.offset >= s16
+                                && row.range.end() <= e16
+                                && !matches!(row.shape, RowShape::TypeUse(..))
+                        })
+                        .map(|row| (self.operand_static_ty(row), row.range))
+                    else {
+                        continue;
+                    };
+                    let code = if map {
+                        // A map literal's spread operand must be a Map.
+                        if matches!(ty, Ty::Named { name, .. } if name == self.collection_heads[2])
+                        {
+                            continue;
+                        }
+                        SemanticCode::ConstSpreadExpectedMap
+                    } else {
+                        // A list/set literal's spread operand must be a
+                        // List/Set/Iterable.
+                        let iterable_heads = [
+                            self.collection_heads[3],
+                            self.collection_heads[0],
+                            self.collection_heads[1],
+                        ];
+                        if matches!(ty, Ty::Named { name, .. } if iterable_heads.contains(&name)) {
+                            continue;
+                        }
+                        SemanticCode::ConstSpreadExpectedListOrSet
+                    };
+                    self.emit(code, range, "", "");
+                }
+            }
+        }
+    }
+
+    /// The `expression_in_map` face (upstream `literal_element_verifier.dart`
+    /// `_verifyElement`'s map arm :100/:135 — `ExpressionImpl` and
+    /// `NullAwareElement` in a map literal): a non-entry, non-spread,
+    /// non-control-flow leaf in a map-resolved literal reports. A
+    /// `key: value` entry, a `...`/`...?` spread, an `if`/`for` control
+    /// element, and a `?`-led null-aware element are all silent (their
+    /// own faces own them). The anchor is the leaf's own span.
+    fn check_expression_in_map(&mut self, left: Token, right: Token) {
+        let bytes = self.source.as_bytes();
+        for (s, e) in self.literal_leaves(left, right) {
+            let s = trim_ws(bytes, s, e);
+            if s >= e {
+                continue;
+            }
+            // A `...`/`...?` spread, an `if`/`for` control element, and a
+            // `?`-led null-aware element are not expressions — their own
+            // faces own them.
+            if bytes[s..].starts_with(b"...")
+                || bytes[s] == b'?'
+                || bytes[s..].starts_with(b"if")
+                || bytes[s..].starts_with(b"for")
+            {
+                continue;
+            }
+            // A map entry (`key: value`) is not an expression.
+            if top_level_colon(bytes, s, e).is_some() {
+                continue;
+            }
+            let (s16, e16) = (self.utf16_of(s), self.utf16_of(e));
+            self.emit_message_with_correction(
+                SemanticCode::ExpressionInMap,
+                SourceRange {
+                    offset: s16,
+                    length: e16 - s16,
+                },
+                SemanticCode::ExpressionInMap.message("", ""),
+            );
+        }
+    }
+
     /// The generator yield face
     /// (`yield_statement_resolver.dart` `_checkForYieldOfInvalidType`):
     /// `yield e` asks e's type of the declared sequence's element type;
@@ -13379,6 +14018,14 @@ impl Engine<'_> {
             self.emit(SemanticCode::UseOfVoidResult, anchor, "", "");
         }
     }
+}
+
+/// The literal kind a spread-element verification runs against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpreadLiteralKind {
+    List,
+    Set,
+    Map,
 }
 
 /// A leaf element's must-be side for the ambiguity decision.

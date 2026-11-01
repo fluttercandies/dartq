@@ -919,12 +919,20 @@ impl<'a> Boundary<'a> {
                     // the diagnosing pool.
                     return Ty::Dynamic;
                 };
-                let (type_params, type_params_named, return_ty, positional, named) = {
+                let (
+                    type_params,
+                    type_params_named,
+                    return_ty,
+                    required_positional,
+                    positional,
+                    named,
+                ) = {
                     let shape = foreign.function_shape(shape);
                     (
                         shape.type_params,
                         shape.type_params_named.to_vec(),
                         shape.return_ty,
+                        shape.required_positional,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
@@ -940,10 +948,12 @@ impl<'a> Boundary<'a> {
                 // pools verbatim when the source shape recorded it (the
                 // `function_generic` producer — the count-only `function`
                 // would strip the very names the generic tear-off's
-                // display spells); a count-only shape keeps its count.
+                // display spells); a count-only shape keeps its count. The
+                // required-positional split is identity, so it rides too.
                 if type_params_named.is_empty() {
-                    return self.args.borrow_mut().function(
+                    return self.args.borrow_mut().function_required(
                         type_params,
+                        required_positional,
                         return_ty,
                         &positional,
                         &named,
@@ -954,8 +964,9 @@ impl<'a> Boundary<'a> {
                     .into_iter()
                     .map(|(n, bound)| (n, bound.map(|b| self.ty(owner, b))))
                     .collect();
-                return self.args.borrow_mut().function_generic(
+                return self.args.borrow_mut().function_generic_required(
                     &type_params_named,
+                    required_positional,
                     return_ty,
                     &positional,
                     &named,
@@ -1145,13 +1156,21 @@ impl<'a> Boundary<'a> {
                 if shape == crate::model::FnShapeId::EMPTY {
                     return ty;
                 }
-                let (type_params, type_params_named, return_ty, positional, named) = {
+                let (
+                    type_params,
+                    type_params_named,
+                    return_ty,
+                    required_positional,
+                    positional,
+                    named,
+                ) = {
                     let pool = self.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
                         shape.type_params_named.to_vec(),
                         shape.return_ty,
+                        shape.required_positional,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
@@ -1184,19 +1203,24 @@ impl<'a> Boundary<'a> {
                 }
                 // The signature's `<T extends B>` group survives the
                 // canonicalization verbatim — a named shape re-interns
-                // through `function_generic`, a count-only one keeps its
-                // count (the generic tear-off's display reads the group).
+                // through `function_generic_required`, a count-only one
+                // keeps its count (the generic tear-off's display reads
+                // the group). The required-positional split is a
+                // positional-LAYOUT fact the leaf rewrite preserves, so it
+                // copies across onto the re-interned shape.
                 if new_type_params_named.is_empty() {
-                    return self.args.borrow_mut().function(
+                    return self.args.borrow_mut().function_required(
                         type_params,
+                        required_positional,
                         new_return_ty,
                         &new_positional,
                         &new_named,
                         nullable,
                     );
                 }
-                self.args.borrow_mut().function_generic(
+                self.args.borrow_mut().function_generic_required(
                     &new_type_params_named,
+                    required_positional,
                     new_return_ty,
                     &new_positional,
                     &new_named,
@@ -1308,7 +1332,11 @@ impl<'a> Boundary<'a> {
     /// Interns a substituted function shape into the diagnosing pool —
     /// the substitution's `Ty::Function` leg re-interns its parts through
     /// the same canonical pool every written shape lives in, so derived
-    /// equality on the substituted face stays structural.
+    /// equality on the substituted face stays structural. Every positional
+    /// formal reads required: a caller that holds the source shape's split
+    /// passes it through [`Self::intern_function_ty_required`], or the
+    /// substituted face would part ways with the very spelling it
+    /// substitutes.
     pub(crate) fn intern_function_ty(
         &self,
         type_params: u16,
@@ -1320,6 +1348,29 @@ impl<'a> Boundary<'a> {
         self.args
             .borrow_mut()
             .function(type_params, return_ty, positional, named, nullable)
+    }
+
+    /// [`Self::intern_function_ty`] with the source shape's
+    /// required-positional count — the split is identity, so a rebuild
+    /// that kept the columns but not the count would intern a different
+    /// shape.
+    pub(crate) fn intern_function_ty_required(
+        &self,
+        type_params: u16,
+        required_positional: u16,
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty)],
+        nullable: bool,
+    ) -> Ty {
+        self.args.borrow_mut().function_required(
+            type_params,
+            required_positional,
+            return_ty,
+            positional,
+            named,
+            nullable,
+        )
     }
 
     /// [`Self::intern_function_ty`] with the signature's own
@@ -6807,6 +6858,7 @@ mod boundary_projection {
             .borrow_mut()
             .intern_record(&[Ty::named(strings.intern("int"))], &[]);
         let function = boundary.args.borrow_mut().intern_function(
+            0,
             0,
             &[],
             Ty::named(strings.intern("int")),

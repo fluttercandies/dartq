@@ -22982,3 +22982,29 @@ mod ticket_3534_tests;
 #[cfg(test)]
 #[path = "ticket_3523_tests.rs"]
 mod ticket_3523_tests;
+
+// —— #3513 ——
+// `deprecated_member_use` across the package boundary: the #3501 recon's
+// "10 missing census rows" were a stale-binary artifact — the member-use
+// face has existed since #2910 (`best_practices_verifier.rs`) and went live
+// on real runs with #3321 (the dart:core tag test's hit arm); the 22:09
+// fresh-HEAD census passes every `function_subtype` case that carried one
+// of those rows. The pins lock the corpus shapes (dependency getter read as
+// a call argument in a non-package unit, the pkg_a/pkg_b path-dependency
+// variable read, the same-package silent control, the plain-tag shape, and
+// the directive + member faces' co-existence) under the engine graph
+// posture so the face cannot go silent again; no second member-use pass is
+// added beside the `dart:` directive face — that would double-report.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3513_tests.rs"]
+mod ticket_3513_tests;
+
+#[cfg(test)]
+#[path = "ticket_3557_tests.rs"]
+mod ticket_3557_tests;
+
+#[cfg(test)]
+#[path = "ticket_3419_tests.rs"]
+mod ticket_3419_tests;

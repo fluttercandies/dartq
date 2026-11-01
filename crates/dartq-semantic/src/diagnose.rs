@@ -693,6 +693,7 @@ pub(crate) fn subst_tree(tree: &TypeTree, map: &FxHashMap<StringId, TypeTree>) -
                 .iter()
                 .map(|(n, b)| (*n, b.as_ref().map(|t| subst_tree(t, map))))
                 .collect(),
+            required_positional: f.required_positional,
             positional: f.positional.iter().map(|p| subst_tree(p, map)).collect(),
             named: f
                 .named
@@ -7450,3 +7451,14 @@ mod ticket_3512_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3520_tests.rs"]
 mod ticket_3520_tests;
+
+/// The #3511 pins: the required-positional count is part of the interned
+/// function-type identity, so `int Function(int)` and `int Function([int])`
+/// never share an `FnShapeId`. The pins are one pool-level identity
+/// contract (equal spellings stay equal, the split separates) and the two
+/// oracle fixture pairs of `function_subtype` (a required operand against
+/// an optional target stays silent, an optional tail against a required
+/// target proves constant-true, a named-set mismatch stays silent).
+#[cfg(test)]
+#[path = "diagnose/ticket_3511_tests.rs"]
+mod ticket_3511_tests;

@@ -11,6 +11,14 @@ use dartq_source::byte_offset_to_utf16;
 #[path = "ticket_2931_tests.rs"]
 mod ticket_2931_tests;
 
+/// The #3510 pins (raw generic alias-headed bounds — the written/judged
+/// split of `check_call_type_arg_bounds`'s parameter rows and the
+/// snapshot-expanded bound the verdict reads). Registered the same
+/// `#[path]` way: the shared `tests` rig stays single-writer.
+#[cfg(test)]
+#[path = "ticket_3510_tests.rs"]
+mod ticket_3510_tests;
+
 /// The #2938 pins (the generic-send `couldNotInfer` face — the real
 /// constraint gather/choose/check pipeline over `foo<T>(args)` and the
 /// context-driven `F<args> = source` solve).
@@ -157,6 +165,36 @@ fn recv_head_ty(recv: &Receiver) -> Ty {
 enum SuperQuery {
     Positional(usize),
     Named(StringId),
+}
+
+/// One parameter row of a type-argument bounds verdict (#3510): the two
+/// faces one upstream `DartType` carries at once — the structural type the
+/// subtype test reads and the alias decoration `getDisplayString` prints
+/// (display_string_builder.dart:379-382). `written` is the bound as the
+/// capture spelled it, the MESSAGE face (`ty_display` fills a raw head to
+/// its instantiate-to-bounds form, so `T extends A` renders `'A<dynamic>'`
+/// — the oracle's decorated spelling); `judged` is the bound the verdict
+/// compares against, the snapshot-expanded shape
+/// ([`crate::bounds::Bounds::expanded_params`] — `C<dynamic, dynamic>`
+/// for that same `A`). An expanded shape never reaches a message, a
+/// written alias head never reaches the verdict. The two coincide for
+/// every bound that is already a type (an executable window, an element
+/// model `type_param_bounds` row): [`From`] builds that row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypeArgBound {
+    pub(crate) name: StringId,
+    pub(crate) written: Option<Ty>,
+    pub(crate) judged: Option<Ty>,
+}
+
+impl From<(StringId, Option<Ty>)> for TypeArgBound {
+    fn from((name, bound): (StringId, Option<Ty>)) -> Self {
+        Self {
+            name,
+            written: bound,
+            judged: bound,
+        }
+    }
 }
 
 impl<'a> Engine<'a> {
@@ -4757,8 +4795,13 @@ impl<'a> Engine<'a> {
         let positional: Vec<Ty> = sig.positional.to_vec();
         let named: Vec<(StringId, Ty)> =
             sig.named.iter().map(|(name, ty, _)| (*name, *ty)).collect();
-        self.boundary.args.borrow_mut().function_generic(
+        // The signature's own required-positional split rides the shape: it
+        // is part of the function-type identity, and a count-blind intern
+        // here would give the same spelling a second `FnShapeId` whenever
+        // another producer recorded the honest split.
+        self.boundary.args.borrow_mut().function_generic_required(
             &sig.params,
+            sig.required_positional,
             sig.return_ty,
             &positional,
             &named,
@@ -4849,8 +4892,9 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|(name, ty)| Some((*name, self.subst_params(*ty, map)?)))
                     .collect::<Option<Vec<_>>>()?;
-                Some(self.boundary.intern_function_ty(
+                Some(self.boundary.intern_function_ty_required(
                     pool_shape.type_params,
+                    pool_shape.required_positional,
                     return_ty,
                     &positional,
                     &named,
@@ -7051,6 +7095,159 @@ impl<'a> Engine<'a> {
         Some((params.into_boxed_slice(), seeds, declared))
     }
 
+    /// The extension-member send's bounds face (#3495) at the formals-less
+    /// seam: [`Self::check_arguments`] hands a send with no member formals
+    /// here, and a member only an applied EXTENSION declares is exactly
+    /// that shape. The written type-argument group checks against the
+    /// table [`Self::extension_member_bounds`] builds; a send that carries
+    /// no group, no resolved receiver, or no extension application is
+    /// silent (the under-report direction).
+    fn check_extension_member_type_arg_bounds(
+        &mut self,
+        callee: usize,
+        recv: Option<Receiver>,
+    ) {
+        let Some(recv) = recv else { return };
+        let Some(member) = self.rows.get(callee).map(|row| row.name) else {
+            return;
+        };
+        let Some(args) = self.call_args_for(callee) else {
+            return;
+        };
+        if let Some(params) = self.extension_member_bounds(&recv, member) {
+            self.check_call_type_arg_bounds(&params, &args);
+        }
+    }
+
+    /// The extension-member send's bounds table (#3495): a member the
+    /// receiver's container never declares lives on an APPLIED extension,
+    /// whose own parameter table [`Self::member_send_params`]'s container
+    /// walk cannot reach. Upstream checks the written type arguments
+    /// against the INSTANTIATED member type (`checkMethodInvocation` reads
+    /// `node.function.staticType`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/type_arguments_verifier.dart:236-240 +
+    /// :570-633): the extension's own parameters bind by the application
+    /// first — the `on` clause's argument positions against the receiver's
+    /// written arguments, a bare own-parameter `on T` wholesale — so
+    /// `R extends Exactly<T>` over an `int` receiver checks against
+    /// `Exactly<int>`. The application's verdict keeps the pool's
+    /// specificity (`Single`/`UnsafeSingle` resolve the member); an
+    /// ambiguous pool, several declarers of the spelling, and a binding
+    /// the substitution cannot spell all keep the under-report (`None`).
+    fn extension_member_bounds(
+        &mut self,
+        recv: &Receiver,
+        member: StringId,
+    ) -> Option<Box<[(StringId, Option<Ty>)]>> {
+        let (head, receiver_ty, receiver_nullable) = match *recv {
+            Receiver::Typed { type_name, ty } => {
+                (type_name, ty, self.potentially_nullable(ty))
+            }
+            // An extension body's `this`: the extended type is the
+            // receiver (`this.m<..>()` re-applies the face like any typed
+            // receiver).
+            Receiver::This { container, kind } => {
+                let ty = self.this_static_ty(container, kind);
+                let Ty::Named { name, .. } = ty else {
+                    return None;
+                };
+                (name, ty, self.potentially_nullable(ty))
+            }
+            _ => return None,
+        };
+        self.accessible_extension_faces();
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
+        let declarers: Vec<(&'a ExtensionFace, FileId)> = faces
+            .iter()
+            .filter(|(face, _)| {
+                face.members
+                    .get(&member)
+                    .is_some_and(|entry| entry.kind == MemberKind::Method)
+            })
+            .copied()
+            .collect();
+        // The oracle resolves ONE extension (`_chooseMostSpecific`); a
+        // pool where several faces spell the member decides by
+        // applicability, which this table cannot attribute — the
+        // under-report direction [`Self::extension_read_ty`] keeps.
+        if declarers.len() != 1 {
+            return None;
+        }
+        let (face, face_file) = declarers[0];
+        match self.extension_application(head, receiver_ty, member, false, receiver_nullable) {
+            ExtensionApp::Single | ExtensionApp::UnsafeSingle => {}
+            ExtensionApp::None | ExtensionApp::Ambiguous(_) => return None,
+        }
+        let entry = face.members.get(&member)?;
+        if entry.type_param_names.is_empty() {
+            return None;
+        }
+        // The extension's own parameters instantiate from the receiver: a
+        // bare own-parameter `on` head binds `T := receiver` wholesale
+        // (`extension StaticType<T> on T`), a generic `on` head binds its
+        // argument positions through the receiver's written arguments
+        // (`extension M<K, V> on Map<K, V>` — the same positional zip
+        // `extension_member_formals` takes). An `on` head the receiver
+        // does not spell (a subtype hop) leaves the map empty.
+        let mut bindings: Vec<(StringId, Ty)> = Vec::new();
+        if let Some(on_head) = face.on_type
+            && face.type_param_names.contains(&on_head)
+        {
+            bindings.push((on_head, receiver_ty));
+        } else if let (
+            Ty::Named {
+                name: on_head,
+                args: on_args,
+                ..
+            },
+            Ty::Named {
+                name: recv_head,
+                args: recv_args,
+                ..
+            },
+        ) = (self.boundary.ty(face_file, face.on_ty), receiver_ty)
+            && on_head == recv_head
+        {
+            let on_args = self.boundary.pool().get(on_args).to_vec();
+            let recv_args = self.boundary.pool().get(recv_args).to_vec();
+            if on_args.len() == recv_args.len() {
+                for (param, arg) in on_args.iter().zip(recv_args) {
+                    if let Ty::Named {
+                        name,
+                        args: ArgListId::EMPTY,
+                        ..
+                    } = param
+                        && face.type_param_names.contains(name)
+                    {
+                        bindings.push((*name, arg));
+                    }
+                }
+            }
+        }
+        let params: Vec<(StringId, Option<Ty>)> = entry
+            .type_param_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let bound = match entry.type_param_bounds.get(index).copied() {
+                    None | Some(Ty::Dynamic) | Some(Ty::Unknown) => None,
+                    // The face's payload interns in its declaring file's
+                    // pool — project before the substitution reads it.
+                    Some(bound) => {
+                        let bound = self.boundary.ty(face_file, bound);
+                        if bindings.is_empty() {
+                            Some(bound)
+                        } else {
+                            self.subst_params(bound, &bindings)
+                        }
+                    }
+                };
+                (*name, bound)
+            })
+            .collect();
+        Some(params.into_boxed_slice())
+    }
+
     /// #2831 P1 — the raw-constructor inference face: an unnamed creation
     /// (`A()`) with no explicit type arguments and no downward context (no
     /// enclosing argument list — an outer call flows its formal downward —
@@ -7153,20 +7350,28 @@ impl<'a> Engine<'a> {
     /// `<TFrom, TTo extends Iterable<TFrom>>` shapes). An arity mismatch
     /// truncates to the shared prefix (the count reports as
     /// `wrong_number_of_type_arguments`), and the report anchors at the
-    /// offending argument's own node (`typeArgumentList[i]`).
-    pub(crate) fn check_call_type_arg_bounds(
+    /// offending argument's own node (`typeArgumentList[i]`). Each row is
+    /// a [`TypeArgBound`] (#3510): the verdict compares the JUDGED bound,
+    /// the message renders the WRITTEN one — a `(name, bound)` pair is the
+    /// row whose two faces coincide.
+    pub(crate) fn check_call_type_arg_bounds<B: Copy + Into<TypeArgBound>>(
         &mut self,
-        params: &[(StringId, Option<Ty>)],
+        params: &[B],
         args: &CallTypeArgs,
     ) {
         let len = params.len().min(args.tys.len());
         let map: Vec<(StringId, Ty)> = params[..len]
             .iter()
             .zip(args.tys[..len].iter())
-            .map(|((param, _), ty)| (*param, *ty))
+            .map(|(row, ty)| ((*row).into().name, *ty))
             .collect();
         for index in 0..len {
-            let Some(bound) = params[index].1 else {
+            let TypeArgBound {
+                name,
+                written,
+                judged,
+            } = params[index].into();
+            let Some(judged) = judged else {
                 continue;
             };
             let arg = args.tys[index];
@@ -7174,18 +7379,26 @@ impl<'a> Engine<'a> {
             // upstream (the resolver substituted dynamic before this face
             // sees the types) and satisfies everything — deciding against
             // an unsolved spelling would over-fire.
-            if !self.call_type_arg_decidable(arg) || !self.call_type_arg_decidable(bound) {
+            if !self.call_type_arg_decidable(arg) || !self.call_type_arg_decidable(judged) {
                 continue;
             }
-            let Some(bound) = self.subst_params(bound, &map) else {
+            let Some(judged) = self.subst_params(judged, &map) else {
                 continue;
             };
-            if self.assignable(arg, bound, false) != Some(false) {
+            if self.assignable(arg, judged, false) != Some(false) {
                 continue;
             }
             let argument = self.ty_display(arg);
-            let parameter = self.strings.resolve(params[index].0).to_string();
-            let bound_text = self.ty_display(bound);
+            let parameter = self.strings.resolve(name).to_string();
+            // The message slot is the written bound, substituted the same
+            // way: the alias decoration the oracle prints (`'A<dynamic>'`)
+            // survives only there — the expanded shape decided, it never
+            // renders. A written face that fails to substitute falls back
+            // to the judged one (the pre-split reading).
+            let shown = written
+                .and_then(|written| self.subst_params(written, &map))
+                .unwrap_or(judged);
+            let bound_text = self.ty_display(shown);
             self.emit3(
                 SemanticCode::TypeArgumentNotMatchingBounds,
                 args.spans[index],
@@ -7210,6 +7423,40 @@ impl<'a> Engine<'a> {
             } => self.named_type_is_type(name),
             _ => true,
         }
+    }
+
+    /// The bounds-verdict rows of a captured head (#3510): the written
+    /// bounds ([`crate::bounds::Bounds::container_params`] /
+    /// [`crate::bounds::Bounds::alias_params`]) as the message face and the
+    /// snapshot-expanded bounds
+    /// ([`crate::bounds::Bounds::expanded_params`]) as the judged face,
+    /// zipped in declaration order. `None` when the head has no capture
+    /// (the caller's other parameter sources decide).
+    fn captured_type_arg_bounds(&self, head: StringId) -> Option<Vec<TypeArgBound>> {
+        let written = self
+            .bounds
+            .container_params(head)
+            .or_else(|| self.bounds.alias_params(head))?;
+        let expanded = self.bounds.expanded_params(self.strings, head);
+        let rows = written
+            .iter()
+            .enumerate()
+            .map(|(index, (name, bound, _))| {
+                let written = bound.as_ref().map(|tree| self.tree_ty(tree));
+                let judged = expanded
+                    .as_ref()
+                    .and_then(|rows| rows.get(index))
+                    .map_or(written, |(_, tree, _)| {
+                        tree.as_ref().map(|tree| self.tree_ty(tree))
+                    });
+                TypeArgBound {
+                    name: *name,
+                    written,
+                    judged,
+                }
+            })
+            .collect();
+        Some(rows)
     }
 
     /// #2869 — the creation bounds face at the formals seam: a send whose
@@ -7260,23 +7507,13 @@ impl<'a> Engine<'a> {
             }
             _ => self.bare_creation_head_name(row.range),
         };
-        let params = head_name.and_then(|name| {
-            self.bounds
-                .container_params(name)
-                .or_else(|| self.bounds.alias_params(name))
-                .map(|capture| {
-                    capture
-                        .iter()
-                        .map(|(param, bound, _)| {
-                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
-                        })
-                        .collect::<Vec<(StringId, Option<Ty>)>>()
-                })
-        });
-        let params = match params {
+        let params = head_name.and_then(|name| self.captured_type_arg_bounds(name));
+        let params: Vec<TypeArgBound> = match params {
             Some(params) => params,
             None => match self.exec_bounds.get(&row.name) {
-                Some(window) if !window.is_empty() => window.to_vec(),
+                Some(window) if !window.is_empty() => {
+                    window.iter().copied().map(TypeArgBound::from).collect()
+                }
                 // The generic function-literal invocation `(<T>() {})
                 // <String>()`: the callee row is the parenthesized
                 // literal's `Bare(Plain)`/`Value` — no declaring name, no
@@ -7297,7 +7534,10 @@ impl<'a> Engine<'a> {
                     Some(window) if !window.is_empty() => window
                         .iter()
                         .map(|(param, bound, _)| {
-                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                            TypeArgBound::from((
+                                *param,
+                                bound.as_ref().map(|tree| self.tree_ty(tree)),
+                            ))
                         })
                         .collect(),
                     _ => return,
@@ -7324,11 +7564,7 @@ impl<'a> Engine<'a> {
     /// declare no type parameters — the `_constructor` count face stays
     /// alone there.
     fn check_creation_ref_bounds(&mut self, class: StringId) {
-        let Some(params) = self
-            .bounds
-            .container_params(class)
-            .or_else(|| self.bounds.alias_params(class))
-        else {
+        let Some(params) = self.captured_type_arg_bounds(class) else {
             return;
         };
         let Some(capture) = self.call_args_capture.take() else {
@@ -7339,10 +7575,6 @@ impl<'a> Engine<'a> {
             tys: tys.into_boxed_slice(),
             spans: spans.into_boxed_slice(),
         };
-        let params: Vec<(StringId, Option<Ty>)> = params
-            .iter()
-            .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
-            .collect();
         self.check_call_type_arg_bounds(&params, &args);
     }
 
@@ -10989,6 +11221,21 @@ impl<'a> Engine<'a> {
                 .map(|sig| sig.formals(self.intern("")))
         });
         let Some(formals) = formals else {
+            // #3495 — the EXTENSION-member send's bounds face. A member the
+            // receiver's container never declares lives on an APPLIED
+            // extension: [`Self::member_formals_full`] walks the container
+            // only, so the send lands here with no formals — and with no
+            // `member_send_params` table either, which is why the written
+            // type arguments checked nothing. Upstream runs
+            // `_checkInvocationTypeArguments` over the INSTANTIATED member
+            // type (`checkMethodInvocation` reads
+            // `node.function.staticType`, upstream Dart SDK source,
+            // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
+            // :236-240 + :570-633): the extension's own parameters bind by
+            // the application first, the member's own by the written
+            // group, so `T expectStaticType<R extends Exactly<T>>()` over
+            // an `int` receiver reports against `Exactly<int>`.
+            self.check_extension_member_type_arg_bounds(callee, send_recv);
             return;
         };
         let Some(row) = self.rows.get(callee) else {
@@ -11170,27 +11417,32 @@ impl<'a> Engine<'a> {
         // DECLARED bounds the callee's own element carries, held apart
         // from `exec_params` (the inference seeds, whose `own_bound` arm
         // answers `None` outside its context-free corner by design). The
-        // `exec_bounds` window and every container/alias/signature arm
-        // below already spell `(name, declared bound)` — those clone
-        // straight in; the member/implicit-call arms fill it from their
+        // `exec_bounds` window and every signature arm below already
+        // spell `(name, declared bound)` — those convert straight in (the
+        // two faces of a [`TypeArgBound`] coincide for a bound that is
+        // already a type); the container/alias arms split the faces
+        // (#3510), and the member/implicit-call arms fill it from their
         // own declared facts.
-        let mut decl_bounds: Option<Box<[(StringId, Option<Ty>)]>> = exec_params.clone();
+        let mut decl_bounds: Option<Box<[TypeArgBound]>> = exec_params
+            .as_deref()
+            .map(|pairs| pairs.iter().copied().map(TypeArgBound::from).collect());
         // #1351: the creation faces' parameters come from the container's
         // bounds capture (its type parameters with their written bounds).
+        // The inference seeds keep the written face; the verdict table
+        // judges the snapshot-expanded one and renders the written one.
         if exec_params.is_none()
             && let Some(container) = creation_container
-            && let Some(params) = self.bounds.container_params(container)
-            && !params.is_empty()
+            && self
+                .bounds
+                .container_params(container)
+                .is_some_and(|params| !params.is_empty())
+            && let Some(rows) = self.captured_type_arg_bounds(container)
         {
-            let pairs: Vec<(StringId, Option<Ty>)> = params
-                .iter()
-                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
-                .collect();
             // The instance-creation verdict (`checkInstanceCreation`,
             // type_arguments_verifier.dart:236-240): `C<String>(x)` over
             // `C<T extends num>` — the class's own bounds.
-            decl_bounds = Some(pairs.iter().copied().collect());
-            exec_params = Some(pairs.into());
+            decl_bounds = Some(rows.iter().copied().collect());
+            exec_params = Some(rows.iter().map(|row| (row.name, row.written)).collect());
         }
         // The bounds capture registers at the container's close, so a
         // creation whose callee is declared LATER in the file (the
@@ -11214,15 +11466,12 @@ impl<'a> Engine<'a> {
         // the name-only shape — recovery residue is never a fact, the
         // same rule the executable windows capture by.
         if exec_params.is_none()
-            && let Some((params, _)) =
-                creation_container.and_then(|head| self.bounds.alias_named_shape(head))
+            && let Some(head) = creation_container
+            && self.bounds.alias_named_shape(head).is_some()
+            && let Some(rows) = self.captured_type_arg_bounds(head)
         {
-            let pairs: Vec<(StringId, Option<Ty>)> = params
-                .iter()
-                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
-                .collect();
-            decl_bounds = Some(pairs.iter().copied().collect());
-            exec_params = Some(pairs.into());
+            decl_bounds = Some(rows.iter().copied().collect());
+            exec_params = Some(rows.iter().map(|row| (row.name, row.written)).collect());
         }
         // The function-typed variable's written signature (the captured
         // `T Function<T>(T)` annotation): its declared type parameters
@@ -11236,7 +11485,7 @@ impl<'a> Engine<'a> {
             // The signature's `params` already pair the declared bounds —
             // `fnVar<String>(x)` over `T Function<T extends num>(T)` is
             // the function-expression-invocation verdict.
-            decl_bounds = Some(sig.params.iter().copied().collect());
+            decl_bounds = Some(sig.params.iter().copied().map(TypeArgBound::from).collect());
         }
         // A function-typed value invoked with explicit type arguments
         // (`fn<String>(x)` over `fn: T Function<T extends num>(T)`, or a
@@ -11257,7 +11506,7 @@ impl<'a> Engine<'a> {
                 .type_params_named
                 .clone();
             if !named.is_empty() {
-                decl_bounds = Some(named);
+                decl_bounds = Some(named.into_iter().map(TypeArgBound::from).collect());
             }
         }
         // The implicit-`call` face's parameters (the call method's own
@@ -11274,7 +11523,7 @@ impl<'a> Engine<'a> {
             // ExpressionInvocation`, upstream Dart SDK source,
             // pkg/analyzer/lib/src/error/type_arguments_verifier.dart
             // :193-196 — `c<int>()` resolves `call`'s own parameters).
-            decl_bounds = Some(params.iter().copied().collect());
+            decl_bounds = Some(params.iter().copied().map(TypeArgBound::from).collect());
         }
         // The member send's inference parameters (`reader.readEnum(...)`,
         // `this.adopt(...)`, `box.get()`): the found method's own
@@ -11296,7 +11545,7 @@ impl<'a> Engine<'a> {
             // String>(...)` checks `String` against the method's own
             // `T extends Enum` bound — the inference seeds' gated
             // `own_bound` never answers it.
-            decl_bounds = Some(bounds);
+            decl_bounds = Some(bounds.iter().copied().map(TypeArgBound::from).collect());
         }
         // The member send's bounds verdict never rides `exec_bounds`: a
         // same-spelled top-level `m<T>`'s window is not the method's
@@ -11307,7 +11556,7 @@ impl<'a> Engine<'a> {
         if let Some(recv) = send_recv
             && let Some((_, _, bounds)) = self.member_send_params(&recv, row.name)
         {
-            decl_bounds = Some(bounds);
+            decl_bounds = Some(bounds.iter().copied().map(TypeArgBound::from).collect());
         }
         // #2516 robustness: a same-file top-level generic callee whose
         // `exec_bounds` window never paired (the bounds capture can miss
@@ -11332,7 +11581,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .map(|name| (*name, None))
                 .collect();
-            decl_bounds = Some(params.iter().copied().collect());
+            decl_bounds = Some(params.iter().copied().map(TypeArgBound::from).collect());
             exec_params = Some(params.into());
         }
         // The count decisions. The parser's total is exact where the row
@@ -11495,7 +11744,7 @@ impl<'a> Engine<'a> {
         // seeds: an `own_bound`-gated `None` is not an absent bound, and
         // an inference-seeded bound is not the declared one.
         if let (Some(params), Some(args)) = (&decl_bounds, &explicit_args) {
-            self.check_call_type_arg_bounds(params, args);
+            self.check_call_type_arg_bounds(&params[..], args);
         }
         // #2890 — the super-send bounds face: `super.m<int>(...)` resolves
         // through the SUPERCLASS's member table, which neither
@@ -13910,17 +14159,8 @@ impl<'a> Engine<'a> {
                 if !row_qualified
                     && let Some(args) = &latched_args
                     && self.dot_follows_range_end(range)
-                    && let Some(params) = self
-                        .bounds
-                        .container_params(class_name)
-                        .or_else(|| self.bounds.alias_params(class_name))
+                    && let Some(params) = self.captured_type_arg_bounds(class_name)
                 {
-                    let params: Vec<(StringId, Option<Ty>)> = params
-                        .iter()
-                        .map(|(param, bound, _)| {
-                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
-                        })
-                        .collect();
                     self.check_call_type_arg_bounds(&params, args);
                 }
             }
@@ -14539,10 +14779,7 @@ impl<'a> Engine<'a> {
             // `self.bounds` immutably, so `call_args_capture.take()`'s
             // `&mut` must complete first.
             if let Some(capture) = self.call_args_capture.take()
-                && let Some(params) = self
-                    .bounds
-                    .container_params(head_id)
-                    .or_else(|| self.bounds.alias_params(head_id))
+                && let Some(params) = self.captured_type_arg_bounds(head_id)
             {
                 let (tys, spans): (Vec<Ty>, Vec<SourceRange>) =
                     capture.members.into_iter().unzip();
@@ -14550,12 +14787,6 @@ impl<'a> Engine<'a> {
                     tys: tys.into_boxed_slice(),
                     spans: spans.into_boxed_slice(),
                 };
-                let params: Vec<(StringId, Option<Ty>)> = params
-                    .iter()
-                    .map(|(param, bound, _)| {
-                        (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
-                    })
-                    .collect();
                 self.check_call_type_arg_bounds(&params, &args);
                 return;
             }

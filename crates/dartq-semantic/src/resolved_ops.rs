@@ -64,7 +64,8 @@ use dartq_types::{
     CoreDecls, NamedMember, ParamFacts, ParamFactsTable, RecordShapeId, TypeDeclId, TypeHierarchy,
     TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedRecord,
     UninternedType, Variance, instantiate_type_formals_to_bounds,
-    instantiate_type_formals_to_bounds_with,
+    instantiate_type_formals_to_bounds_directed, instantiate_type_formals_to_bounds_fixpoint,
+    typedef_parameter_variances,
 };
 
 use crate::bounds::TypeTree;
@@ -466,6 +467,14 @@ impl LibraryTypes {
             .get(&spelling)
             .filter(|_| self.type_param_scope.contains(&(file, spelling)))?;
         self.facts.get(*param).bound
+    }
+
+    /// Test-only face of [`Self::typedef_shapes`] — an alias's
+    /// instantiate-to-bound defaults in declaration order, the pin
+    /// accessor for the typedef-variance-seeded default-type face (#3523).
+    #[cfg(test)]
+    pub(crate) fn testing_typedef_defaults(&self, name: StringId) -> Option<Vec<TypeId>> {
+        self.typedef_shapes.get(&name).map(|shape| shape.defaults.to_vec())
     }
 
     /// Every function-signature binder inside `ty` with its facts bound —
@@ -1161,17 +1170,26 @@ impl LibraryTypes {
                 );
             }
         }
-        // —— the aliases' instantiate-to-bounds defaults ————————————————
-        // A raw alias use instantiates every parameter to its to-bounds
-        // default (`instantiateToBounds` over the resolved alias element,
-        // type_system.dart:719-731): `typedef G<X extends num> = X
-        // Function()` reads `num Function()`, and a self-referential bound
-        // resolves through the fixed point's SCC step to its substituted
-        // instantiation (`X extends FutureOr<X>` reads `FutureOr<dynamic>`),
-        // never by recursing on the bound. The alias's own bound trees ride
-        // the clause capture; they stay local to the shape instead of
-        // mutating `facts`, because an alias's parameters are name-keyed in
-        // this snapshot and shared with every same-spelled declaration. A
+        // —— the aliases' default-type instantiation ———————————————————
+        // A raw alias use instantiates every parameter to its `defaultType`
+        // (`instantiateTypeAliasToBounds` reads `_defaultTypeArguments`,
+        // type_system.dart:719-729/1822-1831) — the default-type face
+        // (`DefaultTypesBuilder._computeDefaultType`), not the to-bounds
+        // fixpoint the extension-specificity projection substitutes:
+        // `typedef G<X extends num> = X Function()` reads `num
+        // Function()`, and a self-referential bound resolves through the
+        // component rewrite to its substituted instantiation (`X extends
+        // FutureOr<X>` reads `FutureOr<dynamic>`), never by recursing on
+        // the bound. The rewrite seeds from each parameter's *typedef*
+        // variance — `VarianceBuilder` computes it from the aliased body
+        // (variance_builder.dart:153-225), so `typedef G<X extends A<X>,
+        // Y extends X> = Y Function(X)` stores `X` contravariant and
+        // grounds to `A<Never>` (the oracle's raw `G<A<Never>,
+        // A<Never>>`), where the class-side covariant seed would leave
+        // `A<dynamic>`. The alias's own bound trees ride the clause
+        // capture; they stay local to the shape instead of mutating
+        // `facts`, because an alias's parameters are name-keyed in this
+        // snapshot and shared with every same-spelled declaration. A
         // declaration the capture missed keeps the seeded `dynamic` face
         // (the under-report direction).
         {
@@ -1200,6 +1218,7 @@ impl LibraryTypes {
                     continue;
                 }
                 let params: Vec<TypeParamId> = shape.params.to_vec();
+                let body = shape.shape;
                 let scope: FxHashMap<StringId, TypeParamId> = decl
                     .type_param_names
                     .iter()
@@ -1228,12 +1247,38 @@ impl LibraryTypes {
                 if bounds.iter().all(Option::is_none) {
                     continue;
                 }
-                let defaults = instantiate_type_formals_to_bounds_with(&table, &params, |param| {
-                    params
-                        .iter()
-                        .position(|candidate| *candidate == param)
-                        .and_then(|at| bounds[at])
-                })
+                // The stored variance of a registered declaration's `i`-th
+                // parameter — the `parameter.variance` the official reads
+                // inside every interface argument position. This snapshot
+                // seeds every stored variance covariant, so the answer is
+                // the covariant default today; the lookup keeps the walk's
+                // contract (an unregistered head reads `None` → covariant,
+                // the under-report direction).
+                let argument_variance = |decl: TypeDeclId, at: usize| -> Option<Variance> {
+                    decl_params
+                        .get(&decl)
+                        .and_then(|owned| owned.get(at))
+                        .map(|&parameter| facts.get(parameter).variance)
+                };
+                let variances =
+                    typedef_parameter_variances(&table, &facts, &params, body, argument_variance);
+                let defaults = instantiate_type_formals_to_bounds_directed(
+                    &table,
+                    &params,
+                    |param| {
+                        params
+                            .iter()
+                            .position(|candidate| *candidate == param)
+                            .and_then(|at| bounds[at])
+                    },
+                    |param| {
+                        variances[params
+                            .iter()
+                            .position(|candidate| *candidate == param)
+                            .expect("the variance walk is asked only about input parameters")]
+                    },
+                    argument_variance,
+                )
                 .defaults;
                 // The mapping above reads the table (a bound may spell a
                 // sibling alias's shape), so the write takes its own
@@ -1504,15 +1549,16 @@ struct TypedefShape {
     /// zip the written arguments substitute against. Empty for a
     /// non-parameterized alias.
     params: Box<[TypeParamId]>,
-    /// Each parameter's instantiate-to-bounds default, parallel to
-    /// [`Self::params`] (`instantiateTypeFormalsToBounds`,
-    /// type_system.dart:719-731): a raw alias use instantiates every
-    /// parameter to this, and a self-referential bound resolves through
-    /// the fixed point's Phi substitution to its instantiated form
-    /// (`typedef G<X extends FutureOr<X>>` reads `FutureOr<dynamic>`)
-    /// instead of recursing. `dynamic` where the declaration's own bound
-    /// list did not reach this snapshot (the under-report face — the
-    /// unbounded default).
+    /// Each parameter's default-type instantiation, parallel to
+    /// [`Self::params`] (`instantiateTypeAliasToBounds` reads
+    /// `_defaultTypeArguments`, type_system.dart:719-729/1822-1831 — the
+    /// default-type face, its rewrite seeded by each parameter's typedef
+    /// variance): a raw alias use instantiates every parameter to this,
+    /// and a self-referential bound resolves through the component
+    /// rewrite to its substituted form (`typedef G<X extends
+    /// FutureOr<X>>` reads `FutureOr<dynamic>`) instead of recursing.
+    /// `dynamic` where the declaration's own bound list did not reach
+    /// this snapshot (the under-report face — the unbounded default).
     defaults: Box<[TypeId]>,
     /// Every function-type binder the flattened RHS minted, paired with
     /// its bound *in the alias template's own terms* (a bound naming an
@@ -1919,10 +1965,15 @@ impl Registry {
                 required: false,
             });
         }
-        // The whole positional list is the required count — the same
-        // normalization `flatten_rhs` applies to the written
-        // `Ty::Function` shapes, so both sides of an is-test normalize
-        // identically.
+        // The declaration's own required-positional split — each
+        // positional formal's captured `required` flag is the written
+        // boundary (`void f([int x])` is `void Function([int])`), so the
+        // resolved identity reads the same split the written
+        // `Ty::Function` shapes carry.
+        let required_positional = u32::try_from(
+            sig.formals.positional.iter().filter(|f| f.required).count(),
+        )
+        .unwrap_or(u32::MAX);
         table
             .intern_function(
                 UninternedFunction {
@@ -1930,8 +1981,7 @@ impl Registry {
                     type_parameters: Vec::new(),
                     positional,
                     named,
-                    required_positional: u32::try_from(sig.formals.positional.len())
-                        .unwrap_or(u32::MAX),
+                    required_positional,
                 },
                 false,
             )
@@ -2083,7 +2133,7 @@ impl Registry {
                     binders.push((id, bound));
                     type_parameters.push(id);
                 }
-                let required_positional = u32::try_from(positional.len()).unwrap_or(u32::MAX);
+                let required_positional = u32::from(shape.required_positional);
                 Some((
                     table
                         .intern_function(
@@ -3622,8 +3672,7 @@ impl<'a> ResolvedTypeOps<'a> {
                                 type_parameters: Vec::new(),
                                 positional,
                                 named,
-                                required_positional: u32::try_from(shape.positional.len())
-                                    .unwrap_or(u32::MAX),
+                                required_positional: u32::from(shape.required_positional),
                             },
                             nullable,
                         )
@@ -3916,22 +3965,25 @@ impl<'a> ResolvedTypeOps<'a> {
         self.param_id(name, self.file)
     }
 
-    /// Step-5's instantiate-to-bounds projection
-    /// (`extension_member_resolver.dart:459-466` `_instantiateToBounds`)
-    /// over a mapped `on` type: every bare face-parameter leaf is replaced
-    /// by that parameter's declared bound — an unbounded parameter by
-    /// `dynamic` (the Dart reading of unbounded), a written bound as the
-    /// FACE declares it (`face_params` carries each parameter's own mapped
-    /// bound: the snapshot's `type_params` registry is name-keyed, so two
-    /// faces spelling the same `DT` would otherwise share one
-    /// `ParamFacts.bound` — `BaseAggregate<DT extends Object>` and
+    /// Step 5's instantiate-to-bounds projection (`_instantiateToBounds`,
+    /// upstream Dart SDK source, pkg/analyzer resolver/
+    /// extension_member_resolver.dart:455-462) over a mapped `on` type:
+    /// the face's own parameters fill with the to-bounds face —
+    /// `instantiateTypeFormalsToBounds`
+    /// ([`instantiate_type_formals_to_bounds_fixpoint`]), never the
+    /// default-type face a raw type instantiates with (#3487: over one
+    /// bound list the faces split on a parameter inside a function-type
+    /// formal, on a cycle's dependent, and on an `X?` leaf). An unbounded
+    /// parameter reads `dynamic`; parameters the fixpoint leaves stuck
+    /// (a bound cycle and its dependents) read the `Phi` fill, `dynamic`.
+    /// `face_params` carries each parameter's own mapped bound — the
+    /// snapshot's `type_params` registry is name-keyed, so two faces
+    /// spelling the same `DT` would otherwise share one
+    /// `ParamFacts.bound`: `BaseAggregate<DT extends Object>` and
     /// `ArithmeticAggregates<DT extends num>` both `on Expression<DT>`
     /// must project to `Expression<Object>` and `Expression<num>`
-    /// respectively, never to one shared face). `T extends Comparable<T>`
-    /// substitutes as written, the residual parameter riding as the
-    /// unmodeled shape the subtype arm leaves unordered. `None` when
-    /// `on_ty` maps no structural face — the caller keeps the name-level
-    /// projection.
+    /// respectively, never to one shared face. `None` when `on_ty` maps
+    /// no structural face — the caller keeps the name-level projection.
     pub(crate) fn bounds_projection(
         &self,
         on_ty: Ty,
@@ -3942,18 +3994,14 @@ impl<'a> ResolvedTypeOps<'a> {
             return None;
         }
         let on = self.map_ty_strict(on_ty, pool)?;
-        let mut facts = ParamFactsTable::new();
-        for &(id, bound) in face_params {
-            facts.set(
-                id,
-                ParamFacts {
-                    variance: Variance::Covariant,
-                    bound,
-                },
-            );
-        }
         let ids: Vec<TypeParamId> = face_params.iter().map(|(id, _)| *id).collect();
-        let instantiation = instantiate_type_formals_to_bounds(&self.snapshot.table, &facts, &ids);
+        let instantiation =
+            instantiate_type_formals_to_bounds_fixpoint(&self.snapshot.table, &ids, |parameter| {
+                face_params
+                    .iter()
+                    .find(|(id, _)| *id == parameter)
+                    .and_then(|(_, bound)| *bound)
+            });
         let map: Vec<(TypeParamId, TypeId)> = ids
             .iter()
             .copied()

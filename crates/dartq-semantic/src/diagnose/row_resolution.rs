@@ -1277,6 +1277,11 @@ impl<'a> Engine<'a> {
         self.apply_deferred_invocation_faces();
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
+        // The anonymous-method bodies' receiver faces join the read-type
+        // table before the walk (#3419): the `this` keywords and injected
+        // formals inside them resolve members through the shared
+        // read-type leg from here on.
+        self.stage_anon_method_bodies();
         // The #2459 cascade-index target latches: a first-section `..[` fold
         // binds the cascade target row itself, and its push-time type is the
         // target's static type — the oracle resolves EVERY section's index
@@ -2789,6 +2794,65 @@ impl<'a> Engine<'a> {
                     self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
                     return;
                 }
+                // #3419 — the implicit-formals anonymous-method body's
+                // receiver: a bare miss inside `x.{ ... }` / `x.=> e`
+                // resolves against the RECEIVER's type first (upstream
+                // `ThisLookup` over `_thisType = parameterType`,
+                // resolver.dart:2031-2046; `InstanceScope.lookup`'s nulls
+                // make an enclosing-class instance member fall here too —
+                // the pushed row was rewritten to this arm at its
+                // identifier event). A hit claims the row through
+                // [`Self::member_defined`] (the member faces, the
+                // extension application, the nullable-dereference and
+                // setter-less-write verdicts all ride it); a miss keeps
+                // this arm's codes with `this` = the receiver's type —
+                // the invocation miss names it, the read miss stays
+                // `undefined_identifier`
+                // (`simple_identifier_resolver.dart:213-223` reports the
+                // name, never the type).
+                let (this_type, ext_invoke) = match self.anon_implicit_this(row.range.offset) {
+                    Some(Some(face @ Ty::Named { name: head, .. })) => {
+                        let recv = Receiver::Typed {
+                            type_name: head,
+                            ty: face,
+                        };
+                        let receiver_nullable = matches!(face, Ty::Named { nullable: true, .. });
+                        if self.member_defined(head, face, row, false, receiver_nullable) {
+                            if !self.self_scope_rows.contains(&row.range.offset) {
+                                self.used_names.insert(row.name);
+                            }
+                            if matches!(row.intent, Intent::Read | Intent::ReadWrite)
+                                || matches!(row.intent, Intent::Operator(..))
+                            {
+                                self.read_names.insert(row.name);
+                                self.note_member_read(row.name, &recv);
+                            }
+                            // The resolved read's declared face feeds
+                            // chained receivers (`x.{ length + 1 }`'s
+                            // bare `length` row) through the shared
+                            // read-type leg.
+                            if !matches!(
+                                row.intent,
+                                Intent::Write | Intent::ReadWrite | Intent::Invoke
+                            ) && let Walk::Found(entry) = self.walk_members(head, row.name)
+                            {
+                                let member_ty = Self::member_result_ty(&entry);
+                                if member_ty != Ty::UNKNOWN {
+                                    self.stage_anon_read_type(row.range, member_ty);
+                                }
+                            }
+                            return;
+                        }
+                        (Some(head), None)
+                    }
+                    // An undecidable or shape receiver: the question is
+                    // silent (the under-report posture).
+                    Some(_) => {
+                        self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
+                        return;
+                    }
+                    None => (this_type, ext_invoke),
+                };
                 // The nullable implicit `this` (`extension on C?`): the
                 // `ThisLookup` arm reports the unchecked access at the name
                 // first; the lexical miss below still reports for a read
@@ -8109,14 +8173,16 @@ impl<'a> Engine<'a> {
         } else if self
             .record_extension_face(self.unwrapped_shape_ty(shape_ty, row), row.name)
             .is_some()
+            || self.function_extension_applies(row, shape_ty, receiver_nullable)
         {
             Some(row.name)
         } else {
             let setter = self.setter_spelling(row.name);
             if write
-                && self
+                && (self
                     .record_extension_face(self.unwrapped_shape_ty(shape_ty, row), setter)
                     .is_some()
+                    || self.function_extension_applies(row, shape_ty, receiver_nullable))
             {
                 Some(setter)
             } else {
@@ -8138,6 +8204,40 @@ impl<'a> Engine<'a> {
             self.credit_record_extension_use(shape_ty, spelling, row.range.offset);
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
+    /// The name-level half of [`Self::check_shape_receiver`]'s extension
+    /// consult (#3496): a FUNCTION-typed receiver names no container at
+    /// all, so [`Self::record_extension_face`]'s shape-vs-shape ask
+    /// (`on void Function()`, `on T Function(T)`) answers only the faces
+    /// that spell a function type. The oracle's `_lookupExtension` runs
+    /// against the receiver type ITSELF (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/type_property_resolver.dart
+    /// :229-232), and a function type subtypes the two named heads no
+    /// shape face spells — `Function` and `Object` — plus a bare
+    /// own-parameter `on T` whose bound admits it. The consult carries the
+    /// receiver's `Function` head into [`Self::extension_application`],
+    /// the same pair [`Self::check_core_type_member`] feeds the spelled
+    /// `Function` interface: `topLevelFunction.expectStaticType<..>()`
+    /// (the tear-off's static type is a function shape) reported
+    /// `undefined_method ... 'Function'` while the same call shaped as a
+    /// `Function` HEAD — a static tear-off — stayed silent.
+    fn function_extension_applies(
+        &mut self,
+        row: &Row,
+        shape_ty: Ty,
+        receiver_nullable: bool,
+    ) -> bool {
+        let shape_ty = self.unwrapped_shape_ty(shape_ty, row);
+        if !matches!(self.fold_alias_ty(shape_ty), Ty::Function { .. }) {
+            return false;
+        }
+        let head = self.intern("Function");
+        let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        matches!(
+            self.extension_application(head, shape_ty, row.name, write, receiver_nullable),
+            ExtensionApp::Single
+        )
     }
 
     /// `shape_ty` with the `?` flag stripped when the access `?.`-unwrapped
@@ -12264,27 +12364,154 @@ impl<'a> Engine<'a> {
             merge_source_ordered(std::mem::take(&mut self.report.diagnostics), rows);
     }
 
-    /// The receiver's static type at one captured invocation: the last
-    /// token before the punctuation carries the expression's type. Literal
-    /// receivers answer from the primitive face (the corpus's `1.()` /
-    /// `"".()` shapes); everything else re-derives through the shared
-    /// receiver walk (the flow read face, then the member-read chain — an
-    /// identifier or `a.b` receiver). A `)`-ended compound receiver finds
-    /// no read record and suppresses.
+    /// The receiver's static type at one captured invocation: the literal
+    /// legs first (the promotion-free primitive faces), then the
+    /// pass-1 row leg (the receiver's tail row — the last non-synthetic
+    /// row that closed before the punctuation; pass 2 drains `rows` into
+    /// its local walk, so the leg is inert there), then the shared
+    /// receiver walk over the last token's span (the flow read face, then
+    /// the member-read chain). A `)`-ended compound receiver finds no read
+    /// record in pass 1 and answers in pass 2 through the group face.
     fn anon_receiver_ty(&self, entry: &crate::model::AnonMethodInvocation) -> Option<Ty> {
-        let tokens = self.tokens.as_slice();
-        let at = tokens
-            .partition_point(|t| t.utf16_offset < entry.punctuation.offset)
-            .checked_sub(1)?;
-        let token = tokens.get(at)?;
-        let end = dartq_source::byte_offset_to_utf16(
-            self.source,
-            (token.byte_offset + token.byte_len) as usize,
-        );
-        let span = SourceRange {
-            offset: token.utf16_offset,
-            length: end.saturating_sub(token.utf16_offset),
+        if let Some(ty) = self.anon_receiver_literal_ty(entry) {
+            return Some(ty);
+        }
+        // The pass-1 row leg: the receiver's tail row carries the
+        // expression's push-time face (a declared local's type, a member's
+        // declared return, a creation's instantiated head). Body rows all
+        // start past the punctuation, so the last row closing before it
+        // is the receiver's own tail.
+        if let Some(row) = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.length > 0 && row.range.end() <= entry.punctuation.offset)
+        {
+            let ty = self.expression_row_ty(row);
+            if ty != Ty::UNKNOWN {
+                return Some(ty);
+            }
+        }
+        let span = self.anon_receiver_tail_span(entry)?;
+        if let Some(ty) = self.recv_expression_ty(span) {
+            return Some(ty);
+        }
+        self.anon_receiver_creation_ty(entry)
+    }
+
+    /// A creation receiver's face (#3419): `C().{ ... }` — the tail token
+    /// is the closer of the creation's argument group; walk back over the
+    /// balanced group (and a generic argument list or named-constructor
+    /// selector before it) to the head identifier and read the container
+    /// face, written type arguments reattached. Only a head that resolves
+    /// as a type qualifies — a call receiver (`f().{ ... }`) keeps the
+    /// undecidable posture (its face is the callee's return, a leg the
+    /// drained pass-1 rows own).
+    fn anon_receiver_creation_ty(
+        &self,
+        entry: &crate::model::AnonMethodInvocation,
+    ) -> Option<Ty> {
+        let token = self.anon_receiver_tail_token(entry)?;
+        if !matches!(
+            token.kind,
+            dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare
+        ) {
+            return None;
+        }
+        let bytes = self.source.as_bytes();
+        let is_ident_byte =
+            |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let mut at = token.byte_offset as usize;
+        // The matching opener, walking back over nested groups.
+        let mut depth = 0usize;
+        let opener = loop {
+            match bytes.get(at) {
+                Some(b')' | b']') => depth += 1,
+                Some(b'(' | b'[') => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        break at;
+                    }
+                }
+                _ if at == 0 => return None,
+                _ => {}
+            }
+            at = at.checked_sub(1)?;
         };
+        // Whitespace, then a generic argument list, then the head — or a
+        // named-constructor selector (`.` + identifier) under the head.
+        let mut cursor = opener;
+        let back = |cursor: &mut usize| {
+            while *cursor > 0 && bytes[*cursor - 1].is_ascii_whitespace() {
+                *cursor -= 1;
+            }
+        };
+        back(&mut cursor);
+        if cursor > 0 && bytes[cursor - 1] == b'>' {
+            cursor -= 1;
+            let mut generics = 0usize;
+            while cursor > 0 {
+                match bytes[cursor - 1] {
+                    b'>' => generics += 1,
+                    b'<' => {
+                        generics = generics.checked_sub(1)?;
+                        if generics == 0 {
+                            cursor -= 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                cursor -= 1;
+            }
+            back(&mut cursor);
+        }
+        // The identifier directly before the group: `C()`, `C<int>()`,
+        // or a named-constructor selector (`C.named()` — the class head
+        // sits before its `.`).
+        let mut head_end = cursor;
+        let mut head_start = cursor;
+        while head_start > 0 && is_ident_byte(bytes[head_start - 1]) {
+            head_start -= 1;
+        }
+        if head_start == head_end {
+            return None;
+        }
+        let mut probe = head_start;
+        back(&mut probe);
+        if probe > 0 && bytes[probe - 1] == b'.' {
+            head_end = probe - 1;
+            head_start = probe - 1;
+            while head_start > 0 && is_ident_byte(bytes[head_start - 1]) {
+                head_start -= 1;
+            }
+            if head_start == head_end {
+                return None;
+            }
+        }
+        let head = &self.source[head_start..head_end];
+        let name = self.intern(head);
+        if !matches!(self.type_resolution(name).0, TypeResolution::Type) {
+            return None;
+        }
+        let head_offset = dartq_source::byte_offset_to_utf16(self.source, head_start);
+        Some(
+            self.creation_row_ty(name, false, head_offset)
+                .unwrap_or(Ty::named(name)),
+        )
+    }
+
+    /// The promotion-free literal face of one captured receiver — the
+    /// primitive legs alone, shared by [`Self::anon_receiver_ty`] and the
+    /// pass-1 `this`-row classification (#3419: a declared face the row
+    /// leg derives may be stale against a flow promotion, and a member row
+    /// frozen at push time with a stale `Typed` receiver never re-decides
+    /// in pass 2, so only the literal faces may freeze).
+    pub(crate) fn anon_receiver_literal_ty(
+        &self,
+        entry: &crate::model::AnonMethodInvocation,
+    ) -> Option<Ty> {
+        let token = self.anon_receiver_tail_token(entry)?;
         match token.kind {
             dartq_scanner::TokenKind::Int => Some(Ty::named(self.members.primitive_ids[0])),
             dartq_scanner::TokenKind::Double => Some(Ty::named(self.members.primitive_ids[1])),
@@ -12294,7 +12521,277 @@ impl<'a> Engine<'a> {
             }
             dartq_scanner::TokenKind::String => Some(Ty::named(self.members.primitive_ids[4])),
             dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Null) => Some(Ty::Null),
-            _ => self.recv_expression_ty(span),
+            _ => None,
+        }
+    }
+
+    /// The last token before the punctuation (the receiver's tail token).
+    fn anon_receiver_tail_token(
+        &self,
+        entry: &crate::model::AnonMethodInvocation,
+    ) -> Option<&dartq_scanner::Token> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens
+            .partition_point(|t| t.utf16_offset < entry.punctuation.offset)
+            .checked_sub(1)?;
+        tokens.get(at)
+    }
+
+    /// The receiver tail token's span.
+    fn anon_receiver_tail_span(
+        &self,
+        entry: &crate::model::AnonMethodInvocation,
+    ) -> Option<SourceRange> {
+        let token = self.anon_receiver_tail_token(entry)?;
+        let end = dartq_source::byte_offset_to_utf16(
+            self.source,
+            (token.byte_offset + token.byte_len) as usize,
+        );
+        Some(SourceRange {
+            offset: token.utf16_offset,
+            length: end.saturating_sub(token.utf16_offset),
+        })
+    }
+
+    /// The innermost anonymous-method invocation whose body contains
+    /// `offset` (#3419): the body extent is `punctuation.end()..end`. The
+    /// capture seals innermost-first (nested members close inside out), so
+    /// the first entry containing the offset in slice order is the
+    /// innermost one.
+    pub(crate) fn anon_method_body_at(
+        &self,
+        offset: u32,
+    ) -> Option<&crate::model::AnonMethodInvocation> {
+        let elements = self.index.get(self.file)?;
+        elements
+            .anon_methods()
+            .iter()
+            .find(|entry| entry.punctuation.end() <= offset && offset < entry.end)
+    }
+
+    /// The `this`-binding face of an implicit-formals body (#3419): the
+    /// receiver's static type, promoted to non-null under `?.`/`?..`
+    /// (`resolver.dart:1977-1982` — `parameterType` wraps the body).
+    pub(crate) fn anon_this_ty(&self, entry: &crate::model::AnonMethodInvocation) -> Option<Ty> {
+        let recv = self.anon_receiver_ty(entry)?;
+        Some(if entry.null_aware {
+            Self::non_null_form(recv)
+        } else {
+            recv
+        })
+    }
+
+    /// The implicit-receiver binding at `offset` (#3419): `None` outside
+    /// an implicit-formals anonymous-method body; inside one, `Some(face)`
+    /// with the receiver's static type or `Some(None)` when undecidable
+    /// (the silent under-report posture — a shape or unresolvable receiver
+    /// never reaches the interface walk).
+    fn anon_implicit_this(&self, offset: u32) -> Option<Option<Ty>> {
+        let entry = self.anon_method_body_at(offset)?;
+        (entry.parens.is_none()).then(|| self.anon_this_ty(entry))
+    }
+
+    /// Rewrites a just-pushed bare row whose scope resolution landed on
+    /// the enclosing container's member map while inside an
+    /// implicit-formals anonymous-method body (#3419): upstream's
+    /// instance-scope lookup ends the lexical search at the enclosing
+    /// class-family element's own INSTANCE member and returns nulls —
+    /// the reference is an implicit `this.`, and `this` in the body is
+    /// the RECEIVER, so the row becomes a `Missing` the pass-2 override
+    /// re-resolves against the receiver's type. A STATIC member keeps
+    /// the lexical win (the same lookup returns the static element), an
+    /// `extension` body keeps every member (its scope resolves outright,
+    /// never the nulls rule), and every non-member face — a local, a
+    /// prefix, a top-level or imported name — keeps its resolution. The
+    /// push-time credits the enclosing member collected (the query type
+    /// row, the field-read join) retract with the rewrite.
+    pub(crate) fn rewrite_anon_bare_row(&mut self, name: StringId, range: SourceRange) -> bool {
+        match self.anon_method_body_at(range.offset) {
+            Some(entry) if entry.parens.is_none() => {}
+            _ => return false,
+        }
+        // Only the class-family containers carry the nulls rule (an
+        // extension's scope resolves its members outright).
+        let container = match self.refs.last().map(|r| r.target) {
+            Some(RefTarget::Member { container }) => container,
+            _ => return false,
+        };
+        if !self
+            .container_context()
+            .is_some_and(|(c, kind)| c == container && !matches!(kind, ContainerKind::Extension))
+        {
+            return false;
+        }
+        if !matches!(self.walk_members(container, name), Walk::Found(e) if !e.is_static) {
+            return false;
+        }
+        let in_exec = self.in_executable();
+        let Some(row) = self.rows.last_mut() else {
+            return false;
+        };
+        if row.range != range
+            || !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+        {
+            return false;
+        }
+        row.shape = RowShape::Bare(BareInfo::Missing {
+            this_type: None,
+            in_exec,
+            on_opaque: false,
+            ext_invoke: None,
+            ext_nullable_this: false,
+        });
+        row.ty = Ty::UNKNOWN;
+        if self
+            .query_type_rows
+            .last()
+            .is_some_and(|(last, _)| *last == range)
+        {
+            self.query_type_rows.pop();
+        }
+        self.field_read_rows.remove(&range.offset);
+        true
+    }
+
+    /// Whether the `return` at `offset` belongs directly to an
+    /// anonymous-method BLOCK body (#3419): upstream swaps the return
+    /// check's context to the body's own INFERRED return type (the
+    /// context swap in error_verifier.dart's block-body arm —
+    /// `fragment.returnType = parent.staticType`), which the body's own
+    /// returns can never violate by construction, so the enclosing
+    /// executable's checks stand down entirely. Only a DIRECT body
+    /// return qualifies: the body opens no executable frame of its own,
+    /// so the innermost executable is the ENCLOSING one exactly when it
+    /// opened before the send's receiver rows — a function literal
+    /// nested in the body opens its own frame after them and keeps its
+    /// own checks (and a nested anonymous body takes the return through
+    /// its own entry, the innermost match here).
+    pub(crate) fn anon_body_owns_return(&self, offset: u32) -> bool {
+        let Some(entry) = self.anon_method_body_at(offset) else {
+            return false;
+        };
+        if entry.is_expression {
+            return false;
+        }
+        let Some(tail) = self
+            .rows
+            .iter()
+            .rposition(|r| r.range.length > 0 && r.range.end() <= entry.punctuation.offset)
+        else {
+            return false;
+        };
+        self.frames
+            .iter()
+            .rev()
+            .find(|f| matches!(f.kind, FrameKind::Executable { .. }))
+            .is_some_and(|f| f.row_mark <= tail)
+    }
+
+    /// Joins one staged read-type row (#3419): a face neither flow leg
+    /// types — the anon body's `this` keyword, the injected formal's
+    /// reads, a bare member read resolved on the receiver. A flow-staged
+    /// `Unknown` at the same span gives way; a face the flow decided (a
+    /// promotion) stands.
+    fn stage_anon_read_type(&mut self, span: SourceRange, ty: Ty) {
+        let at = self
+            .read_types
+            .partition_point(|(row, _)| row.offset < span.offset);
+        let mut decided = false;
+        let mut index = at;
+        while index < self.read_types.len() && self.read_types[index].0.offset == span.offset {
+            if self.read_types[index].0 == span {
+                if self.read_types[index].1 == Ty::UNKNOWN {
+                    self.read_types[index].1 = ty;
+                }
+                decided = true;
+            }
+            index += 1;
+        }
+        if !decided {
+            self.read_types.insert(at, (span, ty));
+        }
+    }
+
+    /// The anonymous-method bodies' receiver faces join the read-type
+    /// table before the pass-2 walk (#3419): every `this` keyword directly
+    /// inside an implicit-formals body and every read of an explicit
+    /// form's injected formal bind the receiver's static type — the flow
+    /// layer types neither face, so the member rows over them re-derive
+    /// through the shared read-type leg exactly like a promoted local.
+    fn stage_anon_method_bodies(&mut self) {
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        // The receiver faces resolve under the shared borrow; the staging
+        // below mutates.
+        let bodies: Vec<(u32, u32, Ty, Option<SourceRange>, bool)> = elements
+            .anon_methods()
+            .iter()
+            .filter_map(|entry| {
+                let this_ty = self.anon_this_ty(entry)?;
+                Some((
+                    entry.punctuation.end(),
+                    entry.end,
+                    this_ty,
+                    entry.first_param,
+                    entry.parens.is_none(),
+                ))
+            })
+            .collect();
+        if bodies.is_empty() {
+            return;
+        }
+        let mut staged: Vec<(SourceRange, Ty)> = Vec::new();
+        for &(start, end, this_ty, first_param, implicit) in &bodies {
+            if implicit {
+                // Every `this` keyword in the body binds the receiver — a
+                // NESTED body's keyword belongs to the inner entry, whose
+                // own punctuation-end sits past this body's.
+                let tokens = self.tokens.as_slice();
+                let mut at = tokens.partition_point(|t| t.utf16_offset < start);
+                while at < tokens.len() && tokens[at].utf16_offset < end {
+                    let token = &tokens[at];
+                    if token.kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::This)
+                    {
+                        let span_end = dartq_source::byte_offset_to_utf16(
+                            self.source,
+                            (token.byte_offset + token.byte_len) as usize,
+                        );
+                        let span = SourceRange {
+                            offset: token.utf16_offset,
+                            length: span_end.saturating_sub(token.utf16_offset),
+                        };
+                        if self
+                            .anon_method_body_at(span.offset)
+                            .is_some_and(|inner| inner.punctuation.end() == start)
+                        {
+                            staged.push((span, this_ty));
+                        }
+                    }
+                    at += 1;
+                }
+            } else if let Some(name_span) = first_param {
+                // The injected formal's reads: the local-use capture keyed
+                // the reads on the declaration's name offset.
+                let reads: Vec<u32> = self
+                    .local_decl_at_read
+                    .iter()
+                    .filter(|&(_, &decl)| decl == name_span.offset)
+                    .map(|(&read, _)| read)
+                    .collect();
+                for read in reads {
+                    staged.push((
+                        SourceRange {
+                            offset: read,
+                            length: name_span.length,
+                        },
+                        this_ty,
+                    ));
+                }
+            }
+        }
+        for (span, ty) in staged {
+            self.stage_anon_read_type(span, ty);
         }
     }
 }

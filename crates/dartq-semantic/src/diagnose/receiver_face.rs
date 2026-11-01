@@ -40,6 +40,66 @@ impl Engine<'_> {
     /// byte. Unlatched rows — cascade sections, invoked callees — never
     /// re-decide.
     pub(crate) fn rederived_receiver(&self, member_offset: u32, recv: Receiver) -> Receiver {
+        // The promoted-PROPERTY receiver face (#3430): a member row whose
+        // receiver expression is a property read the flow promoted
+        // (`x._f is String`, bare `_f is String` inside the declaring
+        // body, `x._f + s`) resolves members on the promoted type — the
+        // receiver EXPRESSION's static type is the gated candidate
+        // (`property_element_resolver.dart:2158-2166` reads the read's
+        // flow type). Two receiver shapes the `promoted_recv_reads`
+        // latch below cannot name reach here instead: the bare-`this`
+        // read `_f` never joined `member_reads` (a `refs`
+        // `RefTarget::Member` row — the latch's backfill keys member
+        // receivers only), and the operator-merged row (`x._f + s`)
+        // folds no member record of its own, so `member_offset` names
+        // the OPERATOR token and the receiver read is the member record
+        // ending just before it. `promotable_field_substitution`
+        // re-runs the eligibility gate (`isPropertyPromotable`), so an
+        // unpromoted or ineligible read — `x.pub is String`, field
+        // promotion needs private+final — keeps the record byte for
+        // byte.
+        if matches!(recv, Receiver::This { .. } | Receiver::Typed { .. }) {
+            // The promoted read's span: the receiver record's `recv_span`
+            // (`x._f.length` records `_f`, the bare-`this` `_f.length`
+            // records `_f` too — a `refs` `RefTarget::Member` row the
+            // `promoted_recv_reads` latch's member-only backfill cannot
+            // name). The member record itself is the promoted read, so
+            // its own row (`x._f + s`, `x._f[i]`) stays out here — the
+            // promoted type substitutes the read's RESULT face at the
+            // operator check, never the read's own receiver.
+            let read_span = self
+                .member_reads
+                .binary_search_by(|read| read.offset.cmp(&member_offset))
+                .ok()
+                .map(|index| self.member_reads[index].recv_span);
+            let ty = read_span.and_then(|span| {
+                // The join key is the read's token OFFSET, matching
+                // [`Self::promotable_field_substitution`]'s own contract —
+                // the staged row spells the member token while a chained
+                // latch's sentinel is zero-length at the same offset.
+                let staged = self.prop_promotion_rows.staged(span)
+                    || self
+                        .prop_promotion_rows
+                        .rows
+                        .binary_search_by(|row| row.offset.cmp(&span.offset))
+                        .is_ok();
+                if !staged {
+                    return None;
+                }
+                let (entry, _name, _origin) = self.member_read_resolution(span.offset)?;
+                self.promotable_field_substitution(
+                    &self.prop_promotion_rows,
+                    span,
+                    Self::member_result_ty(&entry),
+                )
+            });
+            if let Some(ty @ Ty::Named { name, .. }) = ty {
+                return Receiver::Typed {
+                    type_name: name,
+                    ty,
+                };
+            }
+        }
         let Receiver::Typed { ty: static_ty, .. } = recv else {
             return recv;
         };

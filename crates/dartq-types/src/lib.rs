@@ -129,7 +129,8 @@ pub use inference::{
 };
 pub use instantiate_to_bound::{
     BoundsInstantiation, get_free_parameters, instantiate_interface_to_bounds,
-    instantiate_type_formals_to_bounds, instantiate_type_formals_to_bounds_with,
+    instantiate_type_formals_to_bounds, instantiate_type_formals_to_bounds_directed,
+    instantiate_type_formals_to_bounds_fixpoint, instantiate_type_formals_to_bounds_with,
 };
 pub use provably::TypeCheckVerdict;
 pub use suffix::NullabilitySuffix;
@@ -139,7 +140,10 @@ pub use ty::{
     FunctionSigData, NamedMember, PoolRange, RecordShapeData, Type, TypeKind, UninternedFunction,
     UninternedRecord, UninternedType,
 };
-pub use variance::{ParamFacts, ParamFactsTable, Variance, arguments_related, variance_in_type};
+pub use variance::{
+    ParamFacts, ParamFactsTable, Variance, arguments_related, typedef_parameter_variances,
+    variance_in_type,
+};
 
 #[cfg(test)]
 mod ticket_3468_tests;

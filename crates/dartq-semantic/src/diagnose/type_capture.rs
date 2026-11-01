@@ -1669,19 +1669,31 @@ impl<'a> Engine<'a> {
             .map(|(name, ty, _)| (*name, *ty))
             .collect();
         let return_ty = capture.ret.map_or(Ty::Dynamic, |(ty, ..)| ty);
+        // The written required-positional split rides the shape: the
+        // canonical `FnShape` identity carries the `[...]` boundary
+        // (`int Function(int)` and `int Function([int])` are distinct
+        // types upstream — `_equalParameters` compares each formal's
+        // optional flag), so the signature's own count is part of the
+        // intern key rather than a side table's guess.
+        let required_positional = capture.required_positional.min(u16::MAX as usize) as u16;
         // The written `<T, U extends B>` group rides the shape (#2878):
         // the message slots spell it back (`void Function<T>(T)`), the
         // official `FunctionType` display form. #3384: the group is the
         // window-rebuilt slice (declaration order, bounds with their
         // written arguments) when the latch matched, else the captured
         // slice as before.
-        let fn_ty = self.boundary.args.borrow_mut().function_generic(
-            &type_params,
-            return_ty,
-            &capture.positional,
-            &named,
-            nullable,
-        );
+        let fn_ty = self
+            .boundary
+            .args
+            .borrow_mut()
+            .function_generic_required(
+                &type_params,
+                required_positional,
+                return_ty,
+                &capture.positional,
+                &named,
+                nullable,
+            );
         self.armed_ty = Some(fn_ty);
         self.armed_ty_unresolved = false;
         // An inner capture that never landed a pending formal nor a
@@ -1707,7 +1719,7 @@ impl<'a> Engine<'a> {
             // signature-display face inherits the declaration-order
             // fix with the armed-slot face.
             params: type_params.into_boxed_slice(),
-            required_positional: capture.required_positional.min(u16::MAX as usize) as u16,
+            required_positional,
             positional: capture.positional.into_boxed_slice(),
             named: capture.named.into_boxed_slice(),
             return_ty,
