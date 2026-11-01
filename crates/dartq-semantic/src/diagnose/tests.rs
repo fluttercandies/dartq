@@ -18632,3 +18632,28 @@ mod ticket_3398_tests;
 #[cfg(test)]
 #[path = "ticket_3385_tests.rs"]
 mod ticket_3385_tests;
+
+// The #3404 pins (recon_3258 T-A/T-B): the `no_combined_super_signature`
+// gate — the combined-signature report plus the declared-face loop's skip —
+// and the declared-`covariant` induced-setter exemption on a field. Both
+// faces landed with #3345; these pins lock the two directions so neither
+// regression can return silently. Registered here via `#[path]`; the module
+// stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3404_tests.rs"]
+mod ticket_3404_tests;
+
+// The #3394 pins (recon bucket C's `invocation.rs` half + the T2
+// cascade-receiver residual): a creation cascade target is the created
+// INSTANCE — `G.value(1)..gone()` names `G`, never the `Type` literal the
+// bare head answers once the name-level read leaves the constructor
+// send's result `Unknown`; and `creation_call_site_ty`'s context seed is
+// PINNED against a disagreeing argument (`A<int, String> a = new A('s',
+// 1)` keeps `A<int, String>` and reports each conflict), with the
+// explicit-keyword spelling running the same per-argument verdict.
+// Registered here via `#[path]`; the module stays inside the `diagnose`
+// subtree so `crate::diagnose::test_rig` resolves.
+#[cfg(test)]
+#[path = "ticket_3394_tests.rs"]
+mod ticket_3394_tests;

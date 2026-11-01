@@ -160,6 +160,22 @@ enum SuperQuery {
 }
 
 impl<'a> Engine<'a> {
+    /// Whether `name` resolves to a declaration of a `dart:` library — the
+    /// unindexed SDK class head the member merge classifies as a
+    /// [`Receiver::Container`] through its names-only spelling (no
+    /// container table, so no constructor set: `Future.value`,
+    /// `Uri.http` ride this face).
+    fn sdk_type_head(&self, name: StringId) -> bool {
+        matches!(
+            self.namespaces.lookup(self.graph, self.lib, name),
+            Lookup::Found(NamespaceEntry::Decl(owner))
+                if self
+                    .graph
+                    .library_of_file(owner)
+                    .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"))
+        )
+    }
+
     /// Merges `receiver.member` at the dot/cascade event: pops the member row,
     /// classifies the receiver below it, and pushes the merged row. A
     /// null-aware access on a strictly non-nullable receiver emits
@@ -915,6 +931,52 @@ impl<'a> Engine<'a> {
                     RowShape::TypeUse(..) => true,
                     _ => false,
                 };
+                // A constructor-reference send whose instantiated result the
+                // name-level read leaves `Unknown` (`G.value(1)` over a
+                // GENERIC `G` — the declared return needs the inference that
+                // read cannot run, [`Engine::callee_return_ty`]'s
+                // generic-ctor arm) still denotes the CREATED instance,
+                // never the type literal: upstream types the
+                // `InstanceCreationExpression` and resolves the next member
+                // on the created class (probe 3.13.7: `G<T> { G.value(T t);
+                // void n(); }` — `G.value(1)..n()` is silent, `..gone()`
+                // reports "The method 'gone' isn't defined for the type
+                // 'G'."). Without it the merged row falls to the unknown
+                // dispatch, whose pass-2 re-read of the target span answers
+                // the bare head's `Type` face and reports every cascade
+                // section against `Type` (the #3394 T2 residual: the corpus
+                // `Future.value(C())..expectStaticType<…>()` cluster). Gated
+                // on the selector naming a DECLARED constructor, so a
+                // static-member send whose return is unknown keeps the
+                // unknown dispatch; an unindexed SDK class head carries no
+                // constructor table, and its dot-sends are the SDK's own
+                // factories (`Future.value`, `Uri.http` — the oracle types
+                // the created instance there), so the head spelling stands
+                // as the instance.
+                let ctor_send_instance = if popped.intent == Intent::Invoke {
+                    match &popped_shape {
+                        RowShape::Member {
+                            recv: Receiver::Container { name, .. },
+                            ..
+                        } => {
+                            let indexed_ctor = resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                *name,
+                            )
+                            .is_some_and(|(decl, _)| {
+                                self.ctor_face_exists(decl, *name, popped.name)
+                            });
+                            (indexed_ctor || self.sdk_type_head(*name)).then_some(*name)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let recv = match &popped_shape {
                     // A dart:core primitive spelled as the receiver
                     // (`double.nan`, `int.parse`): no indexed container
@@ -1204,7 +1266,13 @@ impl<'a> Engine<'a> {
                                 .push((member.range.offset, receiver_ty));
                             Receiver::Unknown
                         }
-                        _ => Receiver::Unknown,
+                        _ => match ctor_send_instance {
+                            Some(name) => Receiver::Typed {
+                                type_name: name,
+                                ty: Ty::named(name),
+                            },
+                            None => Receiver::Unknown,
+                        },
                     },
                 };
                 if deferred_receiver {
@@ -3687,11 +3755,13 @@ impl<'a> Engine<'a> {
         // type arguments with the declared parameters ahead of the
         // argument-side constraints (upstream's `InferenceContext` supplies
         // the `T` mappings first and `chooseFinalTypes` upgrades them with
-        // the argument types).
+        // the argument types). A seeded slot is PINNED, never poisoned.
+        let mut pinned: Vec<bool> = vec![false; params.len()];
         if let Some(seed) = self.creation_context_seed(class, class_offset, params.len()) {
-            for (slot, ty) in solved.iter_mut().zip(seed) {
+            for ((slot, pin), ty) in solved.iter_mut().zip(pinned.iter_mut()).zip(seed) {
                 if !matches!(ty, Ty::Dynamic | Ty::Unknown) {
                     *slot = Some(ty);
+                    *pin = true;
                 }
             }
         }
@@ -3706,6 +3776,17 @@ impl<'a> Engine<'a> {
             match solved[index] {
                 None => solved[index] = Some(ty),
                 Some(kept) if kept == ty => {}
+                // The covariant pin (`inferTypeParameterFromAll`'s
+                // `typeFromPreviousInference` arm, upstream Dart SDK source,
+                // pkg/_fe_analyzer_shared/lib/src/type_inference/
+                // type_analyzer_operations.dart:1237-1241): a parameter the
+                // DOWNWARD inference already bound returns that binding and
+                // ignores the argument constraint — the constraint's
+                // conflict reports at the argument row through the ordinary
+                // assignability check, never by overwriting the created
+                // type (`A<int, String> x = new A('s', 1)` keeps
+                // `A<int, String>` and reports `'s'`).
+                Some(_) if pinned[index] => {}
                 Some(_) => {
                     poisoned.insert(index);
                     solved[index] = None;
@@ -8662,6 +8743,54 @@ impl<'a> Engine<'a> {
                 self.emit(SemanticCode::UndefinedNamedParameter, label, &text, "");
             }
         }
+        // The per-argument assignability face (`resolveArgumentsToParameters`
+        // pairs each argument with its formal's INSTANTIATED type,
+        // resolver.dart:4978-5009). No callee row runs the send-close solver
+        // for the keyword spelling, so the creation's own solution is the
+        // only source of that instantiation: it substitutes the class's
+        // parameters in the formals before the verdict, and a
+        // context-seeded `A<int, String> a = new A('s', 1)` keeps its
+        // created type (`creation_call_site_ty`'s covariant pin) while each
+        // conflict reports at the argument's own span — the oracle's two
+        // rows.
+        let instantiation = self
+            .creation_call_site_ty(Some(level), level.unnamed_head)
+            .and_then(|ty| match ty {
+                Ty::Named { name, args, .. } if name == head && args != ArgListId::EMPTY => {
+                    Some(self.boundary.args.borrow().get(args).to_vec())
+                }
+                _ => None,
+            });
+        let map: Vec<(StringId, Ty)> = match (instantiation, self.bounds.container_params(head)) {
+            (Some(args), Some(params)) if params.len() == args.len() => params
+                .iter()
+                .map(|(param, _, _)| *param)
+                .zip(args)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut positional_index = 0usize;
+        for (name, ty, literal, range) in &level.args {
+            let formal = match name {
+                Some(name) => self.named_formal_for(&formals, *name),
+                None => {
+                    let formal = formals.positional.get(positional_index);
+                    positional_index += 1;
+                    formal
+                }
+            };
+            let Some(formal) = formal else {
+                continue;
+            };
+            let formal_ty = if map.is_empty() {
+                formal.ty
+            } else {
+                self.subst_params(formal.ty, &map).unwrap_or(formal.ty)
+            };
+            if self.argument_verdict(*ty, formal_ty, *literal) == Some(false) {
+                self.stage(StagedKind::Argument, *range, *ty, formal_ty, *literal);
+            }
+        }
     }
 
     /// The explicit super-constructor invocation's argument faces
@@ -10075,6 +10204,7 @@ impl<'a> Engine<'a> {
                     RowShape::Receiver(Receiver::Created {
                         name,
                         kind: ContainerKind::Class,
+                        ..
                     })
                     | RowShape::Bare(BareInfo::Container {
                         name,
@@ -10420,6 +10550,7 @@ impl<'a> Engine<'a> {
                         Receiver::Created {
                             name,
                             kind: ContainerKind::Class,
+                            ..
                         }
                         | Receiver::Container {
                             name,
@@ -10638,6 +10769,7 @@ impl<'a> Engine<'a> {
                     Receiver::Created {
                         name,
                         kind: ContainerKind::Class,
+                        ..
                     }
                     | Receiver::Container {
                         name,
