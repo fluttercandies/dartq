@@ -605,6 +605,18 @@ struct AliasSink {
     rhs_nullable: bool,
     /// Recovery debris: the alias never expands.
     poisoned: bool,
+    /// Open nested-function formals inside the outer formals region: a
+    /// function-typed formal's own `Function(...)` head bumps this and its
+    /// `)` drops it — only the outermost `)` closes the formals region
+    /// (`{C Function()? x}` at depth 1 leaves the region open for `x`'s
+    /// completion).
+    fn_formals_depth: u32,
+    /// Function levels pushed into the alias's own sink: the RHS's
+    /// outermost `Function(` claims the return region by the alias face,
+    /// never a sink level — only a nested function-typed formal's level
+    /// counts here, so the shared `begin_function` cascade routes a level
+    /// only while the formals region is open.
+    sink_fn_levels: u32,
 }
 
 /// A mapped ITB violation: what to emit and where.
@@ -1181,8 +1193,20 @@ impl<'a> Bounds<'a> {
             header.sink.begin_function();
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.begin_function();
-        } else if self.alias.is_none()
-            && let Some(site) = self.site.as_mut()
+        } else if let Some(alias) = self.alias.as_mut()
+            && matches!(alias.region, Some(AliasRegion::Formals { .. }))
+        {
+            // A function-typed formal inside the RHS's own formals list
+            // (`typedef F2<T> = R Function({C Function()? x})`): the
+            // nested level folds into the formal's TypeTree the expansion
+            // substitutes — its close carries the `?` (`Function()?`'s
+            // nullability) that decides the formal's face. The RHS's own
+            // `Function(` head skips the sink: `alias_formal_boundary`
+            // claims the return region for it.
+            alias.sink.begin_function();
+            alias.sink_fn_levels += 1;
+        } else if let Some(site) = self.site.as_mut()
+            && self.alias.is_none()
         {
             site.begin_function();
         }
@@ -1196,8 +1220,13 @@ impl<'a> Bounds<'a> {
             header.sink.end_function(nullable, end);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.end_function(nullable, end);
-        } else if self.alias.is_none()
-            && let Some(site) = self.site.as_mut()
+        } else if let Some(alias) = self.alias.as_mut()
+            && alias.sink_fn_levels > 0
+        {
+            alias.sink.end_function(nullable, end);
+            alias.sink_fn_levels -= 1;
+        } else if let Some(site) = self.site.as_mut()
+            && self.alias.is_none()
         {
             site.end_function(nullable, end);
         }
@@ -1211,8 +1240,12 @@ impl<'a> Bounds<'a> {
             header.sink.function_formals_begin();
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_formals_begin();
-        } else if self.alias.is_none()
-            && let Some(site) = self.site.as_mut()
+        } else if let Some(alias) = self.alias.as_mut()
+            && alias.sink_fn_levels > 0
+        {
+            alias.sink.function_formals_begin();
+        } else if let Some(site) = self.site.as_mut()
+            && self.alias.is_none()
         {
             site.function_formals_begin();
         }
@@ -1225,8 +1258,12 @@ impl<'a> Bounds<'a> {
             header.sink.function_formal_end(named, name);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_formal_end(named, name);
-        } else if self.alias.is_none()
-            && let Some(site) = self.site.as_mut()
+        } else if let Some(alias) = self.alias.as_mut()
+            && alias.sink_fn_levels > 0
+        {
+            alias.sink.function_formal_end(named, name);
+        } else if let Some(site) = self.site.as_mut()
+            && self.alias.is_none()
         {
             site.function_formal_end(named, name);
         }
@@ -1283,6 +1320,8 @@ impl<'a> Bounds<'a> {
             fn_seen: false,
             rhs_nullable: false,
             poisoned: false,
+            fn_formals_depth: 0,
+            sink_fn_levels: 0,
         });
     }
 
@@ -1371,11 +1410,19 @@ impl<'a> Bounds<'a> {
         let Some(alias) = self.alias.as_mut() else {
             return;
         };
-        if alias.region != Some(AliasRegion::Ret) || alias.fn_seen {
+        // A `Function` head inside the formals region is a nested
+        // function type — a function-typed formal (`{C Function()? x}`)
+        // — which the capture's own function tree models; only a head
+        // outside any open region is unmodelable. Its formals list opens
+        // and closes inside the outer region, so the depth latch keeps the
+        // outer `)` — not the nested one — the region's closer.
+        if alias.region == Some(AliasRegion::Ret) && !alias.fn_seen {
+            alias.fn_seen = true;
+        } else if matches!(alias.region, Some(AliasRegion::Formals { .. })) {
+            alias.fn_formals_depth += 1;
+        } else {
             alias.poisoned = true;
-            return;
         }
-        alias.fn_seen = true;
     }
 
     /// The RHS function type's formal list opened: the trees completed so
@@ -1396,6 +1443,24 @@ impl<'a> Bounds<'a> {
         match alias.sink.done.len() {
             0 => alias.ret = None,
             1 => alias.ret = alias.sink.done.pop(),
+            // A prefixed generic return (`typedef F2<T> = core.List<core.
+            // int> Function(...)`): the argument group's node lands first,
+            // then `handle_type` completes on the prefix token and drops
+            // the `p` leaf behind it — the same double-tree shape
+            // `end_alias`'s named-RHS arm reads. Keep the head tree as the
+            // return; the stray leaf rides its own spelling.
+            2 if !alias.sink.done[0].args.is_empty()
+                && alias.sink.done[1].args.is_empty()
+                && alias.sink.done[1].record.is_none()
+                && alias.sink.done[1].function.is_none()
+                && alias.sink.done[1].range.offset < alias.sink.done[0].range.offset =>
+            {
+                alias.ret = Some(alias.sink.done.remove(0));
+                // The leftover prefix leaf would stand `stray == 1` at
+                // `end_alias` and strand the `Fn` capture — its spelling
+                // already rides the head tree's own `p.` prefix.
+                alias.sink.done.clear();
+            }
             _ => alias.poisoned = true,
         }
         alias.region = Some(AliasRegion::Formals { named: false });
@@ -1416,6 +1481,12 @@ impl<'a> Bounds<'a> {
             .region
             .is_some_and(|region| matches!(region, AliasRegion::Formals { .. }))
         {
+            return;
+        }
+        if alias.fn_formals_depth > 0 {
+            // An optional group inside a nested function-typed formal's
+            // own list is that formal's shape — the outer region's
+            // named/positional latch belongs to the outer list.
             return;
         }
         if opener == "[" && alias.required_positional.is_none() {
@@ -1466,6 +1537,13 @@ impl<'a> Bounds<'a> {
             alias.poisoned = true;
             return;
         }
+        if alias.fn_formals_depth > 0 {
+            // A formal inside a nested function-typed formal's own list
+            // (`{C Function(int q) x}`'s `q`): the nested level's own
+            // `function_formal_end` pairs it — the outer formals list
+            // must not claim its tree.
+            return;
+        }
         if alias.sink.done.len() != 1 {
             alias.poisoned = true;
             return;
@@ -1481,14 +1559,20 @@ impl<'a> Bounds<'a> {
         }
     }
 
-    /// The formals region closed: stray trees past this point poison.
+    /// The formals region closed: stray trees past this point poison. A
+    /// nested function-typed formal's own `)` drops the depth latch and
+    /// keeps the outer region open — only the outermost `)` closes it.
     /// Bound windows gate the same as [`Self::alias_leaf`].
     pub(crate) fn alias_formals_closed(&mut self) {
         if self.bound_sink.is_some() {
             return;
         }
         if let Some(alias) = self.alias.as_mut() {
-            alias.region = None;
+            if alias.fn_formals_depth > 0 {
+                alias.fn_formals_depth -= 1;
+            } else {
+                alias.region = None;
+            }
         }
     }
 
