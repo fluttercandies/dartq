@@ -1835,6 +1835,7 @@ impl<'a> Engine<'a> {
                 };
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
+                && self.member_visible_to(found_owner, name, spelling, scope_lib)
             {
                 return true;
             }
@@ -2594,9 +2595,15 @@ impl<'a> Engine<'a> {
     /// depth 0 (the parser re-fires a parameterized head after its own
     /// type-argument group, so `G<int>?` completes once, here). The entry
     /// span runs name through the trailing `?` or the just-closed group's
-    /// closer — the oracle's whole-NamedType anchor (the prefixed `p.C`
-    /// heads complete on the prefix token; the span starts there and stops
-    /// at the head token, the model's bare-name convention).
+    /// closer — the oracle's whole-NamedType anchor. A prefixed spelling
+    /// (`p.C`) completes on the PREFIX token (the official
+    /// `PrefixedType.parseType` protocol), so its span is widened across
+    /// the `.`-continuation to the local segment's end
+    /// ([`Self::prefixed_head_end`]): the oracle anchors prefix head
+    /// through local end (`resolution_visitor.dart:1235-1237`), and the
+    /// downstream faces read the span's TEXT (the `with`-clause teardown
+    /// resolves a dotted entry through the prefix table,
+    /// [`Engine::finalize_mixin_uses`]).
     pub(crate) fn note_header_type_span(&mut self, name: Token, question: Option<Token>) {
         // #1444: the extension-type header's clause-entry ledger (the
         // modifier window below stays unarmed for extension types; the
@@ -2605,6 +2612,8 @@ impl<'a> Engine<'a> {
         {
             self.extension_clause_miss.push(name.range.offset);
         }
+        // Read before the deferred window is borrowed mutably below.
+        let prefixed_end = self.prefixed_head_end(name.id);
         let Some(deferred) = self.deferred_modifier.as_mut() else {
             return;
         };
@@ -2613,6 +2622,9 @@ impl<'a> Engine<'a> {
             return;
         }
         let mut range = name.range;
+        if let Some(end) = prefixed_end {
+            range.length = end.saturating_sub(range.offset);
+        }
         // The closer latch is consumed by every depth-0 completion (the
         // re-fire is the contractual next event); a trailing `?` wins over
         // the group closer, and a stale latch — possible only ahead of a
@@ -2635,6 +2647,24 @@ impl<'a> Engine<'a> {
         } else {
             spans.buffered.push(range);
         }
+    }
+
+    /// The UTF-16 end offset of the local segment when `id` opens a
+    /// group-less prefixed head (`prefix.Local`); `None` for every other
+    /// token — a bare name, a parser-inserted handle (absent from the token
+    /// table), or a spelling whose continuation is not the adjacent
+    /// `.` + identifier pair (the scanner drops trivia, so adjacent tokens
+    /// are the written segments). A miss leaves the recorded span alone —
+    /// the under-report direction.
+    fn prefixed_head_end(&self, id: u32) -> Option<u32> {
+        let dot = self.tokens.get(id.checked_add(1)? as usize)?;
+        if &self.source[dot.byte_range()] != "." {
+            return None;
+        }
+        let leaf = self.tokens.get(id.checked_add(2)? as usize)?;
+        let text = &self.source[leaf.byte_range()];
+        let length = u32::try_from(text.encode_utf16().count()).ok()?;
+        Some(leaf.utf16_offset + length)
     }
 
     /// A type-argument group opened inside the header window: entries nest
@@ -3267,13 +3297,38 @@ impl<'a> Engine<'a> {
     }
 
     /// Resolves one written super-face name to its declaring handle and
-    /// library (#491 S2a attribution); `None` suppresses the face. The
-    /// handle carries the *declaring* file — the same shape the fold walk's
-    /// hop produces — so `FoldHierarchy::library_of` attributes the super's
-    /// own library and the outside-library gates (`element.library !=
-    /// _currentLibrary`, error_verifier.dart:5619-5622/:5917-5921/:3725-3730)
-    /// compare the right pair.
-    pub(crate) fn resolve_super(&self, name: StringId) -> Option<((FileId, StringId), LibraryId)> {
+    /// library (#491 S2a attribution); `None` suppresses the face. `writer`
+    /// is the declaring container whose header wrote `name` — the
+    /// prefixed-clause probe's key (`implements p.Base` resolves through
+    /// `p`'s table). The handle carries the *declaring* file — the same
+    /// shape the fold walk's hop produces — so `FoldHierarchy::library_of`
+    /// attributes the super's own library and the outside-library gates
+    /// (`element.library != _currentLibrary`, error_verifier.dart:5619-5622
+    /// /:5917-5921/:3725-3730) compare the right pair.
+    pub(crate) fn resolve_super(
+        &self,
+        writer: StringId,
+        name: StringId,
+    ) -> Option<((FileId, StringId), LibraryId)> {
+        // A face written through an import prefix (`class C implements
+        // p.Base`) reaches the element model as its bare leaf — the
+        // collector keeps the local name alone — so the bare walk below
+        // misses it and the face reads as an unresolvable edge (every
+        // outside-library arm then stays silent). The dotted spelling lives
+        // in the header tokens ([`Self::prefixed_clause_prefix`], the same
+        // facts a scanned [`SuperEntry`]'s `prefix` carries): resolve the
+        // leaf through the prefix's merged table, the container identity an
+        // unprefixed import of the same library yields. A registered prefix
+        // whose table lacks the name suppresses — never fall back to the
+        // bare scope, where a same-spelled local would shadow the written
+        // face.
+        if let Some(prefix) = self.prefixed_clause_prefix(writer, name) {
+            let lib = self.graph.library_of_file(self.file).unwrap_or(self.lib);
+            let (_, owner) =
+                prefixed_container(self.graph, self.namespaces, self.index, lib, prefix, name)?;
+            let owner_lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(self.lib);
+            return Some(((owner, name), owner_lib));
+        }
         if let Some((_, owner)) = resolve_container(
             self.graph,
             self.namespaces,
@@ -3348,7 +3403,7 @@ impl<'a> Engine<'a> {
         let mut implements: Vec<ResolvedSuper> = Vec::new();
         let mut ons: Vec<ResolvedSuper> = Vec::new();
         if let Some(name) = decl.superclass
-            && let Some((handle, lib)) = self.resolve_super(name)
+            && let Some((handle, lib)) = self.resolve_super(container, name)
         {
             extends = Some(ResolvedSuper {
                 handle,
@@ -3387,7 +3442,7 @@ impl<'a> Engine<'a> {
             }
         };
         for (index, name) in decl.with_clause.iter().enumerate() {
-            if let Some((handle, lib)) = self.resolve_super(*name) {
+            if let Some((handle, lib)) = self.resolve_super(container, *name) {
                 withs.push(ResolvedSuper {
                     handle,
                     lib,
@@ -3397,7 +3452,7 @@ impl<'a> Engine<'a> {
             }
         }
         for (index, name) in decl.implements_clause.iter().enumerate() {
-            if let Some((handle, lib)) = self.resolve_super(*name) {
+            if let Some((handle, lib)) = self.resolve_super(container, *name) {
                 implements.push(ResolvedSuper {
                     handle,
                     lib,
@@ -3407,7 +3462,7 @@ impl<'a> Engine<'a> {
             }
         }
         for (index, name) in decl.on_clause.iter().enumerate() {
-            if let Some((handle, lib)) = self.resolve_super(*name) {
+            if let Some((handle, lib)) = self.resolve_super(container, *name) {
                 ons.push(ResolvedSuper {
                     handle,
                     lib,
@@ -5132,6 +5187,7 @@ impl<'a> Engine<'a> {
             chain.push((name, found_owner));
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
+                && self.member_visible_to(found_owner, name, spelling, scope_lib)
             {
                 // F2: the inherited entry belongs to `found_owner`'s pool —
                 // project it before the override faces render or compare it.
@@ -5159,6 +5215,7 @@ impl<'a> Engine<'a> {
                     chain.push((*mixin, mixin_owner));
                     if let Some(entry) = mixin_container.members.get(&spelling)
                         && !entry.is_static
+                        && self.member_visible_to(mixin_owner, *mixin, spelling, mixin_lib)
                     {
                         return Some((
                             self.boundary.member(mixin_owner, *mixin, spelling, entry),
@@ -5315,7 +5372,8 @@ impl<'a> Engine<'a> {
                     }
                 };
             chain.push((name, found_owner));
-            if let Some(hit) = self.face_own_hit(found_owner, name, found, spelling, chain.clone())
+            if let Some(hit) =
+                self.face_own_hit(found_owner, name, found, spelling, scope_lib, chain.clone())
             {
                 collected.push(hit);
                 // A hit hop's own clauses never join — a spine hop's
@@ -5351,6 +5409,7 @@ impl<'a> Engine<'a> {
                         *mixin,
                         mixin_container,
                         spelling,
+                        owner_lib,
                         chain.clone(),
                     );
                     chain.pop();
@@ -5430,19 +5489,54 @@ impl<'a> Engine<'a> {
         self.merge_face_candidates(collected, merge_container, face, facts)
     }
 
+    /// Whether a member spelled `spelling` on the container `hop` declared
+    /// in `owner_file` belongs to the name space of `referrer` — the
+    /// library whose scope wrote the face spelling. Public names resolve
+    /// from any library; a private one (`_m`) only from the library that
+    /// declares it — the oracle's member identity is the `(name, library)`
+    /// pair (`inheritance_manager3.dart`'s `Name` carries the declaring
+    /// library), so a same-spelled private member in a foreign library is
+    /// an unrelated member and can neither override nor be overridden
+    /// (`element.library` / `isAccessibleFor` gates,
+    /// `error_verifier.dart:5619-5622`).
+    fn member_visible_to(
+        &self,
+        owner_file: FileId,
+        hop: StringId,
+        spelling: StringId,
+        referrer: LibraryId,
+    ) -> bool {
+        if !self.strings.resolve(spelling).starts_with('_') {
+            return true;
+        }
+        self.owner_library_of(owner_file, hop) == Some(referrer)
+    }
+
     /// One hop's own member face: the stored entry under the lookup
     /// spelling (projected through the boundary, its pointer the dedup
     /// identity), or — for a setter spelling — the non-final field's
     /// induced setter (the oracle's `field.setter` element, synthesized:
-    /// one required positional of the field's type).
+    /// one required positional of the field's type). `referrer` is the
+    /// library whose scope wrote the face spelling — the private-name
+    /// identity's other half.
     fn face_own_hit(
         &self,
         owner_file: FileId,
         hop: StringId,
         found: &'a Container,
         spelling: StringId,
+        referrer: LibraryId,
         chain: Vec<(StringId, FileId)>,
     ) -> Option<FaceHit<'a>> {
+        // A private spelling names only the member declared in the SAME
+        // library: the oracle keys the inheritance map on `(name, library)`
+        // — an element name carries its declaring library, so `_m` in a
+        // foreign library is a different element, never an inherited face
+        // of the referring container (`inheritance_manager3.dart`'s
+        // `Name`).
+        if !self.member_visible_to(owner_file, hop, spelling, referrer) {
+            return None;
+        }
         if let Some(entry) = found.members.get(&spelling)
             && !entry.is_static
         {
@@ -7659,6 +7753,10 @@ impl<'a> Engine<'a> {
     /// keeps the written head — the same under-fold posture `fold_alias_ty`
     /// keeps.
     ///
+    /// An unmodeled TARGET slot (`Ty::Unknown`) decides nothing: it holds
+    /// no comparable type, so no break may be reported from it — answers
+    /// `None`, the caller's under-report direction.
+    ///
     /// The InvalidType arm (`subtype.dart:274-276` — `T0 is InvalidType ||
     /// T1 is InvalidType` answers the subtype question `true`, so the
     /// override is satisfied and stays silent): a `Ty::Named` whose head
@@ -7682,6 +7780,16 @@ impl<'a> Engine<'a> {
     ) -> Option<bool> {
         let from_ty = self.fold_alias_ty(from_ty);
         let to_ty = self.fold_alias_ty(to_ty);
+        // An UNMODELED target slot (`Ty::Unknown` — a names-only SDK
+        // signature, an unwritten column, a face the model could not
+        // resolve) carries no comparable type, so it can never *fail* an
+        // override: every arm below would answer `Some(false)` from a blank
+        // (and the `dynamic`/`void` source arm would too), fabricating a
+        // break on each half-modeled face. Undecided is the under-report
+        // direction the caller already grants.
+        if matches!(to_ty, Ty::Unknown) {
+            return None;
+        }
         if let Ty::Named { name, .. } = from_ty
             && self.named_head_is_invalid(name, from_scope, from_entry)
         {
@@ -7704,14 +7812,6 @@ impl<'a> Engine<'a> {
         // *expression* assigns anywhere, but the override question asks the
         // subtype relation). Decided here rather than through `assignable`,
         // whose arms carry the assignment face's leniency.
-        // A `void` source against an unmodeled target keeps the under-report
-        // direction instead of answering `Left Top`'s `false`: `Ty::Unknown`
-        // is the model's blind spot (a names-only SDK signature, an unwritten
-        // slot — a setter's implicit return reads `Unknown`), and turning it
-        // into a report would fabricate rows on every half-modeled face.
-        if matches!(from_ty, Ty::Void) && matches!(to_ty, Ty::Unknown) {
-            return None;
-        }
         let is_top = |ty: Ty| {
             matches!(ty, Ty::Dynamic | Ty::Void)
                 || matches!(
@@ -7900,6 +8000,7 @@ impl<'a> Engine<'a> {
                 face,
                 found,
                 spelling,
+                lib,
                 hop_chain.clone(),
             ) {
                 let kind_matches = match face_kind {

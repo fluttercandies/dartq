@@ -42,6 +42,30 @@ impl<'a> Engine<'a> {
             .find_map(|f| f.var_types.get(&name).copied())
     }
 
+    /// Whether the frame at `depth` still holds a LIVE declaration of
+    /// `name` — a row of its `locals` range that no case scope has retired.
+    ///
+    /// `Frame::locals` is a name set, so a pattern binder's membership
+    /// outlives the case scope that bound it and a shadowing binder shares
+    /// its spelling's slot with the declaration it hid. The row flag is the
+    /// only per-declaration state: retired everywhere in the frame means
+    /// the spelling is out of scope here, and a read walks on to the outer
+    /// frame (the at-close `restore_var_types` already put the shadowed
+    /// type back, which is why the typed case answers in `var_types` first).
+    fn frame_binds_live(&self, depth: usize, name: StringId) -> bool {
+        let Some(&lo) = self.frame_local_marks.get(depth) else {
+            return false;
+        };
+        let hi = self
+            .frame_local_marks
+            .get(depth + 1)
+            .copied()
+            .unwrap_or(self.locals.len());
+        self.locals
+            .get(lo..hi)
+            .is_some_and(|rows| rows.iter().any(|decl| decl.name == name && !decl.retired))
+    }
+
     /// The declared-type alias fold: a named type whose head resolves to a
     /// type alias rewrites to the alias's captured right-hand type,
     /// carrying the use-site `?` (upstream Dart SDK source,
@@ -1813,11 +1837,20 @@ impl<'a> Engine<'a> {
             // non-null matched type) wins over the outer's declared type —
             // a graph-wide locals-first scan would read the outer's nullable
             // face and lose the binder's promotion.
-            for frame in self.frames.iter().rev() {
+            //
+            // A frame whose every same-named row is RETIRED holds no
+            // binding for the spelling: a case binder leaves its
+            // `Frame::locals` membership behind when its scope closes
+            // ([`super::pattern_scope::retire_binders`] stamps the row, the
+            // set is name-only and its slot is shared with whatever the
+            // binder shadowed), so the read walks on to the outer frame —
+            // the declaration the binder hid — or to the member/library
+            // faces as `undefined_identifier`.
+            for (depth, frame) in self.frames.iter().enumerate().rev() {
                 if let Some(ty) = frame.var_types.get(&name) {
                     return (BareInfo::Plain { ty: *ty }, RefTarget::Local);
                 }
-                if frame.locals.contains(&name) {
+                if frame.locals.contains(&name) && self.frame_binds_live(depth, name) {
                     return (
                         BareInfo::Plain {
                             ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
