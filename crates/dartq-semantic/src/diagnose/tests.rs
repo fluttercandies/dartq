@@ -20007,3 +20007,21 @@ mod ticket_3443_tests;
 #[cfg(test)]
 #[path = "ticket_3378_tests.rs"]
 mod ticket_3378_tests;
+
+// —— #3429 —— the shape/object-pattern EXTRA-row suppression:
+// —— `resolveObjectPatternPropertyGet` is the ordinary property consult,
+// —— so a function pattern head resolves `call`, the extension pool, and
+// —— `Object` members before `undefined_getter` may spell; a nullable
+// —— folded head never reaches the family (the unchecked row anchors at
+// —— the type token, a span the pending triple does not carry, so the
+// —— verdict stands down). `function_extension_face` answers
+// —— `applicableTo`'s subtype ask — a concrete `on` shape decides by
+// —— signature subtyping (`on void Function()` accepts `int Function()`),
+// —— and a param-spelling `on` binds its bare own-param leaves off the
+// —— receiver's aligned slots. Registered here via `#[path]`; the module
+// —— stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// —— resolves.
+
+#[cfg(test)]
+#[path = "ticket_3429_tests.rs"]
+mod ticket_3429_tests;

@@ -139,36 +139,110 @@ impl<'a> Engine<'a> {
     /// displays, and every interface-bearing kind answers — a mixin's `on`
     /// chain and an extension type's own members/representation both read
     /// like a class (`case M(:var q)` over a bare mixin reports "for the
-    /// type 'M'", probe 3.13.7). A function right-hand side has no field
-    /// column at all, so every name misses (`typedef Fn = void Function()`
-    /// reports the alias spelling). Found members of any kind (a method
-    /// field reads its tear-off), `Object` members, enum synthesis, and an
-    /// applicable extension face resolve; `dynamic` and record heads answer
-    /// their own shapes (under-report), and an unresolvable head stays
-    /// silent.
+    /// type 'M'", probe 3.13.7). The resolver's property consult is the
+    /// ordinary member path (`type_property_resolver.dart:186-234`): a
+    /// function head resolves `call` on its own signature, the extension
+    /// pool answers next, and the `Object` interface closes the lookup, so
+    /// `case Fn(:var hashCode)` over `typedef Fn = void Function()` is
+    /// silent (probe 3.13.7 — `element: dart:core::Object::hashCode`). A
+    /// NULLABLE folded head never reaches the `undefined_*` family — the
+    /// `isNullable` branch resolves `Object` members and applicable
+    /// extensions silently, then reports the shared unchecked code at the
+    /// TYPE token (`uncheckedPropertyAccessOfNullableValue`, probe
+    /// 3.13.7's `typedef A = int?` row) — a span the pending triple does
+    /// not carry, so a nullable head's miss stands down rather than spell
+    /// `undefined_getter` in its place. Found members of any kind (a
+    /// method field reads its tear-off), `Object` members, enum synthesis,
+    /// and an applicable extension face resolve; `dynamic` and record
+    /// heads answer their own shapes (under-report), and an unresolvable
+    /// head stays silent.
     pub(crate) fn finalize_pattern_getters(&mut self) {
         for (head, getter, at) in std::mem::take(&mut self.pending_pattern_getters) {
             // The head's static type (`ObjectPattern.type` → `NamedType` →
             // the aliased element's type): a written alias stands for its
             // right-hand side's member columns, one fold hop chain deep.
-            let (container, kind) = match self.fold_alias_ty(Ty::named(head)) {
-                Ty::Named { name, .. } => {
+            let folded = self.fold_alias_ty(Ty::named(head));
+            let (container, kind) = match folded {
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    ..
+                } => {
                     let Some(kind) = self.container_kind_of(name) else {
                         continue;
                     };
                     (name, kind)
                 }
-                // A function type declares the `Object` members alone; a
-                // field name beyond them misses at the written head.
-                Ty::Function { .. } => {
+                // A function head's consult (the non-interface arms of the
+                // property resolver): `call` resolves the receiver's own
+                // signature on a non-nullable head, `Object`'s interface
+                // closes every lookup, and the extension pool answers
+                // between them. A NULLABLE head's miss is the oracle's
+                // unchecked row at the TYPE token — outside the family
+                // this row spells, so the verdict stands down.
+                Ty::Function { nullable, .. } => {
+                    // `call` resolves a NON-nullable receiver's own
+                    // signature (type_property_resolver.dart:202-209); a
+                    // nullable head reaches it only through the extension
+                    // pool, where nothing declares it — the `isNullable`
+                    // branch's unchecked row. `Object` members resolve on
+                    // both nullabilities (the branch's first lookup hits
+                    // them); an applicable extension face resolves on the
+                    // head's own nullability (`on` matching inside
+                    // `function_extension_face`).
+                    // The consult order splits on nullability upstream:
+                    // `call`'s signature arm, then the `isNullable` branch
+                    // hits `Object` FIRST while the non-nullable path asks
+                    // the extension pool before `Object`
+                    // (type_property_resolver.dart:103-110 vs :227-232) —
+                    // an extension member of an `Object` name binds its
+                    // own element only on a non-nullable head.
+                    if getter == self.intern("call") && !nullable {
+                        self.read_names.insert(getter);
+                        continue;
+                    }
+                    if nullable {
+                        let object_hit = getter == self.intern("==")
+                            || self.members.object_members.contains(&getter);
+                        let ext_hit = !object_hit
+                            && self.function_extension_face(folded, getter).is_some();
+                        if object_hit || ext_hit {
+                            self.read_names.insert(getter);
+                            if ext_hit {
+                                self.credit_record_extension_use(folded, getter, at.offset);
+                            }
+                        }
+                        // A nullable head's genuine miss is the oracle's
+                        // unchecked row at the TYPE token
+                        // (type_property_resolver.dart:103-185 —
+                        // `isNullable` precedes the `undefined_*` family)
+                        // — a span the pending triple does not carry, so
+                        // the verdict stands down rather than spell
+                        // `undefined_getter` in its place.
+                        continue;
+                    }
+                    if self.function_extension_face(folded, getter).is_some() {
+                        self.read_names.insert(getter);
+                        self.credit_record_extension_use(folded, getter, at.offset);
+                        continue;
+                    }
+                    if getter == self.intern("==")
+                        || self.members.object_members.contains(&getter)
+                    {
+                        self.read_names.insert(getter);
+                        continue;
+                    }
                     let name_text = self.strings.resolve(getter).to_string();
                     let type_text = self.strings.resolve(head).to_string();
                     self.stage_typed(SemanticCode::UndefinedGetter, at, &name_text, &type_text);
                     continue;
                 }
                 // `dynamic` matches every shape; a record's columns are its
-                // own shape (no member table at name level). Both keep the
-                // established silence.
+                // own shape (no member table at name level); a nullable
+                // folded head (`typedef A = int?`, `typedef B = C?`)
+                // reports the unchecked family upstream — never
+                // `undefined_getter` — so the verdict stands down. All
+                // keep the established silence.
                 _ => continue,
             };
             let resolved = !matches!(self.walk_members(container, getter), Walk::Missing)

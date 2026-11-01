@@ -7443,11 +7443,18 @@ impl<'a> Engine<'a> {
             || row.name == self.intern("==")
         {
             None
-        } else if self.record_extension_face(shape_ty, row.name).is_some() {
+        } else if self
+            .record_extension_face(self.unwrapped_shape_ty(shape_ty, row), row.name)
+            .is_some()
+        {
             Some(row.name)
         } else {
             let setter = self.setter_spelling(row.name);
-            if write && self.record_extension_face(shape_ty, setter).is_some() {
+            if write
+                && self
+                    .record_extension_face(self.unwrapped_shape_ty(shape_ty, row), setter)
+                    .is_some()
+            {
                 Some(setter)
             } else {
                 // `receiverClassName` for the invocation face: `Function`
@@ -7468,6 +7475,29 @@ impl<'a> Engine<'a> {
             self.credit_record_extension_use(shape_ty, spelling, row.range.offset);
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
+    /// `shape_ty` with the `?` flag stripped when the access `?.`-unwrapped
+    /// its receiver — a `f?.bar` member row's `null_aware_members` latch
+    /// marks the unwrap, so the extension consult reads the non-null shape
+    /// (upstream's `applicableTo` runs against the promoted non-null static
+    /// type, never `T?` — the same unwrap
+    /// [`Self::credit_record_extension_use`] applies to its credit face).
+    fn unwrapped_shape_ty(&self, shape_ty: Ty, row: &Row) -> Ty {
+        if !self.null_aware_members.contains(&row.range.offset) {
+            return shape_ty;
+        }
+        match shape_ty {
+            Ty::Record { shape, .. } => Ty::Record {
+                shape,
+                nullable: false,
+            },
+            Ty::Function { shape, .. } => Ty::Function {
+                shape,
+                nullable: false,
+            },
+            other => other,
+        }
     }
 
     /// [`Self::check_shape_receiver`]'s miss tail: a merely-nullable
@@ -10639,30 +10669,30 @@ impl<'a> Engine<'a> {
     /// The function-receiver twin of [`Self::record_extension_face`]: a
     /// receiver whose static type is a FUNCTION type (`extension on
     /// PostMessage` over `typedef PostMessage = void Function(..)`) names
-    /// no container either. Both sides fold through aliases; a folded
-    /// function `on` shape must match the receiver's exactly (a nullable
-    /// `on` also accepts the non-null receiver), while a NAMED `on` head
-    /// spells one of the shape's named supertypes — every function type is
-    /// a `Function`, and a non-nullable one is an `Object`
-    /// (`applicableTo`'s subtype ask, `applicable_extensions.dart:157-171`)
-    /// — so `on Function`/`on Object` faces apply by head alone. A face
-    /// whose `on` type spells its own type parameters is left undecided
+    /// no container either. Both sides fold through aliases; the folded
+    /// `on` face then answers `applicableTo`'s subtype ask whole —
+    /// `receiver <: on` ([`Self::resolved_subtype`],
+    /// applicable_extensions.dart:251-270): a concrete `on` shape decides
+    /// by covariance/contravariance over the signature (`on void
+    /// Function()` accepts the `int Function()` literal's return face), a
+    /// NAMED `on` head spells one of the shape's named supertypes — every
+    /// function type is a `Function`, and a non-nullable one is an
+    /// `Object` — and the nullability pair rides the Left Nullable legs
+    /// (`int Function()? <: Object` fails, `<: Object?` holds). A face
+    /// whose `on` type spells the extension's own type parameters inside
+    /// its shape (`extension E<T> on T Function(T)`) asks
+    /// [`Self::fn_param_binding_applies`]'s inference-shaped question; a
+    /// parameter the binding walk cannot spell keeps the face undecided
     /// (no credit, the under-report direction). Single hit only, like the
     /// record face.
-    fn function_extension_face(
+    pub(crate) fn function_extension_face(
         &mut self,
         receiver: Ty,
         member: StringId,
     ) -> Option<(&'a ExtensionFace, FileId)> {
-        let Ty::Function {
-            shape: recv_shape,
-            nullable: recv_nullable,
-        } = receiver
-        else {
+        if !matches!(receiver, Ty::Function { .. }) {
             return None;
-        };
-        let function_head = self.intern("Function");
-        let object_head = self.intern("Object");
+        }
         self.accessible_extension_faces();
         let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
         let mut hits: Vec<(&'a ExtensionFace, FileId)> = Vec::new();
@@ -10693,29 +10723,29 @@ impl<'a> Engine<'a> {
                         self.resolved_subtype(Self::non_null_form(receiver), bound)
                     }
                 }
-            } else if !face.type_param_names.is_empty() {
-                continue;
             } else {
-                match self.fold_alias_ty(on_ty) {
-                    Ty::Function {
-                        shape: on_shape,
-                        nullable: on_nullable,
-                    } => on_shape == recv_shape && (on_nullable || !recv_nullable),
-                    // A named `on` head spells one of the shape's named
-                    // supertypes: every function type is a `Function`, and
-                    // every one is an `Object` — the subtype ask
-                    // (`applicableTo`) reduces to the two heads plus the
-                    // nullability pair (`int Function()? <: Object` fails,
-                    // `<: Object?` holds — the `on`'s own `?` decides).
-                    Ty::Named {
-                        name,
-                        nullable: on_nullable,
-                        ..
-                    } => {
-                        (name == function_head || name == object_head)
-                            && (on_nullable || !recv_nullable)
-                    }
-                    _ => false,
+                let folded = self.fold_alias_ty(on_ty);
+                // `applicableTo`'s subtype ask (`targetType <: extendedType`,
+                // applicable_extensions.dart:251-270): the concrete `on` face
+                // — `on void Function()`, `on Function`, `on Object` — folds
+                // to the same subtype question the interface lattice answers
+                // whole (a function's only named supertypes are `Function`
+                // and `Object`, and the nullability pair rides the Left
+                // Nullable legs). An `on` face spelling the face's own type
+                // parameters inside its shape (`extension E<T> on T
+                // Function(T)`) asks the inference-shaped question: gather
+                // each bare own-param leaf's binding off the receiver's
+                // matching shape slot, substitute, then answer the same
+                // subtype ask — plus the declared-bound check every bound
+                // parameter owes (`tryChooseFinalTypes`). A leaf the binding
+                // walk cannot spell (a parameter nested inside a compound
+                // leaf, an unaligned skeleton) leaves the face undecided.
+                if face.type_param_names.is_empty()
+                    || !self.ty_mentions_params(folded, &face.type_param_names)
+                {
+                    self.resolved_subtype(receiver, folded)
+                } else {
+                    self.fn_param_binding_applies(receiver, folded, face, face_file)
                 }
             };
             if applies {
@@ -10723,6 +10753,329 @@ impl<'a> Engine<'a> {
             }
         }
         (hits.len() == 1).then(|| hits[0])
+    }
+
+    /// The `extension E<T> on T Function(..)` application ask
+    /// ([`Self::function_extension_face`]'s param-spelling arm): each bare
+    /// own-parameter leaf in the `on` shape binds the receiver's aligned
+    /// leaf (`applicableTo`'s `constrainArgument(targetType, extendedType)`
+    /// — the return slot covariant, the formal slots contravariant; at the
+    /// binding level both read the same `T := leaf` fact). An unaligned
+    /// skeleton, an inconsistent pair, or a parameter a compound leaf hides
+    /// leaves the application undecided (`false` — the under-report
+    /// direction). A consistent binding substitutes through
+    /// [`Self::ty_subst_named`], then the whole `recv <: on[subst]` ask
+    /// decides — arity, variance, and the declared-bound leg included.
+    fn fn_param_binding_applies(
+        &self,
+        receiver: Ty,
+        on_ty: Ty,
+        face: &ExtensionFace,
+        face_file: FileId,
+    ) -> bool {
+        let (
+            Ty::Function {
+                shape: recv_shape, ..
+            },
+            Ty::Function { shape: on_shape, .. },
+        ) = (receiver, on_ty)
+        else {
+            return false;
+        };
+        let (recv_shape, on_shape) = {
+            let pool = self.boundary.pool();
+            (
+                pool.function_shape(recv_shape).clone(),
+                pool.function_shape(on_shape).clone(),
+            )
+        };
+        if on_shape.type_params != 0
+            || on_shape.positional.len() != recv_shape.positional.len()
+            || on_shape.named.len() != recv_shape.named.len()
+            || on_shape
+                .named
+                .iter()
+                .zip(recv_shape.named.iter())
+                .any(|(on, recv)| on.0 != recv.0)
+        {
+            return false;
+        }
+        // Each bare own-param leaf records a constraint, not a binding:
+        // the return slot is covariant (`recv <: on`, so the receiver's
+        // leaf LOWER-bounds the parameter — `T >= leaf`), the formal
+        // slots are contravariant (`on <: recv`, so they UPPER-bound —
+        // `T <= leaf`). `constrainArgument` collects exactly these; a
+        // leaf nested in a compound slot keeps the whole face undecided.
+        let mut lowers: FxHashMap<StringId, Vec<Ty>> = FxHashMap::default();
+        let mut uppers: FxHashMap<StringId, Vec<Ty>> = FxHashMap::default();
+        if let Ty::Named {
+            name: leaf,
+            args: ArgListId::EMPTY,
+            ..
+        } = on_shape.return_ty
+            && face.type_param_names.contains(&leaf)
+        {
+            lowers.entry(leaf).or_default().push(recv_shape.return_ty);
+        }
+        for (on_leaf, recv_leaf) in on_shape
+            .positional
+            .iter()
+            .zip(recv_shape.positional.iter())
+            .chain(
+                on_shape
+                    .named
+                    .iter()
+                    .zip(recv_shape.named.iter())
+                    .map(|(on, recv)| (&on.1, &recv.1)),
+            )
+        {
+            let Ty::Named {
+                name: leaf,
+                args: ArgListId::EMPTY,
+                ..
+            } = on_leaf
+            else {
+                continue;
+            };
+            if face.type_param_names.contains(leaf) {
+                uppers.entry(*leaf).or_default().push(*recv_leaf);
+            }
+        }
+        // Every parameter must bind somewhere — an unconstrained slot is
+        // one the inferrer solves to its bound, a face the name level
+        // cannot spell inside the substituted `on`.
+        if face.type_param_names.iter().any(|param| {
+            !lowers.contains_key(param) && !uppers.contains_key(param)
+        }) {
+            return false;
+        }
+        // Solve each parameter's interval: a candidate binding must lie
+        // above every lower constraint and below every upper one. The
+        // lower candidates are the only answers the ask commits to —
+        // try each in turn; the first that satisfies every leg (and its
+        // declared bound — `tryChooseFinalTypes` rejects a solution
+        // outside it) wins. A parameter with only upper constraints
+        // takes its own first upper as the trial face.
+        let mut bindings: FxHashMap<StringId, Ty> = FxHashMap::default();
+        for param in &face.type_param_names {
+            let lower_set = lowers.get(param).map(Vec::as_slice).unwrap_or(&[]);
+            let upper_set = uppers.get(param).map(Vec::as_slice).unwrap_or(&[]);
+            let mut candidates: Vec<Ty> = lower_set.to_vec();
+            for upper in upper_set {
+                if !candidates.contains(upper) {
+                    candidates.push(*upper);
+                }
+            }
+            let solved = candidates.iter().copied().find(|candidate| {
+                lower_set
+                    .iter()
+                    .all(|lower| self.resolved_subtype(*lower, *candidate))
+                    && upper_set
+                        .iter()
+                        .all(|upper| self.resolved_subtype(*candidate, *upper))
+            });
+            let Some(binding) = solved else {
+                return false;
+            };
+            bindings.insert(*param, binding);
+        }
+        // Every bound parameter's declared bound still owes its check —
+        // `tryChooseFinalTypes` rejects a solution outside it (an absent
+        // or `dynamic` bound is the top and accepts any binding).
+        for (index, bound) in face.type_param_bounds.iter().enumerate() {
+            if matches!(bound, Ty::Dynamic | Ty::Unknown) {
+                continue;
+            }
+            let Some(param) = face.type_param_names.get(index) else {
+                continue;
+            };
+            let Some(binding) = bindings.get(param) else { continue };
+            let bound = Self::non_null_form(self.boundary.ty(face_file, *bound));
+            if !self.resolved_subtype(Self::non_null_form(*binding), bound) {
+                return false;
+            }
+        }
+        let on_subst = self.ty_subst_named(on_ty, &bindings);
+        self.resolved_subtype(receiver, on_subst)
+    }
+
+    /// `ty` with every bare `Named` leaf in `map` replaced by its binding
+    /// (the `?` flag joins through [`Self::join_nullable_ty`]'s rule —
+    /// a `T?` leaf over a non-null binding stays nullable). Compound
+    /// leaves rebuild through the boundary pool; anything unmapped keeps
+    /// its written face. The `on`-shape twin of `assignability.rs`'s
+    /// signature-level `subst_ty` — this face substitutes a standalone
+    /// [`Ty`], not an `FnVarSig`.
+    fn ty_subst_named(&self, ty: Ty, map: &FxHashMap<StringId, Ty>) -> Ty {
+        if let Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        } = ty
+            && let Some(replacement) = map.get(&name)
+        {
+            return Self::join_nullable_ty(*replacement, nullable);
+        }
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } if args != ArgListId::EMPTY => {
+                let written: Vec<Ty> = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                };
+                let substituted: Vec<Ty> = written
+                    .iter()
+                    .map(|arg| self.ty_subst_named(*arg, map))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &substituted)
+            }
+            Ty::Function { shape, nullable } => {
+                let (type_params, type_params_named, return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.type_params_named.clone(),
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|ty| self.ty_subst_named(*ty, map))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, ty)| (*name, self.ty_subst_named(*ty, map)))
+                    .collect();
+                let names: Vec<(StringId, Option<Ty>)> = type_params_named
+                    .iter()
+                    .map(|&(name, bound)| (name, bound.map(|b| self.ty_subst_named(b, map))))
+                    .collect();
+                // The return face substitutes before the re-intern guard:
+                // `ty_subst_named` re-enters the pool in every compound arm
+                // (`pool()`'s borrow), which a live `RefMut` here panics
+                // against (the same discipline `subst_ty` keeps).
+                let return_ty = self.ty_subst_named(return_ty, map);
+                let mut pool = self.boundary.args.borrow_mut();
+                if names.is_empty() {
+                    pool.function(type_params, return_ty, &positional, &named, nullable)
+                } else {
+                    pool.function_generic(&names, return_ty, &positional, &named, nullable)
+                }
+            }
+            Ty::Record { shape, nullable } => {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|ty| self.ty_subst_named(*ty, map))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, ty)| (*name, self.ty_subst_named(*ty, map)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, nullable)
+            }
+            other => other,
+        }
+    }
+
+    /// `ty` with the `?` flag set when `nullable` holds (the join rule a
+    /// substituted `T?` leaf owes — `T := int` under `T?` reads `int?`).
+    fn join_nullable_ty(ty: Ty, nullable: bool) -> Ty {
+        if !nullable {
+            return ty;
+        }
+        match ty {
+            Ty::Named { name, args, .. } => Ty::Named {
+                name,
+                nullable: true,
+                args,
+            },
+            Ty::Record { shape, .. } => Ty::Record {
+                shape,
+                nullable: true,
+            },
+            Ty::Function { shape, .. } => Ty::Function {
+                shape,
+                nullable: true,
+            },
+            other => other,
+        }
+    }
+
+    /// Whether `ty` spells any of `params` in a leaf position — a bare
+    /// `Named` head or nested inside an argument list, a record field, or
+    /// a function shape's return/formal/bound faces. The own-parameter
+    /// gate [`Self::function_extension_face`]'s `on` walk runs: a shape
+    /// that mentions none takes the plain subtype ask, one that does owes
+    /// the binding pass.
+    fn ty_mentions_params(&self, ty: Ty, params: &[StringId]) -> bool {
+        // The pool's canonical shapes read under `&self` — the
+        // `boundary.pool()` snapshots below drop their borrow before the
+        // recursion re-enters them.
+        match ty {
+            Ty::Named { name, args, .. } => {
+                if params.contains(&name) {
+                    return true;
+                }
+                if args == ArgListId::EMPTY {
+                    return false;
+                }
+                let list = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                };
+                list.iter().any(|arg| self.ty_mentions_params(*arg, params))
+            }
+            Ty::Record { shape, .. } => {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                positional
+                    .iter()
+                    .chain(named.iter().map(|(_, ty)| ty))
+                    .any(|ty| self.ty_mentions_params(*ty, params))
+            }
+            Ty::Function { shape, .. } => {
+                let (return_ty, positional, named, bounds) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                        shape
+                            .type_params_named
+                            .iter()
+                            .filter_map(|(_, bound)| *bound)
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                std::iter::once(return_ty)
+                    .chain(positional.iter().copied())
+                    .chain(named.iter().map(|(_, ty)| *ty))
+                    .chain(bounds.iter().copied())
+                    .any(|ty| self.ty_mentions_params(ty, params))
+            }
+            _ => false,
+        }
     }
 
     /// The record-receiver extension application (`extension<BoxedT> on
@@ -10856,10 +11209,11 @@ impl<'a> Engine<'a> {
     /// Credits the record application's member use (the `usedElements`
     /// face — the same insert [`Self::extension_application`]'s unique-hit
     /// arm performs) plus the contributing import. A receiver whose alias
-    /// folds to a record reaches the `Unknown` receiver dispatch (no
-    /// container name exists), so this is the only credit path its member
-    /// sends ever see. A `?.` access already unwrapped the receiver — the
-    /// shape comparison reads the non-null record.
+    /// folds to a record (or a function shape) reaches the `Unknown`
+    /// receiver dispatch (no container name exists), so this is the only
+    /// credit path its member sends ever see. A `?.` access already
+    /// unwrapped the receiver — the shape comparison reads the non-null
+    /// shape.
     pub(crate) fn credit_record_extension_use(
         &mut self,
         receiver_ty: Ty,
@@ -10872,6 +11226,13 @@ impl<'a> Engine<'a> {
                     shape,
                     nullable: true,
                 } => Ty::Record {
+                    shape,
+                    nullable: false,
+                },
+                Ty::Function {
+                    shape,
+                    nullable: true,
+                } => Ty::Function {
                     shape,
                     nullable: false,
                 },
