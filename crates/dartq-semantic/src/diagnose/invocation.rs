@@ -19,6 +19,15 @@ mod ticket_2931_tests;
 #[path = "ticket_3510_tests.rs"]
 mod ticket_3510_tests;
 
+/// The #3575 pins (the `type_argument_not_matching_bounds` over-fire
+/// family: the promoted extension receiver, the facts-carrying message
+/// inversion, the alias-decorated written spellings, and the lazy
+/// parameter id collision). Registered the same `#[path]` way: the
+/// shared `tests` rig stays single-writer.
+#[cfg(test)]
+#[path = "ticket_3575_tests.rs"]
+mod ticket_3575_tests;
+
 /// The #2938 pins (the generic-send `couldNotInfer` face — the real
 /// constraint gather/choose/check pipeline over `foo<T>(args)` and the
 /// context-driven `F<args> = source` solve).
@@ -7114,6 +7123,29 @@ impl<'a> Engine<'a> {
         let Some(args) = self.call_args_for(callee) else {
             return;
         };
+        // A receiver whose frozen face is potentially NULLABLE abstains
+        // (#3575): pass 1 classified the receiver at its push-time face
+        // (`int? i1` under `if (i1 != null)` reads `int?` here), the
+        // promoted face exists only after the pass-2 read-type join
+        // (`Engine::read_types` fills after pass 1), and the extension's
+        // `on T` binding over the unpromoted face checks a bound the
+        // oracle — which reads the instantiated member type over the
+        // promoted receiver (`checkMethodInvocation`'s
+        // `node.function.staticType`) — never sees: the corpus's
+        // `expectStaticType<Exactly<int>>()` family fired 1052 rows the
+        // oracle does not report. The promotion-latch table cannot gate
+        // this seam — its bare-read arm excludes invoked callees
+        // (`Intent::Invoke`), and an extension-member bounds check rides
+        // an invoked send — so the nullable frozen face itself is the
+        // abstain signal. A NON-nullable face cannot be null-narrowed by
+        // a re-derivation, so it decides here as before; `this`-receiver
+        // and unresolved receivers keep the face below (the extension
+        // face's own silence cases decide them).
+        if let Receiver::Typed { ty, .. } = &recv
+            && self.potentially_nullable(*ty)
+        {
+            return;
+        }
         if let Some(params) = self.extension_member_bounds(&recv, member) {
             self.check_call_type_arg_bounds(&params, &args);
         }

@@ -82,7 +82,7 @@ use dartq_types::{
     Boundedness, CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy,
     TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedType,
     Variance, instantiate_type_formals_to_bounds, is_well_bounded, replace_top_bottom,
-    variance_in_type,
+    replace_top_bottom_with_facts, variance_in_type,
 };
 
 // The written-type capture is shared with the collector's pool feeding
@@ -2451,27 +2451,69 @@ impl<'a> Bounds<'a> {
                 // pass's there (`is_well_bounded` reports those), so the
                 // display re-runs the same inversion. The extension-type
                 // face skips the pass upstream too. A bare head keys the
-                // raw-type context row on the i2b instantiation.
-                let inverted_ty = allow_super.then(|| replace_top_bottom(&system, instantiation));
+                // raw-type context row on the i2b instantiation. The
+                // inversion is the FACTS-carrying one — the same
+                // `replace_top_bottom_with_facts` the verdict ran inside
+                // `is_well_bounded`: an alias parameter's computed
+                // variance decides whether an argument flips at all, so
+                // the facts-less `replace_top_bottom` inverted the
+                // message's substitution where the verdict (correctly)
+                // flipped nothing (`G<X> = void Function(X)` keeps
+                // `A<dynamic>` — a contravariant parameter's top argument
+                // is not a covariant top).
+                let inverted_ty = allow_super
+                    .then(|| replace_top_bottom_with_facts(&system, &snapshot.facts, instantiation));
                 let inverted = inverted_ty.map(|ty| snapshot.display(ty));
                 let raw_instantiated = raw.then(|| snapshot.display(instantiation));
-                // The message's bound is the WRITTEN spelling, substituted
-                // the way the failing pass substituted its types (#3510):
-                // an alias-headed bound keeps the alias decoration the
-                // oracle prints (`'A<dynamic>'`, display_string_builder
-                // .dart:379-382), which the snapshot's fully expanded
-                // model drops. The substitution source is the pass that
-                // produced the reported issues — the inverted
-                // instantiation where the super pass ran, the written one
-                // otherwise.
-                let subst_source = inverted_ty.unwrap_or(instantiation);
-                let mut subst: FxHashMap<StringId, TypeId> = FxHashMap::default();
+                // The message's argument and bound are the WRITTEN
+                // spellings, substituted the way the failing pass
+                // substituted its types (#3510): the oracle's
+                // `getDisplayString` keeps an alias decoration on every
+                // type the alias application built (`'G<Null>'`,
+                // `'Fcov<Object>'`, display_string_builder.dart:379-382),
+                // which the snapshot's fully expanded model drops. The
+                // reporting pass decides the rendering: the regular pass
+                // renders the written arguments resolved, the inverted
+                // pass re-runs the per-position top/bottom flip over the
+                // written trees — the same variance-aware walk the
+                // oracle's alias-preserving visitor applies. The bound's
+                // substitution then renders each substituted leaf through
+                // its written argument's text, so `Fcon<X>` over the
+                // argument `Fcon<Never?>` prints `'Fcon<Fcon<Never?>>'`.
+                // A bare head (no written arguments) substitutes the
+                // expanded instantiation's display instead.
+                let written_args: Vec<Option<String>> = (0..head_params.len())
+                    .map(|index| {
+                        args.get(index).and_then(|arg| {
+                            let variance = snapshot
+                                .decl_params
+                                .get(&decl)
+                                .and_then(|params| params.get(index))
+                                .map_or(Variance::Covariant, |&param| {
+                                    snapshot.facts.get(param).variance
+                                });
+                            snapshot.display_written_argument(
+                                arg,
+                                variance,
+                                inverted_ty.is_some(),
+                                scope,
+                            )
+                        })
+                    })
+                    .collect();
+                let mut subst: FxHashMap<StringId, String> = FxHashMap::default();
                 if let TypeKind::Interface { args: arg_range, .. } =
-                    snapshot.table.get(subst_source).kind()
+                    snapshot.table.get(instantiation).kind()
                 {
                     for (index, param) in head_params.iter().enumerate() {
                         if index < arg_range.len() {
-                            subst.insert(*param, snapshot.table.arg(arg_range.offset() + index));
+                            let expanded = snapshot.table.arg(arg_range.offset() + index);
+                            let text = written_args
+                                .get(index)
+                                .cloned()
+                                .flatten()
+                                .unwrap_or_else(|| snapshot.display(expanded));
+                            subst.insert(*param, text);
                         }
                     }
                 }
@@ -2480,7 +2522,11 @@ impl<'a> Bounds<'a> {
                     .map(|issue| BoundedIssue {
                         range: args.get(issue.index).map_or(site, |arg| arg.range),
                         site,
-                        argument: snapshot.display(issue.argument),
+                        argument: written_args
+                            .get(issue.index)
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| snapshot.display(issue.argument)),
                         parameter: snapshot.param_text(issue.parameter),
                         bound: head_bounds
                             .get(issue.index)
@@ -3186,10 +3232,13 @@ impl MapCtx<'_, '_> {
             let id = lazy
                 .entry(name)
                 .or_insert_with(|| {
-                    (
-                        TypeParamId::from_raw(self.next_param.get()),
-                        self.strings.resolve(name).to_string(),
-                    )
+                    // The allocation MUST advance the counter: two fresh
+                    // names in one scope otherwise share one id, and the
+                    // shared id displays (and reads facts) under whichever
+                    // name `param_text` happens to find first.
+                    let id = TypeParamId::from_raw(self.next_param.get());
+                    self.next_param.set(self.next_param.get() + 1);
+                    (id, self.strings.resolve(name).to_string())
                 })
                 .0;
             scope.insert(name, id);
@@ -4038,17 +4087,20 @@ impl<'a> Snapshot<'a> {
     /// (`'A<dynamic>'` — `getDisplayString` writes the alias decoration,
     /// display_string_builder.dart:379-382) while the verdict compares the
     /// expansion. `subst` maps the checked head's parameter names to the
-    /// failing pass's argument types; a leaf naming one renders that
-    /// argument, and a bare generic head (alias or container) renders its
-    /// instantiate-to-bounds form — the same fill `display` applies to a
-    /// raw head. `None` where the written spelling cannot render (a
-    /// poisoned, function-form, or record node — their expanded display is
-    /// the alias-free shape already — or a head the registry and the
-    /// substitution both miss): the caller keeps the expanded display.
+    /// failing pass's rendered argument texts (#3575 — the written
+    /// argument's own spelling, so an alias-substituted leaf prints
+    /// `'Fcon<Fcon<Never?>>'`, never the expansion); a leaf naming one
+    /// renders that text, and a bare generic head (alias or container)
+    /// renders its instantiate-to-bounds form — the same fill `display`
+    /// applies to a raw head. `None` where the written spelling cannot
+    /// render (a poisoned, function-form, or record node — their expanded
+    /// display is the alias-free shape already — or a head the registry
+    /// and the substitution both miss): the caller keeps the expanded
+    /// display.
     fn display_written_bound(
         &self,
         tree: &TypeTree,
-        subst: &FxHashMap<StringId, TypeId>,
+        subst: &FxHashMap<StringId, String>,
     ) -> Option<String> {
         if tree.poisoned || tree.record.is_some() || tree.function.is_some() {
             return None;
@@ -4056,8 +4108,17 @@ impl<'a> Snapshot<'a> {
         let text = self.strings.resolve(tree.head);
         let suffix = if tree.nullable { "?" } else { "" };
         if tree.args.is_empty() {
-            if let Some(&ty) = subst.get(&tree.head) {
-                return Some(format!("{}{suffix}", self.display(ty)));
+            if let Some(text) = subst.get(&tree.head) {
+                // The substituted leaf renders the substituted argument's
+                // text; a nullable leaf takes that text's nullable form —
+                // `X?` over `X := X?` prints `X?`, never `X??` (the
+                // substitution replaces the parameter wholesale, so
+                // nullability never stacks).
+                return Some(if tree.nullable && !text.ends_with('?') {
+                    format!("{text}?")
+                } else {
+                    text.clone()
+                });
             }
             let decl = *self.registry.get(&tree.head)?;
             let params = self.decl_params.get(&decl)?;
@@ -4082,6 +4143,157 @@ impl<'a> Snapshot<'a> {
             .map(|arg| self.display_written_bound(arg, subst))
             .collect::<Option<Vec<_>>>()?;
         Some(format!("{text}<{}>{suffix}", rendered.join(", ")))
+    }
+
+    /// The per-position top/bottom flip of the inverted pass's message
+    /// face: the mirror of `process_top_bottom`'s leaf probe — a
+    /// contravariant position replaces the bottom (`Never`) with
+    /// `Object?`, every other position replaces a top (`dynamic`, `void`,
+    /// `Object?`) with `Never`. `None` = the leaf does not flip.
+    fn flipped_leaf_text(text: &str, variance: Variance) -> Option<&'static str> {
+        if variance == Variance::Contravariant {
+            (text == "Never").then_some("Object?")
+        } else {
+            matches!(text, "dynamic" | "void" | "Object?").then_some("Never")
+        }
+    }
+
+    /// The message face of a WRITTEN argument tree (#3575): the resolved
+    /// spelling the oracle prints, where an alias application keeps its
+    /// decoration (`'G<Null>'`, `'Fcov<Object>'`) while the verdict
+    /// compares the expansion. The inverted pass (`flip`) re-runs the
+    /// per-position top/bottom flip over the written shape — the same
+    /// variance-aware walk `ReplaceTopBottomVisitor` applies (an alias
+    /// rewraps with its arguments flipped by the typedef variance, a
+    /// function flips its return and formals oppositely, a container
+    /// argument combines its declared — legacy-covariant — variance).
+    /// `scope` resolves the parameter leaves (rendered by name — a type
+    /// parameter is neither top nor bottom, so the flip never touches
+    /// one). `None` where the written shape cannot render (a poisoned or
+    /// record node, an unregistered head, an arity mismatch): the caller
+    /// keeps the expanded display.
+    fn display_written_argument(
+        &self,
+        tree: &TypeTree,
+        variance: Variance,
+        flip: bool,
+        scope: &FxHashMap<StringId, TypeParamId>,
+    ) -> Option<String> {
+        if tree.poisoned || tree.record.is_some() {
+            return None;
+        }
+        let render_leaf = |text: &str, nullable: bool| -> String {
+            let flipped = flip.then(|| Self::flipped_leaf_text(text, variance)).flatten();
+            match flipped {
+                // A flipped leaf carries its own nullability (`Object?` is
+                // nullable, `Never` is not).
+                Some(replacement) => replacement.to_string(),
+                None => {
+                    let suffix = if nullable { "?" } else { "" };
+                    format!("{text}{suffix}")
+                }
+            }
+        };
+        if let Some(function) = &tree.function {
+            let ret = match &function.ret {
+                Some(ret) => self.display_written_argument(ret, variance, flip, scope)?,
+                // An unwritten return reads `dynamic` (the same resolution
+                // `map_function` interns).
+                None => render_leaf("dynamic", false),
+            };
+            let mut text = format!("{ret} Function");
+            let type_parameters: Vec<String> = function
+                .type_params_named
+                .iter()
+                .map(|(name, _)| self.strings.resolve(*name).to_string())
+                .collect();
+            if !type_parameters.is_empty() {
+                text.push_str(&format!("<{}>", type_parameters.join(", ")));
+            }
+            let formal = |tree: &TypeTree| {
+                self.display_written_argument(
+                    tree,
+                    variance.combine(Variance::Contravariant),
+                    flip,
+                    scope,
+                )
+            };
+            let mut formals: Vec<String> = function
+                .positional
+                .iter()
+                .map(formal)
+                .collect::<Option<Vec<_>>>()?;
+            let named: Vec<String> = function
+                .named
+                .iter()
+                .map(|(name, tree)| {
+                    Some(format!(
+                        "required {} {}",
+                        formal(tree)?,
+                        self.strings.resolve(*name)
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if !named.is_empty() {
+                formals.push(format!("{{{}}}", named.join(", ")));
+            }
+            let suffix = if tree.nullable { "?" } else { "" };
+            return Some(format!("{text}({}){suffix}", formals.join(", ")));
+        }
+        let text = self.strings.resolve(tree.head);
+        // A user-declared core shadow keeps its registry face — the same
+        // resolution order `map_tree` takes (`dynamic`/`void` are keywords
+        // and can never be declared).
+        let shadowed =
+            matches!(text, "Null" | "Never" | "FutureOr") && self.registry.contains_key(&tree.head);
+        if !shadowed && matches!(text, "dynamic" | "void" | "Null" | "Never") {
+            return Some(render_leaf(text, tree.nullable));
+        }
+        if !shadowed && text == "FutureOr" {
+            if tree.args.len() != 1 {
+                return None;
+            }
+            let base = self.display_written_argument(&tree.args[0], variance, flip, scope)?;
+            let suffix = if tree.nullable { "?" } else { "" };
+            return Some(format!("FutureOr<{base}>{suffix}"));
+        }
+        let suffix = if tree.nullable { "?" } else { "" };
+        if let Some(&decl) = self.registry.get(&tree.head) {
+            let params = self.decl_params.get(&decl)?;
+            if tree.args.is_empty() {
+                if params.is_empty() {
+                    return Some(render_leaf(text, tree.nullable));
+                }
+                // A bare parameterized argument displays its
+                // instantiate-to-bounds form (`raw_display`'s face).
+                let defaults =
+                    instantiate_type_formals_to_bounds(&self.table, &self.facts, params);
+                let rendered: Vec<String> = defaults
+                    .defaults
+                    .iter()
+                    .map(|&ty| self.display(ty))
+                    .collect();
+                return Some(format!("{text}<{}>{suffix}", rendered.join(", ")));
+            }
+            if tree.args.len() != params.len() {
+                return None;
+            }
+            let rendered: Vec<String> = tree
+                .args
+                .iter()
+                .zip(params.iter())
+                .map(|(arg, &param)| {
+                    let declared = self.facts.get(param).variance;
+                    self.display_written_argument(arg, declared.combine(variance), flip, scope)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(format!("{text}<{}>{suffix}", rendered.join(", ")));
+        }
+        // An in-scope type parameter renders by name; anything else is not
+        // a shape the written face can vouch for.
+        scope
+            .contains_key(&tree.head)
+            .then(|| render_leaf(text, tree.nullable))
     }
 
     /// The written-tree projection of a snapshot type (#2838): the ITB
