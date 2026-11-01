@@ -20109,3 +20109,17 @@ mod ticket_3464_tests;
 #[cfg(test)]
 #[path = "ticket_3379_tests.rs"]
 mod ticket_3379_tests;
+
+// The #37 pins. Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3437_tests.rs"]
+mod ticket_3437_tests;
+
+// The #38 pins. Registered here via `#[path]`; the
+// module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
+// resolves.
+#[cfg(test)]
+#[path = "ticket_3438_tests.rs"]
+mod ticket_3438_tests;
