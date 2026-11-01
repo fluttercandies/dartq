@@ -555,6 +555,28 @@ impl<'a> Engine<'a> {
                 .contains(&self.intern(std::str::from_utf8(span).unwrap_or("")))
     }
 
+    /// Whether the byte before the `.` that precedes `offset` is a `?` —
+    /// the `?.`/`?..` token faces the shared dot-shorthand probe's
+    /// catch-all cannot separate from a leading-dot shorthand (both leave
+    /// a `.`-then-selector byte pair; only the token kind does, and the
+    /// byte walk sees neither). A null-aware member/cascade selector
+    /// (`x?._()`) is a receiver access, never the fold's headless shape.
+    fn byte_before_dot_is_question(&self, offset: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(offset);
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || bytes[i - 1] != b'.' {
+            return false;
+        }
+        i -= 1;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i > 0 && bytes[i - 1] == b'?'
+    }
+
     /// The creation/metadata selector credit (`const C._x()`,
     /// `new C._x()`, `@C._x`): the parser routes a constructor
     /// reference's selector through the creation-head events instead of a
@@ -1892,6 +1914,36 @@ impl<'a> Engine<'a> {
         // `top_level_used` set would mask the twin behind the winning
         // spelling's use, so every later claimant skips that credit.
         let mut top_level_first_claims: FxHashSet<StringId> = FxHashSet::default();
+        // The dot-shorthand constructor invocation (`._(...)` under a
+        // written-type declaration): the parser folds the selector to a
+        // bare name and drops the `.` (the const capture's fold — the
+        // root node's span starts at the selector token), so no
+        // creation-head event routes `credit_constructor_selector` and
+        // the constructor reads unused. The oracle resolves the
+        // shorthand against the declaration's context type and credits
+        // that constructor element (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/constant/evaluation.dart
+        // visitDotShorthandConstructorInvocation2:880-916). The fold's
+        // exact shape is re-derived here: a read row spelled at a
+        // leading-dot position ([`Engine::dot_shorthand_context`]) whose
+        // next token opens the argument group — the invocation face, not
+        // a plain wildcard read (`f(_)` closes on `)`) and not a
+        // receiver-qualified access (`x._()` keeps its receiver bytes).
+        // The credit is spelling-scoped, not element-scoped: the
+        // shorthand's context type is the declaration's written type,
+        // which the finalize pass does not model — a same-spelling
+        // selector on a sibling class shares the credit (the
+        // under-report direction every spelling-level corner keeps).
+        let shorthand_ctor_refs: FxHashSet<StringId> = self
+            .rows
+            .iter()
+            .filter(|row| {
+                self.dot_shorthand_context(row.range.offset)
+                    && !self.byte_before_dot_is_question(row.range.offset)
+                    && self.byte_at(row.range.end()) == Some(b'(')
+            })
+            .map(|row| row.name)
+            .collect();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
             let bare = self.bare_name(site.name);
@@ -2311,7 +2363,8 @@ impl<'a> Engine<'a> {
                         // under-report face (upstream spares it via
                         // `usedElements.elements`).
                         let ctor_used = member_used_elements
-                            .contains(&(self.file, container, site.name));
+                            .contains(&(self.file, container, site.name))
+                            || shorthand_ctor_refs.contains(&site.name);
                         let spared = !multi
                             || pragma_spared
                             || (!self.is_nameless(site.name)
@@ -5327,13 +5380,91 @@ impl<'a> Engine<'a> {
         // operand's node range / the `??=` value's expression span).
         let coalesces = std::mem::take(&mut self.coalesce_staged);
         for (read, range) in coalesces {
-            if promotions
+            // The local arm (the promotion table) and the target arm (the
+            // promotion-free declared read face) mirror upstream's two
+            // `readType` sources: a local target reads its flow-promoted
+            // type (`localVariableTypeProvider.getType`), while a member
+            // target reads the getter/field's declared return — never in
+            // the local table (`setReadElement`, resolver.dart:1754-1792),
+            // so its staged pair rides the declared face instead.
+            let anchored = promotions
                 .promoted(read)
                 .is_some_and(Ty::is_strictly_non_nullable)
-            {
+                || self.staged_target_read_never_null(read);
+            if anchored {
                 self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
             }
         }
+    }
+
+    /// The staged `??`/`??=` pair's non-local target face: the promotion
+    /// table never carries a member read (its rows key the bare local
+    /// read's own span — a member row's merged span never matches), so a
+    /// staged pair the local arm missed re-decides on the target row's
+    /// declared/static type — upstream `readType`'s promotion-free member
+    /// source (`setReadElement`: the getter/field's declared return, the
+    /// compound-assignment read face `visitAssignmentExpression` feeds
+    /// `_checkForDeadNullCoalesce`, error_verifier.dart:444-449).
+    ///
+    /// The verdict mirrors [`crate::diagnose::scopes_bodies`]'s walk-time
+    /// face: a `?.`-merged read stays nullable (`widen_null_aware`'s
+    /// posture — the short-circuit read never anchors), the row's own
+    /// static type answers first, and a member row re-asks the
+    /// parse-recorded member read (the merge's receiver classification
+    /// survives the walk) for its declared accessor face. Every
+    /// unknown/invalid answer keeps `false` — the arm only ever anchors
+    /// the strictly-non-nullable declared face, never widens it.
+    fn staged_target_read_never_null(&self, read: SourceRange) -> bool {
+        // A `?.`-merged read is nullable whatever the declared face.
+        if self.null_aware_members.contains(&read.offset) {
+            return false;
+        }
+        // The staged span IS the target row's own range (`check_dead_null_assignment`
+        // stages `target_range`): rows are offset-sorted and a receiver's
+        // bare read can share the offset, so the bounded tail scan matches
+        // the full range.
+        let start = self.rows.partition_point(|row| row.range.offset < read.offset);
+        let Some(row) = self.rows[start..]
+            .iter()
+            .rev()
+            .find(|row| row.range == read)
+        else {
+            return false;
+        };
+        let declared = self.operand_static_ty(row);
+        if declared != Ty::UNKNOWN
+            && !self.written_ty_invalid(declared)
+            && self.strictly_non_nullable(declared)
+        {
+            return true;
+        }
+        // The parse-recorded member face: the walk-time accessor path
+        // answers from the row shape, the staged join re-asks through the
+        // recorded read (its receiver classification was taken at the
+        // merge, before any fold reshaped the row). The member read keys
+        // at the member token inside the staged span, never the receiver
+        // head the row's own offset spells.
+        if !matches!(row.shape, RowShape::Member { .. }) {
+            return false;
+        }
+        let end = self
+            .member_reads
+            .partition_point(|member| member.offset < read.end());
+        let Some(anchor) = self.member_reads[..end].iter().rev().find_map(|member| {
+            (member.recv_span.offset >= read.offset).then_some(member.offset)
+        }) else {
+            return false;
+        };
+        let Some((entry, _, _)) = self.member_read_resolution(anchor) else {
+            return false;
+        };
+        let face = match entry.kind {
+            MemberKind::Field => entry.var_ty,
+            _ => entry.return_ty,
+        };
+        face != Ty::UNKNOWN
+            && !self.written_ty_invalid(face)
+            && self.strictly_non_nullable(face)
     }
 
     /// The enclosing executable's lookup spelling once its name has fired
