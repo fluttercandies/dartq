@@ -513,11 +513,26 @@ impl<'a> Engine<'a> {
                 continue;
             };
             let mut element_ty = row_ty;
-            if spread
-                && let Ty::Named { name, args, .. } = row_ty
-                && let Some(first) = self.spread_element_face(name, args)
-            {
-                element_ty = first;
+            if spread {
+                // A spread element contributes its operand's ELEMENT type
+                // (type_analyzer.dart's spread-element resolution), never
+                // the operand whole — the face answers that contribution
+                // only for an `Iterable`-reaching head. Every other shape
+                // contributes nothing to the assignability ask: `dynamic`
+                // `Null`/a non-iterable operand is the spread verifier's
+                // row (`not_iterable_spread`/`not_null_aware_null_spread`),
+                // and a raw `Iterable` donates `dynamic` — all silent here.
+                // Falling back to `row_ty` fabricates the element code on
+                // operands the oracle never asks this question of.
+                match row_ty {
+                    Ty::Named { name, args, .. } => {
+                        let Some(first) = self.spread_element_face(name, args) else {
+                            continue;
+                        };
+                        element_ty = first;
+                    }
+                    _ => continue,
+                }
             }
             if self.assignable(element_ty, declared, false) == Some(false) {
                 let (a0, a1) = (self.ty_display(element_ty), self.ty_display(declared));

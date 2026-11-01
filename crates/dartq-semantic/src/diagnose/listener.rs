@@ -9509,6 +9509,43 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         // `SetOrMapLiteral`/`MapLiteralEntry` are in the official used set.
         engine.ur_seal_used();
+        // The literal's resolved kind (`_inferSetOrMapLiteralType`):
+        // a `Map` context dominates, then the leaves' can-be/must-be
+        // fold, then a set context's iterable fallback. `None` is the
+        // ambiguous literal — upstream records `dynamic` and runs NO
+        // element verifier (`visitSetOrMapLiteral`'s `isMap`/`isSet`
+        // dispatch), so the spread/expression/const-shape faces all
+        // abstain rather than fire on the parser's map default.
+        let resolved_kind = match engine.typed_set_or_map_literal_ty(left) {
+            // A written type group resolves by its own arity: `<E>{...}`
+            // is a set, `<K, V>{...}` a map, any other arity the oracle's
+            // nonsense-group recovery (it records no usable type — the
+            // leaves still decide below).
+            Some((_, Ty::Named { args, .. })) => {
+                match engine.boundary.args.borrow().get(args).len() {
+                    1 => Some(SpreadLiteralKind::Set),
+                    2 => Some(SpreadLiteralKind::Map),
+                    _ => None,
+                }
+            }
+            _ if count == 0 => Some(match engine.literal_context_side(left) {
+                Some(false) => SpreadLiteralKind::Set,
+                _ => SpreadLiteralKind::Map,
+            }),
+            _ => match engine.literal_context_side(left) {
+                // A `Map` context dominates the leaves outright.
+                Some(true) => Some(SpreadLiteralKind::Map),
+                // Ambiguous leaves defer to a `Set` context's iterable
+                // fallback; with no context at all the literal stays
+                // unresolved.
+                Some(false) => Some(
+                    engine
+                        .leaves_resolve_kind(left, right)
+                        .unwrap_or(SpreadLiteralKind::Set),
+                ),
+                None => engine.leaves_resolve_kind(left, right),
+            },
+        };
         if let Some((shape, has_ctl)) =
             engine
                 .const_capture
@@ -9562,8 +9599,20 @@ impl ParserListener for DiagnoseListener<'_> {
                         // reports `const_spread_expected_map`. The staged
                         // entries carry no non-Entry operand (the
                         // map-resolved split dropped them), so the
-                        // row-level fallback answers the shape ask.
-                        engine.check_const_spread_shapes(left, right, &[], true);
+                        // row-level fallback answers the shape ask. The
+                        // literal's RESOLVED kind decides the expected
+                        // shape — the parser's `hasSetEntry` flag missed
+                        // spread-decided literals (`const {...list}` is a
+                        // set upstream), and an ambiguous literal's
+                        // verifier never runs.
+                        if let Some(kind) = resolved_kind {
+                            engine.check_const_spread_shapes(
+                                left,
+                                right,
+                                &[],
+                                kind == SpreadLiteralKind::Map,
+                            );
+                        }
                         let payload = engine.map_payload(&entries);
                         engine.push_literal_value(failed, right.range, InstanceKind::Map, payload);
                     }
@@ -9594,12 +9643,19 @@ impl ParserListener for DiagnoseListener<'_> {
                         };
                         let failed =
                             engine.check_const_elements(element_code, &elements);
-                        // The const spread-shape face: a `...expr` operand
-                        // that evaluates to a non-map value reports
-                        // `const_spread_expected_map`.
-                        engine.check_const_spread_shapes(
-                            left, right, &elements, has_entry,
-                        );
+                        // The const spread-shape face asks the literal's
+                        // RESOLVED kind — a `:`-led leaf makes it a map,
+                        // a spread-decided literal reads its operand's
+                        // side (`const {...list}` is a set upstream), and
+                        // an ambiguous literal's verifier never runs.
+                        if let Some(kind) = resolved_kind {
+                            engine.check_const_spread_shapes(
+                                left,
+                                right,
+                                &elements,
+                                kind == SpreadLiteralKind::Map,
+                            );
+                        }
                         let payload = engine
                             .literal_payload(&elements)
                             .map(|values| ConstantValue::Set(values.into()));
@@ -9729,25 +9785,37 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.push_typed_value_row(range, ty);
             return;
         }
-        // The literal's side (`_computeSetOrMapResolution`): the parser's
-        // `hasSetEntry` is touched only by a top-level simple entry, so a
-        // literal of spreads and control-flow elements leaves it unset —
-        // the context decides first (`_fromContextType`), then the leaves
-        // (`_fromElement`; [`Engine::leaves_decide_set`]). A literal
-        // neither decides keeps the parser's map default.
-        let kind = if count == 0 {
-            UntypedLiteral::EmptyBraces
-        } else if has_set_entry {
-            UntypedLiteral::SetElements
-        } else {
-            match engine.literal_context_side(left) {
-                Some(true) => UntypedLiteral::MapEntries,
-                Some(false) => UntypedLiteral::SetElements,
-                None if engine.leaves_decide_set(left, right) => UntypedLiteral::SetElements,
-                None => UntypedLiteral::MapEntries,
+        // The literal's row-model side for the downstream typing faces:
+        // `resolved_kind` (computed above the const block) is the
+        // oracle's decision — the empty form's `EmptyBraces` marker, a
+        // decided side's own kind, or NOTHING for the ambiguous literal
+        // (upstream records `dynamic`; an `untyped_literals` entry would
+        // let the assignability faces spell a `Map` the oracle never
+        // typed).
+        match resolved_kind {
+            Some(SpreadLiteralKind::Set) => {
+                engine
+                    .untyped_literals
+                    .insert(right.range.offset, UntypedLiteral::SetElements);
             }
-        };
-        engine.untyped_literals.insert(right.range.offset, kind);
+            Some(SpreadLiteralKind::Map) if count == 0 => {
+                engine
+                    .untyped_literals
+                    .insert(right.range.offset, UntypedLiteral::EmptyBraces);
+            }
+            // An ambiguous literal resolves `dynamic` upstream, and the
+            // `None` answer suppresses its element VERIFIERS below — but
+            // the typing faces downstream still read the literal's
+            // `MapEntries` marker (the promotion/assignability asks the
+            // legacy shape answered before the resolved-kind verdict
+            // existed; dropping the entry starved `??=` promotion and
+            // return-context reads — ticket_3534 regression #1).
+            _ => {
+                engine
+                    .untyped_literals
+                    .insert(right.range.offset, UntypedLiteral::MapEntries);
+            }
+        }
         // The untyped literal's map-context entry face: a written
         // `Map<K, V>` in the direct initializer / arrow-body / `return`
         // position donates its type arguments to the entry checks
@@ -9758,12 +9826,14 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // The spread-element verifier and the `expression_in_map` face run
         // on the resolved kind (upstream `literal_element_verifier.dart`
-        // `_verifyElement`'s dispatch).
-        match kind {
-            UntypedLiteral::SetElements => {
+        // `_verifyElement`'s dispatch). An ambiguous literal resolves to
+        // `dynamic` upstream — `visitSetOrMapLiteral`'s `isMap`/`isSet`
+        // dispatch runs NEITHER verifier, so both faces abstain here.
+        match resolved_kind {
+            Some(SpreadLiteralKind::Set) => {
                 engine.check_spread_elements(left, right, SpreadLiteralKind::Set);
             }
-            UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
+            Some(SpreadLiteralKind::Map) => {
                 engine.check_spread_elements(left, right, SpreadLiteralKind::Map);
                 engine.check_expression_in_map(left, right);
             }
@@ -13131,7 +13201,10 @@ impl Engine<'_> {
             match self.leaf_side(start, end) {
                 LeafSide::Map => has_map = true,
                 LeafSide::Set => has_set = true,
-                LeafSide::Either => either_evidence = true,
+                // `Either` forces nothing itself; `Neither` positively
+                // kills both can-be bits — both leave the literal
+                // unresolvable, so both are `_either` evidence.
+                LeafSide::Either | LeafSide::Neither => either_evidence = true,
                 LeafSide::Blind => hidden_side = true,
             }
         }
@@ -13153,41 +13226,74 @@ impl Engine<'_> {
         self.emit_message_with_correction(code, range, message);
     }
 
-    /// Whether the brace literal's leaves decide a set
-    /// (`typed_literal_resolver.dart` `_fromElement`'s combination): some
-    /// leaf is a set side and none a map side. A spread whose side the rows
-    /// cannot see decides nothing — were it a `Map`, the literal is the
-    /// `_both` error either way.
-    fn leaves_decide_set(&self, left: Token, right: Token) -> bool {
-        let mut set = false;
+    /// The brace literal's resolved kind from its leaves
+    /// (`typed_literal_resolver.dart` `_inferSetOrMapLiteralType`'s
+    /// can-be/must-be combination): each leaf fills the can-be/must-be
+    /// slots through [`Self::leaf_side`], the walk folds them
+    /// (`canBeASet = canBeASet && element.canBeSet`,
+    /// `mustBeASet = mustBeASet || element.mustBeSet`), and the tail
+    /// decides — `canBeASet && mustBeASet` resolves a set, `canBeAMap &&
+    /// mustBeAMap` a map, every other shape is the ambiguous literal the
+    /// oracle leaves UNRESOLVED (its `typeOrThrow` is `dynamic`, so
+    /// `visitSetOrMapLiteral` runs neither element verifier — the
+    /// `None` answer suppresses the spread/expression faces instead of
+    /// fabricating the parser's map default).
+    fn leaves_resolve_kind(&self, left: Token, right: Token) -> Option<SpreadLiteralKind> {
+        let mut can_set = true;
+        let mut must_set = false;
+        let mut can_map = true;
+        let mut must_map = false;
         for (start, end) in self.literal_leaves(left, right) {
             match self.leaf_side(start, end) {
-                LeafSide::Map => return false,
-                LeafSide::Set => set = true,
+                // `elementType` fills the element slot alone: a decided
+                // expression/set-side leaf never contributes the key/value
+                // slots, so it poisons `canBeMap` too (`{8, ...aMap}` is
+                // the ambiguous `_both`, not a map).
+                LeafSide::Set => {
+                    can_map = false;
+                    must_set = true;
+                }
+                LeafSide::Map => {
+                    can_set = false;
+                    must_map = true;
+                }
+                LeafSide::Neither => {
+                    can_set = false;
+                    can_map = false;
+                }
+                // `Either` fills every can-be slot without forcing a
+                // must-be bit; `Blind` may hide a side the oracle already
+                // decided — both leave the fold untouched (the abstain
+                // posture).
                 LeafSide::Either | LeafSide::Blind => {}
             }
         }
-        set
+        if can_set && must_set {
+            Some(SpreadLiteralKind::Set)
+        } else if can_map && must_map {
+            Some(SpreadLiteralKind::Map)
+        } else {
+            None
+        }
     }
 
-    /// One leaf's must-be side (`_inferCollectionElementType`'s
-    /// `mustBeMap`/`mustBeSet` bits).
+    /// One leaf's can-be/must-be side (`_inferCollectionElementType`'s
+    /// per-element type-information slots): an expression is a set side,
+    /// an entry a map side; a spread's operand type decides — an
+    /// `Iterable` operand fills the element slot (set side), a `Map`
+    /// operand the key/value slots (map side), `dynamic`/`Never`/
+    /// null-aware-`Null` fills all three (neither must-be), a decided
+    /// non-collection fills none (poisons both can-be bits), and an
+    /// operand the row model cannot see stays undecided in the abstain
+    /// posture.
     fn leaf_side(&self, start: usize, end: usize) -> LeafSide {
         let bytes = self.source.as_bytes();
         let s = trim_ws(bytes, start, end);
         if bytes[s..].starts_with(b"...") {
-            // The spread expression's row decides (`SpreadElementImpl`'s
-            // arm): a resolved `Map` spread must be a map side, a resolved
-            // iterable-family spread a set side; a `dynamic`/non-collection
-            // row fills the can-be slots without forcing either must-be
-            // bit — positive `_either` evidence.
+            let null_aware = bytes.get(s + 3) == Some(&b'?');
             let s16 = self.utf16_of(s);
             let e16 = self.utf16_of(end);
-            let after = trim_ws(
-                bytes,
-                s + 3 + usize::from(bytes.get(s + 3) == Some(&b'?')),
-                end,
-            );
+            let after = trim_ws(bytes, s + 3 + usize::from(null_aware), end);
             // A collection-literal operand: the rows inside it are its
             // elements, never the operand — `row_in_span` would read an
             // inner element's type as the spread's. A list literal is an
@@ -13216,33 +13322,76 @@ impl Engine<'_> {
                 }
                 _ => {}
             }
-            if let Some((ty, _)) = self.row_in_span(s16, e16) {
-                let Ty::Named { name, .. } = ty else {
-                    return LeafSide::Either;
-                };
-                if name == self.collection_heads[2] {
-                    return LeafSide::Map;
+            match self.spread_operand_ty(s16, e16) {
+                // No row at all: the operand's type is invisible. An
+                // unresolvable operand is the oracle's error-dynamic
+                // shape (positive `_either` evidence); a resolved one
+                // hides a real type whose side may already have decided
+                // the literal — blind.
+                None => {
+                    if let Some(name) = leading_ident_name(self, after, end) {
+                        if self.resolve_local(name).is_none()
+                            && matches!(self.resolve_bare(name).0, BareInfo::Missing { .. })
+                        {
+                            return LeafSide::Either;
+                        }
+                    }
+                    return LeafSide::Blind;
                 }
-                if name == self.collection_heads[0]
-                    || name == self.collection_heads[1]
-                    || name == self.collection_heads[3]
-                {
-                    return LeafSide::Set;
-                }
-                return LeafSide::Either;
-            }
-            // No row: the operand's type is invisible. An unresolvable
-            // operand is the oracle's error-dynamic shape (positive
-            // `_either` evidence); a resolved one hides a real type whose
-            // side may already have decided the literal — blind.
-            if let Some(name) = leading_ident_name(self, after, end) {
-                if self.resolve_local(name).is_none()
-                    && matches!(self.resolve_bare(name).0, BareInfo::Missing { .. })
+                // `dynamic`/undecidable/`Never` fill all three slots —
+                // can-be either side, must-be neither.
+                Some(ty)
+                    if ty == Ty::UNKNOWN || ty == Ty::Dynamic || self.is_never_ty(ty) =>
                 {
                     return LeafSide::Either;
                 }
+                Some(ty) => {
+                    // Subtype-of-`Null`: `...?` admits it (all three
+                    // slots fill with `Never`); `...` leaves the
+                    // element's info EMPTY — it poisons both can-be
+                    // bits.
+                    if self.assignable(ty, Ty::Null, false) == Some(true) {
+                        return if null_aware {
+                            LeafSide::Either
+                        } else {
+                            LeafSide::Neither
+                        };
+                    }
+                    // A type-parameter head reads its bound, matching
+                    // `asInstanceOf`'s bound resolution.
+                    let ty = self.bound_face(ty);
+                    let Ty::Named { name: head, .. } = ty else {
+                        // A function/record/void operand fills no slot.
+                        return LeafSide::Neither;
+                    };
+                    // A head the model cannot resolve (a callee-side
+                    // type parameter, an unmodeled spelling) is
+                    // undecidable — upstream's `typeOrThrow` reads it as
+                    // `dynamic`, which fills every can-be slot.
+                    if crate::library::resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        head,
+                    )
+                    .is_none()
+                        && !self.collection_heads.contains(&head)
+                    {
+                        return LeafSide::Either;
+                    }
+                    // `asInstanceOf(Iterable)` first, `asInstanceOf(Map)`
+                    // second — upstream's order.
+                    if self.head_reaches_iterable(head) {
+                        return LeafSide::Set;
+                    }
+                    if self.head_reaches_map(head) {
+                        return LeafSide::Map;
+                    }
+                    return LeafSide::Neither;
+                }
             }
-            return LeafSide::Blind;
         }
         // `_fromElement`: a map entry (its null-aware `?k: v` / `k: ?v`
         // forms included) is a map side; an expression — the null-aware
@@ -13330,6 +13479,29 @@ impl Engine<'_> {
                 && !self.interpolation_child_rows.contains(&row.range.offset)
         })?;
         Some((row.ty, row.range))
+    }
+
+    /// The spread operand's static type over `[start, end)` (UTF-16): the
+    /// leaf's completion row when it spells a type, else the last row in
+    /// the span through `operand_static_ty` (an untyped bare read resolves
+    /// its declared accessor type — `...list1` reads `List`). `None` when
+    /// no row lives inside the operand span at all — the operand is
+    /// invisible to the row model and every ladder that asks its type must
+    /// abstain rather than fabricate. `Some(Ty::UNKNOWN)` when a row
+    /// exists but resolves to nothing — the oracle's error-dynamic shape.
+    fn spread_operand_ty(&self, start: u32, end: u32) -> Option<Ty> {
+        let (ty, _) = self.leaf_completion_row(start, end)?;
+        if ty != Ty::UNKNOWN {
+            return Some(ty);
+        }
+        Some(
+            self.rows
+                .iter()
+                .rev()
+                .find(|row| row.range.offset >= start && row.range.end() <= end)
+                .map(|row| self.operand_static_ty(row))
+                .unwrap_or(Ty::UNKNOWN),
+        )
     }
 
     /// The context side the literal's direct position donates (`Some(true)`
@@ -13453,23 +13625,21 @@ impl Engine<'_> {
                 offset: s16,
                 length: e16 - s16,
             };
-            let Some((operand_ty, _)) = self.leaf_completion_row(s16, e16) else {
+            let Some(operand_ty) = self.spread_operand_ty(s16, e16) else {
                 continue;
-            };
-            let operand_ty = if operand_ty == Ty::UNKNOWN {
-                self.rows
-                    .iter()
-                    .rev()
-                    .find(|row| row.range.offset >= s16 && row.range.end() <= e16)
-                    .map(|row| self.operand_static_ty(row))
-                    .unwrap_or(Ty::UNKNOWN)
-            } else {
-                operand_ty
             };
             // Dynamic folds silently (the strict-casts tier is not
             // modeled); Never is silent (upstream `isSubtypeOf(exprType,
-            // Never)` → return).
-            if operand_ty == Ty::Dynamic || self.is_never_ty(operand_ty) {
+            // Never)` → return). An undecidable operand (the oracle's
+            // error-dynamic shape: an unresolved name, a receiver the row
+            // model cannot spell) is silent in the same posture — upstream
+            // reads `typeOrThrow` and gets `dynamic`, which folds the whole
+            // ladder; firing on `UNKNOWN` fabricates rows the oracle never
+            // emits.
+            if operand_ty == Ty::UNKNOWN
+                || operand_ty == Ty::Dynamic
+                || self.is_never_ty(operand_ty)
+            {
                 continue;
             }
             // Subtype-of-`Null` (upstream `isSubtypeOf(expressionType,
@@ -13488,10 +13658,14 @@ impl Engine<'_> {
                 }
                 continue;
             }
+            // A type-parameter head reads its captured bound (upstream's
+            // `asInstanceOf` resolves through the bound's interface); the
+            // nullability flag rides along. `asInstanceOf` itself ignores
+            // the receiver's `?` — a `List<int>?` operand still answers
+            // `Iterable<int>`, so nullability never decides this ladder.
+            let operand_ty = self.bound_face(operand_ty);
             let Ty::Named {
-                name: head,
-                args,
-                nullable,
+                name: head, args, ..
             } = operand_ty
             else {
                 // A function/record/void operand is never an Iterable or
@@ -13503,15 +13677,41 @@ impl Engine<'_> {
                 self.emit(code, operand_range, "", "");
                 continue;
             };
-            if nullable {
-                // A nullable operand is never `Iterable`/`Map` — the
-                // iterability row fires (upstream `asInstanceOf` answers
-                // null for `S?` receiver types).
-                let code = match kind {
-                    SpreadLiteralKind::Map => SemanticCode::NotMapSpread,
-                    _ => SemanticCode::NotIterableSpread,
-                };
-                self.emit(code, operand_range, "", "");
+            // `asInstanceOf` delegates through `FutureOr`'s union legs:
+            // `FutureOr<List>` reaches `Iterable`/`Map` iff the argument's
+            // head does. Unwrap the single argument and re-ask on its
+            // head.
+            let operand_heads = {
+                let future_or = self.intern("FutureOr");
+                if head == future_or
+                    && let Some(&inner) = self.boundary.args.borrow().get(args).first()
+                    && let Ty::Named {
+                        name: inner_head, ..
+                    } = inner
+                {
+                    vec![head, inner_head]
+                } else {
+                    vec![head]
+                }
+            };
+            // A head that resolves to NO declaration — a callee-side type
+            // parameter (`...a()` of `T a<T>()`, whose instantiation the
+            // context decides upstream), an unmodeled spelling — is the
+            // oracle's undecidable shape: the literal's `typeOrThrow` side
+            // never fabricates a verdict, so the iterability asks abstain.
+            let head_decidable = operand_heads.iter().any(|h| {
+                self.collection_heads.contains(h)
+                    || crate::library::resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        *h,
+                    )
+                    .is_some()
+            });
+            if !head_decidable {
                 continue;
             }
             match kind {
@@ -13519,7 +13719,7 @@ impl Engine<'_> {
                     // `asInstanceOf(Iterable)` asks whether the operand's
                     // head reaches `Iterable`/`List`/`Set` through its
                     // declared superchain.
-                    if !self.head_reaches_iterable(head) {
+                    if !operand_heads.iter().any(|h| self.head_reaches_iterable(*h)) {
                         self.emit(
                             SemanticCode::NotIterableSpread,
                             operand_range,
@@ -13557,7 +13757,7 @@ impl Engine<'_> {
                 SpreadLiteralKind::Map => {
                     // `asInstanceOf(Map)` asks whether the operand's head
                     // reaches `Map`.
-                    if !self.head_reaches_map(head) {
+                    if !operand_heads.iter().any(|h| self.head_reaches_map(*h)) {
                         self.emit(SemanticCode::NotMapSpread, operand_range, "", "");
                         continue;
                     }
@@ -13739,6 +13939,9 @@ impl Engine<'_> {
             match node {
                 Some(node) => {
                     let verdict = eval(node, self);
+                    // `...?` admits a `null` constant silently (upstream
+                    // `spread.isNull && element.isNullAware` → `continue`).
+                    let null_aware = bytes.get(s + 3) == Some(&b'?');
                     let code = match (&verdict, map) {
                         (
                             Verdict::Value(
@@ -13747,6 +13950,9 @@ impl Engine<'_> {
                             false,
                         ) => continue,
                         (Verdict::Value(ConstantValue::Map(_)), true) => continue,
+                        (Verdict::Value(ConstantValue::Null), _) if null_aware => {
+                            continue;
+                        }
                         (Verdict::Value(_), false) => {
                             SemanticCode::ConstSpreadExpectedListOrSet
                         }
@@ -13758,7 +13964,11 @@ impl Engine<'_> {
                 None => {
                     // The staged nodes do not carry this operand (a
                     // map-resolved `SetOrMap` drops non-Entry elements):
-                    // the row's static type answers the shape ask.
+                    // the row's static type answers the shape ask. An
+                    // undecidable operand (the oracle's error-dynamic
+                    // shape) abstains rather than fabricate a shape
+                    // failure — upstream reads `typeOrThrow`'s `dynamic`
+                    // and stays silent.
                     let e16 = self.utf16_of(e);
                     let Some((ty, range)) = self
                         .rows
@@ -13769,10 +13979,24 @@ impl Engine<'_> {
                                 && row.range.end() <= e16
                                 && !matches!(row.shape, RowShape::TypeUse(..))
                         })
-                        .map(|row| (self.operand_static_ty(row), row.range))
+                        .map(|row| (self.bound_face(self.operand_static_ty(row)), row.range))
                     else {
                         continue;
                     };
+                    if matches!(ty, Ty::UNKNOWN | Ty::Dynamic | Ty::Never)
+                        || self.is_never_ty(ty)
+                    {
+                        continue;
+                    }
+                    // A `Null`-typed operand: `...?` admits `null` silently
+                    // (upstream `spread.isNull && element.isNullAware` →
+                    // `continue`); `...` evaluates to no list/set/map —
+                    // the const shape code still fires.
+                    if self.assignable(ty, Ty::Null, false) == Some(true)
+                        && bytes.get(s + 3) == Some(&b'?')
+                    {
+                        continue;
+                    }
                     let code = if map {
                         // A map literal's spread operand must be a Map.
                         if matches!(ty, Ty::Named { name, .. } if name == self.collection_heads[2])
@@ -14072,13 +14296,19 @@ enum LeafSide {
     Map,
     Set,
     /// No side forced, but the leaf is positively undecided in the
-    /// oracle too (a `dynamic`/non-collection spread row, an
-    /// unresolvable operand's error-dynamic): `_either` evidence.
+    /// oracle too (a `dynamic`/`Never` spread row, a null-aware `Null`
+    /// operand, an unresolvable operand's error-dynamic): fills every
+    /// can-be slot, forces neither must-be — `_either` evidence.
     Either,
     /// The leaf's type is invisible to the row model (no row at the
     /// operand): its hidden real side may already have decided the
     /// literal, so it forces nothing and vetoes the `_either` tail.
     Blind,
+    /// A decided leaf that fills NO slot (a resolved non-collection
+    /// spread operand — `int`, a function type, `void`, a non-aware
+    /// `Null`): poisons both can-be bits, so the literal cannot resolve
+    /// — `_either` evidence through the ambiguous tail.
+    Neither,
 }
 
 /// The operand expression's head offset for the is-verdict span. The merged
