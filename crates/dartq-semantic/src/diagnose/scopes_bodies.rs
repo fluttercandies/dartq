@@ -1236,10 +1236,46 @@ impl<'a> Engine<'a> {
             .filter(|lhs| !self.is_index_key_row(lhs))
             .filter(|lhs| {
                 let span = self.staged_expression_span(lhs.range);
+                // The operand reaches `??` in two shapes: a bare/member row
+                // ABUTS it (only trivia between the span end and `??`), and a
+                // folded result row (`a is bool`, `C<int,int>`) CONTAINS the
+                // operator — the span walk greedily absorbs the `??` right
+                // operand into the operand's extent, so `op` lands strictly
+                // inside the span.
                 self.trivia_between(span.end(), op_range.offset)
+                    || (span.offset < op_range.offset && op_range.offset < span.end())
             });
-        let non_null =
-            lhs_is_bool_comparison || lhs.is_some_and(|lhs| self.coalesce_operand_never_null(lhs, true));
+        // An explicit generic instantiation (`C<int,int>` — a `TypeLiteral`,
+        // upstream static type `Type`) folds into an `Intent::Operator`
+        // value row the walk above drops by intent; its `>`-close is the
+        // type-arguments group, never a binary `>` (the `a > b` comparison
+        // arm carries `eq_spans` and already set `lhs_is_bool_comparison`).
+        // `Type` is unconditionally non-nullable, so the right operand is
+        // dead the moment the operand resolved.
+        let instantiation = !lhs_is_bool_comparison
+            && mark
+                .checked_sub(1)
+                .and_then(|index| self.rows.get(index))
+                .is_some_and(|row| {
+                    // The instantiation's `>`-close op carries its own
+                    // extent end (`C<int,int>` ends at `>`); the row's
+                    // `staged_expression_span` stops at the folded head, so
+                    // the reach check reads the bracket's own range end. The
+                    // `>` byte distinguishes the type-arguments group from
+                    // an index `[]`/`?[]` face (a nullable `V?` read, never
+                    // a `Type` literal) and from arithmetic operators.
+                    let (Intent::Operator(_, bracket), RowShape::Value) =
+                        (&row.intent, &row.shape)
+                    else {
+                        return false;
+                    };
+                    self.byte_at(bracket.offset) == Some(b'>')
+                        && !self.is_index_key_row(row)
+                        && self.trivia_between(bracket.end(), op_range.offset)
+                });
+        let non_null = lhs_is_bool_comparison
+            || instantiation
+            || lhs.is_some_and(|lhs| self.coalesce_operand_never_null(lhs, true));
 
         // The report range (`node.rightOperand`'s own node range): first
         // token after the operator through the rhs-end latch — a
@@ -1252,10 +1288,24 @@ impl<'a> Engine<'a> {
                 offset: rhs_offset,
                 length: end - rhs_offset,
             },
+            // No rhs-end latch (`handle_binary_rhs_end` never saw the `??`
+            // arm's last token — a collection literal's `]` close rides the
+            // literal fold, not the binary right-operand edge): the value
+            // row's expression span spells the operand's own extent. An
+            // EMPTY literal (`x ?? []`) leaves its zero-length `[` row on
+            // top — the `]` is the next token, and the expression span's
+            // close-row re-anchor expands `[..]` to the group's extent.
             _ => self
                 .rows
                 .last()
-                .map(|rhs| rhs.range)
+                .map(|rhs| self.degenerate_rhs_span(rhs.range, rhs_offset))
+                .map(|span| {
+                    let offset = span.offset.min(rhs_offset);
+                    SourceRange {
+                        offset,
+                        length: span.end().saturating_sub(offset),
+                    }
+                })
                 .unwrap_or(SourceRange {
                     offset: rhs_offset,
                     length: 0,
@@ -1281,6 +1331,46 @@ impl<'a> Engine<'a> {
         if range.length > 0 {
             self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
         }
+    }
+
+    /// The `??` right operand's expression span when the fold's top row is a
+    /// degenerate zero-length face. An empty collection literal leaves its
+    /// opener row on top — a fused `[]` is ONE [`TokenKind::Index`] token
+    /// whose own range already spans both brackets, and an empty `{..}`/`(..)`
+    /// group's closer is the next token (its `]`/`}`/`)` re-anchors the
+    /// group's extent through [`Self::staged_expression_span`]). A real
+    /// (non-empty) operand's row already spells its own span and falls
+    /// through unchanged.
+    fn degenerate_rhs_span(&self, range: SourceRange, rhs_offset: u32) -> SourceRange {
+        use dartq_scanner::TokenKind as TK;
+        if range.length != 0 || range.offset != rhs_offset {
+            return self.staged_expression_span(range);
+        }
+        let toks = self.tokens.as_slice();
+        let index = toks.partition_point(|t| t.utf16_offset < range.offset);
+        // The fused `[]`/`[]=` token: its own extent IS the operand's
+        // (`x ?? []` — the `]` never scans as a separate token; the fused
+        // spellings are pure ASCII, so `byte_len` is the utf16 length).
+        if let Some(tok) = toks.get(index)
+            && tok.utf16_offset == range.offset
+            && matches!(tok.kind, TK::Index | TK::IndexEq)
+        {
+            return SourceRange {
+                offset: tok.utf16_offset,
+                length: tok.byte_len,
+            };
+        }
+        // A real group's closer: the next token re-anchors `[..]`/`{..}`/`(..)`
+        // to the operand's whole extent.
+        if let Some(close) = toks.get(index + 1)
+            && matches!(close.kind, TK::CloseSquare | TK::CloseCurly | TK::CloseParen)
+        {
+            return self.staged_expression_span(SourceRange {
+                offset: close.utf16_offset,
+                length: 1,
+            });
+        }
+        self.staged_expression_span(range)
     }
 
     /// The closed `??`'s static type (`resolveIfNull`, upstream Dart SDK
@@ -1381,30 +1471,57 @@ impl<'a> Engine<'a> {
             .get(operator.id as usize + 1)
             .map(|token| token.utf16_offset)
             .unwrap_or_else(|| operator.range.end());
-        let Some(target) = self
+        // The named-target walk covers a bare/member/keyword receiver
+        // (`x ??=`, `c.f ??=`, `this.x ??=`); an index target (`a[i] ??=`,
+        // `x?[i] ??=`) folds into a `RowShape::Value` stand-in at the `]`
+        // whose offset rides `index_result_recvs` — the official
+        // `setReadElement`'s `IndexExpression` arm answers `operator[]`'s
+        // return type, so the stand-in IS the assignment target upstream
+        // writes.
+        let target = self
             .rows
             .iter()
             .rev()
             .find(|row| self.is_assignment_target(row, limit))
-        else {
+            .or_else(|| self.index_assignment_target(limit));
+        let Some(target) = target else {
             return;
         };
         let target_range = target.range;
-        let never_null = self.coalesce_operand_never_null(target, false);
+        // The index-result stand-in's `?[` nullability is the access's own
+        // widening — the `??=` read face upstream strips it (the desugared
+        // `t[i] ??= v` reads `t[i]`'s `[]` return on the non-null temp), so
+        // the verdict asks the `[]` return's own nullability.
+        let never_null = if self
+            .index_result_recvs
+            .get(&target_range.offset)
+            .is_some_and(|(_, was_question)| *was_question)
+        {
+            let ty = Engine::non_null_form(self.operand_static_ty(target));
+            !self.written_ty_invalid(ty) && self.strictly_non_nullable(ty)
+        } else {
+            self.coalesce_operand_never_null(target, false)
+        };
         // The report anchors at `node.value`'s own expression span, never an
         // inner operand row (`bad()`'s head, `-42`'s digits, `[]`'s closing
         // bracket): from the operand's first token through the value row's
-        // own expression end. An invalid value stages no row at all — the
-        // official report then anchors a synthetic empty node the row model
-        // cannot spell, and the face stays silent (under-report).
-        let Some(value) = self.rows.last().filter(|row| row.range.offset >= rhs_offset) else {
-            return;
-        };
-        let span = self.staged_expression_span(value.range);
-        let offset = span.offset.min(rhs_offset);
-        let range = SourceRange {
-            offset,
-            length: span.end().saturating_sub(offset),
+        // own expression end. An invalid value (`x ??= ...`) stages no row
+        // at all — the official report then anchors the SYNTHETIC empty
+        // node at the value's position, a zero-length span the row model
+        // spells as the operator's first-token offset.
+        let range = match self.rows.last().filter(|row| row.range.offset >= rhs_offset) {
+            Some(value) => {
+                let span = self.staged_expression_span(value.range);
+                let offset = span.offset.min(rhs_offset);
+                SourceRange {
+                    offset,
+                    length: span.end().saturating_sub(offset),
+                }
+            }
+            None => SourceRange {
+                offset: rhs_offset,
+                length: 0,
+            },
         };
         if !never_null {
             // The declared-type verdict missed — the `??=` write's own
@@ -1444,6 +1561,22 @@ impl<'a> Engine<'a> {
             _ => false,
         };
         named && self.trivia_between(row.range.end(), limit)
+    }
+
+    /// The index-expression assignment target the named-row walk cannot
+    /// reach (`a[i] ??= v`, `x?[i] ??= v`): the fold leaves a
+    /// `RowShape::Value` stand-in at the `]`, its offset latched in
+    /// [`Engine::index_result_recvs`] — the official
+    /// `visitIfNullAssignment` resolves the `IndexExpression` node through
+    /// `setReadElement`'s `[]` arm, so the stand-in is the row that
+    /// answers the target's read face.
+    fn index_assignment_target(&self, limit: u32) -> Option<&Row> {
+        self.rows.iter().rev().find(|row| {
+            matches!(row.shape, RowShape::Value)
+                && self.index_result_recvs.contains_key(&row.range.offset)
+                && row.range.end() <= limit
+                && self.trivia_between(row.range.end(), limit)
+        })
     }
 
     /// Whether the source at a UTF-16 offset starts a Dart identifier.
@@ -4832,7 +4965,24 @@ impl<'a> Engine<'a> {
     /// The return-type span is deliberately NOT cleared here: it arms at
     /// the head's type events, and a closure nested in a later default
     /// value must not drop it before the declaration's end check.
+    ///
+    /// The armed type slot IS cleared, and that is no contradiction: it is
+    /// the one-shot latch a declaration's own return annotation arms and
+    /// its name event consumes ([`Engine::latch_return_type`]), so whatever
+    /// a previous declaration left on it belongs to that declaration. An
+    /// untyped head (`main() { … }`) must read the element's own absent
+    /// annotation — upstream's untyped return is `dynamic`, never a
+    /// non-nullable completion target — and not the last type some earlier
+    /// declaration completed: `typedef int Foo(bool a, [String b]);` arms a
+    /// whole `int Function(bool, String)` face on the slot, which the
+    /// next untyped declaration would otherwise latch as its own return and
+    /// report `body_might_complete_normally` against (#3514). The
+    /// unarmed latch reads [`Ty::UNKNOWN`], the completion walk's silent
+    /// stand-in for a declaration that spells no return type.
     pub(crate) fn push_executable_frame(&mut self, instance: bool) {
+        self.armed_ty = None;
+        self.armed_ty_unresolved = false;
+        self.armed_ty_span = None;
         self.push_frame(FrameKind::Executable {
             instance,
             ret: None,
@@ -5887,3 +6037,138 @@ mod ticket_3151_tests;
 #[cfg(test)]
 #[path = "ticket_3116_tests.rs"]
 mod ticket_3116_tests;
+
+#[cfg(test)]
+mod tests_3514 {
+    //! The `body_might_complete_normally[_nullable]` return face (#3514,
+    //! C5): the completion walk reads the element's OWN declared return
+    //! type (upstream `checkForBodyMayCompleteNormally` reads
+    //! `element.returnType`, type_analyzer.dart:639-704), never a face an
+    //! earlier declaration left on the shared armed slot.
+    //!
+    //! The defect: `typedef int Foo(bool a, [String b]);` arms a whole
+    //! `int Function(bool, String)` face on `Engine::armed_ty` at its
+    //! right-hand side's close, and the next *untyped* head latched that
+    //! face as its own return — an untyped function's return is `dynamic`
+    //! upstream, no potentially-non-nullable completion target, so the
+    //! oracle never reports it. The corpus fixtures this reproduces are
+    //! the `function_subtype` family's `local0_test` (`main` reported as
+    //! `int Function(bool, String)`), `local1_test` (`bool`) and
+    //! `cast2_test` (a method reported as `void Function(int)`).
+    //!
+    //! Oracle provenance: `dart analyze` 3.13.7
+    //! (`~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`) over the same
+    //! fixture text; each expectation below is a live verdict, quoted at
+    //! its test.
+
+    use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops};
+
+    /// Every `body_might_complete_normally*` row as `(code, offset)`,
+    /// source-ordered — the two completion codes are the only rows these
+    /// pins decide, so the fixture's other rows (unused local functions,
+    /// unresolved `print`) never enter the answer.
+    fn completion_rows(source: &str) -> Vec<(&'static str, u32)> {
+        let report = report_ops(source);
+        let mut rows: Vec<(&'static str, u32)> = report
+            .diagnostics
+            .iter()
+            .filter(|row| row.code.name.starts_with("body_might_complete_normally"))
+            .map(|row| (row.code.name, row.range.offset))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// The offset of the `nth` (0-based) occurrence of `needle` in the
+    /// FIXTURE text, shifted past the prelude the rig mounts ahead of it.
+    /// Every fixture here is ASCII, so byte and UTF-16 offsets coincide.
+    fn at(source: &str, needle: &str, nth: usize) -> u32 {
+        let found = source
+            .match_indices(needle)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("`{needle}` occurrence #{nth} missing"));
+        found.0 as u32 + CORE_PRELUDE.len() as u32
+    }
+
+    /// A typedef's function-typed right-hand side arms the shared slot; the
+    /// following untyped `main` must still read its own absent return
+    /// (`dynamic`, silent), while the declared `int g()` keeps its row.
+    ///
+    /// Probed: exactly one row, `body_might_complete_normally` at `int g`'s
+    /// name (`lib/a.dart:7:5`), none at `main`.
+    #[test]
+    fn untyped_main_latches_its_own_absent_return() {
+        let source = "\
+typedef int Foo(bool a, [String b]);\n\
+\n\
+main() {\n\
+\x20 print(Foo);\n\
+}\n\
+\n\
+int g() {}\n";
+        assert_eq!(
+            completion_rows(source),
+            [("body_might_complete_normally", at(source, "g()", 0))],
+            "{:#?}",
+            completion_rows(source)
+        );
+    }
+
+    /// The `cast2_test` shape: a top-level function-typed variable arms a
+    /// `void Function(int)` face, and the class method that follows is
+    /// untyped — its body's completion question reads `dynamic` and stays
+    /// silent.
+    ///
+    /// Probed: no completion row at all ("No issues found" for the same
+    /// text).
+    #[test]
+    fn untyped_method_after_a_function_typed_field_stays_silent() {
+        let source = "\
+void Function(int) face = (x) => x;\n\
+\n\
+class C {\n\
+\x20 m() {}\n\
+}\n";
+        assert_eq!(completion_rows(source), Vec::new());
+    }
+
+    /// Control: a declared function-typed return is potentially
+    /// non-nullable (`isPotentiallyNonNullable` admits no null), so its
+    /// body keeps the ERROR twin — the fix must not silence the code.
+    ///
+    /// Probed: one row, `body_might_complete_normally` at `g`'s name
+    /// (`lib/a.dart:1:20`): "The body might complete normally, causing
+    /// 'null' to be returned, but the return type, 'void Function(int)',
+    /// is a potentially non-nullable type."
+    #[test]
+    fn declared_function_typed_return_keeps_its_row() {
+        let source = "void Function(int) g() {}\n";
+        assert_eq!(
+            completion_rows(source),
+            [("body_might_complete_normally", at(source, "g()", 0))],
+            "{:#?}",
+            completion_rows(source)
+        );
+    }
+
+    /// Control: a nullable declared return keeps the WARNING twin
+    /// (`body_might_complete_normally_nullable`), whose span is the same
+    /// declaring name.
+    ///
+    /// Probed: one row, `body_might_complete_normally_nullable` at `h`'s
+    /// name (`lib/a.dart:1:6`): "This function has a nullable return type
+    /// of 'int?', but ends without returning a value."
+    #[test]
+    fn nullable_declared_return_keeps_its_twin() {
+        let source = "int? h() {}\n";
+        assert_eq!(
+            completion_rows(source),
+            [(
+                "body_might_complete_normally_nullable",
+                at(source, "h()", 0)
+            )],
+            "{:#?}",
+            completion_rows(source)
+        );
+    }
+}
