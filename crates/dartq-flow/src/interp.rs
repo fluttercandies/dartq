@@ -640,8 +640,9 @@ pub(crate) struct Expr {
     /// The expression reads this variable (promotable reference).
     pub reference: Option<u32>,
     /// The expression reads a property whose receiver is itself a
-    /// promotable reference (a bare local read or `this`): the property
-    /// slot ([`Interp::prop_slot`]) the promotion state lives in (#1409).
+    /// promotable reference (a bare local read, `this`, or `super`): the
+    /// property slot ([`Interp::prop_slot`]) the promotion state lives in
+    /// (#1409).
     /// The read's flow type at this layer is the marker pair
     /// ([`Ty::UNKNOWN_NULLABLE`] unpromoted, [`Ty::UNKNOWN`] promoted).
     pub prop: Option<u32>,
@@ -649,6 +650,10 @@ pub(crate) struct Expr {
     /// shape of property promotion (official `thisExpression()`'s
     /// `_thisVersion` reference, `flow_analysis.dart:8149-8153`).
     pub this_recv: bool,
+    /// The expression is exactly a `super` read: the promotable receiver
+    /// shape of `SuperPropertyTarget` — a promotion chain independent of
+    /// `this`'s (upstream `superExpression`, flow_analysis.dart:8155-8159).
+    pub super_recv: bool,
     /// Boolean literal truth.
     pub bool_value: Option<bool>,
     /// The proven constant of a `&&`/`||` chain, from short-circuit
@@ -737,6 +742,7 @@ impl Expr {
             reference: None,
             prop: None,
             this_recv: false,
+            super_recv: false,
             bool_value: None,
             proven_bool: None,
             branches: None,
@@ -760,6 +766,7 @@ impl Expr {
             reference: Some(var),
             prop: None,
             this_recv: false,
+            super_recv: false,
             bool_value: None,
             proven_bool: None,
             branches: None,
@@ -777,11 +784,14 @@ impl Expr {
     }
 
     /// The promotable receiver identity of this expression, when property
-    /// promotion can track through it: a bare local read (its variable id)
-    /// or a `this` read ([`THIS_RECEIVER`]).
+    /// promotion can track through it: a bare local read (its variable id),
+    /// a `this` read ([`THIS_RECEIVER`]), or a `super` read
+    /// ([`SUPER_RECEIVER`]) — the three upstream `PropertyTarget` forms.
     pub(crate) fn prop_receiver(&self) -> Option<u32> {
         if self.this_recv {
             Some(THIS_RECEIVER)
+        } else if self.super_recv {
+            Some(SUPER_RECEIVER)
         } else {
             self.reference
         }
@@ -795,6 +805,15 @@ impl Expr {
 /// eligibility per upstream `ThisPropertyTarget`,
 /// `flow_analysis.dart:5977-5990`).
 pub(crate) const THIS_RECEIVER: u32 = u32::MAX - 1;
+
+/// The property-key receiver sentinel for `super`: upstream keys the
+/// promotion on the access FORM — `super._f` rides `SuperPropertyTarget`,
+/// an SSA chain independent of `ThisPropertyTarget`'s even when both
+/// resolve to the same field (flow_analysis.dart `PropertyTarget`,
+/// :5524-5529; `super_this_distinction_error_test`). `super` never rebinds
+/// either, so one fixed identity is sound — and a write-side sweep never
+/// reaches it because property writes record no `write_var`.
+pub(crate) const SUPER_RECEIVER: u32 = u32::MAX - 2;
 
 /// Recursion budget for the always-exhaustive bound walk
 /// ([`Interp::is_always_exhaustive`]) and the pattern cover question's
@@ -1267,7 +1286,8 @@ pub(crate) struct Interp<'o> {
     pub(crate) vars: Vec<VarMeta>,
     pub(crate) facts: Vec<FlowFact>,
     /// The property-key table (#1409): slot → `(receiver, field)` — the
-    /// receiver is a variable id or [`THIS_RECEIVER`], the field an
+    /// receiver is a variable id, [`THIS_RECEIVER`], or [`SUPER_RECEIVER`],
+    /// the field an
     /// interned member name (the flow-level stand-in for upstream's
     /// `propertyName` keys, `flow_analysis.dart:5694-5716`). Slot order is
     /// allocation order and matches every [`State::props`] index; slots are
@@ -2081,8 +2101,11 @@ impl<'o> Interp<'o> {
     }
 
     /// The property-key slot of `(receiver, field)`, allocated on first
-    /// use (#1409). Slot order is allocation order — every [`State::props`]
-    /// index is one of these slots.
+    /// use (#1409). `receiver` is a variable id, [`THIS_RECEIVER`], or
+    /// [`SUPER_RECEIVER`] — the upstream `PropertyTarget` identity, so the
+    /// `this` and `super` chains promote independently. Slot order is
+    /// allocation order — every [`State::props`] index is one of these
+    /// slots.
     pub(crate) fn prop_slot(&mut self, receiver: u32, field: u32) -> u32 {
         if let Some(&slot) = self.prop_slots.get(&(receiver, field)) {
             return slot;

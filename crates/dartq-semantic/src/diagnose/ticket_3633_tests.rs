@@ -117,15 +117,6 @@ fn abstract_final_field_promotes() {
 ///
 /// Oracle (`FieldPromotionTest/test_class_field_invocation_simpleIdentifier_nullability`):
 /// no row for the guarded `_foo()`.
-// Residual (out of #3633's scope): the guarded `_foo()` still reports. The
-// flow layer DOES promote the slot (`prop_promoted` answers true at
-// `interp_expr.rs:2581`), but the invocation row re-decides its receiver
-// nullability in `row_resolution.rs` (`member_defined`'s `receiver_nullable`
-// tail, ~:10460) whose promoted-property stand-down joins
-// `promoted_recv_reads`, a latch armed only for MEMBER-read receivers — a
-// bare `_foo()` callee takes none. Fix point: the implicit-`this` callee
-// branch of `resolve_rows`, which is in another lane's file.
-#[ignore = "#3633 residual: bare implicit-this invocation callee never arms the promoted_recv_reads latch (row_resolution.rs member_defined); fix point outside this ticket's file set"]
 #[test]
 fn invocation_after_null_check_promotes() {
     let report = report_ops(
@@ -143,15 +134,6 @@ fn invocation_after_null_check_promotes() {
 /// `if (_f != null)` the two `this` reads are silent and `super._f()`
 /// reports. The no-override shape isolates the access-form split from the
 /// separate `duplicate_definition` face an override raises.
-// Residual (out of #3633's scope): all three reads report. The flow layer
-// keys a property slot on `(receiver, field)` only — `Interp::prop_slot`
-// (`interp.rs:2086`) — so a `this`-chain promotion would apply to
-// `super._f` too; the distinction needs an access-form component in the
-// slot key and a distinct receiver sentinel for `super`, whose read today
-// rides `Ev::OtherExpr` (`record.rs:3067`) and carries no `prop` at all.
-// Fix point: `interp_expr.rs` (`prop_receiver`, the DotAccess prop arm) —
-// another lane's file.
-#[ignore = "#3633 residual: property promotion is keyed on (receiver, slot) with no this/super access-form component; fix point is interp_expr.rs prop_receiver, outside this ticket's file set"]
 #[test]
 fn super_access_promotes_independently_of_this() {
     let report = report_ops(
@@ -173,10 +155,6 @@ fn super_access_promotes_independently_of_this() {
 /// Oracle (`super_this_distinction_error_test`,
 /// `DerivedClassThatOverridesNothing` lines 103-112): `_f()` and
 /// `this._f()` report, `super._f()` is silent.
-// Residual (out of #3633's scope) — the mirror of the pin above: the same
-// `(receiver, slot)` key makes a `super` guard indistinguishable from a
-// `this` guard, and `super._f` carries no promotion slot to guard with.
-#[ignore = "#3633 residual: property promotion is keyed on (receiver, slot) with no this/super access-form component; fix point is interp_expr.rs prop_receiver, outside this ticket's file set"]
 #[test]
 fn this_access_promotes_independently_of_super() {
     let report = report_ops(
@@ -197,15 +175,6 @@ fn this_access_promotes_independently_of_super() {
 /// second component keeps its `?.` shape.
 ///
 /// Oracle (`Records/type_promotion_A02_t01` lines 21-31): silent.
-// Residual (out of #3633's scope): the record's field reads still report.
-// `record_field_ty` (`resolution.rs:514`) already resolves `$1`/`$2` off the
-// receiver's record shape, so the missing half is the promoted receiver
-// TYPE: the record-typed property read must publish its non-null face
-// through `promotable_field_substitution`, whose caller (`member_defined`'s
-// `record_field_ty(receiver_ty, ..)` call at `row_resolution.rs:6734`)
-// passes the UNPROMOTED receiver face — a substitution hook in another
-// lane's file.
-#[ignore = "#3633 residual: the record-field read resolves on the unpromoted receiver face (row_resolution.rs:6734 record_field_ty call); the promoted substitution hook is outside this ticket's file set"]
 #[test]
 fn record_field_promotes() {
     let report = report_ops(&format!(

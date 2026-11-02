@@ -2561,6 +2561,23 @@ impl<'a> Engine<'a> {
                     // the face the same way the chained receiver walk's own
                     // `!` probe does (`null_asserted_after`).
                     let ty = self.null_asserted_after(row.range, ty);
+                    // The promoted-property callee/read face (#3633c): a
+                    // bare implicit-`this` member read (`_f`, `_f()`) under
+                    // a `!= null` guard resolves through the field's
+                    // promoted non-null static type — the same substitution
+                    // the operator and member-walk arms already join on the
+                    // member token's offset (`tryMarkNonNullable`'s promoted
+                    // read feeds every downstream verdict, upstream Dart SDK
+                    // source, flow_analysis_visitor.dart `_handleProperty`).
+                    // A non-member read answers `None` inside the
+                    // substitution and keeps `ty` byte for byte.
+                    let ty = self
+                        .promotable_field_substitution(
+                            &self.prop_promotion_rows,
+                            row.range,
+                            ty,
+                        )
+                        .unwrap_or(ty);
                     // A resolved function-DECLARATION identifier carries
                     // its signature face (`f + 1` over `int f(int)` reads
                     // the tear-off `int Function(int)` —
@@ -5297,6 +5314,27 @@ impl<'a> Engine<'a> {
                             if self.check_type_literal_receiver(row) {
                                 return;
                             }
+                            // The promoted-property face (#3633e): a
+                            // record/function-typed FIELD receiver read
+                            // under its own null guard (`_r != null` then
+                            // `_r.$1`) resolves the member on the
+                            // receiver's promoted non-null static type —
+                            // record fields are ordinary fields for
+                            // promotion purposes (upstream `addField`,
+                            // field_promotability.dart), so the official's
+                            // promoted face feeds the whole shape verdict,
+                            // not just the nullability flag. The receiver
+                            // read's own span keys the staged
+                            // `PromotedPropertyRead` row; an unpromoted or
+                            // non-promotable receiver keeps `face` byte
+                            // for byte.
+                            let face = self
+                                .promotable_field_substitution(
+                                    &self.prop_promotion_rows,
+                                    read_span,
+                                    face,
+                                )
+                                .unwrap_or(face);
                             let receiver_nullable = match face {
                                 Ty::Record { nullable, .. }
                                 | Ty::Function { nullable, .. } => {
@@ -5347,6 +5385,23 @@ impl<'a> Engine<'a> {
                     // types, invocation.rs:857-867) runs the same member
                     // verdict as the flow-derived one — a miss reports the
                     // access-intent trio, never the silent credit alone.
+                    // The promoted-property face (#3633e) substitutes the
+                    // receiver read's non-null static type the same way the
+                    // flow-derived arm above does; the receiver's own read
+                    // span keys the staged `PromotedPropertyRead` row.
+                    let record = self
+                        .member_reads
+                        .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                        .ok()
+                        .map(|index| self.member_reads[index].recv_span)
+                        .and_then(|read_span| {
+                            self.promotable_field_substitution(
+                                &self.prop_promotion_rows,
+                                read_span,
+                                record,
+                            )
+                        })
+                        .unwrap_or(record);
                     let receiver_nullable = match record {
                         Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
                             nullable && !self.null_aware_members.contains(&row.range.offset)
@@ -6602,6 +6657,24 @@ impl<'a> Engine<'a> {
             if self.check_type_literal_receiver(row) {
                 return;
             }
+            // The promoted-property face (#3633e): a record/function-typed
+            // FIELD receiver read under its own null guard (`c._r != null`
+            // then `c._r.$1`) resolves the member on the receiver's
+            // promoted non-null static type — the same substitution the
+            // `Receiver::Unknown` shape arms apply. `read_span` keys the
+            // receiver's own read token; a non-member receiver read answers
+            // `None` inside the substitution and keeps `ty` unchanged.
+            let ty = if let Some(read_span) = self
+                .promoted_recv_reads
+                .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
+                .ok()
+                .map(|index| self.promoted_recv_reads[index].1)
+            {
+                self.promotable_field_substitution(&self.prop_promotion_rows, read_span, ty)
+                    .unwrap_or(ty)
+            } else {
+                ty
+            };
             let folded = self.fold_alias_ty(ty);
             let mut receiver_nullable = match folded {
                 Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
@@ -10733,7 +10806,24 @@ impl<'a> Engine<'a> {
                     && matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
                     && !self.null_aware_members.contains(&row.range.offset)
                 {
-                    let result = self.receiver_static_ty(row);
+                    // The promoted-property callee face (#3633c): a guarded
+                    // promotable field read (`this._f != null`, `super._f !=
+                    // null`, `c._f != null`) publishes its non-null static
+                    // type on the callee expression — upstream resolves the
+                    // invocation's callee through the promoted face
+                    // (`_handleProperty` → `tryMarkNonNullable`,
+                    // field_promotability.dart / flow_analysis_visitor.dart),
+                    // so the unchecked verdict reads the substituted type,
+                    // never the declared nullable one. An unpromoted or
+                    // non-promotable read keeps `result` unchanged.
+                    let declared = self.receiver_static_ty(row);
+                    let result = self
+                        .promotable_field_substitution(
+                            &self.prop_promotion_rows,
+                            row.range,
+                            declared,
+                        )
+                        .unwrap_or(declared);
                     // The official gate mirrors the bare-callee face
                     // (#2815): `nullable_dereference_verifier.dart`'s
                     // `_check` reports only a POTENTIALLY-NULLABLE

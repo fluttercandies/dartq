@@ -7,7 +7,7 @@ use dartq_source::SourceRange;
 use crate::ev::{BinOp, Ev};
 use crate::facts::{FlowFact, PropReceiver};
 pub(crate) use crate::interp::Expr;
-use crate::interp::{CollIfFrame, Frame, Interp, Resolved, THIS_RECEIVER};
+use crate::interp::{CollIfFrame, Frame, Interp, Resolved, SUPER_RECEIVER, THIS_RECEIVER};
 use crate::model::State;
 use crate::ty::{Base, Classification, Ty};
 
@@ -540,9 +540,15 @@ impl Interp<'_> {
                 // `Ev::OtherExpr`'s only remaining producer is the `super`
                 // read — it evaluates to a non-null value, so the
                 // guaranteed-non-null kills (`super.field?.m`) apply even
-                // though the type face stays the opaque unknown.
+                // though the type face stays the opaque unknown. `super` is
+                // also a promotable property receiver
+                // (`SuperPropertyTarget`, flow_analysis.dart:5524-5529) —
+                // its chain promotes independently of `this`'s, so the read
+                // marks the [`SUPER_RECEIVER`] identity for the member
+                // access that folds over it.
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 expr.non_null_literal = true;
+                expr.super_recv = true;
                 self.exprs.push(expr);
             }
             Ev::This { span } => {
@@ -2563,20 +2569,29 @@ impl Interp<'_> {
                 // other consumer reads.
                 expr.callee_span = member_value.read_span;
                 // The property-read face (#1409): a plain-identifier
-                // member on a promotable receiver (a bare local read or
-                // `this` — official `ExpressionPropertyTarget`'s reference
-                // version and `ThisPropertyTarget`'s `_thisVersion`,
-                // `flow_analysis.dart:182-198`, :5977-5990) resolves to a
-                // property slot. Eligibility (a private final field, the
-                // official `isPropertyPromotable` verdict) is the
-                // semantic layer's question — the flow layer tracks every
-                // promotable-shaped read and the consumer gates the rows.
-                if !post_send_tile
-                    && let (Some(field), Some(receiver)) = (
-                        member_value.name,
-                        self.exprs.last().and_then(|e| e.prop_receiver()),
-                    )
-                {
+                // member on a promotable receiver (a bare local read,
+                // `this`, or `super` — official `ExpressionPropertyTarget`'s
+                // reference version, `ThisPropertyTarget`'s `_thisVersion`,
+                // and `SuperPropertyTarget`'s own chain,
+                // `flow_analysis.dart:182-198`, :5524-5529, :5977-5990)
+                // resolves to a property slot. Eligibility (a private
+                // final field, the official `isPropertyPromotable` verdict)
+                // is the semantic layer's question — the flow layer tracks
+                // every promotable-shaped read and the consumer gates the
+                // rows.
+                //
+                // The post-send tile runs the fact half only: an invoked
+                // member read (`this._f()`, `super._f()`, `c._f()`) still
+                // resolves the callee through `propertyGet` — upstream's
+                // `_PropertyReference` machinery marks the promoted read
+                // exactly like the send-less selector — but the access
+                // result is the CALL's return, never the property read
+                // itself, so `expr.prop`/`expr.ty` stay untouched (a
+                // `x.m() != null` test must not promote the `(x, m)` slot).
+                if let (Some(field), Some(receiver)) = (
+                    member_value.name,
+                    self.exprs.last().and_then(|e| e.prop_receiver()),
+                ) {
                     let slot = self.prop_slot(receiver, field);
                     let promoted = self.prop_promoted(receiver, slot);
                     // The promoted-read row at the member name's own
@@ -2606,7 +2621,16 @@ impl Interp<'_> {
                             // the consumer's identity key. A non-`this`
                             // receiver is always a body-declared local,
                             // and every declaration carries its anchor.
-                            let receiver = if receiver == THIS_RECEIVER {
+                            let receiver = if receiver == THIS_RECEIVER
+                                || receiver == SUPER_RECEIVER
+                            {
+                                // `SuperPropertyTarget` has no
+                                // [`PropReceiver`] variant — the tag only
+                                // identifies the receiver KIND for the
+                                // context face, and the consumer resolves
+                                // the member through the merge record's
+                                // `Receiver::Super` walk anyway, so the
+                                // keyword face is the honest spelling.
                                 PropReceiver::This
                             } else {
                                 PropReceiver::Local(
@@ -2627,13 +2651,17 @@ impl Interp<'_> {
                     // (unpromoted = potentially-nullable unknown,
                     // promoted = its non-null face). Decision-equivalent
                     // to `UNKNOWN` in every classification question, and
-                    // never emitted into a fact row.
-                    expr.ty = if promoted {
-                        Ty::UNKNOWN
-                    } else {
-                        Ty::UNKNOWN_NULLABLE
-                    };
-                    expr.prop = Some(slot);
+                    // never emitted into a fact row. The post-send tile
+                    // skips both writes: its result is the invocation's
+                    // own face, not the callee property's.
+                    if !post_send_tile {
+                        expr.ty = if promoted {
+                            Ty::UNKNOWN
+                        } else {
+                            Ty::UNKNOWN_NULLABLE
+                        };
+                        expr.prop = Some(slot);
+                    }
                 }
                 if *null_aware {
                     // The `?.`'s split ran at `Ev::NullAwareMemberBegin` (the
@@ -3401,7 +3429,12 @@ impl Interp<'_> {
                             let history = self.current.prop(slot).history;
                             if history != crate::model::NIL {
                                 let entries = self.intern_non_promotion(None, history);
-                                let prop_receiver = if receiver == THIS_RECEIVER {
+                                let prop_receiver = if receiver == THIS_RECEIVER
+                                    || receiver == SUPER_RECEIVER
+                                {
+                                    // Same fold as `Ev::DotAccess`'s emit:
+                                    // `SuperPropertyTarget` spells the
+                                    // keyword receiver tag.
                                     PropReceiver::This
                                 } else {
                                     PropReceiver::Local(
