@@ -163,23 +163,24 @@ fn bare_statement_eq_operand_miss_reports() {
     );
 }
 
-// —— corpus-shaped over-report guards (#3568 census repair): every row the
-// —— sweep must NOT fabricate — an assignment target's `x = .m()`, a type-
-// —— parameter formal (`C<T>`'s `T`), and a left-of-`==` shorthand —
-// —— upstream reads `'_'`/`missing_context` or a context this walk cannot
-// —— re-derive; all keep the under-report.
+// —— corpus-shaped over-report guards (#3568 census repair): rows the
+// —— sweep must NOT fabricate — an assignment target's `x = .m()` and a
+// —— type-parameter formal (`C<T>`'s `T`, whose substitution lives in
+// —— inference, not the written formal) keep the under-report. The third
+// —— fixture flipped from guard to witness once the invocation face
+// —— rendered: for `.new() == C()` the oracle reports BOTH rows —
+// —— `DOT_SHORTHAND_UNDEFINED_MEMBER` at the `new` selector ("static
+// —— method or constructor", context `_`) plus the incidental
+// —— `UNUSED_LOCAL_VARIABLE` — so the engine's emission pins oracle truth
+// —— 1:1 instead of staying silent.
 #[test]
-fn over_report_guards_stay_silent() {
+fn over_report_guards_stay_silent_dot_new_reports() {
     for source in [
         // `x = .m()` — an assignment, never the declaration's window.
         "void f() { int x = 0; x = .m(); }\n",
         // `C(this.x)`'s formal `x: T` — `T` is `C`'s type parameter; the
         // substitution `T = C` lives in inference, not the written formal.
         "class C<T> { T x; C(this.x); }\nvoid f() { C<C> c = .new(.member()); }\n",
-        // `.new() == C()` — the left shorthand's own context is `'_'`; the
-        // right operand reads `'_'` too (upstream does not push the left
-        // operand's type for a shorthand left).
-        "class C { C(); }\nvoid f() { bool b = .new() == C(); }\n",
     ] {
         let r = report_ops(source);
         assert!(
@@ -188,6 +189,27 @@ fn over_report_guards_stay_silent() {
             rows(&r)
         );
     }
+
+    // `.new() == C()` — no decidable context on either side (upstream does
+    // not push the left operand's type for a shorthand left), and the
+    // oracle reports both rows on this snippet.
+    let source = "class C { C(); }\nvoid f() { bool b = .new() == C(); }\n";
+    let r = report_ops(source);
+    assert_eq!(
+        rows(&r),
+        vec![
+            format!(
+                "unused_local_variable @{}: The value of the local variable 'b' isn't used.",
+                at(source, "b = .new")
+            ),
+            format!(
+                "dot_shorthand_undefined_member @{}: The static method or constructor 'new' isn't defined for the context type '_'.",
+                at(source, "new(")
+            ),
+        ],
+        "the oracle's two rows, byte-exact: {:?}",
+        rows(&r)
+    );
 }
 
 
