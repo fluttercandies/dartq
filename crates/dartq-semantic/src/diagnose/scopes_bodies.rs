@@ -4588,17 +4588,31 @@ impl<'a> Engine<'a> {
 
     /// Binds the open declaration group's type to `name` in the innermost
     /// frame (one `parse_type` arms the group; every name in it binds). The
-    /// bound type folds through a type alias first — the frame's declared
-    /// types are the resolved interface types every verdict reads. A bare
-    /// parameterized head surviving the fold (`G source` over `typedef
-    /// G<X extends A<X>> = X Function()`, `G?` alike) binds its
-    /// instantiate-to-bounds face — the oracle's resolved `staticType` for
-    /// a written `G` is `G<A<dynamic>>` (`type.dart`
+    /// bound type keeps a resolved alias head's use-site spelling (`A<int>`
+    /// stays `A<int>`, never the expanded `int Function()`) — the oracle's
+    /// `getDisplayString(preferTypeAlias)` reads `TypeImpl.alias`, a
+    /// decoration on the instantiated type, so the written spelling is a
+    /// presentation property every downstream message face renders back;
+    /// the verdict layer still unfolds the kept spelling at the ask
+    /// (`fold_alias_verdict`). Every other shape folds through the alias
+    /// first — the frame's declared types are the resolved interface types
+    /// every verdict reads. A bare parameterized head surviving the fold
+    /// (`G source` over `typedef G<X extends A<X>> = X Function()`, `G?`
+    /// alike) binds its instantiate-to-bounds face — the oracle's resolved
+    /// `staticType` for a written `G` is `G<A<dynamic>>` (`type.dart`
     /// `instantiateTypeFormalsToBounds`), so the declared slot carries the
     /// defaults, never the raw head.
     pub(crate) fn bind_declared_type(&mut self, name: StringId) {
         let ty = self.pending_decl_ty.unwrap_or(Ty::UNKNOWN);
-        let ty = self.fold_alias_ty(ty);
+        let ty = match ty {
+            Ty::Named { name, args, .. }
+                if (args == ArgListId::EMPTY && self.alias_rhs(name).is_some())
+                    || (args != ArgListId::EMPTY && self.alias_rhs_any(name).is_some()) =>
+            {
+                ty
+            }
+            _ => self.fold_alias_ty(ty),
+        };
         let ty = self.instantiated_head_ty(ty);
         if self.declares_nothing(name) {
             return;
@@ -4609,9 +4623,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Binds a formal or catch parameter's own declared type (one arm per
-    /// parameter, not shared with a group). The bound type folds through a
-    /// type alias first — the frame's declared types are the resolved
-    /// interface types every verdict reads. An implicitly typed formal of an
+    /// parameter, not shared with a group). The bound type keeps a resolved
+    /// alias head's use-site spelling for the message faces (the same
+    /// `preferTypeAlias` posture [`Self::bind_declared_type`] holds; the
+    /// verdict layer unfolds it at the ask) and folds every other shape
+    /// through the alias first — the frame's declared types are the
+    /// resolved interface types every verdict reads. An implicitly typed formal of an
     /// open function literal infers downward from the enclosing invocation's
     /// context type (`function_expression_resolver.dart`
     /// `_inferFormalParameters`: the schema's corresponding parameter type
@@ -4636,7 +4653,15 @@ impl<'a> Engine<'a> {
             .take()
             .or_else(|| self.closure_param_context_ty(name))
             .unwrap_or(Ty::UNKNOWN);
-        let ty = self.fold_alias_ty(ty);
+        let ty = match ty {
+            Ty::Named { name, args, .. }
+                if (args == ArgListId::EMPTY && self.alias_rhs(name).is_some())
+                    || (args != ArgListId::EMPTY && self.alias_rhs_any(name).is_some()) =>
+            {
+                ty
+            }
+            _ => self.fold_alias_ty(ty),
+        };
         let ty = self.instantiated_head_ty(ty);
         if self.declares_nothing(name) {
             return;
