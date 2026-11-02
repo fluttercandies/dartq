@@ -3175,60 +3175,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The static type a `var`-inferred local's read still owns when the
-    /// parse-time bind landed `Unknown`: `None` unless the read is a bare
-    /// local whose declarator's initializer is a single send whose solved
-    /// result the close left on the row as a function face. The send's
-    /// result is the callee's instantiated return — the face
-    /// [`Self::callee_return_ty`] re-derives — which the parse-time
-    /// `operand_static_ty` arm misread as the uninvoked signature whenever
-    /// the send-close fold kept the callee's function face on the row
-    /// (`toF<X>` returning `F<X>` stores `void Function<Y extends X'>`,
-    /// whose own type-parameter count defeats the callee-result unwrap
-    /// and silently degrades the whole local to `Unknown`).
-    fn var_inferred_send_init_ty(&self, read: &Row) -> Option<Ty> {
-        if !matches!(read.shape, RowShape::Bare(_)) || read.qualified {
-            return None;
-        }
-        // Only a `var`-inferred local can bind `Unknown` here — a written
-        // annotation always lands a face. `typed_local` answers the bound
-        // slot; `Some(Unknown)` is the tell that the bind degraded.
-        if self.typed_local(read.name) != Some(Ty::Unknown) {
-            return None;
-        }
-        let decl_offset = *self.local_decl_at_read.get(&read.range.offset)?;
-        // The declarator's initializer send row: the single `Invoke` row
-        // in the window between the declarator's `=` and this read. A
-        // `var x = <single send>` keeps exactly one such row; any other
-        // shape (a composite, a member read, a literal) leaves none or
-        // more than one, and the bind's `Unknown` is honest — recover
-        // only the single-send shape the parse-time arm provably misread.
-        let mut send: Option<&Row> = None;
-        for cand in self
-            .rows
-            .iter()
-            .filter(|cand| cand.range.offset > decl_offset && cand.range.offset < read.range.offset)
-            .filter(|cand| !matches!(cand.shape, RowShape::TypeUse(..)))
-            .filter(|cand| cand.intent == Intent::Invoke)
-        {
-            if send.is_some() {
-                return None;
-            }
-            send = Some(cand);
-        }
-        let send = send?;
-        // The send must carry the result face the solve left behind — a
-        // `Ty::Function` the callee's own return spelled, never the
-        // callee's uninvoked signature (which this same misread would
-        // then double-unwrap). `callee_return_ty` resolves the declared
-        // return instantiated for the call site.
-        if !matches!(send.ty, Ty::Function { .. }) {
-            return None;
-        }
-        let ty = self.callee_return_ty(send);
-        (ty != Ty::UNKNOWN).then_some(ty)
-    }
-
     /// `rhs_expression_ty`'s undecorated face — the `??`/`?:` recursion
     /// reads sub-expression types, which stay unflattened inside an
     /// `await` operand (the flatten belongs to the whole expression).
@@ -3339,15 +3285,6 @@ impl<'a> Engine<'a> {
             && let Some(sig) = self.tear_off_sig(&rhs_row)
         {
             from = self.fn_sig_ty(&sig);
-        }
-        // A `var`-inferred local read whose send-initializer's result the
-        // parse-time bind degraded to `Unknown` — the same recovery
-        // [`Self::check_decl_initializer`] runs (`var f = toF(src)`
-        // feeding `x = f`).
-        if from == Ty::Unknown
-            && let Some(ty) = self.var_inferred_send_init_ty(&rhs_row)
-        {
-            from = ty;
         }
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
@@ -3800,24 +3737,6 @@ impl<'a> Engine<'a> {
             self.emit_use_of_void_result(from, &row);
             self.init_mark = None;
             return;
-        }
-        // A `var`-inferred local whose initializer is a solved generic
-        // send binds `Unknown` at parse time when the send-close fold kept
-        // the callee's instantiated function face on the row and
-        // `operand_static_ty` misread it as the uninvoked signature —
-        // `var fsource = toF(source)` where `toF<X>` returns a
-        // function-typed alias `F<X>`: the fold stores the RESULT face
-        // `void Function<Y extends X'>` (X' the solved argument), whose
-        // own type-parameter count `callable_result_of` cannot unwrap, so
-        // the bind lands `Unknown` and every read of the local stays
-        // `Unknown`. The send's honest result is the row's own face (the
-        // solve already instantiated it); re-derive it here so the
-        // bound-equality legs below see `F<A<int>?>` and report the
-        // oracle's `invalid_assignment` against `F<A<num>?>?`.
-        if from == Ty::Unknown
-            && let Some(ty) = self.var_inferred_send_init_ty(&row)
-        {
-            from = ty;
         }
         let stashed = self.stashed_fn_pair(&row, None, from, to);
         let verdict = stashed
