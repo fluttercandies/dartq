@@ -53,16 +53,17 @@
 //! guessed from a half-parsed shape risks an extra the census cannot
 //! forgive.
 //!
-//! RESIDUAL — record patterns. Upstream runs `buildSharedPatternFields`
-//! and `duplicateRecordPatternField` for RECORD patterns too, so the two
-//! field-name faces also apply to `(a: 1, a: 2)` / `(: 0)`; the parser
-//! fires `handle_object_pattern_fields` only from `parseObjectPatternRest`
-//! (object patterns), and record patterns close through
-//! `handle_record_pattern`, whose body is a pre-existing override. That
-//! residual is 44 of the 312 oracle rows these five codes carry in
-//! `conformance/expected.tsv` (30 of `missing_named_pattern_field_name`'s
-//! 173 and 14 of `duplicate_pattern_field`'s 27); the object-pattern face
-//! covers the other 268.
+//! * the record pattern's close (`ParserListener::handle_record_pattern`)
+//!   shares the two field-name faces: upstream runs
+//!   `buildSharedPatternFields` and `duplicateRecordPatternField` for
+//!   record patterns too (`ast.dart:27938`/`:27982`,
+//!   `mustBeNamed: false`), so `(a: 1, a: 2)` reports
+//!   `duplicate_pattern_field` and `(: 0)` reports
+//!   `missing_named_pattern_field_name` — while a positional record field
+//!   is legal and never reports `positional_field_in_object_pattern`. The
+//!   hook carries no end token (unlike the object close), so the record
+//!   arm resolves the `)` through the scanner's group table
+//!   (`TokenTable::matching_end`).
 
 use super::*;
 use dartq_scanner::{Token as ScannedToken, TokenKind};
@@ -84,6 +85,35 @@ pub(super) fn object_pattern_field_faces(
     count: usize,
     begin: Token,
     end: Token,
+) {
+    shared_pattern_field_faces(listener, count, begin, Some(end), true);
+}
+
+/// The record pattern's close: the field-name faces. Hooked from the
+/// fold's `handle_record_pattern` — `mustBeNamed: false` upstream, so a
+/// positional field is legal and only the name faces
+/// (`missing_named_pattern_field_name`, `duplicate_pattern_field`) can
+/// fire. The hook carries no end token, so `None` routes the `)` lookup
+/// through the scanner's group table.
+pub(super) fn record_pattern_field_faces(
+    listener: &mut DiagnoseListener<'_>,
+    count: usize,
+    begin: Token,
+) {
+    shared_pattern_field_faces(listener, count, begin, None, false);
+}
+
+/// The shared field faces of `buildSharedPatternFields` +
+/// `duplicateRecordPatternField`: `must_be_named` is the object-pattern
+/// arm (`true`) vs the record-pattern arm (`false`), and `end` is the
+/// group close the object hook passes — `None` resolves it through the
+/// scanner's group table instead (the record hook carries no end token).
+fn shared_pattern_field_faces(
+    listener: &mut DiagnoseListener<'_>,
+    count: usize,
+    begin: Token,
+    end: Option<Token>,
+    must_be_named: bool,
 ) {
     if count == 0 {
         return;
@@ -113,13 +143,26 @@ pub(super) fn object_pattern_field_faces(
         }) {
             return;
         }
-        let close_idx = toks.partition_point(|t| t.utf16_offset < end.range.offset);
-        if toks
-            .get(close_idx)
-            .is_none_or(|t| t.utf16_offset != end.range.offset)
-        {
-            return;
-        }
+        // The group close: the object hook's `end` token locates it by
+        // offset; the record hook carries none, so the scanner's group
+        // table answers the `)` the `(` pairs with (`None` on an
+        // unbalanced recovery shape bails the same way).
+        let close_idx = match end {
+            Some(end) => {
+                let idx = toks.partition_point(|t| t.utf16_offset < end.range.offset);
+                if toks
+                    .get(idx)
+                    .is_none_or(|t| t.utf16_offset != end.range.offset)
+                {
+                    return;
+                }
+                idx
+            }
+            None => match engine.tokens.matching_end(open_idx) {
+                Some(idx) => idx,
+                None => return,
+            },
+        };
         // Split the group at its depth-0 commas: one slice per field, in
         // parse order (the `(...)` brackets of nested sub-patterns and the
         // `${` groups of string constants keep their commas out of sight).
@@ -202,15 +245,19 @@ pub(super) fn object_pattern_field_faces(
                     ledger: Some((name, span_of(engine, toks, s, s + 1))),
                 });
             } else {
-                // A positional field in an object pattern — reported
+                // A positional field: the object-pattern arm reports it
                 // whatever the sub-pattern binds (the oracle's `mustBeNamed`
-                // arm runs before any getter fallback).
+                // arm runs before any getter fallback); the record-pattern
+                // arm keeps it legal (no row, no ledger — a positional slot
+                // carries no name).
                 verdicts.push(FieldVerdict {
-                    row: Some((
-                        SemanticCode::PositionalFieldInObjectPattern,
-                        span_of(engine, toks, s, e),
-                        String::new(),
-                    )),
+                    row: must_be_named.then(|| {
+                        (
+                            SemanticCode::PositionalFieldInObjectPattern,
+                            span_of(engine, toks, s, e),
+                            String::new(),
+                        )
+                    }),
                     ledger: None,
                 });
             }
@@ -388,4 +435,423 @@ fn intern_slice(engine: &Engine<'_>, t: &ScannedToken) -> StringId {
     let start = t.byte_offset as usize;
     let end = start + t.byte_len as usize;
     engine.strings.intern(&engine.source[start..end])
+}
+
+// —— the binder/counter faces (the S2 residual eight, #3667) ——————————————
+//
+// These verdicts anchor inside hooks the fold already owns, and each needs
+// a small ledger the parse events alone do not carry:
+//
+// * `empty_map_pattern` — `analyzeMapPattern`'s `elements.isEmpty` arm
+//   (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+//   type_inference/type_analyzer.dart:1360-1368 — `.at(pattern)`, the
+//   whole `{...}` node including any written `<...>` group).
+// * `expected_one_list_pattern_type_arguments` /
+//   `expected_two_map_pattern_type_arguments` — the written `<...>`
+//   group's element count (upstream Dart SDK source,
+//   pkg/analyzer/lib/src/dart/resolver/
+//   list_pattern_resolver.dart:22-32 and
+//   pkg/analyzer/lib/src/generated/resolver.dart:1607-1619 —
+//   `.at(typeArguments)`, the group node).
+// * `duplicate_variable_pattern` — `VariableBinder.add`'s same-name arm
+//   (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+//   type_inference/variable_bindings.dart:30-44 — the duplicate's name
+//   token, the first binder riding the context row,
+//   `DiagnosticFactory().duplicateDefinitionForNodes`,
+//   pkg/analyzer/lib/src/diagnostic/diagnostic_factory.dart:84-106).
+// * `duplicate_pattern_assignment_variable` — the assignment context's
+//   `assignedVariables` ledger (upstream Dart SDK source,
+//   type_analyzer.dart:331-345 — `.at(duplicate)`, the second target's
+//   name).
+// * `missing_variable_pattern` / `inconsistent_pattern_variable_logical_or`
+//   — `VariableBinder.logicalOrPatternFinish` and the joined-variable
+//   consistency walk (upstream Dart SDK source,
+//   variable_bindings.dart:86-136 and type_analyzer.dart:2870-2920 — the
+//   omitting branch's whole operand node, and the later branch's binder
+//   name token).
+
+/// One case-pattern binder of the `||` ledger — the name-level mirror of a
+/// `VariableBinder._variables` entry (`BindPatternVariableElementImpl`
+/// upstream). `ty`/`fin` carry the declared-type and finality faces the
+/// joined-variable consistency walk compares; `broken` marks a component
+/// that already joined under an inconsistency — upstream's `errorType`
+/// face, which structurally equals only itself.
+pub(super) struct OrBinder {
+    pub(super) name: StringId,
+    pub(super) span: SourceRange,
+    /// The resolved declared type (alias-folded); `None` for an untyped
+    /// binder (`var x`) — the name level cannot infer the matched face,
+    /// so the consistency compare stays silent on it (the under-report
+    /// direction).
+    pub(super) ty: Option<Ty>,
+    /// `Some(is_final)`; `None` once a join went inconsistent on finality
+    /// (upstream's `isFinalIfConsistent` nulls and stays silent).
+    pub(super) fin: Option<bool>,
+    /// The joined variable already carries an inconsistency (upstream's
+    /// `errorType` face): consistent with another broken component,
+    /// inconsistent with every intact one.
+    pub(super) broken: bool,
+}
+
+/// `VariableBinder.add` (variable_bindings.dart:30-44): the declared binder
+/// joins the innermost or-scope, reporting `duplicate_variable_pattern` at
+/// the duplicate's name token with the first binder as context.
+pub(super) fn note_declared_binder(
+    rows: &mut [super::listener::PatternNodeState],
+    engine: &mut Engine<'_>,
+    name: StringId,
+    span: SourceRange,
+    ty: Option<Ty>,
+    fin: Option<bool>,
+) {
+    let Some(root) = rows.first_mut() else {
+        return;
+    };
+    let Some(scope) = root.or_scopes.last_mut() else {
+        return;
+    };
+    if let Some(original) = scope.iter().find(|binder| binder.name == name) {
+        let original_span = original.span;
+        let text = engine.strings.resolve(name).to_string();
+        engine.emit_with_context(
+            SemanticCode::DuplicateVariablePattern,
+            span,
+            &text,
+            "",
+            vec![ContextMessage {
+                message: SharedStr::from("The first definition of this name."),
+                file: engine.file,
+                range: original_span,
+            }],
+        );
+        return;
+    }
+    scope.push(OrBinder {
+        name,
+        span,
+        ty,
+        fin,
+        broken: false,
+    });
+}
+
+/// The `assignedVariables` ledger of `analyzeAssignedVariablePattern`
+/// (type_analyzer.dart:331-345): a second assignment target of the same
+/// variable reports `duplicate_pattern_assignment_variable` at the
+/// later target's name token, the first assignment riding the context
+/// row. Runs only for a resolved LOCAL target — the
+/// `pattern_assignment_not_local_variable` arm owns resolved non-locals
+/// and `undefined_identifier` owns the misses.
+pub(super) fn note_assigned_variable(
+    rows: &mut [super::listener::PatternNodeState],
+    engine: &mut Engine<'_>,
+    name: StringId,
+    span: SourceRange,
+) {
+    let Some(root) = rows.first_mut() else {
+        return;
+    };
+    if let Some(&(_, original_span)) = root
+        .assigned_vars
+        .iter()
+        .find(|(assigned, _)| *assigned == name)
+    {
+        let text = engine.strings.resolve(name).to_string();
+        engine.emit_with_context(
+            SemanticCode::DuplicatePatternAssignmentVariable,
+            span,
+            &text,
+            "",
+            vec![ContextMessage {
+                message: SharedStr::from("The first assigned variable pattern."),
+                file: engine.file,
+                range: original_span,
+            }],
+        );
+        return;
+    }
+    root.assigned_vars.push((name, span));
+}
+
+/// `logicalOrPatternStart` + `logicalOrPatternFinishLeft`
+/// (variable_bindings.dart:139-147): the `||` left operand's binders
+/// already sit in the innermost scope — the current frame's `binder_mark`
+/// marks where they begin, and the right operand parses into a fresh
+/// scope pushed here.
+pub(super) fn begin_or_operand(rows: &mut [super::listener::PatternNodeState]) {
+    let mark = rows.last().map_or(0, |state| state.binder_mark);
+    let Some(root) = rows.first_mut() else {
+        return;
+    };
+    root.or_splits.push(mark);
+    root.or_scopes.push(Vec::new());
+}
+
+/// `logicalOrPatternFinish` (variable_bindings.dart:86-136) plus the
+/// joined-variable consistency walk (type_analyzer.dart:2870-2920,
+/// `JoinedPatternVariableLocation.singlePattern`): each name bound in
+/// exactly one branch reports `missing_variable_pattern` at the OMITTING
+/// branch's operand node; a name bound in both joins, and a
+/// type/finality disagreement reports
+/// `inconsistent_pattern_variable_logical_or` at the LATER branch's
+/// binder. The joined entries re-enter the scope below — the next outer
+/// `||` reads them as its own left operand's binders.
+pub(super) fn end_or_operand(
+    rows: &mut [super::listener::PatternNodeState],
+    engine: &mut Engine<'_>,
+    operator: Token,
+    end: Token,
+) {
+    // The operand spans: the `||` lives in the innermost open frame, whose
+    // begin token is the left operand's head (a left-associative chain
+    // keeps the whole `a || b` left inside the frame); the right operand's
+    // own frame just closed, so `last_pop_begin` is its head and `end` its
+    // last token.
+    let (left_begin, right_begin) = match rows.last() {
+        Some(state) => match (state.begin_token, state.last_pop_begin) {
+            (Some(left), Some(right)) => (left, right),
+            _ => return,
+        },
+        None => return,
+    };
+    let left_span = SourceRange {
+        offset: left_begin.range.offset,
+        length: operator.range.offset.saturating_sub(left_begin.range.offset),
+    };
+    let right_span = SourceRange {
+        offset: right_begin.range.offset,
+        length: end.range.end().saturating_sub(right_begin.range.offset),
+    };
+    if left_span.length == 0 || right_span.length == 0 {
+        return;
+    }
+    // The ledger joins (reads + bookkeeping, no emissions).
+    let (right, left) = {
+        let Some(root) = rows.first_mut() else {
+            return;
+        };
+        let Some(right) = root.or_scopes.pop() else {
+            return;
+        };
+        let Some(mark) = root.or_splits.pop() else {
+            root.or_scopes.push(right);
+            return;
+        };
+        let Some(top) = root.or_scopes.last_mut() else {
+            return;
+        };
+        let left = if mark <= top.len() {
+            top.split_off(mark)
+        } else {
+            Vec::new()
+        };
+        (right, left)
+    };
+    // The finish walk: left-first, then the right-only tail — the oracle's
+    // per-map entry order. A shared name's components compare pairwise:
+    // the left entry is the baseline, the right entry the reported
+    // `component`.
+    let mut joined: Vec<OrBinder> = Vec::with_capacity(left.len() + right.len());
+    let mut right_remaining: Vec<OrBinder> = right;
+    for left_binder in left {
+        let Some(pos) = right_remaining
+            .iter()
+            .position(|b| b.name == left_binder.name)
+        else {
+            // Bound in the left branch only: the right operand omits it.
+            let text = engine.strings.resolve(left_binder.name).to_string();
+            engine.emit_corrected(SemanticCode::MissingVariablePattern, right_span, &text);
+            joined.push(left_binder);
+            continue;
+        };
+        let right_binder = right_remaining.remove(pos);
+        let type_inconsistent = matches!(
+            (left_binder.ty, right_binder.ty),
+            (Some(a), Some(b)) if a != b
+        ) || left_binder.broken != right_binder.broken;
+        let fin_inconsistent = matches!(
+            (left_binder.fin, right_binder.fin),
+            (Some(a), Some(b)) if a != b
+        );
+        if type_inconsistent || fin_inconsistent {
+            let text = engine.strings.resolve(left_binder.name).to_string();
+            engine.emit_corrected(
+                SemanticCode::InconsistentPatternVariableLogicalOr,
+                right_binder.span,
+                &text,
+            );
+        }
+        joined.push(OrBinder {
+            name: left_binder.name,
+            span: left_binder.span,
+            ty: if type_inconsistent {
+                None
+            } else {
+                left_binder.ty.or(right_binder.ty)
+            },
+            fin: if fin_inconsistent {
+                None
+            } else {
+                left_binder.fin.or(right_binder.fin)
+            },
+            broken: left_binder.broken || right_binder.broken || type_inconsistent,
+        });
+    }
+    for right_binder in right_remaining {
+        // Bound in the right branch only: the left operand omits it.
+        let text = engine.strings.resolve(right_binder.name).to_string();
+        engine.emit_corrected(SemanticCode::MissingVariablePattern, left_span, &text);
+        joined.push(right_binder);
+    }
+    if let Some(top) = rows
+        .first_mut()
+        .and_then(|root| root.or_scopes.last_mut())
+    {
+        top.extend(joined);
+    }
+}
+
+/// The written `<...>` group ahead of a list/map pattern's `[`/`{`: the
+/// type-argument COUNT verdict (`expected_one_list_pattern_type_arguments`
+/// / `expected_two_map_pattern_type_arguments`). The group resolves by a
+/// token-table backward walk from the bracket: the `>`'s matching `<` is
+/// found by angle-depth counting (`Gt`/`GtGt`/`GtGtGt` close one/two/three
+/// levels — the scanner's combined closers never split in the stored
+/// table), and the arguments are the depth-0 comma splits inside.
+pub(super) fn pattern_type_argument_count(
+    engine: &mut Engine<'_>,
+    left: Token,
+    expected: usize,
+    code: SemanticCode,
+) {
+    let verdict: Option<(SourceRange, usize)> = {
+        let engine = &*engine;
+        let toks = engine.tokens.as_slice();
+        let left_idx = toks.partition_point(|t| t.utf16_offset < left.range.offset);
+        if toks
+            .get(left_idx)
+            .is_none_or(|t| t.utf16_offset != left.range.offset)
+            || left_idx == 0
+        {
+            None
+        } else {
+            angle_group_before(toks, left_idx).map(|(lt, gt)| (lt, gt, toks))
+        }
+        .and_then(|(lt, gt, toks)| {
+            let count = count_depth0_commas(toks, lt, gt);
+            (count != expected).then(|| {
+                (
+                    SourceRange {
+                        offset: toks[lt].utf16_offset,
+                        length: toks[gt].utf16_offset + toks[gt].byte_len as u32
+                            - toks[lt].utf16_offset,
+                    },
+                    count,
+                )
+            })
+        })
+    };
+    if let Some((span, count)) = verdict {
+        engine.emit_corrected(code, span, &count.to_string());
+    }
+}
+
+/// `visitMapPattern`'s `elements.isEmpty` arm: `.at(pattern)`, the whole
+/// `{...}` node — the written `<...>` group (when present) is part of the
+/// node, so the span opens at the `<`, else at the `{`.
+pub(super) fn empty_map_pattern_face(
+    engine: &mut Engine<'_>,
+    count: usize,
+    left: Token,
+    right: Token,
+) {
+    if count != 0 {
+        return;
+    }
+    let start = {
+        let engine = &*engine;
+        let toks = engine.tokens.as_slice();
+        let left_idx = toks.partition_point(|t| t.utf16_offset < left.range.offset);
+        if toks
+            .get(left_idx)
+            .is_none_or(|t| t.utf16_offset != left.range.offset)
+            || left_idx == 0
+        {
+            None
+        } else {
+            angle_group_before(toks, left_idx).map(|(lt, _)| toks[lt].utf16_offset)
+        }
+    };
+    engine.emit_corrected(
+        SemanticCode::EmptyMapPattern,
+        SourceRange {
+            offset: start.unwrap_or(left.range.offset),
+            length: right
+                .range
+                .end()
+                .saturating_sub(start.unwrap_or(left.range.offset)),
+        },
+        "",
+    );
+}
+
+/// The `<...>` group immediately before token index `open`: `None` unless
+/// `toks[open - 1]` is a `>`-family closer (`Gt`/`GtGt`/`GtGtGt` — the
+/// scanner never splits combined closers in the stored table, so the
+/// group's last token closes its own width of levels) whose matching `<`
+/// the backward angle-depth walk balances. Returns `(lt_idx, gt_idx)`.
+fn angle_group_before(toks: &[ScannedToken], open: usize) -> Option<(usize, usize)> {
+    let gt = open - 1;
+    let mut depth = match toks.get(gt).map(|t| t.kind) {
+        Some(TokenKind::Gt) => 1,
+        Some(TokenKind::GtGt) => 2,
+        Some(TokenKind::GtGtGt) => 3,
+        _ => return None,
+    };
+    for i in (0..gt).rev() {
+        depth += match toks[i].kind {
+            TokenKind::Gt => 1,
+            TokenKind::GtGt => 2,
+            TokenKind::GtGtGt => 3,
+            TokenKind::Lt => -1,
+            _ => 0,
+        };
+        if depth == 0 {
+            return Some((i, gt));
+        }
+        if depth < 0 {
+            return None;
+        }
+    }
+    None
+}
+
+/// The number of comma-separated arguments inside `toks[lt + 1..gt]`: the
+/// depth-0 comma count plus one, `0` when the group holds nothing (a
+/// `<>` recovery). Depth counts angles (`<` opens, `>`-family closes by
+/// lexeme width), brackets and interpolation groups alike.
+fn count_depth0_commas(toks: &[ScannedToken], lt: usize, gt: usize) -> usize {
+    if lt + 1 >= gt {
+        return 0;
+    }
+    let mut depth = 0i32;
+    let mut commas = 0usize;
+    for i in lt + 1..gt {
+        depth += match toks[i].kind {
+            TokenKind::Lt => 1,
+            TokenKind::Gt => -1,
+            TokenKind::GtGt => -2,
+            TokenKind::GtGtGt => -3,
+            TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => -1,
+            _ => 0,
+        };
+        if depth == 0 && toks[i].kind == TokenKind::Comma {
+            commas += 1;
+        }
+    }
+    commas + 1
 }

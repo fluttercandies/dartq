@@ -22,15 +22,15 @@
 //! The no-extras pin guards the census direction: a well-formed pattern
 //! reports none of the five.
 //!
-//! The eight remaining S2 codes (`empty_map_pattern`,
+//! The remaining eight S2 codes (`empty_map_pattern`,
 //! `expected_one_list_pattern_type_arguments`,
 //! `expected_two_map_pattern_type_arguments`, `duplicate_variable_pattern`,
 //! `duplicate_pattern_assignment_variable`,
 //! `pattern_assignment_not_local_variable`, `missing_variable_pattern`,
-//! `inconsistent_pattern_variable_logical_or`) are pinned at the tail as
-//! `#[ignore]`d rows: each verdict belongs inside a hook whose body already
-//! exists in the fold's `ParserListener` impl, so its emit point is not
-//! reachable by a pure append.
+//! `inconsistent_pattern_variable_logical_or`) are pinned at the tail:
+//! their verdicts emit inside the fold's existing `ParserListener` hook
+//! bodies, carried by the `||` binder ledger and the assignment ledger of
+//! `listener.rs`'s `PatternNodeState`.
 
 use super::FileReport;
 use super::test_rig::{CORE_PRELUDE, report_ops};
@@ -206,6 +206,141 @@ fn rest_inside_nested_list_stays_off_the_map_face() {
     assert_eq!(rows(&report, "duplicate_rest_element_in_pattern"), vec![]);
 }
 
+// —— #3668: the record-pattern arm of the same two field-name faces ——
+//
+// `handle_record_pattern` closes through the same shared walk with
+// `mustBeNamed: false` (upstream ast.dart:27938/:27982): positional
+// fields stay legal, `missing_named_pattern_field_name` and
+// `duplicate_pattern_field` fire exactly as in object patterns.
+
+/// `case (: 0)` — the record shorthand's nameless field anchors the whole
+/// `: 0` node, the object arm's exact span (the oracle's
+/// `test_recordType_sameShape_named_noName_constant` row).
+#[test]
+fn record_missing_named_pattern_field_name_anchors_the_whole_field() {
+    let fixture = "\
+void f(({int foo}) x) {
+  switch (x) {
+    case (: 0):
+      break;
+  }
+}
+";
+    let report = report_ops(fixture);
+    assert_eq!(
+        rows(&report, "missing_named_pattern_field_name"),
+        vec![(at("(: 0):", fixture) + 1, 3)],
+        "the row spans the whole `: 0` field node"
+    );
+    assert_eq!(
+        messages(&report, "missing_named_pattern_field_name"),
+        vec!["The getter name is not specified explicitly, and the pattern is not a variable."
+            .to_string()]
+    );
+}
+
+/// `case (foo: 0, foo: 1)` — the duplicate's written name token reports;
+/// the first occurrence stays silent (the oracle's
+/// `test_recordPattern_dynamicType` row).
+#[test]
+fn record_duplicate_pattern_field_anchors_the_duplicate_name() {
+    let fixture = "\
+void f(x) {
+  switch (x) {
+    case (foo: 0, foo: 1):
+      break;
+  }
+}
+";
+    let report = report_ops(fixture);
+    let second = fixture.find("foo: 1").expect("duplicate name in fixture");
+    assert_eq!(
+        rows(&report, "duplicate_pattern_field"),
+        vec![(CORE_PRELUDE.len() as u32 + second as u32, 3)],
+        "exactly one row, at the second `foo`"
+    );
+    assert_eq!(
+        messages(&report, "duplicate_pattern_field"),
+        vec!["The field 'foo' is already matched in this pattern.".to_string()]
+    );
+}
+
+/// `case (foo: 0, :var foo)` — the implicit-name duplicate anchors the
+/// shorthand's colon (`duplicateTarget = name ?? colon`), matching the
+/// oracle's `test_recordPattern_dynamicType_implicitName_duplicate` row.
+#[test]
+fn record_duplicate_pattern_field_implicit_name_anchors_the_colon() {
+    let fixture = "\
+void f(x) {
+  switch (x) {
+    case (foo: 0, :var foo):
+      break;
+  }
+}
+";
+    let report = report_ops(fixture);
+    assert_eq!(
+        rows(&report, "duplicate_pattern_field"),
+        vec![(at(", :var foo", fixture) + 2, 1)],
+        "the row anchors the shorthand field's colon"
+    );
+    assert_eq!(
+        messages(&report, "duplicate_pattern_field"),
+        vec!["The field 'foo' is already matched in this pattern.".to_string()]
+    );
+}
+
+/// `case (:var foo, foo: 1)` — the implicit name joins the ledger at its
+/// own colon, so the later written name reports as the duplicate (the
+/// oracle's `test_recordPattern_dynamicType_implicitName_original` row).
+#[test]
+fn record_duplicate_pattern_field_written_name_after_implicit() {
+    let fixture = "\
+void f(x) {
+  switch (x) {
+    case (:var foo, foo: 1):
+      break;
+  }
+}
+";
+    let report = report_ops(fixture);
+    let second = fixture.find("foo: 1").expect("written duplicate in fixture");
+    assert_eq!(
+        rows(&report, "duplicate_pattern_field"),
+        vec![(CORE_PRELUDE.len() as u32 + second as u32, 3)],
+        "exactly one row, at the written `foo`"
+    );
+    assert_eq!(
+        messages(&report, "duplicate_pattern_field"),
+        vec!["The field 'foo' is already matched in this pattern.".to_string()]
+    );
+}
+
+/// A positional record field is legal — `mustBeNamed: false` keeps the
+/// `positional_field_in_object_pattern` arm dark, and a positional slot
+/// joins no duplicate ledger.
+#[test]
+fn record_positional_fields_stay_legal() {
+    let fixture = "\
+void f(Object? x) {
+  switch (x) {
+    case (0, 1):
+      break;
+    case (var a, b: 2,):
+      break;
+  }
+}
+";
+    let report = report_ops(fixture);
+    for code in [
+        "missing_named_pattern_field_name",
+        "positional_field_in_object_pattern",
+        "duplicate_pattern_field",
+    ] {
+        assert_eq!(rows(&report, code), vec![], "{code} fired on a legal record pattern");
+    }
+}
+
 /// A well-formed named-field pattern reports none of the five faces — the
 /// census direction guard (any emission is pure gain; an extra is never).
 #[test]
@@ -232,13 +367,10 @@ void f(Object? x, List<int> xs) {
     }
 }
 
-// —— residual eight: emit points blocked on foreign-owned hook bodies ——
+// —— the residual eight: verdicts inside the fold's hook bodies ——
 //
-// The remaining eight S2 codes need their verdict at a hook whose body
-// already exists in the fold's `impl ParserListener`, so their emit point
-// cannot be reached by a pure append. Each pin below is the oracle row of
-// the upstream fixture, kept runnable-shaped so the follow-up lane only
-// has to drop the `#[ignore]`:
+// The remaining eight S2 codes emit inside hooks the fold already owns,
+// each pinned to the oracle row of its upstream fixture:
 //
 // * `empty_map_pattern` → `handle_map_pattern`'s `count == 0` arm
 //   (`visitMapPattern`'s `errors.emptyMapPattern(pattern: node)`,
@@ -267,7 +399,6 @@ void f(Object? x, List<int> xs) {
 
 /// `if (x case {})` — the empty map pattern anchors the whole `{}`.
 #[test]
-#[ignore = "emit point is handle_map_pattern's count==0 arm, an existing foreign-owned body"]
 fn empty_map_pattern_anchors_the_empty_braces() {
     let fixture = "void f(Map<int, String> x) {\n  if (x case {}) {}\n}\n";
     let report = report_ops(fixture);
@@ -285,7 +416,6 @@ fn empty_map_pattern_anchors_the_empty_braces() {
 /// `if (x case <int, int>[0])` — the written group's count is the verdict,
 /// and the row spans the group node `<int, int>`.
 #[test]
-#[ignore = "emit point is handle_list_pattern, an existing foreign-owned body"]
 fn expected_one_list_pattern_type_arguments_anchors_the_group() {
     let fixture = "void f(x) {\n  if (x case <int, int>[0]) {}\n}\n";
     let report = report_ops(fixture);
@@ -302,7 +432,6 @@ fn expected_one_list_pattern_type_arguments_anchors_the_group() {
 
 /// `if (x case <int>{0: _})` — the map suffix's group-count verdict.
 #[test]
-#[ignore = "emit point is handle_map_pattern, an existing foreign-owned body"]
 fn expected_two_map_pattern_type_arguments_anchors_the_group() {
     let fixture = "void f(x) {\n  if (x case <int>{0: _}) {}\n}\n";
     let report = report_ops(fixture);
@@ -320,7 +449,6 @@ fn expected_two_map_pattern_type_arguments_anchors_the_group() {
 /// `if (x case var a && var a)` — the second binder reports, the first
 /// carries the context row.
 #[test]
-#[ignore = "emit point is handle_declared_variable_pattern, an existing foreign-owned body"]
 fn duplicate_variable_pattern_anchors_the_second_binder() {
     let fixture = "void f(int x) {\n  if (x case var a && var a) {\n    a;\n  }\n}\n";
     let report = report_ops(fixture);
@@ -338,7 +466,6 @@ fn duplicate_variable_pattern_anchors_the_second_binder() {
 
 /// `(a, a) = (1, 2)` — the second assigned variable reports.
 #[test]
-#[ignore = "emit point is handle_assigned_variable_pattern, an existing foreign-owned body"]
 fn duplicate_pattern_assignment_variable_anchors_the_second_target() {
     let fixture = "void f() {\n  int a;\n  (a, a) = (1, 2);\n  a;\n}\n";
     let report = report_ops(fixture);
@@ -356,7 +483,6 @@ fn duplicate_pattern_assignment_variable_anchors_the_second_target() {
 
 /// `(int) = 0` — a non-local assignment target reports at the name.
 #[test]
-#[ignore = "emit point is handle_assigned_variable_pattern, an existing foreign-owned body"]
 fn pattern_assignment_not_local_variable_anchors_the_target() {
     let fixture = "void f() {\n  (int) = 0;\n}\n";
     let report = report_ops(fixture);
@@ -374,7 +500,6 @@ fn pattern_assignment_not_local_variable_anchors_the_target() {
 /// `if (x case int a || 2 || 3)` — each branch that omits `a` reports at
 /// its own operand.
 #[test]
-#[ignore = "emit point is end_binary_pattern's `||` arm, an existing foreign-owned body"]
 fn missing_variable_pattern_anchors_each_omitting_branch() {
     let fixture = "void f(Object? x) {\n  if (x case int a || 2 || 3 when a > 0) {\n    a;\n  }\n}\n";
     let report = report_ops(fixture);
@@ -397,7 +522,6 @@ fn missing_variable_pattern_anchors_each_omitting_branch() {
 /// `if (x case int a || [double a])` — both branches bind `a`, but their
 /// joined types disagree, so the later branch's binder reports.
 #[test]
-#[ignore = "emit point is end_binary_pattern's `||` arm, an existing foreign-owned body"]
 fn inconsistent_pattern_variable_logical_or_anchors_the_later_binder() {
     let fixture =
         "void f(Object? x) {\n  if (x case int a || [double a] when a > 0) {\n    a;\n  }\n}\n";

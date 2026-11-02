@@ -34,6 +34,35 @@ pub(crate) struct PatternNodeState {
     /// earlier one (`constant_verifier.dart:313-355`), so the frame
     /// accumulates per entry and the map's close drains.
     pub(crate) map_keys: Vec<(crate::const_eval::Node, SourceRange)>,
+    /// The frame's first token (its own `begin_pattern` token): the LEFT
+    /// operand of a `||`/`&&` ending in this frame spans from it to the
+    /// operator — a left-associative chain keeps the whole left subtree
+    /// inside the frame.
+    pub(crate) begin_token: Option<Token>,
+    /// The count of binders in the root ledger's innermost or-scope when
+    /// this frame opened: a `||` beginning in this frame splits that scope
+    /// at exactly this index — entries at `binder_mark..` are its left
+    /// operand's binders (`logicalOrPatternStart`,
+    /// variable_bindings.dart:141-143).
+    pub(crate) binder_mark: usize,
+    /// The first token of the most recently closed child frame: a `||`'s
+    /// RIGHT operand's head (the operand's own `begin_pattern`..`end_pattern`
+    /// bracket closes last, immediately before `end_binary_pattern` runs).
+    pub(crate) last_pop_begin: Option<Token>,
+    /// The root frame's `VariableBinder._variables` stack
+    /// (variable_bindings.dart:24-30): the base scope plus one map per
+    /// open `||` right operand. Only index 0 of `pattern_rows` (the root
+    /// pattern) ever uses it — nested frames carry empty stacks.
+    pub(crate) or_scopes: Vec<Vec<super::pattern_faces::OrBinder>>,
+    /// The `||` split marks of the open or-operands, in push order: at
+    /// `end_binary_pattern` the mark says where the left operand's entries
+    /// begin inside the scope below the just-popped right scope.
+    pub(crate) or_splits: Vec<usize>,
+    /// The root frame's `assignedVariables` ledger
+    /// (type_analyzer.dart:331-345): the resolved assigned-variable
+    /// targets of one pattern assignment, `(name, first span)` in source
+    /// order. Only the root state uses it.
+    pub(crate) assigned_vars: Vec<(StringId, SourceRange)>,
 }
 
 impl PatternNodeState {
@@ -43,6 +72,12 @@ impl PatternNodeState {
             pending: Vec::new(),
             fields: Vec::new(),
             map_keys: Vec::new(),
+            begin_token: None,
+            binder_mark: 0,
+            last_pop_begin: None,
+            or_scopes: Vec::new(),
+            or_splits: Vec::new(),
+            assigned_vars: Vec::new(),
         }
     }
 }
@@ -7676,7 +7711,26 @@ impl ParserListener for DiagnoseListener<'_> {
             binary,
             wildcards: Vec::new(),
         });
-        self.pattern_rows.push(PatternNodeState::new());
+        // The `||` binder ledger (variable_bindings.dart:24-30) lives on the
+        // root state: a root pattern opens with one base scope; a nested
+        // frame only records the scope depth it opened at (`binder_mark`),
+        // which the `||` split reads to isolate its left operand's binders.
+        let is_root = self.pattern_rows.is_empty();
+        let binder_mark = if is_root {
+            0
+        } else {
+            self.pattern_rows
+                .first()
+                .and_then(|root| root.or_scopes.last())
+                .map_or(0, Vec::len)
+        };
+        let mut state = PatternNodeState::new();
+        state.begin_token = Some(token);
+        state.binder_mark = binder_mark;
+        if is_root {
+            state.or_scopes.push(Vec::new());
+        }
+        self.pattern_rows.push(state);
     }
 
     fn end_pattern(&mut self, token: Token) {
@@ -7692,8 +7746,15 @@ impl ParserListener for DiagnoseListener<'_> {
         let popped = engine.switch.pattern_stack.pop();
         if popped.is_some() {
             // Lockstep with the pattern stack: the frame's deferred-row state
-            // dies with the frame.
-            self.pattern_rows.pop();
+            // dies with the frame. The closed frame's first token latches on
+            // its parent — the RIGHT operand's head for a `||`/`&&` closing
+            // next (`end_binary_pattern` runs immediately after the
+            // operand's `end_pattern`).
+            if let Some(state) = self.pattern_rows.pop() {
+                if let Some(parent) = self.pattern_rows.last_mut() {
+                    parent.last_pop_begin = state.begin_token;
+                }
+            }
         }
         let Some(frame) = popped else {
             return;
@@ -7819,10 +7880,32 @@ impl ParserListener for DiagnoseListener<'_> {
         if is_or && let Some(frame) = engine.switch.pattern_stack.last_mut() {
             frame.or_ops += 1;
         }
+        if is_or {
+            // `logicalOrPatternStart` (variable_bindings.dart:141-143): the
+            // left operand's binders already sit in the innermost scope —
+            // the current frame's `binder_mark` marks where they start, and
+            // the right operand parses into a fresh scope.
+            super::pattern_faces::begin_or_operand(&mut self.pattern_rows);
+        }
     }
 
     fn end_binary_pattern(&mut self, operator: Token, end: Token) {
         self.flow().end_binary_pattern(operator, end);
+        if self.engine.text_of(operator) == Some("||") {
+            // `logicalOrPatternFinish` + the joined-variable consistency
+            // walk (variable_bindings.dart:86-136,
+            // type_analyzer.dart:2870-2920): a variable bound in exactly one
+            // branch reports `missing_variable_pattern` at the OMITTING
+            // branch's operand, and a type/finality disagreement across the
+            // branches reports `inconsistent_pattern_variable_logical_or`
+            // at the later branch's binder.
+            super::pattern_faces::end_or_operand(
+                &mut self.pattern_rows,
+                &mut self.engine,
+                operator,
+                end,
+            );
+        }
     }
 
     fn handle_cast_pattern(&mut self, operator: Token) {
@@ -7941,6 +8024,16 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {
         self.flow().handle_list_pattern(count, left, right);
+        // The written `<...>` group's count (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/resolver/
+        // list_pattern_resolver.dart:22-32 — `length != 1` reports
+        // `.at(typeArguments)`, the group node).
+        super::pattern_faces::pattern_type_argument_count(
+            &mut self.engine,
+            left,
+            1,
+            SemanticCode::ExpectedOneListPatternTypeArguments,
+        );
         // The List kind of `checkPatternNeverMatchesValueType`
         // (list_pattern_resolver.dart:45): the pattern's required type is a
         // `List`, so a matched value that cannot be one proves it dead. The
@@ -7963,6 +8056,27 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {
         self.flow().handle_map_pattern(count, left, right);
+        // The written `<...>` group's count (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/generated/resolver.dart:1607-1619 —
+        // `length != 2` reports `.at(typeArguments)`, the group node).
+        super::pattern_faces::pattern_type_argument_count(
+            &mut self.engine,
+            left,
+            2,
+            SemanticCode::ExpectedTwoMapPatternTypeArguments,
+        );
+        // `visitMapPattern`'s `elements.isEmpty` arm (upstream Dart SDK
+        // source, pkg/_fe_analyzer_shared/lib/src/type_inference/
+        // type_analyzer.dart:1360-1368 — `.at(pattern)`, the whole
+        // `{...}` node, type-argument group included): `count` counts
+        // every element slot, rest elements included, matching the
+        // oracle's `node.elements` list.
+        super::pattern_faces::empty_map_pattern_face(
+            &mut self.engine,
+            count,
+            left,
+            right,
+        );
         // `visitMapPattern`'s duplicate-key walk (constant_verifier.dart
         // :325-355) drains here: every entry key that folded to a value was
         // collected in source order, and a key equal to an EARLIER one
@@ -8088,6 +8202,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // failure arm into the unmatched chain so the statement after an
         // if-case stays live.
         self.flow().handle_record_pattern(left_paren, count);
+        // The #3668 field-name faces: upstream runs the same
+        // `buildSharedPatternFields` + `duplicateRecordPatternField` for
+        // record patterns (`mustBeNamed: false`), so `(: 0)` reports
+        // `missing_named_pattern_field_name` and `(a: 1, a: 2)` reports
+        // `duplicate_pattern_field`, while a positional field stays legal.
+        super::pattern_faces::record_pattern_field_faces(self, count, left_paren);
         // The `(` latches: the record kind's never-match row spans the whole
         // `(...)` node, whose closer the scanner's group table answers
         // (#3242).
@@ -8662,6 +8782,23 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(name) = engine.name_of(variable) {
             engine.last_pattern_variable = Some((name, variable.range));
             engine.note_pattern_shadow(name);
+            // `VariableBinder.add` (variable_bindings.dart:30-44): the
+            // binder joins the innermost or-scope, reporting
+            // `duplicate_variable_pattern` at a same-named repeat. The
+            // faces the `||` join compares ride the entry: the resolved
+            // declared type (the still-armed `armed_ty`, alias-folded) and
+            // the `final` keyword's finality.
+            let binder_ty = engine.armed_ty.map(|ty| engine.fold_alias_ty(ty));
+            let binder_fin =
+                keyword.and_then(|kw| engine.text_of(kw)).map(|text| text == "final");
+            super::pattern_faces::note_declared_binder(
+                &mut self.pattern_rows,
+                engine,
+                name,
+                variable.range,
+                binder_ty,
+                binder_fin,
+            );
             if !in_assignment_pattern {
                 // A binder in an if-case condition that shadows an outer
                 // tracked local retires with its case scope: a read after the
@@ -12072,9 +12209,47 @@ impl ParserListener for DiagnoseListener<'_> {
         };
         engine.last_pattern_variable = Some((name, variable.range));
         if engine.resolve_local(name).is_some() {
+            // A resolved local target joins the assignment context's
+            // `assignedVariables` ledger (type_analyzer.dart:331-345): a
+            // second assignment of the same variable reports
+            // `duplicate_pattern_assignment_variable` at the later target.
+            super::pattern_faces::note_assigned_variable(
+                &mut self.pattern_rows,
+                engine,
+                name,
+                variable.range,
+            );
             return;
         }
-        let BareInfo::Missing { on_opaque, .. } = engine.resolve_bare(name).0 else {
+        let (bare, target) = engine.resolve_bare(name);
+        if !matches!(bare, BareInfo::Missing { .. }) {
+            if matches!(target, RefTarget::Local) {
+                // The frameless-initializer local face: still a local
+                // target, so the `assignedVariables` ledger applies.
+                super::pattern_faces::note_assigned_variable(
+                    &mut self.pattern_rows,
+                    engine,
+                    name,
+                    variable.range,
+                );
+            } else {
+                // `visitAssignedVariablePattern`'s resolved-but-not-local
+                // arm (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/resolver/
+                // resolution_visitor.dart:163-201 — `.at(node.name)`): the
+                // name resolved to a type, a member, a prefix, or any
+                // other element that is not a local variable or formal
+                // parameter.
+                engine.emit(
+                    SemanticCode::PatternAssignmentNotLocalVariable,
+                    variable.range,
+                    "",
+                    "",
+                );
+            }
+            return;
+        }
+        let BareInfo::Missing { on_opaque, .. } = bare else {
             return;
         };
         if !on_opaque

@@ -16767,16 +16767,21 @@ fn object_pattern_head_reports_undefined_class() {
 fn switch_expression_arm_heads_report() {
     let source = "class Ok {}\nclass Object {}\nvoid f(Object v) {\n  var r = switch (v) {\n    Missing2(:var x) || Missing3() => 1,\n    Ok() => 2,\n  };\n  return r;\n}";
     let r = report(source);
-    assert_eq!(
-        code_offsets(&r),
-        [
-            ("undefined_class", offset_of(source, "Missing2")),
-            ("unused_local_variable", offset_of(source, "x)")),
-            ("undefined_class", offset_of(source, "Missing3")),
-        ],
-        "{:?}",
-        code_offsets(&r)
-    );
+    // Row order is report order, not offset order, so compare sorted.
+    let mut got = code_offsets(&r);
+    got.sort();
+    let mut want = vec![
+        ("undefined_class", offset_of(source, "Missing2")),
+        ("unused_local_variable", offset_of(source, "x)")),
+        // `||` binds `x` in the left branch only, so the right operand
+        // omits it: `logicalOrPatternBranchMissingVariable` reports at
+        // that operand (`hasInLeft: true` -> `.at(node.rightOperand)`;
+        // variable_bindings.dart:86-136).
+        ("missing_variable_pattern", offset_of(source, "Missing3()")),
+        ("undefined_class", offset_of(source, "Missing3")),
+    ];
+    want.sort();
+    assert_eq!(got, want, "{:?}", code_offsets(&r));
 }
 
 /// F3: an if-case head reports; a defined typed field sub-pattern and
