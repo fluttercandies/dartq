@@ -5508,8 +5508,47 @@ impl<'a> Engine<'a> {
             );
             return;
         }
+        // The static-extensions tail (`resolveStaticExtension`): a miss
+        // on the declaration's own face resolves through exactly one
+        // accessible extension whose on-declaration is this element —
+        // `A.foo` over `extension E on A { static int get foo }` binds
+        // the extension's static member (probed 3.13.7). The interface
+        // invocation face (`C.m()`) does NOT ride it — the oracle's
+        // method-invocation path reports `undefined_method` naming the
+        // type, so only read/write intents ask here.
+        if !defined
+            && !matches!(row.intent, Intent::Invoke | Intent::Operator(..))
+            && let Some((face_file, spelling, extension)) =
+                self.static_extension_member(resolved, owner, row.name)
+        {
+            let ref_kind = Self::member_ref_kind(&row.intent, MemberKind::Getter);
+            self.note_member_ref(
+                row,
+                ref_kind,
+                extension.map(|origin| (face_file, spelling, origin)),
+            );
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            return;
+        }
         let name_text = self.strings.resolve(row.name);
-        let type_text = self.strings.resolve(container).to_string();
+        // The static-face type text is the element's `thisType` — a
+        // generic declaration keeps its own parameter spellings
+        // (`List.gone` names `List<E>`, `FutureOr.foo` `FutureOr<T>`,
+        // lookup_failure_reporter.dart's `interface.thisType`; probed
+        // 3.13.7). The extension face is exempt: its trio names the
+        // declaration's bare `name!`, never the instantiated type
+        // (`_extensionReadFailure`).
+        let mut type_text = self.strings.resolve(container).to_string();
+        if resolved_kind != ContainerKind::Extension && !resolved.type_param_names.is_empty() {
+            type_text.push('<');
+            for (index, param) in resolved.type_param_names.iter().enumerate() {
+                if index > 0 {
+                    type_text.push_str(", ");
+                }
+                type_text.push_str(self.strings.resolve(*param));
+            }
+            type_text.push('>');
+        }
         // A compound write checks both faces (the oracle resolves the read
         // first): the read-face text, then the setter text.
         let read_face_missing = !resolved.members.contains_key(&row.name);
@@ -5669,6 +5708,180 @@ impl<'a> Engine<'a> {
         // the next real application.
         self.members.ext_ref.set(None);
         applies
+    }
+
+    /// The static-extensions tail of a container-static access
+    /// (`C.foo`, `C.foo = x`, `C.foo += 1` — the oracle's
+    /// `typePropertyResolver.resolveStaticExtension`, upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/dart/resolver/
+    /// type_property_resolver.dart:245-283`): after the declaration's own
+    /// static members miss, every accessible extension whose
+    /// ON-DECLARATION is the accessed element answers its static members
+    /// through the type's name (`extension_member_resolver.dart`
+    /// `findStaticExtension` — `extension.onDeclaration == declaration`).
+    /// The on-declaration is the extended type's element — a class, mixin,
+    /// enum, or extension type; a type alias unfolds transitively to its
+    /// interface target, and an `on` clause naming `T?`, `FutureOr<T>`, a
+    /// type variable, `Never`, a record, or a function type has none
+    /// (`element.dart` `onDeclaration`).
+    ///
+    /// One matching member slot resolves; none keeps the miss; two or
+    /// more is the oracle's ambiguity, which still reports the
+    /// access-intent miss (probed 3.13.7: `C.a` over `extension E on C
+    /// { static int a = 1; }` counts the induced getter AND induced
+    /// setter — already two — and reports `undefined_getter`). A single
+    /// member clears BOTH the read and the write need
+    /// (`result.member != null` unsets `_needsGetterError` and
+    /// `_needsSetterError` alike — `C.s += 1` over a lone `static set s`
+    /// resolves both faces). Returns the winning member's reference
+    /// triple `(face file, spelling, extension name)` on a unique hit.
+    fn static_extension_member(
+        &mut self,
+        resolved: &Container,
+        owner: FileId,
+        name: StringId,
+    ) -> Option<(FileId, StringId, Option<StringId>)> {
+        let setter = self.setter_spelling(name);
+        // The member-slot facts each accessible face carries for the base
+        // name, gathered in the face borrow — `havingStaticMemberWithName`
+        // counts the plain spelling's static entry (getter, method, or
+        // field), the field's induced setter when writable, and the
+        // `name=` spelling's static setter separately.
+        let mut candidates: Vec<(FileId, Option<StringId>, StringId, StringId)> = Vec::new();
+        self.accessible_extension_faces();
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
+        for &(face, face_file) in faces {
+            let Ty::Named {
+                name: on_head,
+                nullable: false,
+                ..
+            } = self.boundary.ty(face_file, face.on_ty)
+            else {
+                continue;
+            };
+            if let Some(entry) = face.members.get(&name)
+                && entry.is_static
+            {
+                candidates.push((face_file, face.name, on_head, name));
+                // A writable field's induced setter is a second slot of
+                // the same base name (the ambiguity pair `C.a` over
+                // `static int a` already makes, probed 3.13.7).
+                if entry.kind == MemberKind::Field && !entry.is_final {
+                    candidates.push((face_file, face.name, on_head, setter));
+                }
+            }
+            if face
+                .members
+                .get(&setter)
+                .is_some_and(|entry| entry.is_static)
+            {
+                candidates.push((face_file, face.name, on_head, setter));
+            }
+        }
+        let mut hit: Option<(FileId, StringId, Option<StringId>)> = None;
+        let mut slots = 0usize;
+        for (face_file, extension, on_head, spelling) in candidates {
+            // The on-declaration element: the `on` head unaliased to its
+            // interface container. A face whose `on` clause cannot ground
+            // to the accessed element contributes nothing.
+            let Some((on_container, on_owner)) = self.on_declaration_container(face_file, on_head)
+            else {
+                continue;
+            };
+            // `on FutureOr<T>` has no on-declaration — the union's element
+            // is excluded next to `T?` and the type variable upstream
+            // (`element.dart` `onDeclaration`'s `isDartAsyncFutureOr`
+            // gate). The face's own `on` spelling resolves through its
+            // declaring scope, so the exclusion keys on the resolved
+            // element's library, not the spelled name.
+            if matches!(on_container.kind, ContainerKind::Extension)
+                || self
+                    .graph
+                    .library_of_file(on_owner)
+                    .is_some_and(|lib| self.graph.uri(lib) == "dart:async")
+                    && self
+                        .strings
+                        .resolve(on_head)
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|leaf| leaf == "FutureOr")
+                || !(std::ptr::eq(on_container, resolved) && on_owner == owner)
+            {
+                continue;
+            }
+            slots += 1;
+            hit = Some((face_file, spelling, extension));
+        }
+        (slots == 1).then_some(hit).flatten()
+    }
+
+    /// The container element an `on` clause's named head denotes
+    /// (the on-declaration half of [`Self::static_extension_member`]):
+    /// resolves `head` in `face_file`'s own scope and chases a type
+    /// alias's named right-hand side to its interface target
+    /// (`typedef T<Y> = A<Y>; extension E on T<String>` — the
+    /// on-declaration is `A`, element.dart:3147-3155). `None` when the
+    /// head resolves to no container — a function/record right-hand
+    /// side, a `FutureOr`/union spelling, or a name the face's scope
+    /// cannot ground — the under-report direction.
+    fn on_declaration_container(
+        &self,
+        face_file: FileId,
+        head: StringId,
+    ) -> Option<(&'a Container, FileId)> {
+        let mut file = face_file;
+        let mut head = head;
+        // Alias chains cycle (`typedef A = B; typedef B = A;`): the
+        // oracle's transitive expansion bottoms out on a genuine type —
+        // a bounded chase keeps a degenerate loop from hanging the walk.
+        for _ in 0..8 {
+            let lib = self.graph.library_of_file(file)?;
+            let resolved = if self.strings.resolve(head).contains('.') {
+                resolve_joined_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    lib,
+                    self.strings,
+                    head,
+                )
+            } else {
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    lib,
+                    file,
+                    head,
+                )
+            };
+            if let Some(hit) = resolved {
+                return Some(hit);
+            }
+            let Lookup::Found(NamespaceEntry::Decl(owner)) = self.namespaces.lookup_in_file(
+                self.graph,
+                lib,
+                Some(file),
+                head,
+            ) else {
+                return None;
+            };
+            let decl = self.index.get(owner)?.decl(head)?;
+            if decl.kind != MicroKind::TypeAlias {
+                return None;
+            }
+            let Ty::Named {
+                name: next,
+                nullable: false,
+                ..
+            } = self.boundary.ty(owner, decl.var_ty)
+            else {
+                return None;
+            };
+            head = next;
+            file = owner;
+        }
+        None
     }
 
     /// The interface a type alias names (`typedef A = C;` → `C`) when the
