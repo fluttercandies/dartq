@@ -17,7 +17,13 @@
 # Outputs (under target/conformance/):
 #   census-<ts>.report.tsv     the per-case verdict report (run tool's shape)
 #   census-<ts>.jaccard.tsv    (severity, code, file) Jaccard per severity
-#                              plus OVERALL, and the top divergence rows
+#                              plus OVERALL; a second section repeats the
+#                              same Jaccard at full-row granularity
+#                              (severity, code, file, line:col, length,
+#                              message) so fabricated rows inside an
+#                              otherwise-correct triple cost score; then a
+#                              release_gate line (PASS/FAIL/INCOMPLETE) and
+#                              the top divergence rows
 #   census-<ts>.meta           binary mtime / HEAD / sdk / selection / gate
 #
 # A full census (no --subset) also regenerates the tracked
@@ -40,7 +46,11 @@
 # N manifest ids, which selects a superset of those N (bounded, one run).
 # The actual selected count is printed and recorded in the meta file.
 #
-# Exit codes: 0 ok · 1 census/determinism failure · 2 usage/environment.
+# Exit codes: 0 ok · 1 census/determinism/release-gate failure ·
+#   2 usage/environment. The release gate fails (exit 1) exactly when the
+#   triple-level OVERALL is 1.0 but the row-level is not — fabricated or
+#   drifted rows the triple granularity masks. Sub-1.0 triples are normal
+#   unfinished work (release_gate=INCOMPLETE) and keep exit 0.
 
 set -eu
 
@@ -219,23 +229,34 @@ census_pass() {
 }
 
 # --- Jaccard summary -----------------------------------------------------
-# Per severity and OVERALL: set-level Jaccard over (severity, code, file)
-# triples — expected = expected.tsv rows, actual = expected minus `missing`
-# plus `extra` from the report (the report only records the diff; the
-# matched rows live only in expected.tsv).
+# Per severity and OVERALL, at two granularities over the same expected /
+# actual sets (expected = expected.tsv rows, actual = expected minus
+# `missing` plus `extra` from the report — the report only records the
+# diff; the matched rows live only in expected.tsv):
+#   1. triple: (severity, code, file)
+#   2. row:    the full canonical row text — severity|code|file|line:col|
+#              length|message — so a fabricated diagnostic inside an
+#              otherwise-correct triple still lands in `extra` and costs
+#              score, and message/length drift is visible too.
+# A release_gate line follows: PASS only when the row-level OVERALL is
+# exactly 1.0 — the gate can never pass on triples alone.
 # Top divergence rows: (severity, code) pairs ranked by missing+extra count.
 summarize() {
     report="$1"
     jout="$2"
-    # Pass 1: per-(severity,code,file) Jaccard per severity + OVERALL, and a
-    # raw divergence dump to a side file (sorted in pass 2). Set-level over
-    # triples; a triple diverging in either direction counts once.
+    # Pass 1: both granularities in one awk pass, plus a raw divergence dump
+    # to a side file (sorted in pass 2). Set-level; an entry diverging in
+    # either direction counts once.
     raw="$jout.raw"
     # File order: report first (its case ids bound the census into `seen`),
     # then expected.tsv restricted to those ids — a --subset run must not
     # count the whole corpus's expected rows in its union.
     awk -F'\t' -v raw="$raw" '
         function k3(sev, code, file) { return sev SUBSEP code SUBSEP file }
+        # Row identity = the whole rowtext segment (messages may contain
+        # "|", so the segment string itself is the key, not re-joined
+        # fields). Severity for bucketing is everything before the first |.
+        function rsev(rowtext) { return substr(rowtext, 1, index(rowtext, "|") - 1) }
         NR == FNR {
             # report.tsv: header then case_id \t verdict \t missing \t extra
             if (FNR == 1) next
@@ -245,13 +266,15 @@ summarize() {
             # missing (col 3) ⊆ expected-only; extra (col 4) = actual-only.
             # Rows are joined by a double-semicolon separator — a message
             # containing that literal would split mid-row; its fragment
-            # fails the |field| parse and is skipped (negligible: analyzer
-            # prose never uses it, and the skew is one triple on one case).
+            # fails the |field| parse and is skipped at both granularities
+            # (negligible: analyzer prose never uses it, and the skew is
+            # one entry on one case).
             if ($3 != "") {
                 nm = split($3, ms, ";;")
                 for (i = 1; i <= nm; i++) {
                     if (split(ms[i], r, "|") >= 3) {
                         missing[k3(r[1], r[2], r[3])] = 1
+                        rmissing[rsev(ms[i]) SUBSEP ms[i]] = 1
                         dmiss[r[1] SUBSEP r[2]]++
                     }
                 }
@@ -261,6 +284,7 @@ summarize() {
                 for (i = 1; i <= ne; i++) {
                     if (split(es[i], r, "|") >= 3) {
                         extra[k3(r[1], r[2], r[3])] = 1
+                        rextra[rsev(es[i]) SUBSEP es[i]] = 1
                         dextra[r[1] SUBSEP r[2]]++
                     }
                 }
@@ -274,13 +298,14 @@ summarize() {
             for (i = 2; i <= NF; i++) {
                 split($i, r, "|")
                 expd[k3(r[1], r[2], r[3])] = 1
+                rexpd[rsev($i) SUBSEP $i] = 1
             }
         }
         END {
             # actual = (expd − missing) ∪ extra; union = expd ∪ extra.
             # inter = actual ∩ expd: the set Jaccard of the two sides. It
             # must NOT be actual ∩ union — actual is a subset of union by
-            # construction, so that form counts every fabricated triple as
+            # construction, so that form counts every fabricated entry as
             # an intersection and rewards over-reporting.
             for (k in expd) if (!(k in missing)) actual[k] = 1
             for (k in extra) actual[k] = 1
@@ -302,6 +327,48 @@ summarize() {
             }
             close("sort")
             printf "OVERALL\t%d\t%d\t%.6f\n", ti, tu, (tu ? ti / tu : 1)
+            triple_overall = (tu ? ti / tu : 1)
+
+            # Row-level: same reconstruction, keys are sev SUBSEP rowtext.
+            for (k in rexpd) if (!(k in rmissing)) ractual[k] = 1
+            for (k in rextra) ractual[k] = 1
+            for (k in rexpd) runion[k] = 1
+            for (k in rextra) runion[k] = 1
+            for (k in ractual) if (k in rexpd) {
+                s = k; sub(SUBSEP ".*", "", s); rinter[s]++
+            }
+            for (k in runion) { s = k; sub(SUBSEP ".*", "", s); runi[s]++ }
+
+            print ""
+            print "# row level (full row text: severity|code|file|line:col|length|message)"
+            print "severity\tintersection\tunion\tjaccard"
+            rti = 0; rtu = 0
+            for (s in runi) {
+                ci = rinter[s] + 0; cu = runi[s]
+                printf "%s\t%d\t%d\t%.6f\n", s, ci, cu, (cu ? ci / cu : 1) | "sort"
+                rti += ci; rtu += cu
+            }
+            close("sort")
+            printf "OVERALL\t%d\t%d\t%.6f\n", rti, rtu, (rtu ? rti / rtu : 1)
+            row_overall = (rtu ? rti / rtu : 1)
+
+            # The release gate is a pure function of this report: it
+            # adjudicates a 1.0 claim, so it only FAILs when triples say
+            # the corpus is clean but rows prove otherwise (fabrication or
+            # position/message drift invisible at triple granularity).
+            # A sub-1.0 triple is ordinary unfinished work, not a gate
+            # violation — INCOMPLETE keeps exit 0 for the dev loop.
+            print ""
+            if (row_overall >= 1.0) {
+                print "# release gate"
+                print "release_gate\tPASS"
+            } else if (triple_overall >= 1.0) {
+                print "# release gate: triple level is 1.0 but row level is not — fabricated or drifted rows are masked by the triple granularity"
+                print "release_gate\tFAIL"
+            } else {
+                print "# release gate"
+                print "release_gate\tINCOMPLETE"
+            }
 
             # Raw divergence rows for pass 2 (sorted there).
             for (c in dmiss) all[c] = 1
@@ -323,6 +390,15 @@ summarize() {
         fi
     } >> "$jout"
     rm -f "$raw"
+
+    # Release gate: a FAIL line means the triple granularity masked
+    # fabricated or drifted rows — that is a hard failure, not progress.
+    gate=$(awk -F'\t' '$1 == "release_gate" { print $2 }' "$jout")
+    if [ "$gate" = "FAIL" ]; then
+        echo "RELEASE GATE: FAIL — triple-level Jaccard is 1.0 but row-level" \
+            "is not; fabricated or drifted rows are masked (see $jout)" >&2
+        return 1
+    fi
 }
 
 # --- run -----------------------------------------------------------------
