@@ -2609,6 +2609,23 @@ impl<'o> Interp<'o> {
         if a_invalid && b_invalid {
             return Ty::UNKNOWN;
         }
+        // `UP(Null, T)` is `T` when `T` is nullable and `T?` otherwise
+        // (least_upper_bound.dart:489-508): a `Null` arm joined with any
+        // other operand always keeps that operand, only widening its
+        // suffix. This must precede the unknown-face drops below —
+        // `LUB(Null, T?)` over an unspellable `T?` (`c ? null : x` where
+        // `x`'s spelling resolves to the opaque face) is still
+        // potentially-nullable, and answering `Null` deads every `?.`
+        // access over the joined value the oracle keeps live.
+        if a.base == Base::Null && b.base == Base::Null {
+            return a;
+        }
+        if a.base == Base::Null {
+            return b.make_nullable();
+        }
+        if b.base == Base::Null {
+            return a.make_nullable();
+        }
         if a.base == Base::Unknown {
             return b;
         }
@@ -2616,21 +2633,16 @@ impl<'o> Interp<'o> {
             return a;
         }
         // The official LUB joins the nullability suffix (`least_upper_bound`
-        // over the nullability-aware lattice): `LUB(Null, T) = T?` — a
-        // switch-expression arm folding `_ => null` with instance arms must
-        // keep the expression nullable, or a `?? ` over the assigned value
-        // folds its right side dead.
-        let either_null = a.base == Base::Null || b.base == Base::Null;
-        let nullable_join = a.nullable || b.nullable || either_null;
+        // over the nullability-aware lattice): a switch-expression arm
+        // folding a nullable spelling with instance arms keeps the
+        // expression nullable, or a `?? ` over the assigned value folds
+        // its right side dead. `Null` operands never reach here — the
+        // `UP(Null, T)` arms above own them.
+        let nullable_join = a.nullable || b.nullable;
         let with_join = |mut ty: Ty| -> Ty {
-            if ty.base != Base::Null {
-                ty.nullable = ty.nullable || nullable_join;
-            }
+            ty.nullable = ty.nullable || nullable_join;
             ty
         };
-        if a.base == Base::Null && b.base == Base::Null {
-            return a;
-        }
         if self.ops.is_subtype(a, b) {
             return with_join(b);
         }

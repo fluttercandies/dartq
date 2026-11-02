@@ -287,3 +287,7 @@ mod ticket_3533_pins;
 #[cfg(test)]
 #[path = "ticket_3550_pins.rs"]
 mod ticket_3550_pins;
+
+#[cfg(test)]
+#[path = "ticket_3602_pins.rs"]
+mod ticket_3602_pins;
