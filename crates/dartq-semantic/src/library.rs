@@ -1666,6 +1666,7 @@ mod tests {
                 target: Some(lib_a),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -1675,6 +1676,7 @@ mod tests {
                 target: Some(lib_a),
                 prefix: Some(strings.intern("p")),
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

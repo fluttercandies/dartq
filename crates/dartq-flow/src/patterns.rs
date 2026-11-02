@@ -1541,15 +1541,8 @@ impl Interp<'_> {
                     self.promoted_type_of(var, &model),
                     self.promoted_args_of(var, &model),
                 );
-                self.ops.try_promote_to_typed(
-                    tested,
-                    tested_args,
-                    matched,
-                    matched_args,
-                    self.args,
-                    self.names,
-                )
-                .or_else(|| self.type_parameter_promotion(matched, tested, tested_args))
+                self.promotion_step(tested, tested_args, matched, matched_args)
+                    .or_else(|| self.type_parameter_promotion(matched, tested, tested_args))
             }
         }
     }

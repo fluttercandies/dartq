@@ -65,6 +65,7 @@ fn run_semantic_dep(source: &str, dependency: Option<&str>, rule: &str) -> Vec<L
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         index.insert(dep_file, dep_elements);

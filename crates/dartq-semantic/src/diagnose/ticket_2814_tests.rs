@@ -95,32 +95,36 @@ fn await_for_iterable_reports() {
 }
 
 #[test]
-fn for_in_member_chain_stays_under_reported() {
-    // A member chain's window holds only its receiver's read, which ends
-    // mid-window — the chain's own type is the iterable's, so the
-    // single-reachable-read discipline attributes to nothing (the same
-    // under-report posture the parse-time staging holds for compound
-    // windows).
+fn for_in_member_chain_reports_at_the_chain() {
+    // A member chain's iterable type is the chain's own, not the
+    // receiver's: the operand-expression ask grounds the chain record at
+    // the member token and reports at the whole iterable expression
+    // (the official `.at(iterable)` span — #3632 retired the
+    // single-reachable-read attribution).
     let fixture = "class C {\n  List? list;\n}\nf(C c) {\n  for (var x in c.list) {}\n}\n";
     let report = report_ops(fixture);
-    assert!(
-        unchecked(&report).is_empty(),
-        "member chain reported: {:#?}",
-        unchecked(&report)
+    let chain = at(fixture, "c.list");
+    assert_unchecked(
+        &report,
+        chain,
+        6,
+        "A nullable expression can't be used as an iterator in a for-in loop.",
     );
 }
 
 #[test]
-fn for_in_compound_iterable_stays_under_reported() {
-    // The if-null window holds more than one read row — the single-row
-    // discipline attributes it to no one row (the parse-time staging's
-    // own posture).
+fn for_in_compound_iterable_reports_at_the_iterable() {
+    // The if-null iterable's type is the arms' join; the operand's own
+    // type grounds at its last read and reports over the whole
+    // expression span.
     let fixture = "f() {\n  List? a, b;\n  for (var x in a ?? b) {}\n}\n";
     let report = report_ops(fixture);
-    assert!(
-        unchecked(&report).is_empty(),
-        "compound iterable reported: {:#?}",
-        unchecked(&report)
+    let compound = at(fixture, "a ?? b");
+    assert_unchecked(
+        &report,
+        compound,
+        6,
+        "A nullable expression can't be used as an iterator in a for-in loop.",
     );
 }
 

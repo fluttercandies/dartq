@@ -244,6 +244,7 @@ fn import_library(
                 target: Some(target_lib),
                 prefix: (*prefix).map(|prefix| strings.intern(prefix)),
                 deferred: false,
+                non_library: false,
                 combinators,
             },
         );

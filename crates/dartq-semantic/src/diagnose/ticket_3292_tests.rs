@@ -99,6 +99,7 @@ fn analyze_core(source: &str) -> Analysis<'static> {
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

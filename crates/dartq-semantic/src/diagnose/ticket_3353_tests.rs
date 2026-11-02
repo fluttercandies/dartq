@@ -103,6 +103,7 @@ fn report(main: &str, dependency: &str, legacy: bool) -> FileReport {
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

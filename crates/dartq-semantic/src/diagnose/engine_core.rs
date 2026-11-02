@@ -14,23 +14,38 @@ enum UncheckedOperandFace {
     Spread,
     /// `uncheckedUseOfNullableValueInYieldEach` — the `yield*` operand.
     YieldEach,
+    /// The void operand of a prefix operator: the member spelling
+    /// (`unary-`, `~`) resolves as a METHOD invocation
+    /// (`uncheckedMethodInvocationOfNullableValue` —
+    /// `type_property_resolver.dart`'s member-call arm; the oracle's
+    /// `The method 'unary-' …`/`The method '~' …` rows).
+    Operator(&'static str),
 }
 
 impl UncheckedOperandFace {
     /// The (problem, correction) texts of the face.
-    fn texts(self) -> (&'static str, &'static str) {
+    fn texts(self) -> (String, String) {
         match self {
             UncheckedOperandFace::ForInIterator => (
-                "A nullable expression can't be used as an iterator in a for-in loop.",
-                "Try checking that the value isn't 'null' before using it as an iterator.",
+                "A nullable expression can't be used as an iterator in a for-in loop."
+                    .to_string(),
+                "Try checking that the value isn't 'null' before using it as an iterator."
+                    .to_string(),
             ),
             UncheckedOperandFace::Spread => (
-                "A nullable expression can't be used in a spread.",
-                "Try checking that the value isn't 'null' before using it in a spread, or use a null-aware spread.",
+                "A nullable expression can't be used in a spread.".to_string(),
+                "Try checking that the value isn't 'null' before using it in a spread, or use a null-aware spread."
+                    .to_string(),
             ),
             UncheckedOperandFace::YieldEach => (
-                "A nullable expression can't be used in a yield-each statement.",
-                "Try checking that the value isn't 'null' before using it in a yield-each statement.",
+                "A nullable expression can't be used in a yield-each statement.".to_string(),
+                "Try checking that the value isn't 'null' before using it in a yield-each statement."
+                    .to_string(),
+            ),
+            UncheckedOperandFace::Operator(name) => (
+                SemanticCode::unchecked_nullable_message(UncheckedNullableKind::Method, name),
+                SemanticCode::unchecked_nullable_correction(UncheckedNullableKind::Method)
+                    .to_string(),
             ),
         }
     }
@@ -457,6 +472,7 @@ impl<'a> Engine<'a> {
             cast_rewrites: Vec::new(),
             record_recv_tys: Vec::new(),
             query_type_rows: Vec::new(),
+            void_read_rows: Vec::new(),
             unnamed_extension_faces_opened: 0,
             initializer_locals: FxHashSet::default(),
             const_kw_spans: Vec::new(),
@@ -1622,44 +1638,55 @@ impl<'a> Engine<'a> {
     }
 
     /// The statement-form operand faces of `unchecked_use_of_nullable_value`
-    /// (#2814): the for-in iterable (`uncheckedUseOfNullableValueAsIterator`
-    /// — `for_resolver.dart:124/:208`, the verifier ask `.at(iterable)`
-    /// after the iterable expression resolves) and the spread operand
-    /// (`uncheckedUseOfNullableValueInSpread` — `type_analyzer.dart`
-    /// `visitSpreadElement:4479-4484`, gated on `!node.isNullAware`).
+    /// (#2814, attribution re-derived in #3632): the for-in iterable
+    /// (`uncheckedUseOfNullableValueAsIterator` — `for_resolver.dart`
+    /// :71-74/:178-180, the verifier ask `.at(iterable)` fired for the
+    /// plain, the bare-target, AND the pattern-header foreach alike), the
+    /// spread operand (`uncheckedUseOfNullableValueInSpread` —
+    /// resolver.dart:4188-4193 `.at(node.expression)`, gated on
+    /// `!node.isNullAware`), the `yield*` operand
+    /// (`uncheckedUseOfNullableValueInYieldEach` —
+    /// yield_statement_resolver.dart:163-168, gated on `node.star !=
+    /// null`), and the void-operand negation
+    /// (`uncheckedMethodInvocationOfNullableValue` with the `unary-`/`~`
+    /// member spelling — prefix_expression_resolver.dart:152-227 routes
+    /// every user-definable operator through the type property resolver's
+    /// nullable arm, which resolves the operand's receiver to the
+    /// `unary-`/`~` METHOD and reports the method-invocation face at the
+    /// operator token — the oracle's `The method 'unary-' …` rows).
     ///
     /// The parse-time pass has no window for these faces: the for-in
     /// iterable window closes inside `check_for_in_iterable`, whose
     /// nullable arm defers to "the nullable-dereference face" without
     /// staging one, and a spread's operand never arms a window at all. So
     /// the candidates re-derive here at the teardown join: a token-table
-    /// walk recovers the windows the parser saw, and the operand's flow
-    /// type comes from the `FlowFact::ReadType` rows the #2798 lane
-    /// pinned ([`Engine::read_types`] — the flow-aware static type at
-    /// every local/parameter read, promoted or declared; the pass-2
-    /// pre-pass has emptied the parse-time row stack by this point). A
-    /// window holding exactly one read whose span reaches the window's
-    /// last token decides — a compound iterable's window (an if-null
-    /// pair, a member chain's receiver read) attributes to no single
-    /// read and stays under-reported, the same discipline the parse-time
-    /// staging holds. A promotion on the read
-    /// (`if (l != null) for (var e in l)`) flows through the same row's
-    /// non-nullable type and stays silent.
+    /// walk recovers the windows the parser saw, and the operand's static
+    /// type grounds the way upstream's `expression.typeOrThrow` does —
+    /// the OPERAND EXPRESSION's own type, never a single-read attribution
+    /// (the #2814 single-read discipline under-reported every compound
+    /// iterable: a member chain's window held only its receiver's row, a
+    /// pattern header's a whole head, a `void` iterable none at all). The
+    /// grounding ladder (`operand_expression_ty`) asks the flow's
+    /// `ReadType` row at the operand's last token first (the promoted
+    /// read, the bare local — a promotion rides the row's non-nullable
+    /// type and stays silent), then the pass-2 receiver-expression walk
+    /// (`recv_expression_ty` — chains, call results through the
+    /// completed-send swap, parenthesized groups), then the token before
+    /// a window-closing `)` (the callee/member whose invocation answer
+    /// IS the send's result). A `void` read grounds through the
+    /// [`Engine::void_read_rows`] side table the shared join drops.
+    /// `Ty::Unknown` grounds to nothing — the under-report posture the
+    /// parse-time staging holds.
     fn stage_operand_faces(&self, out: &mut Vec<Diagnostic>) {
-        // Only files carrying a potentially-nullable operand pay the token
-        // walk (a nullable operand is a necessary condition of every
-        // candidate — the flow's read rows are the post-teardown operand
-        // face: a `void`/`Null` operand drops at the `ReadType` staging
-        // boundary and its pass-1 row is already consumed, so the
-        // declared-type fallback lives in the assignability pass that owns
-        // `use_of_void_result`, outside this teardown join).
-        if !self
-            .read_types
-            .iter()
-            .any(|(_, ty)| self.operand_face_ty_nullable(*ty))
-        {
-            return;
-        }
+        // The walk runs unconditionally: a candidate's operand type comes
+        // from the grounding ladder (`operand_expression_ty`), whose
+        // `recv_expression_ty` leg re-derives member chains, call results,
+        // and groups — none of which appear in `read_types`/`void_read_rows`.
+        // A file's read rows can hold only non-nullable bare reads while a
+        // `for (var x in c.bad)` iterable still reports `List?` — the early
+        // exit a row-table scan would give misses that face. The token scan
+        // itself is cheap; the ladder only pays at a `for`/`...`/`yield`/
+        // `-`/`~` hit.
         let tokens = self.tokens.as_slice();
         for i in 0..tokens.len() {
             match tokens[i].kind {
@@ -1678,7 +1705,7 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let Some((ty, range)) =
-                        self.single_reachable_read_between(start, end, close_idx)
+                        self.operand_expression_ty(start, end, close_idx)
                     else {
                         continue;
                     };
@@ -1691,7 +1718,7 @@ impl<'a> Engine<'a> {
                         continue;
                     };
                     let Some((ty, range)) =
-                        self.single_reachable_read_between(start, end, boundary_idx)
+                        self.operand_expression_ty(start, end, boundary_idx)
                     else {
                         continue;
                     };
@@ -1712,15 +1739,325 @@ impl<'a> Engine<'a> {
                         continue;
                     };
                     let Some((ty, range)) =
-                        self.single_reachable_read_between(start, end, boundary_idx)
+                        self.operand_expression_ty(start, end, boundary_idx)
                     else {
                         continue;
                     };
                     self.emit_operand_face_row(UncheckedOperandFace::YieldEach, ty, range, out);
                 }
+                // The void operand of a prefix `-`/`~` (`-x;` over a `void`
+                // parameter — `void_type_usage_test`'s `param_negation`
+                // shape): the value-consuming unary operators resolve as
+                // member invocations (`unary-`/`~`), and a `void` receiver
+                // is `isPotentiallyNullable` — the method-invocation face
+                // reports at the operator token. Grounded on `Ty::Void`
+                // only: a nullable-TYPED operator operand carries a
+                // resolved interface face the operator lanes already
+                // verdict, and re-deciding it here would double the row.
+                dartq_scanner::TokenKind::Minus | dartq_scanner::TokenKind::Tilde => {
+                    let Some((ty, at)) = self.unary_void_operand_ty(i) else {
+                        continue;
+                    };
+                    self.emit_operand_face_row(
+                        UncheckedOperandFace::Operator(if tokens[i].kind
+                            == dartq_scanner::TokenKind::Minus
+                        {
+                            "unary-"
+                        } else {
+                            "~"
+                        }),
+                        ty,
+                        at,
+                        out,
+                    );
+                }
                 _ => {}
             }
         }
+    }
+
+    /// The operand expression's static type and the anchor the oracle
+    /// reports at (`start .. end` — the window IS the expression, the
+    /// `.at(expression)` span). The grounding ladder: the flow read row
+    /// at the operand's last content token (a bare read's own span, a
+    /// promoted property read's member row), then the receiver-expression
+    /// walk at the same span (the member chain's record, the
+    /// parenthesized group's close-paren row), then — for a window
+    /// closing in a call's `)` — the callee/member token before the
+    /// matching `(` (the completed-send swap answers the call's result).
+    /// `None` grounds to nothing.
+    fn operand_expression_ty(
+        &self,
+        start: u32,
+        _end: u32,
+        boundary_idx: usize,
+    ) -> Option<(Ty, SourceRange)> {
+        let tokens = self.tokens.as_slice();
+        // The operand's last content token: recovery synthetics never
+        // stand for the expression's own tail.
+        let mut last = boundary_idx.checked_sub(1)?;
+        while last > 0
+            && tokens[last].is_synthetic()
+            && tokens[last].utf16_offset >= start
+        {
+            last -= 1;
+        }
+        if tokens[last].utf16_offset < start {
+            return None;
+        }
+        // The operand's first content token: the `.at(expression)` anchor
+        // trims the keyword-to-operand whitespace (`yield* s` reports `s`,
+        // never ` s`), and the end trims the trailing gap to `last`'s own
+        // end — the window's boundary token (`)`, `;`, `,`) is the
+        // delimiter, never the expression's extent.
+        let mut first = tokens
+            .iter()
+            .position(|t| t.utf16_offset >= start)
+            .unwrap_or(last);
+        while first < last && tokens[first].is_synthetic() {
+            first += 1;
+        }
+        let last_span = self.token_utf16_span(last)?;
+        let anchor = SourceRange {
+            offset: tokens[first].utf16_offset,
+            length: last_span.end().saturating_sub(tokens[first].utf16_offset),
+        };
+        // 1. The flow row at the operand's last token — the bare read
+        //    (`for (var x in l)`), the promoted property read's member
+        //    row; a `void` read joins through the side table the shared
+        //    join drops.
+        let ty = self
+            .read_type_at(last_span)
+            .or_else(|| self.void_read_ty_at(last_span));
+        if let Some(ty) = ty.filter(|ty| *ty != Ty::Unknown) {
+            return Some((ty, anchor));
+        }
+        // 2. The receiver-expression walk at the last token: the member
+        //    chain's own record (`c.bad` keys at the member token's end),
+        //    the parenthesized group's close-paren row, the compound
+        //    `??`/`?:` arms' re-derivation.
+        if let Some(ty) = self.recv_expression_ty(last_span).filter(|ty| *ty != Ty::Unknown) {
+            return Some((ty, anchor));
+        }
+        // 3. A window closing in `)` that neither leg answered is a call:
+        //    the token before the matching `(` — the callee read of `f()`
+        //    (the completed-send swap answers the call's result) or the
+        //    member of `a.b()` (the chain record's answer IS the send's
+        //    result). A cascade section inside the window (`xs..m()`) is
+        //    NOT a plain send — the cascade's static type is the TARGET's
+        //    type (cascade_expression_resolver.dart), never the section's
+        //    result, so the callee answer would spell `m`'s return over a
+        //    `List<int>` iterable and report a face the oracle keeps
+        //    silent. The under-report posture stands there.
+        if tokens[last].kind == dartq_scanner::TokenKind::CloseParen {
+            // A cascade marker at the operand's own depth (nested `..`
+            // inside a group is the group's own — `f(a..b)` stays a send).
+            let mut head = tokens
+                .iter()
+                .position(|t| t.utf16_offset >= start)
+                .unwrap_or(last);
+            let mut cascade = false;
+            while head < last {
+                if let Some(close) = self.tokens.matching_end(head) {
+                    head = close + 1;
+                    continue;
+                }
+                if matches!(
+                    tokens[head].kind,
+                    dartq_scanner::TokenKind::PeriodPeriod
+                        | dartq_scanner::TokenKind::QuestionPeriodPeriod
+                ) {
+                    cascade = true;
+                    break;
+                }
+                head += 1;
+            }
+            if cascade {
+                return None;
+            }
+            let mut depth = 0usize;
+            let mut at = last;
+            while at > 0 {
+                at -= 1;
+                match tokens[at].kind {
+                    dartq_scanner::TokenKind::CloseParen
+                    | dartq_scanner::TokenKind::CloseSquare
+                    | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                    dartq_scanner::TokenKind::OpenParen
+                    | dartq_scanner::TokenKind::OpenSquare
+                    | dartq_scanner::TokenKind::OpenCurly => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            if depth == 0
+                && tokens[at].kind == dartq_scanner::TokenKind::OpenParen
+                && tokens[at].utf16_offset >= start
+            {
+                // The token before the `(`, skipping recovery synthetics.
+                let mut callee = at;
+                while callee > 0 {
+                    callee -= 1;
+                    if !tokens[callee].is_synthetic()
+                        && tokens[callee].utf16_offset >= start
+                    {
+                        break;
+                    }
+                }
+                if tokens[callee].utf16_offset >= start
+                    && let Some(ty) = self
+                        .recv_expression_ty(self.token_utf16_span(callee)?)
+                        .filter(|ty| *ty != Ty::Unknown)
+                {
+                    return Some((ty, anchor));
+                }
+            }
+        }
+        None
+    }
+
+    /// The prefix `-`/`~` operand's `void` grounding (`unary_void`): the
+    /// operand starts at the token after the operator, and only the shapes
+    /// whose whole extent the ask covers ground — a bare read (`-x`),
+    /// a parenthesized group (`-(x)`), a call whose close the operand ends
+    /// (`-f()`). A member/index/increment continuation after the grounding
+    /// token (`-a.b`, `-x[0]`, `-x++`) names a composite the single-token
+    /// ask cannot spell — the under-report posture stands.
+    fn unary_void_operand_ty(&self, op_idx: usize) -> Option<(Ty, SourceRange)> {
+        let tokens = self.tokens.as_slice();
+        // Prefix position: the token before the operator does not end an
+        // operand (a `y - x`'s minus reads binary). The lexer's own
+        // classification the increment faces hold (`a -b` after an
+        // operand token is binary) — the operand-ending spellings only.
+        let prior_text = if op_idx == 0 {
+            None
+        } else {
+            Some(&self.source[tokens[op_idx - 1].byte_range()])
+        };
+        let unary = prior_text.is_none_or(|text| {
+            matches!(
+                text,
+                "(" | "["
+                    | "{"
+                    | ","
+                    | "="
+                    | "=="
+                    | "!="
+                    | "=>"
+                    | "return"
+                    | "case"
+                    | ";"
+                    | ":"
+                    | "?"
+                    | "&&"
+                    | "||"
+                    | "??"
+                    | "??="
+            )
+        });
+        if !unary {
+            return None;
+        }
+        let mut head = op_idx + 1;
+        while head < tokens.len() && tokens[head].is_synthetic() {
+            head += 1;
+        }
+        let head_tok = tokens.get(head)?;
+        let op_span = self.token_utf16_span(op_idx)?;
+        // A parenthesized head: the group face answers at the matching
+        // close's span.
+        if head_tok.kind == dartq_scanner::TokenKind::OpenParen {
+            let close = self.tokens.matching_end(head)?;
+            let ty = self
+                .recv_expression_ty(self.token_utf16_span(close)?)
+                .filter(|ty| *ty == Ty::Void);
+            return ty.map(|ty| (ty, op_span));
+        }
+        // A callee head (`-f()`): the completed-send swap answers the
+        // call's result; the operand must end at the call's own close (a
+        // `.`/`(`/`[`/`!` continuation names a composite).
+        let next = head + 1;
+        if tokens.get(next).map(|t| t.kind) == Some(dartq_scanner::TokenKind::OpenParen)
+            && let Some(close) = self.tokens.matching_end(next)
+        {
+            let cont = tokens.get(close + 1).map(|t| t.kind);
+            if !matches!(
+                cont,
+                Some(
+                    dartq_scanner::TokenKind::Period
+                        | dartq_scanner::TokenKind::QuestionPeriod
+                        | dartq_scanner::TokenKind::Bang
+                        | dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare
+                )
+            ) && let Some(ty) = self
+                .recv_expression_ty(self.token_utf16_span(head)?)
+                .filter(|ty| *ty == Ty::Void)
+            {
+                return Some((ty, op_span));
+            }
+            return None;
+        }
+        // A bare read head: the flow row (or the void side table) at the
+        // head token, when the operand ends there (no continuation). The
+        // resolved-send lane already owns this shape — `-x`'s operand row
+        // stages the `unary-` verdict on `x`'s own offset
+        // (row_resolution.dart's adjacent-operator arm re-emits it through
+        // [`Engine::emit_unchecked_nullable`] at teardown) — and the
+        // teardown walk must not double the row. The shapes the send never
+        // resolves (the `-(x)` group, the `-f()` send-close) carry no
+        // staged check on their head and still ground here.
+        if !matches!(
+            tokens.get(next).map(|t| t.kind),
+            Some(
+                dartq_scanner::TokenKind::Period
+                    | dartq_scanner::TokenKind::QuestionPeriod
+                    | dartq_scanner::TokenKind::Bang
+                    | dartq_scanner::TokenKind::OpenParen
+                    | dartq_scanner::TokenKind::OpenSquare
+                    | dartq_scanner::TokenKind::MinusMinus
+                    | dartq_scanner::TokenKind::PlusPlus
+            )
+        ) {
+            let head_span = self.token_utf16_span(head)?;
+            if self
+                .staged_checks
+                .iter()
+                .any(|check| check.range.offset == head_span.offset)
+            {
+                return None;
+            }
+            let ty = self
+                .read_type_at(head_span)
+                .or_else(|| self.void_read_ty_at(head_span))
+                .filter(|ty| *ty == Ty::Void);
+            return ty.map(|ty| (ty, op_span));
+        }
+        None
+    }
+
+    /// The `void`-read side table's row at one span (the shared join
+    /// drops `void` rows — the operand faces ask here).
+    fn void_read_ty_at(&self, span: SourceRange) -> Option<Ty> {
+        self.void_read_rows
+            .iter()
+            .any(|(row, _)| *row == span)
+            .then_some(Ty::Void)
+    }
+
+    /// A token's UTF-16 span (the engine's external position convention).
+    fn token_utf16_span(&self, idx: usize) -> Option<SourceRange> {
+        let token = self.tokens.get(idx)?;
+        let end = self
+            .utf16_of(token.byte_offset as usize + token.byte_len as usize);
+        Some(SourceRange {
+            offset: token.utf16_offset,
+            length: end.saturating_sub(token.utf16_offset),
+        })
     }
 
     /// One candidate's verdict: the operand's flow-aware static type (the
@@ -1739,7 +2076,32 @@ impl<'a> Engine<'a> {
         range: SourceRange,
         out: &mut Vec<Diagnostic>,
     ) {
+        // A dead window's operand never fires the verifier's ask — the
+        // `ErrorVerifier` walks the dead node but the non-`dead_code`
+        // checks suppress inside it (the same short-circuit
+        // [`Engine::emit_unchecked_nullable`] holds). The receiver-
+        // expression walk re-decides dead sends, so the gate belongs here
+        // at emit, not at grounding.
+        if self.in_dead_window(range) {
+            return;
+        }
         if !self.operand_face_ty_nullable(ty) {
+            return;
+        }
+        // The prefix-operator face dedups against the resolved-send lane:
+        // `-x`'s operand row resolves `x.unary-()` as a member invocation
+        // (row_resolution.dart's `Intent::Operator`/adjacent arm reports
+        // the same `unary-` method face at the operator token), and the
+        // teardown walk must not double the row. The statement faces
+        // (for-in/spread/yield-each) have no resolved-lane counterpart —
+        // their windows never resolve an operator send — so the check
+        // keys on the operator shape, not the code alone.
+        if matches!(face, UncheckedOperandFace::Operator(_))
+            && self.report.diagnostics.iter().any(|d| {
+                d.code.name == "unchecked_use_of_nullable_value"
+                    && d.range.offset == range.offset
+            })
+        {
             return;
         }
         if ty == Ty::Null {
@@ -1762,10 +2124,10 @@ impl<'a> Engine<'a> {
             Diagnostic::new(
                 SemanticCode::UncheckedUseOfNullableValue.severity(),
                 SemanticCode::UncheckedUseOfNullableValue.code_info(),
-                message.to_string(),
+                message,
                 self.file,
                 range,
-                Some(correction.to_string()),
+                Some(correction),
             )
             .with_context(self.non_promotion_context_at(range.offset)),
         );
@@ -2032,42 +2394,6 @@ impl<'a> Engine<'a> {
             j += 1;
         }
         None
-    }
-
-    /// The single read that IS the window's operand: exactly one
-    /// [`Engine::read_types`] row wholly inside `[start, end)`, and that
-    /// read's span reaches the window's last token (the operand's own
-    /// extent). A compound iterable's window — an if-null pair (two
-    /// reads), a member chain (its receiver read ends mid-window, never
-    /// standing for the chain's type) — attributes to nothing, the
-    /// under-report direction the parse-time staging holds.
-    fn single_reachable_read_between(
-        &self,
-        start: u32,
-        end: u32,
-        boundary_idx: usize,
-    ) -> Option<(Ty, SourceRange)> {
-        let tokens = self.tokens.as_slice();
-        // The window's last content token: the operand's span must reach
-        // it (`for (var x in l.length)`'s `l` read ends mid-window — the
-        // iterable's type is the chain's, not the receiver's).
-        let last_tok_offset = tokens[boundary_idx.checked_sub(1)?].utf16_offset;
-        let mut found: Option<(Ty, SourceRange)> = None;
-        for (range, ty) in &self.read_types {
-            if range.offset >= end {
-                break;
-            }
-            if range.offset >= start {
-                if found.is_some() {
-                    return None;
-                }
-                if range.end() < last_tok_offset {
-                    return None;
-                }
-                found = Some((*ty, *range));
-            }
-        }
-        found
     }
 
     /// The four-placeholder emit (`message4`).
@@ -3184,6 +3510,47 @@ impl<'a> Engine<'a> {
                 }
                 if sup_name == name {
                     return self.same_head_args(name, sub_args_id, sup_args_id, sub, sup, next);
+                }
+                // Two spellings of one leaf that resolve to different
+                // declarations (`async.B` vs `await.B` — two prefixes
+                // importing two `B`s) are distinct elements: the name-level
+                // lattice below keys a dotted head by its leaf and would
+                // read the pair as one head, proving what the oracle's
+                // element-identity walk refuses. One declaration reached
+                // through both spellings (`async.A` vs a bare `A` imported
+                // from the same library) falls through unchanged.
+                let (sub_text, sup_text) =
+                    (self.strings.resolve(name), self.strings.resolve(sup_name));
+                if (sub_text.contains('.') || sup_text.contains('.'))
+                    && sub_text.rsplit('.').next() == sup_text.rsplit('.').next()
+                {
+                    let decl_file = |head: StringId| {
+                        if self.strings.resolve(head).contains('.') {
+                            resolve_joined_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.strings,
+                                head,
+                            )
+                        } else {
+                            resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                head,
+                            )
+                        }
+                        .map(|(_, file)| file)
+                    };
+                    if let (Some(sub_file), Some(sup_file)) = (decl_file(name), decl_file(sup_name))
+                        && sub_file != sup_file
+                    {
+                        return false;
+                    }
                 }
                 // The interface-cycle collapse: upstream resets a cycle
                 // participant's whole face (`interface_cycles.dart:64-82` —
@@ -10660,6 +11027,28 @@ impl<'a> Engine<'a> {
         // 245-258).
         self.emit_use_of_void_result(ty, row);
         if self.nullable_bool_ty(ty) {
+            self.stage_condition_offset(row.range.offset);
+            self.staged_checks.push(StagedCheck {
+                kind: StagedKind::NullableCondition,
+                range: row.range,
+                from: ty,
+                to: Ty::UNKNOWN,
+                literal: false,
+            });
+            return;
+        }
+        // The inferred-const candidate (#3632): an operand whose
+        // parse-time type never resolved (`const c1 = cond ? true : null;
+        // … const c4 = c1 ? 1 : 2;` — the const local's initializer-
+        // derived `bool?` is the flow's answer, a face the parse-time
+        // static type does not spell). A bare local read stages for the
+        // teardown join: the flow's condition-type row at the read
+        // decides, and no row re-decides on the opaque unknown — the
+        // silent posture every unresolvable candidate holds.
+        if ty == Ty::UNKNOWN
+            && !self.bool_decided_covers(row)
+            && self.local_hits.contains_key(&row.range.offset)
+        {
             self.stage_condition_offset(row.range.offset);
             self.staged_checks.push(StagedCheck {
                 kind: StagedKind::NullableCondition,

@@ -80,6 +80,7 @@ fn member_use_report(main: &str, dependency: &str, dependency_uri: &str) -> File
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -89,6 +90,7 @@ fn member_use_report(main: &str, dependency: &str, dependency_uri: &str) -> File
             target: Some(meta),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -98,6 +100,7 @@ fn member_use_report(main: &str, dependency: &str, dependency_uri: &str) -> File
             target: Some(meta),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

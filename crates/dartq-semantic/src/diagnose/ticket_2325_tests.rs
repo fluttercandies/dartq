@@ -78,6 +78,7 @@ fn report(main: &str, mix: &str) -> FileReport {
             target: Some(lib_mix),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

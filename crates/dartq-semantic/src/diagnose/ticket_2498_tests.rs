@@ -58,6 +58,7 @@ fn report_sdk_faces(source: &str) -> FileReport {
                 target: Some(node),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

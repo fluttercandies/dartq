@@ -105,6 +105,7 @@ fn units_report(units: &[(&str, &str)], source: &str) -> FileReport {
                 target: Some(lib_u),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -166,6 +167,7 @@ fn broken_show_report(shown: &str, source: &str) -> FileReport {
             target: None,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::new(
                 [CombinatorClause::Show(
                     vec![strings.intern(shown)].into_boxed_slice(),

@@ -8530,18 +8530,19 @@ fn nullability_disjoint_test_deads_the_then_arm() {
     assert!(dead_snippets(potentially_nullable_operand).is_empty());
 }
 
-/// #2356 pin ④ (guaranteed-fail boundary): the unknown/dynamic/void faces
-/// refuse the fail guarantee — an unknowable operand face is never
-/// certified as a dead-branch producer even against a bottom tested type
-/// (the name-level lattice's optimism must not dead a branch; a resolved
-/// back-end re-decides through the real hierarchy). This pin binds the new
-/// mark's reach, not a swap-back proof: before the fix no fail-marking
-/// exists, so the empty result holds trivially on HEAD — its force is
-/// against the new helper over-firing.
+/// #2356 pin ④ (guaranteed-fail boundary), re-pinned by #3610: the
+/// unknown/dynamic/void operand faces refuse only the nullability-disjoint
+/// fail guarantee. A bottom tested type folds before the operand is read
+/// (official `isExpression_end` — upstream Dart SDK 3.13.7 source,
+/// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:5944-5949),
+/// so even an unknowable operand face (an unresolved call) deads the then
+/// arm — the oracle's `f() is Never` then-block row in
+/// language/nnbd/flow_analysis/unreachable_via_never_test.
 #[test]
 fn unknowable_operand_never_guaranteed_fail() {
     let source = "void f() { if (g() is Never) { h(); } else {} }";
-    assert!(dead_snippets(source).is_empty());
+    // Upstream folds `is Never` before reading the operand (flow_analysis.dart:5944-5949).
+    assert_eq!(dead_snippets(source), ["{ h(); }"]);
 }
 
 /// #2357 pin ① (guaranteed-fail over a reference operand): the official

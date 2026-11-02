@@ -167,56 +167,61 @@ fn yield_as_identifier_is_no_yield_each() {
     );
 }
 
-/// A `void`-typed formal's for-in iterable stays silent on the
-/// unchecked-use face — the operand's `ReadType` row drops at the flow
-/// staging boundary (`FlowBase::Void` is unrepresentable) and its pass-1
-/// row is consumed by teardown, so the declared `void` face is
-/// unreachable from this join. The oracle still reports
-/// `unchecked_use_of_nullable_value` beside its `use_of_void_result`
-/// (forIn_iterable_typeVoid); that face is a residual the assignability
-/// pass that owns `use_of_void_result` must stage — outside this
-/// teardown-join arm. The pin locks the current under-report (no wrong
-/// code emitted), never the oracle's row.
+/// A `void`-typed formal's for-in iterable reports the unchecked-use
+/// face beside its `use_of_void_result`: `void` is potentially nullable,
+/// so upstream `ForResolver` runs `nullableDereferenceVerifier.expression(
+/// uncheckedUseOfNullableValueAsIterator, iterable)` on it. Corpus case
+/// UseOfVoidResultTest/test_forIn_iterable_typeVoid_error is this exact
+/// fixture: both rows at the iterable. (The pin once locked an
+/// under-report while the statement-operand face could not see the
+/// `void` row; the face now stages it.)
 #[test]
-fn for_in_void_iterable_under_reports() {
+fn for_in_void_iterable_reports_the_unchecked_use() {
     let report = report(
         "void f(void x, y) {\n\
          \x20 for (y in x) {}\n\
          }",
     );
-    assert!(
-        !codes(&report).contains(&"unchecked_use_of_nullable_value"),
+    let mut names = codes(&report);
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["unchecked_use_of_nullable_value", "use_of_void_result"],
         "{:?}",
         codes(&report)
     );
 }
 
-/// A `void`-typed formal's spread operand under-reports the same way —
-/// the `void` face is unreachable at teardown.
+/// A `void`-typed formal's spread operand reports the unchecked-use face
+/// the same way: upstream `visitSpreadElement` runs `nullableDereference
+/// Verifier.expression(uncheckedUseOfNullableValueInSpread, …)` on every
+/// non-null-aware spread, and `void` is potentially nullable.
 #[test]
-fn spread_void_operand_under_reports() {
+fn spread_void_operand_reports_the_unchecked_use() {
     let report = report(
         "void f(void x) {\n\
          \x20 var y = [...x];\n\
          }",
     );
     assert!(
-        !codes(&report).contains(&"unchecked_use_of_nullable_value"),
+        codes(&report).contains(&"unchecked_use_of_nullable_value"),
         "{:?}",
         codes(&report)
     );
 }
 
-/// A `void`-typed `yield*` operand under-reports the same way.
+/// A `void`-typed `yield*` operand reports the unchecked-use face the
+/// same way (corpus case UseOfVoidResultTest/
+/// test_yieldStatement_star_syncStar_error).
 #[test]
-fn yield_each_void_operand_under_reports() {
+fn yield_each_void_operand_reports_the_unchecked_use() {
     let report = report(
         "void f(void x) sync* {\n\
          \x20 yield* x;\n\
          }",
     );
     assert!(
-        !codes(&report).contains(&"unchecked_use_of_nullable_value"),
+        codes(&report).contains(&"unchecked_use_of_nullable_value"),
         "{:?}",
         codes(&report)
     );

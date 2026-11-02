@@ -483,6 +483,7 @@ mod tests {
                     target,
                     prefix: Some(prefix),
                     deferred: true,
+                    non_library: false,
                     combinators: Combinators::unfiltered(),
                 },
             );
@@ -504,6 +505,7 @@ mod tests {
                     target,
                     prefix,
                     deferred,
+                    non_library: false,
                     combinators: Combinators::unfiltered(),
                 },
             );
@@ -903,6 +905,7 @@ mod tests {
             target: Some(ext),
             prefix: Some(prefix),
             deferred: true,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         };
         assert!(graph.deferred_import_exports_extension(&hit));
@@ -955,6 +958,7 @@ mod tests {
             target: None,
             prefix: Some(prefix),
             deferred: true,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         };
         assert!(!graph.deferred_import_exports_extension(&edge));

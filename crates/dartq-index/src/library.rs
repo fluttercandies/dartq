@@ -639,6 +639,7 @@ pub(crate) mod tests {
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         builder.import(
@@ -648,6 +649,7 @@ pub(crate) mod tests {
                 prefix: Some(strings.intern("p")),
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -702,6 +704,7 @@ pub(crate) mod tests {
                 prefix: Some(strings.intern("p")),
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -978,6 +981,7 @@ pub(crate) mod tests {
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -1053,6 +1057,7 @@ pub(crate) mod tests {
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -1119,6 +1124,7 @@ pub(crate) mod tests {
                 prefix: Some(strings.intern("p")),
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -1196,6 +1202,7 @@ pub(crate) mod tests {
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -1263,6 +1270,7 @@ pub(crate) mod tests {
                     prefix: Some(strings.intern(prefix)),
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }
@@ -1411,6 +1419,7 @@ pub(crate) mod tests {
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
         let graph = builder.finish();
@@ -1543,6 +1552,7 @@ pub(crate) mod tests {
                     prefix: Some(strings.intern(prefix)),
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }

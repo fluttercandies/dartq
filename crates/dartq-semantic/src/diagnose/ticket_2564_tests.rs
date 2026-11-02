@@ -285,6 +285,7 @@ fn report_prefixed(main_source: &str, lib_source: &str, prefix: &str) -> FileRep
             target: Some(lib_lib),
             prefix: Some(strings.intern(prefix)),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -298,6 +299,7 @@ fn report_prefixed(main_source: &str, lib_source: &str, prefix: &str) -> FileRep
             target: Some(lib_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

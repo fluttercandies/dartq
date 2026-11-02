@@ -673,10 +673,13 @@ pub(crate) struct BoundedIssue {
 /// comes from.
 #[derive(Clone, Copy)]
 enum ScopeKind<'w> {
-    /// A use-site scope (`param_scope` ids carry no facts): a non-nullable
-    /// bounded argument keeps suppressing, a nullable one decides on the
-    /// `Null <: B` conjunct alone, and every other in-scope name reads the
-    /// implicit `Object?` bound.
+    /// A use-site scope: the ids are name-keyed lazy allocations whose
+    /// bounds the snapshot does not carry, so [`Bounds::site_scoped_bounds`]
+    /// resolves them from the captured windows (#3616 F3). A name it cannot
+    /// resolve keeps the old contract — a non-nullable bounded argument
+    /// suppresses, a nullable one decides on the `Null <: B` conjunct
+    /// alone, and every other in-scope name reads the implicit `Object?`
+    /// bound.
     Lazy,
     /// The declaring declaration's own scope: the ids carry their written
     /// bounds in `facts` (containers, alias parameters, extension on).
@@ -2287,6 +2290,24 @@ impl<'a> Bounds<'a> {
             return Vec::new();
         }
         let ctx = snapshot.ctx();
+        // #3616 F3 — the use-site scope's own parameter bounds. A use site
+        // reaches this layer as names plus name-keyed lazy ids, and a lazy
+        // id carries no declared bound in the snapshot: both of the
+        // decisions below read one (the verdict's `X <: B` ride through
+        // `bound(X) <: B`, and the super-bounded inversion's `S <: Never`
+        // probe), so the capture's windows stand in for the declarations
+        // the engine never handed over. `unresolved` names keep the #3593
+        // nested gate's suppression — their bound stays unmodelable here.
+        // An argument list that never names an in-scope parameter reads no
+        // bound at all, so it skips the resolution (the common site).
+        let scope_mentioned = args
+            .iter()
+            .any(|arg| tree_any_head(arg, &|leaf: StringId| scope.contains_key(&leaf)));
+        let (site_facts, unresolved) = match kind {
+            ScopeKind::Lazy if scope_mentioned => self.site_scoped_bounds(&snapshot, scope, site),
+            _ => (None, FxHashSet::default()),
+        };
+        let facts: &ParamFactsTable = site_facts.as_ref().unwrap_or(&snapshot.facts);
         // The instantiation under check: the written arguments mapped, or —
         // a bare head — the oracle's `instantiateToBounds` answer. A wrong
         // written count reports as `wrong_number_of_type_arguments` and the
@@ -2330,21 +2351,26 @@ impl<'a> Bounds<'a> {
                 // #3593 — the NESTED face of the same lazy-scope gap: a
                 // bounded in-scope parameter mentioned BELOW an
                 // argument's root (`A<N>` for `N extends Never` against
-                // `X extends A<X>`) leaves the snapshot's lazy id
-                // boundless, so the leaf `N <: A<N>` — decided by the
-                // parameter's own bound upstream (subtype.dart:490-500)
-                // — answers a fabricated mismatch (`A<N> <\: A<A<N>>`).
-                // The bare-argument arm above keeps #2936's nullable
-                // contract; the nested arm suppresses any mention (the
-                // leaf sits below the root, where the argument's own
-                // nullability decides nothing).
+                // `X extends A<X>`) reads the leaf `N <: A<N>` through
+                // the parameter's own bound upstream (subtype.dart:490-500);
+                // a lazy id whose bound this site could not resolve
+                // ([`Self::site_scoped_bounds`]) would fabricate the
+                // mismatch (`A<N> <\: A<A<N>>`), so those mentions
+                // suppress. A RESOLVED bound decides honestly — the
+                // `N extends Null` super-bounded family's genuine rows
+                // (`'Fcon<N>' doesn't conform to the bound
+                // 'Fcon<Fcon<N>>'`) are exactly the mentions a blanket
+                // suppression lost (#3616 F3). The bare-argument arm
+                // above keeps #2936's nullable contract. A site with NO
+                // unresolved name mentions none: `tree_any_head` answers
+                // a function-shaped leaf conservatively `true`, which
+                // must not suppress `C<List<Function()>>` against `T
+                // extends num` (the oracle reports it).
                 || (matches!(kind, ScopeKind::Lazy)
+                    && !unresolved.is_empty()
                     && args.iter().any(|arg| {
                         arg.args.iter().any(|nested| {
-                            tree_any_head(nested, &|leaf: StringId| {
-                                scope.contains_key(&leaf)
-                                    && self.index.bounded_params.contains(&leaf)
-                            })
+                            tree_any_head(nested, &|leaf: StringId| unresolved.contains(&leaf))
                         })
                     }))
             {
@@ -2373,8 +2399,8 @@ impl<'a> Bounds<'a> {
         };
         // The super pass is forbidden at extension-type elements
         // (:750-752); annotation sites allow it.
-        let system = snapshot.system();
-        match is_well_bounded(&system, &snapshot.facts, instantiation, allow_super) {
+        let system = snapshot.system_with(facts);
+        match is_well_bounded(&system, facts, instantiation, allow_super) {
             Boundedness::NotWellBounded(issues) => {
                 // The type-parameter-argument gate (see `check_named`).
                 // An issue on an in-scope parameter argument `X`/`X?`
@@ -2482,7 +2508,7 @@ impl<'a> Bounds<'a> {
                 // `A<dynamic>` — a contravariant parameter's top argument
                 // is not a covariant top).
                 let inverted_ty = allow_super
-                    .then(|| replace_top_bottom_with_facts(&system, &snapshot.facts, instantiation));
+                    .then(|| replace_top_bottom_with_facts(&system, facts, instantiation));
                 let inverted = inverted_ty.map(|ty| snapshot.display(ty));
                 let raw_instantiated = raw.then(|| snapshot.display(instantiation));
                 // The message's argument and bound are the WRITTEN
@@ -2592,11 +2618,110 @@ impl<'a> Bounds<'a> {
         }
     }
 
+    /// The declared bounds a use-site check reads for its in-scope type
+    /// parameters (#3616 F3).
+    ///
+    /// A use site reaches this layer as names plus name-keyed lazy ids
+    /// ([`MapCtx::param_scope`]), and a lazy id carries no declared bound in
+    /// the snapshot: both of the check's decisions read one — the subtype
+    /// walk's left-variable rule (`X <: B` as `bound(X) <: B`, upstream
+    /// Dart SDK source, `pkg/analyzer/lib/src/dart/element/subtype.dart`)
+    /// and the super-bounded inversion's `S <: Never` probe (upstream Dart
+    /// SDK source, `pkg/analyzer/lib/src/dart/element/
+    /// replace_top_bottom_visitor.dart`). The capture's windows are the
+    /// only bound source left at this layer: a name resolves to the
+    /// NEAREST window that declares it with a bound annotation preceding
+    /// the site, which is the declaration whose scope the site sits in for
+    /// every same-name declaration the capture can order.
+    ///
+    /// A name any window declares WITHOUT a bound stays unresolved — that
+    /// declaration writes no offset to order against the site, so a
+    /// shadowing unbounded parameter would otherwise inherit a foreign
+    /// declaration's bound. The #3593 nested gate keeps its suppression for
+    /// exactly those names.
+    ///
+    /// Answers the facts overlay (built only when at least one name
+    /// resolved, so the common site pays nothing) and the unresolved names.
+    fn site_scoped_bounds(
+        &self,
+        snapshot: &Snapshot<'a>,
+        scope: &FxHashMap<StringId, TypeParamId>,
+        site: SourceRange,
+    ) -> (Option<ParamFactsTable>, FxHashSet<StringId>) {
+        let mut unresolved = FxHashSet::default();
+        let ctx = snapshot.ctx();
+        let mut resolved: Vec<(TypeParamId, TypeId)> = Vec::new();
+        for (&name, &id) in scope {
+            let bound = self
+                .latest_window_bound(name, site.offset)
+                .and_then(|(tree, window)| {
+                    let names: Vec<StringId> = window.iter().map(|(name, _, _)| *name).collect();
+                    let window_scope = ctx.param_scope(&names);
+                    let bound = ctx.map_tree(tree, &window_scope)?;
+                    snapshot.type_is_safe(bound).then_some(bound)
+                });
+            match bound {
+                Some(bound) => resolved.push((id, bound)),
+                None if self.index.bounded_params.contains(&name) => {
+                    unresolved.insert(name);
+                }
+                None => {}
+            }
+        }
+        if resolved.is_empty() {
+            return (None, unresolved);
+        }
+        let mut facts = snapshot.facts.clone();
+        for (id, bound) in resolved {
+            facts.set(
+                id,
+                ParamFacts {
+                    variance: Variance::Covariant,
+                    bound: Some(bound),
+                },
+            );
+        }
+        (Some(facts), unresolved)
+    }
+
+    /// The bound a name's nearest preceding window declaration writes, with
+    /// that window's written parameter list (#3616 F3). `None` when a
+    /// declaration of the name writes no bound (or an unmodelable one) or
+    /// when no bounded declaration precedes `site_offset`.
+    fn latest_window_bound<'i>(
+        &'i self,
+        name: StringId,
+        site_offset: u32,
+    ) -> Option<(&'i TypeTree, &'i [(StringId, Option<TypeTree>, bool)])> {
+        let mut latest: Option<(u32, &TypeTree, &[(StringId, Option<TypeTree>, bool)])> = None;
+        for window in &self.index.param_windows {
+            let Some((_, bound, poisoned)) = window.iter().find(|(param, _, _)| *param == name)
+            else {
+                continue;
+            };
+            if *poisoned {
+                return None;
+            }
+            let Some(tree) = bound.as_ref() else {
+                return None;
+            };
+            let end = tree.range.end();
+            if end > site_offset {
+                continue;
+            }
+            if latest.is_none_or(|(position, ..)| end > position) {
+                latest = Some((end, tree, window));
+            }
+        }
+        latest.map(|(_, tree, window)| (tree, window))
+    }
+
     /// The written-argument site face: `check_named` at the peeled site
     /// root, then the nested-`NamedType` recursion over the argument
     /// subtrees (upstream runs the verdict at every `NamedType`;
     /// #2936). `site` is the checked annotation's own span. The scope is
-    /// lazy (no declared bounds — the bounded-parameter gates stay on).
+    /// lazy — the bounded-parameter gates stay on, and the declarations'
+    /// own bounds come from [`Self::site_scoped_bounds`].
     fn check_site_inner(
         &mut self,
         strings: &'a StringTable,
@@ -2710,6 +2835,26 @@ impl<'a> Bounds<'a> {
                 .map(|(param, (bound, poisoned))| (*param, bound.clone(), *poisoned))
                 .collect(),
         )
+    }
+
+    /// The captured bound of the type parameter `param` wherever a
+    /// container header declares it — `class C<T extends num?>` registers
+    /// `T → num?` under `C`. This-file containers only, matching
+    /// [`Self::container_params`]'s scope: a spelling two declarations
+    /// share answers the first captured bound (the name-level scope the
+    /// post-walk caller no longer holds narrows no further — the
+    /// under-report direction). `None` when no own container declares
+    /// `param` (a concrete head, or a parameter whose bound the executable
+    /// windows alone carry).
+    pub(crate) fn container_param_bound(&self, param: StringId) -> Option<Option<TypeTree>> {
+        self.index.containers.values().find_map(|capture| {
+            capture
+                .params
+                .iter()
+                .zip(&capture.bounds)
+                .find(|(name, _)| **name == param)
+                .map(|(_, (bound, _))| bound.clone())
+        })
     }
 
     /// A captured type alias's own parameters (name, written bound, poison
@@ -3224,9 +3369,10 @@ struct Snapshot<'a> {
     alias_decls: FxHashSet<TypeDeclId>,
     /// Site-side type-parameter allocation: an in-scope parameter name
     /// maps to one id for the file's lifetime (name-keyed — same-name
-    /// parameters in distinct scopes share it, which can only answer
-    /// `true` where the official answers `false`, the under-report
-    /// direction).
+    /// parameters in distinct scopes share it). The shared id carries no
+    /// bound; a use-site check resolves the bounds its own scope declares
+    /// ([`Bounds::site_scoped_bounds`], #3616) rather than reading them off
+    /// the id.
     lazy_params: RefCell<FxHashMap<StringId, (TypeParamId, String)>>,
     next_param: Cell<u32>,
 }
@@ -4032,6 +4178,14 @@ impl<'a> Snapshot<'a> {
     }
 
     fn system(&self) -> TypeSystem<'_> {
+        self.system_with(&self.facts)
+    }
+
+    /// [`Self::system`] over a facts face other than the snapshot's own —
+    /// a site-scope overlay (#3616 F3). The left-type-variable rule reads
+    /// `bound(X0)` off the table the system carries, so a resolved
+    /// use-site bound must ride the same table the checks pass.
+    fn system_with<'s>(&'s self, facts: &'s ParamFactsTable) -> TypeSystem<'s> {
         // The declared bounds arm the subtype walks: the left-type-variable
         // rule (`X0 <: T1` via `bound(X0) <: T1`, subtype.dart:490-500)
         // decides every bounded-parameter question the verifier poses — a
@@ -4039,7 +4193,7 @@ impl<'a> Snapshot<'a> {
         // annotation `A<A<X>>`) asks `A<X> <: A<A<A<X>>>`, which holds
         // through `bound(X) <: A<A<X>>` by reflexivity, and a bound-blind
         // system answers it `false` (the oracle's silent row reported).
-        TypeSystem::new(&self.table, &self.hierarchy).with_param_facts(&self.facts)
+        TypeSystem::new(&self.table, &self.hierarchy).with_param_facts(facts)
     }
 
     fn ctx(&self) -> MapCtx<'_, '_> {
@@ -4217,9 +4371,19 @@ impl<'a> Snapshot<'a> {
     /// contravariant position replaces the bottom (`Never`) with
     /// `Object?`, every other position replaces a top (`dynamic`, `void`,
     /// `Object?`) with `Never`. `None` = the leaf does not flip.
-    fn flipped_leaf_text(text: &str, variance: Variance) -> Option<&'static str> {
+    ///
+    /// The probe is `S <: Never`, not a spelling test (upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/dart/element/
+    /// replace_top_bottom_visitor.dart`, the arm at the top of `process`).
+    /// `Never?` is the `Null` projection — `Null <: Never` is false — so a
+    /// question-suffixed bottom leaf keeps its spelling. The `Object?` top
+    /// is the question projection of `Object`; a synthetic tree that
+    /// carries the whole suffixed spelling in its head keeps matching too.
+    fn flipped_leaf_text(text: &str, nullable: bool, variance: Variance) -> Option<&'static str> {
         if variance == Variance::Contravariant {
-            (text == "Never").then_some("Object?")
+            (!nullable && text == "Never").then_some("Object?")
+        } else if nullable {
+            matches!(text, "Object" | "dynamic" | "void").then_some("Never")
         } else {
             matches!(text, "dynamic" | "void" | "Object?").then_some("Never")
         }
@@ -4250,7 +4414,9 @@ impl<'a> Snapshot<'a> {
             return None;
         }
         let render_leaf = |text: &str, nullable: bool| -> String {
-            let flipped = flip.then(|| Self::flipped_leaf_text(text, variance)).flatten();
+            let flipped = flip
+                .then(|| Self::flipped_leaf_text(text, nullable, variance))
+                .flatten();
             match flipped {
                 // A flipped leaf carries its own nullability (`Object?` is
                 // nullable, `Never` is not).

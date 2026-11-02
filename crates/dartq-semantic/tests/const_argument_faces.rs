@@ -76,6 +76,7 @@ fn unit_fold(source: &str, strings: &StringTable) -> UnitFold {
             prefix: None,
             deferred: false,
             combinators: Combinators::unfiltered(),
+                non_library: false,
         },
     );
     let mut index = ElementIndex::default();

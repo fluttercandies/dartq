@@ -2730,6 +2730,7 @@ mod semantic_identity {
                     prefix: None,
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }

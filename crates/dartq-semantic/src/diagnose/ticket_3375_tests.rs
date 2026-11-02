@@ -175,6 +175,7 @@ fn diagnose_with_combinators(
             target: Some(lib_a),
             prefix: prefix.map(|p| strings.intern(p)),
             deferred: false,
+            non_library: false,
             combinators: Combinators::new(clauses, &strings),
         },
     );

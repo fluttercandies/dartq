@@ -100,6 +100,7 @@ pub(super) fn types_for(source: &str) -> (LibraryTypes, StringTable, dartq_sourc
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -225,6 +226,7 @@ pub(super) fn report_ops_experiments_with(
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -279,15 +281,24 @@ pub(super) fn report_ops_experiments_with(
                 target: Some(core_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
+        // A `deferred` spelling in the fixture's own import directive makes
+        // the edge deferred: the keyword rides the directive, not the
+        // `RigImport` (the corpus's deferred-library fixtures write
+        // `import '…' deferred as p;`).
+        let deferred = import.prefix.is_some_and(|prefix| {
+            source.contains(&format!("deferred as {prefix}"))
+        });
         builder.import(
             lib,
             ImportEdge {
                 target: Some(dep_lib),
                 prefix: import.prefix.map(|prefix| strings.intern(prefix)),
-                deferred: false,
+                deferred,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -393,6 +404,7 @@ fn augment_rig(
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

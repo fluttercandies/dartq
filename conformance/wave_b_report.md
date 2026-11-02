@@ -1,11 +1,11 @@
 # Wave-B diff-family report — types / assignability / resolver sweep
 
-**Input:** `/tmp/clusters/report_full.tsv` (43,959 cases, mtime 2026-10-30 20:14 — the newest
+**Input:** the census report table (43,959 cases, snapshot 2026-10-30 20:14 — the newest
 full snapshot, see `baseline_now.md`). Re-classified existing diff rows; no fresh sweep
 launched. Wave-B covers the type-system, assignability and resolver-cascade diff
-families (codes enumerated in `/tmp/wave_b/wave_b_codes.txt`, 66 codes).
+families (66 codes, enumerated in the wave-B code list produced by the census sweep).
 
-**Filter:** rows where `code ∈ wave_b_codes` from fail cases → `/tmp/wave_b/wave_b_rows.tsv`
+**Filter:** rows where `code ∈ wave_b_codes` from fail cases, extracted into the wave-B row table.
 (33,448 diff rows total: 10,261 missing / 23,187 extra).
 
 **Global context (unchanged since #3017 baseline):**
@@ -375,8 +375,8 @@ tickets don't double-book them.
 
 ## Method notes
 
-- All figures computed from `/tmp/clusters/report_full.tsv` via `awk`
-  aggregation scripts at `/tmp/wave_b/*.tsv` (reproducible).
+- All figures computed from the census report table with `awk`
+  aggregation scripts (reproducible from the census output).
 - `case_id` paths reveal the corpus: `diagnostics/**` (analyzer_test,
   `lib/test.dart`), `features/_core/co19/**` (co19 corpus with `co19/` and
   `co19/Utils/` aux files), `features/_core/<feature>/language/**` (language

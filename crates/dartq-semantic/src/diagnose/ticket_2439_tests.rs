@@ -7,6 +7,7 @@ use dartq_parser::ParserFeatures;
 use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
 use dartq_scanner::ScanConfig;
 use dartq_source::{FileTable, StringTable};
+use rustc_hash::FxHashSet;
 use std::path::Path;
 
 /// The one-library rig: `source` is the sole analyzed file of
@@ -401,7 +402,11 @@ fn enum_root_world_face_decides_without_being_closed() {
     // The root's split enumerates nothing: enum declarations are never
     // coverable subtypes of the root, so the covering walk's witness over
     // an uncovered `Enum` scrutinee is the root's own space.
-    assert!(world.subtypes(&NameTy::Named(enum_root, false)).is_empty());
+    assert!(
+        world
+            .subtypes(&NameTy::Named(enum_root, false), &FxHashSet::default())
+            .is_empty()
+    );
     // `AstNodeTag.a` may inhabit an `Enum` slot: the never-match gate
     // answers overlap.
     assert!(world.can_be_subtype_of(

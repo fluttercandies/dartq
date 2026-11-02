@@ -1692,6 +1692,44 @@ fn sdk_uri_parts<'a>(
     })
 }
 
+/// Whether `directive`'s resolved URI names a non-library unit — the
+/// `unused_import` gate's `DirectiveUriWithLibraryImpl` verdict
+/// (imports_verifier.dart:247-248) recorded on the edge
+/// (`ImportEdge::non_library`). The same classification
+/// [`non_library_import_diagnostics`] runs for its `import_of_non_library`
+/// rows: a `part of` file of the analysis set, a `part of` dep unit, or a
+/// `dart:` URI the SDK file-kind probe calls a part file. A directive with
+/// no resolved library (missing/external non-`dart:` URI) is a plain
+/// library face — the flag never distinguishes it from one.
+fn directive_non_library(state: &EngineState, directive: &DirectiveFacts) -> bool {
+    match directive.target {
+        ResolvedTarget::Resolved(target) => {
+            if let Some(facts) = state.residency.get(&target) {
+                return facts.is_part();
+            }
+            state
+                .deps
+                .units
+                .get(&target)
+                .is_some_and(|unit| unit.facts.is_part())
+        }
+        ResolvedTarget::External => {
+            let Some((sdk_library, sdk_part)) =
+                sdk_uri_parts(directive, &state.declared_variables)
+            else {
+                return false;
+            };
+            let kind = state
+                .sdk_file_kinds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .probe(&state.sdk, sdk_library, sdk_part);
+            FileRole::of_sdk(&kind).is_part()
+        }
+        ResolvedTarget::Missing => false,
+    }
+}
+
 /// The element model for `file` wherever it lives — residency members
 /// first, then the lazily indexed dep/SDK units (the export graph's
 /// declaring-file answers span both worlds).
@@ -1999,6 +2037,7 @@ fn export_graph_diagnostics(
                 prefix: directive.prefix,
                 deferred: directive.deferred,
                 combinators: directive.combinators.clone(),
+                non_library: false,
             };
             if resolved.graph.deferred_import_exports_extension(&edge) {
                 out.push(Arc::new(coded_diagnostic(
@@ -2561,6 +2600,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                         prefix: directive.prefix,
                         deferred: directive.deferred,
                         combinators: directive.combinators.clone(),
+                        non_library: false,
                     },
                 ),
                 DirectiveKind::Export => builder.export(
@@ -2589,6 +2629,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                     prefix: None,
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }
@@ -2667,6 +2708,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                     prefix: None,
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }
@@ -2689,6 +2731,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                                 .or_else(|| graph_target(state, &graph_ids, &dep_nodes, target)),
                             prefix: directive.prefix,
                             deferred: directive.deferred,
+                            non_library: false,
                             combinators: directive.combinators.clone(),
                         },
                     );
@@ -2780,6 +2823,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                                     }),
                                     prefix: directive.prefix,
                                     deferred: directive.deferred,
+                                    non_library: directive_non_library(state, directive),
                                     combinators: directive.combinators.clone(),
                                 },
                             ));
@@ -2869,6 +2913,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                     prefix: None,
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }
@@ -5140,6 +5185,7 @@ mod tests {
                         prefix: None,
                         deferred: false,
                         combinators: Combinators::unfiltered(),
+                        non_library: false,
                     },
                 );
             }
@@ -5171,6 +5217,7 @@ mod tests {
                                     prefix: directive.prefix,
                                     deferred: directive.deferred,
                                     combinators: directive.combinators.clone(),
+                                    non_library: false,
                                 },
                             );
                         }

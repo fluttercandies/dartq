@@ -142,6 +142,7 @@ fn analyze(libs: &[RigLib<'_>]) -> Vec<FileReport> {
                 target: Some(core_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -160,6 +161,7 @@ fn analyze(libs: &[RigLib<'_>]) -> Vec<FileReport> {
                 target: Some(*lib_id),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

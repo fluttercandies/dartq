@@ -1728,6 +1728,16 @@ pub struct Container {
     /// The direct superclass name (`extends S` / a named mixin application's
     /// head type), name-level; `None` when absent or unrecoverable.
     pub superclass: Option<StringId>,
+    /// Whether the CLAIMING fragment itself wrote an `extends` clause —
+    /// the per-fragment fact upstream reads as
+    /// `firstFragment.hasExtendsClause`. [`Self::superclass`] is the merged
+    /// element edge: a same-unit `augment` folds its own `extends` into it
+    /// when the introduction wrote none (`class B {} augment class B
+    /// extends A {}` makes `B`'s element superclass `A`), which must NOT
+    /// read back as the introduction carrying the clause (the
+    /// `augmentation_extends_clause_already_present` chain entry takes this
+    /// flag, not `superclass.is_some()`).
+    pub intro_superclass: bool,
     /// The member name set, ascending by id ([`NameMap`]).
     pub members: NameMap<MemberEntry>,
     /// The container's own type-parameter count (`class C<T, U>`); 0 when

@@ -777,6 +777,7 @@ mod tests {
                     target,
                     prefix,
                     deferred: false,
+                    non_library: false,
                     combinators,
                 },
             );
@@ -800,6 +801,7 @@ mod tests {
                     target,
                     prefix,
                     deferred: false,
+                    non_library: false,
                     combinators,
                 },
             );

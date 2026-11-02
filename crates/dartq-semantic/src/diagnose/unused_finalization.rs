@@ -2411,6 +2411,32 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// The nameless member's report anchor: the enclosing container's
+    /// declared-name token at zero length. Upstream the `<unnamed>`
+    /// element's `firstFragment.name` is null and the row lands on the
+    /// parent fragment's name (`class C { var }` reports `unused_field`
+    /// at `C`, `|0`; enum/mixin/extension-type containers answer the
+    /// same). `site_index` is the member's own slot in `decl_sites`, so
+    /// the scan finds the nearest preceding container site of that
+    /// spelling — a duplicate `class C … class C` pair maps each member
+    /// to its own header. No container site (a nameless container, or a
+    /// named extension the `Container` kind never joins) falls back to
+    /// the file start, `nameless_site_range`'s own default.
+    fn nameless_member_anchor(&self, site_index: usize, container: StringId) -> SourceRange {
+        self.decl_sites
+            .get(..site_index)
+            .unwrap_or(&[])
+            .iter()
+            .rev()
+            .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
+            .map_or(SourceRange { offset: 0, length: 0 }, |site| {
+                SourceRange {
+                    offset: site.range.offset,
+                    length: 0,
+                }
+            })
+    }
+
     /// Whether a `member_reads` entry's read sat in a discarded statement
     /// position: a postfix `++`/`--`/`!` or a compound assign (`+=`,
     /// `-=`, `*=`, `/=`, `%=`, `~/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`,
@@ -3611,7 +3637,21 @@ impl<'a> Engine<'a> {
                     if unnamed_face_owns {
                         continue;
                     }
-                    self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
+                    // A nameless recovery field has no name token to anchor
+                    // at: upstream's row lands on the enclosing container's
+                    // declared-name token at zero length (`class C { var }`
+                    // reports `unused_field` at `C` — the oracle's
+                    // `<unnamed>` element location is the parent fragment's
+                    // name), so the declaration range remaps to the
+                    // container anchor. Every unnamed member of one
+                    // container collapses to the same site; the usage
+                    // tail's identical-row fold emits it once.
+                    let range = if self.is_nameless(site.name) {
+                        self.nameless_member_anchor(site_index, container)
+                    } else {
+                        site.range
+                    };
+                    self.stage_usage(SemanticCode::UnusedField, range, &name_text);
                 }
                 DeclKind::Member {
                     container,
@@ -3722,7 +3762,17 @@ impl<'a> Engine<'a> {
                         || member_used
                         || matches!(self.walk_super(container, site.name), Walk::Found(_));
                     if !spared {
-                        self.stage_usage(SemanticCode::UnusedElement, site.range, &display_text);
+                        // The nameless recovery member anchors like the
+                        // field arm above: the enclosing container's
+                        // declared-name token at zero length (the oracle's
+                        // `<unnamed>` element location is the parent
+                        // fragment's name).
+                        let range = if self.is_nameless(site.name) {
+                            self.nameless_member_anchor(site_index, container)
+                        } else {
+                            site.range
+                        };
+                        self.stage_usage(SemanticCode::UnusedElement, range, &display_text);
                     }
                 }
                 DeclKind::Constructor { container } => {
@@ -6227,23 +6277,45 @@ impl<'a> Engine<'a> {
             return;
         }
         let mut edges = self.graph.import_edges(self.lib);
-        // The implicit prelude edge is exactly one leading entry (the merge
-        // inserts it before every written edge), targets `dart:core`, and
-        // carries no prefix, no deferral, and no combinator clauses. A
-        // written `import 'dart:core';` is payload-identical but sits in
-        // written order behind it; the one-extra count keeps the skip
-        // honest, and the harness graph (no prelude) aligns unchanged.
-        if edges.len() == self.imports.len() + 1
-            && edges.first().is_some_and(|edge| {
-                edge.prefix.is_none()
-                    && !edge.deferred
-                    && edge.combinators.written().next().is_none()
-                    && edge
-                        .target
-                        .is_some_and(|t| self.graph.uri(t) == "dart:core")
-            })
-        {
-            edges = &edges[1..];
+        let runs = self.graph.import_runs(self.lib);
+        if runs.is_empty() {
+            // The implicit prelude edge is exactly one leading entry (the
+            // merge inserts it before every written edge), targets
+            // `dart:core`, and carries no prefix, no deferral, and no
+            // combinator clauses. A written `import 'dart:core';` is
+            // payload-identical but sits in written order behind it; the
+            // one-extra count keeps the skip honest, and the harness graph
+            // (no prelude) aligns unchanged.
+            if edges.len() == self.imports.len() + 1
+                && edges.first().is_some_and(|edge| {
+                    edge.prefix.is_none()
+                        && !edge.deferred
+                        && edge.combinators.written().next().is_none()
+                        && edge
+                            .target
+                            .is_some_and(|t| self.graph.uri(t) == "dart:core")
+                })
+            {
+                edges = &edges[1..];
+            }
+        } else {
+            // Enhanced-parts per-file alignment (upstream
+            // `generateUnusedImportWarnings` walks `fileAnalysis.unit.
+            // directives` — THIS file's written imports — and
+            // `importsTracking` credits only the elements that file's own
+            // imports resolved): `self.imports` aligns against this file's
+            // run alone, never a sibling part's edges. The runs slice out
+            // the shared `dart:core` prelude by construction (it sits in
+            // the library-wide group ahead of every run), so a part-file
+            // pass no longer dies on the count gate.
+            let Some(pos) = runs.iter().position(|&(file, _)| file == self.file) else {
+                return;
+            };
+            let start = runs[pos].1 as usize;
+            let end = runs
+                .get(pos + 1)
+                .map_or(edges.len(), |&(_, next)| next as usize);
+            edges = &edges[start..end];
         }
         if edges.len() != self.imports.len() {
             return;
@@ -6294,6 +6366,17 @@ impl<'a> Engine<'a> {
             .filter(|read| matches!(read.recv, Receiver::Prefix { .. }))
             .map(|read| read.offset)
             .collect();
+        // The literal-receiver applications (`ImportsTracking.
+        // notifyExtensionUsed`, scope.dart:308-321): upstream marks the
+        // applied extension element used while the resolver runs, so its
+        // contributing import stays used. A literal receiver's application
+        // folds into an operator/invoke intent on a `Value` row — pass 2
+        // leaves it inert and no member spelling reaches `used_names` — so
+        // the credit derives from the token shape directly: the literal's
+        // static type head pairs with the applied member spelling, the
+        // same (receiver type, member) join the resolver's applicability
+        // walk made.
+        let literal_apps = self.literal_extension_applications();
         // `bare_decls`: each spelling → the files its bare accesses resolved
         // to. `refs` carries the `Decl{file}` directly for member-row and
         // bare-ref resolutions; `type_uses` resolve through the top-level
@@ -6317,11 +6400,14 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
-            // A bare type-use resolves through the top-level namespace —
-            // the same `namespaces.lookup` the push-time `type_resolution`
-            // walked answers the declaring file here.
-            if let Lookup::Found(NamespaceEntry::Decl(file)) =
-                self.namespaces.lookup(self.graph, self.lib, name)
+            // A bare type-use resolves through the top-level namespace of
+            // the FILE under diagnosis — the same per-file combined import
+            // scope the push-time `type_resolution` walked (a part's own
+            // imports are invisible to the defining unit's scope, and the
+            // oracle walks `fileAnalysis.unit`'s per-file scope chain).
+            if let Lookup::Found(NamespaceEntry::Decl(file)) = self
+                .namespaces
+                .lookup_in_file(self.graph, self.lib, Some(self.file), name)
             {
                 bare_decls.entry(name).or_default().insert(file);
             }
@@ -6331,11 +6417,12 @@ impl<'a> Engine<'a> {
         // `annotation_uses`), but the metadata events carry no row, so the
         // head never reaches `refs`/`type_uses` and the element gate above
         // would drop the credit a genuinely used `@UseResult` import owns.
-        // The top-level namespace answers the declaring file exactly as it
+        // The same per-file scope answers the declaring file exactly as it
         // does for the type-use loop.
         for &name in &self.annotation_uses {
-            if let Lookup::Found(NamespaceEntry::Decl(file)) =
-                self.namespaces.lookup(self.graph, self.lib, name)
+            if let Lookup::Found(NamespaceEntry::Decl(file)) = self
+                .namespaces
+                .lookup_in_file(self.graph, self.lib, Some(self.file), name)
             {
                 bare_decls.entry(name).or_default().insert(file);
             }
@@ -6352,6 +6439,18 @@ impl<'a> Engine<'a> {
                 )
             };
             let Some(target) = edge.target else {
+                // The unresolved-URI face (upstream
+                // `DirectiveUriWithLibraryImpl.relativeUriString` = `''` —
+                // the `unused_import` argument renders the URI the parser
+                // recovered, not the resolution): a written URI that
+                // resolves to no library still reports `unused_import` —
+                // the unquoted-imports empty-path family, `import ''`, and
+                // the directive-recovery shape. A named-but-missing target
+                // keeps the `isOriginNotExistingFile` skip: the
+                // `uri_does_not_exist` face already reports the directive.
+                if uri_text.is_empty() {
+                    self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
+                }
                 continue;
             };
             if self.graph.uri(target) == "dart:core" {
@@ -6377,10 +6476,15 @@ impl<'a> Engine<'a> {
                             // members spare this edge exactly as the
                             // unprefixed arm's do.
                             || self.import_credits_extension_member(edge, target, &credit)
+                            || self.literal_extension_credit(edge, target, &literal_apps)
                     }
                     // No evidence record for the spelling — keep the raw
                     // posture (the under-report direction).
-                    None => self.used_names.contains(&prefix) || self.import_used.contains(&prefix),
+                    None => {
+                        self.used_names.contains(&prefix)
+                            || self.import_used.contains(&prefix)
+                            || self.literal_extension_credit(edge, target, &literal_apps)
+                    }
                 },
                 None => {
                     // The element-attributed hit: the resolved declaration's
@@ -6411,7 +6515,8 @@ impl<'a> Engine<'a> {
                                 )
                             })
                     });
-                    let credited = self.import_credits_extension_member(edge, target, &credit);
+                    let credited = self.import_credits_extension_member(edge, target, &credit)
+                        || self.literal_extension_credit(edge, target, &literal_apps);
                     hit.is_some() || credited
                 }
             };
@@ -6629,6 +6734,187 @@ impl<'a> Engine<'a> {
                         .extension_member_used
                         .iter()
                         .any(|&(file, index, _)| file == entry.file && index == slot)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The literal-receiver extension applications of this unit, as
+    /// `(receiver type head, member spelling)` pairs. A literal's static
+    /// type is fixed by its token kind — `Int`/`Hexadecimal` → `int`,
+    /// `Double` → `double`, `String` → `String` — and its application
+    /// shapes the row model folds inert carry no identifier, so the
+    /// (type, member) join is read straight off the token stream:
+    ///
+    /// - `L[i]` / `L[i] = v` / `L[i] op= v` → `[]`, `[]=`, or both —
+    ///   a write applies `[]=` alone upstream, a read `[]` alone, a
+    ///   read-modify-write (`op=`, `++`, `--`) both;
+    /// - `L(args)` → `call`;
+    /// - `L op x` (any overloadable binary spelling), `op L` (`-`, `~`),
+    ///   `L++`/`L--` (the `-`/`+` member), `L op= x` (the compound base
+    ///   member) → the operator's own spelling;
+    ///
+    /// `==`/`!=`/`&&`/`||`/`??`/`?.` shapes are excluded upstream — `==`
+    /// answers through `Object` always, the boolean operators never
+    /// apply an extension.
+    fn literal_extension_applications(&self) -> Vec<(StringId, StringId)> {
+        let tokens = self.tokens.as_slice();
+        let int = self.intern("int");
+        let double = self.intern("double");
+        let string = self.intern("String");
+        let type_head = |kind: dartq_scanner::TokenKind| match kind {
+            dartq_scanner::TokenKind::Int | dartq_scanner::TokenKind::Hexadecimal => Some(int),
+            dartq_scanner::TokenKind::Double => Some(double),
+            dartq_scanner::TokenKind::String => Some(string),
+            _ => None,
+        };
+        let binary_member = |kind: dartq_scanner::TokenKind| match kind {
+            dartq_scanner::TokenKind::Lt => Some("<"),
+            dartq_scanner::TokenKind::Gt => Some(">"),
+            dartq_scanner::TokenKind::LtEq => Some("<="),
+            dartq_scanner::TokenKind::GtEq => Some(">="),
+            dartq_scanner::TokenKind::Minus | dartq_scanner::TokenKind::MinusEq => Some("-"),
+            dartq_scanner::TokenKind::Plus | dartq_scanner::TokenKind::PlusEq => Some("+"),
+            dartq_scanner::TokenKind::Star | dartq_scanner::TokenKind::StarEq => Some("*"),
+            dartq_scanner::TokenKind::Slash | dartq_scanner::TokenKind::SlashEq => Some("/"),
+            dartq_scanner::TokenKind::TildeSlash | dartq_scanner::TokenKind::TildeSlashEq => {
+                Some("~/")
+            }
+            dartq_scanner::TokenKind::Percent | dartq_scanner::TokenKind::PercentEq => Some("%"),
+            dartq_scanner::TokenKind::LtLt | dartq_scanner::TokenKind::LtLtEq => Some("<<"),
+            dartq_scanner::TokenKind::GtGt | dartq_scanner::TokenKind::GtGtEq => Some(">>"),
+            dartq_scanner::TokenKind::GtGtGt | dartq_scanner::TokenKind::GtGtGtEq => Some(">>>"),
+            dartq_scanner::TokenKind::Ampersand | dartq_scanner::TokenKind::AmpersandEq => Some("&"),
+            dartq_scanner::TokenKind::Bar | dartq_scanner::TokenKind::BarEq => Some("|"),
+            dartq_scanner::TokenKind::Caret | dartq_scanner::TokenKind::CaretEq => Some("^"),
+            _ => None,
+        };
+        let mut apps: Vec<(StringId, StringId)> = Vec::new();
+        for (i, token) in tokens.iter().enumerate() {
+            // Prefix-operator arm: `-L`, `~L` apply the unary member; the
+            // preceding literal-shape check never fires on these (the op
+            // token itself is not a literal).
+            if matches!(
+                token.kind,
+                dartq_scanner::TokenKind::Minus
+                    | dartq_scanner::TokenKind::Tilde
+                    | dartq_scanner::TokenKind::PlusPlus
+                    | dartq_scanner::TokenKind::MinusMinus
+            ) && let Some(head) = tokens.get(i + 1).and_then(|t| type_head(t.kind))
+            {
+                let spelling = match token.kind {
+                    dartq_scanner::TokenKind::Tilde => "~",
+                    dartq_scanner::TokenKind::PlusPlus => "+",
+                    _ => "-",
+                };
+                apps.push((head, self.intern(spelling)));
+                continue;
+            }
+            let Some(head) = type_head(token.kind) else {
+                continue;
+            };
+            let Some(next) = tokens.get(i + 1) else {
+                break;
+            };
+            match next.kind {
+                dartq_scanner::TokenKind::OpenSquare => {
+                    // The write-shape split mirrors the resolver: `L[i] = v`
+                    // applies `[]=` alone, `L[i] op= v`/`L[i]++` applies
+                    // `[]` for the read and `[]=` for the write, every
+                    // other shape applies `[]` alone.
+                    let read = self.intern("[]");
+                    let write = self.intern("[]=");
+                    let follower = self
+                        .tokens
+                        .matching_end(i + 1)
+                        .and_then(|end| tokens.get(end + 1))
+                        .map(|t| t.kind);
+                    match follower {
+                        Some(dartq_scanner::TokenKind::Eq) => {
+                            apps.push((head, write));
+                        }
+                        Some(
+                            dartq_scanner::TokenKind::PlusPlus
+                            | dartq_scanner::TokenKind::MinusMinus
+                            | dartq_scanner::TokenKind::PlusEq
+                            | dartq_scanner::TokenKind::MinusEq
+                            | dartq_scanner::TokenKind::StarEq
+                            | dartq_scanner::TokenKind::SlashEq
+                            | dartq_scanner::TokenKind::TildeSlashEq
+                            | dartq_scanner::TokenKind::PercentEq
+                            | dartq_scanner::TokenKind::AmpersandEq
+                            | dartq_scanner::TokenKind::BarEq
+                            | dartq_scanner::TokenKind::CaretEq
+                            | dartq_scanner::TokenKind::LtLtEq
+                            | dartq_scanner::TokenKind::GtGtEq
+                            | dartq_scanner::TokenKind::GtGtGtEq
+                            | dartq_scanner::TokenKind::QuestionQuestionEq,
+                        ) => {
+                            apps.push((head, read));
+                            apps.push((head, write));
+                        }
+                        _ => apps.push((head, read)),
+                    }
+                }
+                dartq_scanner::TokenKind::OpenParen => {
+                    apps.push((head, self.intern("call")));
+                }
+                dartq_scanner::TokenKind::PlusPlus => {
+                    apps.push((head, self.intern("+")));
+                }
+                dartq_scanner::TokenKind::MinusMinus => {
+                    apps.push((head, self.intern("-")));
+                }
+                kind => {
+                    if let Some(spelling) = binary_member(kind) {
+                        apps.push((head, self.intern(spelling)));
+                    }
+                }
+            }
+        }
+        apps
+    }
+
+    /// The literal-application arm of the extension credit: `apps`
+    /// ([`Self::literal_extension_applications`]) carries `(receiver type
+    /// head, member spelling)` pairs, and an exported extension face
+    /// applies exactly when its `on` head IS the literal's type and it
+    /// declares the member — the same (receiver type, member) granularity
+    /// [`Self::import_credits_extension_member`]'s applied-face arm keeps.
+    /// A face whose `on` head does not resolve a type in its own file
+    /// never applies (the oracle's inapplicable-extension face).
+    fn literal_extension_credit(
+        &self,
+        edge: &dartq_resolution::ImportEdge,
+        target: dartq_resolution::LibraryId,
+        apps: &[(StringId, StringId)],
+    ) -> bool {
+        if apps.is_empty() {
+            return false;
+        }
+        for (export_name, entry) in self.graph.export_scope(target) {
+            if !edge.combinators.allows(export_name) {
+                continue;
+            }
+            let Some(elements) = self.index.get(entry.file) else {
+                continue;
+            };
+            for face in elements.extension_faces() {
+                if face.name != Some(export_name) {
+                    continue;
+                }
+                let Some(on) = face.on_type else {
+                    continue;
+                };
+                if !self.named_type_is_type_in(entry.file, on) {
+                    continue;
+                }
+                if apps
+                    .iter()
+                    .any(|&(head, member)| head == on && face.members.contains_key(&member))
                 {
                     return true;
                 }
@@ -9197,6 +9483,7 @@ mod pins {
                     target: Some(aux_lib),
                     prefix: item.prefix.map(|p| strings.intern(p)),
                     deferred: item.deferred,
+                    non_library: false,
                     combinators: Combinators::new(std::iter::empty(), &strings),
                 },
             );
@@ -10133,3 +10420,21 @@ mod ticket_2482_tests;
 #[cfg(test)]
 #[path = "ticket_3044_tests.rs"]
 mod ticket_3044_tests;
+
+/// The #3636 nameless-member anchor pins — the `<unnamed>` field/method
+/// remap onto the enclosing container's declared-name token at zero
+/// length, the two-member same-site fold to one row, and the named-member
+/// keep-honest twins — kept as a standalone module so the shared `pins`
+/// rig stays untouched.
+#[cfg(test)]
+#[path = "ticket_3636_tests.rs"]
+mod ticket_3636_tests;
+
+/// The #3643 `unused_import` oracle-parity pins — the per-file import-run
+/// edge alignment, the per-file combined-scope `bare_decls` lookup, the
+/// unresolved-URI `''` staging face, and the literal-receiver extension
+/// application credit — kept as a standalone module so the shared `pins`
+/// rig stays untouched.
+#[cfg(test)]
+#[path = "ticket_3643_tests.rs"]
+mod ticket_3643_tests;

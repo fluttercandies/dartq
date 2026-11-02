@@ -110,6 +110,7 @@ fn rig_report(main: &str, mocks: &[(&str, &str, &str)]) -> FileReport {
                 target: Some(mock_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

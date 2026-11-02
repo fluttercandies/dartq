@@ -332,6 +332,11 @@ pub struct PersistedContainer {
     #[serde(default)]
     pub is_mixin_class: bool,
     pub superclass: Option<u32>,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode with no claiming-fragment `extends`
+    /// fact (the #539 additive-field discipline).
+    #[serde(default)]
+    pub intro_superclass: bool,
     pub members: Vec<(u32, PersistedMemberEntry)>,
     pub type_params: u16,
     /// The container's type-parameter spellings in declaration order.
@@ -1460,6 +1465,7 @@ impl PersistedContainer {
             is_interface: container.is_interface,
             is_mixin_class: container.is_mixin_class,
             superclass: container.superclass.map(|name| s.id(name)),
+            intro_superclass: container.intro_superclass,
             members: container
                 .members
                 .iter()
@@ -1523,6 +1529,7 @@ impl PersistedContainer {
             is_interface: self.is_interface,
             is_mixin_class: self.is_mixin_class,
             superclass: self.superclass.map(|at| ids[at as usize]),
+            intro_superclass: self.intro_superclass,
             members: self
                 .members
                 .into_iter()
@@ -1862,6 +1869,7 @@ mod tests {
                 is_interface: false,
                 is_mixin_class: false,
                 superclass: Some(name("Object")),
+                intro_superclass: true,
                 members: [name("m"), name("m=")]
                     .into_iter()
                     .map(|n| (n, member(strings.resolve(n))))
@@ -2069,6 +2077,7 @@ mod tests {
                 is_interface: false,
                 is_mixin_class: false,
                 superclass: None,
+                intro_superclass: false,
                 members: [(name("b"), member()), (name("a"), member())]
                     .into_iter()
                     .collect(),

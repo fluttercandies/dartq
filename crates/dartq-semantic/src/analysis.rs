@@ -1530,6 +1530,7 @@ mod tests {
                     target,
                     prefix: prefix.map(|spelling| strings.intern(spelling)),
                     deferred: false,
+                    non_library: false,
                     combinators: Combinators::unfiltered(),
                 },
             );

@@ -83,6 +83,7 @@ fn literal_report(source: &str, with_meta: bool) -> FileReport {
                 target: Some(meta_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

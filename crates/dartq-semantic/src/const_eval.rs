@@ -187,6 +187,27 @@ pub enum ConstFault {
     /// `recursive_compile_time_constant` — the initializer depends on
     /// itself.
     Recursive,
+    /// `const_eval_for_element` — a constant collection rejects a `for`
+    /// element outright (upstream `_buildListConstant`/`_buildSetConstant`/
+    /// `_buildMapConstant`'s `case ForElement()` →
+    /// `InvalidConstant.forEntity`; the allow-list overrides the site's
+    /// element/declaration default, so the enclosing literal's own verdict
+    /// carries this code rather than a const-init twin).
+    ForElement,
+    /// `non_bool_condition` — a control-flow `if` element's condition
+    /// evaluated to a non-bool constant (`_buildListConstant`'s
+    /// `case IfElement()` `conditionValue == null` arm —
+    /// `InvalidConstant.forEntity(entity: element.expression)`).
+    NonBoolCondition,
+    /// `const_spread_expected_list_or_set` — a `...` operand in a
+    /// list/set literal evaluated to a value that is neither.
+    SpreadExpectedListOrSet,
+    /// `const_spread_expected_map` — a `...` operand in a map literal
+    /// evaluated to a non-map value.
+    SpreadExpectedMap,
+    /// `expression_in_map` — a bare (non-entry) expression element in a
+    /// map-resolved literal (`_buildMapConstant`'s `case Expression()`).
+    ExpressionInMap,
 }
 
 /// The verdict of evaluating one expression.
@@ -254,7 +275,12 @@ pub enum Expr {
     Adjacent(Vec<Node>),
     List(Vec<Node>),
     Set(Vec<Node>),
-    Map(Vec<(Node, Node)>),
+    /// A map literal's ordered elements: `Expr::Entry` pseudo-operands
+    /// plus any `IfElement`/`Spread`/`Faulted` control elements in source
+    /// order — upstream `_buildMapConstant` walks the element list, not a
+    /// pre-paired entry list, so a `for`/`if` element's failure anchors at
+    /// its own element.
+    Map(Vec<Node>),
     Record(Vec<Node>),
     /// A function invocation. Only `identical(a, b)` evaluates; every
     /// other call is provably non-constant.
@@ -265,6 +291,28 @@ pub enum Expr {
     /// A map-entry pseudo-operand (stack staging between the entry event
     /// and the literal close).
     Entry(Box<Node>, Box<Node>),
+    /// A control-flow `if` element staged inside a collection literal
+    /// (`if (cond) e [else e2]`): the verifier arm mirrors upstream
+    /// `_ConstLiteralVerifier.verify`'s `IfElement` dispatch — the
+    /// condition evaluates, a known value verifies the live branch and
+    /// scans the dead one, an unknown value scans both.
+    IfElement {
+        cond: Box<Node>,
+        then: Box<Node>,
+        els: Option<Box<Node>>,
+    },
+    /// A `...`/`...?` spread element staged inside a collection literal:
+    /// the operand carries the element's own const gate (its failure is
+    /// the element face's entity).
+    Spread {
+        operand: Box<Node>,
+        null_aware: bool,
+    },
+    /// A `for` element's fault leaf: a constant collection rejects it
+    /// outright, and the allow-listed `constEvalForElement` overrides the
+    /// site's default at this node — the var-level verdict emits the fault
+    /// code there rather than `const_initialized_with_non_constant_value`.
+    Faulted(ConstFault),
     /// A valid constant of unknown value — constructs the subset defers
     /// on (`e as T`, index expressions, unresolvable call shapes): the
     /// fold carries no verdict through them, so no diagnostic can arise.
@@ -506,16 +554,27 @@ fn collect_npc(node: &Node, lookup: &dyn ConstLookup, out: &mut Vec<SourceRange>
                 collect_npc(part, lookup, out, depth);
             }
         }
-        Expr::Map(entries) => {
-            for (key, value) in entries {
-                collect_npc(key, lookup, out, depth);
-                collect_npc(value, lookup, out, depth);
+        Expr::Map(parts) => {
+            for part in parts {
+                collect_npc(part, lookup, out, depth);
             }
         }
         Expr::Entry(key, value) => {
             collect_npc(key, lookup, out, depth);
             collect_npc(value, lookup, out, depth);
         }
+        Expr::IfElement { cond, then, els } => {
+            collect_npc(cond, lookup, out, depth);
+            collect_npc(then, lookup, out, depth);
+            if let Some(els) = els {
+                collect_npc(els, lookup, out, depth);
+            }
+        }
+        Expr::Spread { operand, .. } => collect_npc(operand, lookup, out, depth),
+        // A `for` element has no dedicated `_Collector` arm — it falls to
+        // the default `nodes.add(node)` leaf like `Expr::Other` (the
+        // element itself is the not-potentially-constant shape).
+        Expr::Faulted(_) => out.push(node.span),
         // Only `identical(a, b)` is a constant call — its arguments
         // potentially-const like any operand; every other callee is the
         // whole-node not-constant shape.
@@ -708,32 +767,90 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
         }
         Expr::List(parts) => eval_each(parts, lookup, InstanceKind::List, depth),
         Expr::Set(parts) => eval_each(parts, lookup, InstanceKind::Set, depth),
-        Expr::Map(entries) => {
-            let mut pairs = Vec::with_capacity(entries.len());
-            for (k, v) in entries {
-                match (fold(k, lookup, depth), fold(v, lookup, depth)) {
-                    (Verdict::Value(key), Verdict::Value(value)) => pairs.push((key, value)),
-                    (
-                        other @ (Verdict::Fault(..)
-                        | Verdict::NotConstant(_)
-                        | Verdict::Unresolved(_)),
-                        _,
-                    )
-                    | (
-                        _,
-                        other @ (Verdict::Fault(..)
-                        | Verdict::NotConstant(_)
-                        | Verdict::Unresolved(_)),
-                    ) => return other,
-                    // One unknown-value side leaves the whole map's value
-                    // unknown (the opaque-kind fallback).
-                    _ => return Verdict::Value(ConstantValue::Instance(InstanceKind::Map)),
+        Expr::Map(parts) => eval_map_parts(parts, lookup, depth),
+        Expr::Record(fields) => eval_each(fields, lookup, InstanceKind::Record, depth),
+        // A `for` element's staged leaf carries its own fault — the
+        // allow-listed `constEvalForElement` overrides the site default at
+        // this node (`_reportError` swaps the code, not the entity).
+        Expr::Faulted(fault) => Verdict::Fault(*fault, node.span),
+        // An `if` element folds like the oracle's `_buildListConstant` arm:
+        // the condition's `InvalidConstant` propagates, a known bool skips
+        // the dead branch and folds the live one in place, an
+        // unknown-but-constant condition leaves the collection's value
+        // unknown (the literal's elements stay individually checked — the
+        // verdict only feeds value-carrying consumers).
+        Expr::IfElement { cond, then, els } => match fold(cond, lookup, depth) {
+            Verdict::Value(ConstantValue::Bool(true)) => {
+                match els
+                    .as_deref()
+                    .and_then(|els| not_potentially_constant(els, lookup))
+                {
+                    // Upstream scans the dead else branch's
+                    // not-potentially-constant shapes before folding the
+                    // live branch (evaluation.dart's dead-branch check).
+                    Some(npc) => Verdict::NotConstant(npc),
+                    None => fold(then, lookup, depth),
                 }
             }
-            Verdict::Value(ConstantValue::Map(pairs.into()))
+            Verdict::Value(ConstantValue::Bool(false)) => {
+                match not_potentially_constant(then, lookup) {
+                    Some(npc) => Verdict::NotConstant(npc),
+                    None => els
+                        .as_deref()
+                        .map_or(Verdict::Constant, |e| fold(e, lookup, depth)),
+                }
+            }
+            // A known non-bool condition faults at the condition node
+            // (`nonBoolCondition` — `const_eval_for_element`'s sibling
+            // allow-list face reports it at `element.expression`).
+            Verdict::Value(_) => Verdict::Fault(ConstFault::NonBoolCondition, cond.span),
+            Verdict::Constant => {
+                let t = fold(then, lookup, depth);
+                let e = els
+                    .as_deref()
+                    .map_or(Verdict::Constant, |e| fold(e, lookup, depth));
+                match (t, e) {
+                    (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
+                    (other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_)), _) => other,
+                    (_, other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_))) => other,
+                    _ => Verdict::Constant,
+                }
+            }
+            other => other,
+        },
+        // A `...` element's operand carries the element's const gate; the
+        // shape answer (`toListValue`/`toSetValue`/`toMapValue`) belongs to
+        // the element check, which reports the `constSpreadExpected*` arm —
+        // here the operand's own verdict propagates and a clean one
+        // defers (the collection's value cannot list a spread's parts).
+        Expr::Spread { operand, .. } => match fold(operand, lookup, depth) {
+            Verdict::Value(_) | Verdict::Constant => Verdict::Constant,
+            other => other,
+        },
+        Expr::Entry(key, value) => {
+            // A staged entry folds as its pair when the collection's own
+            // eval reaches it (`Expr::Map` keeps the ordered shape); the
+            // element-check path reads it through `eval_each`'s arm.
+            match (fold(key, lookup, depth), fold(value, lookup, depth)) {
+                (Verdict::Value(_), Verdict::Value(_)) | (Verdict::Constant, Verdict::Constant) => {
+                    Verdict::Constant
+                }
+                (
+                    other @ (Verdict::Fault(..)
+                    | Verdict::NotConstant(_)
+                    | Verdict::Unresolved(_)),
+                    _,
+                )
+                | (
+                    _,
+                    other @ (Verdict::Fault(..)
+                    | Verdict::NotConstant(_)
+                    | Verdict::Unresolved(_)),
+                ) => other,
+                _ => Verdict::Constant,
+            }
         }
-        Expr::Record(fields) => eval_each(fields, lookup, InstanceKind::Record, depth),
-        Expr::Entry(..) | Expr::Opaque => Verdict::Constant,
+        Expr::Opaque => Verdict::Constant,
         Expr::Call { name, args } => {
             // Only `identical(a, b)` reaches eval — the capture resolves
             // every other callee shape at its close (call classification
@@ -764,6 +881,86 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
             };
             Verdict::Value(ConstantValue::Bool(identical))
         }
+    }
+}
+
+/// `DartObjectImpl ==` over the values this subset folds — the oracle's
+/// `DartObjectImpl.operator ==` (`runtimeTypesEqual(type, other.type) &&
+/// state == other.state`, value.dart:305-311), restricted to the states
+/// whose payloads the subset materializes. Type identity is approximated
+/// by the value's own kind (the subset carries no reified type face): two
+/// `Int(1)`s are equal, an `Int(1)` and a `Double(1.0)` are not.
+#[expect(clippy::float_cmp)] // oracle equality is exact double equality
+fn value_equal(a: &ConstantValue, b: &ConstantValue) -> bool {
+    match (a, b) {
+        (ConstantValue::Null, ConstantValue::Null) => true,
+        (ConstantValue::Bool(x), ConstantValue::Bool(y)) => x == y,
+        (ConstantValue::Int(x), ConstantValue::Int(y)) => x == y,
+        (ConstantValue::Double(x), ConstantValue::Double(y)) => x == y,
+        (ConstantValue::Str(x), ConstantValue::Str(y)) => x == y,
+        (
+            ConstantValue::Enum {
+                container: c1,
+                name: n1,
+            },
+            ConstantValue::Enum {
+                container: c2,
+                name: n2,
+            },
+        ) => c1 == c2 && n1 == n2,
+        (ConstantValue::Type(x), ConstantValue::Type(y)) => x == y,
+        (ConstantValue::Symbol(x), ConstantValue::Symbol(y)) => x == y,
+        (ConstantValue::List(x), ConstantValue::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| value_equal(a, b))
+        }
+        (ConstantValue::Set(x), ConstantValue::Set(y)) => {
+            x.len() == y.len() && x.iter().all(|a| y.iter().any(|b| value_equal(a, b)))
+        }
+        (ConstantValue::Map(x), ConstantValue::Map(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| {
+                    y.iter()
+                        .any(|(k2, v2)| value_equal(k, k2) && value_equal(v, v2))
+                })
+        }
+        (
+            ConstantValue::Record {
+                positional: p1,
+                named: n1,
+            },
+            ConstantValue::Record {
+                positional: p2,
+                named: n2,
+            },
+        ) => {
+            p1.len() == p2.len()
+                && p1.iter().zip(p2.iter()).all(|(a, b)| value_equal(a, b))
+                && n1.len() == n2.len()
+                && n1.iter().all(|(name, a)| {
+                    n2.iter()
+                        .any(|(name2, b)| name == name2 && value_equal(a, b))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The `uniqueKeys` comparator of `visitMapPattern`
+/// (`constant_verifier.dart:313-324`): `identical` when either key lacks
+/// primitive equality, plain `==` when both have it. The oracle's
+/// `isIdentical2` returns UNKNOWN for a `int`/`double` cross pair — the
+/// map comparator treats that as "not equal" (`toBoolValue() == true`
+/// only admits a definite true), so `{1: _, 1.0: _}` stays silent.
+pub fn map_pattern_keys_equal(
+    a: &ConstantValue,
+    b: &ConstantValue,
+    primitive_equality: &dyn Fn(&ConstantValue) -> bool,
+) -> bool {
+    let (pa, pb) = (primitive_equality(a), primitive_equality(b));
+    if pa && pb {
+        value_equal(a, b)
+    } else {
+        primarily_identical(a, b)
     }
 }
 
@@ -803,7 +1000,7 @@ fn primarily_identical(a: &ConstantValue, b: &ConstantValue) -> bool {
 fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth: u32) -> Verdict {
     let mut values = Vec::with_capacity(parts.len());
     for part in parts {
-        match fold(part, lookup, depth) {
+        match eval_element(part, lookup, depth) {
             Verdict::Value(value) => values.push(value),
             Verdict::Constant => return Verdict::Value(ConstantValue::Instance(kind)),
             other @ (Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_)) => {
@@ -823,6 +1020,66 @@ fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth
         },
         _ => ConstantValue::Instance(kind),
     })
+}
+
+/// One collection element's contribution to the literal's own verdict —
+/// upstream `_buildListConstant`'s per-element switch over
+/// `CollectionElement` shapes: a plain element folds its own value, a
+/// `for` element carries its staged fault, and a spread contributes its
+/// operand's verdict (the literal's value cannot list a spread's parts,
+/// so a clean one reports through the element check, not the value).
+fn eval_element(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
+    match &node.expr {
+        Expr::Faulted(fault) => Verdict::Fault(*fault, node.span),
+        Expr::Spread { operand, .. } => match fold(operand, lookup, depth) {
+            // The operand's known value stays out of the literal's element
+            // list (its parts splice, not nest) — the verdict defers.
+            Verdict::Value(_) | Verdict::Constant => Verdict::Constant,
+            other => other,
+        },
+        _ => fold(node, lookup, depth),
+    }
+}
+
+/// The map literal's ordered element walk (upstream `_buildMapConstant`):
+/// `Expr::Entry` nodes carry the `k: v` pairs, a bare expression element
+/// faults `expression_in_map` at its own node, a `for` element faults
+/// `const_eval_for_element`, an `if` element folds like the list arm's
+/// conditional logic (its live branch's piece folds here — an entry
+/// contributes a pair, anything else faults its own arm), and a spread
+/// splices a map-valued operand (`const_spread_expected_map` otherwise).
+fn eval_map_parts(parts: &[Node], lookup: &dyn ConstLookup, depth: u32) -> Verdict {
+    fn fold_piece(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
+        match &node.expr {
+            Expr::Entry(..) | Expr::IfElement { .. } => fold(node, lookup, depth),
+            Expr::Faulted(_) => fold(node, lookup, depth),
+            Expr::Spread {
+                operand, null_aware,
+            } => match fold(operand, lookup, depth) {
+                Verdict::Value(ConstantValue::Null) if *null_aware => Verdict::Constant,
+                Verdict::Value(ConstantValue::Map(_)) | Verdict::Constant => Verdict::Constant,
+                Verdict::Value(_) => {
+                    Verdict::Fault(ConstFault::SpreadExpectedMap, operand.span)
+                }
+                other => other,
+            },
+            // A bare expression in a map literal (`{x}` where the context
+            // resolves a map) — upstream `case Expression()` faults at the
+            // element.
+            _ => Verdict::Fault(ConstFault::ExpressionInMap, node.span),
+        }
+    }
+    for part in parts {
+        match fold_piece(part, lookup, depth) {
+            Verdict::Constant => {}
+            Verdict::Value(_) => {}
+            other => return other,
+        }
+    }
+    // The literal's structural value stays unknown here (ordered pieces
+    // interleave pairs and control elements); the `map_payload` face
+    // answers the structural value for the sites that need it.
+    Verdict::Value(ConstantValue::Instance(InstanceKind::Map))
 }
 
 /// Upstream `_reportNotPotentialConstants` (upstream Dart SDK source,
@@ -1836,6 +2093,12 @@ pub struct ConstCapture {
     /// literal cannot hold a constant `for` element, so the head is all the
     /// capture needs until the close (which only then knows the body's end).
     ctl_open: Vec<SourceRange>,
+    /// The `if`/`spread` elements' stack marks: `(kind, stack len at
+    /// open, head span)`. An `if` element stages `cond`/`then`/`else`
+    /// operands on the stack that its close folds into one
+    /// [`Expr::IfElement`]; a `...`/`...?` spread wraps its one operand
+    /// into [`Expr::Spread`].
+    ctl_marks: Vec<(CtlElementKind, usize, SourceRange)>,
     /// The closed `for` elements' whole extents, waiting for the owning
     /// literal's close: the literal close is the only point that knows the
     /// element list ended and can hand the spans to the report.
@@ -1859,19 +2122,23 @@ pub struct ClosedArgs {
 }
 
 /// The shape a set-or-map literal resolved to, with the parts whose
-/// const-ness the explicit window checks.
+/// const-ness the explicit window checks. Both arms carry the element
+/// list in source order: the set arm's parts are bare operands (plus any
+/// control elements), the map arm's are `Expr::Entry` pseudo-operands
+/// interleaved with control elements — upstream `_buildMapConstant`
+/// walks the ordered element list, so a `for`/`if`/`spread` element in a
+/// map literal keeps its own element entity rather than vanishing into
+/// the entry split.
 #[derive(Clone, Debug)]
 pub enum SetOrMap {
     Set(Vec<Node>),
-    Map(Vec<(Node, Node)>),
+    Map(Vec<Node>),
 }
 
-/// Which control-flow collection element opened. Only a `for` element
-/// carries a diagnostic face (`const_eval_for_element`: a constant
-/// collection rejects it outright — upstream `_buildListConstant` /
-/// `_buildMapConstant`'s `case ForElement()` returns
-/// `InvalidConstant.forEntity`), so only those latch a head span the
-/// owning literal's close turns into a row.
+/// Which control-flow collection element opened. A `for` element latches
+/// its head for the literal close's `const_eval_for_element` span; an
+/// `if`/`spread` element latches a stack mark so its staged operands fold
+/// back into one structured element node at the element's close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CtlElementKind {
     For,
@@ -1882,20 +2149,29 @@ pub enum CtlElementKind {
 /// Splits the popped operands into entries vs bare elements; the
 /// parser's `has_set_entry` is the official `hasSetEntry`: true when the
 /// first simple entry had NO colon (a set), false with a colon, and
-/// false-for-empty `{}` — the official `isMap` default is map.
-fn split_set_or_map(staged: Vec<Node>, has_set_entry: bool) -> SetOrMap {
-    let mut entries = Vec::new();
-    let mut elements = Vec::new();
-    for node in staged {
-        match node.expr {
-            Expr::Entry(k, v) => entries.push((*k, *v)),
-            _ => elements.push(node),
-        }
-    }
+/// false-for-empty `{}` — the official `isMap` default is map. The
+/// RESOLVED kind (`map`) refines the flag the same way upstream's
+/// resolved `isMap` does: a spread-decided `{...list}` or a `Map`-context
+/// literal is a map even with no `:`-led entry written, so its bare
+/// elements keep their ordered list for the element check (the map arm
+/// faults them `expression_in_map` at eval, matching
+/// `_buildMapConstant`'s `case Expression()`).
+fn split_set_or_map(staged: Vec<Node>, has_set_entry: bool, map: bool) -> SetOrMap {
     if has_set_entry {
-        SetOrMap::Set(elements)
+        // The first entry carried no colon, so upstream's `isSet` answers
+        // set regardless of the resolved kind. A `key: value` entry staged
+        // inside is the `mapEntryNotInMap` fault's element — the parts keep
+        // their ordered staged shape so the eval walks it.
+        SetOrMap::Set(staged)
+    } else if map {
+        // No colon entry and the literal resolved map (the parser's
+        // default, a `Map` context, or a map-typed spread): a bare operand
+        // staged here is the `expressionInMap` fault's element.
+        SetOrMap::Map(staged)
     } else {
-        SetOrMap::Map(entries)
+        // No colon entry and the literal resolved set (a `Set` context or
+        // a list/set-typed spread): the bare operands are set elements.
+        SetOrMap::Set(staged)
     }
 }
 
@@ -1923,6 +2199,7 @@ impl ConstCapture {
             pending_ctor_callee: None,
             creation_spans: Vec::new(),
             ctl_open: Vec::new(),
+            ctl_marks: Vec::new(),
             ctl_closed: Vec::new(),
             pending_for_elements: Vec::new(),
         }
@@ -2226,27 +2503,182 @@ impl ConstCapture {
         {
             window.ctl_elements += 1;
         }
-        if kind == CtlElementKind::For && self.open() {
-            self.ctl_open.push(head);
+        match kind {
+            CtlElementKind::For if self.open() => {
+                // The `for`'s whole parts (initializer, condition, updaters,
+                // body) stage on the operand stack like element operands —
+                // the mark lets the element's own close drop them, so the
+                // literal's `count`-keyed `pop_operands` never sees them
+                // (a for element counts as ONE element; its parts are not).
+                self.ctl_open.push(head);
+                self.ctl_marks.push((kind, self.stack.len(), head));
+            }
+            CtlElementKind::If if self.open() => {
+                // The `if`'s `cond`/`then`/`else` operands stage above
+                // this mark; the element's own close folds them into one
+                // structured node.
+                self.ctl_marks.push((kind, self.stack.len(), head));
+            }
+            CtlElementKind::Spread if self.open() => {
+                // The `...`/`...?` event fires AFTER the operand parsed —
+                // it already sits on the stack, so the mark floors below
+                // it (`- 1`, clamped): the close wraps that one operand.
+                self.ctl_marks
+                    .push((kind, self.stack.len().saturating_sub(1), head));
+            }
+            _ => {}
         }
     }
 
-    /// Closes the `for` element opened at [`Self::begin_ctl_element`]: `end`
-    /// is its exclusive UTF-16 end (the body's last significant unit — the
-    /// caller trims the trailing `]`/`,`/`}` trivia). The whole extent waits
-    /// for the owning literal's close, which reports it.
-    pub fn close_ctl_element(&mut self, kind: CtlElementKind, end: u32) {
-        if kind != CtlElementKind::For {
-            return;
+    /// Closes the control-flow element opened at
+    /// [`Self::begin_ctl_element`]: `end` is its exclusive UTF-16 end (the
+    /// body's last significant unit — the caller trims the trailing
+    /// `]`/`,`/`}` trivia). A `for` element's whole extent waits for the
+    /// owning literal's close, which reports it; an `if` element folds its
+    /// staged `cond`/`then`/`else` operands into one [`Expr::IfElement`]
+    /// node spanning the whole element; a `...` spread wraps its operand
+    /// into [`Expr::Spread`]. `has_else`/`null_aware` come from the
+    /// listener's event (the parser knows whether the `else` branch and
+    /// the `?` marker were written).
+    pub fn close_ctl_element(
+        &mut self,
+        kind: CtlElementKind,
+        end: u32,
+        has_else: bool,
+        null_aware: bool,
+    ) {
+        match kind {
+            CtlElementKind::For => {
+                let Some(head) = self.ctl_open.pop() else {
+                    return;
+                };
+                let span = SourceRange {
+                    offset: head.offset,
+                    length: end.saturating_sub(head.offset),
+                };
+                // The `for`'s staged parts are never element operands: drop
+                // everything above the mark the element's open latched, so
+                // the owning literal's `pop_operands(count)` pops only the
+                // elements the parser's element count knows (the `for`
+                // itself re-enters the list as a `Faulted` leaf at
+                // `settle_literal`, not through these nodes).
+                let own_mark = self
+                    .ctl_marks
+                    .last()
+                    .is_some_and(|(kind, _, _)| *kind == CtlElementKind::For);
+                if own_mark {
+                    let (_, mark, _) = self.ctl_marks.pop().expect("checked above");
+                    self.stack.truncate(mark);
+                    self.drop_latches_above(mark);
+                }
+                // A `for` that is an `if` element's branch is that branch's
+                // node: the `if` close folds `cond`/`then`/`else` from the
+                // stack, so the fault leaf stages there (the `if` then
+                // carries the fault to the literal's verdict) instead of
+                // re-entering the literal as a sibling element.
+                if own_mark
+                    && self
+                        .ctl_marks
+                        .last()
+                        .is_some_and(|(kind, _, _)| *kind == CtlElementKind::If)
+                {
+                    self.push(
+                        Node {
+                            expr: Expr::Faulted(ConstFault::ForElement),
+                            span,
+                        },
+                        false,
+                    );
+                } else {
+                    self.ctl_closed.push(span);
+                }
+            }
+            CtlElementKind::If => {
+                let Some((_, mark, head)) = self.ctl_marks.pop() else {
+                    return;
+                };
+                self.apply_unaries_at(self.depth);
+                // `cond`/`then`/`else` staged in order above the mark; a
+                // recovery-shaped stack with fewer than the written parts
+                // leaves the staged nodes as a debris `Other` node at the
+                // element span (still the not-constant leaf the verifier
+                // reports).
+                let whole = SourceRange {
+                    offset: head.offset,
+                    length: end.saturating_sub(head.offset),
+                };
+                let mut nodes = Vec::new();
+                while self.stack.len() > mark {
+                    nodes.push(self.stack.pop().expect("len > mark"));
+                }
+                nodes.reverse();
+                let node = match (has_else, nodes.len()) {
+                    (false, n) if n >= 2 => {
+                        let els = None;
+                        let mut it = nodes.into_iter();
+                        let cond = it.next().expect("cond");
+                        let then = it.next().expect("then");
+                        Node {
+                            expr: Expr::IfElement {
+                                cond: Box::new(cond),
+                                then: Box::new(then),
+                                els,
+                            },
+                            span: whole,
+                        }
+                    }
+                    (true, n) if n >= 3 => {
+                        let mut it = nodes.into_iter();
+                        let cond = it.next().expect("cond");
+                        let then = it.next().expect("then");
+                        let els = it.next().expect("els");
+                        Node {
+                            expr: Expr::IfElement {
+                                cond: Box::new(cond),
+                                then: Box::new(then),
+                                els: Some(Box::new(els)),
+                            },
+                            span: whole,
+                        }
+                    }
+                    _ => Node {
+                        expr: Expr::Other,
+                        span: whole,
+                    },
+                };
+                self.push(node, false);
+            }
+            CtlElementKind::Spread => {
+                let Some((_, mark, head)) = self.ctl_marks.pop() else {
+                    return;
+                };
+                self.apply_unaries_at(self.depth);
+                let node = if self.stack.len() > mark {
+                    // The operand is the staged top; `...`/`...?`'s own
+                    // tokens sit below it. The element spans the `...`
+                    // operator through the operand's own end (the
+                    // listener's event supplies no end token of its own).
+                    let operand = self.stack.pop().expect("len > mark");
+                    self.stack.truncate(mark);
+                    Node {
+                        span: SourceRange {
+                            offset: head.offset,
+                            length: operand.span.end().saturating_sub(head.offset),
+                        },
+                        expr: Expr::Spread {
+                            operand: Box::new(operand),
+                            null_aware,
+                        },
+                    }
+                } else {
+                    Node {
+                        expr: Expr::Other,
+                        span: head,
+                    }
+                };
+                self.push(node, false);
+            }
         }
-        let Some(head) = self.ctl_open.pop() else {
-            return;
-        };
-        let span = SourceRange {
-            offset: head.offset,
-            length: end.saturating_sub(head.offset),
-        };
-        self.ctl_closed.push(span);
     }
 
     /// Removes the `for` elements the literal opened at `left` owns, in
@@ -2267,6 +2699,12 @@ impl ConstCapture {
             }
         });
         self.ctl_open.retain(|head| head.offset <= left);
+        // An `if`/`spread` mark whose element never closed inside this
+        // literal (a recovery skipped its end event) drops here too — a
+        // stale mark would fold a later literal's operands into a node it
+        // does not own.
+        self.ctl_marks
+            .retain(|(_, _, head)| head.offset <= left);
         taken.sort_by_key(|span| span.offset);
         taken
     }
@@ -2366,6 +2804,7 @@ impl ConstCapture {
         count: usize,
         span: SourceRange,
         has_set_entry: bool,
+        map: bool,
     ) -> Option<(SetOrMap, bool)> {
         if !self.top_is_non_const_dup() {
             return None;
@@ -2373,7 +2812,7 @@ impl ConstCapture {
         let has_ctl = self.windows.last().is_some_and(|w| w.ctl_elements > 0);
         self.apply_unaries_at(self.depth);
         let staged = self.pop_operands(count);
-        let shape = split_set_or_map(staged, has_set_entry);
+        let shape = split_set_or_map(staged, has_set_entry, map);
         self.discard_window();
         self.non_const_dup_placeholder(span);
         // A non-const literal never reports `const_eval_for_element`; drop
@@ -2861,8 +3300,19 @@ impl ConstCapture {
             self.pending_for_elements.clear();
             return None;
         }
-        let elements = self.pop_operands(count);
+        let mut elements = self.pop_operands(count);
         self.pending_for_elements = self.settle_literal(span.offset);
+        // A `for` element folds as a staged fault leaf at its own span —
+        // the element check reports `const_eval_for_element` there and the
+        // var-level verdict carries the same fault (the allow-list code
+        // overrides the site's const-init default).
+        for for_span in &self.pending_for_elements {
+            elements.push(Node {
+                expr: Expr::Faulted(ConstFault::ForElement),
+                span: *for_span,
+            });
+        }
+        elements.sort_by_key(|node| node.span.offset);
         Some(elements)
     }
 
@@ -2911,6 +3361,7 @@ impl ConstCapture {
         count: usize,
         span: SourceRange,
         has_set_entry: bool,
+        map: bool,
     ) -> Option<SetOrMap> {
         if !self.open() {
             return None;
@@ -2924,9 +3375,9 @@ impl ConstCapture {
         if self.fold_literal_ctor_element(
             count,
             span,
-            |staged| match split_set_or_map(staged, has_set_entry) {
+            |staged| match split_set_or_map(staged, has_set_entry, map) {
                 SetOrMap::Set(elements) => Expr::Set(elements),
-                SetOrMap::Map(entries) => Expr::Map(entries),
+                SetOrMap::Map(parts) => Expr::Map(parts),
             },
             self.base(),
         ) {
@@ -2934,15 +3385,26 @@ impl ConstCapture {
             self.pending_for_elements.clear();
             return None;
         }
-        let staged = self.pop_operands(count);
-        let shape = split_set_or_map(staged, has_set_entry);
+        let mut staged = self.pop_operands(count);
+        self.pending_for_elements = self.settle_literal(span.offset);
+        // A `for` element folds as a staged fault leaf at its own span —
+        // the literal close's element list gets one node per `for` so the
+        // element check and the var-level verdict both anchor at the
+        // element, never the literal.
+        for for_span in &self.pending_for_elements {
+            staged.push(Node {
+                expr: Expr::Faulted(ConstFault::ForElement),
+                span: *for_span,
+            });
+        }
+        staged.sort_by_key(|node| node.span.offset);
+        let shape = split_set_or_map(staged, has_set_entry, map);
         // The const path stages the parts for the ERROR-tier duplicate
         // check (#2261): the engine drains them at this literal's value
         // push (`push_literal_value`), so the rows land beside the
         // element faces. Non-const literals never reach here (the
         // `close_non_const_dup` branch owns them upstream).
         self.staged_dups.push((shape.clone(), span));
-        self.pending_for_elements = self.settle_literal(span.offset);
         Some(shape)
     }
 
@@ -3465,6 +3927,11 @@ impl ConstCapture {
         );
     }
 
+    /// `throw expr` — the oracle's `visitThrowExpression` rejects the
+    /// whole expression at `node` (`InvalidConstant.forEntity(entity:
+    /// node)`), so the leaf spans the `throw` keyword through the
+    /// operand's end (`end` is the listener's end token). The operand's
+    /// staged node folds away beneath it.
     pub fn throw_expression(&mut self, span: SourceRange) {
         if self.open() {
             let base = self.base();
@@ -3551,6 +4018,23 @@ impl ConstCapture {
             self.push(
                 Node {
                     expr: Expr::Other,
+                    span,
+                },
+                true,
+            );
+        }
+    }
+
+    /// Pushes a fault leaf anchored at `span` — an allow-listed
+    /// `constEval*` failure whose code overrides the enclosing site's
+    /// default (a `for` element's `const_eval_for_element`: the var-level
+    /// verdict emits the fault code at the element rather than a
+    /// const-init twin).
+    pub fn push_fault(&mut self, span: SourceRange, fault: ConstFault) {
+        if self.open() {
+            self.push(
+                Node {
+                    expr: Expr::Faulted(fault),
                     span,
                 },
                 true,
@@ -4558,7 +5042,7 @@ mod tests {
         capture.identifier(world.id("nc"), span(2));
         capture.literal_map_entry(span(2));
         assert!(
-            capture.literal_set_or_map(1, span(3), false).is_none(),
+            capture.literal_set_or_map(1, span(3), false, true).is_none(),
             "a non-const creation's map argument is no element-checked face"
         );
         capture.positional_argument();
@@ -4590,7 +5074,7 @@ mod tests {
         capture.literal(span(1), ConstantValue::Int(1));
         capture.literal(span(2), ConstantValue::Int(2));
         assert!(
-            capture.literal_set_or_map(2, span(3), true).is_none(),
+            capture.literal_set_or_map(2, span(3), true, false).is_none(),
             "a non-const creation's set argument is no element-checked face"
         );
         capture.positional_argument();
@@ -5098,7 +5582,7 @@ final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
     /// never keys).
     #[test]
     fn new_creation_arguments_leave_the_enclosing_key_staged() {
-        use super::{ConstCapture, ConstantValue, Expr, SetOrMap};
+        use super::{ConstCapture, ConstantValue, Expr, Node, SetOrMap};
         use dartq_source::StringTable;
 
         let strings = StringTable::new();
@@ -5125,22 +5609,31 @@ final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
         capture.end_arguments(span(6));
         capture.end_opaque_group(span(6));
         capture.literal_map_entry(span(6));
+        // A colon-entry literal with no set entry resolves map-side (the
+        // listener passes `resolved_is_map` — `leaves_resolve_kind` answers
+        // `Map` over `key: value` leaves).
         let (shape, _) = capture
-            .close_non_const_dup(2, span(7), false)
+            .close_non_const_dup(2, span(7), false, true)
             .expect("the literal's own window closes with its entries");
-        let SetOrMap::Map(entries) = shape else {
+        let SetOrMap::Map(parts) = shape else {
             panic!("expected a map shape");
         };
-        assert_eq!(entries.len(), 2);
+        assert_eq!(parts.len(), 2);
+        fn key_of(part: &Node) -> &Node {
+            match &part.expr {
+                Expr::Entry(k, _) => k,
+                other => panic!("expected an Entry, got {other:?}"),
+            }
+        }
         assert!(
-            matches!(&entries[0].0.expr, Expr::Value(ConstantValue::Str(s)) if s.as_ref() == "a"),
+            matches!(&key_of(&parts[0]).expr, Expr::Value(ConstantValue::Str(s)) if s.as_ref() == "a"),
             "entry 1 keeps its own key, got {:?}",
-            entries[0].0.expr
+            parts[0].expr
         );
         assert!(
-            matches!(&entries[1].0.expr, Expr::Value(ConstantValue::Str(s)) if s.as_ref() == "b"),
+            matches!(&key_of(&parts[1]).expr, Expr::Value(ConstantValue::Str(s)) if s.as_ref() == "b"),
             "entry 2 keeps its own key (the argument list must not eat it), got {:?}",
-            entries[1].0.expr
+            parts[1].expr
         );
     }
 }

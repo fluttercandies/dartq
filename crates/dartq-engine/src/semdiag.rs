@@ -84,7 +84,7 @@ use dartq_language::Feature;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::LibraryClassModifiers;
 use dartq_semantic::{
-    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, MicroKind,
+    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, MicroKind,
     StrictModes, UnitUseFace,
 };
 use dartq_source::{ContentId, FileId, LineIndex, SourceRange, StringId, StringTable};
@@ -219,74 +219,161 @@ fn member_key(
     })
 }
 
+/// The per-file gather face the import-attribution close probes: one
+/// member's `used` names, doc-reference spellings, and demonstrating
+/// extension-credit names — the name-granular form of the oracle's
+/// per-`LibraryFragment` `ImportsTracking`. A use lands in exactly one
+/// file's pool; whether it credits a given import depends on that file's
+/// scope chain, not on the library-merged set.
+struct FileUsePool {
+    /// Resolved-reference spellings (`usedElements` ∪ `members` at name
+    /// granularity — locals included).
+    used: FxHashSet<StringId>,
+    /// `[Name]` doc-comment first-segment spellings of this file.
+    doc_refs: FxHashSet<StringId>,
+    /// Member spellings a demonstrating member access produced (the
+    /// extension-import credit pool, `notifyExtensionUsed`'s gate).
+    extension_credit: FxHashSet<StringId>,
+}
+
+/// The diagnostic codes whose presence anywhere in a library suppresses
+/// EVERY import warning for every file of that library — the oracle's
+/// `_hasDiagnosticReportedThatPreventsImportWarnings`
+/// (library_analyzer.dart:626-647). A resolution or type-system failure
+/// makes the import-usage tracking unreliable, so the verifier bails out
+/// entirely: one `ambiguous_import` (or any sibling code) silences even
+/// an unrelated genuinely-unused import in a different file of the
+/// same library.
+const IMPORT_WARNING_GATE: &[&str] = &[
+    "ambiguous_import",
+    "creation_with_non_type",
+    "extends_non_class",
+    "implements_non_class",
+    "mixin_of_non_class",
+    "not_a_type",
+    "prefix_identifier_not_followed_by_dot",
+    "undefined_annotation",
+    "undefined_class",
+    "undefined_function",
+    "undefined_identifier",
+    "undefined_prefixed_name",
+    "deprecated_export_use",
+];
+
 /// Releases the staged `unused_import` rows whose import the library's
-/// merged faces credit (#2251). The per-file pass fired each row against
-/// its own unit's use set only; the oracle's `ImportsTracking` is
-/// library-scoped — a `part of` file's uses resolve through the library
-/// scope and spare the importing library's imports, and a `[Name]`
-/// doc-comment reference spares the import that provides `Name` (probed:
-/// dart analyze 3.13.1 — a `///` or `/**` mention spares, a plain `//`
-/// does not, a member selector `[Alpha.two]` spares through its first
-/// segment, a prefix ref `[a.Alpha]` spares the prefixed import, a `show`
-/// combinator gates the credit, and a library-local declaration shadows
-/// the import so the row stays).
+/// usage credits. The oracle's `ImportsTracking` is per-`LibraryFragment`
+/// (per file): each file records the elements its own resolutions touched,
+/// and `generateUnusedImportWarnings` asks that file's tracker whether its
+/// own `importElement` is in `importToUsedElements`
+/// (imports_verifier.dart:230-269). A use in file `D` therefore credits an
+/// import of `D` itself or of `D`'s part-tree ancestors — never a
+/// sibling's or child's. `doc_refs` spares the import the same way (the
+/// `[Name]` reference resolves through the doc's own file scope).
 ///
-/// Each row maps to its import directive through the defining file's
-/// directive facts (the row anchors the URI literal, the facts carry the
-/// same span), then to its graph edge positionally — the same alignment
-/// `report_unused_imports` runs, implicit `dart:core` prelude excluded.
-/// An unmappable row (count mismatch, unknown span) stays reported: the
+/// Each staged row maps back through the directives of the file that
+/// staged it (the row's `file` anchor), then positionally into that
+/// file's `import_runs` slice — the `files[0]` mapping this replaced
+/// could never reach a part file's own import. An unmappable row (count
+/// mismatch, unknown span, no run for its file) stays reported: the
 /// mapping can only under-release, never over-release.
+///
+/// Credit rules mirror the oracle's element attribution at name
+/// granularity (the merged name pool cannot identify the exact element a
+/// use resolved to, so the decision is the best approximation the graph
+/// allows):
+///
+/// * A `non_library` edge is dropped outright (`DirectiveUriWithLibraryImpl`
+///   gate — the oracle never reports `unused_import` for `import
+///   'part.dart'`).
+/// * Prefixed `as p`: a use `p.m` in `D` resolves `m` through
+///   `lookup_prefixed_in_file(D, p, m)`; the winning declaration's
+///   contributing edge is the ONLY edge credited. A `p ∈ doc_refs` ref
+///   releases the whole `as p` group of the closest chain file carrying
+///   `as p` edges (`hasPrefixUsedInCommentReference`).
+/// * Unprefixed: a name `n` used in `D` credits the unprefixed edge whose
+///   export supplies the declaration `lookup_in_file(D, n)` returns — the
+///   chain walk supplies "closest scope wins" and the non-SDK merge for
+///   free. A name that is also reachable as `p.n` through a used prefix
+///   `p` is prefix-attributed and does NOT credit unprefixed edges (the
+///   `one.A` receiver wrote `one`+`A`; the bare pool alone cannot tell it
+///   from `x.A`, so the prefix channel claims it).
+/// * Extension members: `m ∈ extension_credit` of `D` probes the edge's
+///   exported extension faces, scoped to `D`'s chain (an application in
+///   `D` resolves through the scopes `D` sees).
+/// * Any member file's emitted diagnostics carrying a gate code
+///   (IMPORT_WARNING_GATE) suppresses every staged row library-wide.
 fn release_unused_imports(
     library: &LibraryView<'_>,
     staged: Vec<Arc<Diagnostic>>,
-    doc_refs: &[StringId],
-    consumed: &LibraryUseSet,
+    file_pools: &FxHashMap<FileId, FileUsePool>,
     out: &mut Vec<Arc<Diagnostic>>,
 ) {
     if staged.is_empty() {
         return;
     }
-    // Unused imports anchor in the defining file: part files carry no
-    // import directives (`files` is defining first, then parts).
-    let defining = &library.facts[&library.files[0]];
-    let imports: Vec<&crate::state::DirectiveFacts> = defining
-        .directives
+    // Library-wide suppression: a gate-listed diagnostic in ANY member
+    // file silences every import warning for EVERY file of the library
+    // (`_hasDiagnosticReportedThatPreventsImportWarnings`,
+    // library_analyzer.dart:626-647). `out` already holds every member's
+    // live rows at the close, so a single scan decides.
+    if out
         .iter()
-        .filter(|d| d.kind == DirectiveKind::Import)
-        .collect();
-    let mut edges = library.graph.import_edges(library.graph_library);
-    // The implicit prelude edge is exactly one leading entry (the merge
-    // inserts it before every written edge), targets `dart:core`, and
-    // carries no prefix, no deferral, and no combinator clauses — the
-    // alignment predicate `report_unused_imports` runs, copied verbatim.
-    if edges.len() == imports.len() + 1
-        && edges.first().is_some_and(|edge| {
-            edge.prefix.is_none()
-                && !edge.deferred
-                && edge.combinators.written().next().is_none()
-                && edge
-                    .target
-                    .is_some_and(|t| library.graph.uri(t) == "dart:core")
-        })
+        .any(|row| IMPORT_WARNING_GATE.contains(&row.code.name))
     {
-        edges = &edges[1..];
-    }
-    if edges.len() != imports.len() {
-        out.extend(staged);
         return;
+    }
+    let lib = library.graph_library;
+    let edges = library.graph.import_edges(lib);
+    let runs = library.graph.import_runs(lib);
+    // Ancestor chains: `chain_of[D]` = [D, part_parent(D), ..., root] —
+    // the scope chain a use in `D` walks, in lookup order. A use in `D`
+    // can credit only the imports on this chain.
+    let mut chain_of: FxHashMap<FileId, Vec<FileId>> = FxHashMap::default();
+    let hop_limit = library.files.len().max(1);
+    for &file in library.files {
+        let mut chain = Vec::with_capacity(4);
+        let mut current = Some(file);
+        let mut hops = 0;
+        while let Some(f) = current {
+            chain.push(f);
+            current = library.graph.part_parent(lib, f);
+            hops += 1;
+            if hops > hop_limit {
+                break;
+            }
+        }
+        chain_of.insert(file, chain);
     }
     // The library's own declarations shadow every import for the whole
     // library (the scope chain resolves locals before imports), so a pool
-    // name spelled as a local declaration cannot credit an import — the
-    // local-shadow probe keeps such rows reported.
+    // name spelled as a local declaration cannot credit an import.
     let mut own = FxHashSet::default();
     for &file in library.files {
         let elements = &library.facts[&file].elements;
         own.extend(elements.declarations().map(|(name, _)| name));
         own.extend(elements.containers().map(|(name, _)| name));
     }
+    // Per-file run slice for the doc-ref prefix release: the file's own
+    // edges in source order.
+    let run_edges = |file: FileId| -> Option<&[dartq_resolution::ImportEdge]> {
+        let position = runs.iter().position(|&(f, _)| f == file)?;
+        let start = runs[position].1 as usize;
+        let end = runs
+            .get(position + 1)
+            .map_or(edges.len(), |&(_, next)| next as usize);
+        Some(&edges[start..end])
+    };
     'rows: for row in staged {
+        let file = row.file;
+        let Some(facts) = library.facts.get(&file) else {
+            out.push(row);
+            continue;
+        };
+        let imports: Vec<&crate::state::DirectiveFacts> = facts
+            .directives
+            .iter()
+            .filter(|d| d.kind == DirectiveKind::Import)
+            .collect();
         let Some(index) = imports
             .iter()
             .enumerate()
@@ -296,7 +383,21 @@ fn release_unused_imports(
             out.push(row);
             continue;
         };
-        let edge = &edges[index];
+        let Some(file_edges) = run_edges(file) else {
+            out.push(row);
+            continue;
+        };
+        if file_edges.len() != imports.len() {
+            out.push(row);
+            continue;
+        }
+        let edge = &file_edges[index];
+        // The oracle's `DirectiveUriWithLibraryImpl` gate: an `import
+        // 'part.dart'` is never reported unused, however its names
+        // resolve — drop the staged row outright.
+        if edge.non_library {
+            continue 'rows;
+        }
         let Some(target) = edge.target else {
             out.push(row);
             continue;
@@ -307,40 +408,172 @@ fn release_unused_imports(
             out.push(row);
             continue;
         }
-        if let Some(prefix) = edge.prefix {
-            // A prefixed use anywhere in the library credits the prefix
-            // (the prefix namespace holds only the import's exports — no
-            // local shadowing applies); a doc reference spelled through
-            // the prefix credits the same way.
-            if consumed.used.contains(&prefix) || doc_refs.contains(&prefix) {
-                continue;
-            }
-            out.push(row);
-            continue;
-        }
-        // Unprefixed: any merged use or doc-reference spelling the target
-        // exports under this directive's combinators credits the import.
-        // The `notifyExtensionUsed` leg (scope.dart:204-321): a used member
-        // of an extension the import provides credits it even when no
-        // top-level name resolves — the merged `consumed.used` holds the
-        // member spellings, and the target's export scope maps the
-        // extension's own name to its declaring file, so the join probes
-        // the exported faces' member tables against the combinator gate.
-        let credited = consumed
-            .used
-            .iter()
-            .copied()
-            .chain(doc_refs.iter().copied())
-            .filter(|name| !own.contains(name))
-            .any(|name| {
-                edge.combinators.allows(name) && library.graph.exported(target, name).is_some()
-            })
-            || extension_member_credit(library, edge, target, consumed);
-        if credited {
+        if import_edge_credited(library, file, edge, target, &chain_of, file_pools, &own) {
             continue 'rows;
         }
         out.push(row);
     }
+}
+
+/// Whether the import `edge` (a directive of `file`, target `target`)
+/// receives element-level credit from any member file's usage pool — the
+/// attribution arm of `release_unused_imports`. The walk is per use-file
+/// `D`: `D` can credit `file`'s edge only when `file` is on `D`'s scope
+/// chain (upstream `ImportsTracking` is per-fragment).
+fn import_edge_credited(
+    library: &LibraryView<'_>,
+    file: FileId,
+    edge: &dartq_resolution::ImportEdge,
+    target: dartq_resolution::LibraryId,
+    chain_of: &FxHashMap<FileId, Vec<FileId>>,
+    file_pools: &FxHashMap<FileId, FileUsePool>,
+    own: &FxHashSet<StringId>,
+) -> bool {
+    let lib = library.graph_library;
+    for (&use_file, pool) in file_pools {
+        let Some(chain) = chain_of.get(&use_file) else {
+            continue;
+        };
+        // A use in `use_file` credits imports on `use_file`'s scope chain
+        // only — `file` must appear in it.
+        if !chain.contains(&file) {
+            continue;
+        }
+        if let Some(prefix) = edge.prefix {
+            // `as p` group release: `[p]` in `use_file`'s docs credits the
+            // closest chain file carrying `as p` edges — `file` is credited
+            // only when it is that file (`hasPrefixUsedInCommentReference`
+            // resolves the prefix through `use_file`'s scope chain).
+            if pool.doc_refs.contains(&prefix)
+                && closest_prefix_file(library, chain, prefix) == Some(file)
+            {
+                return true;
+            }
+            // `p.m`: `use_file` recorded `p`; `m` resolves through
+            // `use_file`'s `p` scope; the winning declaration must be the
+            // one this edge exports (`exported(target, m)`), not a
+            // same-named export a sibling `as p` edge supplies.
+            if pool.used.contains(&prefix) {
+                for &name in &pool.used {
+                    if name == prefix {
+                        continue;
+                    }
+                    let winner =
+                        library
+                            .namespaces
+                            .lookup_prefixed_in_file(library.graph, lib, Some(use_file), prefix, name);
+                    let dartq_resolution::Lookup::Found(
+                        dartq_resolution::NamespaceEntry::Decl(declaring),
+                    ) = winner
+                    else {
+                        continue;
+                    };
+                    if edge.combinators.allows(name)
+                        && library
+                            .graph
+                            .exported(target, name)
+                            .is_some_and(|entry| entry.file == declaring)
+                    {
+                        return true;
+                    }
+                }
+            }
+            continue;
+        }
+        // Unprefixed: a used or doc-referenced `n` in `use_file` credits
+        // this edge when `n` is NOT prefix-attributed and `n`'s bare
+        // resolution in `use_file` lands on the declaration this edge's
+        // target exports under its combinators.
+        for &name in pool.used.iter().chain(pool.doc_refs.iter()) {
+            if own.contains(&name) || !edge.combinators.allows(name) {
+                continue;
+            }
+            let Some(entry) = library.graph.exported(target, name) else {
+                continue;
+            };
+            if pool.doc_refs.contains(&name) {
+                // A `[n]` doc ref resolves bare in `use_file`'s noPrefix
+                // scope — never through a prefix — so doc names skip the
+                // prefix-attribution subtraction.
+            } else if prefix_attributed(library, use_file, pool, name) {
+                continue;
+            }
+            let winner =
+                library
+                    .namespaces
+                    .lookup_in_file(library.graph, lib, Some(use_file), name);
+            if matches!(
+                winner,
+                dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(
+                    declaring
+                )) if declaring == entry.file
+            ) {
+                return true;
+            }
+        }
+        // Extension credit (`notifyExtensionUsed`, scope.dart:204-321):
+        // a demonstrating member access in `use_file` can credit the
+        // import that contributes the extension — scoped to `use_file`'s
+        // chain, which is exactly what `file ∈ chain` already ensures.
+        if extension_member_credit(library, edge, target, &pool.extension_credit) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The file that `use_file`'s doc-ref `p` resolves the prefix through:
+/// the first file on `use_file`'s scope chain (itself, then part-tree
+/// ancestors) that carries any `as p` import — the oracle's
+/// `hasPrefixUsedInCommentReference` walks the same chain and releases
+/// the whole `as p` group of the file it lands on.
+fn closest_prefix_file(
+    library: &LibraryView<'_>,
+    chain: &[FileId],
+    prefix: StringId,
+) -> Option<FileId> {
+    let edges = library.graph.import_edges(library.graph_library);
+    let runs = library.graph.import_runs(library.graph_library);
+    for &file in chain {
+        let Some(position) = runs.iter().position(|&(f, _)| f == file) else {
+            continue;
+        };
+        let start = runs[position].1 as usize;
+        let end = runs
+            .get(position + 1)
+            .map_or(edges.len(), |&(_, next)| next as usize);
+        if edges[start..end]
+            .iter()
+            .any(|edge| edge.prefix == Some(prefix))
+        {
+            return Some(file);
+        }
+    }
+    None
+}
+
+/// Whether `name` (a used spelling of `use_file`) is a `p.name` member
+/// spelling for some prefix `p` that `use_file` also used — the
+/// `p.m`-written pair claims `m`, so `m` cannot also stand as a bare use
+/// for the unprefixed credit pool. `m` counts as prefix-attributed when
+/// some `p ∈ used` resolves `m` through `use_file`'s `p` scope (the
+/// winning declaration may be any import's — attribution asks which
+/// CHANNEL wrote the name, not which element won).
+fn prefix_attributed(
+    library: &LibraryView<'_>,
+    use_file: FileId,
+    pool: &FileUsePool,
+    name: StringId,
+) -> bool {
+    pool.used.iter().any(|&p| {
+        p != name
+            && !matches!(
+                library
+                    .namespaces
+                    .lookup_prefixed_in_file(library.graph, library.graph_library, Some(use_file), p, name),
+                dartq_resolution::Lookup::NotFound
+            )
+    })
 }
 
 /// Whether the extension-credit face's `on` head resolves as a type in the
@@ -400,7 +633,7 @@ fn extension_member_credit(
     library: &LibraryView<'_>,
     edge: &dartq_resolution::ImportEdge,
     target: dartq_resolution::LibraryId,
-    consumed: &LibraryUseSet,
+    extension_credit: &FxHashSet<StringId>,
 ) -> bool {
     for (export_name, entry) in library.graph.export_scope(target) {
         if !edge.combinators.allows(export_name) {
@@ -424,7 +657,7 @@ fn extension_member_credit(
             if face
                 .members
                 .keys()
-                .any(|member| consumed.extension_credit(*member))
+                .any(|member| extension_credit.contains(member))
             {
                 return true;
             }
@@ -968,7 +1201,12 @@ impl SemanticDiagnoser for Diagnoser {
         // `unused_import` rows against the library-merged use set and every
         // member's doc-comment `[Name]` spellings.
         let mut staged_imports: Vec<Arc<Diagnostic>> = Vec::new();
-        let mut doc_refs: Vec<StringId> = Vec::new();
+        // Per-file use pools for the import-attribution close (riders 1+2):
+        // `used`/`doc_refs`/`extension_credit` keyed by the file that
+        // produced them — the oracle's `ImportsTracking` is per-library-
+        // fragment (per file), so a use only credits the imports visible
+        // in that file's scope chain (itself + its part-tree ancestors).
+        let mut file_pools: FxHashMap<FileId, FileUsePool> = FxHashMap::default();
         let unused_import = unused_import_name();
         // The intra-library cancellation cadence: one relaxed atomic load
         // per stride of member folds — the bounded-window contract a flip
@@ -1005,8 +1243,16 @@ impl SemanticDiagnoser for Diagnoser {
                         .map(|(row, name)| (Arc::clone(row), *name)),
                 );
                 staged_imports.extend(fold.unused_imports.iter().cloned());
-                doc_refs.extend(fold.doc_refs.iter().copied());
-                usages.add_unit(library.graph_library, fold.face.expand());
+                let face = fold.face.expand();
+                file_pools.insert(
+                    file,
+                    FileUsePool {
+                        used: face.used.iter().copied().collect(),
+                        doc_refs: fold.doc_refs.iter().copied().collect(),
+                        extension_credit: face.extension_credit.iter().copied().collect(),
+                    },
+                );
+                usages.add_unit(library.graph_library, face);
                 continue;
             }
             // The member's facts' content is resident in the store (the
@@ -1136,7 +1382,14 @@ impl SemanticDiagnoser for Diagnoser {
             // the close's credit pool is library-wide, so a part's docs
             // spare the importing library's imports too.
             let doc_names = doc_reference_names(text, library.strings);
-            doc_refs.extend(doc_names.iter().copied());
+            file_pools.insert(
+                file,
+                FileUsePool {
+                    used: face.used.iter().copied().collect(),
+                    doc_refs: doc_names.iter().copied().collect(),
+                    extension_credit: face.extension_credit.iter().copied().collect(),
+                },
+            );
             out.extend(live.iter().cloned());
             // The extension-member rows leave the name-keyed pool: their
             // close gate is the element-keyed `extension_members` merge, not
@@ -1271,7 +1524,7 @@ impl SemanticDiagnoser for Diagnoser {
                 };
             (!released).then_some(row)
         }));
-        release_unused_imports(&library, staged_imports, &doc_refs, &consumed, out);
+        release_unused_imports(&library, staged_imports, &file_pools, out);
     }
 
     /// The memo-backed member-ref face (#2618): every member's fold is

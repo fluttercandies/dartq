@@ -383,6 +383,7 @@ mod tests {
                     prefix: None,
                     deferred: false,
                     combinators: dartq_resolution::Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }

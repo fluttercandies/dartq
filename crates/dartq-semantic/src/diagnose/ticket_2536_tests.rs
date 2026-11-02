@@ -91,6 +91,7 @@ fn double_import_report(main_source: &str, dependency: &str, prefix: Option<&str
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -101,6 +102,7 @@ fn double_import_report(main_source: &str, dependency: &str, prefix: Option<&str
                 target: Some(dep_lib),
                 prefix: Some(strings.intern(p)),
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

@@ -5721,6 +5721,7 @@ typedef U<T> = T Function();
                 target: Some(lib_other),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -5930,6 +5931,7 @@ typedef U<T> = T Function();
                 target: Some(lib_other),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -6015,6 +6017,7 @@ typedef U<T> = T Function();
                 target: Some(lib_other),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -6288,6 +6291,7 @@ typedef U<T> = T Function();
                 target: Some(lib_s),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

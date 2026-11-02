@@ -105,6 +105,7 @@ fn report_part(root_source: &str, part_source: &str) -> FileReport {
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

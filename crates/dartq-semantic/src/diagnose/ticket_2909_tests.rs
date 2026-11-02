@@ -162,6 +162,7 @@ fn report_with_prefix(source: &str, core_names: &[&str], show_dynamic_export: bo
             target: Some(a_lib),
             prefix: Some(strings.intern("p")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

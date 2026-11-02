@@ -252,6 +252,7 @@ fn prefix_report(main: &str, prefix_name: &str, lib_src: &str) -> FileReport {
             target: Some(lib_core),
             prefix: Some(strings.intern(prefix_name)),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -264,6 +265,7 @@ fn prefix_report(main: &str, prefix_name: &str, lib_src: &str) -> FileReport {
             target: Some(lib_core),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

@@ -77,6 +77,7 @@ fn report_two_file(main_source: &str, lib_source: &str) -> FileReport {
             target: Some(lib_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

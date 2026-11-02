@@ -102,6 +102,7 @@ fn report_prefixed(source_m: &str, source_a: &str, prefix: &str) -> FileReport {
             target: Some(lib_a),
             prefix: Some(strings.intern(prefix)),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -658,6 +659,7 @@ fn report_imported(source_m: &str, source_a: &str) -> FileReport {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -797,6 +799,7 @@ fn report_with_unindexed_super(source_m: &str, source_a: &str) -> FileReport {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

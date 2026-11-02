@@ -413,6 +413,7 @@ mod tests {
                 target: Some(target),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::new(
                     [CombinatorClause::Show(
                         vec![strings.intern("x")].into_boxed_slice(),
@@ -462,6 +463,7 @@ mod tests {
                 target: Some(target),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

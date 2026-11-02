@@ -2859,6 +2859,7 @@ mod tests {
                     prefix: None,
                     deferred: false,
                     combinators: Combinators::unfiltered(),
+                    non_library: false,
                 },
             );
         }

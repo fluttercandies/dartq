@@ -11,6 +11,7 @@ use crate::diagnose::Engine;
 use crate::library::{ElementIndex, resolve_container};
 use crate::model::{ArgListId, Container, ContainerKind, MemberKind, Ty};
 use dartq_resolution::{LibraryGraph, LibraryId, Namespaces};
+use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use dartq_types::{ExhaustivenessWorld, Key, Single, Space};
 use rustc_hash::FxHashMap;
@@ -114,6 +115,12 @@ pub(crate) struct SwitchTracker {
     /// The `switch` keyword of the open switch statement/expression (the
     /// non-exhaustive anchor; the block events only carry the `{`).
     pub(crate) switch_kw_latch: Option<SourceRange>,
+    /// The UTF-16 offset of the open root pattern's first token (latched
+    /// by `begin_pattern` at depth 1): the list probe's scan start
+    /// ([`case_first_opener_is_list`]). A switch-expression case carries
+    /// no keyword anchor, so the root's own head is the one start every
+    /// clause form shares.
+    pub(crate) root_begin: u32,
 }
 
 impl SwitchTracker {
@@ -127,6 +134,7 @@ impl SwitchTracker {
             if_case_window: false,
             pending_const: None,
             switch_kw_latch: None,
+            root_begin: 0,
         }
     }
 
@@ -140,7 +148,14 @@ impl SwitchTracker {
 
     /// Collapses one frame's leaves into the restriction it covers
     /// (`||` unions, `&&` intersects, a bare leaf passes through, a
-    /// type-free pattern covers its context).
+    /// type-free pattern covers its context). A trailing `Unknown` is the
+    /// bracket's own marker leaf (`handle_list_pattern`'s,
+    /// listener.rs:7874 — element sub-patterns merge as one leaf each
+    /// through `end_pattern`'s parent push, so the marker is always last
+    /// when the frame is a list's). The bracket's KIND comes off the
+    /// token stream: the clause's first opener decides list vs
+    /// map/record/paren (upstream knows the node kind; the name level
+    /// only sees a trailing `Unknown` for every bracket face).
     pub(crate) fn collapse(
         world: &NameWorld<'_>,
         leaves: Vec<Restriction>,
@@ -154,14 +169,126 @@ impl SwitchTracker {
         if or_ops > 0 {
             return Restriction::Union(leaves);
         }
+        // The list-pattern split: the frame's last leaf is the bracket's
+        // Unknown marker; the elements before it (and around a rest mark)
+        // are the head, the rest, and the tail — `createListSpace`'s
+        // three-way split (shared.dart:832-911). The probe only fires on
+        // a trailing-Unknown frame: every other bracket face (object,
+        // record, relational, constant) either carries a typed leaf or
+        // stays a single `Unknown`, and a non-`[` first opener keeps the
+        // reduce path untouched.
+        if matches!(leaves.last(), Some(Restriction::Unknown))
+            && case_first_opener_is_list()
+            && let Some((list, elem)) = world.list_pattern_elem()
+        {
+            // The marker is never a list ELEMENT: a frame carrying only
+            // the marker is `[]`, a frame carrying elements + rest mark +
+            // marker is a rest-bearing list. The rest mark — when
+            // present — sits one leaf after its own sub-pattern
+            // (`handle_rest_pattern` fires after the sub merges), so the
+            // leaf before it is the rest's sub-pattern when `had_sub`.
+            let elements = &leaves[..leaves.len() - 1];
+            let rest_mark = elements
+                .iter()
+                .position(|leaf| matches!(leaf, Restriction::RestMark { .. }));
+            let (head, rest, tail) = match rest_mark {
+                Some(mark) => {
+                    let Restriction::RestMark { had_sub } = elements[mark] else {
+                        unreachable!()
+                    };
+                    // A `...sub` sub-pattern's leaf immediately precedes
+                    // the mark; a bare `...`'s mark ends the head run.
+                    if had_sub && mark == 0 {
+                        // `[...sub]` — the sub merged before the mark, so
+                        // the mark cannot be first. A degenerate shape:
+                        // keep the under-report arm.
+                        return Restriction::Unknown;
+                    }
+                    let head_len = mark - usize::from(had_sub);
+                    let rest = if had_sub {
+                        Some(Some(Box::new(elements[mark - 1].clone())))
+                    } else {
+                        Some(None)
+                    };
+                    (
+                        elements[..head_len].to_vec(),
+                        rest,
+                        elements[mark + 1..].to_vec(),
+                    )
+                }
+                None => (elements.to_vec(), None, Vec::new()),
+            };
+            return Restriction::List {
+                list,
+                elem,
+                head,
+                rest,
+                tail,
+            };
+        }
         // `&&` joins (or a bare single leaf) intersect at name level.
         leaves
             .into_iter()
             .reduce(|a, b| a.and_in(world, b))
             .unwrap_or(Restriction::Unknown)
     }
+}
 
-    /// Closes the case-header pattern window and drains its root: the
+/// Whether the case clause now collapsing opens with a LIST bracket. A
+/// list pattern's own frame is the only trailing-`Unknown` root frame a
+/// `[` head produces — object/record/paren brackets open with `(` or
+/// `{`, and a bare `[]` scans as the single `Index` token. The probe is
+/// confined to the outermost collapsing frame (`end_pattern` pops the
+/// frame before collapsing, so an empty `pattern_stack` marks the root):
+/// element frames merge inside their bracket's frame and never reach
+/// this read, so a `[>5]` element cannot ride the case's outer `[`
+/// answer. The scan starts at the root pattern's own first token (the
+/// statement case's `case` keyword and the expression case's missing one
+/// both precede it); terminators bound it to the clause head (`:`/`=>`/
+/// `,`, `when`, `;`), so a bracket-free head (`case >5`, `case 1:`)
+/// declines. Only a case header's root reaches the exhaustiveness walk —
+/// every other root's restriction is dropped at its close.
+/// `const [...]` is a constant pattern (value equality), not a list
+/// pattern — a `const` keyword immediately before the `[` declines it.
+fn case_first_opener_is_list() -> bool {
+    let Some(engine) = fold_engine() else {
+        return false;
+    };
+    // Only the case's outermost frame may answer for the head's bracket —
+    // a nested frame's own bracket is not necessarily the clause's first.
+    if !engine.switch.pattern_stack.is_empty() {
+        return false;
+    }
+    let tokens = engine.tokens.as_slice();
+    let start = tokens.partition_point(|token| token.utf16_offset < engine.switch.root_begin);
+    let mut prev_was_const = false;
+    for token in &tokens[start..] {
+        match token.kind {
+            // `[]` scans as one `Index` token — an empty list pattern.
+            TokenKind::Index | TokenKind::OpenSquare => {
+                return !prev_was_const;
+            }
+            // Any other bracket head (map/record/paren/object) is not the
+            // list face.
+            TokenKind::OpenCurly | TokenKind::OpenParen => return false,
+            // The clause head's own terminators: the pattern ended without
+            // a bracket head (relational, constant, bare type test).
+            TokenKind::Colon
+            | TokenKind::Comma
+            | TokenKind::Semicolon
+            | TokenKind::Function
+            | TokenKind::Eof => return false,
+            TokenKind::Keyword(kw) if kw == Keyword::When => return false,
+            TokenKind::Keyword(kw) => {
+                prev_was_const = kw == Keyword::Const;
+            }
+            _ => prev_was_const = false,
+        }
+    }
+    false
+}
+
+impl SwitchTracker {
     /// topmost restriction is the header pattern's coverage (pushed between
     /// the window's open and here), everything below is debris from earlier
     /// bodies. `None` — a legacy or recovered header with no pattern —
@@ -451,8 +578,15 @@ pub(crate) fn restriction_disjoint_from(
             .all(|part| restriction_disjoint_from(world, part, matched)),
         // The unknown space and the context leaf match by construction —
         // the engine under-reports instead of mis-answering.
-        Restriction::Unknown | Restriction::NamedContext => false,
+        Restriction::Unknown | Restriction::NamedContext | Restriction::RestMark { .. } => false,
         Restriction::Null => !world.can_be_subtype_of(&NameTy::Null, &matched),
+        // A list pattern overlaps the matched type when its `List<E>`
+        // head can be one (`canBeSubtypeOf`'s type ask over the
+        // unrestricted list face — the element/size refinements only
+        // narrow the case's own space, the `Restriction::Object` rule).
+        Restriction::List { elem, .. } => {
+            !world.can_be_subtype_of(&world.list_ty(*elem), &matched)
+        }
         // The object pattern's head test decides the overlap; the property
         // refinements only narrow the case's own space.
         Restriction::Object(name, _) => {
@@ -712,6 +846,19 @@ pub(crate) enum NameTy {
     /// (`NullableStaticType(_BoolValueStaticType)`, `static_type.dart:350`):
     /// the value plus `null`, never the other boolean.
     BoolOrNull(bool),
+    /// A list-pattern static type (`ListPatternStaticType` over
+    /// `ListTypeRestriction`, types/list.dart:124-313): the underlying
+    /// `List` element type, the fixed element count (head + tail), and
+    /// the rest flag — `size == 0 && has_rest` is the unrestricted
+    /// `List<E>` face (`isUnrestricted`, list.dart:264-267).
+    ListPat {
+        /// The element type the list's slots read.
+        elem: Ty,
+        /// Fixed elements the pattern pins (head + tail).
+        size: u32,
+        /// A rest element (`...`) covers the middle.
+        has_rest: bool,
+    },
     /// A unique unknown (relational patterns, unrepresentable constants):
     /// matched by nothing.
     Unknown(u64),
@@ -890,7 +1037,39 @@ pub(crate) enum Restriction {
     /// express degrades the whole pattern to [`Restriction::Unknown`] at
     /// the close.
     Object(StringId, Vec<(StringId, Restriction)>),
-    /// The unknown space: relational patterns, list/map patterns, and
+    /// The rest-element marker a `...` fires inside its own bracket
+    /// (`handle_rest_pattern`): the collapse rebuilds the list pattern's
+    /// head/rest/tail split from it (`createListSpace`,
+    /// shared.dart:832-911). `had_sub` records whether the rest carried a
+    /// sub-pattern (`...p` vs a bare `...`), which decides whether the leaf
+    /// before the mark is the rest's sub-pattern or the last head element.
+    /// Never survives the frame — [`SwitchTracker::collapse`] either folds
+    /// it into [`Restriction::List`] (a list frame) or drops the whole
+    /// pattern to [`Restriction::Unknown`] (every other bracket).
+    RestMark { had_sub: bool },
+    /// A list pattern's coverage: `head` fixed elements, an optional rest
+    /// (`Bare` `...` or `Sub` `...p`), and `tail` fixed elements after it
+    /// (`ListPatternStaticType` over `ListTypeRestriction`,
+    /// types/list.dart:124-313, built by `createListSpace`,
+    /// shared.dart:832-911). `elem` is the resolved element type — the
+    /// scrutinee's `List<E>` argument when the matched type supplies one,
+    /// else `Object?` (the official's `elementType ?? objectQuestionType`,
+    /// list_pattern_resolver.dart:40-45). `list` is the `List` head's name
+    /// — the restriction's static type rides on `List<elem>`.
+    List {
+        /// The `List` container spelling (`dart:core`'s, unless shadowed).
+        list: StringId,
+        /// The resolved element type.
+        elem: Ty,
+        /// The fixed head elements' restrictions.
+        head: Vec<Restriction>,
+        /// The rest element: `None` — no `...`; `Some(None)` — a bare
+        /// `...`; `Some(Some(sub))` — `...sub`.
+        rest: Option<Option<Box<Restriction>>>,
+        /// The fixed tail elements' restrictions.
+        tail: Vec<Restriction>,
+    },
+    /// The unknown space: relational patterns, map patterns, and
     /// constants the name level cannot represent. Never must-matches, so
     /// the engine under-reports instead of mis-answering.
     Unknown,
@@ -1033,6 +1212,76 @@ fn collect_singles(
                 props.push((key, space));
             }
             out.push(Single::with_props(head, props));
+        }
+        // A list pattern's single: `ListPatternStaticType` over the
+        // head+tail size and rest flag, with the `HeadKey`/`RestKey`/
+        // `TailKey` additional-property columns `createListSpace` builds
+        // (shared.dart:865-905). `TailKey(i)` is the `i`th-last element —
+        // `tail[tail.len() - 1 - i]`.
+        Restriction::List {
+            elem,
+            head,
+            rest,
+            tail,
+            ..
+        } => {
+            let ty = NameTy::ListPat {
+                elem: *elem,
+                size: u32::try_from(head.len() + tail.len()).unwrap_or(u32::MAX),
+                has_rest: rest.is_some(),
+            };
+            // The head/tail columns type as the element (`HeadKey`/`TailKey`
+            // → `getListElementType`), the rest column as the `List<E>`
+            // face itself (`RestKey` → `getListType`,
+            // shared.dart:402-411). A type-free element leaf
+            // (`var r1`, `_`) is that column's full space.
+            let column = NameTy::from_semantic(*elem);
+            let rest_column = world.list_ty(*elem);
+            let mut additional =
+                Vec::with_capacity(head.len() + tail.len() + usize::from(rest.is_some()));
+            for (index, leaf) in head.iter().enumerate() {
+                let mut singles = Vec::new();
+                collect_singles(world, leaf, column, &mut singles);
+                additional.push((
+                    Key::Head(index),
+                    Space::from_singles(world, Vec::new(), singles),
+                ));
+            }
+            if let Some(sub) = rest {
+                let space = match sub {
+                    Some(sub) => {
+                        let mut singles = Vec::new();
+                        collect_singles(world, sub, rest_column, &mut singles);
+                        Space::from_singles(world, Vec::new(), singles)
+                    }
+                    // A bare `...` covers its whole `List<E>` column
+                    // (`staticType.getAdditionalPropertyType(RestKey)`,
+                    // shared.dart:888-892).
+                    None => Space::full(rest_column),
+                };
+                additional.push((
+                    Key::Rest {
+                        head: head.len(),
+                        tail: tail.len(),
+                    },
+                    space,
+                ));
+            }
+            for index in 0..tail.len() {
+                let leaf = &tail[tail.len() - index - 1];
+                let mut singles = Vec::new();
+                collect_singles(world, leaf, column, &mut singles);
+                additional.push((
+                    Key::Tail(index),
+                    Space::from_singles(world, Vec::new(), singles),
+                ));
+            }
+            out.push(Single::with_additional(ty, additional));
+        }
+        // The rest mark never survives `collapse` (a non-list frame drops
+        // the whole pattern to `Unknown` before this point).
+        Restriction::RestMark { .. } => {
+            out.push(Single::full(world.unknown()));
         }
     }
 }
@@ -1293,7 +1542,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 NameTy::Named(_, false)
                 | NameTy::NamedArgs(_, false, _)
                 | NameTy::EnumValue(..)
-                | NameTy::BoolValue(_),
+                | NameTy::BoolValue(_)
+                | NameTy::ListPat { .. },
                 NameTy::TopNonNullable,
             ) => true,
             // A constant's type is its declared instantiation
@@ -1329,6 +1579,45 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             (NameTy::TopNonNullable, NameTy::Named(tn, _) | NameTy::NamedArgs(tn, _, _)) => {
                 *tn == self.object_id
             }
+            // `ListTypeRestriction.isSubtypeOf` (types/list.dart:279-292):
+            // a restricted pair compares element types then the size/rest
+            // shape.
+            (
+                NameTy::ListPat {
+                    elem: se,
+                    size: ss,
+                    has_rest: sr,
+                },
+                NameTy::ListPat {
+                    elem: te,
+                    size: ts,
+                    has_rest: tr,
+                },
+            ) => {
+                // The unrestricted target absorbs (`other.isUnrestricted`
+                // first, list.dart:280): `[...]` covers every list.
+                (*tr && *ts == 0)
+                    || (self.elem_sub(*se, *te)
+                        && if *tr { ss >= ts } else if *sr { false } else { ss == ts })
+            }
+            // A list pattern type is still a `List<E>` at the interface
+            // face (`TypeBasedStaticType.isSubtypeOfInternal` — the
+            // restriction is a subtype of every UNRESTRICTED target,
+            // types.dart:224-241): the pair decides as `List<elem> <: sup`.
+            (NameTy::ListPat { elem, .. }, NameTy::Named(..) | NameTy::NamedArgs(..)) => {
+                self.is_subtype_of(&self.list_ty(*elem), sup)
+            }
+            // Any non-list single against a list pattern: the target's
+            // restriction only absorbs when it is itself unrestricted
+            // (`has_rest && size == 0` IS `List<E>` — `[...]`); every
+            // restricted target rejects an unrestricted source
+            // (types.dart:236-241).
+            (sub, NameTy::ListPat {
+                elem,
+                size: 0,
+                has_rest: true,
+            }) => self.is_subtype_of(sub, &self.list_ty(*elem)),
+            (_, NameTy::ListPat { .. }) => false,
             _ => false,
         }
     }
@@ -1341,6 +1630,15 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             | NameTy::TopNullable
             | NameTy::EnumValueOrNull(..)
             | NameTy::BoolOrNull(_) => true,
+            // `ListTypeStaticType.isSealed` (types/list.dart:62): the core
+            // `List` face splits over the size buckets. The restricted
+            // `ListPat` face inherits `TypeBasedStaticType.isSealed` —
+            // `false` (types/list.dart:124-135, list.dart:59).
+            NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _)
+                if *name == self.list_head() =>
+            {
+                true
+            }
             NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
                 self.is_sealed_name(*name)
             }
@@ -1348,7 +1646,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         }
     }
 
-    fn subtypes(&self, ty: &NameTy) -> Vec<NameTy> {
+    fn subtypes(&self, ty: &NameTy, keys: &rustc_hash::FxHashSet<Key>) -> Vec<NameTy> {
         let erased = self.extension_erasure(ty);
         match &erased {
             NameTy::Named(name, true) => vec![NameTy::Named(*name, false), NameTy::Null],
@@ -1362,6 +1660,37 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 vec![NameTy::EnumValue(*enum_name, *constant), NameTy::Null]
             }
             NameTy::BoolOrNull(value) => vec![NameTy::BoolValue(*value), NameTy::Null],
+            // `ListTypeStaticType.getSubtypes` (types/list.dart:65-121):
+            // the case rows' head/tail keys bound the fixed-size split —
+            // sizes `0..maxSize-1` then `size=maxSize, hasRest` — over the
+            // scrutinee's own element type.
+            NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _)
+                if *name == self.list_head() =>
+            {
+                let mut max_head = 0usize;
+                let mut max_tail = 0usize;
+                for key in keys {
+                    match *key {
+                        Key::Head(index) => max_head = max_head.max(index + 1),
+                        Key::Tail(index) => max_tail = max_tail.max(index + 1),
+                        _ => {}
+                    }
+                }
+                let max_size = max_head + max_tail;
+                let elem = self.list_elem_of(&erased);
+                (0..max_size)
+                    .map(|size| NameTy::ListPat {
+                        elem,
+                        size: u32::try_from(size).unwrap_or(u32::MAX),
+                        has_rest: false,
+                    })
+                    .chain(std::iter::once(NameTy::ListPat {
+                        elem,
+                        size: u32::try_from(max_size).unwrap_or(u32::MAX),
+                        has_rest: true,
+                    }))
+                    .collect()
+            }
             NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
                 self.name_subtypes(*name, &erased)
             }
@@ -1385,6 +1714,45 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         self.member_column(*name, self.strings.intern(member))
     }
 
+    /// `getAdditionalPropertyType` → `getAdditionalFieldType`
+    /// (shared.dart:396-416): a head/tail slot reads the list's element
+    /// type, the rest slot reads the `List<E>` face itself, a map key
+    /// reads the map's value type — `None` (the nullable-object
+    /// fallback) for every other key and for a `ty` that cannot answer
+    /// (`getListElementType`/`getMapValueType` decline).
+    fn additional_property_type(&self, ty: &NameTy, key: &Key) -> Option<NameTy> {
+        let ty = &self.extension_erasure(ty);
+        match key {
+            Key::Head(_) | Key::Tail(_) => match ty {
+                NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _)
+                    if *name == self.list_head() =>
+                {
+                    Some(NameTy::from_semantic(self.list_elem_of(ty)))
+                }
+                // The pattern face answers through its own element —
+                // a `HeadKey`/`TailKey` column under a `ListPat` single
+                // (a nested list element's own slots, or the same
+                // column re-asked) reads the restriction's element.
+                NameTy::ListPat { elem, .. } => Some(NameTy::from_semantic(*elem)),
+                _ => None,
+            },
+            Key::Rest { .. } => match ty {
+                NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _)
+                    if *name == self.list_head() =>
+                {
+                    // The rest column IS the `List<E>` face (upstream
+                    // `getListType` → `ListTypeStaticType` — the sealed
+                    // list, not the unrestricted pattern face).
+                    Some(ty.clone())
+                }
+                NameTy::ListPat { elem, .. } => Some(self.list_ty(*elem)),
+                _ => None,
+            },
+            Key::MapKey(_) => None,
+            _ => None,
+        }
+    }
+
     fn is_bottom(&self, ty: &NameTy) -> bool {
         matches!(ty, NameTy::Never)
     }
@@ -1395,6 +1763,65 @@ impl ExhaustivenessWorld for NameWorld<'_> {
 
     fn witness_text(&self, ty: &NameTy, fields: &[(Key, String)]) -> String {
         let ty = &self.extension_erasure(ty);
+        // `ListPatternStaticType.witnessToDart` (types/list.dart:160-238):
+        // the head/tail/rest fields lay out positionally, missing slots
+        // render `_`, a short head pads to the restriction's size, and a
+        // non-list field trails as `&& Object(k: w)` (mirroring the
+        // record/object tail below).
+        if let NameTy::ListPat { size, has_rest, .. } = ty {
+            let mut max_head = 0usize;
+            let mut max_tail = 0usize;
+            for (key, _) in fields {
+                match *key {
+                    Key::Head(index) if index >= max_head => max_head = index + 1,
+                    Key::Tail(index) if index >= max_tail => max_tail = index + 1,
+                    _ => {}
+                }
+            }
+            if max_head + max_tail < *size as usize {
+                max_head = *size as usize - max_tail;
+            }
+            let field = |key: &Key| fields.iter().find(|(k, _)| k == key).map(|(_, t)| t.as_str());
+            let mut text = String::from("[");
+            let mut comma = "";
+            for index in 0..max_head {
+                text.push_str(comma);
+                text.push_str(field(&Key::Head(index)).unwrap_or("_"));
+                comma = ", ";
+            }
+            if *has_rest {
+                text.push_str(comma);
+                text.push_str("...");
+                // A rest sub-witness renders after the `...`
+                // (list.dart:200-203): the single `Rest` field, if any.
+                if let Some(rest) = fields.iter().find(|(k, _)| matches!(k, Key::Rest { .. })) {
+                    text.push_str(&rest.1);
+                }
+                comma = ", ";
+            }
+            for index in (0..max_tail).rev() {
+                text.push_str(comma);
+                text.push_str(field(&Key::Tail(index)).unwrap_or("_"));
+                comma = ", ";
+            }
+            text.push(']');
+            let mut start = " && Object(";
+            let mut close = "";
+            let mut inner_comma = "";
+            for (key, field) in fields {
+                if matches!(key, Key::Head(_) | Key::Rest { .. } | Key::Tail(_)) {
+                    continue;
+                }
+                text.push_str(start);
+                start = "";
+                close = ")";
+                text.push_str(inner_comma);
+                inner_comma = ", ";
+                text.push_str(&format!("{}: {field}", key.name_text()));
+            }
+            text.push_str(close);
+            return text;
+        }
         if fields.is_empty() {
             // The instance-shape witness always carries the
             // constructor-form parentheses, empty or not
@@ -1413,6 +1840,9 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             .map(|(key, text)| match key {
                 Key::RecordIndex(index) => format!("${}:{text}", index + 1),
                 Key::RecordName(name) | Key::Name(name) => format!("{name}: {text}"),
+                // A list/map key trailing a non-list head renders through
+                // its `name` (key.dart) the way `render_fields` does.
+                other => format!("{}: {text}", other.name_text()),
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -1777,12 +2207,17 @@ impl<'a> NameWorld<'a> {
                 }
                 _ => return current,
             };
-            let erased = self.container(name).and_then(|container| {
+            let erased = self.locate(name).and_then(|(container, owner)| {
                 (container.kind == ContainerKind::ExtensionType)
-                    .then(|| container.primary_formals.first().map(|rep| rep.formal.ty))
+                    .then(|| {
+                        container
+                            .primary_formals
+                            .first()
+                            .map(|rep| (rep.formal.ty, owner, container))
+                    })
                     .flatten()
             });
-            let Some(repr) = erased else {
+            let Some((repr, owner, container)) = erased else {
                 return current;
             };
             // An unknown representation (an unresolved annotation the
@@ -1793,6 +2228,30 @@ impl<'a> NameWorld<'a> {
             if repr == Ty::Unknown {
                 return current;
             }
+            // The use-site instantiation substitutes the declaration's
+            // parameters in the representation: `extension type ET<T>(List<T> _)
+            // ` read at `ET<int>` erases to `List<int>`, never `List<T>`
+            // (`extensionTypeErasure` substitutes through the element's
+            // `instantiate`, type.dart). A bare use or a closed fold window
+            // keeps the written representation (the under-report direction).
+            let repr = match (current, fold_engine()) {
+                (NameTy::NamedArgs(_, _, use_args), Some(engine))
+                    if use_args != ArgListId::EMPTY
+                        && !container.type_param_names.is_empty() =>
+                {
+                    let projected = engine.boundary.ty(owner, repr);
+                    let use_args: Vec<Ty> =
+                        engine.boundary.pool().get(use_args).to_vec();
+                    Self::substitute_params(
+                        engine,
+                        projected,
+                        &container.type_param_names,
+                        &use_args,
+                        8,
+                    )
+                }
+                _ => repr,
+            };
             let folded = NameTy::from_semantic(repr);
             current = match folded {
                 // The representation's own nullability joins the use-site
@@ -1811,6 +2270,75 @@ impl<'a> NameWorld<'a> {
         current
     }
 
+    /// The use-site substitution of `substitute_params`: `ty` is the
+    /// representation's declared type, `params`/`use_args` the declaration's
+    /// type-parameter spellings paired with the use-site argument list —
+    /// `extension type ET<K, V>(Map<K, V> _)` read at `ET<int, bool>` maps
+    /// `Map<K, V>` to `Map<int, bool>`. A bare parameter leaf
+    /// (`Ty::Named` with an empty argument list) replaces positionally; a
+    /// nested argument list recurses so `List<T>` inside `Map<String,
+    /// List<T>>` substitutes too. The nullability the parameter leaf was
+    /// written with ORs onto its replacement (`T?` over `int` reads
+    /// `int?`). A parameter spelling without a use-site argument keeps the
+    /// written leaf — the arity-mismatch shape is no honest instantiation
+    /// and stays on the under-report side.
+    fn substitute_params(
+        engine: &Engine<'_>,
+        ty: Ty,
+        params: &[StringId],
+        use_args: &[Ty],
+        budget: u8,
+    ) -> Ty {
+        if budget == 0 {
+            return ty;
+        }
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        if args == ArgListId::EMPTY {
+            let Some(index) = params.iter().position(|param| *param == name) else {
+                return ty;
+            };
+            let Some(&replacement) = use_args.get(index) else {
+                return ty;
+            };
+            return if nullable {
+                match replacement {
+                    Ty::Named {
+                        name,
+                        nullable: _,
+                        args,
+                    } => Ty::Named {
+                        name,
+                        nullable: true,
+                        args,
+                    },
+                    other => other,
+                }
+            } else {
+                replacement
+            };
+        }
+        let inner: Vec<Ty> = engine.boundary.pool().get(args).to_vec();
+        let mapped: Vec<Ty> = inner
+            .iter()
+            .map(|&arg| Self::substitute_params(engine, arg, params, use_args, budget - 1))
+            .collect();
+        if mapped == inner {
+            return ty;
+        }
+        engine
+            .boundary
+            .args
+            .borrow_mut()
+            .named(name, nullable, &mapped)
+    }
+
     /// `isPotentiallyNullable` (`type_system.dart:1260`): everything except
     /// the non-nullable shapes. The cast-pattern close reads it for the
     /// `null` half of `createCastSpace` (shared.dart:731-735).
@@ -1822,12 +2350,14 @@ impl<'a> NameWorld<'a> {
                 | NameTy::TopNonNullable
                 | NameTy::EnumValue(..)
                 | NameTy::BoolValue(_)
+                | NameTy::ListPat { .. }
                 | NameTy::Never
         )
     }
 
     /// The declaration head a restricted shape answers through (the enum
-    /// arm's this-type; the boolean constants' `bool`).
+    /// arm's this-type; the boolean constants' `bool`; a list pattern's
+    /// `List`).
     fn head_name(&self, ty: &NameTy) -> Option<StringId> {
         match ty {
             NameTy::Named(name, _)
@@ -1835,6 +2365,7 @@ impl<'a> NameWorld<'a> {
             | NameTy::EnumValue(name, _)
             | NameTy::EnumValueOrNull(name, _) => Some(*name),
             NameTy::BoolValue(_) | NameTy::BoolOrNull(_) => Some(self.bool_id),
+            NameTy::ListPat { .. } => Some(self.list_head()),
             _ => None,
         }
     }
@@ -1974,6 +2505,116 @@ impl<'a> NameWorld<'a> {
     pub(crate) fn is_enum_name(&self, name: StringId) -> bool {
         self.container(name)
             .is_some_and(|c| c.kind == ContainerKind::Enum)
+    }
+
+    /// The interned `List` spelling. A local `class List` does not
+    /// shadow the pattern's required type — the list pattern's container
+    /// is dart:core's own (`typeProvider.listType`,
+    /// list_pattern_resolver.dart:40-45), and the name level reads the
+    /// spelling's edges as declared (a file-local `List` mirrors the
+    /// core face through its own clauses).
+    fn list_head(&self) -> StringId {
+        self.strings.intern("List")
+    }
+
+    /// `List<elem>` as the world sees it: `NamedArgs` inside a fold
+    /// window (the pool carries the single-argument list), the bare head
+    /// otherwise — the same under-report collapse `NamedArgs` itself
+    /// takes.
+    fn list_ty(&self, elem: Ty) -> NameTy {
+        match fold_engine() {
+            Some(engine) => {
+                let ty = engine.boundary.args.borrow_mut().named(
+                    self.list_head(),
+                    false,
+                    &[elem],
+                );
+                match ty {
+                    Ty::Named { name, args, .. } => NameTy::NamedArgs(name, false, args),
+                    _ => NameTy::Named(self.list_head(), false),
+                }
+            }
+            None => NameTy::Named(self.list_head(), false),
+        }
+    }
+
+    /// The element-type ask inside the list restriction
+    /// (`typeOperations.isSubtypeOf(elementType, other.elementType)`,
+    /// types/list.dart:282-284): the two `Ty`s convert through
+    /// [`NameTy::from_semantic`] and ask the lattice directly. An
+    /// unnameable element (`dynamic` → `TopNullable`) subtypes only the
+    /// same face, matching the official's `dynamic <: dynamic`.
+    fn elem_sub(&self, sub: Ty, sup: Ty) -> bool {
+        self.is_subtype_of(&NameTy::from_semantic(sub), &NameTy::from_semantic(sup))
+    }
+
+    /// The element type of a `List`-headed static type: the written
+    /// `List<E>` argument resolved through the boundary pool, else
+    /// `Object?` (upstream's `elementType ?? objectQuestionType` — the
+    /// bare-`List` face's element is `dynamic` upstream, but the
+    /// argument-less name carries no pool slot here, and `Object?` is
+    /// the widest honest face the name level spells).
+    fn list_elem_of(&self, ty: &NameTy) -> Ty {
+        if let NameTy::NamedArgs(_, _, args) = ty
+            && let Some(engine) = fold_engine()
+            && let Some(arg) = engine.boundary.pool().get(*args).first().copied()
+        {
+            return arg;
+        }
+        self.nullable_form_obj()
+    }
+
+    /// The `(list head, element type)` pair a list pattern's restriction
+    /// rides on — `None` when the scrutinee provably can never be a
+    /// `List` (a `Map`-headed or otherwise declared head with no `List`
+    /// edge either way — where a rest mark inside a `{...}` frame is a
+    /// MAP's rest, which this face must not mistake for the list split).
+    /// The element reads off the open switch's scrutinee (`List<E>`'s
+    /// written argument, else `Object?`).
+    fn list_pattern_elem(&self) -> Option<(StringId, Ty)> {
+        let scrutinee = fold_engine()
+            .and_then(|engine| engine.switch.switches.last())
+            .map(|ctx| ctx.scrutinee)?;
+        // The rest-marked frame only becomes the LIST split when the
+        // scrutinee can be one: a `Map`-headed scrutinee makes the mark
+        // a map rest (`{...}`), and a provably non-list head makes
+        // either spelling a never-match — the unknown space answers both
+        // (under-report, never a false coverage claim).
+        let list = self.list_head();
+        let can_be_list = match scrutinee {
+            Ty::Named { name, .. } => {
+                name == list
+                    || self.named_sub(name, list)
+                    || self.named_sub(list, name)
+                    || !self.is_known_head(name)
+            }
+            // `dynamic`/unknown/record-or-function sentinels: a list is
+            // always possible (under-report for the map-rest twin).
+            _ => true,
+        };
+        if !can_be_list {
+            return None;
+        }
+        let elem = match scrutinee {
+            Ty::Named { name, args, .. } if name == list => fold_engine()
+                .and_then(|engine| engine.boundary.pool().get(args).first().copied())
+                .unwrap_or_else(|| self.nullable_form_obj()),
+            _ => self.nullable_form_obj(),
+        };
+        Some((list, elem))
+    }
+
+    /// `Object?` as a `Ty` — the element-type fallback
+    /// (`objectQuestionType`, list_pattern_resolver.dart:40-45).
+    fn nullable_form_obj(&self) -> Ty {
+        let Ty::Named { name, args, .. } = Ty::named(self.object_id) else {
+            unreachable!()
+        };
+        Ty::Named {
+            name,
+            nullable: true,
+            args,
+        }
     }
 
     /// Whether `name` declares an interface type in this unit: a class
@@ -2142,6 +2783,34 @@ impl<'a> NameWorld<'a> {
             NameTy::BoolValue(value) => value.to_string(),
             NameTy::BoolOrNull(value) => format!("{value}?"),
             NameTy::Unknown(_) => "?".to_string(),
+            // `ListTypeRestriction.toString` (types/list.dart:295-312): the
+            // element type's argument text then `()`-per-slot and `...`
+            // for the rest — the space-text shape `<[(), (), ...]>`.
+            NameTy::ListPat {
+                elem,
+                size,
+                has_rest,
+            } => {
+                let args = match elem {
+                    Ty::Named { args, .. } if *args != ArgListId::EMPTY => {
+                        self.args_text(*args).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                let mut text = format!("{args}[");
+                let mut comma = "";
+                for _ in 0..*size {
+                    text.push_str(comma);
+                    text.push_str("()");
+                    comma = ", ";
+                }
+                if *has_rest {
+                    text.push_str(comma);
+                    text.push_str("...");
+                }
+                text.push(']');
+                text
+            }
         }
     }
 
@@ -2229,10 +2898,85 @@ impl<'a> NameWorld<'a> {
                     nullable: sup_nullable,
                     args: sup_args,
                 };
-                engine.slot_subtype(sub, sup) == Some(true)
+                match engine.slot_subtype(sub, sup) {
+                    Some(verdict) => verdict,
+                    // The semantic face declined (an undeclared head cut the
+                    // walk). A same-head pair still decides argument-wise:
+                    // `E<String> <: E<num>` walks the single covariant
+                    // argument ask `String <: num` — a proven miss the
+                    // element-level `isSubtypeOf` also answers `false` for,
+                    // so the constant `E.b` never populates `E<num>`'s set
+                    // (enum.dart:111-150).
+                    None if sub_name == sup_name => {
+                        self.args_decide_fallback(engine, sub_args, sup_args)
+                    }
+                    // A different-head pair the semantic face could not
+                    // relate keeps the unproven answer `false`: an is-check
+                    // fold must never read a constant `true` off two
+                    // distinct declarations (`async.B<int>` against
+                    // `await.B` — different import prefixes, different
+                    // classes).
+                    None => false,
+                }
             }
             None => true,
         }
+    }
+
+    /// The same-head argument fallback of [`Self::args_subtype`]:
+    /// `slot_subtype` declined a pair whose heads match, so the interface
+    /// rule's pairwise argument ask decides the pair directly. Every
+    /// argument must prove `sub_arg <: sup_arg` through the name-level
+    /// closed walk; one proven `false` (`String <: num`) declines the
+    /// whole pair, an undecided leaf keeps the conservative `true`.
+    fn args_decide_fallback(
+        &self,
+        engine: &Engine<'_>,
+        sub_args: ArgListId,
+        sup_args: ArgListId,
+    ) -> bool {
+        let sub_list = engine.boundary.pool().get(sub_args).to_vec();
+        let sup_list = engine.boundary.pool().get(sup_args).to_vec();
+        if sub_list.len() != sup_list.len() || sub_list.is_empty() {
+            return true;
+        }
+        for (sub_arg, sup_arg) in sub_list.iter().zip(sup_list.iter()) {
+            let (
+                Ty::Named {
+                    name: sub_name, ..
+                },
+                Ty::Named {
+                    name: sup_name, ..
+                },
+            ) = (sub_arg, sup_arg)
+            else {
+                return true;
+            };
+            match self.decide_subtype(*sub_name, *sup_name) {
+                Some(false) => return false,
+                Some(true) => {}
+                // `Object` is the root interface: its only supertypes are
+                // the tops, so `Object <: S` fails for every other head
+                // (`List<Object>` is no `List<int>`) — the walk cuts at the
+                // declaration-less `Object` but the answer is closed.
+                None if *sub_name == self.object_id => return false,
+                // Two distinct dart:core primitives the closed walk cannot
+                // reach (no container, no written clause — `String` and
+                // `num` carry no `core_supertypes` row) are still a proven
+                // miss: every primitive is `final`/`sealed` in dart:core,
+                // so `String <: num` decides `false` where the walk's
+                // `cut` answers `None`. The primitive faces the model
+                // already trusts ([`Self::primitive_ids`]) decide it.
+                None
+                    if self.primitive_ids.contains(sub_name)
+                        && self.primitive_ids.contains(sup_name) =>
+                {
+                    return false;
+                }
+                None => return true,
+            }
+        }
+        true
     }
 
     /// The closed-walk subtype verdict over the same lattice
@@ -2456,7 +3200,35 @@ impl<'a> NameWorld<'a> {
         let Some(over) = Self::overapproximate(engine, scrutinee) else {
             return true;
         };
-        engine.slot_subtype(declared, over).unwrap_or(true)
+        match engine.slot_subtype(declared, over) {
+            Some(verdict) => verdict,
+            // `slot_subtype` declined — an undeclared head cut the walk. A
+            // same-head pair (`E<String>` against `E<num>`) still decides
+            // argument-wise: `String <: num` is a proven miss, so `E.b`
+            // never populates `E<num>`'s set (enum.dart:111-150).
+            None => {
+                let (
+                    Ty::Named {
+                        name: declared_head,
+                        args: declared_args,
+                        ..
+                    },
+                    Ty::Named {
+                        name: over_head,
+                        args: over_args,
+                        ..
+                    },
+                ) = (declared, over)
+                else {
+                    return true;
+                };
+                if declared_head == over_head {
+                    self.args_decide_fallback(engine, declared_args, over_args)
+                } else {
+                    true
+                }
+            }
+        }
     }
 
     /// The scrutinee's overapproximation as a semantic `Ty`
@@ -2575,7 +3347,7 @@ impl<'a> NameWorld<'a> {
                 if !self.is_sealed(&ty) {
                     return false;
                 }
-                let subtypes = self.subtypes(&ty);
+                let subtypes = self.subtypes(&ty, &rustc_hash::FxHashSet::default());
                 !subtypes.is_empty()
                     && subtypes
                         .iter()

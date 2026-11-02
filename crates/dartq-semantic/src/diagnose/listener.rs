@@ -27,6 +27,13 @@ pub(crate) struct PatternNodeState {
     /// One bucket per `handle_pattern_field` boundary, index-aligned with the
     /// frame's drained `ObjectField`s (both append once per boundary).
     pub(crate) fields: Vec<Vec<(SourceRange, Ty)>>,
+    /// A map pattern's evaluated entry keys, in source order: the captured
+    /// key expression plus the key's own span. `visitMapPattern` keeps the
+    /// same list in its `uniqueKeys` table and reports
+    /// `equal_keys_in_map_pattern` at the LATER key whose value equals an
+    /// earlier one (`constant_verifier.dart:313-355`), so the frame
+    /// accumulates per entry and the map's close drains.
+    pub(crate) map_keys: Vec<(crate::const_eval::Node, SourceRange)>,
 }
 
 impl PatternNodeState {
@@ -35,6 +42,7 @@ impl PatternNodeState {
             pending_record_open: None,
             pending: Vec::new(),
             fields: Vec::new(),
+            map_keys: Vec::new(),
         }
     }
 }
@@ -164,6 +172,58 @@ fn local_fn_tear_off_sig(engine: &Engine<'_>, name: StringId) -> Option<super::t
 /// `UnsafeSingle` verdict. The row anchors at the operator token, its
 /// length the lexeme's own width.
 impl DiagnoseListener<'_> {
+
+    /// The WRITTEN extent of the map-pattern key that ends at `colon`: the
+    /// first token after the entry's opening `{`/`,` through the token
+    /// before the `:`. The oracle anchors both the key rows
+    /// (`non_constant_map_pattern_key`'s `_evaluateAndReportError` entity
+    /// and `equal_keys_in_map_pattern`'s `.at(duplicateEntry.key)`) at the
+    /// KEY NODE, whose span is the expression's own — a literal, a
+    /// creation, a record, a member access. The capture root cannot supply
+    /// it: a record literal's value node anchors at its closer, and the
+    /// recovery shapes carry no span at all.
+    fn map_pattern_key_span(&self, colon: Token) -> SourceRange {
+        let toks = self.engine.tokens.as_slice();
+        let end = self.engine.token_at_offset(colon.range.offset);
+        let mut start = end;
+        let mut depth = 0i32;
+        while start > 0 {
+            let kind = toks[start - 1].kind;
+            match kind {
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else if kind == dartq_scanner::TokenKind::OpenCurly {
+                        // The entry's own brace: the key starts after it.
+                        break;
+                    }
+                }
+                dartq_scanner::TokenKind::Comma | dartq_scanner::TokenKind::Colon
+                    if depth == 0 =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            start -= 1;
+        }
+        let (Some(first), Some(last)) = (toks.get(start), end.checked_sub(1).and_then(|i| toks.get(i)))
+        else {
+            return colon.range;
+        };
+        if start >= end {
+            return colon.range;
+        }
+        SourceRange {
+            offset: first.utf16_offset,
+            length: (last.utf16_offset + last.byte_len as u32).saturating_sub(first.utf16_offset),
+        }
+    }
     /// Parks a never-match candidate whose matched type is the enclosing
     /// container's column (the `Some` face of
     /// [`Engine::check_pattern_never_matches`]) on the CONTAINER frame: the
@@ -2316,6 +2376,20 @@ impl ParserListener for DiagnoseListener<'_> {
             self.engine
                 .local_init_rows
                 .insert(name_tok.offset, (row_range.offset, true));
+        }
+
+        // The irrefutable walk over a pattern head (#3640): the head's
+        // declared binders went through the pattern-variable path (never
+        // `for_in_loop_var`), so the element-type derivation asks
+        // `for_in_element_staging` directly — the same `Iterable` face the
+        // identifier-head staging reads. `for_in_marks` still holds the
+        // iterable's row mark (the pop below).
+        if let Some(kw) = pattern_keyword
+            && let Some(&mark) = self.engine.for_in_marks.last()
+            && let Some((sem_ty, _)) =
+                self.engine.for_in_element_staging(mark, await_kw.is_some())
+        {
+            self.engine.irrefutable_walk_for_in_head(kw, in_kw, sem_ty);
         }
 
         // The element-value `void` face (`_checkForEachParts`'s
@@ -6705,6 +6779,17 @@ impl ParserListener for DiagnoseListener<'_> {
                         engine.emit(SemanticCode::ConstEvalMethodInvocation, closed.span, "", "");
                         engine.const_capture.opaque_leaf(closed.span);
                     }
+                    CallClass::ValueCall => {
+                        // The resolver rewrote this call to a
+                        // `FunctionExpressionInvocation` (see
+                        // [`CallClass::ValueCall`]): `ConstantVisitor` has no
+                        // visitor for it, so `visitNode`'s `genericError`
+                        // returns `invalidConstant` — NOT on `_reportError`'s
+                        // allow list, so the enclosing site's default code
+                        // reports at the invocation. `const_eval_method_invocation`
+                        // never fires for this shape.
+                        engine.const_capture.push_non_constant(closed.span);
+                    }
                     CallClass::Unknown => {
                         // The implicit const creation face: a class
                         // container's plain send inside a const-declaration
@@ -7536,6 +7621,7 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.pattern_bind_vars.clear();
             engine.pattern_bind_records = 0;
             engine.pattern_bind_dirty = false;
+            engine.switch.root_begin = token.range.offset;
         }
         // A pattern opening while a condition window is armed marks an
         // if-case: the checkpoint's plain-condition face is routed away
@@ -7877,6 +7963,56 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {
         self.flow().handle_map_pattern(count, left, right);
+        // `visitMapPattern`'s duplicate-key walk (constant_verifier.dart
+        // :325-355) drains here: every entry key that folded to a value was
+        // collected in source order, and a key equal to an EARLIER one
+        // reports `equal_keys_in_map_pattern` at the later key, with the
+        // first key as the "first key with this value" context message.
+        // Equality is the oracle's `uniqueKeys` comparator: `identical` for
+        // keys without primitive equality (records of non-primitive-equality
+        // fields, const instances with a user `==`), `==` for the
+        // primitive-equality states (`int`/`double`/`String`/`bool`/`null`/
+        // `Type`/`Symbol`, and records whose fields all have it).
+        let keys = self
+            .pattern_rows
+            .last_mut()
+            .map_or_else(Vec::new, |state| std::mem::take(&mut state.map_keys));
+        let mut first_of: Vec<(crate::const_eval::ConstantValue, SourceRange)> = Vec::new();
+        let mut duplicates: Vec<(SourceRange, SourceRange)> = Vec::new();
+        for (node, at) in &keys {
+            let crate::const_eval::Verdict::Value(value) = eval(node, &self.engine) else {
+                continue;
+            };
+            // A value this subset only knows as an opaque instance carries
+            // no decidable identity (the under-report direction): two
+            // distinct const creations fold to the same sentinel, and the
+            // oracle's `identical` over them is unknowable here.
+            if matches!(value, crate::const_eval::ConstantValue::Instance(_)) {
+                continue;
+            }
+            let existing = first_of.iter().find(|(prior, _)| {
+                crate::const_eval::map_pattern_keys_equal(prior, &value, &|v| {
+                    self.engine.legacy_primitive_equality(v)
+                })
+            });
+            match existing {
+                Some((_, prior_span)) => duplicates.push((*at, *prior_span)),
+                None => first_of.push((value, *at)),
+            }
+        }
+        for (at, prior) in duplicates {
+            self.engine.emit_with_context(
+                SemanticCode::EqualKeysInMapPattern,
+                at,
+                "",
+                "",
+                vec![ContextMessage {
+                    message: SharedStr::from("The first key with this value."),
+                    file: self.engine.file,
+                    range: prior,
+                }],
+            );
+        }
         // Same latch death as the list arm: a map's entry values never name
         // an enclosing positional field's getter.
         self.engine.last_pattern_variable = None;
@@ -7892,6 +8028,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.const_capture.open_map_pattern_key();
     }
 
+
     fn handle_map_pattern_entry(&mut self, colon: Token, _end: Token) {
         // Close the key's window and evaluate it: a non-constant key reports
         // `non_constant_map_pattern_key` at the key's own span. Unlike the
@@ -7899,15 +8036,48 @@ impl ParserListener for DiagnoseListener<'_> {
         // oracle reports the row even beside a resolution miss (`{id: n}` on
         // an undefined `id` carries both `undefined_identifier` and
         // `non_constant_map_pattern_key`), so no suppression probe here.
+        //
+        // A key that DOES fold to a value also joins the frame's key list:
+        // `visitMapPattern`'s `uniqueKeys` table collects every
+        // `DartObjectImpl` key and the map's close reports the later entry
+        // of an equal pair (`constant_verifier.dart:325-355`).
         if let Some(node) = self.engine.const_capture.close_map_pattern_key() {
-            match eval(&node, &self.engine) {
-                Verdict::Value(_) | Verdict::Constant => {}
+            // A key that reaches its value through a deferred import's
+            // prefix fails const-eval before value production
+            // (`evaluation.dart`'s `_getDeferredLibraryError`, whose
+            // `SwitchPatternCase` arm answers `patternConstantFromDeferred
+            // Library` at the referenced name): the deferred row preempts
+            // the site default, and the key joins no duplicate table.
+            if let Some(span) = self.engine.pattern_deferred_span(&node) {
+                self.engine.emit(
+                    SemanticCode::PatternConstantFromDeferredLibrary,
+                    span,
+                    "",
+                    "",
+                );
+                return;
+            }
+            let value = match eval(&node, &self.engine) {
+                Verdict::Value(value) => Some(value),
+                Verdict::Constant => None,
                 Verdict::NotConstant(span)
                 | Verdict::Unresolved(span)
                 | Verdict::Fault(_, span) => {
                     let span = if span.length > 0 { span } else { colon.range };
                     self.engine
                         .emit_corrected(SemanticCode::NonConstantMapPatternKey, span, "");
+                    None
+                }
+            };
+            // The key expression's WRITTEN span: the capture root's own
+            // span is unreliable for the literal shapes (a record literal's
+            // value node anchors at its closer), so the key extent is read
+            // from the token stream — the token after the entry's opening
+            // `{`/`,` through the token before the `:`.
+            if let Some(value) = value {
+                let at = self.map_pattern_key_span(colon);
+                if let Some(state) = self.pattern_rows.last_mut() {
+                    state.map_keys.push((node, at));
                 }
             }
         }
@@ -7954,7 +8124,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_constant_pattern(const_keyword);
 
         let engine = &mut self.engine;
-        let leaf = engine
+        let mut leaf = engine
             .switch
             .pending_const
             .take()
@@ -7998,6 +8168,26 @@ impl ParserListener for DiagnoseListener<'_> {
             span.offset = kw.range.offset;
         }
         engine.check_constant_pattern(constant, at);
+        // The deferred-library preemption (`evaluation.dart`'s
+        // `_getDeferredLibraryError`, the `SwitchPatternCase` arm): a
+        // constant expression reaching its value through a `deferred`
+        // import's prefix fails const-eval BEFORE value production, so the
+        // row preempts every verdict the subset folds (value, opaque,
+        // generic non-constant, and a same-node fault alike) and anchors at
+        // the referenced name. The oracle's early-return also skips the
+        // constant-pattern value bookkeeping, so nothing else fires here.
+        if let Some(node) = &capture
+            && let Some(span) = engine.pattern_deferred_span(node)
+        {
+            engine.emit(
+                SemanticCode::PatternConstantFromDeferredLibrary,
+                span,
+                "",
+                "",
+            );
+            engine.pattern_leaf(leaf);
+            return;
+        }
         // `visitConstantPattern`'s `_evaluateAndReportError`: the
         // expression's own verdict — a fault overrides the site default,
         // a generic miss reports `constant_pattern_with_non_constant_expression`
@@ -8005,7 +8195,25 @@ impl ParserListener for DiagnoseListener<'_> {
         // — a window that never opened, e.g. a recovery path) stay silent;
         // the oracle's `InvalidType` early-return maps to the same silence.
         if let Some(node) = capture {
-            match eval(&node, engine) {
+            let verdict = eval(&node, engine);
+            // The coverage leaf folds a bare `const` variable to its
+            // value's static type — `const c = true` is `BoolValue(true)`
+            // (upstream `PatternConverter._convertConstantValue`'s
+            // `getBoolValueStaticType`/`getEnumElementStaticType` arms,
+            // analyzer exhaustiveness.dart:744-788), which
+            // `classify_constant_tail`'s member-row shape never reaches.
+            if leaf == Restriction::Unknown
+                && let Verdict::Value(value) = &verdict
+            {
+                leaf = match value {
+                    ConstantValue::Bool(value) => Restriction::BoolValue(*value),
+                    ConstantValue::Enum { container, name } => {
+                        Restriction::EnumValue(*container, *name)
+                    }
+                    _ => leaf,
+                };
+            }
+            match verdict {
                 // An unresolved reference is the oracle's `InvalidType`
                 // early-return (constant_verifier.dart:134-136): the
                 // resolution row (`undefined_prefixed_name`, ...) answers.
@@ -9360,47 +9568,34 @@ impl ParserListener for DiagnoseListener<'_> {
         // body expression was the literal, never the bare shape).
         engine.nsm_poison();
         if let Some(elements) = engine.const_capture.literal_list(count, left.range) {
-            let for_elements = engine.const_capture.take_pending_for_elements();
-            if !for_elements.is_empty() {
-                // A constant collection rejects `for` elements outright
-                // (upstream `_buildListConstant`'s `case ForElement()` →
-                // `InvalidConstant.forEntity`): the oracle reports
-                // `const_eval_for_element` at the whole element and the site
-                // default at the enclosing literal, never the element's own
-                // body expression.
-                let literal_span = SourceRange {
+            // A `for` element already folded into the parts as an
+            // `Expr::Faulted` leaf (the literal close staged it) — the
+            // element check emits `const_eval_for_element` at its span and
+            // the literal's own verdict carries the fault, so no separate
+            // face runs here. Drain the bookkeeping the close left behind.
+            let _ = engine.const_capture.take_pending_for_elements();
+            // Implicit const literals in a const context check per element
+            // with the element code too (the oracle evaluates the literal
+            // at the enclosing site).
+            let failed =
+                engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
+            // The const spread-shape face: a `...expr` operand that
+            // evaluates to a non-list/set value reports
+            // `const_spread_expected_list_or_set`.
+            engine.check_const_spread_shapes(left, right, &elements, false);
+            let payload = engine
+                .literal_payload(&elements)
+                .map(|values| ConstantValue::List(values.into()));
+            engine.push_literal_value(
+                failed,
+                right.range,
+                SourceRange {
                     offset: left.range.offset,
                     length: right.range.end() - left.range.offset,
-                };
-                for span in for_elements {
-                    engine.emit(SemanticCode::ConstEvalForElement, span, "", "");
-                }
-                engine.push_literal_value(
-                    Some(literal_span),
-                    right.range,
-                    crate::const_eval::InstanceKind::List,
-                    None,
-                );
-            } else {
-                // Implicit const literals in a const context check per element
-                // with the element code too (the oracle evaluates the literal
-                // at the enclosing site).
-                let failed =
-                    engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
-                // The const spread-shape face: a `...expr` operand that
-                // evaluates to a non-list/set value reports
-                // `const_spread_expected_list_or_set`.
-                engine.check_const_spread_shapes(left, right, &elements, false);
-                let payload = engine
-                    .literal_payload(&elements)
-                    .map(|values| ConstantValue::List(values.into()));
-                engine.push_literal_value(
-                    failed,
-                    right.range,
-                    crate::const_eval::InstanceKind::List,
-                    payload,
-                );
-            }
+                },
+                crate::const_eval::InstanceKind::List,
+                payload,
+            );
         }
         // The void-operand use (upstream `literal_element_verifier.dart`
         // :95 — `checkElement` → `checkForUseOfVoidResult(element)`): a
@@ -9578,75 +9773,90 @@ impl ParserListener for DiagnoseListener<'_> {
                 None => engine.leaves_resolve_kind(left, right),
             },
         };
-        if let Some((shape, has_ctl)) =
-            engine
-                .const_capture
-                .close_non_const_dup(count, left.range, has_set_entry)
-        {
+        let resolved_is_map = matches!(resolved_kind, Some(SpreadLiteralKind::Map));
+        if let Some((shape, has_ctl)) = engine.const_capture.close_non_const_dup(
+            count,
+            left.range,
+            has_set_entry,
+            resolved_is_map,
+        ) {
             // The `_checkForDuplications` face (WARNING tier).
             engine.check_equal_duplicates(shape, has_ctl);
-        } else if let Some(shape) =
-            engine
-                .const_capture
-                .literal_set_or_map(count, left.range, has_set_entry)
-        {
-            let for_elements = engine.const_capture.take_pending_for_elements();
-            if !for_elements.is_empty() {
-                // A constant collection rejects `for` elements outright
-                // (upstream `_buildMapConstant` / `_buildSetConstant`'s
-                // `case ForElement()` → `InvalidConstant.forEntity`): the
-                // oracle reports `const_eval_for_element` at the whole element
-                // and the site default at the enclosing literal.
-                let literal_span = SourceRange {
-                    offset: left.range.offset,
-                    length: right.range.end() - left.range.offset,
-                };
-                let kind = match &shape {
-                    SetOrMap::Map(_) => InstanceKind::Map,
-                    SetOrMap::Set(_) => InstanceKind::Set,
-                };
-                for span in for_elements {
-                    engine.emit(SemanticCode::ConstEvalForElement, span, "", "");
-                }
-                engine.push_literal_value(Some(literal_span), right.range, kind, None);
-            } else {
-                match shape {
-                    SetOrMap::Map(entries) => {
+        } else if let Some(shape) = engine.const_capture.literal_set_or_map(
+            count,
+            left.range,
+            has_set_entry,
+            resolved_is_map,
+        ) {
+            // A `for` element already folded into the parts as an
+            // `Expr::Faulted` leaf (the literal close staged it) — the
+            // element check emits `const_eval_for_element` at its span and
+            // the literal's own verdict carries the fault, so no separate
+            // face runs here. Drain the bookkeeping the close left behind.
+            let _ = engine.const_capture.take_pending_for_elements();
+            match shape {
+                SetOrMap::Map(parts) => {
                         // The oracle names the failing side
                         // (`_validateMapLiteralEntry`): `non_constant_map_key` /
-                        // `non_constant_map_value` at each entry's key and value.
+                        // `non_constant_map_value` at each entry's key and
+                        // value. The ordered parts interleave `Expr::Entry`
+                        // pseudo-operands with control elements — an entry
+                        // checks each side's face, a control element checks
+                        // the map-element code (`expression_in_map` for a
+                        // bare leaf, `const_eval_for_element` for a `for`,
+                        // the `if`/spread verifier arms).
                         let mut failed = None;
-                        for (key, value) in &entries {
-                            for (code, part) in [
-                                (SemanticCode::NonConstantMapKey, key),
-                                (SemanticCode::NonConstantMapValue, value),
-                            ] {
-                                let at =
-                                    engine.check_const_elements(code, std::slice::from_ref(part));
-                                failed = failed.or(at);
+                        for part in &parts {
+                            match &part.expr {
+                                crate::const_eval::Expr::Entry(key, value) => {
+                                    for (code, side) in [
+                                        (SemanticCode::NonConstantMapKey, key.as_ref()),
+                                        (SemanticCode::NonConstantMapValue, value.as_ref()),
+                                    ] {
+                                        if let Some(at) = engine.check_const_elements(
+                                            code,
+                                            std::slice::from_ref(side),
+                                        ) {
+                                            failed.get_or_insert(at);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if let Some(at) = engine.check_const_elements(
+                                        SemanticCode::NonConstantMapElement,
+                                        std::slice::from_ref(part),
+                                    ) {
+                                        failed.get_or_insert(at);
+                                    }
+                                }
                             }
                         }
                         // The const spread-shape face: a `...expr`
                         // operand that evaluates to a non-map value
-                        // reports `const_spread_expected_map`. The staged
-                        // entries carry no non-Entry operand (the
-                        // map-resolved split dropped them), so the
-                        // row-level fallback answers the shape ask. The
-                        // literal's RESOLVED kind decides the expected
-                        // shape — the parser's `hasSetEntry` flag missed
-                        // spread-decided literals (`const {...list}` is a
-                        // set upstream), and an ambiguous literal's
-                        // verifier never runs.
+                        // reports `const_spread_expected_map`. The literal's
+                        // RESOLVED kind decides the expected shape — the
+                        // parser's `hasSetEntry` flag missed spread-decided
+                        // literals (`const {...list}` is a set upstream),
+                        // and an ambiguous literal's verifier never runs.
                         if let Some(kind) = resolved_kind {
                             engine.check_const_spread_shapes(
                                 left,
                                 right,
-                                &[],
+                                &parts,
                                 kind == SpreadLiteralKind::Map,
                             );
                         }
-                        let payload = engine.map_payload(&entries);
-                        engine.push_literal_value(failed, right.range, InstanceKind::Map, payload);
+                        let payload = engine.map_payload(&parts);
+                        engine.push_literal_value(
+                            failed,
+                            right.range,
+                            SourceRange {
+                                offset: left.range.offset,
+                                length: right.range.end() - left.range.offset,
+                            },
+                            InstanceKind::Map,
+                            payload,
+                        );
                     }
                     SetOrMap::Set(elements) => {
                         // The literal's own resolution decides the element
@@ -9691,10 +9901,18 @@ impl ParserListener for DiagnoseListener<'_> {
                         let payload = engine
                             .literal_payload(&elements)
                             .map(|values| ConstantValue::Set(values.into()));
-                        engine.push_literal_value(failed, right.range, InstanceKind::Set, payload);
+                        engine.push_literal_value(
+                            failed,
+                            right.range,
+                            SourceRange {
+                                offset: left.range.offset,
+                                length: right.range.end() - left.range.offset,
+                            },
+                            InstanceKind::Set,
+                            payload,
+                        );
                     }
                 }
-            }
         }
         // A typed literal (`<int>{}` → `Set<int>`, `<K, V>{}` → `Map<K, V>`)
         // carries its written static type: the same face the typed list
@@ -10109,6 +10327,7 @@ impl ParserListener for DiagnoseListener<'_> {
             let payload = engine.record_payload(&fields, &names);
             engine.push_literal_value(
                 failed,
+                token.range,
                 token.range,
                 crate::const_eval::InstanceKind::Record,
                 payload,
@@ -10608,7 +10827,13 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         engine.ur_seal_used();
-        engine.const_capture.throw_expression(throw.range);
+        // The oracle anchors the throw's `InvalidConstant` at the whole
+        // `throw expr` node, not the keyword — the leaf spans the `throw`
+        // keyword through the operand's end.
+        engine.const_capture.throw_expression(SourceRange {
+            offset: throw.range.offset,
+            length: end.range.end() - throw.range.offset,
+        });
         // The throw's static type is `Never` (the resolver records
         // `NeverTypeImpl`, `resolver_visitor.dart` `visitThrowExpression`):
         // the operand's row is the stack top and carries the throw's value
@@ -10976,6 +11201,8 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.const_capture.close_ctl_element(
             crate::const_eval::CtlElementKind::For,
             end,
+            false,
+            false,
         );
         if engine.in_for_parts.last() == Some(&2) {
             engine.in_for_parts.pop();
@@ -10997,6 +11224,8 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.const_capture.close_ctl_element(
             crate::const_eval::CtlElementKind::For,
             end,
+            false,
+            false,
         );
         if engine.in_for_parts.last() == Some(&2) {
             engine.in_for_parts.pop();
@@ -11260,6 +11489,46 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.formal_written.take(),
             )
         };
+        // A `this.`/`super.` formal's name event arrives under the
+        // `FieldInitializer` context — `formal_written` never latches for
+        // it, while the armed annotation still stands until the
+        // `bind_parameter_type` below consumes it. The default-value check
+        // reads the same written face (`{int super.a}` gates `int`
+        // non-nullable, error_verifier.dart's `parameterElement.type`).
+        let written = written.or_else(|| {
+            (this_keyword.is_some() || super_keyword.is_some())
+                .then(|| self.engine.armed_ty)
+                .flatten()
+        });
+        // The unannotated receiver formal's merged type is the bound
+        // field's own (`ET.c({this.id})` reads the representation `id`'s
+        // `int` — the upstream initializing formal's element type), which
+        // the `in_ctor` bind below resolves through `member_declared_ty`.
+        // A `super.` formal reads the super-constructor's same-named
+        // parameter type — whose `this.` shape the superclass's field face
+        // approximates (`S({this.s2})` types `s2` at the field's `int`).
+        let written = written.or_else(|| {
+            if this_keyword.is_none() && super_keyword.is_none() {
+                return None;
+            }
+            let name_id = self.engine.name_of(name)?;
+            let (container, _) = self.engine.container_context()?;
+            let owner = if this_keyword.is_some() {
+                container
+            } else {
+                resolve_container(
+                    self.engine.graph,
+                    self.engine.namespaces,
+                    self.engine.index,
+                    self.engine.lib,
+                    self.engine.file,
+                    container,
+                )
+                .and_then(|(decl, _)| decl.superclass)?
+            };
+            let ty = self.engine.member_declared_ty(owner, name_id);
+            (ty != Ty::UNKNOWN).then_some(ty)
+        });
         let optional = matches!(
             kind,
             FormalParameterKind::OptionalNamed | FormalParameterKind::OptionalPositional
@@ -11681,6 +11950,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // when `else` is absent — literal_entry_info_impl.dart
         // `IfComplete.parse`): a still-open case scope closes, the
         // `IfElement` arm of `end_if_statement`.
+        let end = element_end_before(&self.engine, token);
+        self.engine.const_capture.close_ctl_element(
+            crate::const_eval::CtlElementKind::If,
+            end,
+            false,
+            false,
+        );
         self.engine.if_statement_end();
     }
 
@@ -11689,6 +11965,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // The else element completes: the case scope already emptied at
         // `handle_else_control_flow`; this pops the cleared entry — the
         // `IfElement` arm of `end_if_statement`.
+        let end = element_end_before(&self.engine, token);
+        self.engine.const_capture.close_ctl_element(
+            crate::const_eval::CtlElementKind::If,
+            end,
+            true,
+            false,
+        );
         self.engine.if_statement_end();
     }
 
@@ -12182,6 +12465,8 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         engine.ur_seal_used();
+        // The irrefutable walk over the assignment's left side (#3640).
+        engine.irrefutable_walk_pattern_assignment(equals);
     }
 
     fn handle_pattern_variable_declaration_statement(
@@ -12340,6 +12625,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
             }
         }
+        // The element's operands are staged — fold them into one
+        // `Expr::Spread` node (`...`/`...?` differ only by the marker).
+        self.engine.const_capture.close_ctl_element(
+            crate::const_eval::CtlElementKind::Spread,
+            0,
+            false,
+            operator.range.length == 4,
+        );
     }
 
     fn handle_switch_case_no_when_clause(&mut self, token: Token) {
@@ -12385,6 +12678,40 @@ impl ParserListener for DiagnoseListener<'_> {
         // (literals.rs `handleThenControlFlow`), so the operand is the
         // last value row — the unchecked-use face (#1351).
         self.engine.check_condition_operand();
+    }
+
+    /// The rest element's close (`...`/`...p` inside a list or map
+    /// pattern): marks the innermost open frame so
+    /// [`crate::switch_tracker::SwitchTracker::collapse`] can rebuild the
+    /// head/rest/tail split the official `createListSpace` produces
+    /// (shared.dart:878-905). `has_sub_pattern` distinguishes `...p` (the
+    /// leaf before the mark is the rest's own sub-pattern) from a bare
+    /// `...` (the mark simply bounds head/tail). A rest mark inside a MAP
+    /// pattern's frame collapses to `Unknown` the same way — the map face
+    /// is unmodeled, so the mark only records the split, never claims
+    /// coverage the world cannot see.
+    fn handle_rest_pattern(&mut self, dots: Token, has_sub_pattern: bool) {
+        // The structural rest faces (#3629): the enclosing bracket decides
+        // — every rest inside a map pattern reports
+        // `rest_element_in_map_pattern`, a second rest in one list pattern
+        // reports `duplicate_rest_element_in_pattern` (the innermost
+        // unclosed group is the suffix's own `[`/`{`).
+        super::pattern_faces::rest_pattern_faces(self, dots, has_sub_pattern);
+        self.engine.pattern_leaf(Restriction::RestMark {
+            had_sub: has_sub_pattern,
+        });
+    }
+
+    /// The object pattern's field-group close (`parseObjectPatternRest`'s
+    /// trailing event, fired before [`Self::handle_object_pattern`]): the
+    /// #3629 field faces — `missing_named_pattern_field_name` (a nameless
+    /// `: pattern` field whose sub-pattern binds no variable),
+    /// `positional_field_in_object_pattern` and `duplicate_pattern_field`.
+    /// The fields are already drained into this pattern's own bracket
+    /// frame; the per-field spans re-derive from the token table
+    /// (resolver.dart:494-508, shared_type_analyzer.dart:78-91).
+    fn handle_object_pattern_fields(&mut self, count: usize, begin: Token, end: Token) {
+        super::pattern_faces::object_pattern_field_faces(self, count, begin, end);
     }
 }
 
@@ -13375,6 +13702,26 @@ impl Engine<'_> {
                 Some(ty)
                     if ty == Ty::UNKNOWN || ty == Ty::Dynamic || self.is_never_ty(ty) =>
                 {
+                    // An untyped CONSTANT read still carries its evaluated
+                    // value, and a constant's value kind is its static
+                    // type's side: `const m = {1: 2}` (an untyped literal
+                    // initializer the inferred-variable overlay never binds)
+                    // spread into `const Set<int> y = {...m}` is a
+                    // must-be-map leaf, so the literal resolves a MAP
+                    // upstream before the `Set` context's fallback.
+                    if ty == Ty::UNKNOWN
+                        && let Some(name) = leading_ident_name(self, after, end)
+                        && trim_ws(bytes, after + self.strings.resolve(name).len(), end) == end
+                        && let IdentVerdict::Value(value) = self.ident(name)
+                    {
+                        match value {
+                            ConstantValue::Map(_) => return LeafSide::Map,
+                            ConstantValue::List(_) | ConstantValue::Set(_) => {
+                                return LeafSide::Set;
+                            }
+                            _ => {}
+                        }
+                    }
                     return LeafSide::Either;
                 }
                 Some(ty) => {
@@ -13967,7 +14314,18 @@ impl Engine<'_> {
                 continue;
             }
             let s16 = self.utf16_of(operand_start);
-            let node = elements.iter().find(|n| n.span.offset == s16);
+            // The `...` operand inside a staged `Expr::Spread` (or a bare
+            // staged leaf for the pre-wrap shapes) — the probe keys on the
+            // operand's own offset.
+            let node = elements.iter().find_map(|n| match &n.expr {
+                crate::const_eval::Expr::Spread { operand, .. }
+                    if operand.span.offset == s16 =>
+                {
+                    Some(operand.as_ref())
+                }
+                _ if n.span.offset == s16 => Some(n),
+                _ => None,
+            });
             match node {
                 Some(node) => {
                     let verdict = eval(node, self);

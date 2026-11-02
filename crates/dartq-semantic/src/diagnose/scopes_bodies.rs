@@ -1092,17 +1092,18 @@ impl<'a> Engine<'a> {
     ///   `dotShorthandUndefinedGetter` freeze to the same code).
     /// - No decidable context: the invocation arm still reports
     ///   `dot_shorthand_undefined_member` (its `contextType` renders `'_'`
-    ///   upstream — `var c = .m()`); the read arm does not (its verdict is
-    ///   `dot_shorthand_missing_context`, an unimplemented sibling).
+    ///   upstream — `var c = .m()`); the read arm reports
+    ///   `dot_shorthand_missing_context` at the whole shorthand span
+    ///   (#3612).
     /// - An unresolvable annotation (`pending_decl_ty_unresolved`) or a
-    ///   non-`Named` head: the read arm's verdict is `missing_context`
-    ///   (suppressed); the invocation arm reports with the written
-    ///   context's display (`C Function() c = .m()`).
+    ///   non-`Named` head: the read arm's verdict is `missing_context`;
+    ///   the invocation arm reports with the written context's display
+    ///   (`C Function() c = .m()`).
     ///
     /// Selector rows pushed with `Intent::Write`/`ReadWrite`/`Operator`
-    /// (`x == .a`, `.a = v`) keep their silence: their context is the
-    /// operand/assignment face's, not the declaration's — the under-report
-    /// direction every other operand-context shorthand keeps.
+    /// resolve through their OWN position's arm (#3612 widened the head
+    /// gate): an expression-statement target (``.a = v;``) arms the
+    /// unknown schema; a mid-expression target keeps the under-report.
     ///
     /// Each row resolves against the context ITS position computes
     /// ([`Self::shorthand_ctx_at`]): a shorthand directly under `=` reads
@@ -1120,15 +1121,18 @@ impl<'a> Engine<'a> {
     }
 
     /// The shared shorthand verdict (#3433's two-arm rule, widened to every
-    /// computable position by #3568): the row resolves against its position's
-    /// context — a hit upgrades the row to the member's declared face, a
-    /// named-context miss reports the context head's NAME (upstream
-    /// `dotShorthandUndefinedGetter`/`...UndefinedInvocation` spell
-    /// `typeReference.name`/`receiver.displayName` — `List<int>` reports
-    /// `'List'`), and a weaker context reports the invocation arm's visited
-    /// schema text (`'_'`, `dynamic`, `bool`, a written schema) while the
-    /// read arm stays silent (the `missing_context` sibling is
-    /// unimplemented).
+    /// computable position by #3568, both arms reporting since #3612): the
+    /// row resolves against its position's context — a hit upgrades the row
+    /// to the member's declared face, a miss against a NAMED ACCESSIBLE
+    /// context head reports the head's NAME (`dotShorthandUndefinedGetter`
+    /// /`...UndefinedInvocation` spell `typeReference.name`/
+    /// `receiver.displayName` — `List<int>` reports `'List'`), and every
+    /// weaker context keeps each arm's own face: the invocation arm reports
+    /// the schema it was visited under (`'_'`, `dynamic`, `bool`, a
+    /// written schema), the read arm reports `dot_shorthand_missing_context`
+    /// at the WHOLE shorthand span (upstream
+    /// `dotShorthandMissingContext.at(node)`,
+    /// property_element_resolver.dart:129).
     ///
     /// `frame_live` marks rows whose innermost executable still sits on the
     /// frame stack (`self.rows`): `return`/`=>` positions then read the
@@ -1144,7 +1148,36 @@ impl<'a> Engine<'a> {
         let Some((resolve, schema)) = self.shorthand_ctx_at(&row, live) else {
             return;
         };
-        let invoke = row.intent == Intent::Invoke;
+        if let Some(ty) = self.verdict_shorthand_miss(&row, resolve, schema) {
+            self.rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
+            self.rows[index].ty = ty;
+        }
+    }
+
+    /// The shared miss verdict once a position's context resolves: a
+    /// member/constructor hit answers the member's declared face (the
+    /// caller upgrades its own row slot); a miss emits the position's row.
+    /// Both arms report their own face on every weaker context — a
+    /// non-interface shape (`dynamic`, `Never`, `void`, a function or
+    /// record type), a decidable-but-empty schema (`'_'`), or a private
+    /// context head this unit cannot see (an imported alias's `_C` right
+    /// — the element lookup stops at the import's privacy boundary, so
+    /// the head never enters the member walk and never spells itself).
+    fn verdict_shorthand_miss(
+        &mut self,
+        row: &Row,
+        resolve: Option<Ty>,
+        schema: String,
+    ) -> Option<Ty> {
+        let resolve = resolve.filter(|ty| match ty {
+            Ty::Named { name, .. } => self.shorthand_head_accessible(*name),
+            _ => true,
+        });
+        // The arm split is SYNTACTIC upstream (DotShorthandInvocation vs
+        // DotShorthandPropertyAccess node kinds), not an intent fact: a
+        // `++`/`--`-demoted invocation chain (`.new()++`) keeps the
+        // invocation arm's `'_'` verdict.
+        let invoke = row.intent == Intent::Invoke || self.selector_invokes_at(row.range.offset);
         let resolved = resolve.and_then(|ctx| {
             let Ty::Named {
                 name: head,
@@ -1157,10 +1190,7 @@ impl<'a> Engine<'a> {
             self.shorthand_member_ty(head, nullable, args, row.name)
         });
         match (resolved, invoke) {
-            (Some(ty), _) => {
-                self.rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
-                self.rows[index].ty = ty;
-            }
+            (Some(ty), _) => Some(ty),
             (None, true) => {
                 // The invocation arm reports unconditionally once its
                 // context is not an accessible interface type
@@ -1172,32 +1202,122 @@ impl<'a> Engine<'a> {
                     _ => schema,
                 };
                 self.emit_shorthand_undefined_member(row.range, &text);
+                None
             }
             (None, false) => {
-                // The property-access arm reports only on a named context
-                // head (`dotShorthandUndefinedGetter` at the selector); every
-                // weaker context — none, invalid, a non-interface shape —
-                // reads `missing_context` upstream (suppressed here).
-                if let Some(Ty::Named { name, .. }) = resolve {
-                    let text = self.strings.resolve(name).to_string();
-                    self.emit_shorthand_undefined_member(row.range, &text);
+                // The property-access arm reports a named accessible head
+                // at the selector (`dotShorthandUndefinedGetter`); every
+                // weaker context reports the whole-span
+                // `dot_shorthand_missing_context`.
+                match resolve {
+                    Some(Ty::Named { name, .. }) => {
+                        let text = self.strings.resolve(name).to_string();
+                        self.emit_shorthand_undefined_member(row.range, &text);
+                    }
+                    _ => self.emit_shorthand_missing_context(row.range),
+                }
+                None
+            }
+        }
+    }
+
+    /// Whether a `Named` context head names a type THIS unit can see: a
+    /// private spelling (`_C`) that resolves to no type here belongs to a
+    /// sibling library, and the analyzer's target-element lookup stops at
+    /// the import's privacy boundary — the context then is not an
+    /// accessible interface type, so both arms report through their weak
+    /// faces (the invocation spells the schema `'_C'`, the read arm
+    /// reports `missing_context`; neither spells the head as an element).
+    fn shorthand_head_accessible(&self, name: StringId) -> bool {
+        let spelling = self.strings.resolve(name);
+        if !spelling.starts_with('_') {
+            return true;
+        }
+        matches!(self.type_resolution(name).0, TypeResolution::Type)
+    }
+
+    /// `dot_shorthand_missing_context` at the WHOLE shorthand span — the
+    /// dot through the selector's end (upstream reports the node, not the
+    /// name: `dotShorthandMissingContext.at(node)`,
+    /// property_element_resolver.dart:129). The const face emits the same
+    /// span for the const roots it reaches, so the emit dedups on it; a
+    /// stale-window resweep likewise stays idempotent.
+    fn emit_shorthand_missing_context(&mut self, selector: SourceRange) {
+        let toks = self.tokens.as_slice();
+        let idx = toks.partition_point(|t| t.utf16_offset < selector.offset);
+        let Some(dot) = idx.checked_sub(1).and_then(|i| toks.get(i)) else {
+            return;
+        };
+        let span = SourceRange {
+            offset: dot.utf16_offset,
+            length: selector.end() - dot.utf16_offset,
+        };
+        if self
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == span && d.code.name == "dot_shorthand_missing_context")
+        {
+            return;
+        }
+        self.emit(SemanticCode::DotShorthandMissingContext, span, "", "");
+    }
+
+    /// Whether the selector at `offset` is written as an invocation — the
+    /// name, one optional balanced type-argument group, then the call's
+    /// `(` (the token-level twin of the const face's byte probe): the
+    /// verdict's arm split follows the WRITTEN node kind, so a selector
+    /// whose invocation shape an operator event demoted
+    /// (`.new()++`'s `ReadWrite`) still verdicts as the invocation arm.
+    fn selector_invokes_at(&self, offset: u32) -> bool {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let mut idx = toks.partition_point(|t| t.utf16_offset < offset) + 1;
+        if toks.get(idx).is_some_and(|t| t.kind == TK::Lt) {
+            let mut depth = 0i32;
+            while let Some(t) = toks.get(idx) {
+                match t.kind {
+                    TK::Lt => depth += 1,
+                    TK::LtLt => depth += 2,
+                    TK::Gt => depth -= 1,
+                    TK::GtGt => depth -= 2,
+                    TK::GtGtGt => depth -= 3,
+                    _ => {}
+                }
+                idx += 1;
+                if depth <= 0 {
+                    break;
                 }
             }
         }
+        toks.get(idx).is_some_and(|t| t.kind == TK::OpenParen)
     }
 
     /// The un-merged leading-dot selector gate shared by every shorthand
     /// sweep: `qualified` (the selector fold), `Bare(_)` (no receiver merged),
     /// `ty == Unknown` (never verdicted — the once-only marker), and the
     /// byte-level `.`-opener probe — or a `...`/`...?` spread head, whose
-    /// `...` byte the opener probe reads as a receiver end.
+    /// `...` byte the opener probe reads as a receiver end, or a `!`-
+    /// negation head (`!.a`), whose `!` byte reads as a postfix assert of
+    /// a receiver. Write/compound/operator intents (``.red = 1;``,
+    /// ``.red++;``) verdict with the others since #3612 — their statement
+    /// positions arm the unknown schema, whose read arm reports
+    /// `missing_context`.
     fn is_shorthand_head(&self, row: &Row) -> bool {
         row.qualified
             && matches!(row.shape, RowShape::Bare(_))
             && row.ty == Ty::UNKNOWN
-            && matches!(row.intent, Intent::Read | Intent::Invoke)
+            && matches!(
+                row.intent,
+                Intent::Read
+                    | Intent::Invoke
+                    | Intent::Write
+                    | Intent::ReadWrite
+                    | Intent::Operator(..)
+            )
             && (self.dot_shorthand_context(row.range.offset)
-                || self.is_spread_head(row.range.offset))
+                || self.is_spread_head(row.range.offset)
+                || self.is_negation_shorthand_head(row.range.offset))
     }
 
     /// Whether the `.` before the selector opens a spread element
@@ -1218,6 +1338,44 @@ impl<'a> Engine<'a> {
         matches!(
             toks[prev_idx].kind,
             TK::PeriodPeriodPeriod | TK::PeriodPeriodPeriodQuestion
+        )
+    }
+
+    /// Whether the `.` before the selector opens a NEGATED shorthand
+    /// (`!.a`, `!!.a`): the `!`-run before the dot roots at a position
+    /// token (an operator, `=`, `(`, `,`, `;`), not at the postfix `!` of
+    /// a written receiver — `x!.a` and `x!!.a` end their `!`-runs at an
+    /// expression token, and the byte-level opener probe's rejection
+    /// stands for them. A genuine negation's context is the language's
+    /// `bool` operand schema (`o = !.getterTrue` reports `'bool'`).
+    fn is_negation_shorthand_head(&self, offset: u32) -> bool {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let name_idx = toks.partition_point(|t| t.utf16_offset < offset);
+        let Some(dot_idx) = name_idx.checked_sub(1) else {
+            return false;
+        };
+        let mut idx = dot_idx;
+        while idx > 0 && toks[idx - 1].kind == TK::Bang {
+            idx -= 1;
+        }
+        if idx == 0 || idx == dot_idx {
+            return false;
+        }
+        !matches!(
+            toks[idx - 1].kind,
+            TK::Identifier
+                | TK::Int
+                | TK::Double
+                | TK::Hexadecimal
+                | TK::String
+                | TK::StringInterpolationIdentifier
+                | TK::CloseParen
+                | TK::CloseSquare
+                | TK::CloseCurly
+                | TK::Gt
+                | TK::Bang
+                | TK::Keyword(Kw::This | Kw::Super | Kw::True | Kw::False | Kw::Null)
         )
     }
 
@@ -1265,12 +1423,13 @@ impl<'a> Engine<'a> {
     /// decidable context (a `Ty::Named` head the member walk reads, or a
     /// weaker shape — `dynamic`, `bool`, a written non-interface schema);
     /// `Some(None, "_")` — the position provably arms no context (the
-    /// invoke arm's `'_'` upstream; the read arm's `missing_context`,
-    /// suppressed); `None` — the position cannot be decided here (an
-    /// operand the row walk cannot type, a type-parameter formal, a shape
-    /// no arm pins) — the row keeps its silence rather than fabricate an
-    /// `undefined` row upstream never emits (the under-report direction
-    /// every shorthand face outside the declaration window keeps).
+    /// invoke arm's `'_'` upstream; the read arm's
+    /// `dot_shorthand_missing_context`); `None` — the position cannot be
+    /// decided here (an operand the row walk cannot type, a type-parameter
+    /// formal, a shape no arm pins) — the row keeps its silence rather
+    /// than fabricate an `undefined` row upstream never emits (the
+    /// under-report direction every shorthand face outside the declaration
+    /// window keeps).
     fn shorthand_ctx_at(&self, row: &Row, live: bool) -> Option<(Option<Ty>, String)> {
         use dartq_scanner::{Keyword as Kw, TokenKind as TK};
         let toks = self.tokens.as_slice();
@@ -1285,14 +1444,25 @@ impl<'a> Engine<'a> {
         // schema, so only a DIRECT dot shorthand on the right reads the left
         // operand's static type. Every shorthand nested in either operand's
         // subtree — the left root, a parenthesized or conditional right —
-        // verdicts against `'_'`: the read arm stays silent (its
-        // `missing_context` sibling is unimplemented) and the invocation arm
-        // reports the empty schemas text, exactly the declaration-window
-        // answers.
+        // verdicts against `'_'`: the read arm reports the whole-span
+        // `missing_context` and the invocation arm the empty schema text,
+        // exactly the declaration-window answers.
         if self.shorthand_roots_equality_lhs(name_idx, prev_idx) {
             return Some((None, "_".to_string()));
         }
         if self.shorthand_nested_in_equality_rhs(dot_idx) {
+            return Some((None, "_".to_string()));
+        }
+        // A shorthand whose selector chain an increment/decrement
+        // terminates (`.new()++`, `.red++`) — the operand schema is the
+        // unknown one upstream (test_postfixOperator's `C c = .new()++`
+        // reports `'_'`).
+        if let Some(end) = self.shorthand_chain_end(name_idx)
+            && matches!(
+                toks[end].kind,
+                TK::PlusPlus | TK::MinusMinus
+            )
+        {
             return Some((None, "_".to_string()));
         }
         // The row whose written expression ends just before `token`'s
@@ -1370,18 +1540,27 @@ impl<'a> Engine<'a> {
                     self.return_ctx()
                 }
             }
-            // `&&`, `||`, `!` — the language-defined `bool` operand context:
-            // both logical operands and a negation operand resolve their
-            // shorthand against `bool` (`bool_context_error_test`).
-            TK::AmpersandAmpersand | TK::BarBar | TK::Bang => self.bool_ctx(),
+            // `&&`/`||` — the language-defined `bool` operand context
+            // (`bool_context_error_test`), EXCEPT inside a `case` pattern,
+            // where the logical operands resolve against the scrutinee's
+            // matched type (`if (e case .one || .two)` — patterns_A02).
+            // `!` always arms `bool` (a negation operand, never a pattern
+            // position).
+            TK::AmpersandAmpersand | TK::BarBar => self
+                .pattern_case_ctx(prev_idx)
+                .or_else(|| self.bool_ctx()),
+            TK::Bang => self.bool_ctx(),
             // `... .x` / `...? .x` — a spread element resolves against the
             // collection the literal builds: `Iterable` for a list/set,
             // `Map` for a map (`non_ambiguity_A02_*`).
             TK::PeriodPeriodPeriod | TK::PeriodPeriodPeriodQuestion => self.spread_ctx_at(dot_idx),
             // `(`, `,` — argument-list or collection/record positions.
-            TK::OpenParen | TK::Comma => self.group_ctx_at(row, prev_idx, operand_row_before),
-            // `:` — a named-argument label's value (`f(name: .a)`).
-            TK::Colon => self.colon_ctx_at(row, prev_idx, operand_row_before),
+            TK::OpenParen | TK::Comma => self.group_ctx_at(row, prev_idx, live, operand_row_before),
+            // `:` — a named-argument label's value (`f(name: .a)`), else a
+            // conditional else-branch or a map entry's value.
+            TK::Colon => self
+                .colon_ctx_at(row, prev_idx, operand_row_before)
+                .or_else(|| self.conditional_branch_ctx(prev_idx, live)),
             // `=` — the declaration initializer's own shorthand
             // (`E e = .a`): the armed annotation's face, decidable only
             // while the declaration's own window is live (`pending_decl_ty`
@@ -1393,6 +1572,51 @@ impl<'a> Engine<'a> {
                 self.eq_ctx_at(prev_idx)
             }
             TK::Eq => None,
+            // A conditional's then-branch (`cond ? .a : b`): the branch
+            // inherits the conditional's own visiting schema —
+            // `if (c == x ? .new() : y)` reports `'bool'`, an `==`-nested
+            // conditional keeps `'_'` (equality_A02_t01/t02).
+            TK::Question => self.conditional_branch_ctx(prev_idx, live),
+            // Prefix `-`/`~`/`++`/`--` operands — no language-defined
+            // operand schema: the unknown schema (`o = -.two()` reports
+            // `'_'`; an infix right operand `- .a` shares the answer).
+            TK::Minus | TK::Tilde | TK::PlusPlus | TK::MinusMinus => {
+                Some((None, "_".to_string()))
+            }
+            // A list/set literal's first element: the element schema
+            // (equality_A02_t01's `if ([C(0)] == [.id(1)])` reports `'_'`).
+            TK::OpenSquare => self.literal_elem_ctx(prev_idx),
+            // `{` — a block statement's first expression arms the unknown
+            // schema (`) {` of a body, `else {`; no_context's statement
+            // shapes); a set/map literal's first element answers through
+            // the element face.
+            TK::OpenCurly => match prev_idx
+                .checked_sub(1)
+                .and_then(|i| toks.get(i))
+                .map(|t| t.kind)
+            {
+                Some(TK::CloseParen | TK::Semicolon | TK::CloseCurly)
+                | Some(TK::Keyword(Kw::Else | Kw::Do)) => Some((None, "_".to_string())),
+                _ => self.literal_elem_ctx(prev_idx),
+            },
+            // An expression statement's own shorthand — `.red = 1;`,
+            // `.red++;`, `.one!;` — arms no context anywhere: the unknown
+            // schema (no_context's read shapes report `missing_context`).
+            TK::Semicolon | TK::CloseCurly => Some((None, "_".to_string())),
+            // `await .red;` as the statement's whole expression — the
+            // await's own context is the unknown schema; an `await` nested
+            // in a larger expression keeps the under-report.
+            TK::Keyword(Kw::Await)
+                if matches!(
+                    prev_idx
+                        .checked_sub(1)
+                        .and_then(|i| toks.get(i))
+                        .map(|t| t.kind),
+                    Some(TK::Semicolon | TK::OpenCurly | TK::CloseCurly) | None
+                ) =>
+            {
+                Some((None, "_".to_string()))
+            }
             _ => None,
         }
     }
@@ -1409,16 +1633,33 @@ impl<'a> Engine<'a> {
     /// position's own context.
     fn shorthand_roots_equality_lhs(&self, name_idx: usize, prev_idx: usize) -> bool {
         use dartq_scanner::TokenKind as TK;
-        let toks = self.tokens.as_slice();
-        if matches!(toks[prev_idx].kind, TK::EqEq | TK::BangEq) {
+        if matches!(self.tokens.as_slice()[prev_idx].kind, TK::EqEq | TK::BangEq) {
             return false;
         }
+        matches!(
+            self.shorthand_chain_end(name_idx),
+            Some(end) if matches!(self.tokens.as_slice()[end].kind, TK::EqEq | TK::BangEq)
+        )
+    }
+
+    /// The token that terminates the shorthand-rooted selector chain at
+    /// `name_idx`: the chain runs through its invocations, index reads,
+    /// and member selects — plus a grouping paren around the whole
+    /// operand — and stops at the first token that is none of those.
+    /// [`Self::shorthand_roots_equality_lhs`] reads it for the `==`/`!=`
+    /// that makes the shorthand a LEFT operand; the `++`/`--` terminator
+    /// (`.new()++`) answers the unknown schema the same way. `None` when
+    /// the chain never completes (an unmatched bracket, a non-grouping
+    /// close).
+    fn shorthand_chain_end(&self, name_idx: usize) -> Option<usize> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
         let mut idx = name_idx + 1;
         while let Some(token) = toks.get(idx) {
             match token.kind {
                 TK::OpenParen | TK::OpenSquare => match self.tokens.matching_end(idx) {
                     Some(end) => idx = end + 1,
-                    None => return false,
+                    None => return None,
                 },
                 TK::Period | TK::QuestionPeriod => idx += 2,
                 // A close that ends the operand: only a GROUPING paren wraps
@@ -1428,13 +1669,12 @@ impl<'a> Engine<'a> {
                 // and keep scanning) or ends the enclosing construct.
                 TK::CloseParen => match self.grouping_open(idx) {
                     Some(_) => idx += 1,
-                    None => return false,
+                    None => return None,
                 },
-                _ => break,
+                _ => return Some(idx),
             }
         }
-        toks.get(idx)
-            .is_some_and(|t| matches!(t.kind, TK::EqEq | TK::BangEq))
+        None
     }
 
     /// The opener of the group a `)` closes, when that group is a grouping
@@ -1501,16 +1741,219 @@ impl<'a> Engine<'a> {
         )
     }
 
+    /// The index of the opener matching the closer at `close_idx` — the
+    /// token store carries only the forward `matching_end`, so the
+    /// backward answer counts bracket depth (the conditional-branch walk
+    /// needs it to step over completed groups).
+    fn matching_open_idx(&self, close_idx: usize) -> Option<usize> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let open = match toks.get(close_idx)?.kind {
+            TK::CloseParen => TK::OpenParen,
+            TK::CloseSquare => TK::OpenSquare,
+            TK::CloseCurly => TK::OpenCurly,
+            _ => return None,
+        };
+        let mut depth = 0i32;
+        for idx in (0..close_idx).rev() {
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                kind if kind == open && depth == 0 => return Some(idx),
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => depth -= 1,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The context of a `&&`/`||` token that sits INSIDE a `case` pattern's
+    /// logical-operand chain (`if (e case .one || .two)`: the pattern's
+    /// operands resolve against the scrutinee's matched type, not `bool`).
+    /// `None` when the scan leftward reaches a statement/group boundary
+    /// first — ordinary boolean logic, the `bool` face answers.
+    fn pattern_case_ctx(&self, op_idx: usize) -> Option<(Option<Ty>, String)> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let mut depth = 0i32;
+        for idx in (0..op_idx).rev() {
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                TK::Semicolon => return None,
+                TK::Keyword(Kw::Case) if depth == 0 => return self.case_scrutinee_ctx(idx),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// A conditional-expression branch's context (`cond ? .a : b` /
+    /// `cond ? b : .a`): both branches inherit the conditional's own
+    /// visiting schema, so the answer classifies the boundary that opens
+    /// the conditional's TEST expression — `if (… == c ? .new() : …)`
+    /// arms `bool`, a declaration initializer's conditional the written
+    /// annotation, an `==`-nested conditional the unknown schema. A `:`
+    /// with no `?` behind it is a map entry's value — the enclosing
+    /// literal's element face answers.
+    fn conditional_branch_ctx(&self, branch_idx: usize, live: bool) -> Option<(Option<Ty>, String)> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let is_colon = toks.get(branch_idx).is_some_and(|t| t.kind == TK::Colon);
+        let cursor = if is_colon {
+            match self.conditional_question_before(branch_idx) {
+                Some(q) => q,
+                // A map entry's value: the element face.
+                None => return self.literal_elem_ctx(self.enclosing_group_open(branch_idx)?),
+            }
+        } else {
+            branch_idx
+        };
+        // (The `?`-pairing scan is `conditional_question_before`'s,
+        // invocation.rs's shared helper — nested conditionals pair their
+        // own `?`/`:` at depth.)
+        // Walk left over the test expression — operands, literals,
+        // operators, and completed groups all continue it — to the
+        // boundary token that opens the position; that boundary's own
+        // face is the branch's context.
+        let mut idx = cursor;
+        while idx > 0 {
+            idx -= 1;
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => {
+                    idx = self.matching_open_idx(idx)?;
+                }
+                TK::OpenParen
+                | TK::OpenSquare
+                | TK::OpenCurly
+                | TK::Comma
+                | TK::Semicolon
+                | TK::Question
+                | TK::Colon
+                | TK::Eq
+                | TK::Function
+                | TK::Keyword(
+                    Kw::If | Kw::While | Kw::Assert | Kw::Return | Kw::Yield | Kw::Else | Kw::Do,
+                ) => return self.expr_boundary_ctx(idx, live),
+                _ => {}
+            }
+        }
+        Some((None, "_".to_string()))
+    }
+
+    /// The context of the expression whose first token sits right AFTER
+    /// `stop_idx` — the boundary that opens the position: statement
+    /// separators arm the unknown schema, `if (`/`while (`/`assert (`
+    /// the `bool` schema, a declarator `=` the written annotation, `=>`
+    /// and `return`/`yield` the return face, an open bracket whatever
+    /// schema the bracket's own position arms (`==` operand → `'_'`), a
+    /// nested conditional's branch token recurses one level up.
+    fn expr_boundary_ctx(&self, stop_idx: usize, live: bool) -> Option<(Option<Ty>, String)> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        match toks[stop_idx].kind {
+            TK::Semicolon | TK::OpenCurly | TK::CloseCurly => Some((None, "_".to_string())),
+            // A declarator `=` arms the annotation (`E e = c ? .a : b`);
+            // an assignment target keeps the under-report.
+            TK::Eq => self.eq_ctx_at(stop_idx),
+            TK::Function | TK::Keyword(Kw::Return | Kw::Yield) => {
+                if live {
+                    self.return_ctx()
+                } else {
+                    Some((None, "_".to_string()))
+                }
+            }
+            // A nested conditional's branch token: classify one level up.
+            TK::Question | TK::Colon => self.conditional_branch_ctx(stop_idx, live),
+            TK::OpenParen | TK::OpenSquare => {
+                match stop_idx
+                    .checked_sub(1)
+                    .and_then(|i| toks.get(i))
+                    .map(|t| t.kind)
+                {
+                    // `if (` / `while (` / `assert (` — the `bool` schema.
+                    Some(TK::Keyword(Kw::If | Kw::While | Kw::Assert)) => self.bool_ctx(),
+                    // An `==`/`!=` operand — the unknown schema.
+                    Some(TK::EqEq | TK::BangEq) => Some((None, "_".to_string())),
+                    // A grouping `(` inherits the schema the group
+                    // expression itself was visited under — classify the
+                    // boundary that opens it (`; (.a);` at statement level
+                    // answers `'_'`; `E e = (.a)` the annotation). A call's
+                    // open lands `None` through the same recursion (its
+                    // predecessor is a callee end); a `[` literal keeps
+                    // the under-report — `literal_elem_ctx` owns its
+                    // element face.
+                    Some(_) if toks[stop_idx].kind == TK::OpenParen => {
+                        self.expr_boundary_ctx(stop_idx - 1, live)
+                    }
+                    _ => None,
+                }
+            }
+            TK::Keyword(Kw::Else | Kw::Do) => Some((None, "_".to_string())),
+            _ => None,
+        }
+    }
+
+    /// A collection literal element's context (`[.a]`, `{.a}`, a later
+    /// element after a `,`, a map entry's value): the element schema the
+    /// LITERAL's own position arms — an `==`/`!=` operand and a condition
+    /// position arm the unknown schema (`if ([C(0)] == [.id(1)])` reports
+    /// `'_'`; `if ({"key": C(0)} != {"key": .intOne})` reports
+    /// `missing_context`). A declaration-typed literal's element type
+    /// lives in the annotation's type arguments (under-reported); an
+    /// index access `a[...]` (an identifier/`)`/`]` before the bracket)
+    /// keeps the under-report.
+    fn literal_elem_ctx(&self, open_idx: usize) -> Option<(Option<Ty>, String)> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        let before = open_idx
+            .checked_sub(1)
+            .and_then(|i| toks.get(i))
+            .map(|t| t.kind)?;
+        match before {
+            TK::EqEq | TK::BangEq => Some((None, "_".to_string())),
+            // A collection directly inside the condition's own paren
+            // (`if ([.a])`): the literal itself was visited under `bool`,
+            // and its elements arm no context.
+            TK::OpenParen => match open_idx
+                .checked_sub(2)
+                .and_then(|i| toks.get(i))
+                .map(|t| t.kind)
+            {
+                Some(TK::Keyword(Kw::If | Kw::While | Kw::Assert)) => {
+                    Some((None, "_".to_string()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The declaration-initializer context for a shorthand directly under
-    /// `=`/`const`/`new`: the armed group annotation (the same face
-    /// [`Self::shorthand_context_ty`] answers — `Some` for a written type,
-    /// the `'_'` verdict for `var`/unresolved, matching the original
-    /// declaration-window rule).
+    /// `=`/`const`/`new`: the armed group annotation — `Some` for a
+    /// written type, the `'_'` verdict for `var`/unresolved, matching the
+    /// original declaration-window rule. The LOOKUP context is the
+    /// futureOr-base of the folded annotation (`FutureOr<C>` resolves on
+    /// `C`); the weak schema display keeps the written `FutureOr<...>`
+    /// spelling (`FutureOr<void> v = .id()` reports `'FutureOr<void>'` —
+    /// the visiting schema, semantics_A02).
     fn shorthand_decl_ctx(&self) -> Option<(Option<Ty>, String)> {
-        Some(match self.shorthand_context_ty() {
-            Some(ty) => (Some(ty), self.ty_display(ty)),
-            None => (None, "_".to_string()),
-        })
+        if self.pending_decl_ty_unresolved {
+            return Some((None, "_".to_string()));
+        }
+        let Some(raw) = self.pending_decl_ty else {
+            return Some((None, "_".to_string()));
+        };
+        if raw == Ty::UNKNOWN {
+            return Some((None, "_".to_string()));
+        }
+        let folded = self.fold_alias_ty(raw);
+        let base = self.future_or_base(folded);
+        Some((Some(base), self.ty_display(folded)))
     }
 
     /// The language-defined `bool` shorthand context: an `if`/`while`/
@@ -1691,10 +2134,13 @@ impl<'a> Engine<'a> {
 
     /// The innermost live executable's return context (`return .a`,
     /// `=> .a`, `yield .a`): the declared return latched on the frame, a
-    /// closure literal's armed context return. `None` when the executable
-    /// arms none (the under-report — upstream's `bodyContext.contextType`
-    /// is the function's own declared return, so an unannotated `dynamic`
-    /// return keeps the shorthand's context-free face, never a miss).
+    /// closure literal's armed context return. An executable that arms
+    /// NONE — an unannotated, still-inferring body (`f() { return .a; }`)
+    /// — visits its returns under the unknown schema: the read arm
+    /// reports `missing_context` and the invocation arm `'_'`
+    /// (type_inference_A03_t01: `return .new()` reports `'_'`); a
+    /// DECLARED `dynamic`/`void` return still spells itself
+    /// (semantics_A02: `'void'`).
     fn return_ctx(&self) -> Option<(Option<Ty>, String)> {
         let ty = self.frames.iter().rev().find_map(|frame| match &frame.kind {
             FrameKind::Executable { ret, ctx_ret, .. } => {
@@ -1704,21 +2150,26 @@ impl<'a> Engine<'a> {
         });
         match ty {
             Some(ty) if ty != Ty::UNKNOWN => {
-                let folded = self.future_or_base(self.fold_alias_ty(ty));
-                Some((Some(folded), self.ty_display(folded)))
+                let folded = self.fold_alias_ty(ty);
+                let base = self.future_or_base(folded);
+                Some((Some(base), self.ty_display(folded)))
             }
-            _ => None,
+            _ => Some((None, "_".to_string())),
         }
     }
 
     /// `(`, `,` context: a call/`new` argument reads the paired parameter's
     /// type; inside `if (`/`while (`/`for (` it is the condition's own
-    /// face; a parenthesized/grouped or record element keeps the under-
-    /// report unless a schema supplies one.
+    /// face; a grouping paren inherits the schema its own position arms
+    /// (the statement-level `(.a);` arms the unknown schema); a collection
+    /// literal's `,`-separated element answers through the element face;
+    /// a record element keeps the under-report unless a schema supplies
+    /// one.
     fn group_ctx_at(
         &self,
         _row: &Row,
         prev_idx: usize,
+        live: bool,
         operand_row_before: impl Fn(&Self, u32, usize) -> Option<Row>,
     ) -> Option<(Option<Ty>, String)> {
         use dartq_scanner::{Keyword as Kw, TokenKind as TK};
@@ -1726,12 +2177,15 @@ impl<'a> Engine<'a> {
         let prev = toks[prev_idx];
         // Find the argument group's open `(`: for a `,` the scan walks back
         // past balanced groups counting top-level commas; for `(` the
-        // shorthand is the group's first element.
+        // shorthand is the group's first element. A `,` whose enclosing
+        // open bracket is a `[`/`{` LITERAL (no `(` ahead of it) is a
+        // collection element — the element face answers.
         let open_idx = match prev.kind {
             TK::OpenParen => Some(prev_idx),
             TK::Comma => {
                 let mut depth = 0i32;
                 let mut found = None;
+                let mut literal = None;
                 for idx in (0..prev_idx).rev() {
                     match toks[idx].kind {
                         TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
@@ -1744,12 +2198,16 @@ impl<'a> Engine<'a> {
                         }
                         TK::OpenSquare | TK::OpenCurly => {
                             if depth == 0 {
+                                literal = Some(idx);
                                 break;
                             }
                             depth -= 1;
                         }
                         _ => {}
                     }
+                }
+                if found.is_none() && let Some(literal_open) = literal {
+                    return self.literal_elem_ctx(literal_open);
                 }
                 found
             }
@@ -1777,6 +2235,25 @@ impl<'a> Engine<'a> {
             before_open.and_then(|i| toks.get(i)).map(|t| t.kind)
         {
             return None;
+        }
+        // A GROUPING paren (no callee ahead — the callee test is
+        // `grouping_open`'s): the parenthesized expression inherits the
+        // schema the paren's own position arms (`(.red);` at statement
+        // level arms the unknown schema — no_context; `E e = (.a);` the
+        // annotation; `x == (.a)` answered earlier, in the equality
+        // guard).
+        if !matches!(
+            before_open.and_then(|i| toks.get(i)).map(|t| t.kind),
+            Some(
+                TK::Identifier
+                    | TK::CloseParen
+                    | TK::CloseSquare
+                    | TK::Gt
+                    | TK::GtGt
+                    | TK::GtGtGt
+            )
+        ) {
+            return self.expr_boundary_ctx(open_idx, live);
         }
         // The argument position's parameter type: the callee is the row
         // whose NAME abuts `(` — the staged span widens through the call
@@ -1839,7 +2316,13 @@ impl<'a> Engine<'a> {
     /// head's type answer — a frame type parameter answers `Type` through
     /// the type-param stack, an unsubstituted container parameter (or any
     /// spelling that never resolves a type element) answers `Missing`/
-    /// `NonType` and is undecidable here.
+    /// `NonType` and is undecidable here. The context armed is the
+    /// formal's INSTANTIATED type — alias spellings fold to their element
+    /// before the lookup and the schema display (`contextAlias(C)`'s
+    /// `.m()` reports `'_C'`, `contextAlias(C<int>)`'s reports
+    /// `'_C<num>'`; private_test), and a `FutureOr<S>` formal resolves
+    /// against its base (`take(FutureOr<C>)`'s `.instance` miss spells
+    /// `'C'` — semantics_A02's futureOrBase).
     fn shorthand_ctx_formal(&self, ty: Ty) -> Option<(Option<Ty>, String)> {
         if let Ty::Named { name, .. } = ty {
             let is_param = self.type_params.contains(&name)
@@ -1848,7 +2331,9 @@ impl<'a> Engine<'a> {
                 return None;
             }
         }
-        Some((Some(ty), self.ty_display(ty)))
+        let folded = self.fold_alias_ty(ty);
+        let base = self.future_or_base(folded);
+        Some((Some(base), self.ty_display(folded)))
     }
 
     /// `:` context — a named-argument label's value (`f(name: .a)` — the
@@ -1910,9 +2395,23 @@ impl<'a> Engine<'a> {
             .and_then(|i| toks.get(i))
             .map(|t| t.kind)
         {
-            Some(TK::Identifier | TK::CloseParen)
+            // A generic annotation's closing `>` (`FutureOr<void> v =`,
+            // `C<int> c =`) ends the declarator's type the same way an
+            // identifier does; `dynamic`/`void`/bare `Function` spell
+            // their annotation through a keyword token.
+            Some(
+                TK::Identifier | TK::CloseParen | TK::Gt | TK::GtGt | TK::GtGtGt,
+            )
             | Some(TK::Keyword(
-                Kw::Var | Kw::Final | Kw::Const | Kw::Late | Kw::Static | Kw::Covariant,
+                Kw::Var
+                    | Kw::Final
+                    | Kw::Const
+                    | Kw::Late
+                    | Kw::Static
+                    | Kw::Covariant
+                    | Kw::Dynamic
+                    | Kw::Void
+                    | Kw::Function,
             )) => self.shorthand_decl_ctx(),
             _ => None,
         }
@@ -1982,36 +2481,9 @@ impl<'a> Engine<'a> {
     /// already left the live stack (the upgrade writes the deferred slot,
     /// not `self.rows`).
     fn verdict_deferred_shorthand(&mut self, index: usize, row: &Row, resolve: Option<Ty>, schema: String) {
-        let invoke = row.intent == Intent::Invoke;
-        let resolved = resolve.and_then(|ctx| {
-            let Ty::Named {
-                name: head,
-                nullable,
-                args,
-            } = ctx
-            else {
-                return None;
-            };
-            self.shorthand_member_ty(head, nullable, args, row.name)
-        });
-        match (resolved, invoke) {
-            (Some(ty), _) => {
-                self.deferred_miss_rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
-                self.deferred_miss_rows[index].ty = ty;
-            }
-            (None, true) => {
-                let text = match resolve {
-                    Some(Ty::Named { name, .. }) => self.strings.resolve(name).to_string(),
-                    _ => schema,
-                };
-                self.emit_shorthand_undefined_member(row.range, &text);
-            }
-            (None, false) => {
-                if let Some(Ty::Named { name, .. }) = resolve {
-                    let text = self.strings.resolve(name).to_string();
-                    self.emit_shorthand_undefined_member(row.range, &text);
-                }
-            }
+        if let Some(ty) = self.verdict_shorthand_miss(row, resolve, schema) {
+            self.deferred_miss_rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
+            self.deferred_miss_rows[index].ty = ty;
         }
     }
 
@@ -2716,7 +3188,21 @@ impl<'a> Engine<'a> {
         if matched == Ty::UNKNOWN || self.is_invalid_ty(matched) {
             return;
         }
-        self.irrefutable_node(kw + 1, eq, matched);
+        let (Some(lo), Some(hi)) = (
+            self.token_source_range(kw + 1),
+            self.token_source_range(eq),
+        ) else {
+            return;
+        };
+        self.irrefutable_walk_between(lo, hi, matched);
+    }
+
+    /// One token's UTF-16 span by index (`None` past the table).
+    fn token_source_range(&self, index: usize) -> Option<SourceRange> {
+        self.tokens.as_slice().get(index).map(|t| SourceRange {
+            offset: t.utf16_offset,
+            length: t.byte_len,
+        })
     }
 
     /// The `[lo, hi)` token window's UTF-16 span (the node report's
@@ -2734,10 +3220,15 @@ impl<'a> Engine<'a> {
     /// One irrefutable-pattern node over the token window `[lo, hi)`
     /// carrying `matched` as its matched value type: the
     /// `pattern_type_mismatch_in_irrefutable_context` emitter behind
-    /// [`Self::check_irrefutable_destructure`]. Structural recursion —
+    /// [`Self::irrefutable_walk_between`]. Structural recursion —
     /// container children recurse with their column's matched type;
     /// everything else stays silent.
-    fn irrefutable_node(&mut self, lo: usize, hi: usize, matched: Ty) {
+    ///
+    /// `assign` marks a pattern-assignment context: bare identifiers are
+    /// then assigned-variable patterns whose required type is the
+    /// variable's declared one (`analyzeAssignedVariablePattern`), never
+    /// fresh binders that infer from the matched type.
+    fn irrefutable_node(&mut self, lo: usize, hi: usize, matched: Ty, assign: bool) {
         if lo >= hi {
             return;
         }
@@ -2746,7 +3237,9 @@ impl<'a> Engine<'a> {
         // re-dispatches the inner pattern with `T` as its matched type
         // (`analyzeCastPattern`: no irrefutable check on the node; the
         // operand sees `requiredType` — `var (int h as num) = 's'`
-        // reports the leaf's `'num'` vs `'int'`).
+        // reports the leaf's `'num'` vs `'int'`). The container column
+        // rides through unchanged, so a `List r as List<num>` rest keeps
+        // the rest's own `List<E>` matched face.
         {
             let mut depth = 0i32;
             let mut cast = None;
@@ -2767,32 +3260,42 @@ impl<'a> Engine<'a> {
                 let Some((cast_ty, _)) = self.reconstruct_ty_at(as_at + 1, &mut carry) else {
                     return;
                 };
-                self.irrefutable_node(lo, as_at, cast_ty);
+                self.irrefutable_node(lo, as_at, cast_ty, assign);
                 return;
             }
         }
-        // The `?` null-check postfix is refutable (its whole subtree
-        // leaves this face); the `!` postfix re-dispatches transparently.
+        // The `?` null-check postfix is refutable — the node reports and
+        // its whole subtree leaves this face (`analyzeNullCheckOrAssertPattern`
+        // reports first, then `makeRefutable()`); the `!` null-assert
+        // postfix re-dispatches transparently.
         let mut hi = hi;
         loop {
             match toks.get(hi - 1).map(|t| t.kind) {
                 Some(TokenKind::Bang) => hi -= 1,
-                Some(TokenKind::Question) => return,
+                Some(TokenKind::Question) => {
+                    self.emit_refutable_pattern(lo, hi);
+                    return;
+                }
                 _ => break,
             }
         }
         if lo >= hi {
             return;
         }
-        // Refutable shapes end the descent: logical operators and a
-        // depth-0 relational head make the subtree skip every check. A
-        // leading `<` that opens a typed collection's argument group is
-        // NOT a relational head — `<T>[...]`/`<K,V>{...}` spell the list
-        // and map nodes, so `Lt` only bails when no `>`-then-`[`/`{`
-        // shape follows.
+        // The refutable shapes, per node, BEFORE the kind faces
+        // (`dispatchPattern`'s per-node gate): `||` reports at the node
+        // and silences its subtree (`analyzeLogicalOrPattern`), a
+        // depth-0 relational/equality head likewise
+        // (`analyzeRelationalPattern`). Constant patterns are the
+        // parser's row (patterns.rs `report_refutable_constant_pattern`)
+        // and fall through to the silent arms below. A leading `<` that
+        // opens a typed collection's argument group is NOT a relational
+        // head — `<T>[...]`/`<K,V>{...}` spell the list and map nodes.
         {
             let mut depth = 0i32;
             let mut i = lo;
+            let mut logical_or = false;
+            let mut logical_and = None;
             while i < hi {
                 match toks[i].kind {
                     TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
@@ -2802,8 +3305,11 @@ impl<'a> Engine<'a> {
                     | TokenKind::CloseSquare
                     | TokenKind::CloseCurly => depth -= 1,
                     TokenKind::Lt if depth == 0 => {
-                        // Typed-collection head? scan forward for the
-                        // group's `>` and the `[`/`{` behind it.
+                        // Typed-collection head (`<T>[...]`/`<K,V>{...}`)
+                        // or a typed object head (`Square<C>(…)`)? Scan
+                        // forward for the group's `>` and the group opener
+                        // behind it; anything else is the relational
+                        // operator `<`.
                         let mut inner = 0i32;
                         let mut j = i + 1;
                         let mut is_container = false;
@@ -2814,7 +3320,11 @@ impl<'a> Engine<'a> {
                                     if inner == 0 {
                                         is_container = matches!(
                                             toks.get(j + 1).map(|t| t.kind),
-                                            Some(TokenKind::OpenSquare | TokenKind::OpenCurly)
+                                            Some(
+                                                TokenKind::OpenSquare
+                                                    | TokenKind::OpenCurly
+                                                    | TokenKind::OpenParen
+                                            )
                                         );
                                         break;
                                     }
@@ -2827,23 +3337,35 @@ impl<'a> Engine<'a> {
                         if is_container {
                             i = j;
                         } else {
+                            self.emit_refutable_pattern(lo, hi);
                             return;
                         }
                     }
-                    TokenKind::BarBar
-                    | TokenKind::AmpersandAmpersand
-                    | TokenKind::EqEq
-                    | TokenKind::BangEq
-                    | TokenKind::Gt
-                    | TokenKind::GtEq
+                    TokenKind::BarBar if depth == 0 => logical_or = true,
+                    TokenKind::AmpersandAmpersand if depth == 0 => logical_and = Some(i),
+                    TokenKind::EqEq | TokenKind::BangEq | TokenKind::Gt | TokenKind::GtEq
                     | TokenKind::LtEq
                         if depth == 0 =>
                     {
+                        self.emit_refutable_pattern(lo, hi);
                         return;
                     }
                     _ => {}
                 }
                 i += 1;
+            }
+            if logical_or {
+                self.emit_refutable_pattern(lo, hi);
+                return;
+            }
+            // `&&` forwards the context verbatim to BOTH operands
+            // (`analyzeLogicalAndPattern`), each seeing the same matched
+            // value type — the left-associative split takes the LAST
+            // depth-0 operator.
+            if let Some(op) = logical_and {
+                self.irrefutable_node(lo, op, matched, assign);
+                self.irrefutable_node(op + 1, hi, matched, assign);
+                return;
             }
         }
         match toks[lo].kind {
@@ -2872,14 +3394,14 @@ impl<'a> Engine<'a> {
                     }
                 }
                 if !is_record {
-                    self.irrefutable_node(lo + 1, close, matched);
+                    self.irrefutable_node(lo + 1, close, matched, assign);
                     return;
                 }
                 let fields = self.pattern_fields(lo + 1, close);
                 let mut positional = Vec::new();
                 let mut named: Vec<(StringId, Ty)> = Vec::new();
                 let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
-                for (name, _, _) in &fields {
+                for (name, _, _, _) in &fields {
                     match name {
                         Some(name) => named.push((*name, object_q)),
                         None => positional.push(object_q),
@@ -2904,7 +3426,7 @@ impl<'a> Engine<'a> {
                     fields
                         .iter()
                         .enumerate()
-                        .map(|(index, (name, _, _))| {
+                        .map(|(index, (name, _, _, _))| {
                             if let Ty::Record { shape, .. } = matched {
                                 let shape = pool.record_shape(shape);
                                 if shape.positional.len() == positional.len()
@@ -2928,8 +3450,8 @@ impl<'a> Engine<'a> {
                         })
                         .collect()
                 };
-                for ((_, fld_lo, fld_hi), slot) in fields.iter().zip(slots) {
-                    self.irrefutable_node(*fld_lo, *fld_hi, slot);
+                for ((_, fld_lo, fld_hi, _), slot) in fields.iter().zip(slots) {
+                    self.irrefutable_node(*fld_lo, *fld_hi, slot, assign);
                 }
             }
             TokenKind::OpenSquare | TokenKind::Lt => {
@@ -2990,8 +3512,12 @@ impl<'a> Engine<'a> {
                         if let Some(at) = self.token_span(lo, hi) {
                             self.emit_irrefutable(at, matched, required);
                         }
-                        for (_, fld_lo, fld_hi) in &fields {
-                            self.irrefutable_node(*fld_lo, *fld_hi, element);
+                        // A rest element's sub-pattern sees the LIST, not
+                        // the element (`analyzeListPattern`:
+                        // `subPatternMatchedType = requiredType`).
+                        for (_, fld_lo, fld_hi, rest) in &fields {
+                            let column = if *rest { required } else { element };
+                            self.irrefutable_node(*fld_lo, *fld_hi, column, assign);
                         }
                     }
                     _ => {
@@ -3016,11 +3542,18 @@ impl<'a> Engine<'a> {
                         if let Some(at) = self.token_span(lo, hi) {
                             self.emit_irrefutable(at, matched, required);
                         }
-                        for (_, fld_lo, fld_hi) in &fields {
+                        for (_, fld_lo, fld_hi, rest) in &fields {
                             // `fld_lo` here is the value sub-pattern —
                             // [`Self::pattern_fields`] already split the
-                            // `key: value` pair for `{}`-led groups.
-                            self.irrefutable_node(*fld_lo, *fld_hi, val_ty);
+                            // `key: value` pair for `{}`-led groups. A
+                            // map rest is an error face
+                            // (`rest_element_in_map_pattern`) whose
+                            // sub-pattern sees `dynamic` upstream — no
+                            // mismatch row can land there.
+                            if *rest {
+                                continue;
+                            }
+                            self.irrefutable_node(*fld_lo, *fld_hi, val_ty, assign);
                         }
                     }
                 }
@@ -3047,11 +3580,50 @@ impl<'a> Engine<'a> {
                 if let Some(at) = self.token_span(lo, hi) {
                     self.emit_irrefutable(at, matched, required);
                 }
-                for (_, fld_lo, fld_hi) in &fields {
-                    self.irrefutable_node(*fld_lo, *fld_hi, val_ty);
+                for (_, fld_lo, fld_hi, rest) in &fields {
+                    if *rest {
+                        continue;
+                    }
+                    self.irrefutable_node(*fld_lo, *fld_hi, val_ty, assign);
                 }
             }
             TokenKind::Identifier | TokenKind::Keyword(_) => {
+                // A bare identifier in an assignment context is an
+                // assigned-variable pattern: its required type is the
+                // variable's own declared type, and no object head can
+                // follow (`analyzeAssignedVariablePattern`).
+                if assign && hi == lo + 1 && toks[lo].kind == TokenKind::Identifier {
+                    let name = self.intern(&self.source[toks[lo].byte_range()]);
+                    let Some(required) = self.typed_local(name) else {
+                        return;
+                    };
+                    if let Some(at) = self.token_span(lo, hi) {
+                        self.emit_irrefutable(at, matched, required);
+                    }
+                    return;
+                }
+                // A leading `var`/`final` keyword is the variable pattern's
+                // own modifier, never a type head: strip it and re-dispatch
+                // the remainder (`final int _` is a declared-variable
+                // pattern whose required type is the written `int`; a bare
+                // `var x` infers from the matched value and stays silent).
+                // A leading `const` opens a constant pattern — the parser
+                // owns that refutable row, so the subtree stays silent.
+                let mut lo = lo;
+                while lo < hi
+                    && matches!(
+                        toks[lo].kind,
+                        TokenKind::Keyword(Keyword::Var | Keyword::Final | Keyword::Const)
+                    )
+                {
+                    if toks[lo].kind == TokenKind::Keyword(Keyword::Const) {
+                        return;
+                    }
+                    lo += 1;
+                }
+                if lo >= hi {
+                    return;
+                }
                 // Typed leaf `T x` / `T _` vs object head `Name(...)`.
                 let mut carry = 0u32;
                 let Some((required, next)) = self.reconstruct_ty_at(lo, &mut carry) else {
@@ -3077,7 +3649,7 @@ impl<'a> Engine<'a> {
                             Ty::Named { name, .. } => Some(name),
                             _ => None,
                         };
-                        for (getter, fld_lo, fld_hi) in
+                        for (getter, fld_lo, fld_hi, _) in
                             self.pattern_fields(next + 1, close)
                         {
                             let column = head
@@ -3087,7 +3659,7 @@ impl<'a> Engine<'a> {
                                 .unwrap_or_else(|| {
                                     Self::nullable_form(Ty::named(self.intern("Object")))
                                 });
-                            self.irrefutable_node(fld_lo, fld_hi, column);
+                            self.irrefutable_node(fld_lo, fld_hi, column, assign);
                         }
                     }
                     Some(TokenKind::Identifier | TokenKind::Keyword(_)) => {
@@ -3108,12 +3680,209 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The shared irrefutable walk over a token window: `lo` is the
+    /// pattern's first token (inclusive; a leading `var`/`final` keyword
+    /// is stripped), `hi` the first token AFTER the window, `matched` the
+    /// matched value type. This is the entry point every irrefutable
+    /// context funnels through — the pattern variable declaration's
+    /// destructure window ([`Self::destructure_record`]), a pattern
+    /// assignment's left side ([`Self::irrefutable_walk_pattern_assignment`])
+    /// and a for-in head ([`Self::irrefutable_walk_for_in_head`]).
+    pub(crate) fn irrefutable_walk_between(
+        &mut self,
+        lo: SourceRange,
+        hi: SourceRange,
+        matched: Ty,
+    ) {
+        if matched == Ty::UNKNOWN || self.is_invalid_ty(matched) {
+            return;
+        }
+        let lo = self.token_at_offset(lo.offset);
+        let hi = self.token_at_offset(hi.offset);
+        self.irrefutable_node(lo, hi, matched, false);
+    }
+
+    /// A pattern assignment's left side (`(a, b) = expr`, `Square(:f) =
+    /// expr`): the parser fires the event after the RHS parsed, so the
+    /// matched type is the RHS expression's folded static type and the
+    /// pattern window is the token run between the statement boundary and
+    /// the `=`. Assignment contexts bind no fresh variables — a bare
+    /// identifier is an assigned-variable pattern whose required type is
+    /// the variable's declared one.
+    pub(crate) fn irrefutable_walk_pattern_assignment(&mut self, equals: Token) {
+        let Some(eq) = self.eq_index(equals) else {
+            return;
+        };
+        let Some(lo) = self.pattern_start_before(eq) else {
+            return;
+        };
+        let Some(semi) = self.statement_end_after(eq) else {
+            return;
+        };
+        let Some(matched) = self.assignment_rhs_ty(equals, semi) else {
+            return;
+        };
+        if matched == Ty::UNKNOWN || self.is_invalid_ty(matched) {
+            return;
+        }
+        self.irrefutable_node(lo, eq, matched, true);
+    }
+
+    /// A for-in pattern head (`for (var (int v) in xs)`): the head's
+    /// pattern window runs from the declaration keyword to the `in`, and
+    /// the matched type is the iterable's element type the caller already
+    /// computed (`for_in_element_staging`).
+    pub(crate) fn irrefutable_walk_for_in_head(
+        &mut self,
+        keyword: Token,
+        in_kw: Token,
+        matched: Ty,
+    ) {
+        if matched == Ty::UNKNOWN || self.is_invalid_ty(matched) {
+            return;
+        }
+        let lo = self.token_at_offset(keyword.range.offset) + 1;
+        let hi = self.token_at_offset(in_kw.range.offset);
+        self.irrefutable_node(lo, hi, matched, false);
+    }
+
+    /// The index of the `=` token `equals` names, `None` when the token
+    /// table disagrees (a synthetic recovery token).
+    #[allow(dead_code)] // rider helper: the listener.rs call sites are a later lane
+    fn eq_index(&self, equals: Token) -> Option<usize> {
+        let toks = self.tokens.as_slice();
+        let eq = self.token_at_offset(equals.range.offset);
+        (toks.get(eq).map(|t| t.kind) == Some(TokenKind::Eq)).then_some(eq)
+    }
+
+    /// The pattern's first token before the `=` at index `eq`. The
+    /// pattern's own outermost group closes right before the `=`, so the
+    /// backward depth walk lands on its opener; an object pattern's
+    /// written head (`Square<C>`, `p.C`) is absorbed onto that opener.
+    /// The token before the result must be a statement boundary — a
+    /// pattern assignment in expression position has no reliable window
+    /// and keeps the under-report.
+    #[allow(dead_code)] // rider helper: the listener.rs call sites are a later lane
+    fn pattern_start_before(&self, eq: usize) -> Option<usize> {
+        let toks = self.tokens.as_slice();
+        let mut depth = 0i32;
+        let mut i = eq;
+        let start = loop {
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+            match toks[i].kind {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    depth += 1;
+                }
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    if depth == 0 {
+                        break self.pattern_head_start(i);
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Semicolon if depth == 0 => break i + 1,
+                _ => {}
+            }
+        };
+        let boundary = match start.checked_sub(1).map(|i| toks[i].kind) {
+            None => true,
+            Some(TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::CloseCurly) => true,
+            Some(_) => false,
+        };
+        boundary.then_some(start)
+    }
+
+    /// Absorbs an object pattern's written head onto its `(`: `Name`,
+    /// `p.Name`, and a `<…>` argument group each extend the window left.
+    #[allow(dead_code)] // rider helper: the listener.rs call sites are a later lane
+    fn pattern_head_start(&self, open: usize) -> usize {
+        let toks = self.tokens.as_slice();
+        let mut j = open;
+        if j > 0 && toks[j - 1].kind == TokenKind::Gt {
+            let mut inner = 1i32;
+            let mut k = j - 1;
+            let mut found = None;
+            while k > 0 {
+                k -= 1;
+                match toks[k].kind {
+                    TokenKind::Gt => inner += 1,
+                    TokenKind::Lt => {
+                        inner -= 1;
+                        if inner == 0 {
+                            found = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match found {
+                Some(lt) => j = lt,
+                None => return open,
+            }
+        }
+        if j == 0 || !matches!(toks[j - 1].kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
+            return open;
+        }
+        j -= 1;
+        if j >= 2
+            && toks[j - 1].kind == TokenKind::Period
+            && matches!(
+                toks[j - 2].kind,
+                TokenKind::Identifier | TokenKind::Keyword(_)
+            )
+        {
+            j -= 2;
+        }
+        j
+    }
+
+    /// The `;` offset closing the statement that owns the `=` at index
+    /// `eq` (the RHS window's end), `None` when recovery left none.
+    #[allow(dead_code)] // rider helper: the listener.rs call sites are a later lane
+    fn statement_end_after(&self, eq: usize) -> Option<u32> {
+        let toks = self.tokens.as_slice();
+        let mut depth = 0i32;
+        for token in &toks[eq + 1..] {
+            match token.kind {
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => depth += 1,
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        return Some(token.utf16_offset);
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Semicolon if depth == 0 => return Some(token.utf16_offset),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The assignment RHS's static type: the tail non-`TypeUse` row inside
+    /// `[equals.end, semi)` — the fold's outermost expression row
+    /// ([`Self::single_row_since`]'s discipline).
+    #[allow(dead_code)] // rider helper: the listener.rs call sites are a later lane
+    fn assignment_rhs_ty(&self, equals: Token, semi: u32) -> Option<Ty> {
+        let row = self
+            .rows
+            .iter()
+            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            .filter(|row| row.range.offset >= equals.range.end() && row.range.end() <= semi)
+            .next_back()?;
+        self.initializer_static_ty(row)
+    }
+
     /// Splits a container's inner token window into its field
-    /// sub-patterns: `(name?, lo, hi)` per field — the name of a
+    /// sub-patterns: `(name?, lo, hi, rest)` per field — the name of a
     /// `name: p` record/object field (and of a `key: p` map entry, where
-    /// `lo`/`hi` bound the VALUE), `None` for a positional/bare field.
-    /// Depth-0 commas delimit; a `...` rest marker is skipped.
-    fn pattern_fields(&self, lo: usize, hi: usize) -> Vec<(Option<StringId>, usize, usize)> {
+    /// `lo`/`hi` bound the VALUE), `None` for a positional/bare field;
+    /// `rest` marks a `...` rest element (the marker itself is stripped
+    /// from `lo`, the flag carries the column switch the callers apply).
+    /// Depth-0 commas delimit.
+    fn pattern_fields(&self, lo: usize, hi: usize) -> Vec<(Option<StringId>, usize, usize, bool)> {
         let toks = self.tokens.as_slice();
         let mut fields = Vec::new();
         let mut depth = 0i32;
@@ -3136,7 +3905,8 @@ impl<'a> Engine<'a> {
             };
             if at_break {
                 let mut lo = start;
-                let mut hi = i;
+                let hi = i;
+                let mut rest = false;
                 while lo < hi
                     && matches!(
                         toks[lo].kind,
@@ -3144,6 +3914,7 @@ impl<'a> Engine<'a> {
                     )
                 {
                     lo += 1;
+                    rest = true;
                 }
                 // A `name: p` / `key: p` pair splits at the FIRST depth-0
                 // colon inside the field slice.
@@ -3178,7 +3949,7 @@ impl<'a> Engine<'a> {
                     None => (None, lo),
                 };
                 if sub_lo < hi {
-                    fields.push((name, sub_lo, hi));
+                    fields.push((name, sub_lo, hi, rest));
                 }
                 start = i + 1;
             }
@@ -3213,29 +3984,64 @@ impl<'a> Engine<'a> {
         Some((*args.first()?, *args.get(1)?))
     }
 
+    /// The refutable-shape row: `refutable_pattern_in_irrefutable_context`
+    /// at the node's own extent (`.at(pattern)` — `shared_type_analyzer`
+    /// `refutablePatternInIrrefutableContext`), then `makeRefutable()`
+    /// silences the whole subtree (the caller returns).
+    ///
+    /// The row renders straight from the official registry descriptor:
+    /// this crate's [`SemanticCode`] table carries no variant for it yet
+    /// (the parser owns the constant-pattern face and emits its own row),
+    /// so the semantic walk takes the generated `CodeInfo` and the
+    /// registry-verbatim text rather than inventing a table entry outside
+    /// its lane. A `SemanticCode::RefutablePatternInIrrefutableContext`
+    /// variant would let this site use the shared emit path — rider on
+    /// the code-table lane.
+    fn emit_refutable_pattern(&mut self, lo: usize, hi: usize) {
+        let Some(at) = self.token_span(lo, hi) else {
+            return;
+        };
+        self.report.diagnostics.push(Diagnostic::new(
+            Severity::Error,
+            dartq_diagnostics::REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT,
+            "Refutable patterns can't be used in an irrefutable context.",
+            self.file,
+            at,
+            Some(
+                "Try using an if-case, a 'switch' statement, or a 'switch' expression instead."
+                    .to_string(),
+            ),
+        ));
+    }
+
     /// The one verdict line: `matched` provably not assignable to
     /// `required` reports the node with both display faces (the
     /// `assignable` `None` stays silent — an undecidable name-level ask
     /// under-reports, never fabricates).
     fn emit_irrefutable(&mut self, at: SourceRange, matched: Ty, required: Ty) {
+        // The undecidable faces answer NOTHING, never a fabricated row: a
+        // scope-parameter matched head (the name level cannot read its
+        // bound, so upstream's `isSubtypeOf` question stays open — the
+        // `T` vs `int` shape) and an unresolvable/invalid head both leave
+        // the verdict `None`.
+        if let Ty::Named { name, .. } = matched
+            && (self.is_scope_param(name) || self.is_invalid_ty(matched))
+        {
+            return;
+        }
         // The verdict: `assignable`'s nominal lattice answers first —
         // `Some` is the assignability answer itself, so the report fires
         // on `false`. When it abstains the declared-edge lattice answers
-        // only a NAMED source — an unindexed `Object` head carries no
-        // declared edges at the `Ty` level, so `assignable` defers while
-        // `Object <: List`/`String`/record is false at every grade and
-        // the oracle's row still lands. A `Record`/`Function` matched
-        // face has no name-level decomposition ([`NameTy::from_semantic`]
-        // maps it to a shape-keyed sentinel), so the fallback cannot
-        // express the pair — abstaining here is the oracle's under-report,
-        // never a fabricated row on a valid destructure.
+        // only a NAMED source whose head the model can decompose — an
+        // unindexed `Object` head carries no declared edges at the `Ty`
+        // level, so `assignable` defers while `Object <: List`/`String`/
+        // record is false at every grade and the oracle's row still
+        // lands. Two abstention faces stay SILENT: a `Record`/`Function`
+        // matched face ([`NameTy::from_semantic`] maps it to a
+        // shape-keyed sentinel the fallback cannot express).
         let verdict = match self.assignable(matched, required, false) {
             Some(assignable) => !assignable,
-            None => {
-                matches!(matched, Ty::Named { .. })
-                    && matched != Ty::Dynamic
-                    && !self.name_subtype(matched, required)
-            }
+            None => matches!(matched, Ty::Named { .. }) && !self.name_subtype(matched, required),
         };
         if verdict {
             let a0 = self.ty_display(matched);
@@ -4158,6 +4964,30 @@ impl<'a> Engine<'a> {
                         self.inferred_formal_containers.insert(name);
                     }
                     return Some(solved);
+                }
+                // An unsolved type-PARAMETER spelling no enclosing scope
+                // declares — the receiver container's or the callee's own
+                // parameter the instantiation above could not seed
+                // (`Bag<L>().map((e) => …)`'s `E` off a creation receiver,
+                // `extension<T> on T?`'s `T`, `Bag<Und>`'s rejected `T`) — is
+                // OUR placeholder, not a type the caller's scope can name:
+                // the unit-wide declaration table answers the spelling as a
+                // type, but the oracle solved it. Binding it hands the
+                // bound-aware receiver faces a parameter whose implicit
+                // `Object?` bound fabricates `undefined_*` and
+                // `unchecked_use_of_nullable_value` rows the oracle never
+                // reports, so the formal keeps `dynamic` (the under-report).
+                // Only the pass-1 bind sees the scope; the pass-2 re-bind
+                // keeps its own narrowing gates.
+                if callee_row.is_some()
+                    && !self.is_scope_param(head)
+                    && self
+                        .index
+                        .get(self.file)
+                        .and_then(|elements| elements.decl(head))
+                        .is_some_and(|decl| decl.kind == MicroKind::TypeParam)
+                {
+                    return None;
                 }
                 // `greatestClosure`'s decidable face (upstream
                 // `_inferFormalParameters`): a provable named schema entry
@@ -7848,3 +8678,7 @@ class C {\n\
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ticket_3640_tests.rs"]
+mod ticket_3640_tests;

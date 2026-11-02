@@ -166,6 +166,7 @@ fn unit_report(source: &str) -> FileReport {
             prefix: None,
             deferred: false,
             combinators: Combinators::unfiltered(),
+                non_library: false,
         },
     );
     let mut index = ElementIndex::default();

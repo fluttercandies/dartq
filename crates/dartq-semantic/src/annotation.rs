@@ -633,6 +633,7 @@ mod tests {
                         target: Some(target),
                         prefix,
                         deferred: false,
+                        non_library: false,
                         combinators,
                     },
                 );
@@ -1283,6 +1284,7 @@ mod tests {
                             target: Some(core),
                             prefix: None,
                             deferred: false,
+                            non_library: false,
                             combinators: Combinators::unfiltered(),
                         },
                     );
@@ -1296,6 +1298,7 @@ mod tests {
                         target: Some(target),
                         prefix,
                         deferred: false,
+                        non_library: false,
                         combinators,
                     },
                 );

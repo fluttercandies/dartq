@@ -547,6 +547,7 @@ impl<'a> Face<'a> {
             is_interface,
             is_mixin_class,
             superclass,
+            intro_superclass,
             members,
             type_params,
             type_param_names,
@@ -611,6 +612,15 @@ impl<'a> Face<'a> {
             Some(superclass) => self.name(*superclass),
             None => self.field("no-superclass"),
         }
+        // The claiming fragment's own `extends` fact: a same-unit augment
+        // can fill the merged edge above without writing the clause on the
+        // introduction, and the fold moves diagnostics (the
+        // extends-clause-already-present entry) — L2-relevant.
+        self.field(if *intro_superclass {
+            "intro-extends"
+        } else {
+            "no-intro-extends"
+        });
         // Clause lists in fixed order (with, on, implements), each in
         // written declaration order.
         self.usize(with_clause.len());

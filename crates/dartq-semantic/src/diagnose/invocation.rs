@@ -2516,11 +2516,19 @@ impl<'a> Engine<'a> {
             // null redirectedElement arm skips); the enum posture lives in
             // the query (an enum's generative constructors are implicitly
             // const).
+            //
+            // A generic `= C<T>.name` target reaches the edge with the
+            // selector folded away (the creation capture keeps the head
+            // alone once type arguments intervene), so the written target
+            // is re-read off the token stream here; the emit then anchors
+            // at the whole `C<T>.name` extent exactly like the oracle's
+            // `factoryRedirectionTarget` entity.
+            let (target_container, target, target_span) = self.redirect_target_face(edge);
             if edge.is_const
-                && self.redirect_target_is_const(edge.target_container, edge.target) == Some(false)
+                && self.redirect_target_const(target_container, target) == Some(false)
             {
                 let span = if edge.factory {
-                    edge.span
+                    target_span
                 } else {
                     edge.target_span
                 };
@@ -2556,6 +2564,151 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+    }
+
+    /// The redirect target's `(container, selector, written-span)` face.
+    /// Generative `this.name` edges carry their selector already (the
+    /// `member_span` the caller captured); factory `= C.name` edges carry
+    /// it only when the creation capture kept the continuation — a generic
+    /// `= C<T>.name` writes `C` alone, so the selector is re-read off the
+    /// token stream: `.ident` segments after the head, across one balanced
+    /// `<…>` type-argument group when it intervenes. Two segments or more
+    /// mean the tail is the container and its continuation the selector
+    /// (`p.C<T>.name` splits `C.name`); a lone segment is a qualified
+    /// container head (`= p.C` reads container `C`, the unnamed face); none
+    /// keeps the edge's own answer.
+    fn redirect_target_face(
+        &self,
+        edge: &RedirectEdge,
+    ) -> (StringId, StringId, SourceRange) {
+        if !edge.factory || edge.target != edge.target_container {
+            return (edge.target_container, edge.target, edge.span);
+        }
+        let mut segments: Vec<StringId> = Vec::new();
+        let mut had_generics = false;
+        let mut cursor = edge.span.offset;
+        let mut end = edge.span.end();
+        loop {
+            let Some(dot) = self.token_after(cursor) else {
+                break;
+            };
+            if self.lexeme_at(dot.offset) == Some("<") {
+                // The balanced type-argument group: `<`/`<<` open, `>`/`>>`/
+                // `>>>`/`>=`/`>>=` close (the lexer joins the closing
+                // angles).
+                let mut depth = 1i32;
+                let mut inner = dot.offset;
+                let mut close_end = None;
+                while let Some(next) = self.token_after(inner) {
+                    let lexeme = self.lexeme_at(next.offset).unwrap_or("");
+                    depth += match lexeme {
+                        "<" => 1,
+                        "<<" => 2,
+                        ">" => -1,
+                        ">>" => -2,
+                        ">>>" => -3,
+                        ">=" => -1,
+                        ">>=" => -2,
+                        _ => 0,
+                    };
+                    inner = next.offset;
+                    if depth <= 0 {
+                        close_end = Some(next.end());
+                        break;
+                    }
+                }
+                let Some(close_end) = close_end else {
+                    break;
+                };
+                had_generics = true;
+                end = close_end;
+                cursor = inner;
+                continue;
+            }
+            if self.lexeme_at(dot.offset) != Some(".") {
+                break;
+            }
+            let Some(name) = self.token_after(dot.offset) else {
+                break;
+            };
+            let Some(text) = self.lexeme_at(name.offset) else {
+                break;
+            };
+            if !text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+            {
+                break;
+            }
+            segments.push(self.intern(text));
+            end = name.end();
+            cursor = name.offset;
+        }
+        let span = SourceRange {
+            offset: edge.span.offset,
+            length: end - edge.span.offset,
+        };
+        // The head's `C<T>` type-argument group re-anchors the segment read:
+        // a trailing `.name` after one is the container's own selector
+        // (`C<T>.name` answers `(C, name)`); without one the segments ARE
+        // the qualified rest (`p.C` answers `(C, C)`, `p.C.name` `(C, name)`
+        // — a bare `C` resolution under-reports the prefix face, the same
+        // posture the unrecovered edge already held).
+        match (segments.len(), had_generics) {
+            (0, _) => (edge.target_container, edge.target, span),
+            (1, true) => (edge.target_container, segments[0], span),
+            (1, false) => (segments[0], segments[0], span),
+            _ => (
+                segments[segments.len() - 2],
+                segments[segments.len() - 1],
+                span,
+            ),
+        }
+    }
+
+    /// The redirect target's const verdict — the `redirectedElement.isConst`
+    /// read (`_checkForRedirectToNonConstConstructor`,
+    /// error_verifier.dart:6926-6943). The declaration-kind face leads:
+    /// its per-constructor rows are the only places the unnamed `factory C()`
+    /// latch and the class/enum/extension-type primary constructor's `const`
+    /// keyword ever land (the generative-site scan misses both shapes), and
+    /// they carry the same `is_const` bit for every named face. The
+    /// declaration-site arm stays as the fallback (an `augment` constructor
+    /// introduces no kind row), and the existence-face tail keeps the
+    /// under-report posture for targets no face of this unit can see. The
+    /// enum's generative-constructor exception rides every arm (upstream
+    /// marks them implicitly const).
+    fn redirect_target_const(&self, container: StringId, selector: StringId) -> Option<bool> {
+        let resolved = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        );
+        let decl = resolved.and_then(|(decl, owner)| (owner == self.file).then_some(decl));
+        let enum_target = decl.is_some_and(|decl| decl.kind == ContainerKind::Enum);
+        let unnamed = selector == container || selector == self.intern("new");
+        let key = if unnamed { container } else { selector };
+        if let Some(target) = self.index.get(self.file).and_then(|elements| {
+            elements.decl_kinds().iter().find(|target| {
+                target.kind == crate::model::AugKind::Constructor
+                    && target.container == Some(container)
+                    && target.name == key
+            })
+        }) {
+            return Some(target.is_const || (enum_target && !target.is_factory));
+        }
+        if let Some(site) = self.ctor_decl_site(container, selector) {
+            return Some(site.const_ctor || (enum_target && !site.is_factory));
+        }
+        let decl = decl?;
+        if !self.ctor_face_exists(decl, container, selector) {
+            return None;
+        }
+        Some(enum_target)
     }
 
     /// The super-constructor selector in an initializer list
@@ -4355,7 +4508,7 @@ impl<'a> Engine<'a> {
     /// over the else operand that skips bracket groups and nested
     /// conditionals (`a ? b ? c : d : e` pairs the outer `?` with the last
     /// `:`). `None` when no pairing `?` sits before it.
-    fn conditional_question_before(&self, colon: usize) -> Option<usize> {
+    pub(crate) fn conditional_question_before(&self, colon: usize) -> Option<usize> {
         use dartq_scanner::TokenKind as K;
         let tokens = self.tokens.as_slice();
         let mut depth = 0usize;
@@ -5334,12 +5487,27 @@ impl<'a> Engine<'a> {
                     return true;
                 }
                 // Different heads: the P-side climbs its super-interface
-                // chain to the Q head and substitutes (`asInstanceOf`).
+                // closure to the Q head and substitutes (`asInstanceOf`).
                 let Some(inst) = self.super_instantiation(p_head, q_head) else {
                     return false;
                 };
                 if inst.len() != q_args.len() {
                     return false;
+                }
+                // A non-generic receiver (`p_args` empty): the instantiation
+                // IS `p` expressed over `q_head` — `D0 extends A<dynamic>
+                // implements B<Object?>` reads `A<Object?>` — so `inst`
+                // unifies against `q_args` directly. Substituting `p_args`
+                // through the map would gather nothing at all (the empty
+                // `p_args` rewrite dropped `inst` whole, the TOP_MERGE
+                // family's silence).
+                if p_args.is_empty() {
+                    for (&ia, &qa) in inst.iter().zip(q_args.iter()) {
+                        if !self.infer_gather(ia, qa, params, left_schema, round) {
+                            return false;
+                        }
+                    }
+                    return true;
                 }
                 let map: Vec<(StringId, Ty)> = self
                     .bounds
@@ -10736,7 +10904,10 @@ impl<'a> Engine<'a> {
     /// `_inferConstructors`'s `asInstanceOf` climb, type_analyzer.dart's
     /// `constructorsToInfer`/`inferrer.constrainArguments`).
     ///
-    /// The walk threads one substitution hop at a time through
+    /// The walk covers the container's FULL direct-supertype closure —
+    /// `extends`, `with`, `implements`, and `on` edges all instantiate
+    /// `target` exactly like the official `asInstanceOf` reads the merged
+    /// interface map — threading one substitution hop at a time through
     /// [`Self::clause_instantiation`]'s recorded clause arguments: the
     /// current head's own written clause `S<sup_args>` substitutes the
     /// current instantiation into `sup_args` (the clause arguments spell the
@@ -10745,6 +10916,13 @@ impl<'a> Engine<'a> {
     /// A missing clause, a non-`Ty::Named` clause argument (the capture
     /// records only named heads), a cycle, or the 16-hop cap all answer
     /// `None` — the under-report direction.
+    ///
+    /// Distinct paths instantiating `target` merge through
+    /// [`Self::top_merge_ty`]'s NORM-canonicalized lattice
+    /// (`class_hierarchy.dart`'s `_ClassInterfaceType.update`: the first
+    /// occurrence stands, every later distinct instantiation NORMs then
+    /// merges into it) — `D0 extends A<dynamic> implements B<Object?>`
+    /// answers `A<Object?>`, not the first-found `A<dynamic>`.
     fn super_instantiation(&self, container: StringId, target: StringId) -> Option<Vec<Ty>> {
         if container == target {
             return None;
@@ -10763,51 +10941,141 @@ impl<'a> Engine<'a> {
         };
         // The identity instantiation `container<P…>` — each hop rewrites it
         // through the current head's super-clause.
-        let mut current_head = container;
-        let mut current_args: Vec<Ty> = params_of(container)?
+        let identity: Vec<Ty> = params_of(container)?
             .iter()
             .map(|name| Ty::named(*name))
             .collect();
-        for _ in 0..16 {
-            let superclass = file.container(current_head)?.superclass?;
-            let clause = self.clause_instantiation(current_head, superclass)?;
-            // The clause capture stores the whole `S<args>` Named as its
-            // single entry (overrides.rs's `scan_clause_type`); a bare
-            // `extends S` stores the unparameterized head.
-            let clause_args = match clause.as_slice() {
-                [Ty::Named { args, .. }] if *args != ArgListId::EMPTY => {
-                    self.boundary.args.borrow().get(*args).to_vec()
-                }
-                _ => Vec::new(),
+        // Breadth-first over every direct-supertype edge of every visited
+        // instantiation; `hits` folds every path that lands on `target`.
+        // The dedup key is the (head, arguments) pair — a diamond that
+        // reaches one head through two different instantiations keeps both
+        // climbs live (their transitive faces differ), while a true cycle
+        // still terminates.
+        let mut hits: Option<Vec<Ty>> = None;
+        let mut frontier: VecDeque<(StringId, Vec<Ty>)> = VecDeque::new();
+        let mut seen: FxHashSet<(StringId, Vec<Ty>)> = FxHashSet::default();
+        frontier.push_back((container, identity));
+        let mut hops = 0_u32;
+        while let Some((head, args)) = frontier.pop_front() {
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            if !seen.insert((head, args.clone())) {
+                continue;
+            }
+            // The hop's declaring file: same-file containers read through
+            // the diagnosing unit's own model; a foreign edge resolves in
+            // its declaring library's scope (the member walk's
+            // `resolve_clause_face` posture — the clause capture itself is
+            // same-file only, so a foreign hop contributes its edges but
+            // not their written arguments).
+            let head_file = if file.container(head).is_some() {
+                self.file
+            } else {
+                self.resolve_clause_face(container, self.file, self.lib, head)
+                    .map(|(_, owner)| owner)
+                    .unwrap_or(self.file)
             };
-            // Substitute the CURRENT instantiation into the clause
-            // arguments: they spell `current_head`'s parameters, whose
-            // solutions the current map carries.
-            let super_params = params_of(current_head)?;
-            let map: Vec<(StringId, Ty)> = super_params
-                .iter()
-                .copied()
-                .zip(current_args.iter().copied())
-                .collect();
-            let mut next_args = Vec::with_capacity(clause_args.len());
-            for arg in &clause_args {
-                next_args.push(self.subst_params(*arg, &map)?);
-            }
-            current_head = superclass;
-            current_args = next_args;
-            if current_head == target {
-                return Some(current_args);
-            }
-            // A bare `extends S` (no written arguments) instantiates the
-            // super face to its own parameters' greatest closure — the
-            // climb's next hop substitutes nothing useful; keep the
-            // walk honest by refusing to continue on a parameter-ful head
-            // whose clause gave no arguments.
-            if clause_args.is_empty() && params_of(superclass).is_some() {
-                return None;
+            let Some(found) = self
+                .index
+                .get(head_file)
+                .and_then(|unit| unit.container(head))
+            else {
+                continue;
+            };
+            let head_params = if head_file == self.file {
+                params_of(head).unwrap_or_default()
+            } else {
+                // A foreign container's parameter spellings never reach this
+                // file's capture — the arity is the model's
+                // (`type_param_names`), and the substitution stays
+                // positional.
+                found.type_param_names.to_vec()
+            };
+            let edges = found
+                .superclass
+                .into_iter()
+                .chain(found.with_clause.iter().copied())
+                .chain(found.implements_clause.iter().copied())
+                .chain(found.on_clause.iter().copied());
+            for edge in edges {
+                let Some(clause) = self.clause_instantiation(head, edge) else {
+                    continue;
+                };
+                // The clause capture stores the whole `S<args>` Named as its
+                // single entry (overrides.rs's `scan_clause_type`); a bare
+                // `extends S` stores the unparameterized head.
+                let clause_args = match clause.as_slice() {
+                    [Ty::Named { args: stored, .. }] if *stored != ArgListId::EMPTY => {
+                        self.boundary.args.borrow().get(*stored).to_vec()
+                    }
+                    _ => Vec::new(),
+                };
+                // Substitute the current instantiation into the clause
+                // arguments: they spell `head`'s parameters, whose solutions
+                // `args` carries.
+                let map: Vec<(StringId, Ty)> = head_params
+                    .iter()
+                    .copied()
+                    .zip(args.iter().copied())
+                    .collect();
+                let mut next_args = Vec::with_capacity(clause_args.len());
+                let mut undecidable = false;
+                for arg in &clause_args {
+                    match self.subst_params(*arg, &map) {
+                        Some(ty) => next_args.push(ty),
+                        None => {
+                            undecidable = true;
+                            break;
+                        }
+                    }
+                }
+                if undecidable {
+                    continue;
+                }
+                if edge == target {
+                    let candidate: Vec<Ty> = next_args
+                        .iter()
+                        .map(|&ty| self.norm_ty(ty))
+                        .collect();
+                    hits = Some(match hits {
+                        None => candidate,
+                        Some(existing) => {
+                            let mut merged = Vec::with_capacity(existing.len());
+                            let mut foldable = existing.len() == candidate.len();
+                            if foldable {
+                                for (&x, &y) in existing.iter().zip(candidate.iter()) {
+                                    match self.top_merge_ty(x, y) {
+                                        Some(ty) => merged.push(ty),
+                                        None => {
+                                            foldable = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            // A pair the lattice cannot merge keeps the
+                            // first-found instantiation — the under-report
+                            // direction the conflict face's merge never
+                            // fabricates through.
+                            if foldable { merged } else { existing }
+                        }
+                    });
+                    continue;
+                }
+                // A bare `extends S` (no written arguments) instantiates the
+                // super face to its own parameters' greatest closure — the
+                // climb's next hop substitutes nothing useful; keep the
+                // walk honest by refusing to descend through a
+                // parameter-ful head whose clause gave no arguments.
+                if clause_args.is_empty() && params_of(edge).is_some() {
+                    continue;
+                }
+                frontier.push_back((edge, next_args));
             }
         }
-        None
+        hits
     }
 
     /// The givens lookup spelling of an invoked selector: the written
@@ -13271,31 +13539,80 @@ impl<'a> Engine<'a> {
                         "",
                         range.offset,
                     );
-                } else if row.ty != Ty::UNKNOWN
-                    // An index-result callee (`handlers[i](x)`) reads the
-                    // element argument's written face, where a function-type
-                    // argument (`List<F Function(String)>`) collapses to its
-                    // return head — the callable shape is lost, so the face
-                    // keeps silent; a `Function` head is callable outright.
-                    && self.source.as_bytes().get(self.byte_of(range.offset)) != Some(&b']')
-                    && !matches!(row.ty, Ty::Named { name, .. } if self.strings.resolve(name) == "Function")
-                    // A callee typed by an in-scope type parameter resolves
-                    // callability through its written bound (the resolver's
-                    // `resolveToBound` step — upstream Dart SDK source,
+                } else {
+                    // The callable verdict the oracle's
+                    // `FunctionExpressionInvocationResolver` asks
+                    // (`resolveToBound` + the `call` type-property resolve —
+                    // upstream Dart SDK source,
                     // pkg/analyzer/lib/src/dart/resolver/
-                    // function_expression_invocation_resolver.dart:66: a
-                    // function-form bound (`T extends MyFunction`) answers
-                    // `receiverType is FunctionTypeImpl` and never reaches
-                    // the report arms).
-                    && !matches!(row.ty, Ty::Named { name, .. } if self.is_scope_param(name)
-                        && self.param_bound_callable(name))
-                {
-                    self.emit(
-                        SemanticCode::InvocationOfNonFunctionExpression,
-                        range,
-                        "",
-                        "",
-                    );
+                    // function_expression_invocation_resolver.dart:66-146): a
+                    // function-typed, dynamic, or unresolved callee never
+                    // reports, a `Function`/aliased/`call`-bearing head stays
+                    // silent, and an accessible extension's `call` method
+                    // answers for the literal `1(x)` send the bare arm never
+                    // sees. An index-result callee (`handlers[i](x)`) reads
+                    // the element argument's written face, where a
+                    // function-type argument (`List<F Function(String)>`)
+                    // collapses to its return head — the callable shape is
+                    // lost, so the face keeps silent.
+                    let callable = match row.ty {
+                        Ty::UNKNOWN | Ty::Dynamic | Ty::Function { .. } => true,
+                        // The void-callee use
+                        // (`function_expression_invocation_resolver.dart`'s
+                        // `function.typeOrThrow` read — the `void` verdict
+                        // fires on its own entity ahead of the non-function
+                        // arm, the same split the bare row keeps).
+                        Ty::Void => {
+                            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+                            true
+                        }
+                        Ty::Named {
+                            name, nullable, ..
+                        } => {
+                            if self.source.as_bytes().get(self.byte_of(range.offset))
+                                == Some(&b']')
+                            {
+                                true
+                            } else if nullable
+                                && matches!(
+                                    self.null_asserted_after(range, row.ty),
+                                    Ty::Named { nullable: true, .. }
+                                )
+                            {
+                                // A nullable callee's `call` resolve runs the
+                                // nullable arm upstream
+                                // (type_property_resolver.dart:103-185): only
+                                // an extension applicable to the NULLABLE
+                                // `on` face answers callable — anything else
+                                // reports `unchecked_use_of_nullable_value`'s
+                                // function variant at the callee BEFORE the
+                                // bound's own members recover the send, so a
+                                // class-side `call` never rescues the verdict
+                                // and the non-function arm never fires.
+                                if !self.extension_call_member(name, true) {
+                                    let range = self.paren_wrapped_range(range);
+                                    self.emit_unchecked_nullable(
+                                        range,
+                                        "",
+                                        UncheckedNullableKind::Function,
+                                    );
+                                }
+                                true
+                            } else {
+                                self.callable_named_head(name, false)
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !callable {
+                        let range = self.paren_wrapped_range(range);
+                        self.emit(
+                            SemanticCode::InvocationOfNonFunctionExpression,
+                            range,
+                            "",
+                            "",
+                        );
+                    }
                 }
             }
             RowShape::Bare(BareInfo::Plain { ty }) => {
@@ -13389,7 +13706,7 @@ impl<'a> Engine<'a> {
                     // pkg/analyzer/lib/src/dart/resolver/
                     // function_expression_invocation_resolver.dart:103-121).
                     if matches!(ty, Ty::Record { .. }) {
-                        let range = row.range;
+                        let range = self.paren_wrapped_range(row.range);
                         self.emit(
                             SemanticCode::InvocationOfNonFunctionExpression,
                             range,
@@ -13405,9 +13722,78 @@ impl<'a> Engine<'a> {
                 // every later read consumes the copies, so the scrutinee
                 // borrow ends at this point.
                 let name = *name;
-                let ty_nullable = *ty_nullable;
                 let row_name = row.name;
                 let row_range = row.range;
+                // A null-asserted callee (`key!(context)`) is invoked at the
+                // assertion's own non-null static type: the `!` folds onto
+                // the bare row without a row of its own.
+                let ty_nullable = *ty_nullable
+                    && matches!(
+                        self.null_asserted_after(row_range, *ty),
+                        Ty::Named { nullable: true, .. }
+                    );
+                // A local callee may stand flow-promoted at the send (a
+                // switch-case pattern narrowed the local to a `call`
+                // class — the flow read-type fact drains only at pass 2):
+                // the row defers its re-decision instead of reporting the
+                // declared face (#2547). The flag is computed once: the
+                // member legs below may answer first (and carry their use
+                // credit), while a nullable local still defers — the
+                // parse-time `T?` face is not the send's promoted truth.
+                // An empty-named row (the parenthesized-expression fold's
+                // `)`-anchored bare, a composite's anonymous face) is never a
+                // local — its `""` intern collides with no declared name.
+                let promotes = !self.strings.resolve(row_name).is_empty()
+                    && self
+                        .frames
+                        .iter()
+                        .rev()
+                        .any(|f| f.locals.contains(&row_name));
+                // The nullable bare callee answers the type-property
+                // resolver's nullable arm before any member question
+                // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+                // resolver/type_property_resolver.dart:103-185): only an
+                // extension applicable to the NULLABLE `on` face rescues
+                // the send — a class-side `call`, a `Function` supertype
+                // head, and a function-typed alias RHS all report
+                // `unchecked_use_of_nullable_value`'s function variant at
+                // the callee, the bound-recovery lookup notwithstanding.
+                if ty_nullable && !promotes {
+                    let call_faces = self.extension_call_faces(name, true);
+                    match call_faces.len() {
+                        // A unique application credits the member and its
+                        // import the way the non-nullable leg below does;
+                        // an ambiguous pool resolves nothing upstream.
+                        1 => {
+                            let (face, face_file) = call_faces[0];
+                            if let Some(face_index) = self
+                                .index
+                                .get(face_file)
+                                .and_then(|elements| {
+                                    elements
+                                        .extension_faces()
+                                        .iter()
+                                        .position(|entry| std::ptr::eq(entry, face))
+                                })
+                                .and_then(|index| u32::try_from(index).ok())
+                            {
+                                self.extension_member_used
+                                    .insert((face_file, face_index, self.intern("call")));
+                            }
+                            self.credit_extension_import(face, face_file);
+                        }
+                        0 => {
+                            let range = self.paren_wrapped_range(row_range);
+                            self.emit_unchecked_nullable(
+                                range,
+                                "",
+                                UncheckedNullableKind::Function,
+                            );
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 if self.strings.resolve(name) == "Function" {
                     return;
                 }
@@ -13525,29 +13911,24 @@ impl<'a> Engine<'a> {
                 {
                     return;
                 }
-                // A local callee may stand flow-promoted at the send (a
-                // switch-case pattern narrowed the local to a `call`
-                // class — the flow read-type fact drains only at pass 2):
-                // the row defers its re-decision instead of reporting the
-                // declared face (#2547).
-                if self
-                    .frames
-                    .iter()
-                    .rev()
-                    .any(|f| f.locals.contains(&row_name))
-                {
+                if promotes {
                     self.deferred_invocation_faces.push((row_range, row_name));
                     return;
                 }
+                let range = self.paren_wrapped_range(row_range);
                 self.emit(
                     SemanticCode::InvocationOfNonFunctionExpression,
-                    row_range,
+                    range,
                     "",
                     "",
                 );
             }
             RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. }) => {
                 let is_super = matches!(&row.shape, RowShape::Receiver(Receiver::Super { .. }));
+                // The extension `call` lookups below take `&mut self` (the
+                // applicable-face cache warms on first ask), so the row's
+                // own span copies out while the scrutinee borrow is open.
+                let row_range = row.range;
                 if self.keyword_receiver_state(is_super) != ReceiverState::Valid {
                     return;
                 }
@@ -13561,7 +13942,11 @@ impl<'a> Engine<'a> {
                 // (`extension E on C { int call(int x) => 0;
                 // int m() => this(2); }`, upstream Dart SDK source,
                 // pkg/analyzer/lib/src/dart/resolver/
-                // function_expression_invocation_resolver.dart:92-100).
+                // function_expression_invocation_resolver.dart:92-100). The
+                // named-container read only: an unnamed extension carries
+                // no container entry — its `call` still answers through the
+                // climb's per-hop extension face (`this` types as the `on`
+                // type, where the extension itself applies).
                 if !is_super
                     && let Some((container, kind)) = self.container_context()
                     && kind == ContainerKind::Extension
@@ -13573,26 +13958,33 @@ impl<'a> Engine<'a> {
                 {
                     return;
                 }
-                let start = if is_super {
-                    self.container_context()
-                        .and_then(|(container, _)| {
-                            self.index
-                                .get(self.file)
-                                .and_then(|f| f.container(container))
-                        })
-                        .and_then(|c| c.superclass)
+                let (start, receiver_nullable) = if is_super {
+                    (
+                        self.container_context()
+                            .and_then(|(container, _)| {
+                                self.index
+                                    .get(self.file)
+                                    .and_then(|f| f.container(container))
+                            })
+                            .and_then(|c| c.superclass),
+                        false,
+                    )
                 } else {
                     // An extension's `this` types as its `on` type
                     // ([`Self::this_static_ty`]) — the alias head is the
                     // callable face the climb asks (`extension
                     // ComparatorExtension<T> on Comparator<T>`'s
                     // `this(...)` sends, #2172).
-                    self.container_context().map(|(name, kind)| {
-                        match self.this_static_ty(name, kind) {
-                            Ty::Named { name: head, .. } => head,
-                            _ => name,
-                        }
-                    })
+                    self.container_context()
+                        .map(|(name, kind)| match self.this_static_ty(name, kind) {
+                            Ty::Named {
+                                name: head,
+                                nullable,
+                                ..
+                            } => (Some(head), nullable),
+                            _ => (Some(name), false),
+                        })
+                        .unwrap_or((None, false))
                 };
                 let call = self.intern("call");
                 let mut callable = false;
@@ -13609,8 +14001,17 @@ impl<'a> Engine<'a> {
                     // extension — `compareBy`'s `(R a, R b) => this(...)`,
                     // #2172): the `on` type's head spells an alias the
                     // bounds tables never carry, and the aliased signature
-                    // is the callable face.
-                    if self.alias_fn_sig(name).is_some() {
+                    // is the callable face. The `Function` supertype itself
+                    // is callable outright (`extension E on Function`'s
+                    // `this(...)` sends — `resolveToBound`'s FunctionTypeImpl
+                    // arm). An accessible extension's `call` method answers
+                    // at every hop (the oracle's `typePropertyResolver`
+                    // consults the applicable set — `extension on A { call }`
+                    // makes `super(2)` inside `C extends A` callable).
+                    if self.strings.resolve(name) == "Function"
+                        || self.alias_fn_sig(name).is_some()
+                        || self.extension_call_member(name, receiver_nullable)
+                    {
                         callable = true;
                         break;
                     }
@@ -13622,10 +14023,14 @@ impl<'a> Engine<'a> {
                         callable = true;
                         break;
                     }
-                    link = if is_super { container.superclass } else { None };
+                    // `this` inherits exactly like `super`: the climb keeps
+                    // walking the superclass spine for both receivers — the
+                    // `call` member an answer needs may sit anywhere up it
+                    // (`class C extends A` with `A.call`).
+                    link = container.superclass;
                 }
                 if !callable {
-                    let range = row.range;
+                    let range = self.paren_wrapped_range(row_range);
                     self.emit(
                         SemanticCode::InvocationOfNonFunctionExpression,
                         range,
@@ -13671,12 +14076,113 @@ impl<'a> Engine<'a> {
     /// pkg/analyzer/lib/src/dart/resolver/
     /// function_expression_invocation_resolver.dart:92-100, the
     /// `typePropertyResolver.resolve` call whose lookup consults the
-    /// library's accessible extensions). A nullable receiver matches only
-    /// a nullable `on` type (`String?` is not a subtype of `String` — the
+    /// library's accessible extensions). A nullable receiver matches only a
+    /// nullable `on` type (`String?` is not a subtype of `String` — the
     /// `applicableTo` predicate), matching the face's own applicability
     /// gate.
     pub(crate) fn extension_call_member(&mut self, name: StringId, nullable: bool) -> bool {
         !self.extension_call_faces(name, nullable).is_empty()
+    }
+
+    /// The callable verdict of a `Named` callee head — the same answer the
+    /// deferred face's flow-type arm gives (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/
+    /// function_expression_invocation_resolver.dart:66-146): the `Function`
+    /// supertype, an aliased function signature, a resolved `call` method
+    /// (interface or accessible-extension), or an in-scope type parameter
+    /// whose written bound is callable. Shared between the `Value` row arm
+    /// and the bare face's destructure so the literal `1(x)` send asks the
+    /// same question a bare `x(...)` callee does.
+    fn callable_named_head(&mut self, name: StringId, nullable: bool) -> bool {
+        self.strings.resolve(name) == "Function"
+            || self.alias_fn_sig(name).is_some()
+            || matches!(
+                self.resolved_member(name, self.intern("call")),
+                Some(entry) if entry.kind == MemberKind::Method
+            )
+            || self.extension_call_member(name, nullable)
+            || (self.is_scope_param(name) && self.param_bound_callable(name))
+    }
+
+    /// The oracle's report entity for a non-function callee is the
+    /// `function` NODE — a `ParenthesizedExpression` spans its parens
+    /// (function_expression_invocation_resolver.dart:105/119/136's
+    /// `.at(function)`), so `(x)` reports wider than either row spelling:
+    /// a range anchored at the `(` itself grows to its matching `)`, and
+    /// an inner-token range re-wraps through the group — the token before
+    /// must be `(` whose matching close lands flush on the range end.
+    /// Anything else (argument lists, casts, suffixes) answers the range
+    /// itself.
+    fn paren_wrapped_range(&self, range: SourceRange) -> SourceRange {
+        let tokens = self.tokens.as_slice();
+        let mut wrapped = range;
+        loop {
+            // The row anchored on the opener itself: `(f)` folds its callee
+            // row at the `(` token — the range already leads the group, so
+            // only the close can extend it.
+            let at = tokens.partition_point(|t| t.utf16_offset < wrapped.offset);
+            if tokens
+                .get(at)
+                .is_some_and(|t| t.utf16_offset == wrapped.offset && t.kind == dartq_scanner::TokenKind::OpenParen)
+                && let Some(close) = self.tokens.matching_end(at)
+            {
+                let close_end = self
+                    .utf16_of((tokens[close].byte_offset + tokens[close].byte_len) as usize);
+                if close_end > wrapped.end() {
+                    wrapped = SourceRange {
+                        offset: wrapped.offset,
+                        length: close_end - wrapped.offset,
+                    };
+                    continue;
+                }
+            }
+            // The `end_parenthesized_expression` row sits at the group's `)`
+            // — `(f)`'s callee folds to a bare row anchored on the closer.
+            // Its matching `(` re-opens the group's own extent the way the
+            // inner-token arm below does from the other side.
+            if tokens
+                .get(at)
+                .is_some_and(|t| t.utf16_offset == wrapped.offset && t.kind == dartq_scanner::TokenKind::CloseParen)
+            {
+                let mut depth = 0u32;
+                let mut open = None;
+                for i in (0..at).rev() {
+                    match tokens[i].kind {
+                        dartq_scanner::TokenKind::CloseParen => depth += 1,
+                        dartq_scanner::TokenKind::OpenParen => {
+                            if depth == 0 {
+                                open = Some(i);
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(open) = open {
+                    wrapped = SourceRange {
+                        offset: tokens[open].utf16_offset,
+                        length: wrapped.end() - tokens[open].utf16_offset,
+                    };
+                    continue;
+                }
+            }
+            if at == 0 || tokens[at - 1].kind != dartq_scanner::TokenKind::OpenParen {
+                return wrapped;
+            }
+            let Some(close) = self.tokens.matching_end(at - 1) else {
+                return wrapped;
+            };
+            if tokens[close].utf16_offset != wrapped.end() {
+                return wrapped;
+            }
+            wrapped = SourceRange {
+                offset: tokens[at - 1].utf16_offset,
+                length: self
+                    .utf16_of((tokens[close].byte_offset + tokens[close].byte_len) as usize)
+                    - tokens[at - 1].utf16_offset,
+            };
+        }
     }
 
     /// Every accessible extension face applicable to the head `name` at the
@@ -15054,15 +15560,59 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The resolved member entry of `container.member` from a clean walk.
+    /// The resolved member entry of `container.member`: the existence walk
+    /// stays first-found (the `undefined_*` verdicts' face), but the
+    /// entry's RESULT columns read the merged interface signature —
+    /// `D0 extends A<dynamic> implements B<Object?>` types `member()`'s
+    /// return as `Object?` (the oracle's `getMember` answer over the
+    /// interface map's `_topMerge`), not the `extends` spine's `dynamic`.
+    /// A single-candidate face, an undecidable substitution, or a merge
+    /// conflict keeps the walked entry verbatim.
     pub(crate) fn resolved_member(
         &self,
         container: StringId,
         member: StringId,
     ) -> Option<Projected<'a, MemberEntry>> {
-        match self.walk_members(container, member) {
-            Walk::Found(entry) => Some(entry),
-            _ => None,
+        let found = match self.walk_members(container, member) {
+            Walk::Found(entry) => entry,
+            _ => return None,
+        };
+        let Some(merged) = self.merged_member_entry(container, member) else {
+            return Some(found);
+        };
+        let mut entry = (*found).clone();
+        let mut changed = false;
+        if merged.return_ty != entry.return_ty {
+            entry.return_ty = merged.return_ty;
+            changed = true;
+        }
+        if merged.var_ty != entry.var_ty {
+            entry.var_ty = merged.var_ty;
+            changed = true;
+        }
+        // The parameter columns join the merge the same way — a candidate
+        // pair differing only in formal types carries the merged signature
+        // (the send's argument-assignability face reads it too).
+        if let (Some(m), Some(e)) = (merged.formals.as_deref(), entry.formals.as_deref_mut()) {
+            for (slot, source) in e.positional.iter_mut().zip(m.positional.iter()) {
+                if slot.ty != source.ty {
+                    slot.ty = source.ty;
+                    changed = true;
+                }
+            }
+            for slot in e.named.iter_mut() {
+                if let Some(source) = m.named_formal(slot.name)
+                    && slot.ty != source.ty
+                {
+                    slot.ty = source.ty;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            Some(Projected::Foreign(std::rc::Rc::new(entry)))
+        } else {
+            Some(found)
         }
     }
 
@@ -16651,3 +17201,14 @@ mod ticket_3208_tests;
 #[cfg(test)]
 #[path = "ticket_3436_tests.rs"]
 mod ticket_3436_tests;
+
+/// The #3659 pins (the redirect target's const face re-read through the
+/// declaration-kind table — unnamed factories, primaries of every
+/// container kind, the `= C<T>.name` selector recovery — and the
+/// invoked-callee callable verdict shared across the value, bare, and
+/// `this`/`super` arms with its nullable and parenthesized-extent
+/// faces). Registered here, not in `tests.rs` (other lanes' file), via
+/// `#[path]`.
+#[cfg(test)]
+#[path = "ticket_3659_tests.rs"]
+mod ticket_3659_tests;

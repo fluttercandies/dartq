@@ -12,14 +12,17 @@
 //!
 //! With the feature off, the parser reports `missing_function_body` on the
 //! `;` (oracle `ExecutableBodyTest/test_class_getter_static_noBody` and its
-//! `_language305` variant: one row at the semicolon). With the feature on the
-//! parse tier is silent and the verdict is the analyzer's post-parse
-//! augmentation walk, which picks `missingFunctionBody` or
-//! `functionNotCompleteAfterAugmentations` — not decidable per unit, because
-//! the `augment` may live in another part file. Emitting from the parse tier
-//! there fires on every declaration a later `augment` completes (oracle
+//! `_language305` variant: one row at the semicolon). With the feature on,
+//! the `;` is parse-admitted and the row defers to `parse_unit`'s end: the
+//! verifier's singleton-completeness arm
+//! (`_checkForFunctionBodyCompleteness`, error_verifier.dart:5286-5311)
+//! reports `missingFunctionBody` at the `EmptyFunctionBody.semicolon` when
+//! no `augment` fragment claims the signature, while a claimed chain goes
+//! to `functionNotCompleteAfterAugmentations` (semantic-side) or silence
+//! (completed). The residual — an `augment` living in another part file —
+//! belongs to the semantic augmentation walk (oracle
 //! `ExecutableBodyTest/test_class_getter_static_augmentation_hasBody`: no
-//! rows at all).
+//! rows at all when the completing `augment` is visible).
 
 use super::collector::{Collector, scan_ok};
 
@@ -64,14 +67,21 @@ fn static_getter_semicolon_body_reports_without_augmentations() {
     );
 }
 
-/// The same member under the augmentations feature: the parse tier is silent.
+/// The same member under the augmentations feature: the `;` still carries
+/// the singleton-completeness row. The verifier's
+/// `_checkForFunctionBodyCompleteness` (error_verifier.dart:5286-5311)
+/// reports `missingFunctionBody` at the `EmptyFunctionBody.semicolon` for a
+/// static member whose augmentation chain stays single-fragment and
+/// incomplete — the parser defers the row to `parse_unit`'s end and drops
+/// it only when a same-unit `augment` claims the signature (the oracle row
+/// for `test_class_getter_static_noBody` is `3:21|1` either way).
 #[test]
-fn static_getter_semicolon_body_silent_with_augmentations() {
+fn static_getter_semicolon_body_reports_with_augmentations() {
     let source = "class A {\n  static int get foo;\n}\n";
     assert_eq!(
         rows(source, true),
-        Vec::new(),
-        "the completeness verdict belongs to the post-parse augmentation walk"
+        vec![("missing_function_body".to_string(), 30, 1)],
+        "a singleton incomplete static member reports at its `;` under the feature"
     );
 }
 
@@ -103,16 +113,24 @@ fn external_semicolon_body_silent_without_augmentations() {
 }
 
 /// Top-level methods follow the same fold
-/// (`isExternal || isAugmentationsFeatureEnabled`): report with the feature
-/// off, silent with it on.
+/// (`isExternal || isAugmentationsFeatureEnabled`), but the verifier's
+/// singleton-completeness arm reports `missingFunctionBody` at the `;`
+/// either way: a bodiless `void f();` with no `augment` anywhere is exactly
+/// the single-fragment incomplete chain the oracle flags
+/// (`test_topLevel_function_noBody`: `2:11|1`). The feature flag only
+/// decides WHICH tier emits — with it off the parse `;` arm reports
+/// directly, with it on the deferred unit-end arm reports the same anchor.
 #[test]
-fn top_level_semicolon_body_follows_the_feature() {
+fn top_level_semicolon_body_reports_in_both_stances() {
     let source = "void f();\n";
     assert_eq!(
         rows(source, false),
         vec![("missing_function_body".to_string(), 8, 1)]
     );
-    assert_eq!(rows(source, true), Vec::new());
+    assert_eq!(
+        rows(source, true),
+        vec![("missing_function_body".to_string(), 8, 1)]
+    );
 }
 
 /// `async`/`sync*` bodies never take the abstract arm

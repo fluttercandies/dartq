@@ -287,9 +287,8 @@ fn identical_arms_yield_the_arm_type() {
 /// the official's top-type rule. At name level the pushed face is
 /// `dynamic`, which the inferred-local adoption correctly leaves as the
 /// unspelled unknown marker — the pre-fix push adopted the else arm's
-/// `String?` outright. The same refusal keeps `x is Never` a live test:
-/// on `String?` it is guaranteed-false (the bottom tested type deads the
-/// then block); on the dynamic stand-in it folds nothing.
+/// `String?` outright. `x is Never` deads the then block on either face:
+/// the bottom tested type folds before the operand's type is read (#3610).
 #[test]
 fn dynamic_arm_absorbs_the_join() {
     let source = "void f(bool b, dynamic d, String? s) {\n  var x = b ? d : s;\n  if (x is Never) {\n    x;\n  }\n  x;\n}\n";
@@ -300,11 +299,12 @@ fn dynamic_arm_absorbs_the_join() {
         "`LUB(dynamic, String?)` is `dynamic` — the unspelled unknown \
          marker, never the else arm's `String?`"
     );
+    // Upstream folds `is Never` before reading the operand (flow_analysis.dart:5944-5949).
     assert_eq!(
         dead_of(source, &facts),
-        Vec::<String>::new(),
-        "`x is Never` on the unknown face stays live — the else arm's \
-         `String?` would have deaded the then block"
+        vec!["{\n    x;\n  }".to_string()],
+        "`x is Never` folds to false on the dynamic face too — the bottom \
+         tested type decides before the operand"
     );
 }
 

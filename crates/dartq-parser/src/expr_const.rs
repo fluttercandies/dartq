@@ -547,8 +547,24 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.parse_selector_chain(end, context)
             }
             TokenKind::Lt => {
-                // `<T>[...]` / `<T>{...}` literal with type arguments.
-                let type_param = self.compute_type_param_or_arg_on_lt(false);
+                // `<T>[...]` / `<T>{...}` literal with type arguments. The
+                // group probe runs in declaration mode (official
+                // `parseLiteralListSetMapOrFunction`,
+                // parser_impl.dart:8742-8745, passes `inDeclaration: true`),
+                // so a `<` with no type-shaped content — the malformed
+                // map-pattern entry `{"k": int x < 0}` recovered through
+                // here — forms a RECOVERED group: `parse_arguments`
+                // reports `expected_type_name` at the junk token and
+                // consumes only the `<` (+synthetics), leaving the junk
+                // for the `[`-face, the enclosing `:` recovery and the
+                // entry's value pattern to anchor on (oracle
+                // pattern_context_A01_t02: all four faces sit on the `0`).
+                // Non-declaration mode rejects the group outright and the
+                // unconsumed `<` fell through to the binary loop, which
+                // swallowed the operand and dragged every anchor one token
+                // right (the `refutable_pattern_in_irrefutable_context`
+                // row landed on the closing `}`).
+                let type_param = self.compute_type_param_or_arg_on_lt(true);
                 let _ = type_param.parse_arguments(self);
                 let end = match self.peek_kind() {
                     TokenKind::OpenSquare | TokenKind::Index => self.parse_list_literal(None),

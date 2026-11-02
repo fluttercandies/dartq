@@ -88,7 +88,7 @@ fn import_with_an_interpolated_primary_uri_reports_interpolation() {
 /// whole literal the same way (`"a$b.dart"` = offset 7, length 10).
 #[test]
 fn export_with_an_interpolated_primary_uri_reports_interpolation() {
-    const A: &str = "export \"a\$b.dart\";\n";
+    const A: &str = r#"export "a$b.dart";"#;
 
     let fixture = Fixture::new(&[("lib/a.dart", A)]);
     let mut engine = fixture.engine();

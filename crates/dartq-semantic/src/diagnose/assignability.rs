@@ -1755,7 +1755,7 @@ impl<'a> Engine<'a> {
             // send's result (`Never die(...)` marks the continuation dead —
             // the real-corpus `usageException` idiom, #2161).
             if let (_, RefTarget::Member { container }) = self.resolve_bare(row.name)
-                && let Walk::Found(entry) = self.walk_members(container, row.name)
+                && let Some(entry) = self.resolved_member(container, row.name)
             {
                 let result = self.member_invoke_result(&entry);
                 if result != Ty::UNKNOWN {
@@ -1927,8 +1927,8 @@ impl<'a> Engine<'a> {
                 _ => Ty::UNKNOWN,
             };
         }
-        match self.walk_members(container, row.name) {
-            Walk::Found(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
+        match self.resolved_member(container, row.name) {
+            Some(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
                 let recv = match &row.shape {
                     RowShape::Member { recv } => *recv,
                     // The pre-merge callee selector row (a dot-spelled
@@ -3043,10 +3043,21 @@ impl<'a> Engine<'a> {
     /// `None` for every other neighborhood (a single-operand tail, a
     /// nested composite whose operands the tail row does not pair with).
     fn binary_join_operands<'r>(&'r self, last: &'r Row) -> Option<(&'r Row, bool)> {
-        let index = self.rows.iter().rposition(|row| std::ptr::eq(row, last))?;
+        // The tail row arrives through callers that clone it out of the
+        // stack (`check_assignment`'s borrow split), so identity is the
+        // row's own range — the last row carrying `last`'s span IS `last`
+        // (rows are offset-sorted and a fold never stacks two rows on one
+        // span).
+        let index = self.rows.iter().rposition(|row| row.range == last.range)?;
+        // The left operand is the row whose span ENDS where `last` begins:
+        // a row nested inside `last`'s own span (the `?:` arms of a
+        // parenthesized composite the row model folds into its tail send
+        // row) is `last`'s child, never its operand — the token window
+        // below would index backward across it.
         let left = self.rows[..index]
             .iter()
             .rev()
+            .filter(|row| row.range.end() <= last.range.offset)
             .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
             .find(|row| !self.interpolation_child_rows.contains(&row.range.offset))?;
         let toks = self.tokens.as_slice();
@@ -3087,59 +3098,387 @@ impl<'a> Engine<'a> {
 
     /// The join of two operand types for a `??`/`?:` tail — upstream
     /// answers `leastUpperBound` (`resolveIfNull` non-nulls the left
-    /// first). The name lattice decides the same-head and declared-edge
-    /// pairs (the join is then the supertype), `Null` legs join the
-    /// nullable form of the other, and everything else keeps the right
-    /// operand's face — the under-report direction (a shared-interface
-    /// LUB this model cannot spell stays the operand's own type, never a
-    /// false `Object` verdict).
+    /// first). The rule order is the official one
+    /// (least_upper_bound.dart:391-672): `Invalid`/bottom legs keep the
+    /// other side, tops absorb, `Null` legs join the nullable form of the
+    /// other, nullability merges through the stripped pair (:562-571), and
+    /// the if-null callable coercion (`resolveIfNull`'s `T2'`) re-faces a
+    /// `call`-declaring right operand before the join. The name lattice
+    /// decides the same-head pair (the join is then the head over the
+    /// pairwise-joined arguments — `Iterable<int>`/`Iterable<double>` is
+    /// `Iterable<num>`) and the declared-edge pairs; everything else runs
+    /// the common-supertype walk ([`Self::join_common_supertype`]) — the
+    /// instantiated-closure intersection the oracle computes
+    /// (`least_upper_bound.dart:162-177`). Only a walk this model cannot
+    /// spell keeps the right operand's face — the under-report direction.
     fn join_operand_ty(&self, left: Ty, right: Ty, non_null_left: bool) -> Ty {
+        if left == right {
+            // `UP(T, T) = T` (least_upper_bound.dart:393-395) precedes
+            // every rule below — including the `??` non-null rewrite.
+            return left;
+        }
         let left = if non_null_left {
-            Self::non_null_form(left)
+            // `resolveIfNull`'s `nonNull(L')`: the null literal's face is
+            // bottom (`Never`), which the BOTTOM arm below discharges;
+            // every other shape takes the `?`-strip projection.
+            if left == Ty::Null {
+                Ty::Never
+            } else {
+                Self::non_null_form(left)
+            }
         } else {
             left
         };
+        // `LUB(InvalidType, X) = X` (least_upper_bound.dart:55) and the
+        // BOTTOM rule (:429-451): the spelled side stands.
         match (left, right) {
-            (Ty::Null, other) | (other, Ty::Null) => Self::nullable_form(other),
+            (Ty::Unknown, other) | (other, Ty::Unknown) => return other,
+            (Ty::Never, other) | (other, Ty::Never) => return other,
+            // TOP (:405-427): `dynamic`/`void` absorb the join (the MORETOP
+            // tie keeps the left, the name-level face's own posture).
+            (top @ (Ty::Dynamic | Ty::Void), _) => return top,
+            (_, Ty::Dynamic | Ty::Void) => return right,
+            _ => {}
+        }
+        // NULL (:487-524): `UP(Null, T)` is `T`/`T?`.
+        if let (Ty::Null, other) | (other, Ty::Null) = (left, right) {
+            return Self::nullable_form(other);
+        }
+        // The if-null callable coercion (#3619): `resolveIfNull`'s `T2'`
+        // — a `call`-declaring right operand facing a function-shaped left
+        // joins as its `call` signature (`Function? f; f ??= callable` is
+        // `Function`), never as its own class face.
+        let (left, right) = if non_null_left {
+            self.coerce_if_null_callable(left, right)
+        } else {
+            (left, right)
+        };
+        // Nullability merge (:562-571): `UP(T1?, T2) = UP(T1, T2)?`.
+        if Self::potentially_nullable_ty(left) || Self::potentially_nullable_ty(right) {
+            return Self::nullable_form(self.join_stripped(
+                Self::non_null_form(left),
+                Self::non_null_form(right),
+            ));
+        }
+        self.join_stripped(left, right)
+    }
+
+    /// The bare-`Function` head: the supertype every function type shares
+    /// (subtype.dart's function block) — the join's function-family pivot.
+    fn is_bare_function_head(&self, ty: Ty) -> bool {
+        matches!(ty, Ty::Named { name, nullable: false, args } if name == self.intern("Function") && args == ArgListId::EMPTY)
+    }
+
+    /// Whether the type carries the trailing `?` (the nullability-merge
+    /// gate's face; `Null` never reaches it — the NULL rule ran first).
+    fn potentially_nullable_ty(ty: Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Named { nullable: true, .. } | Ty::Function { nullable: true, .. } | Ty::Record { nullable: true, .. }
+        )
+    }
+
+    /// [`Self::join_operand_ty`]'s stripped core: both operands non-null,
+    /// no `Null`/top/bottom legs left.
+    fn join_stripped(&self, left: Ty, right: Ty) -> Ty {
+        if left == right {
+            // The nullability-merge entry point re-asks `UP(T, T) = T`
+            // (`UP(f?, f)` strips to an identical pair) — the same rule
+            // [`Self::join_operand_ty`] runs on its own entry.
+            return left;
+        }
+        // The function family: a bare `Function` head is the supertype of
+        // every function type — the pair collapses onto it (the FUNCTION
+        // rule's `is_bare_function_id` arm, least_upper_bound.dart:611-635).
+        if self.is_bare_function_head(left) || self.is_bare_function_head(right) {
+            if matches!(left, Ty::Function { .. }) || matches!(right, Ty::Function { .. }) {
+                return if self.is_bare_function_head(left) { left } else { right };
+            }
+        }
+        match (left, right) {
             (
                 Ty::Named {
                     name: l,
-                    nullable: ln,
                     args: la,
+                    ..
                 },
                 Ty::Named {
                     name: r,
-                    nullable: rn,
                     args: ra,
+                    ..
                 },
-            ) if ln == rn => {
+            ) => {
+                let world = self.name_world();
                 if l == r {
-                    Ty::Named {
+                    // Same head over covariant arguments: the pairwise LUB
+                    // (`Iterable<int>`/`Iterable<double>` is `Iterable<num>`);
+                    // a bare or arity-mismatched pair keeps the written right
+                    // (the under-report posture). The argument lists are
+                    // copied out before the recursion interns — the pool's
+                    // `RefCell` cannot hold a read across the nested write.
+                    let (left_args, right_args) = {
+                        let pool = self.boundary.pool();
+                        (pool.get(la).to_vec(), pool.get(ra).to_vec())
+                    };
+                    if la != ra
+                        && left_args.len() == right_args.len()
+                        && !left_args.is_empty()
+                    {
+                        let joined: Vec<Ty> = left_args
+                            .iter()
+                            .zip(right_args.iter())
+                            .map(|(&a, &b)| self.join_operand_ty(a, b, false))
+                            .collect();
+                        return self.boundary.args.borrow_mut().named(l, false, &joined);
+                    }
+                    return Ty::Named {
                         name: l,
-                        nullable: ln,
+                        nullable: false,
                         args: if la == ra { la } else { ra },
-                    }
-                } else {
-                    let world = self.name_world();
-                    if world.named_sub(r, l) {
-                        Ty::Named {
-                            name: l,
-                            nullable: ln,
-                            args: la,
-                        }
-                    } else if world.named_sub(l, r) {
-                        Ty::Named {
-                            name: r,
-                            nullable: rn,
-                            args: ra,
-                        }
-                    } else {
-                        right
-                    }
+                    };
                 }
+                // A declared edge decides only when the argument lists do
+                // not contradict it — the official subtype test is over the
+                // full types, so a same-head instantiation the name walk
+                // cannot compare (`Iterable<int>` vs `List<num>`) falls to
+                // the common-supertype walk below.
+                if world.named_sub(r, l)
+                    && (ra == ArgListId::EMPTY || ra == la)
+                {
+                    return Ty::Named {
+                        name: l,
+                        nullable: false,
+                        args: la,
+                    };
+                }
+                if world.named_sub(l, r)
+                    && (la == ArgListId::EMPTY || la == ra)
+                {
+                    return Ty::Named {
+                        name: r,
+                        nullable: false,
+                        args: ra,
+                    };
+                }
+                self.join_common_supertype(left, right)
             }
+            // A record joins an interface at `Object` (the official record
+            // fallback `UP(RecordType, T2) = UP(Object, T2)`); two records
+            // keep the right face (the field-wise merge is not a question
+            // this join answers — the under-report direction).
+            (Ty::Record { .. }, Ty::Record { .. }) => right,
+            (Ty::Record { .. }, _) | (_, Ty::Record { .. }) => Ty::named(self.intern("Object")),
+            // A function shape against an unrelated interface is
+            // `UP(Object, T2)` (least_upper_bound.dart:611-635); two
+            // DISTINCT function shapes take the coarse `Function` head —
+            // the official correlation-failure fallback (:684-686), the
+            // same answer `dartq_types::least_upper_bound` gives at the
+            // strict layer. Identical pairs already returned above
+            // (`UP(T, T) = T`), so a kept right face here would only
+            // misrender the message.
+            (Ty::Function { .. }, Ty::Function { .. }) => Ty::named(self.intern("Function")),
+            (Ty::Function { .. }, _) | (_, Ty::Function { .. }) => Ty::named(self.intern("Object")),
             _ => right,
         }
+    }
+
+    /// The cross-head common-supertype walk (#3619): the official interface
+    /// LUB intersects the two INSTANTIATED supertype closures and picks the
+    /// deepest unique candidate (`least_upper_bound.dart:162-177, :327-357).
+    /// The name lattice enumerates the common ancestor heads; the strict
+    /// snapshot certifies each candidate — both operands must view the
+    /// candidate under the SAME instantiation (`instance_env` equality —
+    /// `C1<int>` and `C2<double>` both reach `B1`, but as `B1<int>` and
+    /// `B1<double>`, so `B1` is NOT in the instantiated intersection and
+    /// the walk answers `A`). Candidates with no parameters certify
+    /// trivially; a snapshot that cannot answer excludes the candidate
+    /// (the under-report direction). The selection drops tied
+    /// most-specific levels downward — the max-unique-depth descent.
+    fn join_common_supertype(&self, left: Ty, right: Ty) -> Ty {
+        let Ty::Named { name: l, .. } = left else {
+            return right;
+        };
+        let Ty::Named { name: r, .. } = right else {
+            return right;
+        };
+        let world = self.name_world();
+        // The candidate universe: the unit's containers plus the core
+        // ladder names (an in-file pair's shared ancestors are in-file or
+        // core; a name neither side reaches never joins anyway).
+        let mut heads: Vec<StringId> = vec![l, r, self.intern("Object")];
+        for name in [
+            "num", "Comparable", "Iterable", "List", "Set", "Map", "String", "Pattern", "bool",
+            "Enum", "Function", "Future", "Record",
+        ] {
+            heads.push(self.intern(name));
+        }
+        if let Some(elements) = self.index.get(self.file) {
+            for (name, decl) in elements.declarations() {
+                if matches!(
+                    decl.kind,
+                    MicroKind::Class | MicroKind::Mixin | MicroKind::Enum | MicroKind::Extension
+                ) {
+                    heads.push(name);
+                }
+            }
+        }
+        heads.sort_unstable();
+        heads.dedup();
+        // The instantiated-intersection filter: a common ancestor head both
+        // operands reach under one instantiation.
+        let mut candidates: Vec<(StringId, Vec<Ty>)> = Vec::new();
+        for head in heads {
+            if !world.named_sub(l, head) || !world.named_sub(r, head) {
+                continue;
+            }
+            if let Some(args) = self.common_env_args(left, right, head) {
+                candidates.push((head, args));
+            }
+        }
+        if candidates.is_empty() {
+            // Every interface closure contains `Object` — an empty walk is
+            // the unmodeled/undecidable residue, and the oracle's terminal
+            // upper bound stands.
+            return Ty::named(self.intern("Object"));
+        }
+        // The max-unique-depth descent (least_upper_bound.dart's candidate
+        // loop): the most-specific candidates — those no other candidate
+        // strictly subtypes — stand alone when unique; a TIED top level
+        // drops wholesale and the walk continues among the candidates it
+        // dominated (`C implements I1, I2; D implements I1, I2` over a
+        // shared `J` answers `J`, the next level down), never the kept
+        // faces.
+        let mut level = candidates;
+        loop {
+            let dominated: Vec<usize> = (0..level.len())
+                .filter(|&i| {
+                    (0..level.len()).any(|j| {
+                        j != i
+                            && world.named_sub(level[j].0, level[i].0)
+                            && !world.named_sub(level[i].0, level[j].0)
+                    })
+                })
+                .collect();
+            let top: Vec<(StringId, Vec<Ty>)> = level
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !dominated.contains(i))
+                .map(|(_, candidate)| candidate.clone())
+                .collect();
+            if top.len() == 1 {
+                let (head, args) = top[0].clone();
+                return self.boundary.args.borrow_mut().named(head, false, &args);
+            }
+            if top.len() == level.len() {
+                // Every candidate is mutually incomparable (a diamond the
+                // level drop cannot break) — the terminal bound stands.
+                return Ty::named(self.intern("Object"));
+            }
+            // Drop the tied top level; the descent continues among the
+            // candidates it dominated.
+            level = level
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| dominated.contains(i))
+                .map(|(_, candidate)| candidate)
+                .collect();
+        }
+    }
+
+    /// Both operands' instantiation of `head` — `Some(args)` when the strict
+    /// snapshot certifies the SAME argument environment for both sides (the
+    /// instantiated-intersection face of [`Self::join_common_supertype`]),
+    /// `None` when either view is unavailable or they differ. Without a
+    /// snapshot a parameterless resolvable head still certifies (both
+    /// views are the same empty environment); a generic or unresolvable
+    /// head stays undecidable.
+    fn common_env_args(&self, left: Ty, right: Ty, head: StringId) -> Option<Vec<Ty>> {
+        if let Some(ops) = self.ops {
+            let env_left = ops.instance_env(left, head, &self.boundary.args)?;
+            let env_right = ops.instance_env(right, head, &self.boundary.args)?;
+            return (env_left == env_right)
+                .then(|| env_left.into_iter().map(|(_, ty)| ty).collect());
+        }
+        let (container, _owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        )?;
+        container.type_param_names.is_empty().then(Vec::new)
+    }
+
+    /// A `call`-declaring class's signature face as a `Ty` (#3619): the
+    /// instantiated `call` member's [`FnVarSig`] interned through
+    /// [`Self::fn_sig_ty`] — the face both the if-null coercion sites read.
+    fn call_sig_ty(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        let (formals, return_ty, params) = self.instantiated_call_face(name, args)?;
+        let sig = FnVarSig {
+            params,
+            required_positional: u16::try_from(
+                formals.positional.iter().filter(|f| f.required).count(),
+            )
+            .unwrap_or(u16::MAX),
+            positional: formals.positional.iter().map(|f| f.ty).collect(),
+            named: formals
+                .named
+                .iter()
+                .map(|f| (f.name, f.ty, f.required))
+                .collect(),
+            return_ty,
+        };
+        Some(self.fn_sig_ty(&sig))
+    }
+
+    /// The if-null `T2'` callable coercion (#3619, `resolveIfNull`'s
+    /// coercion step): a `call`-declaring class operand facing a
+    /// function-shaped partner joins as its `call` signature — the pair
+    /// `Function?`/`CallableClass<int>` is `UP(Function, int Function())` =
+    /// `Function`. Only the RIGHT operand coerces (the rule coerces the
+    /// if-null VALUE); the left keeps its own face.
+    fn coerce_if_null_callable(&self, left: Ty, right: Ty) -> (Ty, Ty) {
+        let function_shaped =
+            |ty: Ty| matches!(ty, Ty::Function { .. }) || self.is_bare_function_head(ty);
+        if !function_shaped(left) {
+            return (left, right);
+        }
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = right
+            && let Some(sig) = self.call_sig_ty(name, args)
+        {
+            return (left, sig);
+        }
+        (left, right)
+    }
+
+    /// [`Self::check_assignment`]'s if-null value face (#3619): the coerced
+    /// `T2'` for a `??=` write against the bare `Function` head target —
+    /// the `call`-declaring class's signature face when the raw face is
+    /// not assignable (a function-shaped target decides unchanged through
+    /// [`Self::call_method_assignable`]). Every other shape keeps the raw
+    /// value's face.
+    fn coerced_if_null_value(&self, from: Ty, to: Ty) -> Ty {
+        if !matches!(to, Ty::Named { name, .. } if name == self.intern("Function")) {
+            return from;
+        }
+        if self.assignable(from, to, false) == Some(true) {
+            return from;
+        }
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = from
+            && let Some(sig) = self.call_sig_ty(name, args)
+        {
+            return sig;
+        }
+        from
     }
 
     /// The right-hand expression's static type from its result `row`:
@@ -3163,16 +3502,131 @@ impl<'a> Engine<'a> {
     /// awaited operand, whose own static type upstream does not flatten.
     fn rhs_expression_ty(&self, row: &Row) -> Ty {
         let ty = self.rhs_row_ty(row);
+        // The operand extent's `end` latch is the operand's LAST TOKEN's
+        // start (`end_await_expression` pushes `(await_kw.end(),
+        // end.range.offset)` — the token's offset, never its end). The
+        // outer operand row's span CONTAINS that token (`offset <= end`
+        // and `end() >= end`); every row strictly inside the operand ends
+        // before it, and every row past the operand starts after it, so
+        // containment is the outer row's signature. The `<=` shape this
+        // replaced matched only inner rows and left the operand
+        // unflattened. A bare send's row is the one outer row that does NOT
+        // reach the last token: the callee name stands for the whole
+        // `fs()` (`end_await_expression` rewrites that very row — the stack
+        // top), so a row starting AT the operand's first token is the
+        // operand too (`String a = await fs();` reads `String`).
+        let tokens = self.tokens.as_slice();
         if ty != Ty::UNKNOWN
-            && self
-                .await_operand_extents
-                .iter()
-                .any(|&(start, end)| row.range.offset >= start && row.range.end() <= end)
+            && self.await_operand_extents.iter().any(|&(start, end)| {
+                row.range.offset >= start
+                    && row.range.offset <= end
+                    && (row.range.end() >= end
+                        || tokens
+                            .get(tokens.partition_point(|token| token.utf16_offset < start))
+                            .is_some_and(|head| head.utf16_offset == row.range.offset))
+            })
         {
-            self.flatten(ty)
+            self.await_flatten(ty)
         } else {
             ty
         }
+    }
+
+    /// The await face's full flatten (#3619): the official
+    /// `analyzeAwaitExpression` types the expression by `flatten(T)`
+    /// (type_analyzer.dart:542-548), and the flatten walks MORE than the
+    /// one-level `Future<T>` head the name-level [`Self::flatten`]
+    /// spells — a user type that `implements Future<E>` (a class, mixin,
+    /// enum, or extension type — `SubFuture`/`MixFuture`/
+    /// `ExtensionFuture` in the corpus), and a type parameter's written
+    /// bound (`X & B` derives `B`'s future, the promoted-type walk
+    /// `derive_future_type_test` pins). This face keeps the one-level
+    /// answer as its prefix and walks what it left behind.
+    fn await_flatten(&self, ty: Ty) -> Ty {
+        self.derived_future_walk(self.flatten(ty), 0)
+    }
+
+    /// [`Self::await_flatten`]'s derived-future walk: the type argument a
+    /// `Future<E>` view of `ty` carries, through either the written
+    /// `Future` head or the strict snapshot's instantiated supertype view
+    /// (`instance_env` — the user Future-like family), and the
+    /// type-parameter bound walk (`X & B`). Depth-capped: a self-referential
+    /// derivation (`X extends Future<X>`) terminates on the cap, the
+    /// under-report posture.
+    fn derived_future_walk(&self, ty: Ty, depth: u8) -> Ty {
+        if depth > 8 {
+            return ty;
+        }
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        // A written `Future`/`FutureOr` head is [`Self::flatten`]'s own
+        // prefix — the official flatten peels exactly one level
+        // (`flatten(Future<Future<int>>) = Future<int>`, never `int`), so
+        // the instantiated-`Future<E>` view must NOT re-derive it (an
+        // `instance_env` ask on the `Future` head answers `E` again and
+        // double-flattens). The user Future-like shapes (`SubFuture`,
+        // `WithMixFuture`) are the heads this arm exists for.
+        if name != self.intern("Future")
+            && name != self.intern("FutureOr")
+            && let Some(arg) = self.future_type_arg(name, args)
+        {
+            // The user-Future view's argument is the flatten answer
+            // verbatim (the snapshot's instantiated `Future<E>` already
+            // walked the transitive chain — `ExtSubFuture implements
+            // SubFuture implements Future<int>` derives `Future<int>` in
+            // one ask); the argument itself is never re-flattened.
+            return if nullable {
+                Self::nullable_form(arg)
+            } else {
+                arg
+            };
+        }
+        // The `X & B` walk: the relevant question for a type-parameter
+        // operand is which future type its written bound derives — a bound
+        // that derives nothing keeps the operand's own face (flatten of a
+        // non-future is the identity). The bound takes the one-level
+        // flatten first (`X extends FutureOr<Object>` derives `Object`
+        // through the FutureOr rule, `X extends Future<int>` through the
+        // head), then the walk; the depth budget carries the hop, so a
+        // cyclic bound chain terminates on the cap.
+        if let Some(bound) = self.param_bound_of(name) {
+            let walked = self.derived_future_walk(self.flatten(bound), depth + 1);
+            if walked != bound {
+                return if nullable {
+                    Self::nullable_form(walked)
+                } else {
+                    walked
+                };
+            }
+        }
+        ty
+    }
+
+    /// The `Future<E>` argument a USER Future-like type carries: the strict
+    /// snapshot's instantiated `Future<E>` view (a class, mixin, enum, or
+    /// extension type that `implements Future<E>` — directly or through the
+    /// chain, `ExtSubFuture implements SubFuture implements Future<int>`).
+    /// A written `Future` head never asks here — the official flatten takes
+    /// exactly one head level ([`Self::flatten`]'s prefix), and this walk
+    /// never re-flattens what it left. `None` — the type derives no future.
+    fn future_type_arg(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        let ops = self.ops?;
+        let env = ops.instance_env(
+            Ty::Named {
+                name,
+                nullable: false,
+                args,
+            },
+            self.intern("Future"),
+            &self.boundary.args,
+        );
+        env.and_then(|env| env.first().map(|(_, ty)| *ty))
     }
 
     /// `rhs_expression_ty`'s undecorated face — the `??`/`?:` recursion
@@ -3193,10 +3647,62 @@ impl<'a> Engine<'a> {
                 _ => Ty::UNKNOWN,
             };
         }
+        // A bare top-level/local function read (the `b ? f1 : f2` arms)
+        // carries no `Ty` on its row — the element model holds the
+        // signature, so the join reads the tear-off face the same way
+        // `check_assignment`'s fallback does.
+        if ty == Ty::UNKNOWN
+            && let Some(sig) = self.tear_off_sig(row)
+        {
+            ty = self.fn_sig_ty(&sig);
+        }
         if let Some((left, ifnull)) = self.binary_join_operands(row) {
             let left_ty = self.rhs_row_ty(left);
             if left_ty != Ty::UNKNOWN && ty != Ty::UNKNOWN {
                 return self.join_operand_ty(left_ty, ty, ifnull);
+            }
+        }
+        // The `??` fold's own row: `fold_binary` drains the operand rows
+        // into `deferred_miss_rows` and parks a `Value` composite carrying
+        // `Unknown` (the name-level model cannot spell the if-null LUB).
+        // Recover the operands from the deferred stack — the right
+        // operand is the last drained row inside the composite, the `??`
+        // token just before it the operator, and the left operand the
+        // last drained row ending before that operator (a nested `??`'s
+        // own composite folds in between, so the left is not the
+        // composite's head row).
+        if ty == Ty::UNKNOWN && matches!(row.shape, RowShape::Value) {
+            let right = self
+                .deferred_miss_rows
+                .iter()
+                .rev()
+                .find(|operand| {
+                    operand.range.offset > row.range.offset
+                        && operand.range.end() <= row.range.end()
+                });
+            if let Some(right) = right {
+                let toks = self.tokens.as_slice();
+                let lo = toks.partition_point(|t| t.utf16_offset < row.range.offset);
+                let op_offset = toks[lo..]
+                    .iter()
+                    .take_while(|t| t.utf16_offset < right.range.offset)
+                    .filter(|t| t.kind == dartq_scanner::TokenKind::QuestionQuestion)
+                    .last()
+                    .map(|t| t.utf16_offset);
+                let left = op_offset.and_then(|op| {
+                    self.deferred_miss_rows
+                        .iter()
+                        .rev()
+                        .filter(|operand| operand.range.end() <= op)
+                        .max_by_key(|operand| operand.range.end())
+                });
+                if let Some(left) = left {
+                    let left_ty = self.rhs_row_ty(left);
+                    let right_ty = self.rhs_row_ty(right);
+                    if left_ty != Ty::UNKNOWN && right_ty != Ty::UNKNOWN {
+                        return self.join_operand_ty(left_ty, right_ty, true);
+                    }
+                }
             }
         }
         ty
@@ -3302,6 +3808,17 @@ impl<'a> Engine<'a> {
             }
             _ => self.assignment_target_ty(&target_row),
         };
+        // The if-null `T2'` coercion (#3619): `resolveIfNull` checks the
+        // COERCED value — `T2 <: J'` refuses but `T2` has a `call` member
+        // whose signature subtypes `J'` (a callable class into the bare
+        // `Function?` target, `Function? local2; local2 ??= callableClass`),
+        // so the write accepts where the raw face would report
+        // (`resolveIfNull`'s coercion step; a function-SHAPED target already
+        // coerces through [`Self::call_method_assignable`] inside
+        // `assignable` — the bare-head target is the arm this adds).
+        if op_text == "??=" {
+            from = self.coerced_if_null_value(from, to);
+        }
         // An unannotated collection literal's row is opaque (`Unknown`):
         // the target's write type is the context that types it, and a
         // context its head cannot match leaves the leaves' own upward type
@@ -5065,6 +5582,12 @@ impl<'a> Engine<'a> {
     /// take the interface refusal.
     fn return_param_source_verdict(&self, from: Ty, to: Ty) -> Option<bool> {
         match from {
+            // Left Null (upstream Dart SDK source, pkg/analyzer/lib/src/
+            // dart/element/subtype.dart:119-140): `Null <: X?` holds, and a
+            // bare type-variable target is false outright — the declared
+            // return's own parameter is no inference variable, so `T m() {
+            // return null; }` reports whatever `T`'s bound.
+            Ty::Null => Some(matches!(to, Ty::Named { nullable: true, .. })),
             Ty::Named {
                 name: from_name, ..
             } if self.return_target_is_type_param(from_name) => None,
@@ -7807,6 +8330,14 @@ impl<'a> Engine<'a> {
         if self.members.primitive_ids.contains(&name) {
             return Some(false);
         }
+        // The bare `Function` head carries no `call` member — the oracle's
+        // `callMethodType` is null there and `isAssignableTo` falls
+        // through to `false` (type_system.dart:910-915): `Function` into a
+        // function-shaped target is a definite rejection, and the
+        // names-only face cannot reach the member walk below.
+        if name == self.intern("Function") {
+            return Some(false);
+        }
         let Some((formals, return_ty, params)) = self.instantiated_call_face(name, args) else {
             // A resolvable container with provably no `call` member
             // rejects the written ask: upstream's `callMethodType` is
@@ -9563,3 +10094,10 @@ mod ticket_3424_tests;
 #[cfg(test)]
 #[path = "ticket_3472_tests.rs"]
 mod ticket_3472_tests;
+
+// The #3619 pins (the `?:`/`??` operand join's real least upper bound,
+// the if-null `T2'` callable coercion, and the await face's user-Future
+// flatten). Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3619_tests.rs"]
+mod ticket_3619_tests;

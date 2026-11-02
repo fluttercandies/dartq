@@ -88,6 +88,16 @@ impl Interp<'_> {
                 if let Some(window) = &mut self.dead {
                     window.extend(*end);
                 }
+                // A statement `for` ends (the recorder pairs `ForEnd` /
+                // `ForInEnd` with this event): the scope its declared head
+                // opened at `VarDeclBegin` closes with it.
+                if let Some(close) = i.checked_sub(1)
+                    && matches!(events[close], Ev::ForEnd | Ev::ForInEnd)
+                    && match_of[close] != NIL
+                    && for_declares_head(events, match_of[close] as usize)
+                {
+                    self.scopes.pop();
+                }
             }
             Ev::IfBegin { span } | Ev::SwitchBegin { span } | Ev::SwitchExprBegin { span } => {
                 self.dead_code(*span);
@@ -1290,6 +1300,23 @@ impl Interp<'_> {
                 is_final,
                 span,
             } => {
+                // A statement `for`'s declared head opens the loop's own
+                // scope (official `visitForStatement` wraps the loop parts
+                // and the body in `withLocalScope`, upstream Dart SDK
+                // source, pkg/analyzer/lib/src/dart/resolver/
+                // resolution_visitor.dart): the loop variables bind there,
+                // and the scope closes at the statement's `StmtEnd`, so a
+                // read after the loop resolves the enclosing declaration of
+                // the same name, or nothing, never the loop variable. Only
+                // the header's type events sit between `ForBegin` and the
+                // head's list ([`for_declares_head`] is the closing side's
+                // twin of this test).
+                if let Some(begin) = events[..i].iter().rposition(|ev| !is_header_type(ev))
+                    && matches!(events[begin], Ev::ForBegin { .. })
+                    && match_of[begin] != NIL
+                {
+                    self.push_scope();
+                }
                 self.header_dead_check(*span);
                 // Nested lists swap-and-save the enclosing context (#1051,
                 // paired at `VarDeclEnd`) — an inner list's header must not
@@ -1370,10 +1397,19 @@ impl Interp<'_> {
                 // identifier), so sealing here keeps the header type for
                 // the list's remaining items.
                 self.in_decl = false;
-                // Declared before the initializer runs (official
-                // `declare(initialized: false)` — a self-reference reads
-                // definitely unassigned).
-                let var = self.declare_var(*name, meta, false);
+                // Declared before the initializer runs, assigned iff the
+                // declarator carries one: the official
+                // `variableDeclarationList` declares every declarator of the
+                // list with `initialized: variable.initializer != null`
+                // before any initializer is visited (upstream Dart SDK
+                // source, pkg/analyzer/lib/src/dart/resolver/
+                // flow_analysis_visitor.dart), so a read inside the
+                // declaration's own initializer reads assigned and never
+                // reports unassigned. The recorder fires `InitializerBegin`
+                // right after the identifier when `= e` follows, and
+                // `NoInitializer` otherwise.
+                let initialized = matches!(events.get(i + 1), Some(Ev::InitializerBegin));
+                let var = self.declare_var(*name, meta, initialized);
                 self.pending_inits.push(var);
             }
             Ev::InitializerBegin => {
@@ -2379,6 +2415,28 @@ impl Interp<'_> {
         });
         self.current = matched;
     }
+}
+
+/// A declaration header's type-annotation event: the only events the
+/// recorder places between a statement `for`'s `ForBegin` and its declared
+/// head's `VarDeclBegin` (function-type formals record nothing).
+fn is_header_type(ev: &Ev) -> bool {
+    matches!(
+        ev,
+        Ev::Type { .. } | Ev::NoType | Ev::FunctionType { .. } | Ev::VoidType
+    )
+}
+
+/// Whether the statement `for` opened at `begin` declares its own loop
+/// variables (`for (var i in xs)`, `for (int i = 0; ...)`): past the
+/// header's type events its head is a variable list. Identifier, pattern,
+/// expression and empty heads declare nothing and open no scope.
+fn for_declares_head(events: &[Ev], begin: usize) -> bool {
+    events
+        .iter()
+        .skip(begin + 1)
+        .find(|ev| !is_header_type(ev))
+        .is_some_and(|ev| matches!(ev, Ev::VarDeclBegin { .. }))
 }
 
 /// The official `attachFinally` at the state level: reachability follows

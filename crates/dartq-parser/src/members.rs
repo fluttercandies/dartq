@@ -553,7 +553,38 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // ExecutableBodyTest/test_class_getter_static_augmentation_hasBody:
         // silent), so the stance follows the feature flag exactly.
         let allow_abstract = is_external || self.features.augmentations_enabled;
+        let body_kind = self.peek_kind();
         let end = self.parse_function_body(false, allow_abstract);
+        // The feature admitted the `;` body silently: the verifier's
+        // singleton-completeness arm (`_checkForFunctionBodyCompleteness`,
+        // error_verifier.dart:5256-5319) covers top-level
+        // function/getter/setter intros exactly like the member arm —
+        // deferred as a `missing_function_body` candidate a same-unit
+        // `augment` fragment of the same signature suppresses.
+        if self.features.augmentations_enabled {
+            let member_kind = match get_or_set {
+                Some(t) if self.cursor.lexeme(t.id) == "get" => 1u8,
+                Some(_) => 2u8,
+                None => 0u8,
+            };
+            let key = crate::parser::BodilessKey {
+                container: None,
+                container_kind: crate::listener::DeclarationKind::TopLevel as u8,
+                member_kind,
+                name: self
+                    .cursor
+                    .lexeme(declared_name.unwrap_or(name).id)
+                    .to_owned(),
+            };
+            if augment.is_some() {
+                self.augment_sigs.push(key);
+            } else if body_kind == TokenKind::Semicolon
+                && self.async_state == AsyncModifier::Sync
+                && !is_external
+            {
+                self.deferred_bodiless.push((key, end));
+            }
+        }
         self.async_state = saved_async;
         let begin_token = self.span_at_mark(before_start);
         self.listener
@@ -1629,7 +1660,48 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 || mods.external.is_some()
                 || self.features.augmentations_enabled)
                 && self.async_state == AsyncModifier::Sync;
-            self.parse_function_body(false, allow_abstract)
+            let end = self.parse_function_body(false, allow_abstract);
+            // Under the augmentations feature the `;` body is admitted
+            // silently and the singleton completeness verdict is deferred
+            // (`_checkForFunctionBodyCompleteness`,
+            // error_verifier.dart:5256-5319): a chain that stays
+            // single-fragment and incomplete reports `missingFunctionBody`
+            // at the `EmptyFunctionBody.semicolon`; a same-unit `augment`
+            // fragment of the same signature (body or not — two fragments
+            // already make the chain) flips it to the multi-fragment face
+            // `function_not_complete_after_augmentations`, a semantic-side
+            // code. The verifier's member gate (`:5273-5280`) exempts the
+            // instance members of a class/enum/mixin (abstract classes may
+            // leave them bodiless) and constructors (factory completeness is
+            // its own walk); `external` fragments count complete.
+            if self.features.augmentations_enabled {
+                let member_kind = match get_or_set {
+                    Some(t) if self.cursor.lexeme(t.id) == "get" => 1u8,
+                    Some(_) => 2u8,
+                    None => 0u8,
+                };
+                let key = crate::parser::BodilessKey {
+                    container: enclosing_declaration_name.map(str::to_owned),
+                    container_kind: kind as u8,
+                    member_kind,
+                    name: self.cursor.lexeme(name.id).to_owned(),
+                };
+                if mods.augment.is_some() {
+                    self.augment_sigs.push(key);
+                } else if body_kind == TokenKind::Semicolon
+                    && self.async_state == AsyncModifier::Sync
+                    && !is_constructor
+                    && mods.external.is_none()
+                    && (static_kw.is_some()
+                        || matches!(
+                            kind,
+                            DeclarationKind::Extension | DeclarationKind::ExtensionType
+                        ))
+                {
+                    self.deferred_bodiless.push((key, end));
+                }
+            }
+            end
         };
         self.async_state = saved_async;
 
@@ -3410,7 +3482,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.peek_kind(),
             TokenKind::Keyword(Keyword::Async | Keyword::Sync)
         ) {
-            self.report(msg::unexpected_token(self.cursor.lexeme(this.id)), this);
+            // `primaryConstructorBodyWithModifier` (parser_impl.dart
+            // :3878-3891): the report anchors on the modifier keyword and
+            // its argument is the lexeme with a trailing `*` for the
+            // generator forms (`async*`/`sync*`).
+            let kw = self.peek_span();
+            let mut modifier = self.cursor.lexeme(kw.id).to_owned();
+            if self.cursor.look_kind(1) == TokenKind::Star {
+                modifier.push('*');
+            }
+            self.report(msg::primary_constructor_body_with_modifier(&modifier), kw);
         }
         self.parse_async_modifier_opt();
         self.parse_function_body(false, self.async_state == AsyncModifier::Sync);

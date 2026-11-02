@@ -436,6 +436,15 @@ pub struct ImportEdge {
     /// Whether the import is `deferred` (recorded, never evaluated —
     /// `loadLibrary` synthesis is the semantic layer's job).
     pub deferred: bool,
+    /// Whether the resolved URI names a non-library unit — a `part of`
+    /// file or an SDK part file — rather than a library. The oracle's
+    /// unused-import gate is `DirectiveUriWithLibraryImpl`
+    /// (imports_verifier.dart:247-248): a directive whose URI does not
+    /// resolve to a library element is never reported `unused_import`,
+    /// however its names happen to resolve. Consumers that emit an
+    /// unused verdict gate on this flag; the flag never changes name
+    /// resolution (the edge's `target`/`prefix` carry that face).
+    pub non_library: bool,
     /// The directive's filters, applied at namespace-build time
     ///.
     pub combinators: Combinators,
@@ -786,6 +795,7 @@ impl<'t> LibraryGraphBuilder<'t> {
                 target: Some(core),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -1590,6 +1600,7 @@ mod tests {
             target,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         }
     }
@@ -1821,6 +1832,7 @@ mod tests {
                 target: Some(math),
                 prefix: Some(strings.intern("m")),
                 deferred: false,
+                non_library: false,
                 combinators: both.clone(),
             },
         );
@@ -2475,6 +2487,7 @@ mod tests {
                 target: None,
                 prefix: Some(prefix),
                 deferred: true,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

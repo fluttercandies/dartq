@@ -2472,7 +2472,7 @@ impl<'a> Engine<'a> {
         // head outside it reads all-covariant — every generic of the
         // default SDK carries legacy-covariant parameters
         // (element.dart:11560-11562).
-        let table: FxHashMap<StringId, Vec<Variance>> = self
+        let mut table: FxHashMap<StringId, Vec<Variance>> = self
             .var_containers
             .iter()
             .map(|container| {
@@ -2486,6 +2486,98 @@ impl<'a> Engine<'a> {
                 )
             })
             .collect();
+        // The typedef half of the table: upstream computes each generic
+        // alias's parameter variances from its aliased body
+        // (variance_builder.dart:173-181, `_computeDeclared` — the element's
+        // stored variance is the BODY-computed value, not a keyword), so a
+        // `typedef F<X> = void Function(X)` head contributes `X`
+        // contravariantly wherever `F<X>` appears. Without the seed the
+        // head reads all-covariant and every `A<F<X>>` superinterface
+        // suppresses. The alias's own parameters carry no `in`/`out`/
+        // `inout` keyword — the computed value IS the declared face.
+        //
+        // Chained aliases (`typedef B<X> = A<X>`) resolve inside the same
+        // fixed-point loop the official worklist runs (`_computeVariances`:
+        // a typedef whose body references an uncomputed alias waits for
+        // its pass). `variance_in_tree` reads an unseeded alias head as
+        // all-covariant — the wrong direction for a pending chain — so the
+        // loop re-seeds until a pass inserts nothing: an unresolvable
+        // cycle or a non-alias head's stall keeps the under-report face
+        // rather than inventing a variance.
+        if let Some(elements) = self.index.get(self.file) {
+            // One conversion per alias; the tree is stable across passes.
+            let aliases: Vec<(StringId, VarTree, Box<[StringId]>)> = elements
+                .decls
+                .iter()
+                .filter(|(_, decl)| decl.kind == MicroKind::TypeAlias)
+                .filter(|(_, decl)| !decl.type_param_names.is_empty())
+                .filter_map(|(name, decl)| {
+                    self.ty_to_tree(decl.var_ty)
+                        .map(|tree| (*name, tree, decl.type_param_names.clone()))
+                })
+                .collect();
+            let mut pending: Vec<&(StringId, VarTree, Box<[StringId]>)> = aliases.iter().collect();
+            loop {
+                let mut stalled = Vec::with_capacity(pending.len());
+                let mut progressed = false;
+                for entry in pending {
+                    let (name, tree, params) = entry;
+                    let variances: Vec<Variance> = params
+                        .iter()
+                        .map(|param| {
+                            variance_in_tree(tree, *param, &table, VARIANCE_WALK_DEPTH)
+                        })
+                        .collect();
+                    // A still-unseeded alias inside the body leaves the
+                    // row all-Unrelated exactly when the param never
+                    // occurs elsewhere — the same row a ready alias with
+                    // a phantom param produces, so the seed cannot wait
+                    // on a signal the walk itself does not carry. The
+                    // insert-then-repass loop resolves it: the pending
+                    // head's row lands on the NEXT pass, after the
+                    // referent seeds. Detect a pending referent by
+                    // walking the body's heads — only a same-file alias
+                    // name not yet in `table` stalls.
+                    let mut waits = false;
+                    let mut frontier = vec![tree];
+                    while let Some(node) = frontier.pop() {
+                        match &node.kind {
+                            VarTreeKind::Head { name, args } => {
+                                if !table.contains_key(name)
+                                    && aliases.iter().any(|(alias, _, _)| alias == name)
+                                {
+                                    waits = true;
+                                    break;
+                                }
+                                frontier.extend(args.iter());
+                            }
+                            VarTreeKind::Fn {
+                                ret,
+                                params,
+                                bounds,
+                            } => {
+                                frontier.extend(ret.iter().map(|ret| ret.as_ref()));
+                                frontier.extend(params.iter().chain(bounds.iter()));
+                            }
+                            VarTreeKind::Record { fields } => {
+                                frontier.extend(fields.iter());
+                            }
+                            VarTreeKind::Unit => {}
+                        }
+                    }
+                    if waits {
+                        stalled.push(entry);
+                        continue;
+                    }
+                    table.insert(*name, variances);
+                    progressed = true;
+                }
+                if stalled.is_empty() || !progressed {
+                    break;
+                }
+                pending = stalled;
+            }
+        }
         // The member name anchors (the model carries no spans; the
         // declaration sites do).
         let member_ranges: FxHashMap<(StringId, StringId), SourceRange> = self
@@ -2594,7 +2686,16 @@ impl<'a> Engine<'a> {
                                 parameter,
                                 anchor,
                             );
-                            if !entry.is_final {
+                            // The induced setter's parameter is covariant
+                            // exactly when the field wrote `covariant`
+                            // (element_builder.dart:504
+                            // `isExplicitlyCovariant` — the mark makes the
+                            // INDUCED setter parameter covariant, the
+                            // upstream `node.covariantKeyword == null`
+                            // clause at error_verifier.dart:7583-7588): a
+                            // `covariant` field fires only the getter-side
+                            // check.
+                            if !entry.is_final && !entry.covariant {
                                 let setter = Variance::Contravariant.combine(variance);
                                 self.check_variance_position(
                                     setter,
@@ -2616,6 +2717,15 @@ impl<'a> Engine<'a> {
                             );
                             if let Some(formals) = &entry.formals {
                                 for formal in formals.positional.iter().chain(&formals.named) {
+                                    // A `covariant` formal skips the
+                                    // contravariant-position check
+                                    // (error_verifier.dart:7633-7635
+                                    // `parameter.isCovariant` — the
+                                    // formal's declared variance IS the
+                                    // contravariant face).
+                                    if formal.covariant {
+                                        continue;
+                                    }
                                     let variance = Variance::Contravariant
                                         .combine(self.variance_in_ty(formal.ty, parameter, &table));
                                     self.check_variance_position(
@@ -2728,8 +2838,10 @@ impl<'a> Engine<'a> {
     }
 
     /// The variance of `parameter` in a model type: the tree walk over the
-    /// converted shape (`Ty` cannot represent function or record shapes —
-    /// an `Unknown` contributes unrelated, the under-report direction).
+    /// converted shape (named, function, and record faces convert; the
+    /// remaining leaves — `dynamic`, `void`, `Unknown`, `Null`, `Never` —
+    /// carry no occurrence and read `unrelated`, the under-report
+    /// direction).
     pub(crate) fn variance_in_ty(
         &self,
         ty: Ty,
@@ -2742,26 +2854,80 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `Ty` → `VarTree` conversion the member/typedef faces walk: the
+    /// interned shapes resolve through the pool (`Named` arguments,
+    /// `Function` return + formals + own-parameter bounds, `Record`
+    /// fields); the primitive leaves (`Unknown`, `Null`, `Dynamic`,
+    /// `Never`, `Void`) have no `VarTreeKind` and answer `None`, matching
+    /// the written-type capture's `void`/recovery `ret: None` face. A
+    /// `None` leaf inside a structure answers `None` for the whole tree —
+    /// the under-report direction, never an invented variance.
     pub(crate) fn ty_to_tree(&self, ty: Ty) -> Option<VarTree> {
-        let Ty::Named {
-            name,
-            nullable,
-            args,
-        } = ty
-        else {
-            return None;
-        };
         let pool = self.boundary.pool();
-        let args = pool
-            .get(args)
-            .iter()
-            .map(|&arg| self.ty_to_tree(arg))
-            .collect::<Option<Vec<_>>>()?;
-        Some(VarTree {
-            nullable,
-            poisoned: false,
-            kind: VarTreeKind::Head { name, args },
-        })
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                let args = pool
+                    .get(args)
+                    .iter()
+                    .map(|&arg| self.ty_to_tree(arg))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(VarTree {
+                    nullable,
+                    poisoned: false,
+                    kind: VarTreeKind::Head { name, args },
+                })
+            }
+            Ty::Function { shape, nullable } => {
+                let shape = pool.function_shape(shape);
+                let ret = match shape.return_ty {
+                    // `void` has no `VarTreeKind`: the written-type capture
+                    // leaves `ret: None` for a `void` return (the unrelated
+                    // contribution), so the model face mirrors it.
+                    Ty::Void => None,
+                    return_ty => Some(Box::new(self.ty_to_tree(return_ty)?)),
+                };
+                let params = shape
+                    .positional
+                    .iter()
+                    .chain(shape.named.iter().map(|(_, ty)| ty))
+                    .map(|&ty| self.ty_to_tree(ty))
+                    .collect::<Option<Vec<_>>>()?;
+                let bounds = shape
+                    .type_params_named
+                    .iter()
+                    .filter_map(|(_, bound)| *bound)
+                    .map(|bound| self.ty_to_tree(bound))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(VarTree {
+                    nullable,
+                    poisoned: false,
+                    kind: VarTreeKind::Fn {
+                        ret,
+                        params,
+                        bounds,
+                    },
+                })
+            }
+            Ty::Record { shape, nullable } => {
+                let shape = pool.record_shape(shape);
+                let fields = shape
+                    .positional
+                    .iter()
+                    .chain(shape.named.iter().map(|(_, ty)| ty))
+                    .map(|&ty| self.ty_to_tree(ty))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(VarTree {
+                    nullable,
+                    poisoned: false,
+                    kind: VarTreeKind::Record { fields },
+                })
+            }
+            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => None,
+        }
     }
 }
 
@@ -2814,3 +2980,12 @@ mod exec_bounds_pairing_tests {
     }
 
 }
+
+// The #3642 pins (the `wrong_type_parameter_variance_position` /
+// `wrong_type_parameter_variance_in_superinterface` pair): the `Ty` →
+// `VarTree` conversion's function/record faces, the typedef variance seed,
+// and the `covariant`-formal/field exemption faces. Registered here via
+// `#[path]` under the same module contract as the #3464 pins above.
+#[cfg(test)]
+#[path = "ticket_3642_tests.rs"]
+mod ticket_3642_tests;

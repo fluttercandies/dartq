@@ -90,6 +90,7 @@ fn sealed_report_prefixed(
             target: Some(dep_lib),
             prefix: prefix.map(|p| strings.intern(p)),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -99,6 +100,7 @@ fn sealed_report_prefixed(
             target: Some(meta),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -470,6 +472,7 @@ fn use_result_report(source: &str) -> FileReport {
             target: Some(meta),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -968,6 +971,7 @@ fn foreign_static_call_formals_render_through_the_boundary() {
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -1166,6 +1170,7 @@ fn boundary_reinterns_foreign_types_and_memoizes_slots() {
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

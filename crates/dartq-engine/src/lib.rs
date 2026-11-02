@@ -2780,6 +2780,13 @@ mod ticket_3146_tests;
 #[path = "ticket_3403_tests.rs"]
 mod ticket_3403_tests;
 
+/// #3658 pins: the `unused_import` release path — element attribution,
+/// per-file row mapping, and the non-library gate, locked to the
+/// `dart analyze` 3.13.7 oracle rows.
+#[cfg(test)]
+#[path = "ticket_3658_tests.rs"]
+mod ticket_3658_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -153,6 +153,7 @@ fn meta_report(main_source: &str) -> FileReport {
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

@@ -541,6 +541,7 @@ fn run_semantic_face(
                 prefix: None,
                 deferred: false,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
     }

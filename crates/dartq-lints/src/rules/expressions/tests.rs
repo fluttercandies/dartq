@@ -69,6 +69,7 @@ fn run_semantic(source: &str, rule: &str, dependency: Option<(&str, Option<&str>
                 prefix,
                 deferred,
                 combinators: Combinators::unfiltered(),
+                non_library: false,
             },
         );
     }

@@ -3999,6 +3999,16 @@ pub(crate) struct Engine<'a> {
     /// Merged into `read_types` at the teardown join, ahead of the sort;
     /// the flow layer types neither span, so the merge cannot collide.
     pub(crate) query_type_rows: Vec<(SourceRange, Ty)>,
+    /// The flow's `void`-typed reads (#3632): `staged_promotion_typed` has
+    /// no `Ty` spelling for a `void` head, so the shared `read_types` join
+    /// drops them — but the statement-form operand faces
+    /// (`…AsIterator`/`…InYieldEach`/the `unary-` operator face) decide
+    /// `isPotentiallyNullable(void)` = true on exactly these rows. Kept
+    /// beside the join instead of inside it: the shared table's
+    /// receiver/scrutinee consumers answer on resolved interface types,
+    /// and a `void` row there would re-decide faces the oracle reports
+    /// through other codes. Only the operand-face staging reads this.
+    pub(crate) void_read_rows: Vec<(SourceRange, Ty)>,
     /// Unnamed-extension frames opened so far (#1701): the walk visits
     /// container heads in source order and the pool appends the matching
     /// application faces in the same order, so the k-th unnamed-extension
@@ -4711,6 +4721,21 @@ pub(crate) enum CallClass {
     /// A resolvable invocable name (top-level function/variable, local
     /// callable): the invocation itself faults.
     Invocable,
+    /// A call through a LOCAL variable or formal parameter. The resolver
+    /// rewrites the bare-identifier `p(...)` from `MethodInvocation` to
+    /// `FunctionExpressionInvocation` (`_rewriteToFunctionExpressionInvocation`,
+    /// resolution_visitor.dart — the `RelationalPatternResolutionTest
+    /// .test_rewrite_operand` fixture), and `ConstantVisitor` has no
+    /// `visitFunctionExpressionInvocation`: the node falls through to
+    /// `visitNode`'s `InvalidConstant.genericError`, whose `invalidConstant`
+    /// code is NOT on `_reportError`'s allow list — so the enclosing site's
+    /// default code reports at the invocation (a map pattern key's
+    /// `non_constant_map_pattern_key`, a relational operand's
+    /// `non_constant_relational_pattern_expression`, a constant pattern's
+    /// `constant_pattern_with_non_constant_expression`, a const
+    /// initializer's `const_initialized_with_non_constant_value`) instead
+    /// of `const_eval_method_invocation`.
+    ValueCall,
     /// Unresolvable, or a container without a const constructor (the
     /// `const_with_non_const*` family) — out of subset, defer.
     Unknown,
@@ -4905,6 +4930,27 @@ pub(crate) struct PromotionStaging {
 #[derive(Default)]
 pub(crate) struct PropPromotionStaging {
     pub(crate) rows: Vec<SourceRange>,
+}
+
+/// The single field-promotion eligibility verdict
+/// ([`Engine::property_promotion_verdict`]) every promotion path and the
+/// why-not-promoted context face share. Three outcomes, because the two
+/// consumers split on the middle one: only an INHERENT non-promotability
+/// renders a context row; a library-level name conflict is the official
+/// non-inherent reason and renders none (this engine cannot enumerate the
+/// conflicting declarations the official message names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PropertyPromotionVerdict {
+    /// A promotable instance field (private, final, not external, no
+    /// same-named conflict in the library).
+    Promotable,
+    /// Non-promotable for a reason intrinsic to the member itself — the
+    /// why-not-promoted context row names it.
+    Inherent(PropertyNonPromotability),
+    /// Non-promotable because a same-named non-final field or concrete
+    /// getter exists elsewhere in the library (the official name-poisoning
+    /// rule) — a non-inherent reason with no rendered context row.
+    NameConflict,
 }
 
 /// One merged `receiver.member` read (B5): the facts the staged-join
@@ -5843,6 +5889,20 @@ impl<'a> Engine<'a> {
                 }
                 return Some(bound.unwrap_or_else(implicit_object));
             }
+        }
+        // A container's own type-parameter spelling (`class C<T extends
+        // num?>` member face — `t.isFinite` over `T t`): its bound lives in
+        // the container capture, never an executable window, so the loop
+        // above missed it. The captured bound decides exactly like an
+        // executable's — `num?` reads nullable, `num` does not — and an
+        // unbounded slot keeps the implicit `Object?` face. The
+        // leaked-schema caveat the doc above carries stays honored: a
+        // spelling no own container declares still falls to
+        // `container_owned` (the under-report direction).
+        if container_owned.is_none()
+            && let Some(bound) = self.bounds.container_param_bound(name)
+        {
+            return Some(bound.map_or_else(implicit_object, |tree| self.tree_ty(&tree)));
         }
         container_owned
     }

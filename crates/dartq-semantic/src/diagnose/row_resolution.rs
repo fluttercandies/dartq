@@ -1306,6 +1306,32 @@ impl<'a> Engine<'a> {
                 (ty != Ty::UNKNOWN).then_some((row.range.offset, ty))
             })
             .collect();
+        // #3646 — local-function visibility extents, rebuilt from the token
+        // stream. The push-time local-function decl row is lost whenever a
+        // nested local-function declaration or a function expression inside
+        // its body clobbered the single `pending_local_fn` latch
+        // (`finish_local_fn_site` then finds nothing to push), and the
+        // decl row never exists yet while the body's own calls push
+        // (upstream binds the name into the block scope before visiting the
+        // body — `resolution_visitor._defineLocalElements`). Both leave a
+        // `Missing` row where the name IS defined. The oracle-visible fix
+        // needs only the name's visible region: the whole enclosing block
+        // for a block statement, just the declaration's own statement for a
+        // non-block sub-statement (`_visitStatementInScope`'s implicit
+        // scope). Built lazily — a single scan only when a bare invocation
+        // miss inside an executable exists.
+        let local_fn_scopes = if rows.iter().any(|row| {
+            matches!(
+                row.shape,
+                RowShape::Bare(BareInfo::Missing {
+                    in_exec: true, ..
+                })
+            ) && matches!(row.intent, Intent::Invoke)
+        }) {
+            self.build_local_fn_scopes()
+        } else {
+            Vec::new()
+        };
         let mut deferred = std::mem::take(&mut self.deferred_miss_rows);
         deferred.sort_by_key(|row| row.range.offset);
         // The flow-blind locals' initializer faces — the pass-2 pre-pass:
@@ -1430,18 +1456,28 @@ impl<'a> Engine<'a> {
                     .conditional_uri_rows
                     .contains(&deferred[index].range.offset)
                 {
-                    self.resolve_row(promotions, &deferred[index], &cascade_targets);
+                    self.resolve_row(
+                        promotions,
+                        &deferred[index],
+                        &cascade_targets,
+                        &local_fn_scopes,
+                    );
                 }
                 index += 1;
             }
-            self.resolve_row(promotions, row, &cascade_targets);
+            self.resolve_row(promotions, row, &cascade_targets, &local_fn_scopes);
         }
         for deferred_row in &deferred[index..] {
             if !self
                 .conditional_uri_rows
                 .contains(&deferred[index].range.offset)
             {
-                self.resolve_row(promotions, deferred_row, &cascade_targets);
+                self.resolve_row(
+                    promotions,
+                    deferred_row,
+                    &cascade_targets,
+                    &local_fn_scopes,
+                );
             }
         }
         // The `[]` argument's void face: the index expression is the
@@ -1464,6 +1500,7 @@ impl<'a> Engine<'a> {
         promotions: &PromotionStaging,
         row: &Row,
         cascade_targets: &[(u32, Ty)],
+        local_fn_scopes: &[(StringId, u32, u32)],
     ) {
         // The #2459②③ cascade-index misfold: a CONTINUATION section's
         // `..[` fold binds the previous section's RHS leftover row
@@ -1486,11 +1523,11 @@ impl<'a> Engine<'a> {
                 write_op: None,
                 ..row.clone()
             };
-            self.resolve_row(promotions, &plain, cascade_targets);
+            self.resolve_row(promotions, &plain, cascade_targets, local_fn_scopes);
             return;
         }
         match &row.shape {
-            RowShape::Bare(info) => self.resolve_bare_row(promotions, row, *info),
+            RowShape::Bare(info) => self.resolve_bare_row(promotions, row, *info, local_fn_scopes),
             RowShape::Member { recv } => {
                 let recv = self.cascade_recv_receiver(row, *recv);
                 let recv = self.promoted_receiver(row.range.offset, recv);
@@ -2180,6 +2217,7 @@ impl<'a> Engine<'a> {
         promotions: &PromotionStaging,
         row: &Row,
         info: BareInfo,
+        local_fn_scopes: &[(StringId, u32, u32)],
     ) {
         let name_text = self.strings.resolve(row.name);
         match info {
@@ -2288,30 +2326,20 @@ impl<'a> Engine<'a> {
                     && let RefTarget::Member { container } = self.refs[at].target
                 {
                     let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-                    // A wildcard `_` never enters the lexical scope
-                    // (upstream `WildcardScope` — the wildcard-variables
-                    // experiment binds `_` nowhere): the member walk's hit
-                    // is an artifact of the name-level climb, not a
-                    // resolution — the bare spelling reports
-                    // `undefined_identifier` (probed 3.13.7: `var a = _;`
-                    // inside `m()` over a `final int _` field reports the
-                    // name, `this._` still resolves). A `_` inside a
-                    // constructor-initializer's RHS resolves to the field
-                    // through the implicit-`this` face instead — the
-                    // initializer's `_checkForImplicitThisReferenceIn
-                    // Initializer` consults the member face directly, so
-                    // the row keeps its member target (the
-                    // `init_this_member` arm below reports it).
-                    if self.is_wildcard(row.name) && !self.init_rows.contains_key(&row.range.offset)
-                    {
-                        self.emit(
-                            SemanticCode::UndefinedIdentifier,
-                            row.range,
-                            name_text,
-                            "",
-                        );
-                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-                    } else {
+                    // A wildcard `_` binds nowhere in the LEXICAL scopes
+                    // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+                    // element/scope.dart — `LocalScope`/`FormalParameter
+                    // Scope`/`TypeParameterScope` skip `_` declarations),
+                    // but the member tables carry no wildcard gate: a
+                    // container member named `_` is an ordinary private
+                    // name, and the bare spelling reaching this face
+                    // RESOLVES to it (probed 3.13.7: `var a = _;` inside
+                    // `m()` over a `final int _` field is silent, and so
+                    // is `const c = _ - 1;` over a `static const _`; the
+                    // wildcard-variables non-binding corpus pins both).
+                    // Only a `_` with no binding anywhere reports — that
+                    // row publishes no member target and dies in the
+                    // Missing arm instead.
                     if write && self.init_rows.contains_key(&row.range.offset) {
                         // A bare name written inside a constructor-initializer
                         // list is the field-initializer LHS (`x = e`) — it
@@ -2358,7 +2386,6 @@ impl<'a> Engine<'a> {
                             kind,
                             landing.map(|(file, origin)| (file, row.name, origin)),
                         );
-                    }
                     }
                 }
                 // The implicit-this face (`_checkForInvalidInstanceMember
@@ -2982,6 +3009,7 @@ impl<'a> Engine<'a> {
                         } else if !Self::synthetic_reference(row.range)
                             && !self.keyword_bare_reference(row.range)
                             && !self.guard.ignore(None, row.name)
+                            && !self.local_fn_scope_hit(local_fn_scopes, row)
                         {
                             self.emit(SemanticCode::UndefinedFunction, row.range, name_text, "");
                         }
@@ -3138,6 +3166,244 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// Whether a bare invocation miss actually resolves to a local function
+    /// whose push-time declaration row was lost (#3646). Two coverages:
+    /// the self-reference set records every read the parse-time walk saw
+    /// from inside the name's own body (upstream `_defineLocalElements`
+    /// binds the local function before visiting its block), and the
+    /// token-scanned extents below cover the sibling calls the
+    /// `pending_local_fn` clobber dropped (a nested declaration or a
+    /// function expression inside the outer body cleared the latch before
+    /// `finish_local_fn_site` ran). The miss stays a miss for the model —
+    /// no `used_names` credit and no local-use record — exactly the state
+    /// the row would carry had its declaration bound without the bug's
+    /// observable difference: upstream reports nothing.
+    fn local_fn_scope_hit(&self, scopes: &[(StringId, u32, u32)], row: &Row) -> bool {
+        // A wildcard `_` local function binds nothing (upstream
+        // `LocalScope` skips `_` declarations under wildcard-variables): its
+        // calls are genuine misses wherever they sit.
+        if self.is_wildcard(row.name) {
+            return false;
+        }
+        if self.self_scope_rows.contains(&row.range.offset) {
+            return true;
+        }
+        let offset = row.range.offset;
+        scopes
+            .iter()
+            .any(|&(name, lo, hi)| name == row.name && offset >= lo && offset < hi)
+    }
+
+    /// Rebuilds every local function declaration's visible region from the
+    /// token table — the pass-2 shape of `resolution_visitor`'s scope
+    /// decision (`_defineLocalElements` + `_visitStatementInScope`). A
+    /// declaration is a name token followed by `<` type parameters or `(`
+    /// formals whose close paren is followed by `{`, `=>`, `async`, or
+    /// `sync` — the parser's own `looksLikeLocalFunction` posture; the
+    /// name's region is the whole enclosing `{..}` for a block statement,
+    /// and just the declaration's own statement for a non-block
+    /// sub-statement (inside `if`/`for`/`while`/`do`/`catch`/`else`/
+    /// `finally`/`case`/`default` or after a label's `:` — upstream wraps
+    /// the statement in an implicit scope binding only itself, so a
+    /// sibling call there genuinely misses).
+    /// Returns `(name, lo, hi)` triples in UTF-16 offsets — the row
+    /// coordinates (`SourceRange::offset`).
+    fn build_local_fn_scopes(&self) -> Vec<(StringId, u32, u32)> {
+        use dartq_scanner::{Keyword, TokenKind};
+        let toks = self.tokens.as_slice();
+        let mut scopes = Vec::new();
+        for (index, token) in toks.iter().enumerate() {
+            if !matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
+                continue;
+            }
+            // A declaration's name never follows a creation keyword or a
+            // member/cascade selector: `const A() => 0` (a switch case's
+            // constant pattern) and `x.m() {…}`-shaped spellings are
+            // invocations, not local functions.
+            if index.checked_sub(1).and_then(|prev| toks.get(prev)).is_some_and(|prev| {
+                matches!(
+                    prev.kind,
+                    TokenKind::Keyword(Keyword::Const | Keyword::New)
+                        | TokenKind::Period
+                        | TokenKind::QuestionPeriod
+                        | TokenKind::PeriodPeriod
+                        | TokenKind::QuestionPeriodPeriod
+                )
+            }) {
+                continue;
+            }
+            let mut cursor = index + 1;
+            // Optional `<T, ...>` type parameters before the formals.
+            if toks.get(cursor).is_some_and(|t| t.kind == TokenKind::Lt) {
+                let mut depth = 0i32;
+                let mut balanced = false;
+                while let Some(t) = toks.get(cursor) {
+                    depth += match t.kind {
+                        TokenKind::Lt => 1,
+                        TokenKind::Gt | TokenKind::GtEq => -1,
+                        TokenKind::GtGt | TokenKind::GtGtEq => -2,
+                        TokenKind::GtGtGt | TokenKind::GtGtGtEq => -3,
+                        _ => 0,
+                    };
+                    cursor += 1;
+                    if depth <= 0 {
+                        balanced = true;
+                        break;
+                    }
+                }
+                if !balanced {
+                    continue;
+                }
+            }
+            if toks
+                .get(cursor)
+                .is_none_or(|t| t.kind != TokenKind::OpenParen)
+            {
+                continue;
+            }
+            let Some(close_paren) = self.tokens.matching_end(cursor) else {
+                continue;
+            };
+            let declared = matches!(
+                toks.get(close_paren + 1).map(|t| t.kind),
+                Some(
+                    TokenKind::OpenCurly
+                        | TokenKind::Function
+                        | TokenKind::Keyword(Keyword::Async)
+                        | TokenKind::Keyword(Keyword::Sync)
+                )
+            );
+            if !declared {
+                continue;
+            }
+            let name = self.intern(self.tokens.lexeme(self.source, index));
+            // The declaration's own end: the `}` matching its body's `{`, or
+            // the `;` terminating its `=>` body. Recovery (`=>` at EOF)
+            // clamps to the source end — a miss past it cannot be a call of
+            // this decl anyway.
+            let token_end = |token: &dartq_scanner::Token| {
+                self.utf16_of((token.byte_offset + token.byte_len) as usize)
+            };
+            let decl_end = {
+                let mut after = close_paren + 1;
+                while matches!(
+                    toks.get(after).map(|t| t.kind),
+                    Some(
+                        TokenKind::Keyword(Keyword::Async)
+                            | TokenKind::Keyword(Keyword::Sync)
+                            | TokenKind::Star
+                    )
+                ) {
+                    after += 1;
+                }
+                match toks.get(after).map(|t| t.kind) {
+                    Some(TokenKind::OpenCurly) => self
+                        .tokens
+                        .matching_end(after)
+                        .map(|end| token_end(&toks[end]))
+                        .unwrap_or_else(|| self.utf16_of(self.source.len())),
+                    Some(TokenKind::Function) => {
+                        // `=>` bodies are expressions: angle brackets are
+                        // ambiguous (comparison vs type argument), so only
+                        // the real groups count — a `=> a < b` comparison
+                        // must not swallow the terminating `;`.
+                        let mut depth = 0i32;
+                        let mut end = self.utf16_of(self.source.len());
+                        for t in toks.iter().skip(after + 1) {
+                            match t.kind {
+                                TokenKind::OpenParen
+                                | TokenKind::OpenSquare
+                                | TokenKind::OpenCurly => depth += 1,
+                                TokenKind::CloseParen
+                                | TokenKind::CloseSquare
+                                | TokenKind::CloseCurly => depth -= 1,
+                                TokenKind::Semicolon | TokenKind::Comma if depth <= 0 => {
+                                    end = t.utf16_offset;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        end
+                    }
+                    _ => self.utf16_of(self.source.len()),
+                }
+            };
+            // The enclosing context: walking backward from the name at
+            // depth 0, a `{` opens the block the declaration scopes over;
+            // a control keyword or `:` first means a non-block
+            // sub-statement — the declaration sees only its own extent.
+            let mut depth = 0i32;
+            let mut block_open = None;
+            let mut non_block = false;
+            for prior in (0..index).rev() {
+                let t = &toks[prior];
+                match t.kind {
+                    // Angle brackets never enclose a declaration — a
+                    // comparison's `>` scanning backward is not a closer,
+                    // and `<` cannot open a context the name sits inside.
+                    TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
+                        depth += 1
+                    }
+                    TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
+                        depth -= 1;
+                        if depth < 0 {
+                            // The enclosing `{` — a block context; a `(`
+                            // or `[` cannot enclose a declaration.
+                            if t.kind == TokenKind::OpenCurly {
+                                block_open = Some(prior);
+                            }
+                            break;
+                        }
+                    }
+                    TokenKind::Colon
+                        | TokenKind::Keyword(Keyword::If)
+                        | TokenKind::Keyword(Keyword::Else)
+                        | TokenKind::Keyword(Keyword::For)
+                        | TokenKind::Keyword(Keyword::While)
+                        | TokenKind::Keyword(Keyword::Do)
+                        | TokenKind::Keyword(Keyword::Try)
+                        | TokenKind::Keyword(Keyword::Catch)
+                        | TokenKind::Keyword(Keyword::Finally)
+                        | TokenKind::Keyword(Keyword::Switch)
+                        | TokenKind::Keyword(Keyword::Case)
+                        | TokenKind::Keyword(Keyword::Default)
+                        | TokenKind::Keyword(Keyword::Assert)
+                        | TokenKind::Keyword(Keyword::On)
+                        if depth == 0 =>
+                    {
+                        non_block = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let (lo, hi) = if non_block {
+                // Own statement only: self-recursion resolves, siblings do
+                // not (upstream `_visitStatementInScope`'s implicit scope).
+                (token.utf16_offset, decl_end)
+            } else if let Some(open_index) = block_open {
+                // The whole block — the declaration's name binds before
+                // any statement runs (`_defineLocalElements`), so a
+                // forward sibling reference also resolves at scope level
+                // (upstream reports `referenced_before_declaration`
+                // through `HiddenElements`, a different family).
+                (
+                    toks[open_index].utf16_offset,
+                    self.tokens
+                        .matching_end(open_index)
+                        .map(|end| token_end(&toks[end]))
+                        .unwrap_or_else(|| self.utf16_of(self.source.len())),
+                )
+            } else {
+                // No enclosing `{`: a top-level declaration — not a local.
+                continue;
+            };
+            scopes.push((name, lo, hi));
+        }
+        scopes
     }
 
     /// The operator token adjacent to a non-operator read/write row (#2815
@@ -4888,16 +5154,32 @@ impl<'a> Engine<'a> {
                     // invocation resolver's `<unknown>` receiverClassName
                     // (method_invocation_resolver.dart — only an
                     // `InterfaceType`/`FunctionType` receiver escapes the
-                    // default), the read/write faces name the `InvalidType`
-                    // the failed lookup left (probe: `Undefined.new()`
-                    // reports `<unknown>`, `var x = Undefined.new` reports
-                    // `InvalidType`).
+                    // default). The read/write faces name the receiver's
+                    // resolved static type — `resolveProperty` reports
+                    // against the `receiverType` it was handed, and only a
+                    // receiver whose own resolution failed reads
+                    // `InvalidType` (probed 3.13.7: `d.new` over a
+                    // `dynamic` variable names 'dynamic'; `var x =
+                    // Undefined.new` keeps `InvalidType`).
                     let type_text = if row.intent == Intent::Invoke {
-                        "<unknown>"
+                        "<unknown>".to_owned()
                     } else {
-                        "InvalidType"
+                        self.member_reads
+                            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                            .ok()
+                            .and_then(|i| self.recv_expression_ty(self.member_reads[i].recv_span))
+                            .and_then(|ty| match ty {
+                                Ty::Dynamic => Some("dynamic".to_owned()),
+                                ty @ Ty::Named { name, .. }
+                                    if !self.is_invalid_ty(ty) =>
+                                {
+                                    Some(self.strings.resolve(name).to_string())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "InvalidType".to_owned())
                     };
-                    self.emit(code, row.range, name_text, type_text);
+                    self.emit(code, row.range, name_text, &type_text);
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
                 }
@@ -10452,7 +10734,16 @@ impl<'a> Engine<'a> {
                     && !self.null_aware_members.contains(&row.range.offset)
                 {
                     let result = self.receiver_static_ty(row);
-                    if self.invoke_callee_function_shaped(result) {
+                    // The official gate mirrors the bare-callee face
+                    // (#2815): `nullable_dereference_verifier.dart`'s
+                    // `_check` reports only a POTENTIALLY-NULLABLE
+                    // function type — a non-null `Function` field or an
+                    // instantiated generic tear-off folding to a non-null
+                    // `Ty::Function` resolves the invoke, never the
+                    // unchecked code.
+                    if self.potentially_nullable(result)
+                        && self.invoke_callee_function_shaped(result)
+                    {
                         self.emit_unchecked_nullable(
                             row.range,
                             "",
@@ -13240,6 +13531,7 @@ mod tests {
             target: None,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::new(
                 [CombinatorClause::Show(
                     vec![strings.intern(name)].into_boxed_slice(),
@@ -13256,6 +13548,7 @@ mod tests {
             target: None,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         }
     }
@@ -13317,6 +13610,7 @@ mod tests {
                 target: Some(lib_sdk),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -13567,6 +13861,7 @@ mod tests {
                         target: Some(lib_u),
                         prefix: None,
                         deferred: false,
+                        non_library: false,
                         combinators: combinators.unwrap_or_else(Combinators::unfiltered),
                     },
                 );
@@ -14199,6 +14494,7 @@ mod tests {
                 target: Some(lib_a),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -14967,3 +15263,17 @@ mod ticket_3187_tests;
 #[cfg(test)]
 #[path = "ticket_f1_tests.rs"]
 mod ticket_f1_tests;
+
+// The #3646 pins — the local-function visibility extents: self-recursion
+// (block and non-block statement scopes), the `pending_local_fn` clobber
+// family (nested declarations and lambdas), and the forward sibling
+// reference all suppress `undefined_function` through the token-scanned
+// regions, while a genuine miss and a local variable's forward reference
+// keep their oracle verdicts.
+#[cfg(test)]
+#[path = "ticket_3646_tests.rs"]
+mod ticket_3646_tests;
+
+#[cfg(test)]
+#[path = "ticket_3619_tests.rs"]
+mod ticket_3619_tests;

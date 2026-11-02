@@ -85,6 +85,7 @@ fn report(main: &str, mix: &str) -> FileReport {
         target: Some(target),
         prefix: None,
         deferred: false,
+        non_library: false,
         combinators: Combinators::unfiltered(),
     };
     builder.import(lib_mix, edge(lib_dialect));

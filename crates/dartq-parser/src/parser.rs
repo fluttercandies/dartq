@@ -141,6 +141,20 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// context-free upstream (`handleUnaryPostfixAssignmentExpression`,
     /// ast_builder.dart:5627-5642).
     pub(crate) statement_expr_begin: Option<TokenId>,
+    /// The parsed-shape assignability of the operand most recently completed
+    /// at postfix precedence — the official `reportErrorIfSuper`-family
+    /// operand test (`_isAssignable`, ast_builder.dart:6607: only
+    /// `Identifier`, `PropertyAccess`, `IndexExpression` qualify;
+    /// `PrefixExpression`, `MethodInvocation`, `FunctionReference`,
+    /// `DotShorthandPropertyAccess` and every other shape do not). The
+    /// precedence loop's `lhs_assignable` flag stores here at each exit so a
+    /// PREFIX `++`/`--` frame can judge the operand its own frame parses —
+    /// `++ ++x` reports `missingAssignableSelector` at the inner operand's
+    /// end token (ast_builder.dart:5643-5659) while `++x = 1` takes the
+    /// assignment arm's whole-LHS anchor instead. Cleared by
+    /// [`Self::parse_precedence_inner`] on entry: non-postfix operands leave
+    /// a stale inner value only where nothing reads it.
+    pub(crate) last_expr_assignable: bool,
     /// `DirectiveContext.state` (`directive_context.dart:20`): where the
     /// unit is in the directive prelude (ordering checks, #300).
     pub(crate) directive_state: crate::directives::DirectiveState,
@@ -240,6 +254,48 @@ pub struct Parser<'s, 't, 'l, L: ParserListener> {
     /// fixed at each block's entry (just inside its `{`), so the scan never
     /// leaves the block whose statement loop is running.
     pub(crate) spill_scan_floor: usize,
+    /// `;`-bodied executable intros collected while the augmentations
+    /// feature admits the body silently (upstream `allowAbstract`,
+    /// parser_impl.dart:4606-4610/:6029-6035). The parser cannot call the
+    /// completeness verdict until the unit's `augment` fragments are all
+    /// seen — the official `_checkForFunctionBodyCompleteness`
+    /// (error_verifier.dart:5256-5319) reports `missingFunctionBody` at the
+    /// `EmptyFunctionBody.semicolon` only for the chain that stays
+    /// single-fragment and incomplete. Entries flush at `parse_unit`'s end:
+    /// a key a same-unit `augment` claimed drops out (the multi-fragment arm
+    /// is `function_not_complete_after_augmentations`, a semantic-side code).
+    /// A completion in another part file is not visible here — that residual
+    /// belongs to the semantic augmentation walk.
+    pub(crate) deferred_bodiless: Vec<(BodilessKey, TokenSpan)>,
+    /// Signature keys of `augment`-introduced method/getter/setter fragments
+    /// parsed in this unit — the chain membership evidence
+    /// [`Self::deferred_bodiless`] suppresses on (any fragment, body or not:
+    /// two fragments make the chain the verifier's
+    /// `function_not_complete_after_augmentations` face, not the singleton
+    /// `missingFunctionBody` row).
+    pub(crate) augment_sigs: Vec<BodilessKey>,
+}
+
+/// The verifier chain key for a `;`-bodied executable introspection
+/// (`ExecutableElement` fragments group by enclosing element + name +
+/// kind). A top-level fragment carries no container; a member's container
+/// key is its enclosing declaration's name — `class A { static get x; }`
+/// and `class B { static get x; }` are different chains. Members of
+/// unnamed declarations key on the declaration kind so an unnamed
+/// extension's member never aliases a top-level name.
+#[derive(PartialEq)]
+pub(crate) struct BodilessKey {
+    /// Enclosing declaration name (`None` = top-level fragment).
+    pub(crate) container: Option<String>,
+    /// Enclosing [`crate::listener::DeclarationKind`] as a `u8` — pairs
+    /// with `container` so two same-named declarations of different kinds
+    /// never merge their chains.
+    pub(crate) container_kind: u8,
+    /// `0` method, `1` getter, `2` setter — the `get`/`set` introducer's
+    /// lexeme folded down (getter/setter chains never mix upstream).
+    pub(crate) member_kind: u8,
+    /// The member's declared name lexeme.
+    pub(crate) name: String,
 }
 
 /// Representation-field shape state for one extension type primary
@@ -293,6 +349,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             currently_recovering: false,
             assignment_op_spliced: false,
             statement_expr_begin: None,
+            last_expr_assignable: false,
             directive_state: crate::directives::DirectiveState::Unknown,
             external_ctor_field_formals: false,
             unmatched_reported: Vec::new(),
@@ -308,6 +365,8 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             ext_type_name_next: None,
             spill_after: None,
             spill_scan_floor: 0,
+            deferred_bodiless: Vec::new(),
+            augment_sigs: Vec::new(),
         }
     }
 
@@ -552,6 +611,22 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             }
         }
         let eof = self.peek_span();
+        // Flush the deferred `missing_function_body` candidates: the unit's
+        // `augment` fragments are all accounted now, so a
+        // `;`-bodied singleton intro whose signature no `augment` claimed
+        // reports `missingFunctionBody` at its semicolon
+        // (`_checkForFunctionBodyCompleteness` singleton arm,
+        // error_verifier.dart:5286-5311). Claimed keys drop out — the
+        // multi-fragment incomplete chain is the semantic walk's
+        // `function_not_complete_after_augmentations` face.
+        let mut i = 0usize;
+        while i < self.deferred_bodiless.len() {
+            if !self.augment_sigs.contains(&self.deferred_bodiless[i].0) {
+                let semi = self.deferred_bodiless[i].1;
+                self.report(crate::message::msg::expected_body(), semi);
+            }
+            i += 1;
+        }
         // Official `reportAllErrorTokens` (parser_impl.dart:11433-11439, run
         // after the declaration loop): the scanner's unmatched groups report
         // here, at `begin.endGroup`'s post-parse offset — adopted closers
@@ -702,6 +777,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             currently_recovering: self.currently_recovering,
             assignment_op_spliced: self.assignment_op_spliced,
             statement_expr_begin: self.statement_expr_begin,
+            last_expr_assignable: self.last_expr_assignable,
             directive_state: self.directive_state,
             external_ctor_field_formals: self.external_ctor_field_formals,
             unmatched_reported: Vec::new(),
@@ -717,6 +793,8 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
             ext_type_name_next: None,
             spill_after: self.spill_after,
             spill_scan_floor: self.spill_scan_floor,
+            deferred_bodiless: Vec::new(),
+            augment_sigs: Vec::new(),
         }
     }
 }

@@ -788,7 +788,7 @@ struct Builder<'src, 'tab> {
     /// one-head form (`note_annotation_segment`'s idiom; upstream resolves
     /// `prefix.Name` through the import namespace as one node — upstream
     /// Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart).
-    pending_qualified: Option<(TokenId, StringId, StringId)>,
+    pending_qualified: Option<(TokenId, StringId, StringId, Option<SourceRange>)>,
     /// The latched declared type of the open field group.
     field_group_ty: Option<Ty>,
     /// The metadata star of the declaration that opens next, in written
@@ -1282,8 +1282,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// spelling, the under-report direction. A non-matching completion (a
     /// type argument's head completing inside the qualified type's own
     /// `<...>`) leaves the latch for the outer head.
-    fn join_qualified(&mut self, name: Token) -> Option<StringId> {
-        let (prefix_id, prefix, cont) = self.pending_qualified?;
+    /// Returns the joined qualified spelling plus the continuation token's
+    /// range — the prefix head's `handle_type` extends the armed range to
+    /// the continuation's end so a `p.T` anchor spans the whole written
+    /// `TypeAnnotation`, matching the oracle's node extent.
+    fn join_qualified(&mut self, name: Token) -> Option<(StringId, Option<SourceRange>)> {
+        let (prefix_id, prefix, cont, cont_range) = self.pending_qualified?;
         if prefix_id != name.id {
             return None;
         }
@@ -1294,7 +1298,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 self.strings.resolve(prefix),
                 self.strings.resolve(cont)
             );
-            self.strings.intern(&joined)
+            (self.strings.intern(&joined), cont_range)
         })
     }
 
@@ -2284,6 +2288,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 is_interface: open.is_interface,
                 is_mixin_class: open.is_mixin_class,
                 superclass: open.superclass,
+                // The claiming fragment's own `extends` fact — the merged
+                // edge above takes a same-unit augment's clause on the fold,
+                // while this flag keeps the per-fragment answer
+                // (`firstFragment.hasExtendsClause`).
+                intro_superclass: open.superclass.is_some(),
                 members: members.finish(),
                 type_params: open.type_params,
                 type_param_names,
@@ -2391,11 +2400,51 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         let Some(mut sitting) = self.named_containers.get(&name).cloned() else {
             return;
         };
-        sitting.members = sitting
-            .members
+        // The `augment`-marked members fold nowhere — except enum
+        // constants: the `constant_variable_augmentation` check walks the
+        // merged container's constants and reads the constant's own
+        // `augment` keyword (upstream fires it per constant FRAGMENT,
+        // `visitEnumConstantDeclaration`, error_verifier.dart:808-818), so
+        // the fragment identity has to survive the fold. A colliding
+        // constant keeps the introduction's row payload (its annotations
+        // and declared type are the element's) but takes the fragment's
+        // `is_augment` and name span — the check's anchor is the
+        // augmenting name token.
+        let augment_constants: Vec<(StringId, MemberEntry)> =
+            if fragment.kind == ContainerKind::Enum {
+                fragment
+                    .enum_constants
+                    .iter()
+                    .filter_map(|constant| {
+                        let entry = fragment.members.get(constant)?;
+                        if !entry.is_augment {
+                            return None;
+                        }
+                        let merged = match sitting.members.get(constant) {
+                            Some(intro) => MemberEntry {
+                                is_augment: true,
+                                name_range: entry.name_range,
+                                ..intro.clone()
+                            },
+                            None => entry.clone(),
+                        };
+                        Some((*constant, merged))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        sitting.members = augment_constants
             .iter()
-            .chain(fragment.members.iter().filter(|(_, entry)| !entry.is_augment))
             .cloned()
+            .chain(sitting.members.iter().cloned())
+            .chain(
+                fragment
+                    .members
+                    .iter()
+                    .filter(|(_, entry)| !entry.is_augment)
+                    .cloned(),
+            )
             .collect();
         // Declaration order: the element's constants first, then every
         // fragment's (upstream `EnumElementImpl.constants` is the merged
@@ -3615,9 +3664,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // faces). Every other name stays as written. A prefixed
         // annotation's completion joins to the qualified spelling first —
         // the head is `ast.AstNode`, never the bare prefix token.
-        let spelling = builder
-            .join_qualified(name)
-            .or_else(|| builder.name_of(name));
+        let (spelling, qualified_tail) = match builder.join_qualified(name) {
+            Some((joined, tail)) => (Some(joined), tail),
+            None => (builder.name_of(name), None),
+        };
         // The head's own group (if any) closed before this completion;
         // the slot is consumed either way.
         builder.pending_type_head = None;
@@ -3637,13 +3687,20 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             None
         } else {
             spelling.and_then(|spelling| {
-                let range = match question {
+                let mut range = match question {
                     Some(q) => SourceRange {
                         offset: name.range.offset,
                         length: q.range.end() - name.range.offset,
                     },
                     None => name.range,
                 };
+                // A qualified `p.T` head token is the prefix; the oracle
+                // anchors the whole `TypeAnnotation`, so the armed range
+                // runs through the continuation's end (or the `?` past it,
+                // whichever reaches further).
+                if let Some(tail) = qualified_tail {
+                    range.length = tail.end().max(range.end()) - range.offset;
+                }
                 builder.armed_ty_range = Some(range);
                 builder.complete_type_site(spelling, question.is_some(), range)
             })
@@ -3930,9 +3987,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 if context == IdentifierContext::TypeReferenceContinuation
                     && let Some(entry) = &mut builder.pending_qualified
                     && entry.2 == StringId::NONE
-                    && let Some(name) = name
+                    && let Some((name, range)) = name_with_range
                 {
                     entry.2 = name;
+                    entry.3 = Some(range);
                 }
                 builder.note_header_reference(context, name, offset);
             }
@@ -3943,7 +4001,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // overwrites any stale latch, a synthetic prefix (no
                 // honest name) clears it.
                 builder.pending_qualified =
-                    name_with_range.map(|(name, _)| (token.id, name, StringId::NONE));
+                    name_with_range.map(|(name, _)| (token.id, name, StringId::NONE, None));
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 // The return type parsed between the begin event and the
@@ -5025,12 +5083,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 });
             }
             if let Some(mut augment) = builder.pending_aug.take() {
-                let (names, bounds) = builder
-                    .pending_top
-                    .as_ref()
-                    .map(|t| (t.type_param_names.clone(), t.type_param_bounds.clone()))
-                    .unwrap_or_default();
-                augment.type_params = builder.zip_type_var_rows(&names, &bounds);
+                // `pending` was taken above — its vectors still hold the
+                // just-collected type parameters until they move into
+                // `TopDecl` below; read them directly (the drained
+                // `pending_top` slot is always `None` here).
+                augment.type_params =
+                    builder.zip_type_var_rows(&pending.type_param_names, &pending.type_param_bounds);
                 augment.type_params_close = builder.type_group_close;
                 augment.name = spelling;
                 let spelling_text = builder.strings.resolve(spelling);
@@ -5726,7 +5784,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn end_typedef(
         &mut self,
-        _augment: Option<Token>,
+        augment: Option<Token>,
         _typedef: Token,
         equals: Option<Token>,
         _end: Token,
@@ -5734,8 +5792,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut self.builder;
         // A type alias can never be augmented: the parser reports the shape
         // outright (`parser_impl.dart:1453` reports `typedefAugmentation` at
-        // the `augment` keyword) and recovers into the plain alias — no
-        // augmentation capture joins the verifier's chain.
+        // the `augment` keyword) and keeps parsing the alias — no
+        // augmentation capture joins the verifier's chain, and the
+        // duplicate check skips it (below).
         if let Some(pending) = builder.pending_typedef.take()
             && let Some((name, range)) = pending.name
         {
@@ -5814,21 +5873,36 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 head_range: None,
                 name_range: range,
             });
-            let _ = builder.declare_top(
-                name,
-                range,
-                TopDecl {
-                    kind: MicroKind::TypeAlias,
-                    type_params: pending.type_params,
-                    type_param_names: pending.type_param_names.into_boxed_slice(),
-                    type_param_bounds: pending.type_param_bounds.into_boxed_slice(),
-                    var_ty,
-                    return_ty: Ty::UNKNOWN,
-                    formals: None,
-                    annotations: pending.annotations.into_boxed_slice(),
-                },
-                TIER_TYPE_ALIAS,
-            );
+            // An `augment typedef` stays an augmentation fragment upstream
+            // (the AST keeps `augmentKeyword` past the parser's
+            // `typedefAugmentation` report), and `checkUnit` skips every
+            // augmentation alias (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/error/duplicate_definition_verifier.dart
+            // :295-303): it never collides with the declaration already
+            // holding its name. A vacant name still declares, so uses of a
+            // lone augment alias resolve.
+            let augments_sitting = augment.is_some()
+                && builder
+                    .decls
+                    .get(&name)
+                    .is_some_and(|decl| decl.kind != MicroKind::TypeParam);
+            if !augments_sitting {
+                let _ = builder.declare_top(
+                    name,
+                    range,
+                    TopDecl {
+                        kind: MicroKind::TypeAlias,
+                        type_params: pending.type_params,
+                        type_param_names: pending.type_param_names.into_boxed_slice(),
+                        type_param_bounds: pending.type_param_bounds.into_boxed_slice(),
+                        var_ty,
+                        return_ty: Ty::UNKNOWN,
+                        formals: None,
+                        annotations: pending.annotations.into_boxed_slice(),
+                    },
+                    TIER_TYPE_ALIAS,
+                );
+            }
         }
     }
 

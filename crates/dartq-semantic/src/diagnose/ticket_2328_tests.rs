@@ -97,6 +97,7 @@ fn report(main_source: &str, deps: &[(&str, &str, bool)]) -> FileReport {
                 target: Some(dep_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

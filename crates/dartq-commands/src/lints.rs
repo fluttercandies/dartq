@@ -1335,6 +1335,7 @@ fn seed_imports(
                     prefix: directive.prefix,
                     deferred: directive.deferred,
                     combinators: directive.combinators.clone(),
+                    non_library: false,
                 },
             );
         }

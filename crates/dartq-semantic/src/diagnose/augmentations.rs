@@ -376,7 +376,14 @@ pub(super) fn augmentation_diagnostics(
     // the check's own fragment arm, never reached for the firstFragment arm.
     // The member row's `is_augment` is the constant's own keyword (patched
     // per-constant by the collector); the gate needs no chain walk.
+    // `container_order` repeats a name once per closing fragment (a folded
+    // `augment enum` head pushes it again): each enum contributes its
+    // constants once, or the same row reports twice.
+    let mut seen_enums: FxHashSet<StringId> = FxHashSet::default();
     for &container_name in own.container_order() {
+        if !seen_enums.insert(container_name) {
+            continue;
+        }
         let Some(container) = own.container(container_name) else {
             continue;
         };
@@ -992,7 +999,16 @@ fn populate(
     // such a unit would claim an introduction that never happened, so the
     // fragment index (the same one the container anchor merges through)
     // answers the filter.
+    //
+    // `container_order` repeats a name once per closing fragment (an
+    // `augment` head folded into its own-unit element still pushed the
+    // name): each container contributes ONE introductory row — upstream
+    // `precedingFragments` counts the element's intro fragment once.
+    let mut seen: FxHashSet<StringId> = FxHashSet::default();
     for &name in elements.container_order() {
+        if !seen.insert(name) {
+            continue;
+        }
         if index.container_row_is_fragment(graph, lib, unit, name) {
             continue;
         }
@@ -1016,7 +1032,10 @@ fn populate(
             kind,
             false,
             0,
-            container.superclass.is_some(),
+            // `firstFragment.hasExtendsClause` — the claiming fragment's own
+            // clause, not the merged edge: a same-unit `augment` can fill
+            // `superclass` without the introduction writing `extends`.
+            container.intro_superclass,
             mixin_apps.contains(&name),
             false,
             false,
@@ -1066,11 +1085,11 @@ fn populate(
             // Already folded into the container entry above.
             continue;
         }
-        if target.kind == AugKind::TypeAlias {
-            // The parser rejects typedef augmentations outright — the row
-            // never joins a lookup chain (the augment early-continues).
-            continue;
-        }
+        // A `typedef` declaration still lands in `lastFragments` upstream:
+        // `augment class A {}` over `typedef A` reports the different-kind
+        // refusal, never the without-declaration one. (An `augment typedef`
+        // is the parser's own diagnostic — the AugmentDecl side skips it in
+        // the process loop.)
         // A constructor selector lands in its owner's static namespace
         // (upstream `_staticNamespace`: `ConstructorFragmentImpl => true`),
         // everything else in the single top-level slot.
@@ -2663,7 +2682,14 @@ fn executable_body_diagnostics(
             _ => {}
         }
     }
+    // `container_order` repeats a name once per closing fragment — a folded
+    // `augment` head pushes it again; each container's members walk once or
+    // the completeness rows report twice.
+    let mut seen: FxHashSet<StringId> = FxHashSet::default();
     for &container_name in own.container_order() {
+        if !seen.insert(container_name) {
+            continue;
+        }
         // An `augment` container head's member rows are fragment members,
         // not introductions — the same filter the chain table applies.
         if index.container_row_is_fragment(graph, lib, file, container_name) {
@@ -3037,3 +3063,10 @@ mod ticket_3556_tests;
 #[cfg(test)]
 #[path = "ticket_3569_tests.rs"]
 mod ticket_3569_tests;
+
+// The #3650 pins — oracle-verbatim tuples for the census sub-families:
+// typedef targets in `lastFragments`, extends-clause presence, top-level
+// type-parameter capture, formal/default/induced-accessor checks.
+#[cfg(test)]
+#[path = "ticket_3650_tests.rs"]
+mod ticket_3650_tests;

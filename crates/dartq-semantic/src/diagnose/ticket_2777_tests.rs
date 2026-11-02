@@ -172,6 +172,7 @@ fn diagnose(
         target: Some(target),
         prefix: None,
         deferred: false,
+        non_library: false,
         combinators: Combinators::unfiltered(),
     };
     builder.import(declaring_lib, edge(meta_lib));

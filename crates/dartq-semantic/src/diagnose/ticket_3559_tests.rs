@@ -234,6 +234,7 @@ fn deferred_report() -> FileReport {
                 target: Some(core_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -247,6 +248,7 @@ fn deferred_report() -> FileReport {
             target: Some(units[1].0),
             prefix: Some(strings.intern("d")),
             deferred: true,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

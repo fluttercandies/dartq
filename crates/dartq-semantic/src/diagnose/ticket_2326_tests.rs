@@ -121,6 +121,7 @@ fn report_two_file(main_source: &str, mix_source: &str) -> FileReport {
             target: Some(lib_mix),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

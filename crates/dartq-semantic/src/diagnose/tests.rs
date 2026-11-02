@@ -239,6 +239,7 @@ fn report_with_core_faces(source: &str) -> FileReport {
             target: Some(core),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -313,6 +314,7 @@ fn report_with_sdk_faces(source: &str) -> FileReport {
                 target: Some(node),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -397,6 +399,7 @@ fn report_with_core_stubs(source: &str) -> FileReport {
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -2762,6 +2765,7 @@ fn broken_import_shown_name_is_suppressed() {
             target: None,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::new(
                 [CombinatorClause::Show(
                     vec![strings.intern("gone")].into_boxed_slice(),
@@ -2790,6 +2794,7 @@ fn const_literal_failures_cascade_to_the_declaration() {
             target: None,
             prefix: Some(strings.intern("diag")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         })
     });
@@ -2839,6 +2844,7 @@ fn unfiltered_broken_import_keeps_bare_miss() {
             target: None,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         })
     });
@@ -2902,6 +2908,7 @@ fn prefixed_invoke_miss_reports_undefined_function() {
             target: Some(lib_a),
             prefix: Some(strings.intern("p")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -3004,6 +3011,7 @@ fn modifier_use_site_rows_anchor_written_entries() {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -3124,6 +3132,7 @@ fn sealed_contract_row_anchors_declaring_node() {
             target: Some(lib_meta),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -3133,6 +3142,7 @@ fn sealed_contract_row_anchors_declaring_node() {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -5341,6 +5351,7 @@ fn prefixed_property_miss_reports_undefined_prefixed_name() {
             target: Some(lib_a),
             prefix: Some(strings.intern("p")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -7557,13 +7568,22 @@ fn invocable_callee_reports_method_invocation() {
     // invocation anchor. The `var`-inferred `g` now carries its `int`
     // static type, so the invocation of a non-function faults too —
     // the oracle's own co-row (probed 3.13.1: `error -
-    // invocation_of_non_function_expression` at `g()`).
+    // invocation_of_non_function_expression` at `g()`). The const side
+    // is the ValueCall face: the resolver rewrites a bare local call to
+    // a FunctionExpressionInvocation, whose `visitNode` fallback is NOT
+    // on `_reportError`'s allow list, so the site default — not
+    // `const_eval_method_invocation` — reports (corpus:
+    // Constructor-tear-offs/named_constructor_A08_t05, `const c1 =
+    // v1(3, 14)` reports only `const_initialized_with_non_constant_
+    // value` at the invocation; a top-level or local FUNCTION callee is
+    // the one that carries `const_eval_method_invocation`, corpus
+    // const_functions_block_test).
     let rep = report("void m() { var g = 1; const y = g(); }");
     assert_eq!(
         code_names(&rep),
         [
             "unused_local_variable",
-            "const_eval_method_invocation",
+            "const_initialized_with_non_constant_value",
             "invocation_of_non_function_expression"
         ],
         "{:?}",
@@ -8617,6 +8637,7 @@ fn cross_file_override_report() -> (FileReport, FileId) {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -8683,6 +8704,7 @@ fn cross_file_record_type_projects_into_the_diagnosing_pool() {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -9164,6 +9186,7 @@ fn cross_library_private_names_are_inaccessible() {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -9449,6 +9472,7 @@ fn superclass_hop_resolves_in_the_declaring_library() {
             target: Some(n3),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -9458,6 +9482,7 @@ fn superclass_hop_resolves_in_the_declaring_library() {
             target: Some(n1),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -9467,6 +9492,7 @@ fn superclass_hop_resolves_in_the_declaring_library() {
             target: Some(n2),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -9730,6 +9756,7 @@ fn multiply_imported_extension_applies_once() {
                 target: Some(a),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -9981,6 +10008,7 @@ fn prefixed_container_members_resolve_through_the_prefix() {
             target: Some(lib_a),
             prefix: Some(strings.intern("io")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -10812,6 +10840,7 @@ fn unused_import_reports_at_the_uri() {
             target: Some(other),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -10863,6 +10892,7 @@ fn used_prefix_import_stays_silent() {
             target: Some(other),
             prefix: Some(strings.intern("p")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -10930,6 +10960,7 @@ fn interpolated_import_keeps_edge_alignment() {
             target: None,
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -10939,6 +10970,7 @@ fn interpolated_import_keeps_edge_alignment() {
             target: Some(other),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -11012,6 +11044,7 @@ fn report_with_imports(
                 target: Some(core),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -11036,6 +11069,7 @@ fn report_with_imports(
                 target: Some(other),
                 prefix: (!prefix.is_empty()).then(|| strings.intern(prefix)),
                 deferred: false,
+                non_library: false,
                 combinators,
             },
         );
@@ -12164,6 +12198,7 @@ fn report_with_core_face(source: &str, core_names: &[&str]) -> FileReport {
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );
@@ -13045,7 +13080,12 @@ fn pattern_never_matches_on_closed_left() {
 /// split by the parameter group.
 #[test]
 fn missing_default_value_reports() {
-    let src = "void f([int a]) {} void g({int b}) {}";
+    // The rig carries no core library: `class int {}` declares the
+    // parameter type. An unresolved `int` is an invalid type, and upstream
+    // `isNullable(InvalidType)` answers true (upstream Dart SDK source,
+    // pkg/analyzer/lib/src/dart/element/type_system.dart:1208-1210), so it
+    // reports no row.
+    let src = "void f([int a]) {} void g({int b}) {} class int {}";
     let r = report(src);
     let rows: Vec<_> = r
         .diagnostics
@@ -23154,3 +23194,63 @@ mod ticket_3611_tests;
 #[cfg(test)]
 #[path = "ticket_3610_tests.rs"]
 mod ticket_3610_tests;
+
+#[cfg(test)]
+#[path = "ticket_3616_tests.rs"]
+mod ticket_3616_tests;
+
+#[cfg(test)]
+#[path = "ticket_3612_tests.rs"]
+mod ticket_3612_tests;
+
+#[cfg(test)]
+#[path = "ticket_3623_tests.rs"]
+mod ticket_3623_tests;
+
+#[cfg(test)]
+#[path = "ticket_3626_tests.rs"]
+mod ticket_3626_tests;
+
+#[cfg(test)]
+#[path = "ticket_3625_tests.rs"]
+mod ticket_3625_tests;
+
+#[cfg(test)]
+#[path = "ticket_3628_tests.rs"]
+mod ticket_3628_tests;
+
+#[cfg(test)]
+#[path = "ticket_3624_tests.rs"]
+mod ticket_3624_tests;
+
+#[cfg(test)]
+#[path = "ticket_3634_tests.rs"]
+mod ticket_3634_tests;
+
+#[cfg(test)]
+#[path = "ticket_3632_tests.rs"]
+mod ticket_3632_tests;
+
+#[cfg(test)]
+#[path = "ticket_3635_tests.rs"]
+mod ticket_3635_tests;
+
+#[cfg(test)]
+#[path = "ticket_3629_tests.rs"]
+mod ticket_3629_tests;
+
+#[cfg(test)]
+#[path = "ticket_3631_tests.rs"]
+mod ticket_3631_tests;
+
+#[cfg(test)]
+#[path = "ticket_3633_tests.rs"]
+mod ticket_3633_tests;
+
+#[cfg(test)]
+#[path = "ticket_3630_tests.rs"]
+mod ticket_3630_tests;
+
+#[cfg(test)]
+#[path = "ticket_3659_tests.rs"]
+mod ticket_3659_tests;

@@ -149,6 +149,44 @@ pub fn replace_top_bottom_with_facts(
     process_top_bottom(sys, facts, ty, Variance::Covariant, object_question, never, 0)
 }
 
+/// `S <: Never` — the official probe's test: `ReplaceTopBottomVisitor`
+/// asks `typeSystem.isSubtypeOf(type, NeverTypeImpl.instance)` at every
+/// contravariant occurrence (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/dart/element/replace_top_bottom_visitor.dart`,
+/// the arm at the top of `process`). The relation reaches a type variable
+/// through its bound (the `Left Type Variable Bound` rule: `X0 <: T1` when
+/// `bound(X0) <: T1`, upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/dart/element/subtype.dart`), which the system's
+/// own snapshot answers for declaration-keyed ids. A use-site parameter id
+/// may carry its bound only in the `facts` table this walk was handed (a
+/// site-scope parameter, whose declaration the snapshot does not own), so
+/// the bound is consulted here as well.
+///
+/// A question-suffixed leaf never answers bottom: `Never?` is the `Null`
+/// projection, and the nullable rule's second conjunct (`Null <: Never`)
+/// is false.
+fn answers_bottom(
+    sys: &TypeSystem<'_>,
+    facts: &ParamFactsTable,
+    ty: TypeId,
+    bottom: TypeId,
+) -> bool {
+    if sys.is_subtype(ty, bottom) {
+        return true;
+    }
+    let leaf = sys.table().get(ty);
+    if leaf.is_nullable() {
+        return false;
+    }
+    let TypeKind::TypeParameter { parameter } = leaf.kind() else {
+        return false;
+    };
+    facts
+        .get(parameter)
+        .bound
+        .is_some_and(|bound| sys.is_subtype(bound, bottom))
+}
+
 fn process_top_bottom(
     sys: &TypeSystem<'_>,
     facts: &ParamFactsTable,
@@ -164,7 +202,7 @@ fn process_top_bottom(
     }
     // The position probe (replace_top_bottom_visitor.dart:20-33).
     if variance == Variance::Contravariant {
-        if sys.is_subtype(ty, bottom) {
+        if answers_bottom(sys, facts, ty, bottom) {
             return top;
         }
     } else if sys.is_top(ty) {

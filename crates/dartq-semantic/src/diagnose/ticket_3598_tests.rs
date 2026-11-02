@@ -65,9 +65,9 @@ fn lang_feature_report(body: &str) -> FileReport {
 }
 
 /// The declared-type acceptance: `var fsource = toF(source)` infers the
-/// instantiated `F<A<int>?>` (the miss names the function face with its
-/// substituted `Y` bound — never `Unknown`'s silence, never a second
-/// unwrap's `void`).
+/// instantiated `F<A<int>?>` (the miss names the ALIAS-SPELLED face —
+/// the oracle's `preferTypeAlias` display — never `Unknown`'s silence,
+/// never a second unwrap's `void`, never the expanded signature).
 #[test]
 fn t3598_var_binds_instantiated_function_face() {
     let report = lang_feature_report(
@@ -81,8 +81,8 @@ fn t3598_var_binds_instantiated_function_face() {
         .collect();
     assert_eq!(misses.len(), 1, "expected one row, got {:?}", rows(&report));
     assert!(
-        misses[0].contains("'void Function<Y extends A<int>?>()'"),
-        "the miss must name the instantiated function face, got {:?}",
+        misses[0].contains("'F<A<int>?>'"),
+        "the miss must name the alias-spelled instantiation, got {:?}",
         misses[0]
     );
 }
@@ -141,7 +141,9 @@ fn t3598_param_free_return_unchanged() {
 
 /// The #3588 residual this fix closes: a solve whose instantiation is a
 /// NON-generic function type (`typedef G<T> = T Function(T); G<T> id<T>`)
-/// answers the function type itself, never the second unwrap's `int`.
+/// answers the function type itself, never the second unwrap's `int` —
+/// and the miss spells the alias use `G<int>` the oracle's
+/// `preferTypeAlias` display prints.
 #[test]
 fn t3598_plain_function_instantiation_not_unwrapped() {
     let report = report_ops_with(
@@ -159,8 +161,8 @@ fn t3598_plain_function_instantiation_not_unwrapped() {
         .collect();
     assert_eq!(misses.len(), 1, "expected one row, got {:?}", rows(&report));
     assert!(
-        misses[0].contains("'int Function(int)'"),
-        "the miss must name the instantiated function type, got {:?}",
+        misses[0].contains("'G<int>'"),
+        "the miss must name the alias-spelled instantiation, got {:?}",
         misses[0]
     );
 }
@@ -195,6 +197,7 @@ fn t3598_unsolved_function_result_keeps_single_flatten() {
 /// directly in an assignment (not only through a `var` binding) — the
 /// family's non-`var` census rows.
 #[test]
+#[ignore = "witness: the #3598 send-result fix was reverted as corpus net-negative (975b4177, 5f8c99b4); the direct-assignment row returns with its replacement fix"]
 fn t3598_direct_assignment_reports() {
     let report = lang_feature_report(
         "main() {\n  A<int>? source;\n  String s = toF(source);\n}\n",
@@ -207,8 +210,8 @@ fn t3598_direct_assignment_reports() {
         .collect();
     assert_eq!(misses.len(), 1, "expected one row, got {:?}", rows(&report));
     assert!(
-        misses[0].contains("'void Function<Y extends A<int>?>()'"),
-        "the miss must name the instantiated face, got {:?}",
+        misses[0].contains("'F<A<int>?>'"),
+        "the miss must name the alias-spelled instantiation, got {:?}",
         misses[0]
     );
 }

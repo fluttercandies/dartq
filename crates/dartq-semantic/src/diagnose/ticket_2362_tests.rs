@@ -139,6 +139,7 @@ fn report_two_file(main_source: &str, other_source: &str) -> FileReport {
             target: Some(lib_other),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

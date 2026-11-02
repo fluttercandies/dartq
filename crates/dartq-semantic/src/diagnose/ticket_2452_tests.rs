@@ -74,6 +74,7 @@ fn report_prefixed(source_m: &str, source_a: &str) -> FileReport {
             target: Some(lib_a),
             prefix: Some(strings.intern("shared")),
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

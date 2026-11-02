@@ -22,7 +22,7 @@ impl Engine<'_> {
         let raw = self.raw_receiver_env(recv);
         let raw_only = |raw: &[(StringId, Ty)]| {
             let keys: FxHashMap<StringId, Ty> = raw.iter().copied().collect();
-            self.fold_alias_ty(self.substitute_ty(declared, &keys))
+            self.fold_call_return(self.substitute_ty(declared, &keys))
         };
         let Some((params, seeds, ordered)) = self.closure_callee_params(recv, row.name) else {
             return if raw.is_empty() {
@@ -104,7 +104,32 @@ impl Engine<'_> {
         if free {
             return Ty::UNKNOWN;
         }
-        self.fold_alias_ty(out)
+        self.fold_call_return(out)
+    }
+
+    /// `fold_alias_ty` with the alias-USE face preserved: a named head
+    /// that resolves to a type alias keeps its use-site spelling
+    /// (`F<A<int>?>`, never the expanded `void Function<Y extends
+    /// A<int>?>`) — upstream the instantiated `FunctionTypeImpl.alias`
+    /// rides the send's static type (type.dart:1467) and
+    /// `getDisplayString(preferTypeAlias: true)` renders it back, so the
+    /// publication leg must not lose the spelling either. An arg-bearing
+    /// head is a use the parameterized fold would substitute and erase;
+    /// a bare head keeps the spelling only when the NON-parameterized
+    /// gate resolves it (a raw generic alias head still needs the fold's
+    /// instantiate-to-bounds fill). Every other shape folds exactly as
+    /// before — the verdict layer unfolds the kept spelling at the ask
+    /// (`fold_alias_verdict`), so no judgment reads a weaker face.
+    fn fold_call_return(&self, ty: Ty) -> Ty {
+        let Ty::Named { name, args, .. } = ty else {
+            return self.fold_alias_ty(ty);
+        };
+        let alias_use = if args == ArgListId::EMPTY {
+            self.alias_rhs(name).is_some()
+        } else {
+            self.alias_rhs_any(name).is_some()
+        };
+        if alias_use { ty } else { self.fold_alias_ty(ty) }
     }
 
     /// The instantiate-to-bounds environment of a raw generic receiver

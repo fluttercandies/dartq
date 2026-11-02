@@ -1204,10 +1204,6 @@ impl<'a> Engine<'a> {
         let FlowFact::NonPromotedPropertyRead { name, .. } = fact else {
             return None;
         };
-        let spelling = flow.name_lexeme(*name);
-        if !spelling.starts_with('_') {
-            return Some(PropertyNonPromotability::NotPrivate);
-        }
         // The resolution keys on the read's own offset: the fact row's span
         // is the member read token — the same anchor the merge record and
         // the published bare resolution carry.
@@ -1215,16 +1211,22 @@ impl<'a> Engine<'a> {
             return None;
         };
         let (entry, _name, _origin) = self.member_read_resolution(span.range.offset)?;
-        if entry.kind != MemberKind::Field {
-            return Some(PropertyNonPromotability::NotField);
+        // The flow fact carries the flow layer's own name id; the verdict
+        // keys the semantic table, so the spelling re-interns here (the
+        // same re-intern [`Engine::stage_non_promotion`] performs for the
+        // context row's `'<prop>'`).
+        let spelling = self.strings.intern(flow.name_lexeme(*name));
+        // The shared eligibility verdict ([`Engine::property_promotion_verdict`]):
+        // the same conjunction [`Engine::promotable_field_entry`] gates
+        // every promotion path with, so the context row can never name a
+        // face the promotion gate disagrees with. A name conflict is the
+        // non-inherent arm — the context producer renders nothing for it
+        // (it enumerates the conflicting declarations, which this engine
+        // does not model).
+        match self.property_promotion_verdict(&entry, spelling) {
+            PropertyPromotionVerdict::Inherent(reason) => Some(reason),
+            PropertyPromotionVerdict::Promotable | PropertyPromotionVerdict::NameConflict => None,
         }
-        if entry.is_external {
-            return Some(PropertyNonPromotability::External);
-        }
-        if !entry.is_final {
-            return Some(PropertyNonPromotability::NotFinal);
-        }
-        None
     }
 
     /// The why-not-promoted context rows for one read offset (#1877) —
@@ -1378,31 +1380,74 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// The ONE eligibility verdict every promotion path shares — the
+    /// official `isPropertyPromotable` conjunction (upstream Dart SDK
+    /// source, pkg/_fe_analyzer_shared/lib/src/field_promotability.dart
+    /// `addField`/`addGetter`; `flow_analysis.dart`'s `isPropertyPromotable`
+    /// delegate). [`Engine::promotable_field_entry`] gates every promotion
+    /// substitution on it, and [`Engine::property_non_promotability`]
+    /// derives the why-not-promoted context row from the SAME answer — the
+    /// verdict and the flow can no longer disagree by construction.
+    pub(crate) fn property_promotion_verdict(
+        &self,
+        entry: &Projected<'_, MemberEntry>,
+        name: StringId,
+    ) -> PropertyPromotionVerdict {
+        // A non-private name can never be promotable (the official
+        // `addField` ignores public names entirely: a subclass in another
+        // library may alias the read to a getter or a mutable field).
+        if !self.strings.resolve(name).starts_with('_') {
+            return PropertyPromotionVerdict::Inherent(PropertyNonPromotability::NotPrivate);
+        }
+        // Only a field (never a getter/method), only an instance member,
+        // and only a `final` one — the official `addField` conjunction
+        // (`isExternal || !isFinal` is the bail; `isStatic` members never
+        // enter the promotability pass at all, `_handleMembers` skips
+        // them). An `abstract final` field stays promotable — the oracle
+        // promotes it (`abstract final int? _x` under `if (_x != null)`
+        // reports nothing), and the official `addField` never consults
+        // `isAbstract` for the finality arm.
+        if entry.kind != MemberKind::Field || entry.is_static || !entry.is_final {
+            return PropertyPromotionVerdict::Inherent(if entry.kind == MemberKind::Field {
+                PropertyNonPromotability::NotFinal
+            } else {
+                PropertyNonPromotability::NotField
+            });
+        }
+        // An external field's read may run arbitrary foreign code.
+        if entry.is_external {
+            return PropertyPromotionVerdict::Inherent(PropertyNonPromotability::External);
+        }
+        // The library-wide name poisoning (`addField`/`addGetter`,
+        // field_promotability.dart:100-172): any same-named non-final
+        // field or concrete getter anywhere in the library defeats every
+        // field of that name. The field itself is fine — the official
+        // models this as a NON-inherent reason, and the context producer
+        // renders no row for it (it enumerates the conflicting
+        // declarations, which this engine does not model).
+        if self.unit_field_name_conflicted(name) {
+            return PropertyPromotionVerdict::NameConflict;
+        }
+        PropertyPromotionVerdict::Promotable
+    }
+
     /// The promotable-field verdict on one resolved member entry (the
-    /// flags half of [`Engine::promotable_field_substitution`]'s contract).
-    /// The language-version grant ANDs in first (the official
-    /// `isPromotable` conjunction, `flow_analysis.dart:7811-7815`):
-    /// `fieldPromotionEnabled` comes from the *accessing* library's
-    /// feature set (`ast_resolver.dart:139-140`), so a pre-3.2 unit never
-    /// promotes — even a field declared in a 3.2 library.
+    /// flags half of [`Engine::promotable_field_substitution`]'s contract):
+    /// the shared [`Engine::property_promotion_verdict`] under the unit's
+    /// field-promotion grant (`fieldPromotionEnabled` — the *accessing*
+    /// library's settled feature set, `ast_resolver.dart:139-140`, so a
+    /// pre-3.2 unit never promotes even a field declared in a 3.2
+    /// library).
     pub(crate) fn promotable_field_entry(
         &self,
         entry: &Projected<'_, MemberEntry>,
         name: StringId,
     ) -> bool {
-        if !self.field_promotion_enabled {
-            return false;
-        }
-        if entry.kind != MemberKind::Field || entry.is_static || !entry.is_final {
-            return false;
-        }
-        if entry.is_external {
-            return false;
-        }
-        if !self.strings.resolve(name).starts_with('_') {
-            return false;
-        }
-        !self.unit_field_name_conflicted(name)
+        self.field_promotion_enabled
+            && matches!(
+                self.property_promotion_verdict(entry, name),
+                PropertyPromotionVerdict::Promotable
+            )
     }
 
     /// Whether any unit member of the given private name defeats field
@@ -2947,7 +2992,9 @@ impl<'a> Engine<'a> {
         range: SourceRange,
         target: &mut RefTarget,
     ) {
-        if self.switch.pattern_depth > 0 && self.relational_operand_at(range) {
+        if self.switch.pattern_depth > 0
+            && (self.relational_operand_at(range) || self.relational_operand_contains(range))
+        {
             self.check_relational_operand(name, range);
         }
         if self.in_when_guard(range) {
@@ -2982,6 +3029,96 @@ impl<'a> Engine<'a> {
         false
     }
 
+    /// Whether `range`'s identifier sits ANYWHERE inside a relational
+    /// pattern's operand, not only at its head. `visitRelationalPattern`
+    /// evaluates the whole operand expression
+    /// (`_evaluateAndReportError(node.operand, …)`), and the oracle's
+    /// failing entity is the deepest non-constant construct — for the
+    /// compound operands the corpus writes (`== 0 + i`, `> a + 1`,
+    /// `>= j && < 20`) that construct is a name the head-only probe never
+    /// reaches. The scan walks back over the operand's expression tokens
+    /// at bracket depth 0 and stops at:
+    ///
+    /// * a relational operator — the identifier is inside that operand;
+    /// * a call/index opener whose callee is an expression (`f(` / `a[`) —
+    ///   the call's own face covers its arguments (the operand's evaluation
+    ///   reports the invocation, never its argument);
+    /// * any pattern-level boundary (`&&`, `||`, `:`, `,`, an opener, an
+    ///   arrow, `case`/`when`/`if`, the clause keyword) — not our operand.
+    fn relational_operand_contains(&self, range: SourceRange) -> bool {
+        let toks = self.tokens.as_slice();
+        let mut i = self.token_at_offset(range.offset);
+        let mut depth: i32 = 0;
+        while i > 0 {
+            i -= 1;
+            let kind = toks[i].kind;
+            match kind {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    depth += 1;
+                }
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    if depth > 0 {
+                        depth -= 1;
+                        continue;
+                    }
+                    // Only a grouping paren continues the operand: `[`, `{`
+                    // at depth 0 open a nested pattern (a list/map element
+                    // whose own faces own the identifier), and a call's
+                    // paren means the invocation's face owns its arguments.
+                    if kind != TokenKind::OpenParen {
+                        return false;
+                    }
+                    let caller = i.checked_sub(1).and_then(|j| toks.get(j)).is_some_and(|t| {
+                        matches!(
+                            t.kind,
+                            TokenKind::Identifier
+                                | TokenKind::CloseParen
+                                | TokenKind::CloseSquare
+                                | TokenKind::CloseCurly
+                        )
+                    });
+                    if caller {
+                        return false;
+                    }
+                }
+                TokenKind::Gt
+                | TokenKind::GtEq
+                | TokenKind::Lt
+                | TokenKind::LtEq
+                | TokenKind::EqEq
+                | TokenKind::BangEq => {
+                    return depth == 0;
+                }
+                TokenKind::AmpersandAmpersand
+                | TokenKind::BarBar
+                | TokenKind::Colon
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+                | TokenKind::Function
+                | TokenKind::Keyword(_) => return false,
+                // The operand's own expression tokens.
+                TokenKind::Identifier
+                | TokenKind::Int
+                | TokenKind::Double
+                | TokenKind::Hexadecimal
+                | TokenKind::String
+                | TokenKind::Minus
+                | TokenKind::Plus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Tilde
+                | TokenKind::Bang
+                | TokenKind::Period
+                | TokenKind::QuestionPeriod
+                | TokenKind::Question
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The relational operand's two verdicts: a same-head pattern variable
     /// resolves in the enclosing scope (hidden upstream), and the operand
     /// must be a constant. The self/same-head read answers BOTH rows —
@@ -2989,19 +3126,63 @@ impl<'a> Engine<'a> {
     /// `referenced_before_declaration` report), which the constant visitor
     /// then judges non-constant (`_evaluateAndReportError`'s own row) —
     /// an outer `const` never feeds the ask.
+    ///
+    /// The `>`-prefix shapes the oracle's entity reads:
+    ///
+    /// * a bare name — the identifier itself;
+    /// * a postfix `++`/`--` on the name — the WHOLE `i++` (`visitPostfixExpression`
+    ///   evaluates the operand, fails, and reports its own node);
+    /// * a call — the resolver rewrote it to a `FunctionExpressionInvocation`
+    ///   (see [`CallClass::ValueCall`]), whose `visitNode` fallback reports
+    ///   the invocation, not the callee; but a `MethodInvocation` on a
+    ///   top-level FUNCTION reports `const_eval_method_invocation` from the
+    ///   allow list, which wins over this site's default (the row then
+    ///   carries that code, not this one).
     fn check_relational_operand(&mut self, name: StringId, range: SourceRange) {
         let self_read = self
             .resolve_local(name)
             .is_some_and(|hit| self.pattern_decl_in_head(hit, range.offset));
-        // `name(...)` is an invocation, never a constant operand.
-        let invoked = {
-            let toks = self.tokens.as_slice();
-            toks
-                .get(self.token_at_offset(range.offset) + 1)
-                .is_some_and(|t| t.kind == TokenKind::OpenParen)
-        };
+        // `name(...)`: a call — never a constant operand, and its own row
+        // (if any) owns the anchor. A top-level function's invocation is a
+        // real `MethodInvocation` and reports `const_eval_method_invocation`
+        // (allow-listed, so the site default never fires); every other
+        // callee shape falls through to the enclosing default.
+        let next = self.token_at_offset(range.offset) + 1;
+        let toks = self.tokens.as_slice();
+        let call_shape = toks
+            .get(next)
+            .is_some_and(|t| t.kind == TokenKind::OpenParen);
+        if call_shape {
+            // A top-level FUNCTION callee is a real `MethodInvocation`:
+            // `ConstantVisitor.visitMethodInvocation` answers the
+            // allow-listed `const_eval_method_invocation`, which overrides
+            // this site's default — the const-eval close owns the row. Every
+            // other callee shape (a local/formal/field read) was rewritten
+            // to a `FunctionExpressionInvocation`, whose `genericError` is
+            // NOT allow-listed, so the enclosing default reports here.
+            let allow_listed = matches!(
+                self.top_level_decl(name).map(|d| d.kind),
+                Some(MicroKind::TopLevelFn)
+            );
+            if !allow_listed {
+                self.emit(
+                    SemanticCode::NonConstantRelationalPatternExpression,
+                    range,
+                    "",
+                    "",
+                );
+            }
+            return;
+        }
+        // A postfix `++`/`--` widens the anchor over the operator token.
+        let postfix = toks.get(next).filter(|t| {
+            matches!(t.kind, TokenKind::PlusPlus | TokenKind::MinusMinus)
+        });
+        let anchor = postfix.map_or(range, |t| SourceRange {
+            offset: range.offset,
+            length: t.utf16_offset + t.byte_len as u32 - range.offset,
+        });
         let nonconst = self_read
-            || invoked
             || matches!(
                 ConstLookup::ident(self, name),
                 IdentVerdict::NotConstant | IdentVerdict::Unresolved
@@ -3009,7 +3190,7 @@ impl<'a> Engine<'a> {
         if nonconst {
             self.emit(
                 SemanticCode::NonConstantRelationalPatternExpression,
-                range,
+                anchor,
                 "",
                 "",
             );

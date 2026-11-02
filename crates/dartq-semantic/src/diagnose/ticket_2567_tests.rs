@@ -130,6 +130,7 @@ fn report_prefixed(other_src: &str, main_src: &str) -> FileReport {
             target: Some(other_lib),
             prefix: Some(strings.intern("p")),
             deferred: false,
+            non_library: false,
             combinators: dartq_resolution::library_graph::Combinators::unfiltered(),
         },
     );
@@ -593,6 +594,7 @@ fn sdk_stub_member_face_answers_through_frozen_rows() {
             target: Some(stub_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: dartq_resolution::Combinators::unfiltered(),
         },
     );

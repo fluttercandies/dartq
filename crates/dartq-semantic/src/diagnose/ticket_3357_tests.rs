@@ -104,6 +104,7 @@ fn rig(main: &str, lib1: &str, prefix: Option<&str>, deferred: bool) -> FileRepo
         ImportEdge {
             target: Some(lib1_lib),
             prefix: prefix.map(|name| strings.intern(name)),
+            non_library: false,
             deferred,
             combinators: Combinators::unfiltered(),
         },
@@ -115,6 +116,7 @@ fn rig(main: &str, lib1: &str, prefix: Option<&str>, deferred: bool) -> FileRepo
                 target: Some(meta_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

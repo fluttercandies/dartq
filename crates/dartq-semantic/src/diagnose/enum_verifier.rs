@@ -284,6 +284,19 @@ impl<'a> Engine<'a> {
             return;
         }
         let scope_lib = self.owner_library_of(self.file, name).unwrap_or(self.lib);
+        let object_id = self.intern("Object");
+        // `enclosingClass.supertype` upstream — the direct superclass, `Enum`
+        // for an enum declaration, `Object` for a class with no `extends`.
+        // The written name resolves to a container that may live outside
+        // `self.file` (an imported supertype), so it goes through
+        // `resolve_clause_face` rather than a same-file lookup.
+        let implicit_super = match (container.superclass, container.kind) {
+            (Some(face), _) => face,
+            (None, ContainerKind::Enum) => self.intern("Enum"),
+            (None, _) => object_id,
+        };
+        let resolved_super =
+            self.resolve_clause_face(name, self.file, scope_lib, implicit_super);
         let mut previous: Vec<(StringId, FileId)> = Vec::new();
         for (position, mixin) in container.with_clause.iter().enumerate() {
             let resolved = self.resolve_clause_face(name, self.file, scope_lib, *mixin);
@@ -294,9 +307,16 @@ impl<'a> Engine<'a> {
                 && mixin_container.kind == ContainerKind::Mixin
             {
                 for constraint in mixin_container.on_clause.iter() {
-                    let by_super = container
-                        .superclass
-                        .is_some_and(|face| self.supertype_reaches(face, self.file, *constraint));
+                    let by_super = implicit_super == *constraint
+                        || *constraint == object_id
+                        || resolved_super.is_some_and(|(super_container, super_file)| {
+                            self.supertype_closure_contains(
+                                implicit_super,
+                                super_file,
+                                *constraint,
+                                super_container,
+                            )
+                        });
                     let mut satisfied = by_super;
                     for (prior, prior_file) in &previous {
                         if self.supertype_reaches(*prior, *prior_file, *constraint) {
@@ -311,9 +331,7 @@ impl<'a> Engine<'a> {
                         return;
                     };
                     let a0 = self.display_of(*mixin);
-                    let a1 = container
-                        .superclass
-                        .map_or_else(|| "Object".to_string(), |face| self.display_of(face));
+                    let a1 = self.display_of(implicit_super);
                     let a2 = self.display_of(*constraint);
                     self.stage_row3(
                         SemanticCode::MixinApplicationNotImplementedInterface,
@@ -341,7 +359,7 @@ impl<'a> Engine<'a> {
             return true;
         }
         let target = self.intern("Enum");
-        self.supertype_closure_contains(name, target, container)
+        self.supertype_closure_contains(name, self.file, target, container)
     }
 
     /// The first concrete member named `member` on the superclass+mixin chain
@@ -461,17 +479,25 @@ impl<'a> Engine<'a> {
         None
     }
 
-    /// Whether the start container's own supertype closure reaches `target`.
+    /// Whether `container`'s own supertype closure reaches `target`, starting
+    /// from the file `container` is declared in (`start_file`) so clause faces
+    /// written there resolve against its own imports — a supertype carried
+    /// across a library boundary would otherwise read the diagnosing file's
+    /// scope and miss the face. `X <: Object` holds unconditionally.
     fn supertype_closure_contains(
         &self,
         name: StringId,
+        start_file: FileId,
         target: StringId,
         container: &Container,
     ) -> bool {
+        if target == self.intern("Object") {
+            return true;
+        }
         let mut queue: VecDeque<(StringId, FileId)> =
-            self.supertype_faces(name, self.file, container).into();
+            self.supertype_faces(name, start_file, container).into();
         let mut seen: FxHashSet<(StringId, FileId)> = FxHashSet::default();
-        seen.insert((name, self.file));
+        seen.insert((name, start_file));
         while let Some((face, file)) = queue.pop_front() {
             if face == target {
                 return true;
@@ -490,14 +516,14 @@ impl<'a> Engine<'a> {
     /// Whether the closure of the container declared as `start` in
     /// `file` reaches `target`.
     fn supertype_reaches(&self, start: StringId, file: FileId, target: StringId) -> bool {
-        if start == target {
+        if start == target || target == self.intern("Object") {
             return true;
         }
         let index = self.index;
         let Some(container) = index.get(file).and_then(|unit| unit.container(start)) else {
             return false;
         };
-        self.supertype_closure_contains(start, target, container)
+        self.supertype_closure_contains(start, file, target, container)
     }
 
     /// One container's resolved supertype faces, in written order
@@ -734,3 +760,7 @@ fn angle_delta(text: &str) -> i32 {
 fn utf16_len(text: &str) -> u32 {
     u32::try_from(text.chars().map(char::len_utf16).sum::<usize>()).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+#[path = "ticket_3660_tests.rs"]
+mod ticket_3660_tests;

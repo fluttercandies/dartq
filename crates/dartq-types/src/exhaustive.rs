@@ -41,12 +41,14 @@
 //! [`crate::TypeHierarchy`]); higher layers may bring narrower models
 //! until the interned type wiring lands.
 //!
-//! The value spaces carry no list/map columns: list and map patterns
-//! split their element spaces through the `keysOfInterest` channel and
-//! additional-property keys (key.dart `HeadKey`/`RestKey`/`TailKey`/
-//! `MapKey`), which this face does not consume yet — a list/map case
-//! row arrives as the *unknown* space from the space builder and
-//! suppresses (under-reports) instead of mis-answering.
+//! The value spaces carry the list/map columns through the
+//! `keysOfInterest` channel and the additional-property keys (key.dart
+//! `HeadKey`/`RestKey`/`TailKey`/`MapKey`): a list case row splits its
+//! element spaces through `SingleSpace.additionalProperties`, and the
+//! sealed `List` subtype walk bounds its size buckets by those keys
+//! (types/list.dart). The space builder side decides which shapes
+//! produce them; a row it cannot express still arrives as the unknown
+//! space and suppresses (under-reports) instead of mis-answering.
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -59,18 +61,103 @@ use crate::system::TypeSystem;
 use crate::ty::{TypeKind, UninternedType};
 
 /// A field identity inside a matched value (official `Key`, key.dart): a
-/// positional or named record field, or an object member. Ordering mirrors
-/// the official `compareTo` where it can be observed: record index keys
-/// sort before named keys (key.dart:186-198, :206-226), names compare
-/// alphabetically within a kind.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+/// positional or named record field, an object member, or one of the
+/// additional-property keys the list/map face indexes by (`HeadKey`/
+/// `RestKey`/`TailKey`/`MapKey`). Ordering mirrors the official
+/// `compareTo` chain (key.dart:37-226): head keys index-ascending first,
+/// then rest keys head-ascending/tail-descending, then tail keys
+/// index-DESCENDING, then map keys by their rendered text, then record
+/// index keys before every named key, names alphabetical within a kind.
+/// The `Ord` is manual because the tail index sorts descending — the
+/// derived order cannot express it.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
+    /// A list element accessed by index from the start (`HeadKey`).
+    Head(usize),
+    /// A list's middle sublist from index `head` to the `tail`th last
+    /// element (`RestKey`).
+    Rest {
+        /// Elements before the rest pattern.
+        head: usize,
+        /// Elements after the rest pattern.
+        tail: usize,
+    },
+    /// A list element accessed by index from the end — the `index`th
+    /// last element (`TailKey`).
+    Tail(usize),
+    /// A map entry addressed by a constant key, kept as its rendered
+    /// text (`MapKey` — the official compares by `valueAsText`).
+    MapKey(String),
     /// A positional record field `$1`, `$2`, … (`RecordIndexKey`).
     RecordIndex(usize),
     /// A named record field (`RecordNameKey`).
     RecordName(String),
     /// An object member (`NameKey`).
     Name(String),
+}
+
+impl Key {
+    /// The `&& Object(name: …)` tail spelling (key.dart `Key.name`):
+    /// `[i]` for a head, `[h:-t]` for a rest, `[-i]` for a tail, `[v]`
+    /// for a map entry, `$i`/name/`name` for the record/member keys.
+    pub fn name_text(&self) -> String {
+        match self {
+            Key::Head(index) => format!("[{index}]"),
+            Key::Rest { head, tail } => format!("[{head}:-{tail}]"),
+            Key::Tail(index) => format!("[-{}]", index + 1),
+            Key::MapKey(value) => format!("[{value}]"),
+            Key::RecordIndex(index) => format!("${}", index + 1),
+            Key::RecordName(name) | Key::Name(name) => name.clone(),
+        }
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Key {
+    /// The official `compareTo` chain (key.dart): `HeadKey` before
+    /// everything, `RestKey` after heads before tails, `TailKey` after
+    /// rests before maps, `MapKey` after list keys before record/name
+    /// keys, `RecordIndexKey` after the container keys before every
+    /// named key, `RecordNameKey`/`NameKey` last. Within a kind:
+    /// head/rest-head/tail-head indexes ascend, the rest's tail size and
+    /// the tail index DESCEND, map keys compare their rendered text,
+    /// names compare alphabetically.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        /// The key's rank in the official cross-kind order.
+        fn rank(key: &Key) -> u8 {
+            match key {
+                Key::Head(_) => 0,
+                Key::Rest { .. } => 1,
+                Key::Tail(_) => 2,
+                Key::MapKey(_) => 3,
+                Key::RecordIndex(_) => 4,
+                Key::RecordName(_) | Key::Name(_) => 5,
+            }
+        }
+        match (self, other) {
+            (Key::Head(a), Key::Head(b)) => a.cmp(b),
+            (
+                Key::Rest {
+                    head: ah,
+                    tail: at,
+                },
+                Key::Rest {
+                    head: bh,
+                    tail: bt,
+                },
+            ) => ah.cmp(bh).then_with(|| bt.cmp(at)),
+            (Key::Tail(a), Key::Tail(b)) => b.cmp(a),
+            (Key::MapKey(a), Key::MapKey(b)) => a.cmp(b),
+            (Key::RecordIndex(a), Key::RecordIndex(b)) => a.cmp(b),
+            (Key::RecordName(a) | Key::Name(a), Key::RecordName(b) | Key::Name(b)) => a.cmp(b),
+            _ => rank(self).cmp(&rank(other)),
+        }
+    }
 }
 
 /// The engine's view of a static type — the questions
@@ -113,13 +200,25 @@ pub trait ExhaustivenessWorld {
     /// `getSubtypes` (`static_type.dart:113`): the closed subtype set `ty`
     /// splits over — subclasses of a sealed class (instantiated to this
     /// type), the constants of an enum, `true`/`false`, `T`/`Future<T>`,
-    /// and `T`/`Null` for `T?`.
-    fn subtypes(&self, ty: &Self::Ty) -> Vec<Self::Ty>;
+    /// `T`/`Null` for `T?`, and — the list face — the size buckets the
+    /// cases' additional-property keys determine
+    /// (`ListTypeStaticType.getSubtypes`, types/list.dart:65-121: `keys`
+    /// is the union of every case row's additional-property keys, whose
+    /// head/tail indexes bound the fixed-size splits).
+    fn subtypes(&self, ty: &Self::Ty, keys: &FxHashSet<Key>) -> Vec<Self::Ty>;
 
     /// `getPropertyType` (`static_type.dart:36`): the static type of the
     /// field `key` exposes, or `None` when unknown (the checker then uses
     /// the nullable object as the column type, exhaustive.dart:396-406).
     fn property_type(&self, ty: &Self::Ty, key: &Key) -> Option<Self::Ty>;
+
+    /// `getAdditionalPropertyType` (types.dart:44-45 →
+    /// `ExhaustivenessCache.getAdditionalFieldType`, shared.dart:396-416):
+    /// the column type an additional-property key reads — a `HeadKey`/
+    /// `TailKey` reads the list element type, a `RestKey` the list type
+    /// itself, a `MapKey` the map value type, anything else the `Object`
+    /// member of that name — or `None`, the nullable-object fallback.
+    fn additional_property_type(&self, ty: &Self::Ty, key: &Key) -> Option<Self::Ty>;
 
     /// `ty.isSubtypeOf(NeverType)` — the queue skip test
     /// (exhaustive.dart:205-208).
@@ -143,11 +242,14 @@ pub trait ExhaustivenessWorld {
 
 /// One conjunctive component of a value set (official `SingleSpace`,
 /// space.dart:17-33): a type test plus the property sub-spaces it
-/// destructures.
+/// destructures, split across the two channels the official keeps apart —
+/// `props` for the object/record member columns, `additional` for the
+/// list/map positional columns (`HeadKey`/`RestKey`/`TailKey`/`MapKey`).
 #[derive(Clone, Debug)]
 pub struct Single<M: Clone + PartialEq + Eq + Hash + Debug> {
     ty: M,
     props: Vec<(Key, Space<M>)>,
+    additional: Vec<(Key, Space<M>)>,
 }
 
 impl<M: Clone + PartialEq + Eq + Hash + Debug> PartialEq for Single<M> {
@@ -186,6 +288,7 @@ impl<M: Clone + PartialEq + Eq + Hash + Debug> Single<M> {
         Single {
             ty: world.never(),
             props: Vec::new(),
+            additional: Vec::new(),
         }
     }
 
@@ -194,6 +297,7 @@ impl<M: Clone + PartialEq + Eq + Hash + Debug> Single<M> {
         Single {
             ty,
             props: Vec::new(),
+            additional: Vec::new(),
         }
     }
 
@@ -201,7 +305,23 @@ impl<M: Clone + PartialEq + Eq + Hash + Debug> Single<M> {
     /// into key order so equality and rendering are order-insensitive.
     pub fn with_props(ty: M, mut props: Vec<(Key, Space<M>)>) -> Self {
         props.sort_by(|a, b| a.0.cmp(&b.0));
-        Single { ty, props }
+        Single {
+            ty,
+            props,
+            additional: Vec::new(),
+        }
+    }
+
+    /// A single with additional (list/map positional) sub-spaces
+    /// (`SingleSpace(additionalProperties: …)`, space.dart:29-33) —
+    /// canonicalized into key order like `props`.
+    pub fn with_additional(ty: M, mut additional: Vec<(Key, Space<M>)>) -> Self {
+        additional.sort_by(|a, b| a.0.cmp(&b.0));
+        Single {
+            ty,
+            props: Vec::new(),
+            additional,
+        }
     }
 
     fn is_empty<W: ExhaustivenessWorld<Ty = M>>(&self, world: &W) -> bool {
@@ -213,6 +333,13 @@ impl<M: Clone + PartialEq + Eq + Hash + Debug> Single<M> {
             .binary_search_by(|(k, _)| k.cmp(key))
             .ok()
             .map(|index| &self.props[index].1)
+    }
+
+    fn additional_prop(&self, key: &Key) -> Option<&Space<M>> {
+        self.additional
+            .binary_search_by(|(k, _)| k.cmp(key))
+            .ok()
+            .map(|index| &self.additional[index].1)
     }
 }
 
@@ -525,6 +652,17 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
 
     let first = &value_patterns[0];
 
+    // The case rows' additional-property keys bound the list-type
+    // subtype split (exhaustive.dart:193-198 — collected before the
+    // queue walk, fed into `getSubtypes(keysOfInterest)` at every
+    // expansion).
+    let mut keys_of_interest: FxHashSet<Key> = FxHashSet::default();
+    for row in case_rows {
+        for single in row[0].first_singles() {
+            keys_of_interest.extend(single.additional.iter().map(|(key, _)| key.clone()));
+        }
+    }
+
     // Cycle guard, reused across the singles' walks (`clear` keeps the
     // allocation; visits are not shared between walks because a type's
     // expansion depends on `single`). `subtypes` feeds a FIFO expansion,
@@ -570,7 +708,7 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
                 );
                 if result.is_some() {
                     // Not fully handled: split over the closed subtypes.
-                    for subtype in world.subtypes(&ty) {
+                    for subtype in world.subtypes(&ty, &keys_of_interest) {
                         stack.push_back(subtype);
                     }
                 }
@@ -639,8 +777,9 @@ fn filter_by_type<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWor
         }
     }
 
-    // The union of the value's and the surviving rows' property keys,
-    // sorted for deterministic column order (exhaustive.dart:313-328).
+    // The union of the value's and the surviving rows' property keys —
+    // both channels — sorted for deterministic column order
+    // (exhaustive.dart:313-328).
     let mut property_keys: Vec<Key> = Vec::new();
     for (key, _) in &value_single.props {
         property_keys.push(key.clone());
@@ -653,11 +792,37 @@ fn filter_by_type<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWor
     property_keys.sort();
     property_keys.dedup();
 
-    let mut value_spaces = expand_properties(world, &property_keys, value_single, ty, path);
+    let mut additional_keys: Vec<Key> = Vec::new();
+    for (key, _) in &value_single.additional {
+        additional_keys.push(key.clone());
+    }
+    for single in &remaining_singles {
+        for (key, _) in &single.additional {
+            additional_keys.push(key.clone());
+        }
+    }
+    additional_keys.sort();
+    additional_keys.dedup();
+
+    let mut value_spaces = expand_properties(
+        world,
+        &property_keys,
+        &additional_keys,
+        value_single,
+        ty,
+        path,
+    );
     value_spaces.extend(value_patterns.iter().skip(1).cloned());
 
     for (row, single) in remaining_rows.iter_mut().zip(remaining_singles) {
-        let mut spaces = expand_properties(world, &property_keys, single, &single.ty, path);
+        let mut spaces = expand_properties(
+            world,
+            &property_keys,
+            &additional_keys,
+            single,
+            &single.ty,
+            path,
+        );
         spaces.extend(row.iter().skip(1).cloned());
         *row = spaces;
     }
@@ -668,21 +833,39 @@ fn filter_by_type<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWor
 /// `_Checker._expandProperties` (exhaustive.dart:380-429): one column per
 /// interested key — the single's sub-space when it tests the property,
 /// otherwise the full space of the property's static type (nullable object
-/// when the type world does not know it).
+/// when the type world does not know it). The additional channel answers
+/// through `additional_property_type` (the list/map slot types).
 fn expand_properties<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty = M>>(
     world: &W,
     keys: &[Key],
+    additional_keys: &[Key],
     single: &Single<M>,
     ty: &M,
     path: &[Key],
 ) -> Vec<Space<M>> {
-    let mut result = Vec::with_capacity(keys.len());
+    let mut result = Vec::with_capacity(keys.len() + additional_keys.len());
     for key in keys {
         let space = match single.prop(key) {
             Some(space) => space.clone(),
             None => Space::full(
                 world
                     .property_type(ty, key)
+                    .unwrap_or_else(|| world.object_nullable()),
+            ),
+        };
+        let mut child_path = path.to_vec();
+        child_path.push(key.clone());
+        result.push(Space {
+            path: child_path,
+            singles: space.singles,
+        });
+    }
+    for key in additional_keys {
+        let space = match single.additional_prop(key) {
+            Some(space) => space.clone(),
+            None => Space::full(
+                world
+                    .additional_property_type(ty, key)
                     .unwrap_or_else(|| world.object_nullable()),
             ),
         };
@@ -1138,7 +1321,7 @@ impl ExhaustivenessWorld for TypedModel<'_> {
         }
     }
 
-    fn subtypes(&self, ty: &TypedTy) -> Vec<TypedTy> {
+    fn subtypes(&self, ty: &TypedTy, _keys: &FxHashSet<Key>) -> Vec<TypedTy> {
         match ty {
             // NullableStaticType.getSubtypes (static_type.dart:359-362).
             TypedTy::Nullable(inner) => vec![(**inner).clone(), TypedTy::Null],
@@ -1234,8 +1417,14 @@ impl ExhaustivenessWorld for TypedModel<'_> {
                 .map(|(slot, _)| {
                     self.static_type(self.sys.table().named_ty(shape.named.offset() + slot))
                 }),
-            Key::Name(_) => None,
+            _ => None,
         }
+    }
+
+    fn additional_property_type(&self, _ty: &TypedTy, _key: &Key) -> Option<TypedTy> {
+        // The typed backend builds no list/map rows yet — the nullable
+        // object fallback the checker defaults to (exhaustive.dart:421-424).
+        None
     }
 
     fn is_bottom(&self, ty: &TypedTy) -> bool {
@@ -1357,6 +1546,13 @@ fn render_fields(fields: &[(Key, String)]) -> String {
         .map(|(key, text)| match key {
             Key::RecordIndex(index) => format!("${}:{text}", index + 1),
             Key::RecordName(name) | Key::Name(name) => format!("{name}: {text}"),
+            // The additional-property keys reach `&& Object(...)` tails
+            // through their `name` (key.dart): a head `[i]`, a rest
+            // `[h:-t]`, a tail `[-i-1]`, a map entry `[v]`.
+            Key::Head(index) => format!("[{index}]: {text}"),
+            Key::Rest { head, tail } => format!("[{head}:-{tail}]: {text}"),
+            Key::Tail(index) => format!("[-{}]: {text}", index + 1),
+            Key::MapKey(value) => format!("[{value}]: {text}"),
         })
         .collect::<Vec<_>>()
         .join(", ")

@@ -387,12 +387,14 @@ mod enum_verifier;
 mod extension_types;
 mod ffi;
 mod index_result;
+mod interface_conflicts;
 mod invocation;
 mod legacy_switch;
 mod listener;
 mod never_send;
 mod operand_face;
 mod overrides;
+mod pattern_faces;
 mod pattern_scope;
 mod primitive_lattice;
 mod receiver_face;
@@ -1208,6 +1210,124 @@ fn for_header_closers(tokens: &TokenTable) -> FxHashSet<u32> {
     closers
 }
 
+/// The `not_assigned_potentially_non_nullable_local_variable` suppression
+/// gates the flow layer cannot express inside this crate's ownership:
+/// `checkReadOfNotAssignedLocalVariable` (resolver.dart:655-702) gates on
+/// the RESOLVED element — `element is PromotableElementImpl` skips
+/// wildcard `_`s outright, `element.type` answers `isPotentiallyNonNullable`
+/// through typedef folds (`typedef A = T?`) and `void`, and the for-in
+/// head's identifier is a `flow.write`, never a read. The flow row's
+/// `potentially_non_nullable` bit is a name-level approximation that
+/// misses each of those answers; this gate re-asks them at the fact's own
+/// anchors. Every arm below stands in for a flow-side fix tracked as a
+/// rider — see the ticket's report for the upstream citation each arm
+/// mirrors.
+fn unassigned_read_suppressed(
+    span: Token,
+    declared_type: Option<SourceRange>,
+    tokens: &TokenTable,
+    engine: &Engine,
+    name: &str,
+) -> bool {
+    let toks = tokens.as_slice();
+    // A wildcard `_` is not a `PromotableElement` upstream — the resolver's
+    // `element is PromotableElementImpl` returns false and the check ends
+    // before the assigned query. The flow layer tracks it like an ordinary
+    // binding (its unassigned rows ride the same face); the wildcard gate
+    // is the oracle's own answer (`_isNamedWildcard`,
+    // unused_local_elements_verifier.dart:836-844 — pre-feature `_`s are
+    // ordinary names and stay eligible).
+    if engine.is_wildcard(engine.intern(name)) {
+        return true;
+    }
+    // A for-in identifier head (`for (i in xs)`): the head's target is a
+    // WRITE — upstream `forEach_bodyBegin` calls `flow.write` on this node
+    // (for_resolver.dart:237-241), never a read. The flow layer's `i + 1`
+    // lookahead for `ForInExprBegin` misses the `ForInit` marker the
+    // initializer wrapper emits between them (`record.rs:3241`), so the
+    // read arm fires — `Identifier`-next-`in` is the for-in target's own
+    // token shape; no other context lands `in` immediately after a bare
+    // identifier (a ternary's `:` cannot follow `in`).
+    if let Some(next) = toks.get(span.id as usize + 1)
+        && matches!(
+            next.kind,
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
+        )
+    {
+        return true;
+    }
+    // A shared-case-scope read of an inconsistently bound name: upstream
+    // reports `invalid_pattern_variable_in_shared_case_scope` at the read
+    // (variable_bindings.dart:183-194) and resolves it to the joined
+    // shared variable, never an unassigned read. The parse-time verifier
+    // already emits its row into `engine.report.diagnostics` — a co-anchor
+    // hit is the oracle's own answer at this span.
+    if engine.report.diagnostics.iter().any(|d| {
+        d.code.name == "invalid_pattern_variable_in_shared_case_scope" && d.range == span.range
+    }) {
+        return true;
+    }
+    // The declared-head answer to `isPotentiallyNonNullable(element.type)`
+    // (type_system.dart:1249 = `!isNullable`): `void` is `isNullable` true
+    // upstream, a typedef spelling folds its right-hand `?` into the
+    // declared slot, and a `Null`/`dynamic`-folded head suppresses the
+    // row. The flow's `potentially_non_nullable` bit sees only the
+    // use-site `?` and the bare head's own base — `Base::Void` is missing
+    // from its suppression list and the alias never unfolds at the name
+    // level — so the bit stays true where the resolved element answers
+    // false.
+    if let Some(decl) = declared_type {
+        let idx = toks.partition_point(|t| t.utf16_offset < decl.offset);
+        let mut i = idx;
+        while i > 0 {
+            i -= 1;
+            match toks[i].kind {
+                // Declarator modifiers and the list separator — keep
+                // walking to the head of THIS declarator's type. Any other
+                // token closes the window: a previous declarator's
+                // initializer tail (`x = 1, y`) shares the group's header
+                // type through a different anchor the scan cannot reach
+                // soundly, so it drops the gate (under-corrects to the
+                // fact's own bit — the pre-gate answer, never a new
+                // misfire).
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Late
+                    | dartq_scanner::Keyword::Final
+                    | dartq_scanner::Keyword::Var
+                    | dartq_scanner::Keyword::Const,
+                )
+                | dartq_scanner::TokenKind::Comma => continue,
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Void) => return true,
+                dartq_scanner::TokenKind::Identifier => {
+                    // `text_of` keys on the token's table index — the
+                    // range payload is unread, so the declared span stands
+                    // in for the ident's own.
+                    let ident = Token { id: i as u32, range: decl };
+                    let Some(text) = engine.text_of(ident) else {
+                        return false;
+                    };
+                    let folded = engine.fold_alias_ty(Ty::Named {
+                        name: engine.intern(text),
+                        nullable: false,
+                        args: ArgListId::EMPTY,
+                    });
+                    return matches!(
+                        folded,
+                        Ty::Named { nullable: true, .. }
+                            | Ty::Record { nullable: true, .. }
+                            | Ty::Function { nullable: true, .. }
+                            | Ty::Dynamic
+                            | Ty::Null
+                            | Ty::Void
+                    );
+                }
+                _ => return false,
+            }
+        }
+    }
+    false
+}
+
 /// [`diagnose_unit`]'s whole pipeline, exposed for the query face: the
 /// same fold, with the intermediates kept instead of dropped.
 #[allow(clippy::too_many_arguments)] // the analysis context, one field each
@@ -1699,7 +1819,7 @@ pub fn fold_unit_with_ops<'t>(
                 is_final,
                 definitely_unassigned,
                 potentially_non_nullable,
-                ..
+                declared_type,
             } => {
                 let range = span.range;
                 // The span is UTF-16; the slice reads source bytes —
@@ -1713,8 +1833,15 @@ pub fn fold_unit_with_ops<'t>(
                 } else if is_final {
                     Some(SemanticCode::ReadPotentiallyUnassignedFinal)
                 } else {
-                    (potentially_non_nullable)
-                        .then_some(SemanticCode::NotAssignedPotentiallyNonNullableLocalVariable)
+                    (potentially_non_nullable
+                        && !unassigned_read_suppressed(
+                            span,
+                            declared_type,
+                            tokens,
+                            &engine,
+                            name,
+                        ))
+                    .then_some(SemanticCode::NotAssignedPotentiallyNonNullableLocalVariable)
                 };
                 if let Some(code) = code {
                     flow_diagnostics.push(Diagnostic::new(
@@ -1753,7 +1880,8 @@ pub fn fold_unit_with_ops<'t>(
             // The query-face rows (#1056): no diagnostic behavior — the
             // report side is unchanged. The read-type row joins into the
             // semantic `Ty` space beside its promotion sibling; a
-            // void/never-typed read (no real read can carry one) drops. The
+            // `void`-typed read carries no spelling here and joins the
+            // operand-face side table instead (#3632). The
             // staged type folds through a type alias first (`type_of`
             // answers the resolved interface type).
             FlowFact::ReadType { span, ty, args } => {
@@ -1765,6 +1893,15 @@ pub fn fold_unit_with_ops<'t>(
                 // spelling for the shapeless head.
                 if ty.base == FlowBase::Function {
                     engine.promotion_function_reads.insert(span.range.offset);
+                }
+                // A `void` read has no `Ty` spelling through
+                // `staged_promotion_typed`, but the statement-form operand
+                // faces decide `isPotentiallyNullable(void)` on exactly it
+                // (#3632) — the row lands on the operand-face side table
+                // instead of the shared join.
+                if ty.base == FlowBase::Void {
+                    engine.void_read_rows.push((span.range, Ty::Void));
+                    continue;
                 }
                 let staged = staged_promotion_typed(
                     ty,
@@ -2155,6 +2292,9 @@ pub fn fold_unit_with_ops<'t>(
     // abstractness, and name span. The rows stage into the same usage tail
     // (sorted by offset before the merge below).
     engine.verify_enum_member_set();
+    // The #3626 interface-conflict face rides the same post-pass slot: the
+    // header scan and the merge walk need only the closed model.
+    engine.verify_generic_interface_conflicts();
     // The use-face extraction (#767): the per-file consumers have read
     // their sets; the sets re-home into the face for the caller's
     // per-library close.
@@ -2557,6 +2697,13 @@ pub fn fold_unit_with_ops<'t>(
     report.diagnostics = merge_source_ordered(report.diagnostics, body_rows);
     let mut staged = std::mem::take(&mut report.usage);
     staged.sort_by_key(|d| d.range.offset);
+    // The oracle's listener collects into a `Set<Diagnostic>` (analyzer's
+    // RecordingAnalysisErrorListener), so byte-identical rows emit once.
+    // The nameless-member remap anchors every unnamed member of one
+    // container at the same (offset, 0) site — `class C { var  var }`
+    // upstream is ONE `unused_field` row at `C`, never two — and the
+    // stable sort makes identical rows adjacent.
+    staged.dedup();
     report.diagnostics = merge_source_ordered(report.diagnostics, staged);
     // The #3288 dead-clause containment pass runs on the joined list: a
     // catch clause the clause-level families have already reported dead
@@ -7479,3 +7626,14 @@ mod ticket_3520_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3511_tests.rs"]
 mod ticket_3511_tests;
+
+/// The #3648 pins: `not_assigned_potentially_non_nullable_local_variable`'s
+/// diagnose-side suppression gates — the resolved-element answers the
+/// flow's name-level `potentially_non_nullable` bit cannot express
+/// (wildcard `_` non-binding, the for-in identifier head's write face,
+/// the shared-case-scope join, and the `void` / typedef-nullable /
+/// `dynamic` / `Null` declared heads the upstream
+/// `isPotentiallyNonNullable` folds).
+#[cfg(test)]
+#[path = "diagnose/ticket_3648_tests.rs"]
+mod ticket_3648_tests;

@@ -1184,6 +1184,7 @@ mod tests {
                     is_final: false,
                     is_interface: false,
                     is_mixin_class: false,
+                    intro_superclass: false,
                     superclass: None,
                     factory_formals: Vec::new(),
                     members: vec![(

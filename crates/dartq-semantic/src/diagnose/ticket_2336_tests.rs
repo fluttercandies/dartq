@@ -81,6 +81,7 @@ fn switch_report(main_source: &str, dependency: &str, imported: bool) -> FileRep
                 target: Some(dep_lib),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

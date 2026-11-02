@@ -108,6 +108,7 @@ fn dep_member_use_report(
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

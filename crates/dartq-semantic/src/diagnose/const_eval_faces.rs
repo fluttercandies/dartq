@@ -174,7 +174,14 @@ impl ConstLookup for Engine<'_> {
             // silent (the oracle's `hasKnownValue` gate — the undefined
             // name already carries the report).
             BareInfo::Missing { .. } => {
-                if self.guard.ignore(None, name) {
+                // A bare `dynamic` read is a valid `Type` literal constant
+                // (`const d = dynamic` — the resolver's `dynamic` pseudo-
+                // element is a `TypeLiteral`, `TypeState` of unknown reified
+                // type but a legal constant); the name never reaches the
+                // model's resolution faces, so the bare-name path defers.
+                if self.strings.resolve(name) == "dynamic" {
+                    IdentVerdict::Constant
+                } else if self.guard.ignore(None, name) {
                     IdentVerdict::Constant
                 } else {
                     IdentVerdict::Unresolved
@@ -341,16 +348,23 @@ impl<'a> Engine<'a> {
                         stack.push(part);
                     }
                 }
-                Expr::Map(entries) => {
-                    for (key, value) in entries {
-                        stack.push(key);
-                        stack.push(value);
+                Expr::Map(parts) => {
+                    for part in parts {
+                        stack.push(part);
                     }
                 }
                 Expr::Entry(key, value) => {
                     stack.push(key);
                     stack.push(value);
                 }
+                Expr::IfElement { cond, then, els } => {
+                    stack.push(cond);
+                    stack.push(then);
+                    if let Some(els) = els {
+                        stack.push(els);
+                    }
+                }
+                Expr::Spread { operand, .. } => stack.push(operand),
                 Expr::Call { args, .. } => {
                     for arg in args {
                         stack.push(arg);
@@ -468,6 +482,26 @@ impl<'a> Engine<'a> {
                 "",
                 "",
             );
+        } else if let Verdict::Fault(ConstFault::ForElement, _) = verdict {
+            // The element face already reported `const_eval_for_element`
+            // at the element. A top-level/field const's own value-
+            // computation wraps the initializer as
+            // `genericError(node.initializer)` upstream — non-allow-
+            // listed, so the site default `const_init` fires at the whole
+            // initializer expression (the literal). A LOCAL const's
+            // `visitVariableDeclaration` `_reportError` carries the
+            // element's `InvalidConstant` verbatim — the allow-list swaps
+            // the code at the element, no twin fires (nothing more to do).
+            if !local {
+                if let Some(span) = root.as_ref().map(|node| node.span) {
+                    self.emit(
+                        SemanticCode::ConstInitializedWithNonConstantValue,
+                        span,
+                        "",
+                        "",
+                    );
+                }
+            }
         } else {
             self.resolve_const_verdict(&verdict);
         }
@@ -641,10 +675,12 @@ impl<'a> Engine<'a> {
             // reference is known-invalid at the variable. A leading-dot
             // shorthand (`.blue` — `DotShorthandNameExpression` resolves
             // against the context type) reads unresolved through the
-            // bare-name path the capture folds it to: the oracle answers
-            // `invalid_constant` only for the member the type cannot
-            // resolve, and the valid shorthands outnumber it — the
-            // under-report verdict stays silent.
+            // bare-name path the capture folds it to: a RESOLVED shorthand
+            // defers like any constant (the declaration shorthand pass
+            // upgraded its row's type), while a FAILED one — the context
+            // type cannot answer the member — is the oracle's
+            // `invalidConstant` at the whole shorthand node (the dot
+            // included), alongside its own `dot_shorthand_*` face row.
             Verdict::Unresolved(span) => {
                 if !self.dot_shorthand_context(span.offset) {
                     self.emit(
@@ -653,6 +689,25 @@ impl<'a> Engine<'a> {
                         "",
                         "",
                     );
+                } else if !self.shorthand_resolved_at(*span) {
+                    let whole = self.shorthand_whole_span(*span);
+                    // A decl-root shorthand's `report_root_shorthand` already
+                    // landed this row; the Unresolved verdict's twin collapses.
+                    let info =
+                        SemanticCode::ConstInitializedWithNonConstantValue.code_info();
+                    if !self
+                        .report
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.range == whole && d.code == info)
+                    {
+                        self.emit(
+                            SemanticCode::ConstInitializedWithNonConstantValue,
+                            whole,
+                            "",
+                            "",
+                        );
+                    }
                 }
             }
             Verdict::Fault(fault, span) => self.emit_const_fault(*fault, *span),
@@ -705,7 +760,28 @@ impl<'a> Engine<'a> {
             ConstFault::ThrowsIdbze => SemanticCode::ConstEvalThrowsIdbze,
             ConstFault::PrimitiveEquality => SemanticCode::ConstEvalPrimitiveEquality,
             ConstFault::Recursive => SemanticCode::RecursiveCompileTimeConstant,
+            ConstFault::ForElement => SemanticCode::ConstEvalForElement,
+            ConstFault::NonBoolCondition => SemanticCode::NonBoolCondition,
+            ConstFault::SpreadExpectedListOrSet => {
+                SemanticCode::ConstSpreadExpectedListOrSet
+            }
+            ConstFault::SpreadExpectedMap => SemanticCode::ConstSpreadExpectedMap,
+            ConstFault::ExpressionInMap => SemanticCode::ExpressionInMap,
         };
+        // One allow-listed failure is one row upstream — the element face's
+        // row and the propagated verdict's row are the same diagnostic
+        // (`_reportError` on the `InvalidConstant`), so a second emit at the
+        // same `(code, range)` collapses (the fault leaf's re-eval lands on
+        // the entity the element check already reported).
+        let info = code.code_info();
+        if self
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == span && d.code == info)
+        {
+            return;
+        }
         self.emit(code, span, "", "");
     }
 
@@ -1002,8 +1078,26 @@ impl<'a> Engine<'a> {
         {
             return CallClass::ConstCtor;
         }
+        // A pattern's constant-expression context is NOT a const context: a
+        // bare `C(...)` there is an ordinary (non-const) creation, not the
+        // implicit `const C(...)` the initializer face folds. The oracle
+        // reports the enclosing site's default at the creation
+        // (`{A(): 0}` → `non_constant_map_pattern_key`, `case > A()` →
+        // `non_constant_relational_pattern_expression`), which is exactly
+        // the [`CallClass::ValueCall`] posture.
+        // Only an IMPLICIT creation is affected, and only a MAP-PATTERN
+        // KEY's window: an explicit `const C()` is the same constant it is
+        // anywhere else, and a CONSTANT pattern's `case C()` is a variable
+        // pattern rather than a constant expression (its own face owns the
+        // shape). `const_kw_spans` being non-empty marks the explicit
+        // prefix.
+        let in_pattern_expression = self.const_capture.top_is_map_pattern_key();
         if self.const_ctor_target(name) {
-            return CallClass::ConstCtor;
+            return if in_pattern_expression {
+                CallClass::ValueCall
+            } else {
+                CallClass::ConstCtor
+            };
         }
         // `C.named(` over an in-file class container: the implicit
         // `const C.named(...)` creation when a declared CONST constructor
@@ -1076,10 +1170,17 @@ impl<'a> Engine<'a> {
                     }
                     if matches!(
                         target,
-                        RefTarget::Local
-                            | RefTarget::This
-                            | RefTarget::Member { .. }
-                            | RefTarget::Opaque
+                        RefTarget::Local | RefTarget::Opaque
+                    ) {
+                        // A bare-identifier call on a LOCAL / FORMAL: the
+                        // resolver rewrites it to a
+                        // `FunctionExpressionInvocation` (see
+                        // [`CallClass::ValueCall`]).
+                        return CallClass::ValueCall;
+                    }
+                    if matches!(
+                        target,
+                        RefTarget::This | RefTarget::Member { .. }
                     ) || (matches!(target, RefTarget::Decl { .. })
                         && self.type_resolution(recv.name).0 == TypeResolution::NonType)
                     {
@@ -1111,11 +1212,55 @@ impl<'a> Engine<'a> {
         if self.frames.iter().any(|f| f.locals.contains(&name))
             || self.const_scopes.iter().any(|s| s.contains_key(&name))
         {
-            return CallClass::Invocable;
+            // Same rewrite face as the receiver-shaped local call above.
+            return CallClass::ValueCall;
         }
         match self.top_level_decl(name).map(|d| d.kind) {
-            Some(MicroKind::TopLevelFn | MicroKind::TopLevelVar) => CallClass::Invocable,
+            // A top-level FUNCTION is a real method invocation
+            // (`const_eval_method_invocation`); a top-level VARIABLE is a
+            // getter read followed by a call, which the resolver rewrites to
+            // a `FunctionExpressionInvocation` ([`CallClass::ValueCall`]).
+            Some(MicroKind::TopLevelFn) => CallClass::Invocable,
+            Some(MicroKind::TopLevelVar) => CallClass::ValueCall,
             _ => CallClass::Unknown,
+        }
+    }
+
+    /// Whether the leading-dot shorthand whose name sits at `span`
+    /// resolved through the declaration shorthand pass: a hit upgrades the
+    /// row's `Bare` shape to `Plain { ty }` with a non-`UNKNOWN` `ty`
+    /// (`verdict_shorthand_at`), so the const root defers like any
+    /// constant; a miss keeps `ty == UNKNOWN` (its own
+    /// `dot_shorthand_undefined_member`/`missing_context` row already
+    /// reports the member face, and the const root still owes the oracle's
+    /// `invalidConstant` at the whole shorthand).
+    fn shorthand_resolved_at(&self, span: SourceRange) -> bool {
+        self.rows
+            .iter()
+            .find(|row| row.range.offset <= span.offset && row.range.end() >= span.end())
+            .is_some_and(|row| row.ty != Ty::UNKNOWN)
+    }
+
+    /// The whole leading-dot shorthand span whose name sits at `span` —
+    /// the `.` through the selector's end (the oracle anchors a failed
+    /// shorthand's `invalidConstant` at the node, not the name).
+    fn shorthand_whole_span(&self, span: SourceRange) -> SourceRange {
+        let toks = self.tokens.as_slice();
+        let idx = toks.partition_point(|t| t.utf16_offset < span.offset);
+        let Some(dot) = idx.checked_sub(1).and_then(|i| toks.get(i)) else {
+            return span;
+        };
+        if self
+            .source
+            .as_bytes()
+            .get(self.byte_of(dot.utf16_offset))
+            != Some(&b'.')
+        {
+            return span;
+        }
+        SourceRange {
+            offset: dot.utf16_offset,
+            length: span.end() - dot.utf16_offset,
         }
     }
 
@@ -1225,19 +1370,38 @@ impl<'a> Engine<'a> {
         if call {
             self.emit_shorthand_undefined_member(selector, "dynamic");
         } else {
+            // The declaration-initializer shorthand pass may already have
+            // reported this row (`emit_shorthand_missing_context` dedups on
+            // `(code, range)`); a second emit here would twin it.
+            let info = SemanticCode::DotShorthandMissingContext.code_info();
+            if !self
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.range == whole && d.code == info)
+            {
+                self.emit(
+                    SemanticCode::DotShorthandMissingContext,
+                    whole,
+                    "",
+                    "",
+                );
+            }
+        }
+        let info = SemanticCode::ConstInitializedWithNonConstantValue.code_info();
+        if !self
+            .report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == whole && d.code == info)
+        {
             self.emit(
-                SemanticCode::DotShorthandMissingContext,
+                SemanticCode::ConstInitializedWithNonConstantValue,
                 whole,
                 "",
                 "",
             );
         }
-        self.emit(
-            SemanticCode::ConstInitializedWithNonConstantValue,
-            whole,
-            "",
-            "",
-        );
     }
 
     /// The `dot_shorthand_undefined_member` emit surface every shorthand
@@ -2006,11 +2170,19 @@ impl<'a> Engine<'a> {
             .unwrap_or_default()
     }
 
+    /// The element verifier's return: `Some(verdict)` is the literal's
+    /// own value-fold — `Verdict::Fault` is an allow-listed
+    /// `constEval*`/`nonBoolCondition` failure (a `for` element's
+    /// `Faulted` leaf or an `if` condition's non-bool), so the caller
+    /// pushes a fault leaf (the allow list overrides the site's
+    /// const-init default); `Verdict::NotConstant`/`Unresolved` is a
+    /// plain element failure pushed as a non-constant leaf. `None` means
+    /// every element folded clean.
     pub fn check_const_elements(
         &mut self,
         code: SemanticCode,
         parts: &[crate::const_eval::Node],
-    ) -> Option<SourceRange> {
+    ) -> Option<Verdict> {
         // `constantContext2` (ast.dart:17927-17983) walks a literal's
         // ancestors: inside a `this(...)`/`this.named(...)`/`super(...)`/
         // `super.named(...)` argument list it hits the
@@ -2041,107 +2213,91 @@ impl<'a> Engine<'a> {
         // other leaf classifies exactly as before, so a genuinely
         // non-constant element still reports through the same face.
         let formals = self.ctor_init_formals();
-        let verdicts: Vec<Verdict> = if formals.is_empty() {
-            parts.iter().map(|part| eval(part, self)).collect()
-        } else {
-            let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
-            for name in formals {
-                env.insert(name, CtorBinding::Opaque);
-            }
-            let scope = CtorScope {
-                engine: self,
-                env: &env,
-            };
-            parts.iter().map(|part| eval(part, &scope)).collect()
+        let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
+        for name in &formals {
+            env.insert(*name, CtorBinding::Opaque);
+        }
+        let scope = CtorScope {
+            engine: self,
+            env: &env,
         };
+        // The element evaluates under the ctor-formals scope when the
+        // enclosing context binds any (the potentially-constant arm);
+        // `self` answers every other leaf through the same `ConstLookup`
+        // face.
+        let lookup: &dyn ConstLookup = if formals.is_empty() { self } else { &scope };
+        // The pure verifier walk: each element contributes its report rows
+        // (site-code leaves and allow-listed faults), the spans folding
+        // clean (whose subtrees still owe the resolved-creation leaf
+        // sweep), and the literal's own verdict. Row emission happens in
+        // the drain below — the `lookup` borrow ends there, freeing `self`
+        // for `&mut` reporting.
+        let mut rows: Vec<ElementRow> = Vec::new();
+        let mut clean: Vec<SourceRange> = Vec::new();
         let mut failed = None;
-        for (part, verdict) in parts.iter().zip(verdicts) {
-            let failed_at = match verdict {
-                // An element folding clean but closing an unresolved
-                // callee's invocation (`[Undefined()]`): the oracle's
-                // evaluation is known-invalid at the invocation
-                // (`undefined_function` is not override-listed,
-                // `constant_verifier.dart` `_reportError`), so the element's
-                // site default fires there like an eval-failed element.
-                Verdict::Value(_) | Verdict::Constant => self.unresolved_call(part.span),
-                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
-                    // A leading-dot shorthand resolves against the context
-                    // type upstream — the bare-name verdict is ambiguous.
-                    if self.dot_shorthand_context(span.offset) {
-                        None
-                    } else {
-                        Some(span)
-                    }
-                }
-                Verdict::Fault(fault, span) => {
-                    self.emit_const_fault(fault, span);
-                    failed.get_or_insert(span);
-                    None
-                }
-            };
-            // An element folding clean can still carry unresolved leaves
-            // deeper inside a resolved const creation's arguments (the
-            // corpus's `GenerateNodeProperty('element', type:
-            // ExtensionElementImpl)`): the oracle's creation evaluation
-            // reports the leaf itself and nothing above it (#2261).
-            self.check_invalid_constant_leaves(part.span);
-            if let Some(span) = failed_at {
-                let info = code.code_info();
-                let repeat = self
-                    .report
-                    .diagnostics
-                    .iter()
-                    .rev()
-                    .any(|d| d.range == span && d.code == info);
-                if !repeat {
-                    if self.leaf_in_resolved_creation(span.offset) {
-                        // The failing leaf sits inside a resolved const
-                        // creation's argument list: the oracle reports the
-                        // leaf directly there and the literal's element
-                        // face never substitutes — the positional arm's
-                        // `const_with_non_constant_argument` already owns
-                        // the span, everything else is `invalid_constant`.
-                        if !self.const_arg_row_at(span) {
-                            self.emit(SemanticCode::InvalidConstant, span, "", "");
-                        }
-                    } else if self.initializer_depth > 0 && self.in_const_ctor {
-                        // A literal inside the const constructor's
-                        // initializer list is never `isConst`
-                        // (`constantContext2` answers null on the
-                        // initializer ancestors), so the element faces
-                        // never run there — the gate is the initializer's
-                        // potentially-constant scan (upstream Dart SDK
-                        // source, pkg/analyzer/lib/src/dart/constant/
-                        // constant_verifier.dart
-                        // `_validateConstructorInitializers` →
-                        // `_reportNotPotentialConstants`), whose face is
-                        // `invalid_constant` at the failing leaf
-                        // (probe2484 p4a: `: rec = (a: g)` reports
-                        // `invalid_constant` at `g`, never
-                        // `non_constant_record_field` — that face owns the
-                        // true const literal context alone, probe2484 p4b).
-                        self.emit(SemanticCode::InvalidConstant, span, "", "");
-                    } else {
-                        self.emit(code, span, "", "");
-                        // A leaf under an open annotation window joins the
-                        // argument faces' pairing log (#2261); a set/map
-                        // element's own face rides retractable — the
-                        // type-declaration hosts' evaluation owns the
-                        // report there, decided at the annotation's close
-                        // (the element check has no host view).
-                        let retractable = matches!(
-                            code,
-                            SemanticCode::NonConstantSetElement
-                                | SemanticCode::NonConstantMapValue
-                                | SemanticCode::NonConstantMapKey
-                        ) && self.span_ends_call(span);
-                        self.const_capture.note_annotation_leaf(span, retractable);
-                    }
-                }
-                failed.get_or_insert(span);
+        for part in parts {
+            if let Some(v) = verify_const_element(part, code, lookup, &mut rows, &mut clean, self)
+            {
+                failed.get_or_insert(v);
+            }
+        }
+        for span in clean {
+            self.check_invalid_constant_leaves(span);
+        }
+        for row in rows {
+            match row {
+                ElementRow::Site(span, row_code) => self.report_element_leaf(span, row_code),
+                ElementRow::Fault(span, fault) => self.emit_const_fault(fault, span),
             }
         }
         failed
+    }
+
+    /// Reports the element's site code at the failing leaf — the resolved-
+    /// creation/ctor-initializer override arms and the annotation pairing
+    /// all funnel through here (upstream `_reportError` on the site
+    /// default).
+    fn report_element_leaf(&mut self, span: SourceRange, code: SemanticCode) {
+        let info = code.code_info();
+        let repeat = self
+            .report
+            .diagnostics
+            .iter()
+            .rev()
+            .any(|d| d.range == span && d.code == info);
+        if repeat {
+            return;
+        }
+        if self.leaf_in_resolved_creation(span.offset) {
+            // The failing leaf sits inside a resolved const creation's
+            // argument list: the oracle reports the leaf directly there
+            // and the literal's element face never substitutes — the
+            // positional arm's `const_with_non_constant_argument` already
+            // owns the span, everything else is `invalid_constant`.
+            if !self.const_arg_row_at(span) {
+                self.emit(SemanticCode::InvalidConstant, span, "", "");
+            }
+        } else if self.initializer_depth > 0 && self.in_const_ctor {
+            // A literal inside the const constructor's initializer list is
+            // never `isConst` (`constantContext2` answers null on the
+            // initializer ancestors), so the element faces never run there
+            // — the gate is the initializer's potentially-constant scan,
+            // whose face is `invalid_constant` at the failing leaf.
+            self.emit(SemanticCode::InvalidConstant, span, "", "");
+        } else {
+            self.emit(code, span, "", "");
+            // A leaf under an open annotation window joins the argument
+            // faces' pairing log (#2261); a set/map element's own face
+            // rides retractable — the type-declaration hosts' evaluation
+            // owns the report there, decided at the annotation's close.
+            let retractable = matches!(
+                code,
+                SemanticCode::NonConstantSetElement
+                    | SemanticCode::NonConstantMapValue
+                    | SemanticCode::NonConstantMapKey
+            ) && self.span_ends_call(span);
+            self.const_capture.note_annotation_leaf(span, retractable);
+        }
     }
 
     /// The unresolved leaves (`Bare(Missing)` rows) under `span` that sit
@@ -2497,16 +2653,25 @@ impl<'a> Engine<'a> {
     /// Pushes a closed const literal's value onto the capture: its
     /// structural value when every element was constant and known
     /// (`payload` — the duplicate twins compare by value), the
-    /// opaque-kind instance when any element's value is unknown, else a
-    /// non-constant leaf anchored at the first failing element (so the
-    /// enclosing initializer's verdict reports there). Inside a
-    /// creation's argument list the failure stays local — the oracle's
-    /// argument faces there are `invalid_constant`, which this face does
-    /// not model.
+    /// opaque-kind instance when any element's value is unknown, else the
+    /// failing element's leaf — `Verdict::Fault` is an allow-listed
+    /// `constEval*` failure pushed as a fault leaf (the enclosing
+    /// declaration's site default swaps to the fault's code at the
+    /// element, never a const-init twin); `NotConstant`/`Unresolved` is a
+    /// plain non-constant leaf. Inside a creation's argument list the
+    /// failure stays local — the oracle's argument faces there are
+    /// `invalid_constant`, which this face does not model.
+    /// `end` is the literal's closing token (the value node's span);
+    /// `literal` is the whole literal extent (`[`/`{` through the close)
+    /// — a fault leaf's staged span, since the declaration's own verdict
+    /// for a `for` element wraps the whole initializer upstream
+    /// (`genericError(node.initializer)` → the site default anchors at
+    /// the literal, not the element).
     pub(crate) fn push_literal_value(
         &mut self,
-        failed: Option<SourceRange>,
+        failed: Option<Verdict>,
         end: SourceRange,
+        literal: SourceRange,
         kind: crate::const_eval::InstanceKind,
         payload: Option<ConstantValue>,
     ) {
@@ -2518,7 +2683,25 @@ impl<'a> Engine<'a> {
             self.check_const_duplicates(shape);
         }
         match failed {
-            Some(span) if !self.const_capture.in_arguments() => {
+            Some(Verdict::Fault(fault, span)) if !self.const_capture.in_arguments() => {
+                // A `for` element's fault anchors its leaf at the literal —
+                // the declaration's own verdict wraps the whole initializer
+                // (`genericError(node.initializer)`), so the var-level
+                // const-init twin spans the literal, not the element. Every
+                // other allow-listed fault keeps its entity span (the
+                // element-check already reported the allow-listed code
+                // there — the pushed leaf's re-eval lands the declaration
+                // verdict on the same entity and the `(code, range)` dedup
+                // collapses them to the oracle's single row).
+                let anchor = match fault {
+                    ConstFault::ForElement => literal,
+                    _ => span,
+                };
+                self.const_capture.push_fault(anchor, fault);
+            }
+            Some(Verdict::NotConstant(span) | Verdict::Unresolved(span))
+                if !self.const_capture.in_arguments() =>
+            {
                 self.const_capture.push_non_constant(span);
             }
             _ => self
@@ -2544,17 +2727,25 @@ impl<'a> Engine<'a> {
             .collect()
     }
 
-    /// The map literal's structural value: every entry's key/value pair
-    /// in order, `None` when any side is of unknown value (the
-    /// opaque-kind fallback).
+    /// The map literal's structural value: every `Expr::Entry` piece's
+    /// key/value pair in order, `None` when any side is of unknown value
+    /// or a control element sits in the literal (the ordered parts carry
+    /// `if`/`spread`/`for` shapes whose folded value a `Map` constant
+    /// cannot list — upstream `_buildMapConstant` splices them, this
+    /// face's structural answer stays unknown there).
     pub(crate) fn map_payload(
         &mut self,
-        entries: &[(crate::const_eval::Node, crate::const_eval::Node)],
+        parts: &[crate::const_eval::Node],
     ) -> Option<ConstantValue> {
-        entries
+        parts
             .iter()
-            .map(|(key, value)| match (eval(key, self), eval(value, self)) {
-                (Verdict::Value(key), Verdict::Value(value)) => Some((key, value)),
+            .map(|part| match &part.expr {
+                crate::const_eval::Expr::Entry(key, value) => {
+                    match (eval(key, self), eval(value, self)) {
+                        (Verdict::Value(key), Verdict::Value(value)) => Some((key, value)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
@@ -2599,9 +2790,15 @@ impl<'a> Engine<'a> {
         use crate::const_eval::SetOrMap;
         let (code, parts): (SemanticCode, Vec<crate::const_eval::Node>) = match shape {
             SetOrMap::Set(elements) => (SemanticCode::EqualElementsInConstSet, elements),
-            SetOrMap::Map(entries) => (
+            SetOrMap::Map(parts) => (
                 SemanticCode::EqualKeysInConstMap,
-                entries.into_iter().map(|(key, _)| key).collect(),
+                parts
+                    .into_iter()
+                    .filter_map(|part| match part.expr {
+                        crate::const_eval::Expr::Entry(key, _) => Some(*key),
+                        _ => None,
+                    })
+                    .collect(),
             ),
         };
         self.report_duplicate_elements(code, &parts);
@@ -2632,9 +2829,15 @@ impl<'a> Engine<'a> {
         }
         let (code, parts): (SemanticCode, Vec<crate::const_eval::Node>) = match shape {
             SetOrMap::Set(elements) => (SemanticCode::EqualElementsInSet, elements),
-            SetOrMap::Map(entries) => (
+            SetOrMap::Map(parts) => (
                 SemanticCode::EqualKeysInMap,
-                entries.into_iter().map(|(key, _)| key).collect(),
+                parts
+                    .into_iter()
+                    .filter_map(|part| match part.expr {
+                        crate::const_eval::Expr::Entry(key, _) => Some(*key),
+                        _ => None,
+                    })
+                    .collect(),
             ),
         };
         self.report_duplicate_elements(code, &parts);
@@ -3228,6 +3431,162 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// A report row the pure element verifier stages: a site-code leaf or
+/// an allow-listed `constEval*`/`nonBoolCondition` fault.
+enum ElementRow {
+    Site(SourceRange, SemanticCode),
+    Fault(SourceRange, ConstFault),
+}
+
+/// One collection element's verifier arm — the pure half of upstream
+/// `_ConstLiteralVerifier.verify`: each shape contributes its report
+/// rows (site-code leaves / allow-listed faults) and the literal's own
+/// verdict. `clean` accumulates the spans folding clean whose subtrees
+/// still owe the resolved-creation leaf sweep. The `engine` read-only
+/// probes (`dot_shorthand_context`, `unresolved_call`) stay on `self`;
+/// emission is the caller's drain.
+fn verify_const_element(
+    part: &crate::const_eval::Node,
+    code: SemanticCode,
+    lookup: &dyn ConstLookup,
+    rows: &mut Vec<ElementRow>,
+    clean: &mut Vec<SourceRange>,
+    engine: &Engine<'_>,
+) -> Option<Verdict> {
+    use crate::const_eval::Expr;
+    match &part.expr {
+        Expr::IfElement { cond, then, els } => {
+            // The condition evaluates with the element code (a non-bool
+            // constant faults `non_bool_condition` at
+            // `element.expression` — upstream `conditionValue == null`
+            // → `InvalidConstant.forEntity(entity: element.expression)`).
+            match eval(cond, lookup) {
+                Verdict::Value(ConstantValue::Bool(b)) => {
+                    // The dead branch's not-potentially-constant shapes
+                    // each report the element code (upstream
+                    // `_reportNotPotentialConstants` over the skipped
+                    // element) but never fault the literal — the live
+                    // branch alone decides the verdict.
+                        // The live branch (`then` on true, `els` — which may
+                        // be absent — on false) verifies like an element; the
+                        // dead one scans its not-potentially-constant shapes.
+                        if b {
+                            if let Some(els) = els.as_deref() {
+                                dead_branch_npc(els, code, lookup, rows, engine);
+                            }
+                            verify_const_element(then, code, lookup, rows, clean, engine)
+                        } else {
+                            dead_branch_npc(then, code, lookup, rows, engine);
+                            els.as_deref().and_then(|els| {
+                                verify_const_element(els, code, lookup, rows, clean, engine)
+                            })
+                        }
+                }
+                // A known non-bool condition faults `non_bool_condition`
+                // at the condition (the oracle's entity is the
+                // expression, not the whole element).
+                Verdict::Value(_) => {
+                    rows.push(ElementRow::Fault(cond.span, ConstFault::NonBoolCondition));
+                    Some(Verdict::Fault(ConstFault::NonBoolCondition, cond.span))
+                }
+                // An unknown-but-constant condition scans BOTH branches'
+                // not-potentially-constant shapes (upstream `isUnknown`
+                // → unknown collection, each branch's shapes still
+                // report their element-code rows); the literal's own
+                // verdict defers (the value is unknown, not failed).
+                Verdict::Constant => {
+                    dead_branch_npc(then, code, lookup, rows, engine);
+                    if let Some(els) = els.as_deref() {
+                        dead_branch_npc(els, code, lookup, rows, engine);
+                    }
+                    None
+                }
+                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                    if engine.dot_shorthand_context(span.offset) {
+                        None
+                    } else {
+                        rows.push(ElementRow::Site(span, code));
+                        Some(Verdict::NotConstant(span))
+                    }
+                }
+                Verdict::Fault(fault, span) => {
+                    rows.push(ElementRow::Fault(span, fault));
+                    Some(Verdict::Fault(fault, span))
+                }
+            }
+        }
+        Expr::Spread { operand, .. } => match eval(operand, lookup) {
+            Verdict::Value(_) | Verdict::Constant => None,
+            Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                if engine.dot_shorthand_context(span.offset) {
+                    None
+                } else {
+                    rows.push(ElementRow::Site(span, code));
+                    Some(Verdict::NotConstant(span))
+                }
+            }
+            Verdict::Fault(fault, span) => {
+                rows.push(ElementRow::Fault(span, fault));
+                Some(Verdict::Fault(fault, span))
+            }
+        },
+        _ => {
+            // A plain element (and a `ForElement` `Faulted` leaf — its
+            // fault reaches the verdict arm below).
+            match eval(part, lookup) {
+                Verdict::Value(_) | Verdict::Constant => {
+                    clean.push(part.span);
+                    // An element folding clean but closing an
+                    // unresolved callee's invocation (`[Undefined()]`)
+                    // reports the element's site default there like an
+                    // eval-failed element.
+                    engine.unresolved_call(part.span).map(|span| {
+                        rows.push(ElementRow::Site(span, code));
+                        Verdict::NotConstant(span)
+                    })
+                }
+                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                    // A leading-dot shorthand resolves against the
+                    // context type upstream — the bare-name verdict is
+                    // ambiguous.
+                    if engine.dot_shorthand_context(span.offset) {
+                        None
+                    } else {
+                        rows.push(ElementRow::Site(span, code));
+                        Some(Verdict::NotConstant(span))
+                    }
+                }
+                Verdict::Fault(fault, span) => {
+                    rows.push(ElementRow::Fault(span, fault));
+                    Some(Verdict::Fault(fault, span))
+                }
+            }
+        }
+    }
+}
+
+/// The dead-branch / unknown-condition not-potentially-constant scan
+/// (upstream `_reportNotPotentialConstants`): each shape the const
+/// grammar can never value reports the element code at its own leaf,
+/// but the literal's own verdict is untouched (upstream skips the
+/// branch's contribution — `elementCode` rows are sibling reports,
+/// not the collection's failure).
+fn dead_branch_npc(
+    node: &crate::const_eval::Node,
+    code: SemanticCode,
+    lookup: &dyn ConstLookup,
+    rows: &mut Vec<ElementRow>,
+    engine: &Engine<'_>,
+) {
+    let mut spans = Vec::new();
+    crate::const_eval::collect_not_potentially_constant(node, lookup, &mut spans);
+    for span in spans {
+        if !engine.dot_shorthand_context(span.offset) {
+            rows.push(ElementRow::Site(span, code));
+        }
+    }
+}
+
 #[cfg(test)]
 mod face_tests {
     use crate::collector::collect;
@@ -3437,21 +3796,24 @@ mod face_tests {
         // element face at the spread operand, NOT through this ticket's
         // initializer code (oracle shape: `non_constant_map_element`
         // only — corpus case NonConstantMapElementTest/
-        // test_spreadElement_notConst expects that single row). The
-        // element faces' own red zone (non_constant_list/set/map_
-        // element, 80 pipeline fails) belongs to the element-face lane;
-        // this pin holds the const-init code out of it.
+        // test_spreadElement_notConst expects that single row, at the
+        // `notConst` operand). The element face now emits it, so the pin
+        // holds exactly that row and no const-init twin.
         let rep = unit_report(
             "void main() {\n\
              var notConst = {};\n\
              const {1: null, ...notConst};\n\
              }\n",
         );
-        assert!(
-            const_init(&rep).is_empty(),
-            "spread: {:?}",
-            const_init(&rep)
-        );
+        let rows: Vec<(&str, u32, u32)> = rep
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.name.starts_with("const_") || d.code.name.starts_with("non_constant")
+            })
+            .map(|d| (d.code.name, d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(rows, [("non_constant_map_element", 52, 8)], "spread: {rows:?}");
     }
 
     /// A `new` creation in a const initializer reports at the whole

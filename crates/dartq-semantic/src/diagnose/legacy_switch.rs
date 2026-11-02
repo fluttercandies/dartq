@@ -74,10 +74,9 @@ impl<'a> Engine<'a> {
                         walk(part, hit);
                     }
                 }
-                Expr::Map(pairs) => {
-                    for (key, val) in pairs {
-                        walk(key, hit);
-                        walk(val, hit);
+                Expr::Map(parts) => {
+                    for part in parts {
+                        walk(part, hit);
                     }
                 }
                 Expr::Call { args, .. } => {
@@ -89,7 +88,19 @@ impl<'a> Engine<'a> {
                     walk(key, hit);
                     walk(val, hit);
                 }
-                Expr::Value(_) | Expr::Ident(_) | Expr::Opaque | Expr::Other => {}
+                Expr::IfElement { cond, then, els } => {
+                    walk(cond, hit);
+                    walk(then, hit);
+                    if let Some(els) = els {
+                        walk(els, hit);
+                    }
+                }
+                Expr::Spread { operand, .. } => walk(operand, hit),
+                Expr::Value(_)
+                | Expr::Ident(_)
+                | Expr::Opaque
+                | Expr::Other
+                | Expr::Faulted(_) => {}
             }
         }
         let mut hit = None;
@@ -101,6 +112,104 @@ impl<'a> Engine<'a> {
             .iter()
             .any(|edge| edge.deferred && edge.prefix == Some(name));
         deferred.then_some(span)
+    }
+
+    /// The deferred-import face of a PATTERN constant (upstream
+    /// `evaluation.dart`'s `_getDeferredLibraryError` →
+    /// `patternConstantFromDeferredLibrary`, the `SwitchPatternCase` arm at
+    /// :2130-2132): a constant expression that reaches a value through a
+    /// `deferred` import's prefix fails const-eval at the referenced name,
+    /// and the row anchors there (`errorTarget` — the identifier of a
+    /// `PrefixedIdentifier`, the name of a `NamedType`). The same walk as
+    /// [`Self::legacy_deferred_span`]; a pattern-era switch takes this code
+    /// instead of the legacy case-expression one.
+    pub(crate) fn pattern_deferred_span(
+        &self,
+        node: &crate::const_eval::Node,
+    ) -> Option<SourceRange> {
+        // The pattern arm's `errorTarget` is the referenced NAME, not the
+        // prefix: `visitPrefixedIdentifier` passes `node.identifier` and
+        // `visitNamedType` passes `node.name` (`evaluation.dart`), so the
+        // row anchors at `c` of `a.c` (probed 3.13.7: `case a.c` reports
+        // at the `c` column, len 1).
+        fn named_prefix(node: &crate::const_eval::Node) -> Option<(StringId, StringId)> {
+            if let Expr::Member { recv, name } = &node.expr
+                && let Expr::Ident(prefix) = &recv.expr
+            {
+                return Some((*prefix, *name));
+            }
+            None
+        }
+        let mut hit: Option<(StringId, StringId)> = None;
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            if hit.is_none()
+                && let Some(found) = named_prefix(n)
+            {
+                hit = Some(found);
+            }
+            match &n.expr {
+                Expr::Member { recv, .. } => stack.push(recv),
+                Expr::Binary { left, right, .. } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+                Expr::Unary { operand, .. } => stack.push(operand),
+                Expr::Cond { cond, then, els } => {
+                    stack.push(cond);
+                    stack.push(then);
+                    stack.push(els);
+                }
+                Expr::Interp { parts } | Expr::Adjacent(parts) => stack.extend(parts.iter()),
+                Expr::List(parts) | Expr::Set(parts) | Expr::Record(parts) => {
+                    stack.extend(parts.iter());
+                }
+                Expr::Map(parts) => stack.extend(parts.iter()),
+                Expr::Call { args, .. } => stack.extend(args.iter()),
+                Expr::Entry(key, val) => {
+                    stack.push(key);
+                    stack.push(val);
+                }
+                Expr::IfElement { cond, then, els } => {
+                    stack.push(cond);
+                    stack.push(then);
+                    if let Some(els) = els {
+                        stack.push(els);
+                    }
+                }
+                Expr::Spread { operand, .. } => stack.push(operand),
+                Expr::Value(_)
+                | Expr::Ident(_)
+                | Expr::Opaque
+                | Expr::Other
+                | Expr::Faulted(_) => {}
+            }
+        }
+        fn member_span(node: &crate::const_eval::Node) -> Option<SourceRange> {
+            if let Expr::Member { .. } = &node.expr {
+                return Some(node.span);
+            }
+            None
+        }
+        let (prefix, name) = hit?;
+        let deferred = self
+            .graph
+            .import_edges(self.lib)
+            .iter()
+            .any(|edge| edge.deferred && edge.prefix == Some(prefix));
+        if !deferred {
+            return None;
+        }
+        // The member node's span ends at the selector's end (`dot_access`
+        // builds receiver-through-selector), so the identifier's own extent
+        // is the span TAIL. Dart identifiers are ASCII-only here, so the
+        // interned text's length is its UTF-16 width.
+        let span = member_span(node)?;
+        let width = self.strings.resolve(name).len() as u32;
+        Some(SourceRange {
+            offset: span.end().saturating_sub(width),
+            length: width,
+        })
     }
 
     /// Runs the legacy switch checks over the closed context the caller
@@ -243,7 +352,7 @@ impl<'a> Engine<'a> {
     /// opaque `Instance` accepts only on the function tear-off shape (the
     /// upstream `FunctionState` answer — `GenericState` answers `false`
     /// and the engine folds no finer face).
-    fn legacy_primitive_equality(&self, value: &ConstantValue) -> bool {
+    pub(crate) fn legacy_primitive_equality(&self, value: &ConstantValue) -> bool {
         match value {
             ConstantValue::Null
             | ConstantValue::Bool(_)

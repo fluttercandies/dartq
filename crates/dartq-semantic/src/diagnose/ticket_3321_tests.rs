@@ -94,6 +94,7 @@ fn core_member_use_report_prefixed(
                 target: Some(core),
                 prefix: Some(prefix_id),
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -104,6 +105,7 @@ fn core_member_use_report_prefixed(
             target: Some(dep_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

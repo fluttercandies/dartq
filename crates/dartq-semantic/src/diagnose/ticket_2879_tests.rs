@@ -67,6 +67,7 @@ fn report(source: &str) -> FileReport {
             target: Some(core_lib),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

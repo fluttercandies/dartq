@@ -73,6 +73,7 @@ fn unit_fold(source: &str, strings: &StringTable) -> UnitFold {
             prefix: None,
             deferred: false,
             combinators: Combinators::unfiltered(),
+                non_library: false,
         },
     );
     let mut index = ElementIndex::default();
@@ -715,6 +716,7 @@ fn unit_fold_prefixed(source: &str, other_source: &str, strings: &StringTable) -
             prefix: Some(strings.intern("p")),
             deferred: false,
             combinators: Combinators::unfiltered(),
+                non_library: false,
         },
     );
     builder.import(
@@ -724,6 +726,7 @@ fn unit_fold_prefixed(source: &str, other_source: &str, strings: &StringTable) -
             prefix: None,
             deferred: false,
             combinators: Combinators::unfiltered(),
+                non_library: false,
         },
     );
     for (name, decl) in elements.declarations() {

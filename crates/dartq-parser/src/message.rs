@@ -154,6 +154,7 @@ pub(crate) mod msg {
         MISSING_KEYWORD_OPERATOR, MIXIN_WITH_CLAUSE, MULTIPLE_IMPLEMENTS_CLAUSES,
         MULTIPLE_ON_CLAUSES, MULTIPLE_WITH_CLAUSES,
         PATTERN_VARIABLE_DECLARATION_OUTSIDE_FUNCTION_OR_METHOD,
+        PRIMARY_CONSTRUCTOR_BODY_WITH_MODIFIER,
     };
 
     /// `expectedToken` / `expectedButGot` / `expectedAfterButGot` all surface
@@ -1519,6 +1520,19 @@ pub(crate) mod msg {
                 "EXTENSION_PRIMARY_CONSTRUCTOR",
             ),
             "Extensions can't have primary constructors.",
+        )
+    }
+
+    /// `primaryConstructorBodyWithModifier` (registry code
+    /// `PRIMARY_CONSTRUCTOR_BODY_WITH_MODIFIER`): the `async`/`async*`/
+    /// `sync*` modifier a `this` primary-constructor body carries
+    /// (parser_impl.dart:3878-3891). `modifier` is the keyword lexeme with
+    /// a trailing `*` for the generator forms.
+    pub(crate) fn primary_constructor_body_with_modifier(modifier: &str) -> Message {
+        Message::with_correction(
+            PRIMARY_CONSTRUCTOR_BODY_WITH_MODIFIER,
+            format!("A primary constructor body can't have the modifier '{modifier}'."),
+            "Try removing the modifier.",
         )
     }
 

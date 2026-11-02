@@ -389,6 +389,7 @@ fn container_lookup_is_file_local_then_namespace() {
             target: Some(lib_a),
             prefix: None,
             deferred: false,
+            non_library: false,
             combinators: Combinators::unfiltered(),
         },
     );

@@ -13,6 +13,12 @@ struct DeferredDefault {
     range: SourceRange,
     /// The parameter's name (fragments match parameters by name).
     param: StringId,
+    /// The deferring parameter is named (`{a}`) or positional (`[a]`) —
+    /// augmentation-chain fragments merge named parameters by name and
+    /// positional parameters by POSITION (upstream merges the merged
+    /// element's formal table; a renamed positional augment still
+    /// supplies the same slot).
+    named: bool,
 }
 
 /// The current unit's deferred optional-parameter rows: staged at the
@@ -2687,6 +2693,20 @@ impl<'a> Engine<'a> {
             } if nullable
                 || self.strings.resolve(name) != "FutureOr" =>
             {
+                // An unresolvable head is the oracle's `InvalidType`
+                // (`void f({A a})` over an undeclared `A` resolves to the
+                // invalid face, which answers `isPotentiallyNullable` like
+                // `dynamic` — no `missing_default_value_for_parameter`
+                // row ever fires on it). Type parameters keep the written
+                // answer (their own bound face, not a resolution miss);
+                // every resolvable container/typedef keeps it too —
+                // `resolve_container` covers classes, mixins, enums and
+                // extension types, the namespace `Decl` probe covers SDK
+                // faces and typedefs the index cannot project.
+                if !nullable && !self.is_scope_param(name) && !self.type_head_resolves(name)
+                {
+                    return true;
+                }
                 nullable
             }
             Ty::Named {
@@ -2708,12 +2728,80 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether `name` denotes a type in this file's scope — the
+    /// `written_nullable_pnn` `InvalidType` gate's positive leg. A
+    /// container (class/mixin/enum/extension type, local or imported) and
+    /// any scope `Decl` the namespace answers (SDK faces like `int`, whose
+    /// declaring unit carries no element model, and typedefs) resolve; an
+    /// `Ambiguous`/`NotFound` name, a prefix, or a non-type decl the probe
+    /// cannot classify keep the `InvalidType` face — the under-report
+    /// direction (`true` = nullable above).
+    fn type_head_resolves(&self, name: StringId) -> bool {
+        if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )
+        .is_some()
+        {
+            return true;
+        }
+        // The namespace probe catches what the container walk cannot: an
+        // SDK declaration (its unit is never indexed — `index.get` misses)
+        // and a type alias (`decl` carries `TypeAlias`, never a container
+        // row). A `Decl` in an indexed unit resolves only when its own
+        // kind is a type — a function or variable `A` used in type
+        // position is the oracle's `InvalidType` even though the bare name
+        // binds.
+        match self.namespaces.lookup(self.graph, self.lib, name) {
+            Lookup::Found(NamespaceEntry::Decl(owner)) => match self.index.get(owner) {
+                Some(elements) => elements.decl(name).is_some_and(|decl| {
+                    matches!(
+                        decl.kind,
+                        crate::model::MicroKind::Class
+                            | crate::model::MicroKind::Enum
+                            | crate::model::MicroKind::Mixin
+                            | crate::model::MicroKind::Extension
+                            | crate::model::MicroKind::TypeAlias
+                    )
+                }),
+                // An unindexed owner is an SDK face — SDK names in type
+                // position are type declarations.
+                None => true,
+            },
+            _ => false,
+        }
+    }
+
     /// Stages the current optional formal for the body-verdict flush: only
     /// a potentially-non-nullable written type without a default value
     /// stages (error_verifier.dart:8394-8418); primary constructors decide
     /// immediately (`defaultValuesAreExpected` answers true unconditionally
-    /// there, :8368-8370).
+    /// there, :8368-8370). An `augment` fragment's formal stages like any
+    /// other: every fragment's formal list is checked against the merged
+    /// element (upstream MissingDefaultValueForParameterTest.
+    /// test_function_nonNullable_positional_optional_noDefault_augmentation:
+    /// `void f([int a]);` + `augment void f([int a]) {}` reports at both
+    /// `a`s); the renamed-slot and merged-type exceptions live in
+    /// [`Self::chain_supplies_default`]. Without the augmentation merge
+    /// (the feature off) no chain answers an `augment` fragment's formal —
+    /// its merged type and slot belong to the introductory formal, which
+    /// carries the row alone.
     pub(crate) fn stage_default_check(&mut self, check: PendingDefaultCheck) {
+        if !self.augmentations_enabled
+            && self.index.get(self.file).is_some_and(|elements| {
+                elements.augmentations().iter().any(|aug| {
+                    aug.formals
+                        .iter()
+                        .any(|formal| formal.name_range.offset == check.name_range.offset)
+                })
+            })
+        {
+            return;
+        }
         if self.written_potentially_non_nullable(check.written) {
             self.pending_default_checks.push(check);
         }
@@ -2780,6 +2868,7 @@ impl<'a> Engine<'a> {
                         code,
                         range: check.name_range,
                         param: check.name,
+                        named: check.named,
                     });
                 });
             } else {
@@ -2806,7 +2895,9 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether any fragment of the item's augmentation chain supplies a
-    /// default for the same-named parameter — the `hasDefaultValue` merge.
+    /// default for the same-named parameter — the `hasDefaultValue` merge —
+    /// or the item is an augment formal renaming its merged slot (the
+    /// introductory formal then owns the row).
     /// The chain key resolves like the augmentation verifier's
     /// (`augment_key`): a member augment keys `(container, name, static)`,
     /// a top-level executable keys `name`. Intro fragments read the model's
@@ -2818,8 +2909,14 @@ impl<'a> Engine<'a> {
         let own = self.index.get(self.file);
         // The owner key: an `augment` formal matches by its name-token span;
         // an introductory formal resolves to the nearest preceding
-        // executable declaration site.
+        // executable declaration site. A positional item also records its
+        // position among the fragment's positional parameters — the chain
+        // merges positional parameters by POSITION (the merged element's
+        // formal table pairs fragments slot-by-slot), so a renamed
+        // positional augment still supplies the intro parameter's default.
         let mut owner: Option<(Option<StringId>, StringId, bool, bool)> = None;
+        let mut item_pos: Option<usize> = None;
+        let mut from_aug = false;
         if let Some(elements) = own {
             'aug: for aug in elements.augmentations() {
                 if !matches!(
@@ -2832,7 +2929,7 @@ impl<'a> Engine<'a> {
                 ) {
                     continue;
                 }
-                for formal in aug.formals.iter() {
+                for (at, formal) in aug.formals.iter().enumerate() {
                     if formal.name_range.offset == item.range.offset {
                         owner = Some((
                             aug.container,
@@ -2840,6 +2937,27 @@ impl<'a> Engine<'a> {
                             aug.is_static,
                             aug.kind == crate::model::AugKind::Constructor,
                         ));
+                        from_aug = true;
+                        if item.named {
+                            // A wildcard `_` named formal merges by position
+                            // among the NAMED parameters (the `_`-or-same-
+                            // name rule); record its named index.
+                            if self.strings.resolve(item.param) == "_" {
+                                item_pos = Some(
+                                    aug.formals[..at]
+                                        .iter()
+                                        .filter(|f| f.named)
+                                        .count(),
+                                );
+                            }
+                        } else {
+                            item_pos = Some(
+                                aug.formals[..at]
+                                    .iter()
+                                    .filter(|f| f.required_positional || f.optional_positional)
+                                    .count(),
+                            );
+                        }
                         break 'aug;
                     }
                 }
@@ -2901,16 +3019,82 @@ impl<'a> Engine<'a> {
                     .decl(name)
                     .and_then(|decl| decl.formals.as_deref()),
             };
-            if let Some(formals) = intro_formals
-                && formals
-                    .positional
-                    .iter()
-                    .chain(formals.named.iter())
-                    .any(|formal| {
-                        formal.name == item.param && formal.default_value.is_some()
+            if let Some(formals) = intro_formals {
+                // Positional parameters merge by position: the deferring
+                // fragment's own index decides — an aug item reads its
+                // captured `item_pos`, an intro item its own table slot,
+                // latched here so the augment-fragment matching below
+                // compares the same slot across fragments.
+                if item_pos.is_none() {
+                    if !item.named {
+                        item_pos = formals
+                            .positional
+                            .iter()
+                            .position(|formal| formal.name == item.param);
+                    } else if self.strings.resolve(item.param) == "_" {
+                        // An intro-deferred wildcard `_` carries its own
+                        // index among the named parameters — the same slot
+                        // the augment-fragment matching compares below.
+                        item_pos = formals
+                            .named
+                            .iter()
+                            .position(|formal| formal.name == item.param);
+                    }
+                }
+                // An augment formal that renames its merged slot (`_` or a
+                // fresh name over the introductory `x`) leaves the row to
+                // the introductory formal: `void f([int x])` + `augment
+                // void f([int _])` reports once, at `x` (the #3625 oracle
+                // observation). A same-named augment formal reports on its
+                // own fragment — against the MERGED element's type, which is
+                // the introductory formal's (`augment void f({int a})` over
+                // `void f({int? a})` asks `int?`: silent).
+                if from_aug {
+                    let intro = match item_pos {
+                        Some(at) if item.named => formals.named.get(at),
+                        Some(at) => formals.positional.get(at),
+                        None if item.named => {
+                            formals.named.iter().find(|formal| formal.name == item.param)
+                        }
+                        None => None,
+                    };
+                    if intro.is_some_and(|formal| {
+                        formal.name != item.param
+                            || !self.written_potentially_non_nullable(formal.ty)
+                    }) {
+                        return true;
+                    }
+                }
+                let supplied = if item.named {
+                    match item_pos {
+                        // A wildcard `_` aug item carries its named index —
+                        // the merged named slot at that index supplies.
+                        Some(at) => formals
+                            .named
+                            .get(at)
+                            .is_some_and(|formal| formal.default_value.is_some()),
+                        None => formals
+                            .named
+                            .iter()
+                            .any(|formal| formal.name == item.param && formal.default_value.is_some()),
+                    }
+                } else {
+                    let at = item_pos.or_else(|| {
+                        formals
+                            .positional
+                            .iter()
+                            .position(|formal| formal.name == item.param)
+                    });
+                    at.is_some_and(|at| {
+                        formals
+                            .positional
+                            .get(at)
+                            .is_some_and(|formal| formal.default_value.is_some())
                     })
-            {
-                return true;
+                };
+                if supplied {
+                    return true;
+                }
             }
             for aug in elements.augmentations() {
                 if !matches!(
@@ -2927,18 +3111,55 @@ impl<'a> Engine<'a> {
                 {
                     continue;
                 }
-                // Same-file augment formals expose the default clause only
-                // through the token stream — scan between the parameter's
-                // name and its closing delimiter.
-                if unit != self.file {
-                    continue;
-                }
-                for formal in aug.formals.iter() {
-                    if formal.name == Some(item.param)
-                        && self.augment_formal_has_default(formal.name_range)
-                    {
-                        return true;
-                    }
+                // The fragment's own `default_separator` marks the written
+                // `=`/`:` clause (upstream
+                // `formalParameter.defaultClause.separator`) — a cross-file
+                // augment's default reads it too; the token scan stays as
+                // the same-file fallback for rows captured before the
+                // separator latch. Positional parameters merge by
+                // position, named by name.
+                let supplied = aug.formals.iter().enumerate().any(|(at, formal)| {
+                    let slot_matches = if item.named {
+                        match item_pos {
+                            // The wildcard `_` item's named index merges
+                            // this fragment's named formal at the same
+                            // index.
+                            Some(item_pos) => {
+                                let pos = aug.formals[..at]
+                                    .iter()
+                                    .filter(|f| f.named)
+                                    .count();
+                                formal.named && pos == item_pos
+                            }
+                            None => formal.name == Some(item.param),
+                        }
+                    } else {
+                        // An aug-deferred positional matches its captured
+                        // slot; an intro-deferred one (position resolved
+                        // only against the introductory table, not this
+                        // fragment's) falls back to the name match — the
+                        // position it occupies in THIS fragment is the same
+                        // slot only when names agree anyway.
+                        match item_pos {
+                            Some(item_pos) => {
+                                let pos = aug.formals[..at]
+                                    .iter()
+                                    .filter(|f| {
+                                        f.required_positional || f.optional_positional
+                                    })
+                                    .count();
+                                pos == item_pos
+                            }
+                            None => formal.name == Some(item.param),
+                        }
+                    };
+                    slot_matches
+                        && (formal.default_separator.is_some()
+                            || (unit == self.file
+                                && self.augment_formal_has_default(formal.name_range)))
+                });
+                if supplied {
+                    return true;
                 }
             }
         }
@@ -2984,6 +3205,15 @@ impl<'a> Engine<'a> {
     /// previous member, so the scan cannot misread one. A 512-token cap
     /// bounds a pathological unclosed header; the first declaration in a
     /// file walks to index 0.
+    ///
+    /// Braces need care: the named-parameter group's own `{` sits INSIDE
+    /// the formal list (`C({int a})`), and a default value's map/set/record
+    /// literal adds more pairs (`{int a = const {1: 2}}`). A header-level
+    /// brace — the class body's `{`, a previous member's `}` — always
+    /// follows a `)`, an identifier, or another brace backward; an
+    /// in-formals brace always follows `(`, `,`, `=`/`:`/`const` (a
+    /// default literal's lead-in). Only the header-level kind ends the
+    /// scan.
     fn header_is_external(&self, name_range: SourceRange) -> bool {
         let tokens = self.tokens.as_slice();
         let at = tokens.partition_point(|token| token.utf16_offset < name_range.offset);
@@ -2993,8 +3223,42 @@ impl<'a> Engine<'a> {
         };
         for _ in 0..512 {
             match self.tokens.lexeme(self.source, index) {
-                ";" | "{" | "}" => return false,
+                ";" => return false,
                 "external" => return true,
+                "{" | "}" => {
+                    // For `}` skip the balanced group backward to its `{`
+                    // (a default literal's braces ride the same
+                    // transparent path as the named group's own).
+                    let mut brace = index;
+                    if self.tokens.lexeme(self.source, index) == "}" {
+                        let mut depth = 0i32;
+                        loop {
+                            match self.tokens.lexeme(self.source, brace) {
+                                "}" => depth += 1,
+                                "{" => depth -= 1,
+                                _ => {}
+                            }
+                            if depth == 0 || brace == 0 {
+                                break;
+                            }
+                            brace -= 1;
+                        }
+                        if depth != 0 {
+                            return false;
+                        }
+                    }
+                    let before = brace
+                        .checked_sub(1)
+                        .map(|i| self.tokens.lexeme(self.source, i));
+                    match before {
+                        Some("(") | Some(",") | Some("=") | Some(":") | Some("{")
+                        | Some("const") => {
+                            index = brace - 1;
+                            continue;
+                        }
+                        _ => return false,
+                    }
+                }
                 _ => {}
             }
             if index == 0 {
@@ -3612,6 +3876,73 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the member named at `name_range` counts as an augmentation
+    /// upstream — `augment` written as the member's FIRST modifier. The
+    /// fasta member walk (`parser_impl.dart`'s class-member modifier
+    /// chain) binds `augmentKeyword` only in the leading slot: an
+    /// `augment` consumed later (`external augment m();`, `static augment
+    /// m();`) reports `conflicting_modifiers`/`modifier_out_of_order` yet
+    /// the AST's `augmentKeyword` stays null, so the member is a plain
+    /// declaration — it claims its scope exactly like an unmodified one
+    /// (the parser-fe `member_errors` matrix proves the asymmetry: the
+    /// `external augment` members claim while the `augment`-leading ones
+    /// report `augmentation_without_declaration` and claim nothing). The
+    /// member's header window is the token run after the previous
+    /// member's terminator — `;`, or a depth-zero `{`/`}` (the prior
+    /// declaration's end); an initializer's `,` chain keeps scanning
+    /// through brackets (`var a = f(x), augment b;` cannot occur, but a
+    /// group member's name sits mid-declaration, so the walk must not
+    /// stop inside the group's own balanced spans).
+    fn member_augment_is_leading(&self, name_range: SourceRange) -> bool {
+        if name_range.offset == u32::MAX {
+            return true;
+        }
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < name_range.offset);
+        let mut index = at;
+        let mut depth = 0i32;
+        while index > 0 {
+            match self.tokens.lexeme(self.source, index - 1) {
+                // The previous member's terminator at top level — `;`, or
+                // a `}` (its body close) / `{` (the container's own body
+                // open). A `)`/`]`/`}` inside a balanced span is no
+                // boundary: `augment int Function() f;` must not stop the
+                // walk at the function-type's own `)`.
+                ";" | "{" | "}" if depth == 0 => break,
+                ")" | "]" | "}" => depth += 1,
+                "(" | "[" | "{" => depth -= 1,
+                _ => {}
+            }
+            index -= 1;
+        }
+        matches!(tokens.get(index), Some(token) if &self.source[token.byte_range()] == "augment")
+    }
+
+    /// Whether `range` lands on this file's token stream and its token's
+    /// text reads as `name` (the `name=` setter spelling counts — the
+    /// member map's key keeps it). A merged-face member contributed by
+    /// another unit keeps the range it declared at — a span in the OTHER
+    /// file's coordinates — so a range that fails the text check is
+    /// foreign and this file's token stream cannot answer questions about
+    /// it.
+    fn name_text_at_range(&self, name: StringId, range: SourceRange) -> bool {
+        if range.offset == u32::MAX {
+            return false;
+        }
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < range.offset);
+        let Some(token) = tokens.get(at) else {
+            return false;
+        };
+        if token.utf16_offset != range.offset {
+            return false;
+        }
+        let text = self.strings.resolve(name);
+        let written = &self.source[token.byte_range()];
+        written == text
+            || (text.ends_with('=') && written == &text[..text.len() - 1])
+    }
+
     /// Whether the report already holds this `conflicting_static_and_instance`
     /// row (same anchor, same rendered message).
     fn static_instance_reported(&self, range: SourceRange, message: &str) -> bool {
@@ -3700,6 +4031,18 @@ impl<'a> Engine<'a> {
         let Some((container, container_kind)) = self.container_context() else {
             return;
         };
+        // The merged element face (`resolve_container` → `element_face`):
+        // the introduction plus every `augment` fragment's rows across
+        // the library's units.
+        let merged_decl = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .map(|(decl, _)| decl);
         // The container's own constructor selectors. A constructor is not a
         // member of the instance scope (`member_duplicate_definition
         // .dart:191-233` walks `ClassMember` field/method declarations), and
@@ -3707,36 +4050,103 @@ impl<'a> Engine<'a> {
         // ("factories … keep their member capture"), so the name must be
         // dropped here or a `factory foo()` would read as an instance member
         // of `foo`.
-        let ctor_names: FxHashSet<StringId> = self
-            .index
-            .get(self.file)
-            .and_then(|elements| elements.container(container))
+        let ctor_names: FxHashSet<StringId> = merged_decl
             .map(|decl| decl.constructors.iter().copied().collect())
             .unwrap_or_default();
-        // The instance-scope bare names of this container's own members.
-        // An `augment` member merges into the augmented element — it claims
-        // no introductory instance name of its own (upstream's claim side
-        // skips augmentation fragments, member_duplicate_definition_verifier
-        // .dart:307-309), so an augmenting instance member never silences
-        // a same-named static here. The static-probe side keeps every site:
-        // upstream applies no augment filter on probes.
-        let instance_names: FxHashSet<StringId> = self
+        // The instance-scope bare names of the ELEMENT's members. The
+        // oracle keys `_InstanceElementContext` on the merged element's
+        // first fragment (`_getElementContext(fragment.element
+        // .firstFragment)`, member_duplicate_definition_verifier.dart
+        // :185-186/:591-594): members introduced inside `augment`
+        // containers of any unit of the library claim into the same scope
+        // — `augment class C { int foo; }` lands `foo` beside the
+        // introduction's own members — while a member carrying its own
+        // `augment` keyword claims nothing (:307-309). Primary-
+        // constructor declaring formals (`class C(var v)`) and an
+        // extension type's representation field (`extension type ET(int
+        // id)`) join through the same map — the induced instance fields
+        // the `primaryConstructor` arm claims (:62-97).
+        //
+        // Two halves union because neither alone is complete:
+        // - the decl-site view sees THIS file's instance members verbatim
+        //   — including the keep-first losers the member map drops (a
+        //   `static m` + instance `m` pair keeps only the static in
+        //   `members`, so the instance claim survives nowhere in the map);
+        // - the merged element face supplies the OTHER units' augment-
+        //   container members — claims a part file's `augment class C`
+        //   makes into this element's scope.
+        //
+        // Upstream `fragment.isAugmentation` is `node.augmentKeyword !=
+        // null`, and `augmentKeyword` binds only at the member's LEADING
+        // modifier slot (parser_impl.dart's first slot) — `external
+        // augment m();` is a plain member that claims. The model's
+        // `is_augment`/`site.is_augment` marks `augment` at ANY position,
+        // so this file's rows re-derive leading position from the token
+        // stream (`member_augment_is_leading`). A foreign member's range
+        // is in its own file's coordinates — `name_text_at_range` confirms
+        // the range lands here before scanning; a range that doesn't
+        // verify is foreign and stays excluded (the common foreign
+        // `is_augment` shape is leading anyway; the cross-unit `external
+        // augment` claim is the documented residual).
+        let mut instance_names: FxHashSet<StringId> = self
             .decl_sites
             .iter()
             .filter(|site| {
-                !site.is_augment
-                    && matches!(
-                        &site.kind,
-                        DeclKind::Member {
-                            is_static: false,
-                            container: c,
-                            ..
-                        } if *c == container
-                    )
+                matches!(
+                    &site.kind,
+                    DeclKind::Member {
+                        is_static: false,
+                        container: c,
+                        ..
+                    } if *c == container
+                ) && (!site.is_augment || !self.member_augment_is_leading(site.range))
             })
             .map(|site| self.bare_name(site.name))
-            .filter(|name| !ctor_names.contains(name))
             .collect();
+        // The model-member half adds what decl_sites cannot see: the
+        // extension type's representation field and the primary
+        // constructor's declaring formals register in `members` but never
+        // emit decl sites; cross-unit fragment members claim through the
+        // same map. This file's own row comes from the merged face (the
+        // element's intro view); the other units' fragment rows are walked
+        // per unit — `members`'s keep-first fold drops same-name pairs (a
+        // static `m` in one fragment plus an instance `m` in another keeps
+        // only the first row, so the merged face alone cannot see the pair
+        // — the exact cross-unit shape `_checkUnitStatic` exists to catch).
+        for unit in self.graph.unit_files(self.lib) {
+            let decl = if *unit == self.file {
+                merged_decl
+            } else {
+                self.index
+                    .get(*unit)
+                    .and_then(|elements| elements.container(container))
+            };
+            let Some(decl) = decl else { continue };
+            for (name, entry) in decl.members.iter() {
+                if entry.is_static {
+                    continue;
+                }
+                if entry.is_augment {
+                    // This file's fragment members re-verify leading
+                    // position from the token stream; a foreign member's
+                    // range is in its own file's coordinates — the scan
+                    // cannot run, and the common shape is leading anyway,
+                    // so it stays excluded (the cross-unit `external
+                    // augment` claim is the documented residual).
+                    if *unit == self.file
+                        && self.name_text_at_range(*name, entry.name_range)
+                        && !self.member_augment_is_leading(entry.name_range)
+                    {
+                        instance_names.insert(self.bare_name(*name));
+                    }
+                    continue;
+                }
+                instance_names.insert(self.bare_name(*name));
+            }
+        }
+        instance_names.retain(|name| {
+            !ctor_names.contains(name) && !self.strings.resolve(*name).is_empty()
+        });
         // The implicit `Object` instance members a static member can
         // collide with through `getInherited` — the walk has no model rows
         // for them (they live on dart:core's `Object`), so the probe falls
@@ -3819,6 +4229,14 @@ impl<'a> Engine<'a> {
         let is_extension = container_kind == ContainerKind::Extension;
         for (range, base, accessor) in sites {
             let base_text = self.strings.resolve(base).to_string();
+            // A recovery-shaped static site with no name never probes:
+            // upstream's `identifier.isSynthetic` gate
+            // (member_duplicate_definition_verifier.dart:303) keeps the
+            // missing-identifier face out of both scopes, so `static mixin
+            // M {}`'s unnamed recovery row cannot collide with anything.
+            if base_text.is_empty() {
+                continue;
+            }
             if is_extension {
                 // The extension arm reports the one-argument dedicated
                 // code — own-face only (extensions never inherit).
@@ -4473,14 +4891,51 @@ impl<'a> Engine<'a> {
         // (base_or_final_type_verifier.dart:47-74). The `{1}` slot names
         // the nearest explicit `base`/`final` ancestor, not the direct
         // super (:198/:222-315).
-        let subtype_faces: Vec<&ResolvedSuper> = if class_drive {
+        //
+        // The verifier mounts on the resolver's class, class-type-alias
+        // and mixin visitors ONLY (resolver.dart's three
+        // `baseOrFinalTypeVerifier.checkElement` sites) — an enum or
+        // extension type never runs it: `enum Bar implements Base` stays
+        // silent on this family no matter the modifier face (the co19
+        // Class-modifiers `EnumImplements*`/`EnumWith*`/`test_enum_*`
+        // rows oracle never emits). The face lists are the ELEMENT's
+        // resolved supertype columns, not the written clauses: the
+        // extends head joins `element.supertype` only when it resolves
+        // to a class (`_isInterfaceTypeClass`, types_builder.dart:40-46
+        // — `class C extends SomeMixin` leaves `supertype` null), and
+        // the `implements`/`with`/`on` lists keep interface-typed
+        // elements only (`isInterfaceTypeInterface`, types_builder.dart
+        // :23-37 — enum and extension-type entries drop out).
+        let super_kind = |entry: &ResolvedSuper| {
+            self.index
+                .get(entry.handle.0)
+                .and_then(|file| file.container(entry.handle.1))
+                .map(|decl| decl.kind)
+        };
+        let interface_typed = |entry: &ResolvedSuper| {
+            matches!(
+                super_kind(entry),
+                Some(ContainerKind::Class | ContainerKind::Mixin)
+            )
+        };
+        let subtype_faces: Vec<&ResolvedSuper> = if !matches!(
+            decl.kind,
+            ContainerKind::Class | ContainerKind::Mixin
+        ) {
+            Vec::new()
+        } else if class_drive {
             extends
                 .iter()
-                .chain(implements.iter())
-                .chain(withs.iter())
+                .filter(|entry| super_kind(entry) == Some(ContainerKind::Class))
+                .chain(implements.iter().filter(|e| interface_typed(e)))
+                .chain(withs.iter().filter(|e| interface_typed(e)))
                 .collect()
         } else {
-            implements.iter().chain(ons.iter()).collect()
+            implements
+                .iter()
+                .filter(|e| interface_typed(e))
+                .chain(ons.iter().filter(|e| interface_typed(e)))
+                .collect()
         };
         let element_mods = hierarchy.effective(element);
         for entry in subtype_faces {
@@ -6232,6 +6687,44 @@ impl<'a> Engine<'a> {
         )
     }
 
+    /// The merged interface signature of `spelling` as `container` sees it
+    /// — the oracle's interface-map entry (`inheritance_manager3.dart`'s
+    /// `_getValidOverrides` + `_topMerge` through
+    /// [`Self::face_member_in`]'s full direct-supertype closure): `D0
+    /// extends A<dynamic> implements B<Object?>` reads `member`'s return as
+    /// `Object?`, never the first-found `dynamic` the `extends` spine alone
+    /// would answer. This is the RESULT-typing face only — existence and
+    /// miss verdicts keep [`Self::walk_members`]'s first-found posture. An
+    /// empty or conflicting candidate set, an undecidable substitution
+    /// environment, or a clause capture outside this file's scanner all
+    /// answer `None` (the under-report direction the single-hit callers
+    /// already keep).
+    pub(crate) fn merged_member_entry(
+        &self,
+        container: StringId,
+        spelling: StringId,
+    ) -> Option<MemberEntry> {
+        let mut facts: Option<HeaderClauses> = None;
+        let hit = self.face_member_in(
+            self.file,
+            container,
+            self.lib,
+            container,
+            container,
+            spelling,
+            &mut facts,
+        )?;
+        // The hit carries the merged candidate's RAW signature (`T
+        // member()` on `B<T>`) — the interface-map read the caller wants is
+        // the substituted one (`Object? member()` under `implements
+        // B<Object?>`), exactly [`Self::combined_inherited`]'s arm; a
+        // synthesized or undecidable hit keeps its own entry verbatim.
+        Some(
+            self.substituted_signature(&hit, container, &mut facts)
+                .unwrap_or_else(|| hit.entry().clone()),
+        )
+    }
+
     /// [`Self::override_face_member`] rooted at an arbitrary container:
     /// `(root_file, root_writer, root_lib)` is the file / declaring
     /// container / scope library whose written clause heads the climb —
@@ -6258,7 +6751,20 @@ impl<'a> Engine<'a> {
         let mut scope_lib = root_lib;
         let mut seen = FxHashSet::default();
         let mut chain: Vec<(StringId, FileId)> = Vec::new();
-        let mut pending: VecDeque<(StringId, FileId, LibraryId, StringId)> = VecDeque::new();
+        // A pending face carries the chain of the hop that listed it —
+        // `instantiate_inherited` walks the chain as the path of written
+        // super edges from `merge_container` to the declaring hop, so a
+        // branch's own path must be restored when it dequeues; the single
+        // accumulator the walk otherwise keeps would graft the resolved
+        // branch's hops onto the queued one (`D0 extends A implements B`
+        // recording `B` behind `A`, an undecidable edge pair).
+        let mut pending: VecDeque<(
+            StringId,
+            FileId,
+            LibraryId,
+            StringId,
+            Vec<(StringId, FileId)>,
+        )> = VecDeque::new();
         let mut collected: Vec<FaceHit<'a>> = Vec::new();
         loop {
             if !seen.insert(name) {
@@ -6281,7 +6787,8 @@ impl<'a> Engine<'a> {
                 match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
                     Some(pair) => pair,
                     None => {
-                        let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                        let Some((next, next_owner, next_lib, next_writer, next_chain)) =
+                            pending.pop_front()
                         else {
                             break;
                         };
@@ -6289,10 +6796,18 @@ impl<'a> Engine<'a> {
                         owner = next_owner;
                         scope_lib = next_lib;
                         hop_writer = next_writer;
+                        chain = next_chain;
                         continue;
                     }
                 };
-            chain.push((name, found_owner));
+            // The merge container itself is not a chain hop: the first
+            // entry's incoming edge lives in `merge_container`'s own header
+            // (`instantiate_inherited` looks `chain[0]` up in its `supers`),
+            // so the root hop records nothing — its empty path is the
+            // identity environment an own member already reads.
+            if name != merge_container {
+                chain.push((name, found_owner));
+            }
             if let Some(hit) =
                 self.face_own_hit(found_owner, name, found, spelling, scope_lib, chain.clone())
             {
@@ -6303,11 +6818,12 @@ impl<'a> Engine<'a> {
                 // is done. The next candidate comes from the pending
                 // queue.
                 match pending.pop_front() {
-                    Some((next, next_owner, next_lib, next_writer)) => {
+                    Some((next, next_owner, next_lib, next_writer, next_chain)) => {
                         name = next;
                         owner = next_owner;
                         scope_lib = next_lib;
                         hop_writer = next_writer;
+                        chain = next_chain;
                         continue;
                     }
                     None => break,
@@ -6356,13 +6872,25 @@ impl<'a> Engine<'a> {
                     let mixin_owner_lib = self
                         .owner_library_of(mixin_owner, *mixin)
                         .unwrap_or(owner_lib);
+                    // The mixin face's path runs THROUGH the mixin hop —
+                    // its incoming edge lives in the mixin's own header —
+                    // so the branch's chain snapshot re-appends the mixin
+                    // hop the hit attempt popped.
+                    let mut mixin_chain = chain.clone();
+                    mixin_chain.push((*mixin, mixin_owner));
                     for mixin_face in mixin_container
                         .with_clause
                         .iter()
                         .chain(mixin_container.on_clause.iter())
                         .chain(mixin_container.implements_clause.iter())
                     {
-                        pending.push_back((*mixin_face, mixin_owner, mixin_owner_lib, *mixin));
+                        pending.push_back((
+                            *mixin_face,
+                            mixin_owner,
+                            mixin_owner_lib,
+                            *mixin,
+                            mixin_chain.clone(),
+                        ));
                     }
                 }
             }
@@ -6372,21 +6900,22 @@ impl<'a> Engine<'a> {
                 // spine drops out, but this hop's own `implements`/`on`
                 // faces still join the candidate set.
                 for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
-                    pending.push_back((*super_face, found_owner, owner_lib, name));
+                    pending.push_back((*super_face, found_owner, owner_lib, name, chain.clone()));
                 }
                 match pending.pop_front() {
-                    Some((next, next_owner, next_lib, next_writer)) => {
+                    Some((next, next_owner, next_lib, next_writer, next_chain)) => {
                         name = next;
                         owner = next_owner;
                         scope_lib = next_lib;
                         hop_writer = next_writer;
+                        chain = next_chain;
                         continue;
                     }
                     None => break,
                 }
             }
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
-                pending.push_back((*super_face, found_owner, owner_lib, name));
+                pending.push_back((*super_face, found_owner, owner_lib, name, chain.clone()));
             }
             match found.superclass {
                 Some(superclass) => {
@@ -6396,7 +6925,8 @@ impl<'a> Engine<'a> {
                     owner = found_owner;
                 }
                 None => {
-                    let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                    let Some((next, next_owner, next_lib, next_writer, next_chain)) =
+                        pending.pop_front()
                     else {
                         break;
                     };
@@ -6404,6 +6934,7 @@ impl<'a> Engine<'a> {
                     owner = next_owner;
                     scope_lib = next_lib;
                     hop_writer = next_writer;
+                    chain = next_chain;
                 }
             }
         }
@@ -6799,16 +7330,19 @@ impl<'a> Engine<'a> {
         Some(merged)
     }
 
-    /// `TopMergeHelper.topMerge` on one type column: the NNBD lattice's
+    /// `TopMergeHelper.topMerge` on one type column: the NORM canonical
+    /// fold first (`normalize.dart` — `FutureOr<top>` collapses to the top,
+    /// every other shape normalizes its columns), then the NNBD lattice's
     /// cross arms, then the structural descent over one shared head's
-    /// arguments. An unwritten annotation ([`Ty::Unknown`]) is the oracle's
-    /// `dynamic`. `None` = the pair is outside the modelled subset (a
-    /// different head, a function-typed or record column, one-sided
-    /// nullability), and the caller keeps its first valid candidate.
-    fn top_merge_ty(&self, first: Ty, other: Ty) -> Option<Ty> {
+    /// arguments, one function shape, or one record shape. An unwritten
+    /// annotation ([`Ty::Unknown`]) is the oracle's `dynamic`. `None` = the
+    /// pair is outside the modelled subset (a different head, one-sided
+    /// nullability, an unmergeable shape pair), and the caller keeps its
+    /// first valid candidate.
+    pub(crate) fn top_merge_ty(&self, first: Ty, other: Ty) -> Option<Ty> {
         let written = |ty: Ty| if ty == Ty::UNKNOWN { Ty::Dynamic } else { ty };
-        let a = written(first);
-        let b = written(other);
+        let a = self.norm_ty(written(first));
+        let b = self.norm_ty(written(other));
         // The identity arms: `dynamic`/`dynamic`, `void`/`void`,
         // `Never`/`Never`, `Object?`/`Object?`, one head with equal
         // arguments — every one of them answers its own value.
@@ -6838,49 +7372,329 @@ impl<'a> Engine<'a> {
         if a_nullable != b_nullable {
             return None;
         }
-        let (
-            Ty::Named {
-                name: a_name,
-                args: a_args,
-                ..
-            },
-            Ty::Named {
-                name: b_name,
-                args: b_args,
-                ..
-            },
-        ) = (a_core, b_core)
-        else {
-            return None;
-        };
-        if a_name != b_name {
-            return None;
-        }
-        let (a_slots, b_slots) = {
-            let pool = self.boundary.args.borrow();
-            (pool.get(a_args).to_vec(), pool.get(b_args).to_vec())
-        };
-        if a_slots.len() != b_slots.len() {
-            return None;
-        }
-        let mut slots = Vec::with_capacity(a_slots.len());
-        for (x, y) in a_slots.iter().zip(b_slots.iter()) {
-            slots.push(self.top_merge_ty(*x, *y)?);
-        }
-        let merged = if slots == a_slots {
-            a_core
-        } else {
-            Ty::Named {
-                name: a_name,
-                nullable: false,
-                args: self.boundary.args.borrow_mut().intern(&slots),
+        let merged_core = match (a_core, b_core) {
+            (
+                Ty::Named {
+                    name: a_name,
+                    args: a_args,
+                    ..
+                },
+                Ty::Named {
+                    name: b_name,
+                    args: b_args,
+                    ..
+                },
+            ) => {
+                if a_name != b_name {
+                    return None;
+                }
+                let (a_slots, b_slots) = {
+                    let pool = self.boundary.args.borrow();
+                    (pool.get(a_args).to_vec(), pool.get(b_args).to_vec())
+                };
+                if a_slots.len() != b_slots.len() {
+                    return None;
+                }
+                let mut slots = Vec::with_capacity(a_slots.len());
+                for (x, y) in a_slots.iter().zip(b_slots.iter()) {
+                    slots.push(self.top_merge_ty(*x, *y)?);
+                }
+                if slots == a_slots {
+                    a_core
+                } else {
+                    Ty::Named {
+                        name: a_name,
+                        nullable: false,
+                        args: self.boundary.args.borrow_mut().intern(&slots),
+                    }
+                }
             }
+            // `_functionTypes`: equal-shape gates only (arity, the
+            // required/optional split, the named set); a type-parameter
+            // group the shape cannot alpha-rename keeps the pair
+            // unmergeable. A covariant column merges toward the subtype
+            // verdict — the `Ty` model records no per-parameter variance,
+            // so every column takes the merge arm, the documented
+            // under-report posture.
+            (Ty::Function { shape: x, .. }, Ty::Function { shape: y, .. }) => {
+                let (x, y) = {
+                    let pool = self.boundary.pool();
+                    (pool.function_shape(x).clone(), pool.function_shape(y).clone())
+                };
+                if x.type_params != 0
+                    || y.type_params != 0
+                    || x.positional.len() != y.positional.len()
+                    || x.required_positional != y.required_positional
+                    || x.named.len() != y.named.len()
+                {
+                    return None;
+                }
+                let return_ty = self.top_merge_ty(x.return_ty, y.return_ty)?;
+                let mut positional = Vec::with_capacity(x.positional.len());
+                for (&p, &q) in x.positional.iter().zip(y.positional.iter()) {
+                    positional.push(self.top_merge_ty(p, q)?);
+                }
+                let mut named = Vec::with_capacity(x.named.len());
+                for &(name, p) in x.named.iter() {
+                    let Some(&(_, q)) = y.named.iter().find(|&&(yn, _)| yn == name) else {
+                        return None;
+                    };
+                    named.push((name, self.top_merge_ty(p, q)?));
+                }
+                self.boundary.intern_function_ty_required(
+                    0,
+                    x.required_positional,
+                    return_ty,
+                    &positional,
+                    &named,
+                    false,
+                )
+            }
+            // `_recordTypes`: positional pairwise, named pairwise by name.
+            (Ty::Record { shape: x, .. }, Ty::Record { shape: y, .. }) => {
+                let (x, y) = {
+                    let pool = self.boundary.pool();
+                    (pool.record_shape(x).clone(), pool.record_shape(y).clone())
+                };
+                if x.positional.len() != y.positional.len() || x.named.len() != y.named.len() {
+                    return None;
+                }
+                let mut positional = Vec::with_capacity(x.positional.len());
+                for (&p, &q) in x.positional.iter().zip(y.positional.iter()) {
+                    positional.push(self.top_merge_ty(p, q)?);
+                }
+                let mut named = Vec::with_capacity(x.named.len());
+                for (&(name, p), &(yn, q)) in x.named.iter().zip(y.named.iter()) {
+                    if name != yn {
+                        return None;
+                    }
+                    named.push((name, self.top_merge_ty(p, q)?));
+                }
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, false)
+            }
+            _ => return None,
         };
         Some(if a_nullable {
-            Self::nullable_form(merged)
+            Self::nullable_form(merged_core)
         } else {
-            merged
+            merged_core
         })
+    }
+
+    /// `NormalizeHelper.normalize` (`normalize.dart`): the canonical
+    /// representation the merge reads. `FutureOr<NORM(T)>` collapses when
+    /// its normalized argument is a top type, `Object`, `Never` (→
+    /// `Future<Never>`), or `Null` (→ `Future<Null>?`); `T?` collapses to
+    /// the top/`Null` its core normalizes to (a nullable-argument
+    /// `FutureOr` keeps the written face); every other shape normalizes
+    /// its own columns. An unwritten annotation stays `Unknown` — the
+    /// merge's own `dynamic` rewrite runs next.
+    pub(crate) fn norm_ty(&self, ty: Ty) -> Ty {
+        match ty {
+            Ty::Named {
+                name,
+                nullable: true,
+                args,
+            } => {
+                // NORM(T?): let S = NORM(T); a top stays, `Never?`/`Null?`
+                // are `Null`, a nullable-argument `FutureOr` stays, else
+                // `S?` (normalize.dart `_nullabilityQuestion`).
+                let stripped = self.norm_ty(Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                });
+                if self.is_top_ty(stripped) {
+                    return stripped;
+                }
+                if stripped == Ty::Never || stripped == Ty::Null {
+                    return Ty::Null;
+                }
+                if let Ty::Named {
+                    name: inner,
+                    nullable: false,
+                    args: inner_args,
+                } = stripped
+                    && inner == self.intern("FutureOr")
+                    && inner_args != ArgListId::EMPTY
+                {
+                    let argument = self.boundary.pool().get(inner_args).first().copied();
+                    if argument.is_some_and(|arg| self.nullable_ty(arg)) {
+                        return stripped;
+                    }
+                }
+                Self::nullable_form(stripped)
+            }
+            Ty::Named {
+                name,
+                nullable: false,
+                args,
+            } => {
+                // NORM(FutureOr<T>): a top argument collapses to itself,
+                // `Object` to itself, `Never` to `Future<Never>`, `Null`
+                // to `Future<Null>?`, else `FutureOr<NORM(T)>`
+                // (normalize.dart `_futureOr`).
+                if name == self.intern("FutureOr") && args != ArgListId::EMPTY {
+                    if let Some(argument) = self.boundary.pool().get(args).first().copied() {
+                        let s = self.norm_ty(argument);
+                        let object = Ty::Named {
+                            name: self.intern("Object"),
+                            nullable: false,
+                            args: ArgListId::EMPTY,
+                        };
+                        if self.is_top_ty(s) || s == object {
+                            return s;
+                        }
+                        if s == Ty::Never {
+                            return Ty::Named {
+                                name: self.intern("Future"),
+                                nullable: false,
+                                args: self.boundary.intern_list(&[Ty::Never]),
+                            };
+                        }
+                        if s == Ty::Null {
+                            return Ty::Named {
+                                name: self.intern("Future"),
+                                nullable: true,
+                                args: self.boundary.intern_list(&[Ty::Null]),
+                            };
+                        }
+                        if s != argument {
+                            return Ty::Named {
+                                name,
+                                nullable: false,
+                                args: self.boundary.intern_list(&[s]),
+                            };
+                        }
+                        return ty;
+                    }
+                }
+                // NORM(C<T0..Tn>) = C<NORM(Ti)>.
+                if args != ArgListId::EMPTY {
+                    let normalized: Vec<Ty> = {
+                        let pool = self.boundary.pool();
+                        let list = pool.get(args).to_vec();
+                        drop(pool);
+                        list.iter().map(|arg| self.norm_ty(*arg)).collect()
+                    };
+                    let interned = self.boundary.intern_list(&normalized);
+                    if interned != args {
+                        return Ty::Named {
+                            name,
+                            nullable: false,
+                            args: interned,
+                        };
+                    }
+                }
+                ty
+            }
+            // Record and function columns normalize field-wise — the same
+            // descent the named arm runs (`normalize.dart`'s record /
+            // function arms), re-interned through the shared pool.
+            Ty::Record { shape, nullable } => {
+                let pooled = {
+                    let pool = self.boundary.pool();
+                    pool.record_shape(shape).clone()
+                };
+                let positional: Vec<Ty> = pooled
+                    .positional
+                    .iter()
+                    .map(|ty| self.norm_ty(*ty))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = pooled
+                    .named
+                    .iter()
+                    .map(|(name, ty)| (*name, self.norm_ty(*ty)))
+                    .collect();
+                if positional == *pooled.positional && named == *pooled.named {
+                    ty
+                } else {
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .record(&positional, &named, nullable)
+                }
+            }
+            Ty::Function { shape, nullable } => {
+                let pooled = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                let return_ty = self.norm_ty(pooled.return_ty);
+                let positional: Vec<Ty> = pooled
+                    .positional
+                    .iter()
+                    .map(|ty| self.norm_ty(*ty))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = pooled
+                    .named
+                    .iter()
+                    .map(|(name, ty)| (*name, self.norm_ty(*ty)))
+                    .collect();
+                if return_ty == pooled.return_ty
+                    && positional == *pooled.positional
+                    && named == *pooled.named
+                {
+                    ty
+                } else {
+                    self.boundary.intern_function_ty_required(
+                        pooled.type_params,
+                        pooled.required_positional,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// `TypeSystemImpl.isTop` at `Ty` level: `dynamic`, `void`, `Unknown`
+    /// (the oracle's `InvalidType`), `T?` over a top or `Object`, and
+    /// `FutureOr<T>` over a top.
+    fn is_top_ty(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Unknown | Ty::Dynamic | Ty::Void => true,
+            Ty::Null | Ty::Never => false,
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if nullable {
+                    return name == self.intern("Object")
+                        || self.is_top_ty(Ty::Named {
+                            name,
+                            nullable: false,
+                            args,
+                        });
+                }
+                if name == self.intern("FutureOr") && args != ArgListId::EMPTY {
+                    let argument = self.boundary.pool().get(args).first().copied();
+                    return argument.is_some_and(|argument| self.is_top_ty(argument));
+                }
+                false
+            }
+            Ty::Record { .. } | Ty::Function { .. } => false,
+        }
+    }
+
+    /// `TypeSystemImpl.isNullable` at `Ty` level (`dynamic`, `Null`, a
+    /// `?`-flagged shape) — the full verdict, distinct from the
+    /// `?`-suffix-only [`Self::is_nullable_ty`] the receiver gates read.
+    fn nullable_ty(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Dynamic | Ty::Null => true,
+            Ty::Named { nullable, .. }
+            | Ty::Record { nullable, .. }
+            | Ty::Function { nullable, .. } => nullable,
+            _ => false,
+        }
     }
 
     /// A type's suffix-less core plus its `?` flag — the pair the
@@ -9958,7 +10772,11 @@ mod sealed_abstract_fold_tests {
     /// still reports.
     #[test]
     fn external_top_level_header_takes_no_defaults() {
-        let report = report("external int f(int a, [int b]);\nint g(int a, [int b]);\n");
+        // `C` — a locally declared head — stands in for `int`: this rig
+        // mounts no `dart:core`, so an `int` formal is the oracle's
+        // `InvalidType`, whose `isPotentiallyNonNullable` gate suppresses
+        // the row before the `external` arm under test ever sees it.
+        let report = report("class C {}\nexternal C f(C a, [C b]);\nC g(C a, [C b]);\n");
         let names = code_names(&report);
         let defaults: Vec<_> = names
             .iter()
@@ -10181,6 +10999,7 @@ mod invalid_type_override_tests {
                 target: Some(lib_a),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );
@@ -10660,3 +11479,13 @@ mod ticket_2515_tests;
 #[cfg(test)]
 #[path = "ticket_3484_tests.rs"]
 mod ticket_3484_tests;
+
+/// The #3661 pins: the enum/ext-type exemption of the base-or-final
+/// subtype verifier (the resolver's `checkElement` mounts on class,
+/// class-type-alias and mixin only) plus the merged-element instance
+/// scope of `conflicting_static_and_instance` — `augment`-container
+/// members, primary-constructor declaring formals, the extension-type
+/// representation field, and the non-leading-`augment` claim asymmetry.
+#[cfg(test)]
+#[path = "ticket_3661_tests.rs"]
+mod ticket_3661_tests;

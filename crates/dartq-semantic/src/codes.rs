@@ -321,6 +321,18 @@ pub enum SemanticCode {
     /// (error_verifier.dart:6076-6116 `_checkForMixinSuperclassConstraints`),
     /// anchored at the `with` clause's mixin name token.
     MixinApplicationNotImplementedInterface,
+    /// `The {0} '{1}' can't implement both '{2}' and '{3}' because the type
+    /// arguments are different.` — the same generic class reaches a
+    /// class-family declaration's interface set twice and the two
+    /// instantiations cannot merge (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/generated/error_verifier.dart`
+    /// `_checkForConflictingGenerics` :3848-3878 over
+    /// `class_hierarchy.dart`'s `InterfacesMerger` — the NNBD_TOP_MERGE of
+    /// NORM of every collected instantiation, one row per conflicting
+    /// element in collection order). Anchored at the declaration's name
+    /// token; the kind word is the official `ClassKind.displayName`
+    /// (`class`/`mixin`/`enum`/`extension type`).
+    ConflictingGenericInterfaces,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
     /// `'{0}' can't be used as a setter because it's final.` — the write's
@@ -449,6 +461,20 @@ pub enum SemanticCode {
     /// :2528-2538; `visitConstantPattern`'s `_evaluateAndReportError`
     /// default, constant_verifier.dart:128-142).
     ConstantPatternWithNonConstantExpression,
+    /// `Two keys in a map pattern can't be equal.` — a `MapPattern` whose
+    /// two entry keys constant-evaluate to equal values (`identical` for
+    /// keys without primitive equality, `==` for primitive-equality ones),
+    /// reported at the LATER key with the first key as a context message
+    /// (`equalKeysInMapPattern`; `visitMapPattern`'s `uniqueKeys` walk,
+    /// constant_verifier.dart:313-355). `messages.yaml` :5849-5860.
+    EqualKeysInMapPattern,
+    /// `Constant values from a deferred library can't be used in
+    /// patterns.` — a pattern whose constant expression reaches a value
+    /// through a deferred import's prefix, reported at the referenced name
+    /// (`patternConstantFromDeferredLibrary`; the `SwitchPatternCase` arm
+    /// of evaluation.dart's `_invalidConstantForEntity`, :2130-2132).
+    /// `messages.yaml` :2925-2936.
+    PatternConstantFromDeferredLibrary,
     /// `Case expressions must be constant.` — a legacy (`< 3.0`, patterns
     /// disabled) switch-statement `case e:` whose expression fails
     /// const-evaluation (`nonConstantCaseExpression`, diagnostic.g.dart
@@ -510,6 +536,78 @@ pub enum SemanticCode {
     /// `visitMapPattern`'s per-entry `_evaluateAndReportError`,
     /// constant_verifier.dart:342-358).
     NonConstantMapPatternKey,
+    /// `The getter name is not specified explicitly, and the pattern is not
+    /// a variable.` — an object/record pattern field of the `: pattern`
+    /// shape whose sub-pattern is not a variable pattern, so no getter name
+    /// is inferable (`missingNamedPatternFieldName`,
+    /// diagnostic.g.dart:10592-10600; `buildSharedPatternFields`'s
+    /// null-name arm, resolver.dart:494-502).
+    MissingNamedPatternFieldName,
+    /// `Object patterns can only use named fields.` — an object pattern's
+    /// positional field (`positionalFieldInObjectPattern`,
+    /// diagnostic.g.dart:15122-15129; `buildSharedPatternFields`'s
+    /// `mustBeNamed` arm, resolver.dart:503-508).
+    PositionalFieldInObjectPattern,
+    /// `Variable pattern '{0}' is missing in this branch of the logical-or
+    /// pattern.` — one `||` operand binds a variable the other does not
+    /// (`missingVariablePattern`, diagnostic.g.dart:15445-15453;
+    /// `logicalOrPatternBranchMissingVariable`,
+    /// resolution_visitor.dart:1657-1669).
+    MissingVariablePattern,
+    /// `Only local variables can be assigned in pattern assignments.` — a
+    /// pattern assignment's target that resolves to a non-local element
+    /// (`patternAssignmentNotLocalVariable`,
+    /// diagnostic.g.dart:14808-14815; `visitAssignedVariablePattern`'s
+    /// element-kind arm, resolution_visitor.dart:180-200).
+    PatternAssignmentNotLocalVariable,
+    /// `The variable '{0}' is already defined in this pattern.` — one
+    /// pattern binds the same variable name twice (`duplicateVariablePattern`,
+    /// diagnostic.g.dart:5480-5488; `_VariableBinderErrors`,
+    /// resolution_visitor.dart:1638-1650).
+    DuplicateVariablePattern,
+    /// `The field '{0}' is already matched in this pattern.` — one
+    /// object/record pattern matches the same field name twice
+    /// (`duplicatePatternField`, diagnostic.g.dart:5377-5385;
+    /// `duplicateRecordPatternField`, shared_type_analyzer.dart:78-91).
+    DuplicatePatternField,
+    /// `The variable '{0}' has a different type and/or finality in this
+    /// branch of the logical-or pattern.` — both `||` operands bind the
+    /// variable but their joined types/finality disagree
+    /// (`inconsistentPatternVariableLogicalOr`,
+    /// diagnostic.g.dart:9505-9513; `inconsistentJoinedPatternVariable`,
+    /// shared_type_analyzer.dart:109-124).
+    InconsistentPatternVariableLogicalOr,
+    /// `A map pattern must have at least one entry.` — the empty `{}` map
+    /// pattern (`emptyMapPattern`, diagnostic.g.dart:5529-5537;
+    /// `emptyMapPattern`, shared_type_analyzer.dart:106-111).
+    EmptyMapPattern,
+    /// `A map pattern can't contain a rest pattern.` — a `...` element
+    /// inside a map pattern (`restElementInMapPattern`,
+    /// diagnostic.g.dart:16492-16500; `restPatternInMap`,
+    /// shared_type_analyzer.dart:228-237).
+    RestElementInMapPattern,
+    /// `Map patterns require two type arguments or none, but {0} found.` —
+    /// a map pattern's written type-argument group with a count other than
+    /// 0 or 2 (`expectedTwoMapPatternTypeArguments`,
+    /// diagnostic.g.dart:8306-8315; resolver.dart's map-pattern entry,
+    /// resolver.dart:1610-1620).
+    ExpectedTwoMapPatternTypeArguments,
+    /// `The variable '{0}' is already assigned in this pattern.` — one
+    /// pattern assignment assigns the same variable twice
+    /// (`duplicatePatternAssignmentVariable`,
+    /// diagnostic.g.dart:5328-5336; `duplicateAssignmentPatternVariable`,
+    /// shared_type_analyzer.dart:70-82).
+    DuplicatePatternAssignmentVariable,
+    /// `At most one rest element is allowed in a list or map pattern.` — a
+    /// second `...` element in one list pattern (`duplicateRestElementInPattern`,
+    /// diagnostic.g.dart:5445-5453; `duplicateRestPattern`,
+    /// shared_type_analyzer.dart:92-105).
+    DuplicateRestElementInPattern,
+    /// `List patterns require one type argument or none, but {0} found.` —
+    /// a list pattern's written type-argument group with a count other than
+    /// 0 or 1 (`expectedOneListPatternTypeArguments`,
+    /// diagnostic.g.dart:8296-8304).
+    ExpectedOneListPatternTypeArguments,
     /// `In constant expressions, operands of this operator must be of type
     /// 'bool'.`
     ConstEvalTypeBool,
@@ -2430,9 +2528,66 @@ impl SemanticCode {
                 "constant_pattern_with_non_constant_expression",
                 "CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
             ),
+            Self::EqualKeysInMapPattern => (
+                "equal_keys_in_map_pattern",
+                "EQUAL_KEYS_IN_MAP_PATTERN",
+            ),
+            Self::PatternConstantFromDeferredLibrary => (
+                "pattern_constant_from_deferred_library",
+                "PATTERN_CONSTANT_FROM_DEFERRED_LIBRARY",
+            ),
             Self::NonConstantMapPatternKey => (
                 "non_constant_map_pattern_key",
                 "NON_CONSTANT_MAP_PATTERN_KEY",
+            ),
+            Self::MissingNamedPatternFieldName => (
+                "missing_named_pattern_field_name",
+                "MISSING_NAMED_PATTERN_FIELD_NAME",
+            ),
+            Self::PositionalFieldInObjectPattern => (
+                "positional_field_in_object_pattern",
+                "POSITIONAL_FIELD_IN_OBJECT_PATTERN",
+            ),
+            Self::MissingVariablePattern => (
+                "missing_variable_pattern",
+                "MISSING_VARIABLE_PATTERN",
+            ),
+            Self::PatternAssignmentNotLocalVariable => (
+                "pattern_assignment_not_local_variable",
+                "PATTERN_ASSIGNMENT_NOT_LOCAL_VARIABLE",
+            ),
+            Self::DuplicateVariablePattern => (
+                "duplicate_variable_pattern",
+                "DUPLICATE_VARIABLE_PATTERN",
+            ),
+            Self::DuplicatePatternField => (
+                "duplicate_pattern_field",
+                "DUPLICATE_PATTERN_FIELD",
+            ),
+            Self::InconsistentPatternVariableLogicalOr => (
+                "inconsistent_pattern_variable_logical_or",
+                "INCONSISTENT_PATTERN_VARIABLE_LOGICAL_OR",
+            ),
+            Self::EmptyMapPattern => ("empty_map_pattern", "EMPTY_MAP_PATTERN"),
+            Self::RestElementInMapPattern => (
+                "rest_element_in_map_pattern",
+                "REST_ELEMENT_IN_MAP_PATTERN",
+            ),
+            Self::ExpectedTwoMapPatternTypeArguments => (
+                "expected_two_map_pattern_type_arguments",
+                "EXPECTED_TWO_MAP_PATTERN_TYPE_ARGUMENTS",
+            ),
+            Self::DuplicatePatternAssignmentVariable => (
+                "duplicate_pattern_assignment_variable",
+                "DUPLICATE_PATTERN_ASSIGNMENT_VARIABLE",
+            ),
+            Self::DuplicateRestElementInPattern => (
+                "duplicate_rest_element_in_pattern",
+                "DUPLICATE_REST_ELEMENT_IN_PATTERN",
+            ),
+            Self::ExpectedOneListPatternTypeArguments => (
+                "expected_one_list_pattern_type_arguments",
+                "EXPECTED_ONE_LIST_PATTERN_TYPE_ARGUMENTS",
             ),
             Self::ConstEvalTypeBool => ("const_eval_type_bool", "CONST_EVAL_TYPE_BOOL"),
             Self::ConstEvalTypeBoolInt => ("const_eval_type_bool_int", "CONST_EVAL_TYPE_BOOL_INT"),
@@ -2553,6 +2708,9 @@ impl SemanticCode {
             ),
             Self::InconsistentInheritance => {
                 ("inconsistent_inheritance", "INCONSISTENT_INHERITANCE")
+            }
+            Self::ConflictingGenericInterfaces => {
+                ("conflicting_generic_interfaces", "CONFLICTING_GENERIC_INTERFACES")
             }
             Self::InconsistentInheritanceGetterAndMethod => (
                 "inconsistent_inheritance_getter_and_method",
@@ -3846,6 +4004,12 @@ impl SemanticCode {
             Self::ConstantPatternWithNonConstantExpression => {
                 "The expression of a constant pattern must be a valid constant.".to_string()
             }
+            Self::EqualKeysInMapPattern => {
+                "Two keys in a map pattern can't be equal.".to_string()
+            }
+            Self::PatternConstantFromDeferredLibrary => {
+                "Constant values from a deferred library can't be used in patterns.".to_string()
+            }
             Self::NonConstantCaseExpression => {
                 "Case expressions must be constant.".to_string()
             }
@@ -3875,6 +4039,49 @@ impl SemanticCode {
             }
             Self::NonConstantMapPatternKey => {
                 "Key expressions in map patterns must be constants.".to_string()
+            }
+            // The S2 structural pattern faces (#3629): verbatim
+            // `messages.yaml` texts (the `{0}` slot is the field/variable
+            // name or the written type-argument count).
+            Self::MissingNamedPatternFieldName => {
+                "The getter name is not specified explicitly, and the pattern is not a variable."
+                    .to_string()
+            }
+            Self::PositionalFieldInObjectPattern => {
+                "Object patterns can only use named fields.".to_string()
+            }
+            Self::MissingVariablePattern => {
+                format!("Variable pattern '{a0}' is missing in this branch of the logical-or pattern.")
+            }
+            Self::PatternAssignmentNotLocalVariable => {
+                "Only local variables can be assigned in pattern assignments.".to_string()
+            }
+            Self::DuplicateVariablePattern => {
+                format!("The variable '{a0}' is already defined in this pattern.")
+            }
+            Self::DuplicatePatternField => {
+                format!("The field '{a0}' is already matched in this pattern.")
+            }
+            Self::InconsistentPatternVariableLogicalOr => format!(
+                "The variable '{a0}' has a different type and/or finality in this branch of the logical-or pattern."
+            ),
+            Self::EmptyMapPattern => {
+                "A map pattern must have at least one entry.".to_string()
+            }
+            Self::RestElementInMapPattern => {
+                "A map pattern can't contain a rest pattern.".to_string()
+            }
+            Self::ExpectedTwoMapPatternTypeArguments => {
+                format!("Map patterns require two type arguments or none, but {a0} found.")
+            }
+            Self::DuplicatePatternAssignmentVariable => {
+                format!("The variable '{a0}' is already assigned in this pattern.")
+            }
+            Self::DuplicateRestElementInPattern => {
+                "At most one rest element is allowed in a list or map pattern.".to_string()
+            }
+            Self::ExpectedOneListPatternTypeArguments => {
+                format!("List patterns require one type argument or none, but {a0} found.")
             }
             Self::ConstEvalTypeBool => {
                 "In constant expressions, operands of this operator must be of type 'bool'."
@@ -4012,6 +4219,7 @@ impl SemanticCode {
                 "Can't infer missing types in '{a0}' from overridden methods: {a1}."
             ),
             Self::InheritsAbstractMemberFour => self.message4(a0, a1, "", ""),
+            Self::ConflictingGenericInterfaces => self.message4(a0, a1, "", ""),
             Self::InheritsAbstractMemberFivePlus => self.message5(a0, a1, "", "", ""),
             // Registry-backed rows, same face as the setter row above.
             Self::MemberWithClassName => registry_message("member_with_class_name"),
@@ -5422,6 +5630,12 @@ impl SemanticCode {
             Self::ConstantPatternWithNonConstantExpression => {
                 Some("Try making the expression a valid constant.".to_string())
             }
+            Self::EqualKeysInMapPattern => {
+                Some("Change or remove the duplicate key.".to_string())
+            }
+            Self::PatternConstantFromDeferredLibrary => {
+                Some("Try removing the keyword 'deferred' from the import.".to_string())
+            }
             // The redirect family's shared correctionMessage
             // (diagnostic.g.dart :14936/:14976/:14992/:14846 — every face
             // carries the identical `Try redirecting to a different
@@ -5537,6 +5751,45 @@ impl SemanticCode {
                 "Try correcting the name to reference an existing setter, or declare the setter."
                     .to_string(),
             ),
+            // The S2 structural pattern faces (#3629): verbatim oracle
+            // `correctionMessage` texts (messages.yaml, the thirteen
+            // pattern-structure rows).
+            Self::MissingNamedPatternFieldName => Some(
+                "Try specifying the getter name explicitly, or using a variable pattern."
+                    .to_string(),
+            ),
+            Self::PositionalFieldInObjectPattern => {
+                Some("Try specifying the field name.".to_string())
+            }
+            Self::MissingVariablePattern => {
+                Some("Try declaring this variable pattern in the branch.".to_string())
+            }
+            Self::PatternAssignmentNotLocalVariable => {
+                Some("Try assigning to a local variable.".to_string())
+            }
+            Self::DuplicateVariablePattern | Self::DuplicatePatternAssignmentVariable => {
+                Some("Try renaming the variable.".to_string())
+            }
+            Self::DuplicatePatternField => {
+                Some("Try removing the duplicate field.".to_string())
+            }
+            Self::InconsistentPatternVariableLogicalOr => Some(
+                "Try declaring the variable pattern with the same type and finality in both branches."
+                    .to_string(),
+            ),
+            Self::EmptyMapPattern => {
+                Some("Try replacing it with an object pattern 'Map()'.".to_string())
+            }
+            Self::RestElementInMapPattern => {
+                Some("Try removing the rest pattern.".to_string())
+            }
+            Self::ExpectedTwoMapPatternTypeArguments
+            | Self::ExpectedOneListPatternTypeArguments => {
+                Some("Try adjusting the number of type arguments.".to_string())
+            }
+            Self::DuplicateRestElementInPattern => {
+                Some("Try removing the duplicate rest element.".to_string())
+            }
             _ => None,
         }
     }
@@ -5562,6 +5815,11 @@ impl SemanticCode {
             }
             Self::InheritsAbstractMemberFour => {
                 format!("Missing concrete implementations of '{a0}', '{a1}', '{a2}', and '{a3}'.")
+            }
+            Self::ConflictingGenericInterfaces => {
+                format!(
+                    "The {a0} '{a1}' can't implement both '{a2}' and '{a3}' because the type arguments are different."
+                )
             }
             // Other rows keep their own (shorter) templates.
             _ => self.message(a0, a1),
@@ -5685,8 +5943,24 @@ mod tests {
             SemanticCode::NonConstantMapValue,
             SemanticCode::NonConstantRecordField,
             SemanticCode::ConstantPatternWithNonConstantExpression,
+            SemanticCode::EqualKeysInMapPattern,
+            SemanticCode::PatternConstantFromDeferredLibrary,
             SemanticCode::NonConstantCaseExpression,
             SemanticCode::NonConstantMapPatternKey,
+            // The #3629 S2 structural pattern faces.
+            SemanticCode::MissingNamedPatternFieldName,
+            SemanticCode::PositionalFieldInObjectPattern,
+            SemanticCode::MissingVariablePattern,
+            SemanticCode::PatternAssignmentNotLocalVariable,
+            SemanticCode::DuplicateVariablePattern,
+            SemanticCode::DuplicatePatternField,
+            SemanticCode::InconsistentPatternVariableLogicalOr,
+            SemanticCode::EmptyMapPattern,
+            SemanticCode::RestElementInMapPattern,
+            SemanticCode::ExpectedTwoMapPatternTypeArguments,
+            SemanticCode::DuplicatePatternAssignmentVariable,
+            SemanticCode::DuplicateRestElementInPattern,
+            SemanticCode::ExpectedOneListPatternTypeArguments,
             SemanticCode::ConstEvalTypeBool,
             SemanticCode::ConstEvalTypeBoolInt,
             SemanticCode::ConstEvalTypeBoolNumString,
@@ -6019,6 +6293,21 @@ mod tests {
         SemanticCode::NonConstantMapKey,
         SemanticCode::NonConstantMapValue,
         SemanticCode::NonConstantRecordField,
+        // The #3629 S2 structural pattern faces (all error-tier
+        // compile-time-error rows).
+        SemanticCode::MissingNamedPatternFieldName,
+        SemanticCode::PositionalFieldInObjectPattern,
+        SemanticCode::MissingVariablePattern,
+        SemanticCode::PatternAssignmentNotLocalVariable,
+        SemanticCode::DuplicateVariablePattern,
+        SemanticCode::DuplicatePatternField,
+        SemanticCode::InconsistentPatternVariableLogicalOr,
+        SemanticCode::EmptyMapPattern,
+        SemanticCode::RestElementInMapPattern,
+        SemanticCode::ExpectedTwoMapPatternTypeArguments,
+        SemanticCode::DuplicatePatternAssignmentVariable,
+        SemanticCode::DuplicateRestElementInPattern,
+        SemanticCode::ExpectedOneListPatternTypeArguments,
         SemanticCode::ConstEvalTypeBool,
         SemanticCode::ConstEvalTypeBoolInt,
         SemanticCode::ConstEvalTypeBoolNumString,
@@ -6448,6 +6737,61 @@ mod tests {
             SemanticCode::BodyMightCompleteNormallyNullable.message("int?", ""),
             "This function has a nullable return type of 'int?', but ends without returning a value."
         );
+        // The #3629 S2 structural pattern faces: verbatim `messages.yaml`
+        // texts (the `{0}` slot is the field/variable name or the written
+        // type-argument count).
+        assert_eq!(
+            SemanticCode::MissingNamedPatternFieldName.message("", ""),
+            "The getter name is not specified explicitly, and the pattern is not a variable."
+        );
+        assert_eq!(
+            SemanticCode::PositionalFieldInObjectPattern.message("", ""),
+            "Object patterns can only use named fields."
+        );
+        assert_eq!(
+            SemanticCode::MissingVariablePattern.message("x", ""),
+            "Variable pattern 'x' is missing in this branch of the logical-or pattern."
+        );
+        assert_eq!(
+            SemanticCode::PatternAssignmentNotLocalVariable.message("", ""),
+            "Only local variables can be assigned in pattern assignments."
+        );
+        assert_eq!(
+            SemanticCode::DuplicateVariablePattern.message("x", ""),
+            "The variable 'x' is already defined in this pattern."
+        );
+        assert_eq!(
+            SemanticCode::DuplicatePatternField.message("sign", ""),
+            "The field 'sign' is already matched in this pattern."
+        );
+        assert_eq!(
+            SemanticCode::InconsistentPatternVariableLogicalOr.message("x", ""),
+            "The variable 'x' has a different type and/or finality in this branch of the logical-or pattern."
+        );
+        assert_eq!(
+            SemanticCode::EmptyMapPattern.message("", ""),
+            "A map pattern must have at least one entry."
+        );
+        assert_eq!(
+            SemanticCode::RestElementInMapPattern.message("", ""),
+            "A map pattern can't contain a rest pattern."
+        );
+        assert_eq!(
+            SemanticCode::ExpectedTwoMapPatternTypeArguments.message("1", ""),
+            "Map patterns require two type arguments or none, but 1 found."
+        );
+        assert_eq!(
+            SemanticCode::DuplicatePatternAssignmentVariable.message("a", ""),
+            "The variable 'a' is already assigned in this pattern."
+        );
+        assert_eq!(
+            SemanticCode::DuplicateRestElementInPattern.message("", ""),
+            "At most one rest element is allowed in a list or map pattern."
+        );
+        assert_eq!(
+            SemanticCode::ExpectedOneListPatternTypeArguments.message("2", ""),
+            "List patterns require one type argument or none, but 2 found."
+        );
     }
 
     /// The correction-carrying rows answer the verbatim oracle
@@ -6584,6 +6928,9 @@ mod tests {
             // The #3293 const-constructor declaration face: an inline
             // `message` arm (no `registry_message` call site).
             | SemanticCode::ConstConstructorWithNonFinalField
+            // The #3626 conflicting-generic-interfaces face: an inline
+            // `message4` arm (no `registry_message` call site).
+            | SemanticCode::ConflictingGenericInterfaces
             // The #2784/#2867 augmentation faces — none registry-backed (the
             // dartq-diagnostics table predates them; the inline `message`
             // arms above are the sole template source).
@@ -6639,6 +6986,8 @@ mod tests {
             | SemanticCode::ConstWithNonConstantArgument
             | SemanticCode::ConstantPatternNeverMatchesValueType
             | SemanticCode::ConstantPatternWithNonConstantExpression
+            | SemanticCode::EqualKeysInMapPattern
+            | SemanticCode::PatternConstantFromDeferredLibrary
             | SemanticCode::NonConstantCaseExpression
             // The #3559 legacy-switch cluster: none registry-backed (the
             // inline `message` arms are the sole template source).
@@ -6957,6 +7306,21 @@ mod tests {
             | SemanticCode::ValuesDeclarationInEnum
             | SemanticCode::MixinApplicationNoConcreteSuperInvokedMember
             | SemanticCode::MixinApplicationNotImplementedInterface
+            // The #3629 S2 structural pattern faces: none registry-backed
+            // (the inline `message` arms are the sole template source).
+            | SemanticCode::MissingNamedPatternFieldName
+            | SemanticCode::PositionalFieldInObjectPattern
+            | SemanticCode::MissingVariablePattern
+            | SemanticCode::PatternAssignmentNotLocalVariable
+            | SemanticCode::DuplicateVariablePattern
+            | SemanticCode::DuplicatePatternField
+            | SemanticCode::InconsistentPatternVariableLogicalOr
+            | SemanticCode::EmptyMapPattern
+            | SemanticCode::RestElementInMapPattern
+            | SemanticCode::ExpectedTwoMapPatternTypeArguments
+            | SemanticCode::DuplicatePatternAssignmentVariable
+            | SemanticCode::DuplicateRestElementInPattern
+            | SemanticCode::ExpectedOneListPatternTypeArguments
             | SemanticCode::AbstractSuperMemberReference(_)
             => code.code_info(),
         }
@@ -7028,6 +7392,8 @@ mod tests {
             SemanticCode::ConstWithNonConstantArgument,
             SemanticCode::ConstantPatternNeverMatchesValueType,
             SemanticCode::ConstantPatternWithNonConstantExpression,
+            SemanticCode::EqualKeysInMapPattern,
+            SemanticCode::PatternConstantFromDeferredLibrary,
             SemanticCode::NonConstantCaseExpression,
             SemanticCode::NonConstantMapPatternKey,
             SemanticCode::CreationWithNonType,
@@ -7285,6 +7651,20 @@ mod tests {
             SemanticCode::ValuesDeclarationInEnum,
             SemanticCode::MixinApplicationNoConcreteSuperInvokedMember,
             SemanticCode::MixinApplicationNotImplementedInterface,
+            // The #3629 S2 structural pattern faces.
+            SemanticCode::MissingNamedPatternFieldName,
+            SemanticCode::PositionalFieldInObjectPattern,
+            SemanticCode::MissingVariablePattern,
+            SemanticCode::PatternAssignmentNotLocalVariable,
+            SemanticCode::DuplicateVariablePattern,
+            SemanticCode::DuplicatePatternField,
+            SemanticCode::InconsistentPatternVariableLogicalOr,
+            SemanticCode::EmptyMapPattern,
+            SemanticCode::RestElementInMapPattern,
+            SemanticCode::ExpectedTwoMapPatternTypeArguments,
+            SemanticCode::DuplicatePatternAssignmentVariable,
+            SemanticCode::DuplicateRestElementInPattern,
+            SemanticCode::ExpectedOneListPatternTypeArguments,
         ]
     }
 

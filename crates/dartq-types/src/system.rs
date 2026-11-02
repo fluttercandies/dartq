@@ -244,13 +244,17 @@ impl<'a> TypeSystem<'a> {
             return false;
         }
         match ty.kind() {
-            // M1 has no declared bounds; the official unbound case is `false`
-            // as well (type_system.dart:1910).
-            TypeKind::Dynamic
-            | TypeKind::Void
-            | TypeKind::Invalid
-            | TypeKind::Null
-            | TypeKind::TypeParameter { .. } => false,
+            TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => false,
+            // A type parameter is non-nullable exactly when its declared
+            // bound is (type_system.dart:1179-1182): `T extends num` is
+            // non-nullable, `T extends num?` and an unbounded `T` (implicit
+            // `Object?` bound) are not. The bound rides the injected facts
+            // snapshot; a parameter with no facts entry, or a facts-less
+            // system, answers `false` — the unbounded face.
+            TypeKind::TypeParameter { parameter } => self
+                .param_facts
+                .and_then(|facts| facts.get(parameter).bound)
+                .is_some_and(|bound| self.is_non_nullable(bound)),
             TypeKind::FutureOr { base } => self.is_non_nullable(base),
             _ => true,
         }

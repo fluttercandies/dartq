@@ -3900,18 +3900,10 @@ impl Interp<'_> {
                         self.promoted_args_of(var, &model),
                     )
                 };
-                self.ops
-                    .try_promote_to_typed(
-                        tested,
-                        tested_args,
-                        previous,
-                        previous_args,
-                        self.args,
-                        self.names,
-                    )
-                    .or_else(|| {
-                        self.type_parameter_promotion(previous, tested, tested_args)
-                    })
+                let promoted = self.promotion_step(tested, tested_args, previous, previous_args);
+                promoted.or_else(|| {
+                    self.type_parameter_promotion(previous, tested, tested_args)
+                })
             }
         }
     }
@@ -4287,16 +4279,51 @@ impl Interp<'_> {
             Base::Unknown | Base::Dynamic | Base::Void => None,
             _ => {
                 let (previous, previous_args) = self.prop_previous(slot);
-                self.ops.try_promote_to_typed(
-                    tested,
-                    tested_args,
-                    previous,
-                    previous_args,
-                    self.args,
-                    self.names,
-                )
+                self.promotion_step(tested, tested_args, previous, previous_args)
             }
         }
+    }
+
+    /// One `is`/`as` promote step over the instantiated spellings — the
+    /// `tryPromoteToType` candidate gated by `isValidPromotionStep`
+    /// (flow_analysis.dart:5989-6007). The SOUND posture delegates to the
+    /// resolved seam's [`TypeOps::try_promote_to_typed`], whose strict
+    /// subtype gate (`to <: from && !(from <: to)`) refuses a mutual or
+    /// repeated promotion. The disabled (pre-3.9) posture is the legacy
+    /// step: any tested subtype of `previous` that differs from it by
+    /// identity — a mutual subtype like `List<dynamic>` over
+    /// `List<Object?>` promotes where the sound gate refuses. `None`
+    /// otherwise (the test's top-type spellings, a redundant step, or a
+    /// target `previous` does not admit).
+    pub(crate) fn promotion_step(
+        &self,
+        tested: Ty,
+        tested_args: u32,
+        previous: Ty,
+        previous_args: u32,
+    ) -> Option<Ty> {
+        if self.sound_flow {
+            return self.ops.try_promote_to_typed(
+                tested,
+                tested_args,
+                previous,
+                previous_args,
+                self.args,
+                self.names,
+            );
+        }
+        if self.ops.is_subtype_typed(
+            tested,
+            tested_args,
+            previous,
+            previous_args,
+            self.args,
+            self.names,
+        ) && (tested, tested_args) != (previous, previous_args)
+        {
+            return Some(tested);
+        }
+        None
     }
 
     /// The promoted-property read's flow-type row (#3430): when the

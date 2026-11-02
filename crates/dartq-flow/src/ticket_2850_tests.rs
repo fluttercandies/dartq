@@ -307,8 +307,9 @@ fn dead_constant_if_empty_then_block_reports_braces() {
 
 #[test]
 fn same_type_is_negated_branch_stays_silent() {
-    // A same-type `is!` is a promotion no-op, not a fold: the then
-    // branch stays live and its empty block reports nothing.
+    // A same-type `is!` deads the then branch, so its empty block reports the
+    // braces (the #3610 oracle probe; implicit_covariance_test's `x is! num`).
     let src = "void f(int x) {\n  if (x is! int) {}\n}";
-    assert!(dead_of(src).is_empty(), "{:?}", dead_of(src));
+    // Upstream: a bottom `factor` makes `ifFalse` unreachable (flow_analysis.dart:3207-3239).
+    assert_eq!(dead_of(src), vec!["{}".to_string()]);
 }

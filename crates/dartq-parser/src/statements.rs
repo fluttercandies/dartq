@@ -1433,7 +1433,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             if self.cursor.at_eof() {
                 break;
             }
+            // `reportErrorIfSuper(update)` (ast_builder.dart:4348): EACH
+            // comma-separated updater expression carries the selector-missing
+            // row when it parses as the bare `super` expression
+            // (`for (;; super)` → `4:14|5`; `for (;; super, super)` reports
+            // once per updater).
+            let updater_begin = self.peek_span();
             let _ = self.parse_expression();
+            if self.is_bare_super_expression(updater_begin, self.last_consumed_span()) {
+                self.report(msg::missing_assignable_selector(), updater_begin);
+            }
             expression_count += 1;
             if self.peek_kind() != TokenKind::Comma {
                 break;
