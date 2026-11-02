@@ -3237,6 +3237,78 @@ impl<'a> Engine<'a> {
             })
             .map(|r| r.name)
             .collect();
+        // The public-typedef exposure face (`visitGenericTypeAlias`,
+        // unused_local_elements_verifier.dart:175-190): a non-private
+        // `typedef Public = _Private` adds every NON-private constructor
+        // of the aliased interface type to `usedElements.elements` —
+        // `_PrivateClass.named` is reachable through the alias even though
+        // no `named(` call exists anywhere. The resolution is type-level
+        // (`node.type.type` — a `typedef AlsoPublic = _PrivateAlias`
+        // indirection resolves through the middle alias to the same
+        // element), so the name model walks the alias→head edges to a
+        // fixed point before resolving the leaf as a container. A
+        // private-named alias contributes nothing itself but still
+        // forwards on the chain (the oracle reads the resolved type, not
+        // the spelling). The element-tuple set matches
+        // `member_used_elements`' keying so the Constructor arm can read
+        // it directly — the exposure spares only the resolved file's own
+        // constructors.
+        let alias_heads: FxHashMap<StringId, (StringId, Option<StringId>)> = self
+            .decl_sites
+            .iter()
+            .filter(|site| matches!(site.kind, DeclKind::TypeAlias))
+            .filter_map(|site| self.typedef_rhs_head(site).map(|rhs| (site.name, rhs)))
+            .collect();
+        let mut alias_used_ctors: FxHashSet<(FileId, StringId, StringId)> =
+            FxHashSet::default();
+        for site in &self.decl_sites {
+            if !matches!(site.kind, DeclKind::TypeAlias) || self.is_private_name(site.name) {
+                continue;
+            }
+            // The alias's own RHS opens the walk; each hop follows a
+            // same-file alias's RHS head (`A = B`, `B = _C`) until the
+            // head names no alias — a `prefix.Leaf` arm or an unresolvable
+            // name ends the chain there. Cycle-guarded: typedef cycles
+            // are an error upstream, but the walk terminates regardless.
+            let Some(&init) = alias_heads.get(&site.name) else {
+                continue;
+            };
+            let mut rhs = init;
+            let mut seen: FxHashSet<StringId> = FxHashSet::default();
+            while rhs.1.is_none() && seen.insert(rhs.0) {
+                let Some(&next) = alias_heads.get(&rhs.0) else {
+                    break;
+                };
+                rhs = next;
+            }
+            let (leaf, prefix) = rhs;
+            let target = match prefix {
+                Some(p) => prefixed_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    p,
+                    leaf,
+                ),
+                None => resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    leaf,
+                ),
+            };
+            let Some((container, container_file)) = target else {
+                continue;
+            };
+            for &ctor in container.constructors.iter() {
+                if !self.is_private_name(ctor) {
+                    alias_used_ctors.insert((container_file, leaf, ctor));
+                }
+            }
+        }
         // The augment-fragment skip: upstream's `_reportDiagnosticForElement`
         // anchors every `unused_element`/`unused_element_parameter`/`unused_field`
         // row at `element.firstFragment.nameOffset` — the introductory
@@ -3697,6 +3769,7 @@ impl<'a> Engine<'a> {
                         // `usedElements.elements`).
                         let ctor_used = member_used_elements
                             .contains(&(self.file, container, site.name))
+                            || alias_used_ctors.contains(&(self.file, container, site.name))
                             || shorthand_ctor_refs.contains(&site.name);
                         let spared = !multi
                             || pragma_spared
@@ -4492,6 +4565,44 @@ impl<'a> Engine<'a> {
         }
         let byte = selector.byte_offset as usize;
         Some(self.intern(&self.source[byte..byte + selector.byte_len as usize]))
+    }
+
+    /// The `typedef NAME<T> = RHS` head the alias exposes (`RHS` or
+    /// `prefix.RHS`): `(head, prefix)` interned off the token stream, `None`
+    /// for the function-style form (`typedef void F()`) or a missing `=`.
+    /// The returned head is the first written identifier after `=` — the
+    /// declaration-site token's own span cannot carry it, so the type-uses
+    /// index never learns which name a given alias RHS opened with.
+    fn typedef_rhs_head(&self, site: &DeclSite) -> Option<(StringId, Option<StringId>)> {
+        let tokens = self.tokens.as_slice();
+        let mut index = tokens.partition_point(|t| t.utf16_offset < site.range.end());
+        // `NAME` may open a type-parameter group (`A<T>`): the alias's own
+        // `= ` is the first Eq AFTER the group's matching close, or the
+        // first Eq outright when no `<` follows the name.
+        if tokens.get(index)?.kind == dartq_scanner::TokenKind::Lt {
+            index = self.tokens.matching_end(index)? + 1;
+        }
+        if tokens.get(index)?.kind != dartq_scanner::TokenKind::Eq {
+            return None;
+        }
+        let head = tokens.get(index + 1)?;
+        if head.kind != dartq_scanner::TokenKind::Identifier {
+            return None;
+        }
+        let head_name = self.spelling_at(head.utf16_offset)?;
+        // `= prefix.Name`: the dot-joined spelling resolves through the
+        // prefix table — return both sides so the caller walks
+        // `prefixed_container` instead of the bare scope.
+        if tokens.get(index + 2).map(|t| t.kind) == Some(dartq_scanner::TokenKind::Period)
+            && tokens.get(index + 3).map(|t| t.kind)
+                == Some(dartq_scanner::TokenKind::Identifier)
+        {
+            let leaf = tokens.get(index + 3)?;
+            let byte = leaf.byte_offset as usize;
+            let leaf_name = self.intern(&self.source[byte..byte + leaf.byte_len as usize]);
+            return Some((leaf_name, Some(head_name)));
+        }
+        Some((head_name, None))
     }
 
     /// Whether the identifier whose token ends at `end` is a plain
