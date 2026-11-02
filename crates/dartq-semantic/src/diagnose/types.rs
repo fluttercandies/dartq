@@ -3085,6 +3085,13 @@ pub(crate) struct Engine<'a> {
     /// this besides [`Self::init_frame_depth`], whose last value would
     /// otherwise read stale outside initializers.
     pub(crate) in_initializer: bool,
+    /// Open conditional-expression depth (`begin_conditional_expression` /
+    /// `end_conditional_expression`): an `as` cast inside a `?:` arm gets
+    /// its dead-code row from the flow layer's `cast_tail_row` — the
+    /// official `flowEnd(thenExpression)`/`flowEnd(elseExpression)` close
+    /// (resolver.dart:2458/2484) reports `[type.offset, arm.end)` — so the
+    /// initializer face [`Self::in_initializer`] must defer to it.
+    pub(crate) cond_expr_depth: u32,
     /// The const group's declared names, in initializer order.
     pub(crate) const_group_names: Vec<StringId>,
     /// The next const-group name an initializer window consumes.

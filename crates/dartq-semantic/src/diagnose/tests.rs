@@ -23259,3 +23259,31 @@ mod ticket_3630_tests;
 #[cfg(test)]
 #[path = "ticket_3659_tests.rs"]
 mod ticket_3659_tests;
+
+#[cfg(test)]
+#[path = "ticket_3673_tests.rs"]
+mod ticket_3673_tests;
+
+#[cfg(test)]
+#[path = "ticket_3675_tests.rs"]
+mod ticket_3675_tests;
+
+#[cfg(test)]
+#[path = "ticket_3676_tests.rs"]
+mod ticket_3676_tests;
+
+#[cfg(test)]
+#[path = "ticket_3677_tests.rs"]
+mod ticket_3677_tests;
+
+#[cfg(test)]
+#[path = "ticket_3678_tests.rs"]
+mod ticket_3678_tests;
+
+#[cfg(test)]
+#[path = "ticket_3679_tests.rs"]
+mod ticket_3679_tests;
+
+#[cfg(test)]
+#[path = "ticket_3685_tests.rs"]
+mod ticket_3685_tests;

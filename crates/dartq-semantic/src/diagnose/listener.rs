@@ -5997,6 +5997,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.cond_mark = outer_mark;
         engine.cond_case = outer_case;
         engine.const_capture.begin_conditional();
+        // An `as` cast inside a `?:` arm reports its dead tail through
+        // flow's `cast_tail_row` (the official `flowEnd` close), so the
+        // initializer face in `check_dead_cast_tail` defers while the
+        // depth is open.
+        engine.cond_expr_depth += 1;
     }
 
     fn handle_conditional_expression_colon(&mut self) {
@@ -6030,6 +6035,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         engine.const_capture.end_conditional(end.range);
+        engine.cond_expr_depth = engine.cond_expr_depth.saturating_sub(1);
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, token: Token) {
@@ -6231,6 +6237,26 @@ impl ParserListener for DiagnoseListener<'_> {
                 )
             };
             let row = &engine.rows[index];
+            // A written argument group (`C<int>()`, `p.C<int>()`) instantiates
+            // the created type — the bare head would stage `C` and answer a
+            // `C<dynamic>` operand where the oracle reads `C<int>`
+            // (`InstanceCreationExpression.staticType`). The `call_type_args`
+            // entry keys on the callee row's head offset: the group's
+            // arguments spell the instance face the verdict compares.
+            let created_ty = |engine: &Engine, name: StringId, offset: u32| -> Ty {
+                match engine
+                    .call_type_args
+                    .iter()
+                    .find(|(at, _)| *at == offset)
+                {
+                    Some((_, entry)) => engine
+                        .boundary
+                        .args
+                        .borrow_mut()
+                        .named(name, false, &entry.tys),
+                    None => Ty::named(name),
+                }
+            };
             // `MicroKind::Extension` collapses `extension E` and
             // `extension type Ext` into one row kind (`Bare(Container.
             // Extension)`); only the extension-type spelling is a creation
@@ -6245,7 +6271,7 @@ impl ParserListener for DiagnoseListener<'_> {
                             || engine.container_kind_of(*name)
                                 == Some(ContainerKind::ExtensionType)
                         {
-                            Some(Ty::named(row.name))
+                            Some(created_ty(engine, row.name, row.range.offset))
                         } else {
                             None
                         }
@@ -6257,7 +6283,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     recv: Receiver::Prefix { name: prefix },
                 } if prefixed_container(*prefix, row.name) => {
                     if row.intent == Intent::Invoke {
-                        Some(Ty::named(row.name))
+                        Some(created_ty(engine, row.name, row.range.offset))
                     } else {
                         Some(Ty::named(engine.intern("Type")))
                     }
@@ -6279,7 +6305,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         || engine.container_kind_of(*name)
                             == Some(ContainerKind::ExtensionType)
                     {
-                        Some(Ty::named(*name))
+                        Some(created_ty(engine, *name, row.range.offset))
                     } else {
                         None
                     }
@@ -14956,6 +14982,38 @@ fn operand_expr_head(engine: &Engine<'_>, from: u32) -> u32 {
                 head = opener;
                 while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte) {
                     head -= 1;
+                }
+                // The call's callee may itself carry a type-argument group
+                // (`C<int>()`, `new OneArg<String>().foo`): the ident walk
+                // stopped at the group's `>`. Walk the balanced `<>` back
+                // to its `<`, then over the head ident — the same walk the
+                // dot arm below applies to a receiver's generic head.
+                if head > 0 && engine.byte_at(head - 1) == Some(b'>') {
+                    let mut depth = 0u32;
+                    let mut scan = head - 1;
+                    let group_open = loop {
+                        if scan == 0 {
+                            break None;
+                        }
+                        scan -= 1;
+                        match engine.byte_at(scan) {
+                            Some(b'>') => depth += 1,
+                            Some(b'<') => {
+                                if depth == 0 {
+                                    break Some(scan);
+                                }
+                                depth -= 1;
+                            }
+                            _ => {}
+                        }
+                    };
+                    if let Some(group_open) = group_open {
+                        head = group_open;
+                        while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte)
+                        {
+                            head -= 1;
+                        }
+                    }
                 }
                 continue;
             }

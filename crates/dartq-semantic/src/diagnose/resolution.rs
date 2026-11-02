@@ -3792,6 +3792,36 @@ impl<'a> Engine<'a> {
             self.init_rows.insert(range.offset, container);
         }
         let ty = match info {
+            // A bare type-ALIAS name read in expression position is a
+            // `TypeLiteral` — its static type is `dart:core Type`, never
+            // the alias's right-hand face (upstream Dart SDK source,
+            // `pkg/analyzer/lib/src/dart/resolver/simple_identifier_resolver.dart`
+            // `_resolve2`: a `TypeAliasElement` identifier answers
+            // `_typeProvider.typeType` whenever `_isExpressionIdentifier`
+            // holds or its `aliasedType` is not an `InterfaceType`). The
+            // row's `shape.ty` keeps the alias's declared right-hand side —
+            // the `L()`/`L.named` invoke and member faces still read it —
+            // while the read operand (`row.ty`) the assignability and
+            // postfix checks consume is `Type`, so `f(F)` against a `Type`
+            // formal stays silent instead of reporting the RHS function
+            // type (census-12 shape 2.1).
+            //
+            // The rewrite is gated on the head NOT being a member-receiver
+            // (`Cb.foo`, `Cb.new`): a selector head's operand type is the
+            // literal-receiver face the member-miss checks read through
+            // `shape.ty`/`receiver_static_ty` — rewriting `row.ty` there
+            // would collapse the `Type`-display miss the alias literal
+            // family pins (the `followed_by_period` lookahead is the same
+            // `p.C` head probe the type-use arm runs).
+            BareInfo::Plain { ty }
+                if ty != Ty::UNKNOWN
+                    && !self.followed_by_period(range.end())
+                    && self
+                        .top_level_decl(name)
+                        .is_some_and(|d| d.kind == MicroKind::TypeAlias) =>
+            {
+                Ty::named(self.intern("Type"))
+            }
             BareInfo::Plain { ty } if ty != Ty::UNKNOWN => ty,
             // #279 type folding: an in-file const top-level variable's
             // declared type folds to its evaluated constant's type (the

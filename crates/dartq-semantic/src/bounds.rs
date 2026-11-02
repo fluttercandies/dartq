@@ -361,6 +361,128 @@ fn tree_any_head(tree: &TypeTree, pred: &dyn Fn(StringId) -> bool) -> bool {
     pred(tree.head) || tree.args.iter().any(|arg| tree_any_head(arg, pred))
 }
 
+/// Collects the indices of the `params` members a leaf head of `tree`
+/// names — the free type-parameter leaves
+/// [`Snapshot::grounded_bound_trees`]'s dependency graph reads. Named and
+/// record nodes walk their children; a function node walks its return,
+/// formal columns, and nested bound trees (a bound's own binder names are
+/// not in `params`, so the walk never crosses a nested binder's shadow).
+fn tree_param_leaves(
+    tree: &TypeTree,
+    params: &FxHashMap<StringId, usize>,
+    out: &mut FxHashSet<usize>,
+) {
+    if tree.poisoned {
+        return;
+    }
+    if let Some((positional, named)) = &tree.record {
+        for field in positional.iter().chain(named.iter().map(|(_, ty)| ty)) {
+            tree_param_leaves(field, params, out);
+        }
+        return;
+    }
+    if let Some(function) = &tree.function {
+        if let Some(ret) = &function.ret {
+            tree_param_leaves(ret, params, out);
+        }
+        for (_, bound) in &function.type_params_named {
+            if let Some(bound) = bound {
+                tree_param_leaves(bound, params, out);
+            }
+        }
+        for formal in function
+            .positional
+            .iter()
+            .chain(function.named.iter().map(|(_, ty)| ty))
+        {
+            tree_param_leaves(formal, params, out);
+        }
+        return;
+    }
+    if tree.args.is_empty() {
+        if let Some(&index) = params.get(&tree.head) {
+            out.insert(index);
+        }
+        return;
+    }
+    for arg in &tree.args {
+        tree_param_leaves(arg, params, out);
+    }
+}
+
+/// `computeStrongComponents` (`pkg/kernel/lib/util/graph.dart:35-93`) —
+/// the Dijkstra path-based strong-component algorithm the oracle's
+/// `DefaultTypesBuilder` consumes (default_types_builder.dart:142-143),
+/// the same walk the TypeId-level grounding runs. `dependents[i]` are
+/// the out-neighbors of `i`; the component order is the official
+/// emission order, which the component pass is indifferent to — each
+/// component's substitution is scoped to its own members' bounds.
+fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn visit(
+        vertex: usize,
+        dependents: &[Vec<usize>],
+        count: &mut usize,
+        preorder: &mut [usize],
+        unassigned: &mut Vec<usize>,
+        candidates: &mut Vec<usize>,
+        assigned: &mut [bool],
+        result: &mut Vec<Vec<usize>>,
+    ) {
+        preorder[vertex] = *count;
+        *count += 1;
+        unassigned.push(vertex);
+        candidates.push(vertex);
+        for &neighbor in &dependents[vertex] {
+            if preorder[neighbor] == usize::MAX {
+                visit(
+                    neighbor, dependents, count, preorder, unassigned, candidates, assigned,
+                    result,
+                );
+            } else if !assigned[neighbor] {
+                while preorder[*candidates.last().expect("path is nonempty")]
+                    > preorder[neighbor]
+                {
+                    candidates.pop();
+                }
+            }
+        }
+        if *candidates.last().expect("path is nonempty") == vertex {
+            let mut component = Vec::new();
+            while let Some(top) = unassigned.pop() {
+                component.push(top);
+                assigned[top] = true;
+                if top == vertex {
+                    break;
+                }
+            }
+            result.push(component);
+            candidates.pop();
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut count = 0usize;
+    let mut preorder = vec![usize::MAX; dependents.len()];
+    let mut unassigned = Vec::new();
+    let mut candidates = Vec::new();
+    let mut assigned = vec![false; dependents.len()];
+    for vertex in 0..dependents.len() {
+        if preorder[vertex] == usize::MAX {
+            visit(
+                vertex,
+                dependents,
+                &mut count,
+                &mut preorder,
+                &mut unassigned,
+                &mut candidates,
+                &mut assigned,
+                &mut result,
+            );
+        }
+    }
+    result
+}
+
 /// The syntactic alias self-reference walk (upstream
 /// `TypeAliasSelfReferenceFinder`/`_Finder`, `pkg/analyzer/lib/src/
 /// summary2/type_alias.dart:10-133`). A typedef's right-hand side — its
@@ -2566,6 +2688,48 @@ impl<'a> Bounds<'a> {
                         })
                     })
                     .collect();
+                // A bare head carries no written arguments at all: its
+                // instantiate-to-bounds arguments still display the
+                // WRITTEN bound under the grounding substitution — the
+                // oracle's instantiated type keeps the alias decoration
+                // the bound spelled (`'A<Never>'` for `X extends A<X>`,
+                // never the `Never Function(Never)` expansion
+                // `snapshot.display` reads off the interned answer).
+                // `grounded_args[index]` renders parameter `index`'s
+                // grounded bound tree ([`Snapshot::grounded_bound_trees`])
+                // through the same alias-preserving, per-position-flipped
+                // face the written arguments use; an unmodelable bound
+                // keeps the expanded display's fallback.
+                let grounded_args: Vec<Option<String>> = if args.is_empty() {
+                    let grounded =
+                        snapshot.grounded_bound_trees(decl, &head_params, &head_bounds);
+                    (0..head_params.len())
+                        .map(|index| {
+                            let variance = snapshot
+                                .decl_params
+                                .get(&decl)
+                                .and_then(|params| params.get(index))
+                                .map_or(Variance::Covariant, |&param| {
+                                    snapshot.facts.get(param).variance
+                                });
+                            snapshot.display_written_argument(
+                                &grounded[index],
+                                variance,
+                                inverted_ty.is_some(),
+                                scope,
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let argument_text = |index: usize| {
+                    written_args
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .or_else(|| grounded_args.get(index).cloned().flatten())
+                };
                 let subst_source = match inverted_ty {
                     Some(inverted)
                         if matches!(
@@ -2584,10 +2748,7 @@ impl<'a> Bounds<'a> {
                     for (index, param) in head_params.iter().enumerate() {
                         if index < arg_range.len() {
                             let expanded = snapshot.table.arg(arg_range.offset() + index);
-                            let text = written_args
-                                .get(index)
-                                .cloned()
-                                .flatten()
+                            let text = argument_text(index)
                                 .unwrap_or_else(|| snapshot.display(expanded));
                             subst.insert(*param, text);
                         }
@@ -2598,10 +2759,7 @@ impl<'a> Bounds<'a> {
                     .map(|issue| BoundedIssue {
                         range: args.get(issue.index).map_or(site, |arg| arg.range),
                         site,
-                        argument: written_args
-                            .get(issue.index)
-                            .cloned()
-                            .flatten()
+                        argument: argument_text(issue.index)
                             .unwrap_or_else(|| snapshot.display(issue.argument)),
                         parameter: snapshot.param_text(issue.parameter),
                         bound: head_bounds
@@ -4527,6 +4685,239 @@ impl<'a> Snapshot<'a> {
         scope
             .contains_key(&tree.head)
             .then(|| render_leaf(text, tree.nullable))
+    }
+
+    /// The written instantiate-to-bounds argument trees of a bare head
+    /// (#3675): a raw `G` resolves to its instantiate-to-bounds
+    /// instantiation, whose argument for parameter `i` is `i`'s written
+    /// bound under the grounding substitution — and the oracle's
+    /// instantiated type keeps the alias decoration that bound spelled
+    /// (`'A<Never>'`, never the `Never Function(Never)` expansion the
+    /// TypeId-level answer carries). `grounded[i]` replays
+    /// `default_types_builder.dart`'s `_computeDefaultType` on the
+    /// WRITTEN bound trees: each strongly-connected component's own
+    /// bounds rewrite their mutual references to `dynamic`/`Never` by
+    /// position, then a declaration-order sweep substitutes every
+    /// parameter leaf with the resolved bound — the same pair of passes
+    /// [`instantiate_type_formals_to_bounds_directed`] runs on the
+    /// interned answer, each bound's rewrite seeded by its owner's stored
+    /// variance. `display_written_argument`'s per-position flip then
+    /// renders the inverted pass's `Never`/`Object?` out of the grounded
+    /// trees, so one grounding serves both passes. An unbounded or
+    /// poisoned bound reads `dynamic`, the implicit face.
+    fn grounded_bound_trees(
+        &self,
+        decl: TypeDeclId,
+        head_params: &[StringId],
+        head_bounds: &[(Option<TypeTree>, bool)],
+    ) -> Vec<TypeTree> {
+        let range = SourceRange {
+            offset: 0,
+            length: 0,
+        };
+        let dynamic = TypeTree::leaf(self.strings.intern("dynamic"), false, range);
+        let never = TypeTree::leaf(self.strings.intern("Never"), false, range);
+        let count = head_params.len();
+        let variance_of = |index: usize| {
+            self.decl_params
+                .get(&decl)
+                .and_then(|params| params.get(index))
+                .map_or(Variance::Covariant, |&param| {
+                    self.facts.get(param).variance
+                })
+        };
+        // Every parameter's bound starts at its written tree — `dynamic`
+        // for an unwritten or poisoned one (the implicit bound,
+        // default_types_builder.dart:136-140).
+        let index_of: FxHashMap<StringId, usize> = head_params
+            .iter()
+            .enumerate()
+            .map(|(index, &name)| (name, index))
+            .collect();
+        let mut bounds: Vec<TypeTree> = (0..count)
+            .map(|index| {
+                head_bounds
+                    .get(index)
+                    .and_then(|(tree, poisoned)| {
+                        (!*poisoned).then_some(tree.as_ref()).flatten()
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| dynamic.clone())
+            })
+            .collect();
+        // The `-->m` relation (:375-428): `dependents[i]` lists the
+        // parameters whose bounds mention `head_params[i]` anywhere.
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (j, bound) in bounds.iter().enumerate() {
+            let mut free = FxHashSet::default();
+            tree_param_leaves(bound, &index_of, &mut free);
+            for index in free {
+                dependents[index].push(j);
+            }
+        }
+        // The component pass (:142-162): each strongly connected
+        // component's own bounds rewrite the member leaves — `dynamic`
+        // above, `Never` below — under the bound owner's stored variance.
+        for component in strong_components(&dependents) {
+            let is_cycle = component.len() > 1
+                || component.iter().any(|&i| dependents[i].contains(&i));
+            if !is_cycle {
+                continue;
+            }
+            let members: FxHashSet<StringId> =
+                component.iter().map(|&i| head_params[i]).collect();
+            for &i in &component {
+                bounds[i] = self.replace_param_leaves(
+                    &bounds[i],
+                    &members,
+                    &dynamic,
+                    &never,
+                    variance_of(i),
+                );
+            }
+        }
+        // The grounding sweep (:164-180), declaration order: every
+        // parameter leaf inside every bound substitutes — the resolved
+        // bound above, `Never` below — under each bound owner's seed.
+        for i in 0..count {
+            let upper = bounds[i].clone();
+            for j in 0..count {
+                let mut single = FxHashSet::default();
+                single.insert(head_params[i]);
+                bounds[j] = self.replace_param_leaves(
+                    &bounds[j],
+                    &single,
+                    &upper,
+                    &never,
+                    variance_of(j),
+                );
+            }
+        }
+        bounds
+    }
+
+    /// The tree-level `_UpperLowerReplacementVisitor`
+    /// (`default_types_builder.dart:431-479`): every leaf head in `tree`
+    /// naming a member of `targets` returns `lower` when the walk's
+    /// current variance is contravariant, `upper` otherwise — verbatim,
+    /// so the leaf's own `?` never joins the replacement. Interface
+    /// arguments combine the declaration parameter's stored variance
+    /// (`visitTypeArgument`, :458-469); a function node's return keeps
+    /// the current variance while its formal columns flip co↔contra
+    /// (`changeVariance`, :444-451); a nested signature's own
+    /// type-parameter bounds rewrite under the current variance before
+    /// the flip (`visitTypeParameterBound`, :279-281).
+    fn replace_param_leaves(
+        &self,
+        tree: &TypeTree,
+        targets: &FxHashSet<StringId>,
+        upper: &TypeTree,
+        lower: &TypeTree,
+        variance: Variance,
+    ) -> TypeTree {
+        if tree.poisoned {
+            return tree.clone();
+        }
+        if let Some((positional, named)) = &tree.record {
+            let mut out = tree.clone();
+            out.record = Some((
+                positional
+                    .iter()
+                    .map(|field| {
+                        self.replace_param_leaves(field, targets, upper, lower, variance)
+                    })
+                    .collect(),
+                named
+                    .iter()
+                    .map(|(name, field)| {
+                        (
+                            *name,
+                            self.replace_param_leaves(field, targets, upper, lower, variance),
+                        )
+                    })
+                    .collect(),
+            ));
+            return out;
+        }
+        if let Some(function) = &tree.function {
+            let mut out = tree.clone();
+            let flipped = match variance {
+                Variance::Covariant => Variance::Contravariant,
+                Variance::Contravariant => Variance::Covariant,
+                other => other,
+            };
+            out.function = Some(FnTree {
+                ret: function.ret.as_ref().map(|ret| {
+                    Box::new(self.replace_param_leaves(ret, targets, upper, lower, variance))
+                }),
+                type_params: function.type_params,
+                type_params_named: function
+                    .type_params_named
+                    .iter()
+                    .map(|(name, bound)| {
+                        (
+                            *name,
+                            bound.as_ref().map(|bound| {
+                                self.replace_param_leaves(bound, targets, upper, lower, variance)
+                            }),
+                        )
+                    })
+                    .collect(),
+                required_positional: function.required_positional,
+                positional: function
+                    .positional
+                    .iter()
+                    .map(|formal| {
+                        self.replace_param_leaves(formal, targets, upper, lower, flipped)
+                    })
+                    .collect(),
+                named: function
+                    .named
+                    .iter()
+                    .map(|(name, formal)| {
+                        (
+                            *name,
+                            self.replace_param_leaves(formal, targets, upper, lower, flipped),
+                        )
+                    })
+                    .collect(),
+            });
+            return out;
+        }
+        if tree.args.is_empty() {
+            if targets.contains(&tree.head) {
+                return if variance == Variance::Contravariant {
+                    lower.clone()
+                } else {
+                    upper.clone()
+                };
+            }
+            return tree.clone();
+        }
+        // An argument's subtree sees the current variance combined with
+        // the head's stored parameter variance; an unregistered head
+        // degrades to covariant — the under-report direction a missing
+        // fact already implies (`None` answers covariant in the TypeId
+        // walk's `argument_variance`).
+        let arg_params = self
+            .registry
+            .get(&tree.head)
+            .and_then(|decl| self.decl_params.get(decl));
+        let mut out = tree.clone();
+        out.args = tree
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                let declared = arg_params
+                    .and_then(|params| params.get(index))
+                    .map_or(Variance::Covariant, |&param| {
+                        self.facts.get(param).variance
+                    });
+                self.replace_param_leaves(arg, targets, upper, lower, variance.combine(declared))
+            })
+            .collect();
+        out
     }
 
     /// The written-tree projection of a snapshot type (#2838): the ITB

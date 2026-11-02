@@ -291,6 +291,7 @@ impl<'a> Engine<'a> {
             field_group_depth: 0,
             init_frame_depth: 0,
             in_initializer: false,
+            cond_expr_depth: 0,
             const_group_names: Vec::new(),
             const_group_cursor: 0,
             nonconst_top_level: FxHashSet::default(),
@@ -992,6 +993,7 @@ impl<'a> Engine<'a> {
         // The statement-form operand faces (#2814) join the same
         // offset-sorted survivor tail.
         self.stage_operand_faces(&mut survivors);
+        self.stage_nullable_operator_faces(&mut survivors);
         for check in std::mem::take(&mut self.staged_checks) {
             // The nullable-condition face re-decides first: the flow's
             // condition-type row (the operand read's flow-aware static
@@ -3725,10 +3727,18 @@ impl<'a> Engine<'a> {
         if sub_list.len() != sup_list.len() {
             return false;
         }
-        sub_list
-            .iter()
-            .zip(sup_list.iter())
-            .all(|(&sub_arg, &sup_arg)| self.strict_subtype(sub_arg, sup_arg, depth + 1))
+        // Each argument answers against its ALIASED face: upstream
+        // `isSubtypeOf` never sees a `TypeAliasElement` — a written
+        // `C<void___int>` vs `C<void_>` asks `void Function([int]) <:
+        // void Function()`, invisible under the typedef leaf. The fold
+        // instantiates the alias to its declaration's argument frame.
+        sub_list.iter().zip(sup_list.iter()).all(|(&sub_arg, &sup_arg)| {
+            self.strict_subtype(
+                self.fold_alias_ty(sub_arg),
+                self.fold_alias_ty(sup_arg),
+                depth + 1,
+            )
+        })
     }
 
     /// The source span of the token group `open` opened — `open` through its
@@ -6901,11 +6911,19 @@ impl<'a> Engine<'a> {
             )
         };
         if from_params.is_empty()
-            || from_params.len() != to_params.len()
             || from_params.iter().any(|(name, _)| *name == StringId::NONE)
             || to_params.iter().any(|(name, _)| *name == StringId::NONE)
         {
             return None;
+        }
+        // `relateTypeParameters` refuses a parameter-count mismatch
+        // (upstream type_system.dart:1585-1587) — a generic source never
+        // subtypes a non-generic target (`m15 is F15<T>` over a tear-off
+        // `List<T> Function(int, [List<int>]) Function()` answers false:
+        // the `is` expression's operand stays un-instantiated, so the
+        // arity ask short-circuits before the return/positional legs).
+        if from_params.len() != to_params.len() {
+            return Some(false);
         }
         let unify: FxHashMap<StringId, Ty> = from_params
             .iter()
@@ -7374,6 +7392,11 @@ impl<'a> Engine<'a> {
         if !self.is_never_ty(operand)
             || !self.in_initializer
             || self.frames.len() != self.init_frame_depth
+            // A cast inside a `?:` arm reports through the flow layer's
+            // `cast_tail_row` instead (the official `flowEnd(arm)` covers
+            // it): the arm row runs `[type.offset, arm.end)` — this face
+            // would duplicate the head.
+            || self.cond_expr_depth > 0
         {
             return;
         }
