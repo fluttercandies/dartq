@@ -14626,6 +14626,12 @@ impl<'a> Engine<'a> {
         // must not reach them.
         let row_name = row.name;
         let row_qualified = row.qualified;
+        // The generic-instantiation face needs the row's own value-read
+        // intent and the whole row for [`Self::tear_off_sig`] below the
+        // `&mut` arity/bounds emits — capture both before the match opens
+        // the immutable borrow.
+        let row_value_read = row.intent == Intent::Read;
+        let row_for_sig = row.clone();
         match &row.shape {
             RowShape::Bare(BareInfo::Container { name, .. }) => {
                 let class_name = *name;
@@ -14679,6 +14685,68 @@ impl<'a> Engine<'a> {
                         let window: Vec<(StringId, Option<Ty>)> = window.iter().copied().collect();
                         self.check_call_type_arg_bounds(&window, args);
                     }
+                    // The explicit generic instantiation (`var f = id<int>`):
+                    // a bare top-level-function read carrying written type
+                    // arguments IS the instantiated tear-off — the oracle's
+                    // `TypeInstantiation.staticType` resolves `id<int>` to
+                    // `int Function(int)`, never the generic `T Function(T)`
+                    // face `operand_tear_off_ty` spells. The send path reads
+                    // the type arguments off `call_args_for` (the `id<int>(`
+                    // call), so this arm only fires on the VALUE read —
+                    // `tear_off_sig` gates `Intent::Read`, which the call's
+                    // `Invoke` callee never meets. Substituting the written
+                    // arguments through the declared signature interns the
+                    // instantiated face onto the row, where
+                    // `initializer_static_ty`/`operand_static_ty` re-read it
+                    // and the enclosing `var f`'s call checks `f("s")`
+                    // against `int` — the missing `argument_type_not_
+                    // assignable` family.
+                    if !row_qualified
+                        && let Some(args) = &latched_args
+                        && args.tys.len() == usize::from(declared)
+                        && row_value_read
+                        && let Some(sig) = self.tear_off_sig(&row_for_sig)
+                    {
+                        let params: Vec<StringId> = self
+                            .top_level_decl(row_name)
+                            .map(|d| d.type_param_names.to_vec())
+                            .unwrap_or_default();
+                        if params.len() == args.tys.len() {
+                            let map: Vec<(StringId, Ty)> = params
+                                .iter()
+                                .copied()
+                                .zip(args.tys.iter().copied())
+                                .collect();
+                            let positional: Vec<Ty> = sig
+                                .positional
+                                .iter()
+                                .map(|ty| {
+                                    self.subst_params(*ty, &map).unwrap_or(*ty)
+                                })
+                                .collect();
+                            let named: Vec<(StringId, Ty)> = sig
+                                .named
+                                .iter()
+                                .map(|(n, ty, _)| {
+                                    (*n, self.subst_params(*ty, &map).unwrap_or(*ty))
+                                })
+                                .collect();
+                            let return_ty =
+                                self.subst_params(sig.return_ty, &map).unwrap_or(sig.return_ty);
+                            let instantiated =
+                                self.boundary.args.borrow_mut().function_generic_required(
+                                    &[],
+                                    sig.required_positional,
+                                    return_ty,
+                                    &positional,
+                                    &named,
+                                    false,
+                                );
+                            if let Some(r) = self.rows.get_mut(row_index) {
+                                r.ty = instantiated;
+                            }
+                        }
+                    }
                 } else if let Some((declared, kind)) = self
                     .tear_off_element_arity(row_name)
                 {
@@ -14720,6 +14788,10 @@ impl<'a> Engine<'a> {
                 }
             }
             RowShape::Member { recv } => {
+                // `recv` borrows the row through `self.rows`; the member
+                // instantiation below needs `&mut` emits after it — lift
+                // the receiver to an owned copy (the enum is `Copy`).
+                let recv_ty = *recv;
                 // A property-access tear-off (`C.sm<int, String>;`): the
                 // oracle's `InvocationTargetFunctionTypedExpression` reports
                 // `_function` leading with the function type — rendered from
@@ -14780,6 +14852,80 @@ impl<'a> Engine<'a> {
                                 })
                                 .collect();
                             self.check_call_type_arg_bounds(&params, args);
+                        }
+                        // The explicit generic instantiation (`var x =
+                        // o.m<int>` / `var y = super.m<int>`): a member-read
+                        // tear-off carrying written type arguments IS the
+                        // instantiated signature — the oracle's
+                        // `TypeInstantiation.staticType` resolves `m<int>`
+                        // to `int Function(int)`, never the generic
+                        // `T Function<T>(T)` face `member_tear_off_ty`
+                        // keeps. Substitute the written arguments through
+                        // the receiver-instantiated formals and the declared
+                        // return, and intern the instantiated face onto the
+                        // row — the enclosing `var x`'s call then checks
+                        // `x("s")` against `int` (the missing
+                        // `argument_type_not_assignable` family). The
+                        // receiver-typed face only fires on the VALUE read
+                        // (`Intent::Read`); the `o.m<int>(` send reads its
+                        // type arguments off `call_args_for`, and the
+                        // `Invoke` callee never reaches this arm.
+                        if row_value_read
+                            && entry.type_params == count
+                            && let Some(args) = &latched_args
+                        {
+                            // The `Projected` borrows `self`; the formals
+                            // walk, the substitution, and the row write all
+                            // need `&mut` faces — lift the entry's facts to
+                            // owned copies first.
+                            let entry_return_ty = entry.return_ty;
+                            let entry_param_names: Vec<StringId> =
+                                entry.type_param_names.to_vec();
+                            let map: Vec<(StringId, Ty)> = entry_param_names
+                                .iter()
+                                .copied()
+                                .zip(args.tys.iter().copied())
+                                .collect();
+                            let formals = self
+                                .member_formals_full(&recv_ty, row_name)
+                                .map(|f| f.into_owned());
+                            let return_ty = self
+                                .subst_params(entry_return_ty, &map)
+                                .unwrap_or(entry_return_ty);
+                            if let Some(formals) = formals {
+                                let positional: Vec<Ty> = formals
+                                    .positional
+                                    .iter()
+                                    .map(|f| self.subst_params(f.ty, &map).unwrap_or(f.ty))
+                                    .collect();
+                                let named: Vec<(StringId, Ty)> = formals
+                                    .named
+                                    .iter()
+                                    .map(|f| {
+                                        (f.name, self.subst_params(f.ty, &map).unwrap_or(f.ty))
+                                    })
+                                    .collect();
+                                let required = formals
+                                    .positional
+                                    .iter()
+                                    .filter(|f| f.required)
+                                    .count();
+                                let instantiated = self
+                                    .boundary
+                                    .args
+                                    .borrow_mut()
+                                    .function_generic_required(
+                                        &[],
+                                        u16::try_from(required).unwrap_or(u16::MAX),
+                                        return_ty,
+                                        &positional,
+                                        &named,
+                                        false,
+                                    );
+                                if let Some(r) = self.rows.get_mut(row_index) {
+                                    r.ty = instantiated;
+                                }
+                            }
                         }
                     }
                     // Non-method finds (getter/field tear-offs) are the
