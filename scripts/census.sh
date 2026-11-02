@@ -277,13 +277,16 @@ summarize() {
             }
         }
         END {
-            # actual = (expd − missing) ∪ extra; union = expd ∪ extra;
-            # inter = actual ∩ union.
+            # actual = (expd − missing) ∪ extra; union = expd ∪ extra.
+            # inter = actual ∩ expd: the set Jaccard of the two sides. It
+            # must NOT be actual ∩ union — actual is a subset of union by
+            # construction, so that form counts every fabricated triple as
+            # an intersection and rewards over-reporting.
             for (k in expd) if (!(k in missing)) actual[k] = 1
             for (k in extra) actual[k] = 1
             for (k in expd) union[k] = 1
             for (k in extra) union[k] = 1
-            for (k in actual) if (k in union) {
+            for (k in actual) if (k in expd) {
                 s = k; sub(SUBSEP ".*", "", s); inter[s]++
             }
             for (k in union) { s = k; sub(SUBSEP ".*", "", s); uni[s]++ }
