@@ -212,3 +212,32 @@ fn t3598_direct_assignment_reports() {
         misses[0]
     );
 }
+
+/// TEMP bisect probes (removed before finish).
+#[test]
+fn t3598_bisect_direct() {
+    for (name, src, import) in [
+        ("plain_fn", "int Function(int) top() => (int x) => x;\nmain() { String s = top(); }\n", false),
+        ("alias_fn", "typedef G<T> = T Function(T);\nG<int> idc(int x) => (int y) => y;\nmain() { String s = idc(1); }\n", false),
+        ("generic_plain_ret", "int counter<T>(T x) => 1;\nmain() { A<int>? q; String s = counter(q); }\n", true),
+        ("generic_fn_ret", "main() { A<int>? q; String s = toF(q); }\n", true),
+    ] {
+        let body = if import {
+            format!("class num {{}} class int extends num {{}} class String {{}}\nclass A<X extends num> {{}}\n{src}")
+        } else {
+            format!("class String {{}}\n{src}")
+        };
+        let report = if import {
+            report_ops_with(&body, &[RigImport { uri: "package:x/lang_feature_check.dart", prefix: None, source: LANG_FEATURE_CHECK }], None)
+        } else {
+            report_ops_with(&body, &[], None)
+        };
+        let misses: Vec<String> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "invalid_assignment")
+            .map(|d| d.message.to_string())
+            .collect();
+        println!("BISECT {name}: {:?}", rows(&report));
+    }
+}
