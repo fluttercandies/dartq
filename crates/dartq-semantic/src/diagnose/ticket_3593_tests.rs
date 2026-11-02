@@ -150,12 +150,64 @@ void testCovariantSuperbound<N extends Never>() {
     );
 }
 
-/// Probe: the dynamic-receiver family (`function_bounds_test`, 5 census
-/// extras): `(g as dynamic)<double, int>(…)` is a dynamic invocation —
-/// the oracle resolves no element, so `_checkInvocationTypeArguments`
-/// never runs over it.
+/// The composite-receiver family (`number_operator_typing_test`, 55
+/// census extras): a parenthesized arithmetic composite over a `dynamic`
+/// operand reads an operator result the oracle refines
+/// (`refineBinaryExpressionType`: `int - dynamic` is the declared `num`),
+/// where the engine's face followed the operand. The face now abstains
+/// when the operand row is still on the stack; a composite over concrete
+/// operands (`(i - 1)`, result `int`) keeps its genuine row.
+///
+/// Reach note: the `int + Never` shape of the same family is NOT covered
+/// — the binary fold collapses its operands into one `Value` result row
+/// (refined to `double` through a subtype test where upstream asks
+/// identity), so no operand face survives to the bounds site; that fix
+/// belongs to the fold's refinement.
+///
+/// Oracle evidence (2026-11-02, fixture /tmp/3593fx/fx5/lib/test.dart):
+/// exactly one row, line 16 — `'Exactly<num>' doesn't conform to the bound
+/// 'Exactly<int>' of the type parameter 'R'.`; the `dyn1`/`never` operand
+/// lines are silent.
 #[test]
-fn probe_dynamic_receiver_explicit_type_args() {
+fn composite_receiver_dynamic_operand_abstains() {
+    let source = format!(
+        "{EXTENSION_SCAFFOLD}\
+final dynamic dyn1 = 1;
+void main() {{
+  int i = 1;
+  (i - dyn1).expectStaticType<Exactly<num>>();
+  (i - 1).expectStaticType<Exactly<num>>();
+}}
+"
+    );
+    let report = report_ops(&source);
+    let bounds_rows: Vec<String> = rows(&report)
+        .into_iter()
+        .filter(|row| row.contains("type_argument_not_matching_bounds"))
+        .collect();
+    // Count discriminates the abstain (2 rows if it fails); the bound text
+    // discriminates the anchor — the fabricated row would read the operand
+    // face `dynamic` in the bound, only the concrete composite reads `int`.
+    assert_eq!(bounds_rows.len(), 1, "rows: {bounds_rows:#?}");
+    assert!(
+        bounds_rows[0].contains("'Exactly<num>' doesn't conform to the bound 'Exactly<int>'"),
+        "the concrete-operand control drifted: {}",
+        bounds_rows[0]
+    );
+}
+
+/// The dynamic-receiver family (`function_bounds_test`, 5 census
+/// extras): `(g as dynamic)<double, int>(...)` is a dynamic invocation —
+/// the oracle resolves no element, so `_checkInvocationTypeArguments`
+/// never runs over it. The engine's nameless-literal arm borrowed the
+/// LAST closed type-variables window (`g`'s own `<T extends U, U extends
+/// num>`) and judged the written arguments against it. The DYNAMIC
+/// callee face now abstains; the resolved `f<String>('x')` control keeps
+/// its genuine row. Oracle evidence (2026-11-02, fixture
+/// /tmp/3593fx/fx4/lib/test.dart): exactly one row, line 6 —
+/// `'String' doesn't conform to the bound 'num' of the type parameter 'T'.`
+#[test]
+fn dynamic_callee_type_args_abstain_resolved_callee_reports() {
     let source = "\
 void main() {
   f<T extends num>(T x) => x;
@@ -166,9 +218,16 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    for row in rows(&report) {
-        println!("{row}");
-    }
+    let bounds_rows: Vec<String> = rows(&report)
+        .into_iter()
+        .filter(|row| row.contains("type_argument_not_matching_bounds"))
+        .collect();
+    assert_eq!(bounds_rows.len(), 1, "rows: {bounds_rows:#?}");
+    assert!(
+        bounds_rows[0].contains("'String' doesn't conform to the bound 'num'"),
+        "the resolved control drifted: {}",
+        bounds_rows[0]
+    );
 }
 /// The genuine-violation control of the same family: concrete arguments
 /// that truly miss the cyclic bound still report, with the oracle's own

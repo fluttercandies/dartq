@@ -192,6 +192,47 @@ fn continues_primary_backward(kind: dartq_scanner::TokenKind) -> bool {
     )
 }
 
+/// Whether a token is an arithmetic, bitwise, increment or assignment
+/// operator (#3593's composite-receiver arm): the binary expressions
+/// upstream's `refineBinaryExpressionType` refines over a `num` family
+/// receiver, plus the assignment forms whose expression type follows the
+/// write. Comparisons stay out — they type `bool` through the latched
+/// `bool_decided` span, a grounded face.
+fn is_arithmetic_or_assignment(kind: dartq_scanner::TokenKind) -> bool {
+    use dartq_scanner::TokenKind as K;
+    matches!(
+        kind,
+        K::Plus
+            | K::Minus
+            | K::Star
+            | K::Slash
+            | K::Percent
+            | K::TildeSlash
+            | K::PlusPlus
+            | K::MinusMinus
+            | K::Tilde
+            | K::Ampersand
+            | K::Bar
+            | K::Caret
+            | K::LtLt
+            | K::GtGt
+            | K::GtGtGt
+            | K::Eq
+            | K::PlusEq
+            | K::MinusEq
+            | K::StarEq
+            | K::SlashEq
+            | K::PercentEq
+            | K::TildeSlashEq
+            | K::AmpersandEq
+            | K::BarEq
+            | K::CaretEq
+            | K::LtLtEq
+            | K::GtGtEq
+            | K::GtGtGtEq
+    )
+}
+
 /// Which associated parameter one parked `super.name` sentinel reads: the
 /// forward's own index among the constructor's super formals, or the named
 /// entry's spelling.
@@ -7171,20 +7212,21 @@ impl<'a> Engine<'a> {
         {
             return;
         }
-        // #3593 — an if-null receiver whose join never grounded: the
-        // `??=` form stages no join at all (`begin_if_null` arms on the
-        // plain `??` only) and a `??` whose LUB the join pass cannot
-        // spell (`int ?? double`, LUB `num`) stages nothing either, so
-        // the paren close freezes the RHS operand's push-time face as
-        // the receiver — a face the oracle's own typing (the callable
-        // coercion `T2 -> T2'` then `UP(NonNull(T1), T2')`) never
-        // produces. The 20261102-080528 census isolated 600+ fabricated
-        // rows of exactly this shape (the
-        // `(local2 ??= callableClass)..expectStaticType<…>()`
-        // receivers checking `Exactly<CallableClass<C2<int>>>` where
-        // the oracle's receiver is the coerced join). The bounds face
-        // abstains over such an extent — the under-report direction.
-        if self.receiver_if_null_ungrounded(callee) {
+        // #3593 — a receiver face the engine never grounded abstains
+        // (the under-report direction): an if-null receiver whose join
+        // never staged (the `??=` form stages none — `begin_if_null` arms
+        // on the plain `??` only — and a `??` whose LUB the join pass
+        // cannot spell, `int ?? double`, stages nothing either), so the
+        // paren close froze the RHS operand's push-time face where the
+        // oracle types the coerced join `UP(NonNull(T1), T2')`; or a
+        // parenthesized arithmetic composite over a `dynamic`/`Never`
+        // operand, where the oracle refines the operator result and the
+        // engine's face follows the operand. The 20261102-080528 census
+        // isolated 600+ fabricated rows of the first shape (the
+        // `(local2 ??= callableClass)..expectStaticType<…>()` receivers
+        // checking `Exactly<CallableClass<C2<int>>>`) and the
+        // `number_operator_typing` family of the second.
+        if self.receiver_face_ungrounded(callee) {
             return;
         }
         if let Some(params) = self.extension_member_bounds(&recv, member) {
@@ -7192,18 +7234,29 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Whether the member send's receiver expression is an if-null
-    /// expression (`??`/`??=`) whose staged join is absent (#3593): the
-    /// frozen receiver face is then the RHS operand's push-time type
-    /// (the paren close's last-row fallback — the receiver row itself
-    /// for a cascade target), never the oracle's
-    /// `LUB(NonNull(T1), T2')` over the coerced right side. Only a
-    /// TOP-LEVEL operator abstains: an if-null nested inside an
-    /// argument (`f(a ?? b)..m()`) leaves the receiver face the send's
-    /// own return, and a grounded join (`(s ?? '')` — the
-    /// [`Self::if_null_results`] entry keyed inside the extent) decides
-    /// as before.
-    fn receiver_if_null_ungrounded(&self, callee: usize) -> bool {
+    /// Whether the member send's receiver expression carries a face the
+    /// engine never grounded (#3593) — the extension-member bounds face
+    /// abstains over it (the under-report direction). Two arms over the
+    /// receiver's token extent (a backward walk from the member's
+    /// separator over the maximal balanced postfix expression, its own
+    /// wrapping parens stripped):
+    ///
+    /// * **if-null** — a top-level `??`/`??=` whose staged join is absent:
+    ///   the frozen receiver face is then the RHS operand's push-time
+    ///   type (the paren close's last-row fallback — the receiver row
+    ///   itself for a cascade target), never the oracle's
+    ///   `LUB(NonNull(T1), T2')` over the coerced right side. A grounded
+    ///   join (`(s ?? '')` — the [`Self::if_null_results`] entry keyed
+    ///   inside the extent) decides as before;
+    /// * **composite** — a top-level arithmetic/assignment operator with
+    ///   a `dynamic`/`Never` operand row: the oracle refines the operator
+    ///   result (`refineBinaryExpressionType`) where the engine's face
+    ///   follows the operand.
+    ///
+    /// Only TOP-LEVEL operators count: an if-null or arithmetic nested
+    /// inside an argument (`f(a ?? b)..m()`) leaves the receiver face the
+    /// send's own return.
+    fn receiver_face_ungrounded(&self, callee: usize) -> bool {
         use dartq_scanner::TokenKind as K;
         let Some(member) = self.rows.get(callee) else {
             return false;
@@ -7270,6 +7323,7 @@ impl<'a> Engine<'a> {
             hi -= 1;
         }
         let mut depth = 0usize;
+        let mut composite = false;
         for i in lo..=hi {
             match tokens[i].kind {
                 K::OpenParen | K::OpenSquare | K::OpenCurly => depth += 1,
@@ -7281,8 +7335,29 @@ impl<'a> Engine<'a> {
                         .keys()
                         .any(|rhs| start <= *rhs && *rhs <= end);
                 }
+                kind if depth == 0 && is_arithmetic_or_assignment(kind) => composite = true,
                 _ => {}
             }
+        }
+        // The composite arm (#3593, the `number_operator_typing` family):
+        // a parenthesized arithmetic/assignment composite whose operand
+        // row's face is `dynamic` or `Never` reads an operator result the
+        // oracle REFINES (`refineBinaryExpressionType`: `int - dynamic`
+        // is the declared `num`) where the engine's composite face
+        // followed the operand. A composite over concrete operand faces
+        // (`(i - 1)`, `(i--)`) keeps its grounded result and decides as
+        // before. Reach: the operand rows must still be on the stack — a
+        // binary fold that already collapsed them into one `Value` result
+        // row (the `int + Never` shape, whose fold refines to `double`
+        // through a subtype test where upstream asks identity) hides the
+        // operand here; that face belongs to the fold's refinement.
+        if composite {
+            let (start, end) = (tokens[lo].utf16_offset, tokens[hi].utf16_offset);
+            return self.rows.iter().any(|row| {
+                start <= row.range.offset
+                    && row.range.offset <= end
+                    && (matches!(row.ty, Ty::Dynamic) || self.is_never_ty(row.ty))
+            });
         }
         false
     }
@@ -7721,6 +7796,20 @@ impl<'a> Engine<'a> {
         let Some(row) = self.rows.get(callee) else {
             return;
         };
+        // #3593 — a DYNAMIC callee face is a dynamic invocation
+        // (`(g as dynamic)<double, int>(…)`): upstream's
+        // `_checkInvocationTypeArguments` reads the type parameters of
+        // the resolved `staticInvokeType`, and `dynamic` declares none, so
+        // no bound is ever checked there. The nameless-literal arm below
+        // would otherwise borrow the LAST closed type-variables window
+        // (`bounds.pending` — a neighbouring declaration's `<T extends U,
+        // U extends num>`) and judge the written arguments against a
+        // window the callee never owned: the `function_bounds_test`
+        // family's 5 fabricated `'double' doesn't conform to the bound
+        // 'int'` rows.
+        if matches!(row.ty, Ty::Dynamic) {
+            return;
+        }
         if row.qualified {
             return;
         }
