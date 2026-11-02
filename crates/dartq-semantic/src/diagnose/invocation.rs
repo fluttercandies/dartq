@@ -167,6 +167,31 @@ fn recv_head_ty(recv: &Receiver) -> Ty {
     }
 }
 
+/// Whether a token can carry a postfix/primary expression backward
+/// (#3593's receiver-extent walk): identifiers, keywords and literals
+/// spell operands, the dot/bang/index separators continue a chain.
+/// Everything else (a statement/argument boundary, an operator, an
+/// assignment) closes the walk — the receiver expression never spans
+/// past one at bracket depth 0.
+fn continues_primary_backward(kind: dartq_scanner::TokenKind) -> bool {
+    use dartq_scanner::TokenKind as K;
+    matches!(
+        kind,
+        K::Identifier
+            | K::Keyword(_)
+            | K::Int
+            | K::Double
+            | K::Hexadecimal
+            | K::String
+            | K::Period
+            | K::QuestionPeriod
+            | K::Bang
+            | K::Index
+            | K::IndexEq
+            | K::Question
+    )
+}
+
 /// Which associated parameter one parked `super.name` sentinel reads: the
 /// forward's own index among the constructor's super formals, or the named
 /// entry's spelling.
@@ -7146,9 +7171,120 @@ impl<'a> Engine<'a> {
         {
             return;
         }
+        // #3593 — an if-null receiver whose join never grounded: the
+        // `??=` form stages no join at all (`begin_if_null` arms on the
+        // plain `??` only) and a `??` whose LUB the join pass cannot
+        // spell (`int ?? double`, LUB `num`) stages nothing either, so
+        // the paren close freezes the RHS operand's push-time face as
+        // the receiver — a face the oracle's own typing (the callable
+        // coercion `T2 -> T2'` then `UP(NonNull(T1), T2')`) never
+        // produces. The 20261102-080528 census isolated 600+ fabricated
+        // rows of exactly this shape (the
+        // `(local2 ??= callableClass)..expectStaticType<…>()`
+        // receivers checking `Exactly<CallableClass<C2<int>>>` where
+        // the oracle's receiver is the coerced join). The bounds face
+        // abstains over such an extent — the under-report direction.
+        if self.receiver_if_null_ungrounded(callee) {
+            return;
+        }
         if let Some(params) = self.extension_member_bounds(&recv, member) {
             self.check_call_type_arg_bounds(&params, &args);
         }
+    }
+
+    /// Whether the member send's receiver expression is an if-null
+    /// expression (`??`/`??=`) whose staged join is absent (#3593): the
+    /// frozen receiver face is then the RHS operand's push-time type
+    /// (the paren close's last-row fallback — the receiver row itself
+    /// for a cascade target), never the oracle's
+    /// `LUB(NonNull(T1), T2')` over the coerced right side. Only a
+    /// TOP-LEVEL operator abstains: an if-null nested inside an
+    /// argument (`f(a ?? b)..m()`) leaves the receiver face the send's
+    /// own return, and a grounded join (`(s ?? '')` — the
+    /// [`Self::if_null_results`] entry keyed inside the extent) decides
+    /// as before.
+    fn receiver_if_null_ungrounded(&self, callee: usize) -> bool {
+        use dartq_scanner::TokenKind as K;
+        let Some(member) = self.rows.get(callee) else {
+            return false;
+        };
+        let tokens = self.tokens.as_slice();
+        // The receiver expression's extent: a backward walk from the
+        // member's separator (`.`/`..`) over the maximal balanced
+        // postfix expression — closers deepen, the depth-0 opener that
+        // closes the walk starts it, and any token that cannot continue
+        // a primary backward (a statement/argument/operator boundary)
+        // ends it just past itself.
+        let after = tokens.partition_point(|t| t.utf16_offset < member.range.offset);
+        let mut sep = after;
+        while sep > 0
+            && matches!(
+                tokens[sep - 1].kind,
+                K::Period
+                    | K::PeriodPeriod
+                    | K::QuestionPeriodPeriod
+                    | K::PeriodPeriodPeriod
+                    | K::PeriodPeriodPeriodQuestion
+            )
+        {
+            sep -= 1;
+        }
+        if sep == 0 {
+            return false;
+        }
+        let last = sep - 1;
+        let mut depth = 0usize;
+        let mut first = last;
+        let mut i = last;
+        loop {
+            match tokens[i].kind {
+                K::CloseParen | K::CloseSquare | K::CloseCurly => depth += 1,
+                K::OpenParen | K::OpenSquare | K::OpenCurly if depth == 0 => {
+                    first = i;
+                    break;
+                }
+                K::OpenParen | K::OpenSquare | K::OpenCurly => depth -= 1,
+                _ if depth == 0 && !continues_primary_backward(tokens[i].kind) => {
+                    first = i + 1;
+                    break;
+                }
+                _ => {}
+            }
+            if i == 0 {
+                return false;
+            }
+            i -= 1;
+        }
+        // Strip the extent's own wrapping groups (the parenthesized
+        // receiver `(a ??= b)`, double-wrapped `((a ?? b))`): the pair
+        // IS the expression, not a nesting level.
+        let (mut lo, mut hi) = (first, last);
+        while hi > lo
+            && matches!(
+                tokens[lo].kind,
+                K::OpenParen | K::OpenSquare | K::OpenCurly
+            )
+            && self.tokens.matching_end(lo) == Some(hi)
+        {
+            lo += 1;
+            hi -= 1;
+        }
+        let mut depth = 0usize;
+        for i in lo..=hi {
+            match tokens[i].kind {
+                K::OpenParen | K::OpenSquare | K::OpenCurly => depth += 1,
+                K::CloseParen | K::CloseSquare | K::CloseCurly => depth = depth.saturating_sub(1),
+                K::QuestionQuestion | K::QuestionQuestionEq if depth == 0 => {
+                    let (start, end) = (tokens[lo].utf16_offset, tokens[hi].utf16_offset);
+                    return !self
+                        .if_null_results
+                        .keys()
+                        .any(|rhs| start <= *rhs && *rhs <= end);
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// The extension-member send's bounds table (#3495): a member the

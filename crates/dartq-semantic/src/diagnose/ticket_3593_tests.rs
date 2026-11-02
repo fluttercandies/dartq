@@ -150,6 +150,26 @@ void testCovariantSuperbound<N extends Never>() {
     );
 }
 
+/// Probe: the dynamic-receiver family (`function_bounds_test`, 5 census
+/// extras): `(g as dynamic)<double, int>(…)` is a dynamic invocation —
+/// the oracle resolves no element, so `_checkInvocationTypeArguments`
+/// never runs over it.
+#[test]
+fn probe_dynamic_receiver_explicit_type_args() {
+    let source = "\
+void main() {
+  f<T extends num>(T x) => x;
+  g<T extends U, U extends num>(T x, U y) => x;
+  (f as dynamic)<Object>(42);
+  (g as dynamic)<double, int>(42.0, 100);
+  f<String>('x');
+}
+";
+    let report = report_ops(source);
+    for row in rows(&report) {
+        println!("{row}");
+    }
+}
 /// The genuine-violation control of the same family: concrete arguments
 /// that truly miss the cyclic bound still report, with the oracle's own
 /// row text. Oracle evidence (2026-11-02, fixture

@@ -2327,6 +2327,26 @@ impl<'a> Bounds<'a> {
                         && scope.contains_key(&arg.head)
                         && self.index.bounded_params.contains(&arg.head)
                 })
+                // #3593 — the NESTED face of the same lazy-scope gap: a
+                // bounded in-scope parameter mentioned BELOW an
+                // argument's root (`A<N>` for `N extends Never` against
+                // `X extends A<X>`) leaves the snapshot's lazy id
+                // boundless, so the leaf `N <: A<N>` — decided by the
+                // parameter's own bound upstream (subtype.dart:490-500)
+                // — answers a fabricated mismatch (`A<N> <\: A<A<N>>`).
+                // The bare-argument arm above keeps #2936's nullable
+                // contract; the nested arm suppresses any mention (the
+                // leaf sits below the root, where the argument's own
+                // nullability decides nothing).
+                || (matches!(kind, ScopeKind::Lazy)
+                    && args.iter().any(|arg| {
+                        arg.args.iter().any(|nested| {
+                            tree_any_head(nested, &|leaf: StringId| {
+                                scope.contains_key(&leaf)
+                                    && self.index.bounded_params.contains(&leaf)
+                            })
+                        })
+                    }))
             {
                 return Vec::new();
             }
