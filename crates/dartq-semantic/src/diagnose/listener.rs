@@ -2364,6 +2364,12 @@ impl ParserListener for DiagnoseListener<'_> {
             .begin_variables_declaration(token, late_kw, var_final_or_const);
 
         let engine = &mut self.engine;
+        // A for-element's loop-variable group opens inside the enclosing
+        // declaration's initializer; park the outer group's declared type
+        // so its close hands it back (the outer initializer check needs its
+        // own target — `List<int> v = <num>[for (int i = 0; …) i]`).
+        self.decl_group_stack
+            .push((engine.pending_decl_ty, engine.pending_decl_ty_unresolved));
         // The group's declared type arms here (one `parse_type` per group,
         // `handle_no_type` disarmed it for untyped groups); every name in
         // the group binds it.
@@ -2405,8 +2411,15 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_variables_declaration(count, end);
 
         let engine = &mut self.engine;
-        engine.pending_decl_ty = None;
-        engine.pending_decl_ty_unresolved = false;
+        // Hand the enclosing group's declared type back when this one was
+        // nested inside its initializer (a for-element's loop variable);
+        // the outermost group closes to the idle `None` pair.
+        let (outer_ty, outer_unresolved) = self
+            .decl_group_stack
+            .pop()
+            .unwrap_or((None, false));
+        engine.pending_decl_ty = outer_ty;
+        engine.pending_decl_ty_unresolved = outer_unresolved;
         engine.armed_ty = None;
         engine.armed_ty_unresolved = false;
         // The group closed: a declarator no initializer claimed (a `var a;`
@@ -2435,6 +2448,15 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().begin_variable_initializer(token);
 
         let engine = &mut self.engine;
+        // A collection literal's `for` element opens its loop variable's
+        // initializer inside the enclosing declaration's initializer: park
+        // the outer window so the nested close can hand it back (the outer
+        // declaration's own bind and initializer check read it).
+        self.init_windows.push((
+            engine.init_mark,
+            engine.in_initializer,
+            engine.init_frame_depth,
+        ));
         // #1314 FAM18: the initializer belongs to the most recently latched
         // variable (declaration order).
         if let Some(check) = engine.pending_init_variables.last_mut() {
@@ -2805,6 +2827,16 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.close_const_initializer();
         }
         engine.check_decl_initializer();
+        // Hand the enclosing initializer's window back when this one was a
+        // nested window (a for-element's loop variable): the outer
+        // declaration's bind and check close against its own mark, not the
+        // nested one's (already cleared by `check_decl_initializer`).
+        if let Some((mark, in_initializer, frame_depth)) = self.init_windows.pop() {
+            let engine = &mut self.engine;
+            engine.init_mark = mark;
+            engine.in_initializer = in_initializer;
+            engine.init_frame_depth = frame_depth;
+        }
     }
 
     fn begin_type_variable(&mut self, token: Token) {

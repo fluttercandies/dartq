@@ -760,6 +760,18 @@ pub(crate) struct DiagnoseListener<'a> {
     /// container's close knows — so its row waits there
     /// ([`listener::PatternNodeState`]).
     pub(crate) pattern_rows: Vec<listener::PatternNodeState>,
+    /// The enclosing variable groups' declaration state, innermost last:
+    /// `(pending_decl_ty, pending_decl_ty_unresolved)`. A collection
+    /// literal's `for` element opens a loop-variable group inside the
+    /// enclosing declaration's initializer; its close must hand the outer
+    /// group's declared type back so the outer initializer check still has
+    /// a target (`List<int> v = <num>[for (int i = 0; …) i]`).
+    pub(crate) decl_group_stack: Vec<(Option<Ty>, bool)>,
+    /// The enclosing initializer windows, innermost last:
+    /// `(init_mark, in_initializer, init_frame_depth)` — the same nesting
+    /// hand-back for [`Engine::init_mark`]: the outer initializer's row
+    /// window must survive a for-element's loop-variable initializer.
+    pub(crate) init_windows: Vec<(Option<usize>, bool, usize)>,
     /// The parse-recovery rows (`handle_recoverable_error` /
     /// `handle_experiment_not_enabled`), in arrival order. The production
     /// pipeline serves the identical rows from the l1 collector's facts
@@ -1301,6 +1313,8 @@ pub fn fold_unit_with_ops<'t>(
         pending_exit: None,
         file,
         pattern_rows: Vec::new(),
+        decl_group_stack: Vec::new(),
+        init_windows: Vec::new(),
         parse_diagnostics: Vec::new(),
     };
     // The parse runs inside the argument-aware fold window (#2462): the
@@ -1325,6 +1339,8 @@ pub fn fold_unit_with_ops<'t>(
         pending_exit: _,
         file: _,
         pattern_rows: _,
+        decl_group_stack: _,
+        init_windows: _,
         parse_diagnostics,
     } = listener;
     // The flow layer's facts fold in exactly once, before the engine
