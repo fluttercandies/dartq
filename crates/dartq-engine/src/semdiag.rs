@@ -194,6 +194,31 @@ fn extension_member_key(
         })
 }
 
+/// The declaration key an `unused_element`/`unused_field` row anchored on a
+/// CLASS-family member carries into the library close: the declaring
+/// container's name and the member's lookup spelling (a setter keeps its
+/// `=` suffix — the same key space the `member_refs` edge's
+/// `(target_file, target_container, target_name)` tuple resolves onto).
+/// `MemberEntry.name_range` is the written name token — the same UTF-16
+/// span the per-file pass staged the row on — so the anchor maps back to
+/// exactly one (container, spelling) pair. Named constructors and
+/// extension-type primaries are not `MemberEntry` rows (the former live in
+/// `Container::constructors`, the latter in `primary_formals`), so their
+/// staged rows map to nothing and keep the name-level verdict — the
+/// documented under-report direction.
+fn member_key(
+    file: FileId,
+    index: &dartq_semantic::ElementIndex,
+    range: SourceRange,
+) -> Option<(FileId, StringId, StringId)> {
+    index.get(file)?.containers().find_map(|(container, c)| {
+        c.members
+            .iter()
+            .find(|(_, entry)| entry.name_range == range)
+            .map(|(spelling, _)| (file, container, *spelling))
+    })
+}
+
 /// Releases the staged `unused_import` rows whose import the library's
 /// merged faces credit (#2251). The per-file pass fired each row against
 /// its own unit's use set only; the oracle's `ImportsTracking` is
@@ -1174,11 +1199,43 @@ impl SemanticDiagnoser for Diagnoser {
         // libraries never enter the set (the close folds this library's
         // faces only), so a same-named private elsewhere cannot spare.
         let consumed = usages.close_library_usage(library.graph_library);
-        out.extend(
-            staged
-                .into_iter()
-                .filter_map(|(row, name)| (!consumed.used(name)).then_some(row)),
-        );
+        // The library's resolved member-access edges (#3478): the oracle's
+        // `usedElements.members`/`readMembers` verdicts are ELEMENT sets —
+        // a use of `B._m` credits `B._m` alone, never the same-spelled
+        // `A._m` the merged name pool would also release. The merged
+        // `member_refs` rows are that set at the close's granularity
+        // (`target_file, target_container, target_name` — setter targets
+        // under their `name=` spelling, the `MemberEntry` lookup keys);
+        // the read-shaped subset feeds the `unused_field` gate. Edges mint
+        // only on a RESOLVED access — an unresolved `f._x` read lands in
+        // `consumed.reads` by spelling alone, the same way upstream's
+        // `unresolvedReadMembers` keeps the spelling.
+        let mut member_edges: FxHashSet<(FileId, StringId, StringId)> = FxHashSet::default();
+        let mut member_reads: FxHashSet<(FileId, StringId, StringId)> = FxHashSet::default();
+        for (_, refs) in self.member_refs(&library) {
+            for edge in refs.iter() {
+                member_edges.insert((edge.target_file, edge.target_container, edge.target_name));
+                if matches!(
+                    edge.kind,
+                    dartq_semantic::MemberRefKind::Read
+                        | dartq_semantic::MemberRefKind::ReadWritten
+                ) {
+                    member_reads.insert((
+                        edge.target_file,
+                        edge.target_container,
+                        edge.target_name,
+                    ));
+                }
+            }
+        }
+        out.extend(staged.into_iter().filter_map(|(row, name)| {
+            let released = if let Some(key) = member_key(row.file, library.index, row.range) {
+                member_edges.contains(&key)
+            } else {
+                consumed.used(name)
+            };
+            (!released).then_some(row)
+        }));
         // The extension-member arm (`_isUsedMember`'s element sets,
         // unused_local_elements_verifier.dart:1127-1142): the row releases
         // only when a unit of THIS library resolved an implicit application
@@ -1191,17 +1248,29 @@ impl SemanticDiagnoser for Diagnoser {
                 .into_iter()
                 .filter_map(|(row, key)| (!consumed.extension_member_used(key)).then_some(row)),
         );
-        // The `unused_field` twin: the official `readMembers` merge is
-        // library-wide, so a read in any member file spares the declaring
-        // file's field. The name-level read pool under-credits the
-        // element-scoped join the per-file pass ran — a same-spelled field
-        // in an unrelated container of the same library reads as used —
-        // the documented under-report direction.
-        out.extend(
-            staged_fields
-                .into_iter()
-                .filter_map(|(row, name)| (!consumed.read(name)).then_some(row)),
-        );
+        // The `unused_field` twin (`_isReadMember`,
+        // unused_local_elements_verifier.dart:880-908): the official
+        // `readMembers` merge is element-level and library-wide — a read
+        // in any member file spares the field it resolved. Extension
+        // members answer through the application pool (a write credits
+        // only the `name=` spelling, so the read gate holds); class-family
+        // fields join the read-edge subset; a spelling no read-edge ever
+        // claimed keeps the name pool — the `unresolvedReadMembers` arm,
+        // where every recorded read of it resolved nothing. Rows mapping
+        // to no member entry keep the name verdict.
+        out.extend(staged_fields.into_iter().filter_map(|(row, name)| {
+            let released =
+                if let Some(key) = extension_member_key(row.file, library.index, row.range) {
+                    consumed.extension_member_used(key)
+                } else if let Some(key) = member_key(row.file, library.index, row.range) {
+                    member_reads.contains(&key)
+                        || (consumed.read(name)
+                            && !member_reads.iter().any(|(_, _, target)| *target == name))
+                } else {
+                    consumed.read(name)
+                };
+            (!released).then_some(row)
+        }));
         release_unused_imports(&library, staged_imports, &doc_refs, &consumed, out);
     }
 
