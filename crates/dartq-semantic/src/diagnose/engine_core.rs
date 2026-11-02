@@ -7612,9 +7612,16 @@ impl<'a> Engine<'a> {
             return sig.return_ty;
         }
         if row.ty != Ty::UNKNOWN {
-            // A function-typed callee (or the bare `Function` interface)
-            // answers the send face ([`Self::invoked_callee_result`]).
-            if let Some(result) = self.invoked_callee_result(row) {
+            // A send-close solve's instantiated callee (`toF(source)`
+            // binding `X := G`): the solve deliberately kept the callee's
+            // own — now instantiated — function face on the row (the
+            // send-close fold skips it), so the unwrap below is the ONE
+            // flatten this face ever gets and its return IS the call's
+            // static type (upstream
+            // `function_expression_invocation_resolver.dart:55-78`).
+            if self.solved_call_params.contains_key(&row.range.offset)
+                && let Some(result) = self.invoked_callee_result(row)
+            {
                 return result;
             }
             // The row keeps the callee's DECLARED type, never the send's
@@ -7630,9 +7637,70 @@ impl<'a> Engine<'a> {
                     return self.callee_return_ty(row);
                 }
             }
+            // A BARE callee's function-typed `ty` is the send's
+            // already-flattened RESULT, never the callee's own face: the
+            // send close folds a non-null function-typed bare callee onto
+            // its return before any verdict reads the row, and the send
+            // result lands on the row the same way — so `int Function(int)
+            // top()` invoked `top()` carries `int Function(int)` here, and
+            // unwrapping it again ([`Self::invoked_callee_result`]) would
+            // answer `int` where the oracle answers the function type
+            // (`method_invocation_resolver.dart` types the node by the
+            // invoked signature's return — one unwrap, never two). A
+            // NULLABLE function type survives that fold only as the
+            // callee's own standing face (`int Function(int)? f` invoked
+            // `f()` — the fold refuses nullable faces so the
+            // unchecked-use verdict owns the value), so it keeps the
+            // unwrap arms below — except when no local binds the name: a
+            // top-level send's nullable result (`int Function(int)?
+            // top()`) is as flattened as its non-null sibling. Member and
+            // prefixed rows are exempt wholesale: their faces arm at the
+            // dot merge, which the deferred pass can run AFTER the send
+            // close, so a function-typed member `ty` may still be the
+            // callee's own face owed exactly one unwrap
+            // (`comparison(a, b)` on `int Function(E, E) comparison`).
+            if !row.qualified && self.bare_invoke_ty_is_result(row) {
+                return row.ty;
+            }
+            // The bare `Function` interface spelling whose declaration
+            // names a result keeps that result: `Function top()` reads
+            // `Function`, never the interface's `dynamic` dispatch face —
+            // the callee spelling (`Function f` invoked `f()`, whose
+            // declaration names no return) keeps the dispatch below.
+            if !row.qualified
+                && let Ty::Named { name, .. } = row.ty
+                && self.strings.resolve(name) == "Function"
+            {
+                let declared = self.callee_return_ty(row);
+                if declared != Ty::UNKNOWN {
+                    return declared;
+                }
+            }
+            // A function-typed callee (or the bare `Function` interface)
+            // answers the send face ([`Self::invoked_callee_result`]).
+            if let Some(result) = self.invoked_callee_result(row) {
+                return result;
+            }
             return self.callable_call_ret(row, row.ty).unwrap_or(row.ty);
         }
         self.callee_return_ty(row)
+    }
+
+    /// Whether a bare Invoke row's function-typed `ty` is the send's
+    /// result rather than the callee's own standing face
+    /// ([`Self::operand_static_ty`]'s gate): a non-null function type
+    /// always is (the send-close fold consumed every non-null bare face
+    /// ahead of any read); a nullable one is unless a local of that name
+    /// still binds the face in scope.
+    fn bare_invoke_ty_is_result(&self, row: &Row) -> bool {
+        match row.ty {
+            Ty::Function { nullable: false, .. } => true,
+            Ty::Function { nullable: true, .. } => !self
+                .frames
+                .iter()
+                .any(|f| f.locals.contains(&row.name)),
+            _ => false,
+        }
     }
 
     /// The untyped row's static type the oracle still answers

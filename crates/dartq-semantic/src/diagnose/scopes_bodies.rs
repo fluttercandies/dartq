@@ -1189,13 +1189,36 @@ impl<'a> Engine<'a> {
     /// The un-merged leading-dot selector gate shared by every shorthand
     /// sweep: `qualified` (the selector fold), `Bare(_)` (no receiver merged),
     /// `ty == Unknown` (never verdicted — the once-only marker), and the
-    /// byte-level `.`-opener probe.
+    /// byte-level `.`-opener probe — or a `...`/`...?` spread head, whose
+    /// `...` byte the opener probe reads as a receiver end.
     fn is_shorthand_head(&self, row: &Row) -> bool {
         row.qualified
             && matches!(row.shape, RowShape::Bare(_))
             && row.ty == Ty::UNKNOWN
             && matches!(row.intent, Intent::Read | Intent::Invoke)
-            && self.dot_shorthand_context(row.range.offset)
+            && (self.dot_shorthand_context(row.range.offset)
+                || self.is_spread_head(row.range.offset))
+    }
+
+    /// Whether the `.` before the selector opens a spread element
+    /// (`... .x` / `...? .x`): the token before the dot is a spread
+    /// operator. The byte-level opener probe rejects that shape (a `.`
+    /// before the dot reads as a receiver end), so the sweep admits it
+    /// through this arm and [`Self::spread_ctx_at`] supplies the context.
+    fn is_spread_head(&self, offset: u32) -> bool {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let name_idx = toks.partition_point(|t| t.utf16_offset < offset);
+        let Some(dot_idx) = name_idx.checked_sub(1) else {
+            return false;
+        };
+        let Some(prev_idx) = dot_idx.checked_sub(1) else {
+            return false;
+        };
+        matches!(
+            toks[prev_idx].kind,
+            TK::PeriodPeriodPeriod | TK::PeriodPeriodPeriodQuestion
+        )
     }
 
     /// The body-end shorthand sweep (#3568): runs at every executable body's
@@ -1332,6 +1355,14 @@ impl<'a> Engine<'a> {
                     self.return_ctx()
                 }
             }
+            // `&&`, `||`, `!` — the language-defined `bool` operand context:
+            // both logical operands and a negation operand resolve their
+            // shorthand against `bool` (`bool_context_error_test`).
+            TK::AmpersandAmpersand | TK::BarBar | TK::Bang => self.bool_ctx(),
+            // `... .x` / `...? .x` — a spread element resolves against the
+            // collection the literal builds: `Iterable` for a list/set,
+            // `Map` for a map (`non_ambiguity_A02_*`).
+            TK::PeriodPeriodPeriod | TK::PeriodPeriodPeriodQuestion => self.spread_ctx_at(dot_idx),
             // `(`, `,` — argument-list or collection/record positions.
             TK::OpenParen | TK::Comma => self.group_ctx_at(row, prev_idx, operand_row_before),
             // `:` — a named-argument label's value (`f(name: .a)`).
@@ -1361,6 +1392,91 @@ impl<'a> Engine<'a> {
             Some(ty) => (Some(ty), self.ty_display(ty)),
             None => (None, "_".to_string()),
         })
+    }
+
+    /// The language-defined `bool` shorthand context: an `if`/`while`/
+    /// `assert` condition, an `&&`/`||` operand and a `!` operand resolve
+    /// their shorthand against `bool` (the 3.13.7 oracle reports
+    /// `The static getter 'x' isn't defined for the context type 'bool'`
+    /// there — `bool_context_error_test`, `grammar_A05`). `bool` carries no
+    /// static members, so every miss reports at the selector and every hit
+    /// (there is none) stays silent — the same shape a real `Ty::Named`
+    /// head takes.
+    fn bool_ctx(&self) -> Option<(Option<Ty>, String)> {
+        Some((
+            Some(Ty::Named {
+                name: self.intern("bool"),
+                nullable: false,
+                args: ArgListId::EMPTY,
+            }),
+            "bool".to_string(),
+        ))
+    }
+
+    /// The spread-element shorthand context (`... .x`, `...? .x`): a spread
+    /// argument resolves against the collection the enclosing literal
+    /// builds — `Iterable` for a list (`[`) or set (`{` with one type
+    /// argument), `Map` for a map literal (`{` with two type arguments).
+    /// The oracle reports the raw head (`'Iterable'`, `'Map'` —
+    /// `non_ambiguity_A02_*`), so a shorthand there is an undefined member
+    /// unless the head carries that static name. `None` when the enclosing
+    /// collection kind is undecidable (an untyped brace literal, a nested
+    /// `>>` the scanner did not split) — the under-report.
+    fn spread_ctx_at(&self, dot_idx: usize) -> Option<(Option<Ty>, String)> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let open_idx = self.enclosing_group_open(dot_idx)?;
+        let head = match toks[open_idx].kind {
+            TK::OpenSquare => "Iterable",
+            TK::OpenCurly => {
+                // The explicit type-argument arity decides set vs map: one
+                // argument is a set, two a map. A nested `>>`/`>>>` the
+                // scanner left unsplit makes the arity unreadable — bail.
+                let closed = open_idx.checked_sub(1)?;
+                if toks[closed].kind != TK::Gt {
+                    return None;
+                }
+                let mut depth = 0i32;
+                let mut lt = None;
+                for i in (0..closed).rev() {
+                    match toks[i].kind {
+                        TK::Gt => depth += 1,
+                        TK::Lt => {
+                            if depth == 0 {
+                                lt = Some(i);
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        TK::GtGt | TK::GtGtGt | TK::GtGtEq | TK::GtGtGtEq => return None,
+                        _ => {}
+                    }
+                }
+                let lt = lt?;
+                let mut commas = 0usize;
+                let mut depth = 0i32;
+                for t in &toks[lt + 1..closed] {
+                    match t.kind {
+                        TK::Lt => depth += 1,
+                        TK::Gt => depth -= 1,
+                        TK::GtGt | TK::GtGtGt | TK::GtGtEq | TK::GtGtGtEq => return None,
+                        TK::Comma if depth == 0 => commas += 1,
+                        _ => {}
+                    }
+                }
+                if commas >= 1 { "Map" } else { "Iterable" }
+            }
+            _ => return None,
+        };
+        let name = self.intern(head);
+        Some((
+            Some(Ty::Named {
+                name,
+                nullable: false,
+                args: ArgListId::EMPTY,
+            }),
+            head.to_string(),
+        ))
     }
 
     /// The scrutinee's matched type for a `case == .a` relational pattern:
@@ -1521,15 +1637,25 @@ impl<'a> Engine<'a> {
             _ => None,
         };
         let open_idx = open_idx?;
-        // `if (`/`while (`/`for (`/`switch (`/`assert (`/`return (` — a
-        // condition or grouped expression arms no shorthand context the
-        // walk can re-derive (upstream's `if` condition does not push a
-        // `bool` shorthand context — a `.a` there reads `'_'`); every one
-        // keeps the under-report rather than fabricate a `bool` verdict.
+        // `if (`/`while (`/`assert (` — the language-defined `bool`
+        // condition context (the 3.13.7 oracle reports `'bool'` for a
+        // shorthand there). Only the group's FIRST element inherits it: a
+        // comma-separated `assert` message is a `String`, not `bool`.
+        // `for (`/`switch (`/`return (` arm no context the walk can
+        // re-derive — every one keeps the under-report rather than
+        // fabricate a verdict.
         let before_open = open_idx.checked_sub(1);
-        if let Some(TK::Keyword(
-            Kw::If | Kw::While | Kw::Assert | Kw::For | Kw::Switch | Kw::Return,
-        )) = before_open.and_then(|i| toks.get(i)).map(|t| t.kind)
+        if let Some(TK::Keyword(Kw::If | Kw::While | Kw::Assert)) =
+            before_open.and_then(|i| toks.get(i)).map(|t| t.kind)
+        {
+            return if prev.kind == TK::OpenParen {
+                self.bool_ctx()
+            } else {
+                None
+            };
+        }
+        if let Some(TK::Keyword(Kw::For | Kw::Switch | Kw::Return)) =
+            before_open.and_then(|i| toks.get(i)).map(|t| t.kind)
         {
             return None;
         }
