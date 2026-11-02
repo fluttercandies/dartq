@@ -7791,16 +7791,6 @@ impl<'a> Engine<'a> {
             return sig.return_ty;
         }
         if row.ty != Ty::UNKNOWN {
-            // A send-close solve's invocation is typed by its declared
-            // return instantiated with the stashed solution — the face the
-            // argument-check walk published onto the row, which a second
-            // unwrap would flatten one level too far (upstream
-            // `function_expression_invocation_resolver.dart:55-78` records
-            // the instantiated return once, never the callee's own
-            // signature).
-            if let Some(result) = self.solved_invoke_result(row) {
-                return result;
-            }
             // The row keeps the callee's DECLARED type, never the send's
             // result — a spelled named type that is a type alias's head
             // (`Predicate<T> p` invoked as `p(x)`) answers nothing about

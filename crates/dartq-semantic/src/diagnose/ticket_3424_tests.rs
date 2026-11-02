@@ -175,10 +175,13 @@ fn adopting_contexts_stay_silent() {
     assert!(rows.is_empty(), "{rows:#?}");
 }
 
-/// Leaves without an exact face refuse the whole question — a spread
-/// element, and user classes whose shared supertype needs the ranked walk
-/// (the oracle's `Set<int>` / `Set<B>`; the under-report is pinned so a
-/// guessed element type never misprints the message).
+/// Leaves without an exact face refuse the whole question — user classes
+/// whose shared supertype needs the ranked walk keep their under-report
+/// (a guessed element type never misprints the message). A spread element
+/// DOES type: the oracle reports `Set<int>` for `{...xs}` over
+/// `List<int>` (probed: dart analyze 3.13.7 `INVALID_ASSIGNMENT`), so
+/// the literal's own `Set<int>` answers the assignability question the
+/// declared `C<int>` fails.
 #[test]
 fn leaves_without_an_exact_face_refuse() {
     let source = format!(
@@ -187,5 +190,9 @@ fn leaves_without_an_exact_face_refuse() {
          C<B> mixed = {{B1(), B2()}};\n}}\n"
     );
     let rows = assignment_rows(&source);
-    assert!(rows.is_empty(), "{rows:#?}");
+    assert_eq!(
+        rows,
+        [row("{...xs}", "Set<int>", "C<int>")],
+        "{rows:#?}"
+    );
 }
