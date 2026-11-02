@@ -565,10 +565,15 @@ pub enum SemanticCode {
     /// whole `.name` shorthand).
     DotShorthandMissingContext,
     /// `The static getter '{0}' isn't defined for the context type '{1}'.`
-    /// — a dot-shorthand member the context type cannot answer (the getter
-    /// and invocation faces share this code —
-    /// `dotShorthandUndefinedGetter` / `dotShorthandUndefinedInvocation`).
+    /// — a dot-shorthand member the context type cannot answer, read
+    /// face (`dotShorthandUndefinedGetter`; the shared registry name is
+    /// `dot_shorthand_undefined_member`).
     DotShorthandUndefinedMember,
+    /// `The static method or constructor '{0}' isn't defined for the
+    /// context type '{1}'.` — the same miss at invocation face
+    /// (`dotShorthandUndefinedInvocation`; one registry code, two message
+    /// shapes — the [`Self::InvalidOverrideSetter`] split).
+    DotShorthandUndefinedMemberInvocation,
     /// `The compile-time constant expression depends on itself.`
     RecursiveCompileTimeConstant,
     /// `Invalid constant value.` — a node in a constructor-initializer
@@ -2462,7 +2467,7 @@ impl SemanticCode {
                 "dot_shorthand_missing_context",
                 "DOT_SHORTHAND_MISSING_CONTEXT",
             ),
-            Self::DotShorthandUndefinedMember => (
+            Self::DotShorthandUndefinedMember | Self::DotShorthandUndefinedMemberInvocation => (
                 "dot_shorthand_undefined_member",
                 "DOT_SHORTHAND_UNDEFINED_MEMBER",
             ),
@@ -3970,6 +3975,9 @@ impl SemanticCode {
             }
             Self::DotShorthandUndefinedMember => format!(
                 "The static getter '{a0}' isn't defined for the context type '{a1}'."
+            ),
+            Self::DotShorthandUndefinedMemberInvocation => format!(
+                "The static method or constructor '{a0}' isn't defined for the context type '{a1}'."
             ),
             Self::RecursiveCompileTimeConstant => {
                 "The compile-time constant expression depends on itself.".to_string()
@@ -5694,6 +5702,7 @@ mod tests {
             SemanticCode::ConstEvalForElement,
             SemanticCode::DotShorthandMissingContext,
             SemanticCode::DotShorthandUndefinedMember,
+            SemanticCode::DotShorthandUndefinedMemberInvocation,
             SemanticCode::RecursiveCompileTimeConstant,
             SemanticCode::InvalidConstant,
             SemanticCode::InvalidOverride,
@@ -6024,6 +6033,7 @@ mod tests {
         SemanticCode::ConstEvalForElement,
         SemanticCode::DotShorthandMissingContext,
         SemanticCode::DotShorthandUndefinedMember,
+        SemanticCode::DotShorthandUndefinedMemberInvocation,
         SemanticCode::RecursiveCompileTimeConstant,
         SemanticCode::InvalidConstant,
         SemanticCode::InvalidOverride,
@@ -6402,6 +6412,18 @@ mod tests {
             SemanticCode::UnnecessaryNanComparisonFalse.message("", ""),
             "A double can't equal 'double.nan', so the condition is always 'false'."
         );
+        // The #3603 dot-shorthand miss pair: one registry code, two
+        // message shapes (upstream analyzer `messages.yaml` :4927/:4981 —
+        // the read face's "static getter", the invocation face's "static
+        // method or constructor").
+        assert_eq!(
+            SemanticCode::DotShorthandUndefinedMember.message("bar", "C"),
+            "The static getter 'bar' isn't defined for the context type 'C'."
+        );
+        assert_eq!(
+            SemanticCode::DotShorthandUndefinedMemberInvocation.message("bar", "C"),
+            "The static method or constructor 'bar' isn't defined for the context type 'C'."
+        );
         assert_eq!(
             SemanticCode::UnnecessaryQuestionMark.message("dynamic", ""),
             "The '?' is unnecessary because 'dynamic' is nullable without it."
@@ -6605,6 +6627,7 @@ mod tests {
             | SemanticCode::ConstEvalTypeBool
             | SemanticCode::DotShorthandMissingContext
             | SemanticCode::DotShorthandUndefinedMember
+            | SemanticCode::DotShorthandUndefinedMemberInvocation
             | SemanticCode::ConstEvalTypeBoolInt
             | SemanticCode::ConstEvalTypeBoolNumString
             | SemanticCode::ConstEvalTypeInt
@@ -7014,6 +7037,7 @@ mod tests {
             SemanticCode::DeadNullAwareExpression,
             SemanticCode::DotShorthandMissingContext,
             SemanticCode::DotShorthandUndefinedMember,
+            SemanticCode::DotShorthandUndefinedMemberInvocation,
             SemanticCode::DuplicateDefinition,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
             SemanticCode::TypeAliasCannotReferenceItself,

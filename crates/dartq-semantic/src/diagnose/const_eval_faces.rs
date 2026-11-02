@@ -1247,9 +1247,13 @@ impl<'a> Engine<'a> {
     /// shorthand's selector span — `memberName` upstream — with the context
     /// type's display as the second slot (`'_'` for a context-free
     /// invocation, `dynamic` for the const root's known-invalid context).
-    /// Emitting twice at one selector is one verdict — the diagnostic set
-    /// dedups on the `(code, range)` pair so a stale-window resweep stays
-    /// idempotent.
+    /// The message shape follows the selector's own spelling — a selector
+    /// carrying an argument list renders the invocation face's "static
+    /// method or constructor" (`dotShorthandUndefinedInvocation`,
+    /// analyzer `messages.yaml` :4981), a read selector the getter face's
+    /// "static getter" (:4927). Emitting twice at one selector is one
+    /// verdict — the diagnostic set dedups on the `(code, range)` pair so
+    /// a stale-window resweep stays idempotent.
     pub(crate) fn emit_shorthand_undefined_member(&mut self, selector: SourceRange, context: &str) {
         if self
             .report
@@ -1260,12 +1264,32 @@ impl<'a> Engine<'a> {
             return;
         }
         let selector_text = self.source_slice(selector).to_string();
-        self.emit(
-            SemanticCode::DotShorthandUndefinedMember,
-            selector,
-            &selector_text,
-            context,
-        );
+        let code = if self.shorthand_selector_invokes(selector) {
+            SemanticCode::DotShorthandUndefinedMemberInvocation
+        } else {
+            SemanticCode::DotShorthandUndefinedMember
+        };
+        self.emit(code, selector, &selector_text, context);
+    }
+
+    /// Whether the selector's written spelling carries an argument list —
+    /// the invocation/read message split of the shared
+    /// `dot_shorthand_undefined_member` code (#3603). The probe walks the
+    /// identifier, one optional balanced type-argument group, then the
+    /// argument list's `(` — the same lexical shape [`Self::shorthand_face`]
+    /// uses to classify the const root's call face. The open byte must sit
+    /// exactly at the probe point (no trivia skip), so a read selector can
+    /// never read as a call.
+    fn shorthand_selector_invokes(&self, selector: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut token = self.byte_of(selector.offset);
+        while let Some(&b) = bytes.get(token)
+            && (b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        {
+            token += 1;
+        }
+        let typed = skip_balanced(bytes, token, b'<');
+        skip_balanced(bytes, typed, b'(') != typed
     }
 
     /// `(whole shorthand span, selector span, is-a-call)` for a leading-dot
