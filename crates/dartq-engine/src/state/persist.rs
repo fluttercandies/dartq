@@ -1094,7 +1094,7 @@ mod tests {
     /// [`Self::populated_elements_shape_is_pinned`] fails — the same
     /// bump-the-version-and-re-pin contract as the main pin.
     const FACTS_SHAPE_ELEMENTS_JSON_PIN: &str = concat!(
-        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"default_value":null}],"named":[]},"annotations":[]}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]],"annotations":[]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false,"head_range":{"offset":58,"length":3}}],"anon_methods":[],"wildcard_duplicates":[],"formal_annotations":[],"ctor_annotations":[],"library_annotations":[]}"#,
+        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[],"required_positional":1}},"required":true,"covariant":false,"default_value":null}],"named":[]},"annotations":[]}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_augment":false,"is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"is_const":false,"covariant":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_augment":false,"is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"is_const":false,"covariant":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]],"annotations":[]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null,"default_separator":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false,"head_range":{"offset":58,"length":3},"name_range":null}],"anon_methods":[],"wildcard_duplicates":[],"formal_annotations":[],"ctor_annotations":[],"library_annotations":[]}"#,
     );
 
     /// The element rows the main probe rides past empty, modeled on the
@@ -1162,6 +1162,9 @@ mod tests {
                                     args: Vec::new(),
                                 }],
                                 named: Vec::new(),
+                                // `String Function(int)` — the single
+                                // positional formal is required.
+                                required_positional: Some(1),
                             },
                             required: true,
                             covariant: false,
@@ -1187,10 +1190,12 @@ mod tests {
                         1,
                         PersistedMemberEntry {
                             kind: PersistedMemberKind::Method,
+                            is_augment: false,
                             is_static: false,
                             is_abstract: false,
                             is_external: false,
                             is_final: false,
+                            is_const: false,
                             covariant: false,
                             type_params: 0,
                             type_param_names: Vec::new(),
@@ -1275,10 +1280,12 @@ mod tests {
                     14,
                     PersistedMemberEntry {
                         kind: PersistedMemberKind::Getter,
+                        is_augment: false,
                         is_static: false,
                         is_abstract: false,
                         is_external: false,
                         is_final: false,
+                        is_const: false,
                         covariant: false,
                         type_params: 0,
                         type_param_names: Vec::new(),
@@ -1382,6 +1389,8 @@ mod tests {
                     named: false,
                     covariant_kw: None,
                     required_kw: None,
+                    // The positional formal carries no `=`/`:` default.
+                    default_separator: None,
                 }],
                 parens: Some((
                     PersistedRange {
@@ -1415,6 +1424,9 @@ mod tests {
                     offset: 58,
                     length: 3,
                 }),
+                // The synthetic target row records no intro-fragment name
+                // span; `None` is the span-less decode default.
+                name_range: None,
             }],
             anon_methods: Vec::new(),
             // The #2914 wildcard-duplicate log and the #2924 annotation

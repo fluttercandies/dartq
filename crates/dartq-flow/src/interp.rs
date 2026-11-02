@@ -14,7 +14,7 @@ use dartq_parser::TokenSpan;
 use dartq_source::{SourceRange, saturate_slot_u32};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::ev::Ev;
+use crate::ev::{BinOp, BlockKind, Ev};
 use crate::facts::FlowFact;
 use crate::model::{Lists, NIL, ReachArena, Reasons, State};
 use crate::ty::{Base, Classification, Ty, TypeOps};
@@ -4635,17 +4635,156 @@ impl Interp<'_> {
                 self.loop_exit(true);
                 Control::Continue
             }
-            _ => {
-                if self.stmt_step(ev, events, i, match_of) {
+            Ev::IsEnd => {
+                // The bottom-tested fold decides BEFORE the operand kind
+                // (official `isExpression_end`,
+                // flow_analysis.dart:5944-5949 — `isBottomType(checkedType)`
+                // precedes `_getExpressionReference`): `e is Never` folds
+                // to `booleanLiteral(isNot)` for ANY operand face —
+                // reference, property, call result, dynamic — so the test
+                // deads the matched arm no matter what the operand's static
+                // type is. The per-kind arms inside `expr_step` only reach
+                // the fold through `is_test_guaranteed_fail`, whose
+                // operand-side refusals (an unknown/dynamic operand, a
+                // property slot) correctly gate the nullability-disjoint
+                // arm but must not gate this one. The fold carries the
+                // official's `booleanLiteral` face too: `proven_bool` marks
+                // the condition provably constant for the empty-branch
+                // marker ([`Interp::if_branch_folded`]), and the deadness
+                // rides the branch pair exactly like the in-place arms.
+                if let Some((is_not, tested, tested_args)) = self.type_test_pending
+                    && self.ops.is_bottom(tested)
+                    && !self
+                        .ops
+                        .is_invalid_typed(tested, tested_args, self.args, self.names)
+                {
+                    self.type_test_pending = None;
+                    self.in_type_test = false;
+                    self.pop_value();
+                    let cur = self.current.clone();
+                    let dead = cur.clone().set_unreachable(&mut self.reach);
+                    let mut expr = Expr::trivial(Ty::UNKNOWN);
+                    expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
+                    expr.proven_bool = Some(is_not);
+                    expr.non_null_literal = true;
+                    self.exprs.push(expr);
                     return Control::Continue;
                 }
-                if self.expr_step(ev, events, i, match_of) {
-                    return Control::Continue;
-                }
-                self.pattern_step(ev, events, i, match_of);
-                Control::Continue
+                self.dispatch(ev, events, i, match_of)
             }
+            Ev::Block { kind, .. } => {
+                // An if-branch whose arm entered unreachable reports even
+                // its empty block — official `visitBlock` polls
+                // `checkUnreachableNode` unconditionally, with no
+                // empty-block exemption (oracle-probed on 3.13.7:
+                // `if (i is! int) {}` and `if (y is Never) {}` both carry
+                // the braces row). The `if_branch_folded` marker's
+                // literal-condition posture suppresses the empty-block
+                // poll for a dead arm the condition's split produced;
+                // adopt the dead-entry state into the marker so the poll
+                // fires for the same rows the official reports.
+                if matches!(kind, BlockKind::Statement)
+                    && matches!(self.stack.last(), Some(Frame::If { .. }))
+                    && !self.reachable()
+                {
+                    self.if_branch_folded = true;
+                }
+                self.dispatch(ev, events, i, match_of)
+            }
+            Ev::BinaryEnd { op, end }
+                if matches!(op, BinOp::And | BinOp::Or)
+                    && self.dead.is_some()
+                    && matches!(
+                        self.stack.last(),
+                        Some(Frame::Branch {
+                            rhs_dead_entry: false,
+                            ..
+                        })
+                    ) =>
+            {
+                // The right operand's own `flowEnd` (official
+                // binary_expression_resolver.dart:285/:331 — unconditional
+                // at the construct's close): a dead interval anchored
+                // INSIDE the operand — the operand ran live, then a
+                // `throw`/Never exit killed it mid-way — is contained by
+                // the operand and closes here, reporting
+                // `firstDeadNode.offset .. rightOperand.end`
+                // (dead_code_verifier.dart:243-330: `firstDeadNode` is not
+                // the operand itself — an entry-dead operand takes the
+                // `rhs_dead_entry` arm's operator re-anchor instead — so
+                // the offset stays the anchor's own). The depth read is the
+                // official parent-chain containment: the operand's events
+                // ran with this `Frame::Branch` on the stack, so an anchor
+                // at or below its depth sits inside the operand. An
+                // enclosing dead context's window stays open — the covering
+                // close owns it.
+                let len = self.stack.len();
+                if let Some(window) = self.dead
+                    && window.depth >= len
+                {
+                    self.dead = None;
+                    let offset = window.anchor.range.offset;
+                    if *end > offset {
+                        self.emit(FlowFact::DeadCode {
+                            span: TokenSpan {
+                                id: window.anchor.id,
+                                range: SourceRange {
+                                    offset,
+                                    length: *end - offset,
+                                },
+                            },
+                        });
+                    }
+                }
+                self.dispatch(ev, events, i, match_of)
+            }
+            Ev::Assign {
+                plain: true,
+                if_null: false,
+                field_init: false,
+                ..
+            } => {
+                // The plain-write constant feed (official `flow.write`'s
+                // recorded RHS value — the write-side arm of the
+                // `_getConstantValue` read fold [`Ev::Ident`]): `b = false;
+                // if (b) {}` deads the then-block exactly like the
+                // declaration's `const_feed`. `apply_write` clears the slot
+                // unconditionally; re-feed it from the popped RHS's
+                // `bool_value` after the write lands. Compound operators,
+                // `??=`, and constructor field initializers keep the clear
+                // (a read-modify-write or conditional write proves no
+                // constant).
+                let len = self.exprs.len();
+                let rhs_bool = self.exprs.last().and_then(|e| e.bool_value);
+                let target_var = len
+                    .checked_sub(2)
+                    .and_then(|t| self.exprs.get(t))
+                    .and_then(|e| e.reference);
+                let handled = self.dispatch(ev, events, i, match_of);
+                if let (Some(var), Some(value)) = (target_var, rhs_bool)
+                    && let Some(meta) = self.vars.get_mut(var as usize)
+                    && !meta.late
+                {
+                    meta.const_bool = Some(value);
+                }
+                handled
+            }
+            _ => self.dispatch(ev, events, i, match_of),
         }
+    }
+
+    /// The shared tail of [`Interp::step`]'s match: every event without a
+    /// dedicated `step` arm, and every dedicated arm after its hook ran,
+    /// lands on the stmt/expr/pattern dispatch in this order.
+    fn dispatch(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> Control {
+        if self.stmt_step(ev, events, i, match_of) {
+            return Control::Continue;
+        }
+        if self.expr_step(ev, events, i, match_of) {
+            return Control::Continue;
+        }
+        self.pattern_step(ev, events, i, match_of);
+        Control::Continue
     }
 }
 
