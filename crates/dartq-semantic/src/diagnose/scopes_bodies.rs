@@ -1280,6 +1280,21 @@ impl<'a> Engine<'a> {
         let dot_idx = name_idx.checked_sub(1)?;
         let prev_idx = dot_idx.checked_sub(1)?;
         let prev = toks[prev_idx];
+        // The equality-operand rule (`binary_expression_resolver.dart`
+        // `_resolveEqual`): both operands are analyzed with the unknown
+        // schema, so only a DIRECT dot shorthand on the right reads the left
+        // operand's static type. Every shorthand nested in either operand's
+        // subtree — the left root, a parenthesized or conditional right —
+        // verdicts against `'_'`: the read arm stays silent (its
+        // `missing_context` sibling is unimplemented) and the invocation arm
+        // reports the empty schemas text, exactly the declaration-window
+        // answers.
+        if self.shorthand_roots_equality_lhs(name_idx, prev_idx) {
+            return Some((None, "_".to_string()));
+        }
+        if self.shorthand_nested_in_equality_rhs(dot_idx) {
+            return Some((None, "_".to_string()));
+        }
         // The row whose written expression ends just before `token`'s
         // offset — the operand/context expression the position reads.
         // Searched from the shorthand's own index backward in `self.rows`,
@@ -1380,6 +1395,110 @@ impl<'a> Engine<'a> {
             TK::Eq => None,
             _ => None,
         }
+    }
+
+    /// Whether the shorthand at `name_idx` roots the LEFT operand of an
+    /// `==`/`!=` comparison (`binary_expression_resolver.dart` analyzes that
+    /// operand under the unknown schema): the selector chain that starts at
+    /// the shorthand's name runs through its invocations, index reads, and
+    /// member selects — plus a grouping paren around the whole operand —
+    /// and stops exactly at the equality operator. A shorthand that is
+    /// already the operator's right operand is excluded (its own arm above
+    /// reads the left operand's type); a chain that ends on any other token
+    /// (an argument, a condition, a declaration initializer) keeps the
+    /// position's own context.
+    fn shorthand_roots_equality_lhs(&self, name_idx: usize, prev_idx: usize) -> bool {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        if matches!(toks[prev_idx].kind, TK::EqEq | TK::BangEq) {
+            return false;
+        }
+        let mut idx = name_idx + 1;
+        while let Some(token) = toks.get(idx) {
+            match token.kind {
+                TK::OpenParen | TK::OpenSquare => match self.tokens.matching_end(idx) {
+                    Some(end) => idx = end + 1,
+                    None => return false,
+                },
+                TK::Period | TK::QuestionPeriod => idx += 2,
+                // A close that ends the operand: only a GROUPING paren wraps
+                // the operand (`(...) == x`); an invocation's `)` belongs to
+                // the chain's callee and is already consumed above, so a
+                // close reached here either wraps the operand (step past it
+                // and keep scanning) or ends the enclosing construct.
+                TK::CloseParen => match self.grouping_open(idx) {
+                    Some(_) => idx += 1,
+                    None => return false,
+                },
+                _ => break,
+            }
+        }
+        toks.get(idx)
+            .is_some_and(|t| matches!(t.kind, TK::EqEq | TK::BangEq))
+    }
+
+    /// The opener of the group a `)` closes, when that group is a grouping
+    /// paren (the token before the opener is not a callee end — an
+    /// identifier, a `)`/`]`, or a type argument's `>`). `None` for a call
+    /// group: its contents are the callee's arguments, never the operand's
+    /// own extent.
+    fn grouping_open(&self, close_idx: usize) -> Option<usize> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let mut depth = 0i32;
+        let mut open = None;
+        for idx in (0..close_idx).rev() {
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                TK::OpenParen => {
+                    if depth == 0 {
+                        open = Some(idx);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TK::OpenSquare | TK::OpenCurly => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let open = open?;
+        if open == 0 {
+            return Some(open);
+        }
+        (!matches!(
+            toks[open - 1].kind,
+            TK::Identifier
+                | TK::CloseParen
+                | TK::CloseSquare
+                | TK::Gt
+                | TK::GtGt
+                | TK::GtGtGt
+        ))
+        .then_some(open)
+    }
+
+    /// Whether the shorthand at `dot_idx` sits inside an expression that is
+    /// the DIRECT right operand of `==`/`!=` — a parenthesized or conditional
+    /// subtree. Upstream pushes no shorthand context onto such an operand
+    /// (only a direct dot shorthand reads the left operand's type), so the
+    /// nested shorthand verdicts against `'_'`.
+    fn shorthand_nested_in_equality_rhs(&self, dot_idx: usize) -> bool {
+        use dartq_scanner::TokenKind as TK;
+        let Some(open) = self.enclosing_group_open(dot_idx) else {
+            return false;
+        };
+        let Some(before) = open.checked_sub(1) else {
+            return false;
+        };
+        matches!(
+            self.tokens.as_slice()[before].kind,
+            TK::EqEq | TK::BangEq
+        )
     }
 
     /// The declaration-initializer context for a shorthand directly under
