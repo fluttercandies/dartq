@@ -2854,11 +2854,12 @@ impl<'a> Engine<'a> {
                 }
             }
             Ty::Function { shape, nullable } => {
-                let (type_params, names, return_ty, positional, named) = {
+                let (type_params, required, names, return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.required_positional,
                         shape.type_params_named.to_vec(),
                         shape.return_ty,
                         shape.positional.to_vec(),
@@ -2877,18 +2878,23 @@ impl<'a> Engine<'a> {
                 // The generic-parameter names ride the rebuild (the
                 // generic-signature asks correspond on them): a count-only
                 // producer would strip the very names the faces above
-                // preserved.
+                // preserved. The shape's own `required_positional` split
+                // rides too — the rebuild is a leaf substitution, never a
+                // shape re-decision (the all-required producers would
+                // re-intern a different identity).
                 if names.is_empty() {
-                    self.boundary.intern_function_ty(
+                    self.boundary.intern_function_ty_required(
                         type_params,
+                        required,
                         return_ty,
                         &positional,
                         &named,
                         nullable,
                     )
                 } else {
-                    self.boundary.args.borrow_mut().function_generic(
+                    self.boundary.args.borrow_mut().function_generic_required(
                         &names,
+                        required,
                         return_ty,
                         &positional,
                         &named,
@@ -4203,7 +4209,14 @@ impl<'a> Engine<'a> {
         // re-enters `borrow_mut` and panics (#2992).
         let return_ty = self.fold_alias_ty(sig.return_ty);
         let mut args = self.boundary.args.borrow_mut();
-        let ty = args.function_generic(type_params, return_ty, &positional, &named, false);
+        let ty = args.function_generic_required(
+            type_params,
+            sig.required_positional,
+            return_ty,
+            &positional,
+            &named,
+            false,
+        );
         drop(args);
         ty
     }
@@ -4417,9 +4430,21 @@ impl<'a> Engine<'a> {
                     }
                     _ => self.fold_alias_ty(entry.return_ty),
                 };
+                // The declared required/optional split joins the face's
+                // identity (`FnShape::required_positional`): interning the
+                // all-required reading strands `m is Function(int, [..])`
+                // against a source signature whose optional group the
+                // arity gate reads as required — a decided miss where the
+                // oracle's tear-off `staticType` proves the check.
+                let required = formals
+                    .positional
+                    .iter()
+                    .filter(|formal| formal.required)
+                    .count() as u16;
                 if entry.type_params == 0 {
-                    return Some(self.boundary.intern_function_ty(
+                    return Some(self.boundary.intern_function_ty_required(
                         0,
+                        required,
                         return_ty,
                         &positional,
                         &named,
@@ -4452,7 +4477,14 @@ impl<'a> Engine<'a> {
                     self.boundary
                         .args
                         .borrow_mut()
-                        .function_generic(&type_params, return_ty, &positional, &named, false),
+                        .function_generic_required(
+                            &type_params,
+                            required,
+                            return_ty,
+                            &positional,
+                            &named,
+                            false,
+                        ),
                 )
             }
             MemberKind::Getter if entry.return_ty != Ty::Unknown => {
@@ -4800,14 +4832,23 @@ impl<'a> Engine<'a> {
         } else {
             Vec::new()
         };
+        // The declared required/optional split joins the face's identity
+        // (`FnShape::required_positional`) — `C.new is C Function([int])`
+        // over `C([int])` reads the arity gate's honest count.
+        let required = formals
+            .positional
+            .iter()
+            .filter(|formal| formal.required)
+            .count() as u16;
         let ty = if sig_params.is_empty() {
             self.boundary
                 .args
                 .borrow_mut()
-                .function(0, return_ty, &positional, &named, false)
+                .function_required(0, required, return_ty, &positional, &named, false)
         } else {
-            self.boundary.args.borrow_mut().function_generic(
+            self.boundary.args.borrow_mut().function_generic_required(
                 &sig_params,
+                required,
                 return_ty,
                 &positional,
                 &named,
@@ -4851,11 +4892,12 @@ impl<'a> Engine<'a> {
                 }
             }
             Ty::Function { shape, nullable } => {
-                let (count, names, ret, pos, named) = {
+                let (count, required, names, ret, pos, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
+                        shape.required_positional,
                         shape.type_params_named.to_vec(),
                         shape.return_ty,
                         shape.positional.to_vec(),
@@ -4878,17 +4920,18 @@ impl<'a> Engine<'a> {
                     .map(|(name, formal)| (name, self.subst_named_leaves(formal, &inner)))
                     .collect();
                 // Both producers wrap the rebuilt shape with the carried
-                // nullability — the interned face is the substitution.
+                // nullability — the interned face is the substitution; the
+                // `required_positional` split is the shape's own.
                 if names.is_empty() {
                     self.boundary
                         .args
                         .borrow_mut()
-                        .function(count, ret, &pos, &named, nullable)
+                        .function_required(count, required, ret, &pos, &named, nullable)
                 } else {
                     self.boundary
                         .args
                         .borrow_mut()
-                        .function_generic(&names, ret, &pos, &named, nullable)
+                        .function_generic_required(&names, required, ret, &pos, &named, nullable)
                 }
             }
             other => other,
@@ -6433,21 +6476,33 @@ impl<'a> Engine<'a> {
         // The required-positional half of `_isFunctionSubtypeOf`'s arity
         // gate (subtype.dart:107-113): the source must accept AT LEAST the
         // target's required count (`from.required <= to.required`). The
-        // interned shape carries no required column — `Function(int)` and
-        // `Function([int])` are one `FnShapeId` — so the written count
-        // rides `fn_shape_required`, keyed at each signature's own close;
-        // a shape with no recorded spelling reads its full length (the
-        // all-required face).
+        // written count rides `fn_shape_required` for spellings interned
+        // through the all-required producers (whose `FnShapeId` merges the
+        // split — `Function(int)` and `Function([int])` share one slot);
+        // a shape interned with its split baked in
+        // (`function_required`/`function_generic_required`, the tear-off
+        // faces) reads its own `required_positional` column, and only a
+        // shape carrying neither record reads its full length.
         let from_required = self
             .fn_shape_required
             .get(&from_shape)
             .map(|&r| r as usize)
-            .unwrap_or(from_pos.len());
+            .unwrap_or_else(|| {
+                self.boundary
+                    .pool()
+                    .function_shape(from_shape)
+                    .required_positional as usize
+            });
         let to_required = self
             .fn_shape_required
             .get(&to_shape)
             .map(|&r| r as usize)
-            .unwrap_or(to_pos.len());
+            .unwrap_or_else(|| {
+                self.boundary
+                    .pool()
+                    .function_shape(to_shape)
+                    .required_positional as usize
+            });
         if from_required > to_required {
             return Some(false);
         }
@@ -6614,11 +6669,12 @@ impl<'a> Engine<'a> {
         if shape == crate::model::FnShapeId::EMPTY {
             return ty;
         }
-        let (type_params, names, return_ty, positional, named) = {
+        let (type_params, required, names, return_ty, positional, named) = {
             let pool = self.boundary.args.borrow();
             let shape = pool.function_shape(shape);
             (
                 shape.type_params,
+                shape.required_positional,
                 shape.type_params_named.to_vec(),
                 shape.return_ty,
                 shape.positional.to_vec(),
@@ -6633,18 +6689,24 @@ impl<'a> Engine<'a> {
             .collect();
         // The written-parameter group rides the rebuild (#2878): a
         // count-only producer would strip the names the generic-signature
-        // asks correspond on.
+        // asks correspond on. The shape's own `required_positional` split
+        // rides too — the leaf substitution is not a shape re-decision,
+        // and the all-required producers would re-intern a different
+        // identity (`Function(int, [..])` collapsing into
+        // `Function(int, ..)`).
         if names.is_empty() {
-            self.boundary.intern_function_ty(
+            self.boundary.intern_function_ty_required(
                 type_params,
+                required,
                 leaf(return_ty),
                 &positional,
                 &named,
                 nullable,
             )
         } else {
-            self.boundary.args.borrow_mut().function_generic(
+            self.boundary.args.borrow_mut().function_generic_required(
                 &names,
+                required,
                 leaf(return_ty),
                 &positional,
                 &named,
@@ -7612,16 +7674,14 @@ impl<'a> Engine<'a> {
             return sig.return_ty;
         }
         if row.ty != Ty::UNKNOWN {
-            // A send-close solve's instantiated callee (`toF(source)`
-            // binding `X := G`): the solve deliberately kept the callee's
-            // own — now instantiated — function face on the row (the
-            // send-close fold skips it), so the unwrap below is the ONE
-            // flatten this face ever gets and its return IS the call's
-            // static type (upstream
-            // `function_expression_invocation_resolver.dart:55-78`).
-            if self.solved_call_params.contains_key(&row.range.offset)
-                && let Some(result) = self.invoked_callee_result(row)
-            {
+            // A send-close solve's invocation is typed by its declared
+            // return instantiated with the stashed solution — the face the
+            // argument-check walk published onto the row, which a second
+            // unwrap would flatten one level too far (upstream
+            // `function_expression_invocation_resolver.dart:55-78` records
+            // the instantiated return once, never the callee's own
+            // signature).
+            if let Some(result) = self.solved_invoke_result(row) {
                 return result;
             }
             // The row keeps the callee's DECLARED type, never the send's
@@ -8414,17 +8474,31 @@ impl<'a> Engine<'a> {
             .zip(entry.type_param_bounds.iter().copied())
             .map(|(name, bound)| (name, (bound != Ty::Dynamic).then_some(bound)))
             .collect();
+        // The declared required/optional split joins the face's identity
+        // (`FnShape::required_positional`), like
+        // [`Self::member_entry_tear_off_ty`].
+        let required = formals
+            .map(|f| f.positional.iter().filter(|p| p.required).count() as u16)
+            .unwrap_or(0);
         let mut args = self.boundary.args.borrow_mut();
         let fn_ty = if type_params.is_empty() && entry.type_params > 0 {
-            args.function(
+            args.function_required(
                 entry.type_params,
+                required,
                 entry.return_ty,
                 &positional,
                 &named,
                 false,
             )
         } else {
-            args.function_generic(&type_params, entry.return_ty, &positional, &named, false)
+            args.function_generic_required(
+                &type_params,
+                required,
+                entry.return_ty,
+                &positional,
+                &named,
+                false,
+            )
         };
         drop(args);
         Some(fn_ty)
