@@ -2698,6 +2698,31 @@ impl<'a> Engine<'a> {
         if self.is_scope_param(name) || self.name_world().is_known_head(name) {
             return false;
         }
+        // A dot-joined `p.T` head names an element through an import
+        // prefix — the official resolver's `PrefixedType` arm, which the
+        // bare-scope walk below cannot see (the leaf is not in this
+        // library's own scope). The prefix table answers instead: a
+        // spelling that reaches a container is a real interface type, not
+        // the `InvalidType` an unresolved head is.
+        if self.strings.resolve(name).contains('.')
+            && resolve_joined_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.strings,
+                name,
+            )
+            .is_some()
+        {
+            return false;
+        }
+        // A dot-joined `p.T` head names an element through an import
+        // prefix — the official resolver's `PrefixedType` arm, which the
+        // bare-scope walk below cannot see (the leaf is not in this
+        // library's own scope). The prefix table answers instead: a
+        // spelling that reaches a container is a real interface type, not
+        // the `InvalidType` an unresolved head is.
         match self.type_resolution(name).0 {
             TypeResolution::Missing | TypeResolution::NonType => true,
             TypeResolution::Type => matches!(
@@ -5277,6 +5302,118 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// The operand's declared type as WRITTEN when the declaration spells
+    /// it with an import prefix; the captured face otherwise.
+    ///
+    /// The official verdict reads `operand.staticType`, which spells the
+    /// resolved element whatever prefix the annotation used. This engine's
+    /// capture drops that prefix on two of the three written shapes — a
+    /// group-less `p.T` annotation arms nothing the variable can read, and
+    /// a parameterised one arms the leaf (`Named{T}` with the written
+    /// arguments) — so the spelled-head comparison against the checked
+    /// side's joined `p.T` reads two different types and the row stays
+    /// silent. The annotation itself survives only in the source: re-read
+    /// it backwards from the declaration's own name token and keep the
+    /// recovered face when it is a `p.T` spelling whose prefix resolves.
+    /// Every other declaration (a bare head, an inferred `var`, a dead
+    /// prefix) keeps its captured face, so the recovery can only restore
+    /// a prefix the capture dropped, never invent one.
+    fn prefixed_operand_ty(&self, operand_ty: Ty) -> Ty {
+        // A face that already spells a joined head kept its prefix (a
+        // promoted read, an augmented capture): nothing was dropped, and
+        // the declaration's own spelling must not downgrade it.
+        if let Ty::Named { name, .. } = operand_ty
+            && self.strings.resolve(name).contains('.')
+        {
+            return operand_ty;
+        }
+        let Some(offset) = self
+            .operand_row()
+            .and_then(|row| self.operand_decl_offset(row))
+        else {
+            return operand_ty;
+        };
+        let Some(recovered) = self
+            .backward_ty_text(offset)
+            .and_then(|text| self.parse_spelled_ty(&text))
+        else {
+            return operand_ty;
+        };
+        let Ty::Named { name, .. } = recovered else {
+            return operand_ty;
+        };
+        let spelled = self.strings.resolve(name);
+        let Some((prefix, _)) = spelled.split_once('.') else {
+            return operand_ty;
+        };
+        if !matches!(self.resolve_bare(self.intern(prefix)).1, RefTarget::Prefix) {
+            return operand_ty;
+        }
+        // The joined `p.T` collapses onto the bare element where this
+        // file also reaches it (`canonical_head`'s same-element guard) —
+        // the face the captured operand already spells in that
+        // configuration.
+        self.boundary.canonical_dotted_ty(recovered)
+    }
+
+    /// The name-token offset of the declaration the operand reads: the
+    /// innermost live local or formal of the same spelling, the top-level
+    /// variable's own declaration site, or the field of the receiver's
+    /// container. Only declarations of THIS file qualify — the backward
+    /// scan reads `self.source`, so a foreign file's offsets mean
+    /// nothing here.
+    fn operand_decl_offset(&self, row: &Row) -> Option<u32> {
+        if let Some(decl) = self
+            .locals
+            .iter()
+            .rev()
+            .find(|decl| decl.name == row.name && !decl.retired)
+        {
+            return Some(decl.range.offset);
+        }
+        if let Some(site) = self
+            .decl_sites
+            .iter()
+            .find(|site| site.name == row.name && matches!(site.kind, DeclKind::TopLevelVar))
+        {
+            return Some(site.range.offset);
+        }
+        let RowShape::Member { recv } = &row.shape else {
+            return None;
+        };
+        let (container, owner) = match recv {
+            Receiver::Container { name, .. } => resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                *name,
+            )?,
+            Receiver::Typed { type_name, .. } => resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                *type_name,
+            )?,
+            Receiver::PrefixedContainer { prefix, name, .. } => prefixed_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                *prefix,
+                *name,
+            )?,
+            _ => return None,
+        };
+        (owner == self.file)
+            .then(|| container.members.get(&row.name))
+            .flatten()
+            .map(|entry| entry.name_range.offset)
+    }
+
     /// Whether a pooled face still carries a prefix-sentinel leaf — the
     /// bare `Named{p}` a `p.T<p.U>` spelling degrades to inside a
     /// declaration-tree capture when the collector's armed walk poisons
@@ -7268,38 +7405,18 @@ impl<'a> Engine<'a> {
         // the under-report the oracle's flag answers true).
         let operand_ty = match keyword_operand {
             Some((ty, _)) => ty,
-            None => self.type_check_operand_ty(),
+            None => self.prefixed_operand_ty(self.type_check_operand_ty()),
         };
         // The declared `p.T` face surfaces as the bare prefix
         // (`Named{async}` for `async.A<int> x` — the armed head's
         // prefix-token face): the prefix veto below must not read it as
         // the `e is p` nonsense, whose operand is a bare prefix READ.
-        // The operand row's own local declaration anchors the name token
-        // — the backward scan recovers the written `p.T<args>` spelling
-        // and rejoins the declared face the strict ask needs.
-        let operand_decl_range = if let Ty::Named {
-            name,
-            args: ArgListId::EMPTY,
-            ..
-        } = operand_ty
-            && !self.strings.resolve(name).contains('.')
-            && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
-        {
-            self.operand_row()
-                .and_then(|row| {
-                    self.locals
-                        .iter()
-                        .rev()
-                        .find(|decl| decl.name == row.name && !decl.retired)
-                })
-                .map(|decl| decl.range.offset)
-        } else {
-            None
-        };
-        let operand_ty = operand_decl_range
-            .and_then(|offset| self.backward_ty_text(offset))
-            .and_then(|text| self.parse_spelled_ty(&text))
-            .unwrap_or(operand_ty);
+        // `prefixed_operand_ty` above restores the other two written
+        // shapes the #3611 `known_prefix` family carries — a group-less
+        // `p.T` annotation arms nothing the variable can read and a
+        // parameterised one arms the leaf (`Named{T}` with the written
+        // arguments) — from the declaration's own written spelling, which
+        // is where the dropped prefix survives.
         // The tear-off face over an unwritten-signature function (`void
         // topx(x,)` — a bare-read is-check's container-less operand,
         // #2813) reads the same official leaves as the checked side. The
