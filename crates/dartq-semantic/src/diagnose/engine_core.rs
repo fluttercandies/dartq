@@ -1202,12 +1202,16 @@ impl<'a> Engine<'a> {
                         .unwrap_or(check.from),
                 }
             };
-            // A staged invocation operand reads the call's RESULT: a callee
-            // whose function face became non-null only through the
-            // substitution above (`if (_create != null) return _create();`
-            // over a private final `T Function()?` field) still spells the
-            // function type here, so the send's value is the shape's return.
-            if self.invocation_span(check.range).is_some()
+            // A substitution face at an invocation span may be the CALLEE's
+            // own (promoted) function face — the staged operand reads the
+            // call's RESULT, so the send's value is that shape's return
+            // (`if (_create != null) return _create();` over a private
+            // final `T Function()?` field). The check's OWN face needs no
+            // flatten: it already IS the send's result (a solved or
+            // function-typed instantiation — flattening it would unwrap one
+            // level too far, `F<A<int>?>` collapsing to `void`).
+            if from != check.from
+                && self.invocation_span(check.range).is_some()
                 && let Ty::Function {
                     shape,
                     nullable: false,

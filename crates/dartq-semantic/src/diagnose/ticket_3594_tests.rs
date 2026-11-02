@@ -18,9 +18,11 @@
 //! `solved_call_params` arm misread that face as the uninvoked signature
 //! and `callable_result_of` could not unwrap its own type-parameter count,
 //! so the local bound `Unknown` and the bound-equality legs never ran.
-//! [`Engine::var_inferred_send_init_ty`] re-derives the send's honest
-//! result through `callee_return_ty` at the check, so the read spells
-//! `F<A<int>?>` and the verdict decides.
+//! #3598's [`Engine::solved_invoke_result`] types the solved send by its
+//! declared return instantiated with the solution (the check-layer
+//! fallback this ticket first tried was reverted — it fabricated 1,067
+//! rows without recovering any), so the read spells `F<A<int>?>` and the
+//! verdict decides.
 
 use super::test_rig::{RigImport, code_names, report_ops_with};
 
@@ -36,7 +38,6 @@ F<X> toF<X>(X x) => <Y extends X>() {};
 /// `A<num>?`), and neither is a subtype of the other in both directions —
 /// reports `invalid_assignment` on the assigned expression.
 #[test]
-#[ignore = "reverted: the var-inferred send fallback fabricated 1,067 invalid_assignment rows without recovering any missing one (census 20261102-092322)"]
 fn bounds_differ_nested_nullability_reports() {
     let report = report_ops_with(
         r#"import 'package:x/lang_feature_check.dart';
