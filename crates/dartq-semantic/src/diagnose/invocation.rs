@@ -12899,7 +12899,21 @@ impl<'a> Engine<'a> {
                             let head = self.strings.resolve(name);
                             let unbound = self.type_params.contains(&name)
                                 || self.pending_type_params.contains(&name);
-                            !unbound && head != "Object" && head != "Function"
+                            // A head that FOLDS to a function shape is not a
+                            // refusal: the alias's right-hand face is the
+                            // formal the oracle decides against (the
+                            // `_CheckExceptionFn?` family — a private or
+                            // unexported function typedef the use-site scope
+                            // cannot name, [`Engine::fold_alias_verdict`]'s
+                            // graph-wide typedef chase unfolds). Only a
+                            // non-function resolved head refuses.
+                            !unbound
+                                && head != "Object"
+                                && head != "Function"
+                                && !matches!(
+                                    self.fold_alias_verdict(formal_ty),
+                                    Ty::Function { .. }
+                                )
                         }
                         _ => false,
                     };

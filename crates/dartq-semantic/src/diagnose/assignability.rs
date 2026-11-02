@@ -6793,6 +6793,59 @@ impl<'a> Engine<'a> {
                 };
                 folded = Self::join_nullable(substituted, nullable);
             }
+            // A surviving bare head can still be an UNNAMEABLE alias: a
+            // private or otherwise unexported typedef whose written
+            // spelling reached this file through a foreign member's
+            // captured signature (co19's `_CheckExceptionFn` — the
+            // `Expect.throws` `check` formal — declares the type inside
+            // its OWN library, where the resolver folds it; the import
+            // scope at the use site never names it, so
+            // [`Engine::alias_rhs`]'s scoped lookup misses and the class
+            // `declaring_libraries` index does not index typedefs). The
+            // resolved `staticType` is the alias's right-hand side
+            // regardless of use-site visibility, so the verdict fold
+            // chases the unique declaring file's decl row directly —
+            // the same element-model projection `boundary.ty` gives a
+            // scoped hit. Zero matches keeps the written head (a
+            // genuinely unmodeled name); MULTIPLE matches declines to
+            // pick (an ambiguous private spelling across unrelated
+            // libraries is the under-report direction, never a
+            // fabricated fold). A parameterized alias stays out — its
+            // substitution face is `parameterized_alias_fold`'s own.
+            if let Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } = folded
+                && self.alias_rhs_any(name).is_none()
+            {
+                let mut hit = None;
+                let mut ambiguous = false;
+                for lib in self.graph.libraries() {
+                    for &unit in self.graph.unit_files(lib) {
+                        let Some(decl) = self.index.get(unit).and_then(|f| f.decl(name)) else {
+                            continue;
+                        };
+                        if decl.kind != MicroKind::TypeAlias {
+                            continue;
+                        }
+                        if hit.replace((unit, decl.var_ty)).is_some() {
+                            ambiguous = true;
+                            break;
+                        }
+                    }
+                    if ambiguous {
+                        break;
+                    }
+                }
+                if !ambiguous
+                    && let Some((owner, var_ty)) = hit
+                    && var_ty != Ty::UNKNOWN
+                {
+                    let rhs = self.boundary.ty(owner, var_ty);
+                    folded = Self::join_nullable(rhs, nullable);
+                }
+            }
         }
         self.alias_fold_memo.borrow_mut().insert(ty, folded);
         folded
