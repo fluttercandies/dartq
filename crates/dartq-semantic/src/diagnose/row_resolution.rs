@@ -5570,6 +5570,36 @@ impl<'a> Engine<'a> {
             })
     }
 
+    /// Whether the member access's receiver read names a schema-bound
+    /// closure formal (#3595): `member_reads` keys the receiver's own
+    /// read span off the member offset, and `closure_formal_names` holds
+    /// the unannotated formals `closure_param_context_ty` bound. The
+    /// read's own spelling decides — a bare identifier receiver
+    /// (`t.anyMethod()` — `recv_span` covers `t` alone) names the formal
+    /// directly. `local_hits`/`local_decl_at_read` never recorded the
+    /// read (a schema-bound formal's member receiver resolves outside
+    /// the bare-read channel), so the interned spelling is the only
+    /// reach. A non-identifier receiver span (a chained link, a send
+    /// result) spells nothing in the set and answers false by
+    /// construction; a missed answer only keeps an honest verdict.
+    fn recv_read_names_closure_formal(&self, member_offset: u32) -> bool {
+        let Some(read) = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&member_offset))
+            .ok()
+            .map(|index| self.member_reads[index])
+        else {
+            return false;
+        };
+        let start = self.byte_of(read.recv_span.offset).min(self.source.len());
+        let end = self
+            .byte_of(read.recv_span.end())
+            .max(start)
+            .min(self.source.len());
+        let recv_name = self.intern(&self.source[start..end]);
+        self.closure_formal_names.contains(&recv_name)
+    }
+
     /// The `Type` instance's member face: `Object`'s members plus every
     /// member an ACCESSIBLE extension declares on a top-shaped `on` type.
     ///
@@ -6202,6 +6232,53 @@ impl<'a> Engine<'a> {
             && !self.read_offset_is_member(read_span.offset)
             && let Some(promoted) = promotions.promoted(read_span)
             && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
+        {
+            receiver_nullable = false;
+        }
+        // The inference-bound closure formal (#3595): an unannotated
+        // `(t) => …` formal binds through `closure_context_schema` while
+        // the callee's type parameter is still unsolved — its receiver
+        // face then spells that parameter head (`Named { T }`), whose
+        // only reachable bound is the implicit `Object?`. That face is
+        // OUR placeholder, not the oracle's decided face: horizontal
+        // inference solves `T` from the later arguments at send-close,
+        // and a `dynamic` or non-null solution never owes an unchecked
+        // verdict. The re-bind machinery only reaches QUALIFIED callees,
+        // so the placeholder survives to this verdict on the bare shape
+        // (`f((t) { t.anyMethod(); }, [1])`): undecidable here — abstain.
+        //
+        // The arm is deliberately narrow. `receiver_nullable` is already
+        // true, so a `?`-less `Named` face reached this point through
+        // `param_bound_potentially_nullable` — which also answers true
+        // for an UNRESOLVABLE spelled head (the typedef family's `Qex`
+        // annotations: upstream's `UnknownInferredType` formal is
+        // potentially nullable and owes the honest verdict). Only a head
+        // that IS a live EXECUTABLE type parameter — a name a
+        // function/method window declares, the container-owned windows
+        // excluded (`exec_param_bound`'s same owner-kind split: a
+        // class's `T` on a closure formal is the decided bound face,
+        // not an inference placeholder) — stands down; a decided
+        // nullable annotation binds a `?`-suffixed concrete face and
+        // keeps its verdict.
+        let recv_is_inference_placeholder = match &recv {
+            Receiver::Typed { ty, .. } => {
+                matches!(ty, Ty::Named { name, nullable: false, .. }
+                    if self
+                        .exec_bounds
+                        .iter()
+                        .chain(self.method_exec_bounds.iter())
+                        .filter(|(owner, _)| {
+                            self.index
+                                .get(self.file)
+                                .is_none_or(|elements| elements.container(**owner).is_none())
+                        })
+                        .any(|(_, window)| window.iter().any(|(param, _)| param == name)))
+            }
+            _ => false,
+        };
+        if receiver_nullable
+            && recv_is_inference_placeholder
+            && self.recv_read_names_closure_formal(row.range.offset)
         {
             receiver_nullable = false;
         }

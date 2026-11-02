@@ -1778,10 +1778,10 @@ impl<'a> Engine<'a> {
         let toks = self.tokens.as_slice();
         // The declarator-name arm: `T name =`/`var|final|const|late name =`
         // — an identifier directly before `=` whose own predecessor is the
-        // declared type (an identifier — `E e`) or a declaration keyword.
-        // Anything else (`x =`, `o.f =`, `this.x =`, `o[i] =`) is an
-        // assignment whose target's own face owns the shorthand — the
-        // under-report.
+        // declared type (an identifier — `E e`, a function/record type's
+        // closing `)`) or a declaration keyword. Anything else (`x =`,
+        // `o.f =`, `this.x =`, `o[i] =`) is an assignment whose target's
+        // own face owns the shorthand — the under-report.
         let name_idx = eq_idx.checked_sub(1)?;
         if toks[name_idx].kind != TK::Identifier {
             return None;
@@ -1791,7 +1791,7 @@ impl<'a> Engine<'a> {
             .and_then(|i| toks.get(i))
             .map(|t| t.kind)
         {
-            Some(TK::Identifier)
+            Some(TK::Identifier | TK::CloseParen)
             | Some(TK::Keyword(
                 Kw::Var | Kw::Final | Kw::Const | Kw::Late | Kw::Static | Kw::Covariant,
             )) => self.shorthand_decl_ctx(),
@@ -6499,16 +6499,36 @@ impl<'a> Engine<'a> {
     ///
     /// For a non-generator `async` literal the matched context's return
     /// type additionally rewrites: the oracle's `element.returnType` is
-    /// the imposed `R` async-wrapped through `Future<flatten(R)>`
-    /// (body_inference_context.dart:132-153, `computeInferredReturnType`
-    /// — a body whose returns do not satisfy the context clamps to `R`,
-    /// and `FutureOr<futureValueType(imposedType)>` at :259-261 supplies
-    /// the async body's context). `void Function() test = () async {
-    /// return v; }` reports `'Future<void>'` as the destination, not the
-    /// raw `void` — the literal's own `Ty::Function` face carries the
-    /// wrapped return for both the verdict and the Value row. Formals
-    /// bind before this event fires, so the rewrite never disturbs the
-    /// per-formal inference arm.
+    /// the async body's *inferred* return — `Future<flatten(clamp)>` over
+    /// the body's own returns, never the imposed face verbatim
+    /// (body_inference_context.dart:132-153 `computeInferredReturnType`,
+    /// :259-261 `_contextTypeForImposed` supplying the
+    /// `FutureOr<futureValueType(imposed)>` context, :206-222
+    /// `_clampToContextType`). The clamp answers `void` first, then the
+    /// body's returned type when it fits the context, and only then the
+    /// context itself — so the two arms whose destination is independent
+    /// of the context are the ones this name-level walk can ground:
+    ///
+    /// - `futureValueType(R)` is `void` (`R` spells `void`/`Future<void>`/
+    ///   `FutureOr<void>`): the clamp short-circuits to `void`, and the
+    ///   destination is `Future<void>` — `void Function() test = () async
+    ///   { return v; }` reports `'Future<void>'`, never the raw `void`.
+    /// - `futureValueType(R)` is `Object?` (`R` names no `Future`/
+    ///   `FutureOr` head at all, or names one whose argument is
+    ///   `Object?`/a type parameter): every flattened return type is a
+    ///   subtype of `FutureOr<Object?>`, so the clamp answers the body's
+    ///   own type and the per-return ask degenerates to `S <: S`. No
+    ///   return row can fire; `Future<void>` is that silent face's
+    ///   spelling here (`Object Function() f = () async { return v; }`
+    ///   is clean upstream).
+    ///
+    /// A concrete `Future<X>`/`FutureOr<X>` context keeps `Future<X>`: the
+    /// clamp either answers `X` (identical destination) or the body's own
+    /// type, on which the `X` ask agrees (`Future<int> Function()` with a
+    /// `void` return reports `'Future<int>'`, `int Function()` with the
+    /// same body stays silent — `Object?` is the fallback that absorbs
+    /// it). Formals bind before this event fires, so the rewrite never
+    /// disturbs the per-formal inference arm.
     pub(crate) fn note_async_modifier(&mut self, is_async: bool, generator: bool) {
         if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable {
@@ -6543,7 +6563,16 @@ impl<'a> Engine<'a> {
                 shape.named.to_vec(),
             )
         };
-        let flat = engine_core::flatten_ty(self.strings, &self.boundary.pool(), return_ty);
+        // The clamp's grounded arm (`_clampToContextType`): an implied
+        // `Object?` value type is the fallback face of a context that is
+        // not a `Future`/`FutureOr` at all — the body's own return type
+        // wins there, so no return row survives and the wrap carries the
+        // silent `void` face instead of the fallback head.
+        let flat = if self.future_value_type(return_ty) == self.object_question() {
+            Ty::Void
+        } else {
+            engine_core::flatten_ty(self.strings, &self.boundary.pool(), return_ty)
+        };
         let future = Ty::Named {
             name: self.intern("Future"),
             nullable: false,
