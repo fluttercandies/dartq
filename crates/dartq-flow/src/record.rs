@@ -233,6 +233,13 @@ pub struct Flow<'t> {
     /// clears the latch (its own return/parameter rows must not leak), so
     /// an untyped or function-typed header answers unknown.
     top_last_type: Option<(crate::ty::Ty, u32)>,
+    /// The top-level header now parsing spelled a function type
+    /// (`end_function_type` latches, [`Flow::end_typedef`] consumes): a
+    /// signature carries no formals in the alias table's
+    /// `(Ty, ArgListId)` face, so its typedef must not register — the
+    /// `Function` fallback row would turn every `x is F` into `x is
+    /// Function`.
+    top_fn_type_header: bool,
     /// The head token of the most recent [`ParserListener::handle_type`]
     /// row (the annotation's first token — a qualified chain keys its
     /// first element). [`ParserListener::handle_no_type`] clears it. Read
@@ -459,6 +466,7 @@ impl<'t> Flow<'t> {
             tv_in_record: false,
             top_level: FxHashMap::default(),
             top_last_type: None,
+            top_fn_type_header: false,
             type_head: None,
             is_type_head: None,
             as_type_head: None,
@@ -2246,6 +2254,10 @@ impl ParserListener for Flow<'_> {
         // return/parameter rows must not leak into the latch.
         if self.buffer.is_none() {
             self.top_last_type = None;
+            // A signature answers no round-trippable alias face
+            // ([`Flow::top_fn_type_header`]): `end_typedef` reads this
+            // latch to keep the alias out of the table.
+            self.top_fn_type_header = true;
         }
         // A function-typed method return resolves to the `Function` face —
         // the same non-`Never` answer an untyped header gives, so the
@@ -2444,6 +2456,7 @@ impl ParserListener for Flow<'_> {
         // the latch, so it lands on the same `Function` face). `handle_type`
         // substitutes it so `x is fx` folds through the name-level subtype
         // verdict the official's resolved alias answers.
+        let function_typed = std::mem::take(&mut self.top_fn_type_header);
         let aliased = self.top_last_type.take().unwrap_or((
             crate::ty::Ty {
                 base: crate::ty::Base::Function,
@@ -2452,8 +2465,19 @@ impl ParserListener for Flow<'_> {
             crate::ty::EMPTY_ARGS,
         ));
         if let Some(name_token) = self.top_fn_name.take() {
-            let name = self.name(name_token);
-            self.type_aliases.entry(name).or_insert(aliased);
+            // A signature-typed right-hand side (`typedef F = int
+            // Function(String);`) registers nothing: the table's
+            // `(Ty, ArgListId)` face carries no formals, so the row could
+            // only be the signature-less `(Function, EMPTY_ARGS)` fallback
+            // — `x is F` would test `Function`, promote `x`, and kill the
+            // always-true `x is int Function(String)` the official's
+            // resolved alias answers. With the alias absent, the use site
+            // keeps the name-level face and the semantic layer's alias
+            // chase folds the signature.
+            if !function_typed {
+                let name = self.name(name_token);
+                self.type_aliases.entry(name).or_insert(aliased);
+            }
         }
     }
 
@@ -2464,6 +2488,7 @@ impl ParserListener for Flow<'_> {
         // or the header type into the next declaration's capture.
         self.top_fn_name = None;
         self.top_last_type = None;
+        self.top_fn_type_header = false;
         self.top_ret_pending = false;
         self.top_ret = None;
     }
