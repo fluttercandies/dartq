@@ -3025,6 +3025,18 @@ impl ParserListener for Flow<'_> {
     }
 
     fn end_literal_string(&mut self, interpolation_count: usize, _end: Token) {
+        // A simple (non-interpolated) string literal is a single token —
+        // `_end` spans its whole extent, including the opening quote.
+        // `Ev::EndLiteralString` carries no span of its own, so the
+        // dead-code operand latch (`Interp::step`'s first-spanned-event
+        // read) would leave a `??= 'lit'`/`??= 'lit'` operand unanchored
+        // and fall back to `1:1`. A phantom `Ev::ParenBegin` — the only
+        // spanned event that is a semantic no-op in both interpreters —
+        // delivers the literal's begin offset without shifting the value
+        // stack or any begin/end pairing.
+        if interpolation_count == 0 {
+            self.record(Ev::ParenBegin { span: _end });
+        }
         self.record(Ev::EndLiteralString {
             interpolation_count,
         });
@@ -3510,6 +3522,16 @@ impl ParserListener for Flow<'_> {
             self.kind(operator),
             Some(dartq_scanner::TokenKind::QuestionPeriodPeriod)
         );
+        if null_aware {
+            // The `?..` operator token, delivered as a spanned no-op
+            // (`Ev::ParenBegin` is inert in both interpreters): the
+            // cascade section's dead interval anchors AT the operator
+            // (`x?..m(1);` reports `?..m(1);` — the section node's own
+            // `beginToken`, dead_code_verifier.dart's first-dead-node
+            // walk over `CascadeExpression` sections), and
+            // `Ev::CascadeBegin` carries no span of its own.
+            self.record(Ev::ParenBegin { span: operator });
+        }
         self.record(Ev::CascadeBegin { null_aware });
     }
 

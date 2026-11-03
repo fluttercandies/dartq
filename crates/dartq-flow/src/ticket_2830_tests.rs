@@ -59,30 +59,43 @@ fn dead_of(source: &str) -> Vec<String> {
 
 #[test]
 fn recovered_cascade_block_does_not_kill() {
-    for (label, src) in [
+    // The recovered section itself contributes NO row (the divergence this
+    // ticket pins). The `statement` fixture's one row is a different face:
+    // its well-formed sibling `buffer?..g()` takes the
+    // `_verifyUnassignedVariable` row (`buffer` is a definitely-unassigned
+    // `C?`), which the oracle reports at the `?` operator —
+    // `dart analyze --format machine` 3.13.7 on that fixture:
+    // `DEAD_CODE 5:7|6` covering `?..g()`. The recovered `?..{` section
+    // above it still kills nothing (`use(v1);` and friends stay live).
+    for (label, src, expected) in [
         (
             "initializer",
             "class C {}\nint foo = 42;\nvoid use(Object? x) {}\nvoid f() { C? buffer; final v1 = buffer?..{\n  return foo;\n};\nuse(v1);\n}",
+            vec![],
         ),
         (
             "nested",
             "class C {}\nint foo = 42;\nvoid use(Object? x) {}\nvoid f() { C? buffer; final v2 = (buffer?..{\n  return foo;\n})?..{\n  return foo;\n};\nuse(v2);\n}",
+            vec![],
         ),
         (
             "statement",
             "class C { void g() {} }\nvoid f() { C? buffer; buffer?..{\n  return 1;\n};\nbuffer?..g();\n}",
+            vec!["?..g()"],
         ),
         (
             "chained_bare_sections",
             "class C {}\nint foo = 42;\nvoid use(Object? x) {}\nvoid f() { C? buffer; buffer?..{\n  return foo;\n}..{\n  return foo;\n};\nuse(buffer);\n}",
+            vec![],
         ),
         (
             "anonymous_method_section",
             "class C {}\nvoid use(Object? x) {}\nvoid f() { C? buffer; final v = buffer?..(int p) {\n  return p;\n};\nuse(v);\n}",
+            vec![],
         ),
     ] {
         let dead = dead_of(src);
-        assert!(dead.is_empty(), "{label}: {dead:?}");
+        assert_eq!(dead, expected, "{label}: {dead:?}");
     }
 }
 
@@ -91,8 +104,17 @@ fn real_sibling_block_after_cascade_still_kills() {
     // The `?..{` fingerprint arms on `{` directly after the operator only:
     // a REAL block statement after a healthy cascade keeps its events, so
     // its `return` kills the tail (the plain statement-block face).
+    //
+    // The first row is the healthy cascade's own
+    // `_verifyUnassignedVariable` face (`buffer` is a definitely-unassigned
+    // `C?`) — the oracle reports both rows on this fixture:
+    // `dart analyze --format machine` 3.13.7:
+    // `DEAD_CODE 3:29|6` (`?..g()`) and `DEAD_CODE 7:1|12` (`use(buffer);`).
     let src = "class C { void g() {} }\nvoid use(Object? x) {}\nvoid f() { C? buffer; buffer?..g();\n{\n  return 1;\n}\nuse(buffer);\n}";
-    assert_eq!(dead_of(src), vec!["use(buffer);".to_string()]);
+    assert_eq!(
+        dead_of(src),
+        vec!["?..g()".to_string(), "use(buffer);".to_string()]
+    );
 }
 
 #[test]

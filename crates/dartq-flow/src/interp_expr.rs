@@ -443,9 +443,18 @@ impl Interp<'_> {
                 // a collection is the official's first dead node —
                 // `[1, 2, f(), 4]` on `Never f()` anchors `4`. An open
                 // interval keeps ownership (later nodes extend), and the
-                // wrapper's re-anchor lifts statement-level anchors.
+                // wrapper's re-anchor lifts statement-level anchors. A leaf
+                // inside a `?.`-opened-dead chain polls nothing — the member
+                // name owns the official's first dead node (`null?.m(1)`
+                // rows `m(1)`).
                 if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
-                    self.dead_code(*span);
+                    if !self
+                        .null_shorts
+                        .last()
+                        .is_some_and(|short| short.dead_at_open)
+                    {
+                        self.dead_code(*span);
+                    }
                 }
                 // The literal's static type is `bool` (official
                 // `literalBool`'s recorded type — the `matchedType` an
@@ -487,9 +496,18 @@ impl Interp<'_> {
                 // OPEN the interval (`dead.is_none()`): a literal element
                 // reached dead inside a collection is the official's
                 // first dead node — `[1, 2, f(), 4]` on `Never f()`
-                // anchors `4`, the covering close runs to `]`.
+                // anchors `4`, the covering close runs to `]`. A leaf
+                // inside a `?.`-opened-dead chain polls nothing — the
+                // member name owns the official's first dead node
+                // (`null?.m(1)` rows `m(1)`).
                 if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
-                    self.dead_code(*span);
+                    if !self
+                        .null_shorts
+                        .last()
+                        .is_some_and(|short| short.dead_at_open)
+                    {
+                        self.dead_code(*span);
+                    }
                 }
                 // The literal's static type is `int` — the same
                 // `matchedType` face `Ev::Bool` spells `bool` for
@@ -517,9 +535,16 @@ impl Interp<'_> {
             Ev::Double { span } => {
                 // The same header-part leaf poll `Ev::Int` carries —
                 // outside a header it also fires to OPEN the interval
-                // (`dead.is_none()`, the dead collection-element face).
+                // (`dead.is_none()`, the dead collection-element face),
+                // gated the same way inside a `?.`-opened-dead chain.
                 if self.for_header_depth > self.header_cond_depth || self.dead.is_none() {
-                    self.dead_code(*span);
+                    if !self
+                        .null_shorts
+                        .last()
+                        .is_some_and(|short| short.dead_at_open)
+                    {
+                        self.dead_code(*span);
+                    }
                 }
                 // `Ev::Int`'s `double` twin (`num? d = 1.5` promotes `d`
                 // to `num`).
@@ -1791,11 +1816,23 @@ impl Interp<'_> {
                         // always the topmost dead node); no window means a
                         // bare literal operand polled nothing — the poll
                         // here opens it while the state is still the dead
-                        // null path (the restore below is live).
+                        // null path (the restore below is live). A bare
+                        // `null` operand leaves the step-level latch empty
+                        // (`Ev::Null` carries no span): the literal ends
+                        // exactly at the assignment end, so its begin is
+                        // `end - 4` — `l ??= null` rows `null;`, never
+                        // the `1:1` whole-file fallback.
+                        let operand_begin = operand_start.unwrap_or_else(|| {
+                            if matches!(events.get(i.wrapping_sub(1)), Some(Ev::Null)) {
+                                end.saturating_sub(4)
+                            } else {
+                                0
+                            }
+                        });
                         let anchor = TokenSpan {
                             id: 0,
                             range: dartq_source::SourceRange {
-                                offset: operand_start.unwrap_or(0),
+                                offset: operand_begin,
                                 length: 0,
                             },
                         };
@@ -2531,17 +2568,44 @@ impl Interp<'_> {
                 } else if !self.stmt_began_dead
                     && !self.exit_at.is_some_and(|at| at >= member.range.offset)
                 {
-                    // A `?.` whose access path was dead at open (a
-                    // null-or-equivalent receiver) anchors at the member
-                    // name — the official polls the property/method name
-                    // node. `member` is the send's tiled end there (the
-                    // #585 follower), so the anchor reads the member's own
-                    // identifier token.
-                    let anchor = self
-                        .exprs
-                        .last()
-                        .and_then(|e| e.read_span)
-                        .unwrap_or(*ident);
+                    // A `?.` whose access path was dead at open has TWO
+                    // official anchor faces. The definitely-unassigned
+                    // nullable local (`(i)?.sign`, `i?.sign` on an
+                    // unassigned `int? i`) reports from the `?.` operator —
+                    // `dead_code_verifier._verifyUnassignedVariable` emits
+                    // `operator.offset .. node.end` (`?.sign`), a separate
+                    // reporting path from `_firstDeadNode`. Every other
+                    // dead-at-open receiver (a `null` literal, a `Null`-
+                    // typed or `Never`-typed read) reports the member's
+                    // own node — `null?.m(1)` and `x?.m(1)` on an assigned
+                    // `Null x` both row `m(1)`. The event carries no `?`
+                    // span, but `?.` is exactly the two bytes before the
+                    // member identifier — the unassigned face reads
+                    // `ident.offset - 2`. `member` is the send's tiled end
+                    // (the #585 follower), unusable for the offset.
+                    let unassigned_receiver = *null_aware
+                        && self
+                            .null_shorts
+                            .last()
+                            .and_then(|short| {
+                                self.exprs.get(short.exprs_depth.saturating_sub(1))
+                            })
+                            .and_then(|recv| recv.reference)
+                            .is_some_and(|var| self.current.model(var).unassigned);
+                    let anchor = if unassigned_receiver {
+                        TokenSpan {
+                            id: ident.id,
+                            range: dartq_source::SourceRange {
+                                offset: ident.range.offset.saturating_sub(2),
+                                length: 0,
+                            },
+                        }
+                    } else {
+                        self.exprs
+                            .last()
+                            .and_then(|e| e.read_span)
+                            .unwrap_or(*ident)
+                    };
                     self.dead_code(anchor);
                 }
                 // The member identifier's own entry sits on top (every
@@ -2791,7 +2855,27 @@ impl Interp<'_> {
                 if !self.receiver_is_cascade_target() {
                     self.exprs.pop();
                 }
+                let access_end = ident.range.end();
                 self.exprs.push(expr);
+                // The bottom-typed member read's exit (official
+                // `recordStaticType`'s `handleExit` on `type.isBottom`,
+                // ast.dart:11146-11153, the `Ident`/`Send` arms' twin): a
+                // `Never`-typed getter/property read — `a.f` over
+                // `Never get f` — ends the access path's flow at the
+                // member's own end, so `a.f(0)`'s argument list anchors the
+                // dead interval at `(` exactly like the bare `f(0)` face
+                // (the `exit_at` boundary above then lets `(` report).
+                // The post-send tile's own `Ev::Send` close already runs
+                // this exit at the send's `)`; re-running it here would
+                // move `exit_at` back over the member name.
+                if !post_send_tile
+                    && self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                {
+                    self.unreachable_cur();
+                    if !self.collecting() {
+                        self.exit_at = Some(access_end);
+                    }
+                }
             }
             ev @ (Ev::Send { .. } | Ev::SendNoArgs { .. }) => {
                 // The invocation's own closer is the null-shorted chain's
@@ -3081,7 +3165,7 @@ impl Interp<'_> {
                             | Ev::IndexAccess { .. }
                             | Ev::Exit { .. }
                     )
-                ) && !self.exit_at.is_some_and(|at| at >= open.range.offset)
+                ) && !self.exit_at.is_some_and(|at| at > open.range.offset)
                 {
                     self.dead_code(*open);
                 }
@@ -3136,7 +3220,15 @@ impl Interp<'_> {
                     && !self
                         .exit_at
                         .is_some_and(|at| at >= arg_span.range.offset)
+                    && !self
+                        .null_shorts
+                        .last()
+                        .is_some_and(|short| short.dead_at_open)
                 {
+                    // The `?.` face owns the anchor — the official polls
+                    // the member NAME before the argument list (the
+                    // `ArgumentsBegin` arm's skip, applied to the argument
+                    // poll too: `null?.m(1)` rows `m(1)`, never `1)`).
                     self.dead_code(arg_span);
                 }
                 // A condition-valued argument (`f(x is T)`, `f(!(x is T))`)
@@ -3351,8 +3443,53 @@ impl Interp<'_> {
                     // non-`flowEnd` close: a dead interval inside a section
                     // keeps running to the statement's `;`, never trimmed
                     // to the section face the selector shorts take.
-                    if let Some(short) = self.null_shorts.last_mut() {
-                        short.cascade_head = true;
+                    // `_verifyUnassignedVariable` lands the same anchor
+                    // without a second face: a definitely-unassigned
+                    // nullable target's value is `null` by construction, so
+                    // `null_short_begin` folds its access path dead
+                    // (`i?..m(1)` on an unassigned `int? i` is
+                    // `dead_at_open` like the `null` literal).
+                    let head_dead = self
+                        .null_shorts
+                        .last_mut()
+                        .is_some_and(|short| {
+                            short.cascade_head = true;
+                            short.dead_at_open
+                        });
+                    // The `?..` head's own dead-interval anchor (official:
+                    // the cascade SECTION is the first dead node and its
+                    // `beginToken` is the `?..` operator — `x?..m(1);`
+                    // reports `?..m(1);` through the statement's `;`,
+                    // unlike the `?.` member whose row trims at the
+                    // selector chain's end). The recorder delivers the
+                    // operator token as the no-op `Ev::ParenBegin`
+                    // immediately before this event — the only way a
+                    // `ParenBegin` can sit at `i - 1` is that phantom
+                    // (a real `(` never precedes `CascadeBegin`).
+                    // `_verifyUnassignedVariable` lands the same anchor for
+                    // an unassigned nullable target
+                    // (dead_code_verifier.dart:418-426 —
+                    // `verifyCascadeExpression` passes `first!.operator`,
+                    // the `?..` token), so EVERY null-aware head on a dead
+                    // receiver polls here, not only the unassigned face.
+                    // A selector-less section (`?..{`, `?..(p) {`) is the
+                    // parser's bail re-parsed as a sibling statement whose
+                    // body the recorder drops (see `Flow`'s
+                    // `cascade_probe_arm`): the official AST for that
+                    // broken cascade ends AT the operator and its rows
+                    // (the `?..` stub plus the broken recovery's tail
+                    // kills) are a recovery-face divergence the #2830 pins
+                    // own — the row is not modeled here.
+                    let recovered_section = matches!(
+                        events.get(i.wrapping_add(1)),
+                        Some(Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin { .. })
+                    );
+                    if head_dead && !self.stmt_began_dead && !recovered_section {
+                        if let Some(Ev::ParenBegin { span }) =
+                            events.get(i.wrapping_sub(1))
+                        {
+                            self.dead_code(*span);
+                        }
                     }
                     // The target's `ReadType` row re-spells the promoted
                     // face: upstream `cascadeReceiver` reads the target's
@@ -3526,8 +3663,15 @@ impl Interp<'_> {
                 // Another section of the same cascade follows: the head's
                 // `?..` context spans it too — only the section-local
                 // shorts close here, the head short joins after the LAST
-                // section.
-                let next_is_section = matches!(events.get(i + 1), Some(Ev::CascadeBegin { .. }));
+                // section. The `?..` operator's phantom `ParenBegin` (the
+                // recorder's span delivery at `begin_cascade`) sits before
+                // its `CascadeBegin` — look through one to find it.
+                let mut lookahead = i + 1;
+                if matches!(events.get(lookahead), Some(Ev::ParenBegin { .. })) {
+                    lookahead += 1;
+                }
+                let next_is_section =
+                    matches!(events.get(lookahead), Some(Ev::CascadeBegin { .. }));
                 if owns_short && !next_is_section {
                     self.cascade_head_open = false;
                 }

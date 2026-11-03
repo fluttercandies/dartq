@@ -885,6 +885,14 @@ pub(crate) struct NullShort {
     /// `?.`/`?[` selector short ends through `finishNullShorting` instead —
     /// the chain-close emit stays gated on it.
     pub cascade_head: bool,
+    /// The receiver was a definitely-unassigned nullable local
+    /// (`dead_code_verifier._verifyUnassignedSimpleIdentifier`,
+    /// dead_code_verifier.dart:467-497). Its row spans
+    /// `operator.offset .. node.end` of the enclosing access chain — for
+    /// a `?..` head that is the cascade EXPRESSION's end (the last
+    /// section's `)`), never the statement's `;` the first-dead-node
+    /// path yields for a genuinely `Null`-typed target.
+    pub unassigned_receiver: bool,
 }
 
 /// The receiver-invalidation sweep over one state's property slots: the
@@ -2345,8 +2353,25 @@ impl<'o> Interp<'o> {
             matched = Some(self.current.clone());
         }
         let non_null = non_null_literal || self.classify(ty) == Classification::NonNullable;
+        // A definitely-unassigned nullable local holds `null` by
+        // construction, so the access path is dead exactly like a
+        // `Null`-typed receiver's (official
+        // `dead_code_verifier._verifyUnassignedSimpleIdentifier`,
+        // dead_code_verifier.dart:467-497: the row starts at the `?`
+        // operator of `?.`/`?..` when the target is unparenthesized
+        // simple identifier of a definitely-unassigned promotable
+        // element). The receiver's own READ face keeps the declared
+        // type — only the null-short split folds it.
+        let unassigned_receiver = reference.is_some_and(|var| {
+            self.current.model(var).unassigned
+                && self
+                    .vars
+                    .get(var as usize)
+                    .is_some_and(|meta| meta.ty.nullable)
+        });
         match self.classify(ty) {
             Classification::NullOrEquivalent => self.unreachable_cur(),
+            _ if unassigned_receiver => self.unreachable_cur(),
             _ if non_null && self.sound_flow => {
                 // The skip path dies "assuming sound null safety"
                 // (official `_nullAwareAccess_rightBegin`,
@@ -2364,6 +2389,7 @@ impl<'o> Interp<'o> {
             dead_at_open: !self.reachable(),
             recv_offset,
             cascade_head: false,
+            unassigned_receiver,
         });
     }
 
@@ -2453,8 +2479,13 @@ impl<'o> Interp<'o> {
     /// (the semantic as-cast tail face's row) retires silently.
     pub(crate) fn null_short_end(&mut self) -> Option<NullShort> {
         let short = self.null_shorts.pop()?;
+        // A `?..` head's interval survives to the statement's `;` (its
+        // `nullAwareAccess_end` close runs no `flowEnd`) — except the
+        // `_verifyUnassignedVariable` face, whose row ends at the cascade
+        // EXPRESSION's own end: closing it here keeps the later dead code
+        // of the enclosing statement a separate row.
         let close = short.dead_at_open
-            && !short.cascade_head
+            && (!short.cascade_head || short.unassigned_receiver)
             && self.dead.as_ref().is_some_and(|window| {
                 !window.suppressed && window.anchor.range.offset > short.recv_offset
             });
@@ -2525,7 +2556,10 @@ impl<'o> Interp<'o> {
         // (its `nullAwareAccess_end` bypasses `handleNullShortingFinished`,
         // resolver.dart:2330): the interval runs to the statement's `;`,
         // never trimmed to a section end — `x?..m` and `x?..=> e` alike.
-        if !short.dead_at_open || short.cascade_head {
+        // The `_verifyUnassignedVariable` face is different: its row ends
+        // at the cascade expression's own end (the last section's), so the
+        // unassigned head DOES take the chain face.
+        if !short.dead_at_open || (short.cascade_head && !short.unassigned_receiver) {
             return;
         }
         short.face_end = short.face_end.max(end);
