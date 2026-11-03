@@ -8138,7 +8138,22 @@ impl<'a> Engine<'a> {
             if self.bound_mentions_undecidable(judged) {
                 continue;
             }
-            if self.assignable(arg, judged, false) != Some(false) {
+            // #3839 — the JUDGMENT unaliases the written argument, the
+            // message does not. Upstream's `isSubtypeOf` reads a
+            // `TypeAliasElement` use through its expansion (the alias is
+            // a decoration on the resolved type, `element.dart`'s
+            // `instantiate`), and only `getDisplayString` still prints
+            // the alias spelling. Judging the bare head instead fails
+            // every alias whose right-hand side is a FUNCTION type: the
+            // corpus's `typedef num Foo(Object o)` against
+            // `T extends Object Function(num)` (`V1<Foo>` in the
+            // extension-type semantics tests) read as a class head and
+            // reported `'Foo' doesn't conform to the bound 'Object
+            // Function(num)'` — three fabricated rows the oracle never
+            // reports. A class-headed alias already folded on the
+            // judgment path; this closes the function-typedef half.
+            let judged_arg = self.fold_alias_ty(arg);
+            if self.assignable(judged_arg, judged, false) != Some(false) {
                 continue;
             }
             let argument = self.ty_display(arg);

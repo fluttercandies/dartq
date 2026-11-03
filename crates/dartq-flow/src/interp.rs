@@ -292,6 +292,19 @@ pub(crate) enum Frame {
         /// end: a closure body's own statement boundaries must not rewrite
         /// what the enclosing statement began in.
         began_dead: bool,
+        /// The enclosing `pending_ty` sink, restored at the executable's
+        /// end. A type annotation parsed inside an executable belongs to
+        /// that executable's own signature or body — a local function's
+        /// `Never` return type, a nested closure's formal — and can never
+        /// be the declaration type a later `VarDeclBegin`/`Formal` of the
+        /// ENCLOSING context adopts. The slot is cleared on entry so the
+        /// executable's own signature annotations stay scoped, and the
+        /// enclosing pending restores on exit (#3778).
+        pending_ty: Option<Ty>,
+        /// `pending_ty`'s written-argument tree, restored likewise.
+        pending_ty_args: u32,
+        /// `pending_ty`'s written-annotation marker, restored likewise.
+        pending_ty_written: bool,
     },
     Block {
         scopes_base: usize,
@@ -3918,6 +3931,15 @@ impl Interp<'_> {
     fn exec_begin(&mut self, is_closure: bool, events: &[Ev], i: usize, match_of: &[u32]) {
         self.push_scope();
         let scopes_base = self.scopes.len() - 1;
+        // The annotation sink scopes to the executable (see
+        // [`Frame::Exec::pending_ty`]): a return type or formal annotation
+        // parsed inside this signature/body belongs to this executable
+        // alone — it must neither adopt an enclosing pending type nor
+        // leak its own outward. The enclosing slot rides the frame and
+        // restores at [`Self::exec_end`].
+        let pending_ty = self.pending_ty.take();
+        let pending_ty_args = std::mem::take(&mut self.pending_ty_args);
+        let pending_ty_written = std::mem::take(&mut self.pending_ty_written);
         if self.collect.is_some() {
             self.collect_push();
             self.stack.push(Frame::Exec {
@@ -3927,6 +3949,9 @@ impl Interp<'_> {
                 reads: FxHashSet::default(),
                 declared: FxHashSet::default(),
                 began_dead: self.stmt_began_dead,
+                pending_ty,
+                pending_ty_args,
+                pending_ty_written,
             });
             return;
         }
@@ -3945,6 +3970,9 @@ impl Interp<'_> {
                 reads: FxHashSet::default(),
                 declared: FxHashSet::default(),
                 began_dead,
+                pending_ty,
+                pending_ty_args,
+                pending_ty_written,
             });
             return;
         }
@@ -3962,6 +3990,9 @@ impl Interp<'_> {
                 reads: FxHashSet::default(),
                 declared: FxHashSet::default(),
                 began_dead,
+                pending_ty,
+                pending_ty_args,
+                pending_ty_written,
             });
             return;
         }
@@ -3979,6 +4010,9 @@ impl Interp<'_> {
             reads: effects.read.clone(),
             declared: effects.declared.clone(),
             began_dead,
+            pending_ty,
+            pending_ty_args,
+            pending_ty_written,
         });
     }
 
@@ -3999,12 +4033,23 @@ impl Interp<'_> {
             scopes_base,
             saved,
             began_dead,
+            pending_ty,
+            pending_ty_args,
+            pending_ty_written,
             ..
         } = frame
         else {
             self.stack.push(frame);
             return;
         };
+        // The annotation sink's enclosing face returns (see
+        // [`Frame::Exec::pending_ty`]): whatever the closed executable's
+        // signature or body left pending dies with it — a local
+        // function's `Never` return type is not the next declaration's
+        // header.
+        self.pending_ty = pending_ty;
+        self.pending_ty_args = pending_ty_args;
+        self.pending_ty_written = pending_ty_written;
         // The ctor-initializer face is the executable's own: an open
         // entry head or a fired latch never outlives its Exec frame.
         self.ctor_init_begin = None;

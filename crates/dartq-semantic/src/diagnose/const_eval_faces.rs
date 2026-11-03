@@ -217,14 +217,6 @@ impl ConstLookup for Engine<'_> {
     /// fold to type literals, top-level functions are constant tear-offs;
     /// everything else defers — the rows report genuine misses).
     fn ident(&self, name: StringId) -> IdentVerdict {
-        // A wildcard local (`_`) is never a readable name upstream — the
-        // const evaluator's `_` identifier resolves to nothing, so the
-        // read's verdict is the unresolved face (the oracle's
-        // `undefined_identifier` already reports it; the const site
-        // default fires beside it).
-        if self.is_wildcard(name) {
-            return IdentVerdict::Unresolved;
-        }
         for scope in self.const_scopes.iter().rev() {
             match scope.get(&name) {
                 Some(ConstBinding::Value(v)) => return IdentVerdict::Value(v.clone()),
@@ -236,6 +228,26 @@ impl ConstLookup for Engine<'_> {
                 Some(ConstBinding::Failed) => return IdentVerdict::Constant,
                 None => {}
             }
+        }
+        // A wildcard name (`_`) never denotes a readable const variable, but
+        // a read of it is *undefined* only when nothing declares the
+        // spelling: a `typedef _`/`class _` folds to its type literal (a
+        // valid constant) and a `_`-named local answers itself, so the read
+        // defers. Upstream pairs `undefined_identifier` with the const site
+        // default for the undeclared spelling only (`const y = _;` with no
+        // `_` in scope); after `class _ {}` or `typedef _ = Type;` the same
+        // initializer is a type literal constant and nothing reports. A
+        // wildcard local is never a `NotConstant` either — it binds nothing
+        // to be non-constant.
+        if self.is_wildcard(name) {
+            let declared = self.frames.iter().any(|f| f.locals.contains(&name))
+                || self.top_level_decl(name).is_some()
+                || !matches!(self.resolve_bare(name).0, BareInfo::Missing { .. });
+            return if declared {
+                IdentVerdict::Constant
+            } else {
+                IdentVerdict::Unresolved
+            };
         }
         if self.frames.iter().any(|f| f.locals.contains(&name)) {
             return IdentVerdict::NotConstant;
@@ -883,6 +895,57 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Widens an operator fault's anchor left to the prefix operator that
+    /// produced it.
+    ///
+    /// The capture folds a prefix operator onto its operand without
+    /// widening the node span (`ConstCapture::apply_unaries_at` copies the
+    /// operand's span), while upstream anchors every constant fault at the
+    /// *operator node*: `ConstantVisitor.visitUnaryExpression` hands the
+    /// whole `PrefixExpression` to `DartObjectComputer`, whose
+    /// `_reportError` reports that node's offset and length (upstream Dart
+    /// SDK source, pkg/analyzer/lib/src/dart/constant/evaluation.dart,
+    /// `visitUnaryExpression`; `value.dart`'s `negated`/`bitNot`/`logicalNot`
+    /// throw with the same entity). The oracle rows pin the node extent:
+    /// `!D` over a null-valued const reports at `!D`, `!!D` at the innermost
+    /// `!D`, `- - D` at `- D`, and the operand-type faults of `!1`, `~'a'`
+    /// and `-'a'` cover their operator as well.
+    ///
+    /// A candidate operator the *binary* grammar produced keeps the span
+    /// untouched: `1 - x` and `a ~ b` put a value-ending byte left of the
+    /// operator, which a prefix operator never has (it follows an opener,
+    /// another operator, or nothing).
+    fn unary_fault_extent(&self, span: SourceRange) -> SourceRange {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(span.offset).min(bytes.len());
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        let Some(op) = i.checked_sub(1) else {
+            return span;
+        };
+        if !matches!(bytes[op], b'!' | b'-' | b'~') {
+            return span;
+        }
+        let mut left = op;
+        while left > 0 && bytes[left - 1].is_ascii_whitespace() {
+            left -= 1;
+        }
+        if let Some(&b) = left.checked_sub(1).and_then(|j| bytes.get(j))
+            && (b.is_ascii_alphanumeric()
+                || b == b'_'
+                || b == b'$'
+                || matches!(b, b')' | b']' | b'}' | b'\'' | b'"'))
+        {
+            return span;
+        }
+        let start = self.utf16_of(op);
+        SourceRange {
+            offset: start,
+            length: span.end().saturating_sub(start),
+        }
+    }
+
     /// A const-eval fault reports its allow-listed `constEval*` code. The
     /// throws-exception face carries the oracle's context row (#1876 W5):
     /// upstream wraps a runtime-exception `InvalidConstant` into
@@ -902,6 +965,29 @@ impl<'a> Engine<'a> {
     /// super-constructor stack-trace contexts (evaluation.dart:3453/:3464)
     /// stay out of scope until the oracle corpus exercises them.
     pub(crate) fn emit_const_fault(&mut self, fault: ConstFault, span: SourceRange) {
+        // The operator faults anchor at the operator's node, not at the
+        // operand the capture folded it onto — see
+        // [`Self::unary_fault_extent`]. The remaining variants anchor at the
+        // entity their own face already named (an element, a condition, a
+        // cyclic reference), so they keep the incoming span.
+        let span = match fault {
+            ConstFault::TypeBool
+            | ConstFault::TypeBoolInt
+            | ConstFault::TypeBoolNumString
+            | ConstFault::TypeInt
+            | ConstFault::TypeNum
+            | ConstFault::TypeNumString
+            | ConstFault::TypeString
+            | ConstFault::ThrowsException
+            | ConstFault::ThrowsIdbze => self.unary_fault_extent(span),
+            ConstFault::PrimitiveEquality
+            | ConstFault::Recursive
+            | ConstFault::ForElement
+            | ConstFault::NonBoolCondition
+            | ConstFault::SpreadExpectedListOrSet
+            | ConstFault::SpreadExpectedMap
+            | ConstFault::ExpressionInMap => span,
+        };
         let code = match fault {
             ConstFault::TypeBool => SemanticCode::ConstEvalTypeBool,
             ConstFault::TypeBoolInt => SemanticCode::ConstEvalTypeBoolInt,
@@ -4626,3 +4712,7 @@ mod face_tests {
 #[cfg(test)]
 #[path = "ticket_3163_tests.rs"]
 mod ticket_3163_tests;
+
+#[cfg(test)]
+#[path = "ticket_3842_tests.rs"]
+mod ticket_3842_tests;

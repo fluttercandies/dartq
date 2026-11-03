@@ -7821,3 +7821,12 @@ mod ticket_3648_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3785_tests.rs"]
 mod ticket_3785_tests;
+
+/// The #3848 pins: the `duplicate_field_formal_parameter` descriptor — the
+/// initializing-formal (`this.x`) pair swap of the formal duplicate scope
+/// (upstream `duplicate_definition_verifier.dart:447-450`). The row-level
+/// swap waits on the capture-to-fold field-formal bit; the code contract is
+/// pinned here so the two codes can never collapse into one.
+#[cfg(test)]
+#[path = "diagnose/ticket_3848_tests.rs"]
+mod ticket_3848_tests;

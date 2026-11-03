@@ -364,7 +364,15 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let name_text = self.strings.resolve(getter).to_string();
-                    let type_text = self.strings.resolve(head).to_string();
+                    // The message names the head INSTANTIATED TO BOUNDS —
+                    // `Square<MetricUnits>` over a bare generic alias, `Fn`
+                    // over a non-generic one — the receiver face
+                    // `type_analyzer.dart:1669-1689` resolves each field
+                    // getter against (`named_type_resolver.dart:226` for an
+                    // interface, `:246` for an alias). `ty_display` is that
+                    // display face; an unresolvable head keeps its bare
+                    // spelling.
+                    let type_text = self.ty_display(Ty::named(head));
                     self.stage_typed(SemanticCode::UndefinedGetter, at, &name_text, &type_text);
                     continue;
                 }
@@ -401,7 +409,14 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let name_text = self.strings.resolve(getter).to_string();
-            let type_text = self.strings.resolve(head).to_string();
+            // Same display face as the function head's miss above: the
+            // oracle names the head instantiated to bounds
+            // (`type_analyzer.dart:1669-1689`), so a bare generic head
+            // (`Circle` over `Circle<T extends MetricUnits>`) spells
+            // `Circle<MetricUnits>` — an alias keeps the written spelling
+            // with its bounds-filled arguments, a non-generic or
+            // unresolvable head its bare name.
+            let type_text = self.ty_display(Ty::named(head));
             self.stage_typed(SemanticCode::UndefinedGetter, at, &name_text, &type_text);
         }
     }
@@ -3215,6 +3230,55 @@ impl<'a> Engine<'a> {
             .filter(|name| !non_member_resolved.contains(name))
             .copied()
             .collect();
+        // The self-reference exclusion (`_useIdentifierElement`'s two identity
+        // arms, unused_local_elements_verifier.dart:489-495): a reference to
+        // an element from INSIDE that element's own declaration credits
+        // nothing — `get _g { return _g; }` reports `_g`, and the recursive
+        // `_f(p - 1)` inside `_f` leaves `_f` unused. Upstream reaches the arm
+        // through the gather visitor's `_enclosingExec` (set by
+        // `visitFunctionDeclaration` :214-220, `visitMethodDeclaration`
+        // :287-292 and `visitTopLevelGetterDeclaration` :390-395 — the
+        // declarations that own a body) and `_enclosingClass`
+        // (`visitClassDeclaration` :94-102); the engine keeps no
+        // per-reference enclosing declaration, so the declaration's own token
+        // extent re-derives it here: a reference strictly inside the extent of
+        // a same-spelled executable site is that site's own body.
+        let executable_spans: Vec<(StringId, StringId, u32, u32)> = self
+            .decl_sites
+            .iter()
+            .filter(|site| match site.kind {
+                // The three declaration shapes whose visit sets
+                // `_enclosingExec`. A setter rides `TopLevelFn`/`Member` like
+                // its getter twin; a constructor never sets the slot, so it
+                // stays out.
+                DeclKind::TopLevelFn => true,
+                DeclKind::Member { kind, .. } => !matches!(kind, MemberKind::Field),
+                _ => false,
+            })
+            .filter_map(|site| {
+                let tokens = self.tokens.as_slice();
+                let at = tokens.partition_point(|token| token.utf16_offset < site.range.offset);
+                if tokens.get(at).map(|token| token.utf16_offset) != Some(site.range.offset) {
+                    return None;
+                }
+                // A setter site keys `name=`; its body reads the bare
+                // spelling, so both spellings credit the same element.
+                let end = executable_extent(tokens, at)?;
+                Some((site.name, self.bare_name(site.name), site.range.offset, end))
+            })
+            .collect();
+        let self_references: FxHashSet<u32> = self
+            .refs
+            .iter()
+            .filter(|r| {
+                executable_spans.iter().any(|&(spelling, bare, start, end)| {
+                    (r.name == spelling || r.name == bare)
+                        && r.range.offset > start
+                        && r.range.offset < end
+                })
+            })
+            .map(|r| r.range.offset)
+            .collect();
         let element_used: FxHashSet<StringId> = self
             .used_names
             .iter()
@@ -3231,11 +3295,14 @@ impl<'a> Engine<'a> {
         // a resolved member access credits the exact element it bound,
         // never a same-spelling member of a sibling class. The Member arm's
         // `_isUsedMember` check reads this set — `element_used`'s name-level
-        // set would spare `A._m` from `B._m`'s use.
+        // set would spare `A._m` from `B._m`'s use. A member's own body read
+        // of itself is no use at all, so the self-reference offsets drop
+        // here too (see the extent block above).
         let member_used_elements: FxHashSet<(FileId, StringId, StringId)> = self
             .report
             .member_refs
             .iter()
+            .filter(|r| !self_references.contains(&r.range.offset))
             .map(|r| (r.target_file, r.target_container, r.target_name))
             .collect();
         // The implicit-this setter face (upstream `preferSetter`,
@@ -3243,17 +3310,21 @@ impl<'a> Engine<'a> {
         // `RefTarget::Missing` at push time (the plain-name `_s` is not in
         // `A.members` — only `_s=` is), and `bare_write_target_exists`
         // rescues the write silently without a `member_refs` edge. The
-        // write still credits the setter element — the `refs` pool's
-        // `Missing` arm re-derives it (the row stack is drained by
+        // write still credits a CONTAINER's setter element — the `refs`
+        // pool's `Missing` arm re-derives it (the row stack is drained by
         // finalize): a `RefTarget::Missing` entry in write position
         // (`pure_write_at`) re-derives the `this_type` the drained row
         // carried through `enclosing_container_at`, and the setter's
-        // `name=` spelling is the `member_found` probe.
+        // `name=` spelling is the `member_found` probe. A top-level write's
+        // `this_type` is `None` and its accessor credit is
+        // `top_level_setter_writes`' below — the same write must not reach
+        // the name-level top-level pool, where it would spare the VARIABLE.
         let missing_write_candidates: Vec<(Option<StringId>, StringId)> = self
             .refs
             .iter()
             .filter(|r| {
                 matches!(r.target, RefTarget::Missing)
+                    && !self_references.contains(&r.range.offset)
                     && self.pure_write_at(r.range.offset, r.range.end())
             })
             .map(|r| {
@@ -3263,34 +3334,26 @@ impl<'a> Engine<'a> {
             .collect();
         let mut missing_write_setters: FxHashSet<(FileId, StringId, StringId)> =
             FxHashSet::default();
-        let mut missing_write_top_levels: FxHashSet<StringId> = FxHashSet::default();
         for (this_type, name) in missing_write_candidates {
             let setter = self.setter_spelling(name);
-            match this_type {
-                Some(container)
-                    if self
-                        .container_kind_of(container)
-                        .is_some_and(|kind| kind != ContainerKind::Extension)
-                        && self.member_found(container, setter, false) =>
-                {
-                    missing_write_setters.insert((self.file, container, setter));
-                }
-                // A top-level write's `this_type` is `None` — the setter's
-                // `name=` spelling resolves through the scope lookup
-                // (`resolve_bare` at push time already tried it and missed:
-                // `BareInfo::Missing` is the push-time result, not the
-                // write-upgraded second chance `bare_write_target_exists`
-                // ran). A `RefTarget::Decl` hit means the top-level setter
-                // exists and the write used it. An extension body's
-                // `this_type` is `None` upstream (the `on` face carries
-                // the write), so it falls here too — the extension's
-                // `on` type setter resolves through the scope lookup the
-                // same way a top-level's does.
-                _ => {
-                    if matches!(self.resolve_bare(setter).1, RefTarget::Decl { .. }) {
-                        missing_write_top_levels.insert(name);
-                    }
-                }
+            // Only a CONTAINER-bound write feeds this set. A top-level (or
+            // extension-body) write's `this_type` is `None`, and its setter
+            // credit is `top_level_setter_writes`' — a pure write binds the
+            // SETTER element, never the variable, so feeding the name-level
+            // top-level pool here would spare the variable
+            // (`_useAssignmentTargetElement` →
+            // `_useIdentifierElement(node.write.element)`,
+            // unused_local_elements_verifier.dart:464-479 against
+            // `_visitTopLevelVariableElement`'s element check at :1319-1325).
+            let Some(container) = this_type else {
+                continue;
+            };
+            if self
+                .container_kind_of(container)
+                .is_some_and(|kind| kind != ContainerKind::Extension)
+                && self.member_found(container, setter, false)
+            {
+                missing_write_setters.insert((self.file, container, setter));
             }
         }
         // `element_used`'s Member-arm view: names that resolved ONLY through
@@ -3471,10 +3534,10 @@ impl<'a> Engine<'a> {
                     && !write_offsets.contains(&r.range.offset)
                     && !pure_write_refs.contains(&r.range.offset)
                     && !self.statement_discarded_rows.contains(&r.range.offset)
+                    && !self_references.contains(&r.range.offset)
             })
             .map(|r| r.name)
             .chain(self.type_uses.iter().map(|(_, name)| *name))
-            .chain(missing_write_top_levels.iter().copied())
             .collect();
         // The resolved member reads the refs pool already carries: the
         // `member_refs` edge pool misses the access shapes whose credit the
@@ -3505,6 +3568,7 @@ impl<'a> Engine<'a> {
                     if !write_offsets.contains(&r.range.offset)
                         && !pure_write_refs.contains(&r.range.offset)
                         && !written_ref_offsets.contains(&r.range.offset)
+                        && !self_references.contains(&r.range.offset)
                         && !self.pure_write_at(r.range.offset, r.range.end())
                         && !self.statement_discarded_rows.contains(&r.range.offset) =>
                 {
@@ -3530,6 +3594,7 @@ impl<'a> Engine<'a> {
             .iter()
             .filter(|r| {
                 matches!(r.target, RefTarget::Decl { .. } | RefTarget::Missing)
+                    && !self_references.contains(&r.range.offset)
                     && (write_offsets.contains(&r.range.offset)
                         || pure_write_refs.contains(&r.range.offset))
             })
@@ -8459,6 +8524,63 @@ fn normalize_deprecation(message: &str) -> Option<String> {
     }
 }
 
+/// The UTF-16 end (exclusive) of the executable declaration whose name token
+/// sits at `name_at`: the close of its `{…}` body, or the `;` that ends an
+/// expression body (`=> …`) or a body-less head (`int get _g;`).
+///
+/// The walk tracks one bracket depth so a `{` inside a formal list, an
+/// argument list or an expression body never reads as the declaration's own
+/// body, and only a `{` at depth zero opens one. `None` when the tokens run
+/// out first (recovery residue): the caller then keeps every reference, the
+/// under-report direction.
+fn executable_extent(tokens: &[dartq_scanner::Token], name_at: usize) -> Option<u32> {
+    use dartq_scanner::TokenKind;
+    // An expression body's `{…}` (a set/map literal, a closure body) is a
+    // bracket like any other; `=>` arms the flag that stops it reading as
+    // the declaration's own body.
+    let mut after_arrow = false;
+    let mut depth = 0i32;
+    let mut at = name_at + 1;
+    while let Some(token) = tokens.get(at) {
+        match token.kind {
+            TokenKind::OpenParen | TokenKind::OpenSquare => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare => depth -= 1,
+            TokenKind::OpenCurly if depth == 0 && !after_arrow => {
+                let mut inner = 1i32;
+                let mut cursor = at + 1;
+                while let Some(next) = tokens.get(cursor) {
+                    match next.kind {
+                        TokenKind::OpenCurly => inner += 1,
+                        TokenKind::CloseCurly => {
+                            inner -= 1;
+                            if inner == 0 {
+                                // `}` is one UTF-16 unit.
+                                return Some(next.utf16_offset + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    cursor += 1;
+                }
+                return None;
+            }
+            TokenKind::OpenCurly => depth += 1,
+            TokenKind::CloseCurly => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            TokenKind::Function if depth == 0 => after_arrow = true,
+            // `;` is one UTF-16 unit.
+            TokenKind::Semicolon if depth == 0 => return Some(token.utf16_offset + 1),
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
 /// The shortest bracket-balanced token run ending at the `=` at `eq`: the
 /// left side of a candidate pattern assignment. Walking back from the `=`
 /// the running bracket depth returns to zero at the run's own head — the
@@ -10881,3 +11003,20 @@ mod ticket_3636_tests;
 #[cfg(test)]
 #[path = "ticket_3643_tests.rs"]
 mod ticket_3643_tests;
+
+/// The #3840 `unused_element` pins — the self-reference exclusion
+/// (`_useIdentifierElement`'s `_enclosingExec` arm) and the write-only
+/// top-level variable (a pure write credits the setter accessor, never the
+/// variable) — kept as a standalone module so the shared `pins` rig stays
+/// untouched.
+#[cfg(test)]
+#[path = "ticket_3840_tests.rs"]
+mod ticket_3840_tests;
+
+/// The #3855 `undefined_getter` display pins — an object-pattern getter miss
+/// names the head instantiated to bounds (`Circle<MetricUnits>`, never the raw
+/// `Circle`), for the foreign and same-file generic heads, the function-alias
+/// head, and the non-generic head/alias spellings, plus the silence twins.
+#[cfg(test)]
+#[path = "ticket_3855_tests.rs"]
+mod ticket_3855_tests;

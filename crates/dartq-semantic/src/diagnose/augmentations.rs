@@ -1693,7 +1693,7 @@ fn check_default_chain(
 /// modifier checks, then the written-type comparison — upstream
 /// `checkFormalParameterPair`'s order. An unwritten intro type compares as
 /// `dynamic` (the oracle's parameter type); the augmentation's omitted
-/// type never reports.
+/// type never reports, and an unresolvable face on either side is no row.
 #[expect(clippy::too_many_arguments)] // one column per check input
 fn check_pair(
     out: &mut Vec<Diagnostic>,
@@ -1734,24 +1734,36 @@ fn check_pair(
         }
     }
     if let (Some(actual_ty), Some(span)) = (cur.ty, cur.ty_range) {
-        // The judged side: resolved-type equality like the return pair —
-        // `p.C` and `C` name one element, a typedef spells its expansion;
-        // an unwritten/invalid expected face is `dynamic` and an invalid
-        // actual face is the oracle's `InvalidType` bail.
-        let matches = match first.ty {
-            Ty::UNKNOWN => canon_top(actual_ty, file, own, aug_params, canon)
-                .is_some_and(|actual| actual == "dynamic"),
-            expected_ty => {
-                match (
-                    canon_top(actual_ty, file, own, aug_params, canon),
-                    canon_top(expected_ty, intro_unit_id, intro_unit, intro_params, canon),
-                ) {
-                    (Some(actual), Some(expected)) => actual == expected,
-                    _ => false,
-                }
-            }
+        // The judged side is the INTRODUCTION's ELEMENT type (upstream
+        // `firstParameter.element.type`), compared by resolved-type equality
+        // like the return pair — `p.C` and `C` name one element, a typedef
+        // spells its expansion — while the augmentation's participation is
+        // gated on its own written annotation (`cur.ty`, upstream
+        // `formalParameter.explicitFragmentType`).
+        //
+        // `Ty::Never` is this model's park for a positional `super.x` formal
+        // with no written annotation (`collector.rs`: the association crosses
+        // containers, so the capture defers it): upstream reads the ASSOCIATED
+        // super-constructor parameter's type there, a lookup this pass has no
+        // engine handle for (`associated_super_formal_ty`, invocation.rs). The
+        // honest direction is the suppression one — comparing would display a
+        // `Never` no source wrote.
+        if first.ty == Ty::Never {
+            return;
+        }
+        // An unwritten plain formal's element type is `dynamic`.
+        // Upstream bails on `actualType is InvalidType || expectedType is
+        // InvalidType`: an unresolvable face on EITHER side is no row at all,
+        // never a mismatch (`_ => false` used to fabricate one).
+        let expected = match first.ty {
+            Ty::UNKNOWN => Some("dynamic".to_string()),
+            expected_ty => canon_top(expected_ty, intro_unit_id, intro_unit, intro_params, canon),
         };
-        if !matches {
+        let actual = canon_top(actual_ty, file, own, aug_params, canon);
+        let (Some(actual), Some(expected)) = (actual, expected) else {
+            return;
+        };
+        if actual != expected {
             let expected = match first.ty {
                 Ty::UNKNOWN => "dynamic".to_string(),
                 ty => display_ty(ty, intro_unit, strings),
@@ -3070,3 +3082,10 @@ mod ticket_3569_tests;
 #[cfg(test)]
 #[path = "ticket_3650_tests.rs"]
 mod ticket_3650_tests;
+
+// The #3843 pins — the formal-parameter type pair's judgment inputs: the
+// `InvalidType` bail on both faces, the positional `super.x` park, and the
+// plain-vs-field-formal element type.
+#[cfg(test)]
+#[path = "ticket_3843_tests.rs"]
+mod ticket_3843_tests;

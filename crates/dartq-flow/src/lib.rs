@@ -307,6 +307,10 @@ mod ticket_3627_tests;
 mod ticket_3775_pins;
 
 #[cfg(test)]
+#[path = "ticket_3778_pins.rs"]
+mod ticket_3778_pins;
+
+#[cfg(test)]
 #[path = "ticket_3791_pins.rs"]
 mod ticket_3791_pins;
 
@@ -321,3 +325,7 @@ mod never_cond_tests;
 
 #[cfg(test)]
 mod void_region_tests;
+
+#[cfg(test)]
+#[path = "ticket_3853_pins.rs"]
+mod ticket_3853_pins;

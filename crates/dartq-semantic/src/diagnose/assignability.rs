@@ -4216,6 +4216,179 @@ impl<'a> Engine<'a> {
         ty
     }
 
+    // —— the conditional's context-driven arm conversion (#3849) ————————
+
+    /// Upstream `analyzeIntLiteral`'s schema test
+    /// (`_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:950-967`):
+    /// `convertToDouble = !isTypeSchemaSatisfied(intType, schema) &&
+    /// isTypeSchemaSatisfied(doubleType, schema)`. The criterion is the
+    /// literal's CONTEXT SCHEMA, never the literal's own static type — a
+    /// schema `int` satisfies keeps the literal `int` (`int`, `num`,
+    /// `dynamic`, `Object`), and a schema that satisfies neither keeps it
+    /// `int` too (a type parameter, an unrelated class).
+    fn int_literal_double_ctx(&self, ctx: Ty) -> bool {
+        let ctx = self.fold_alias_ty(ctx);
+        let (int, double) = (self.members.primitive_ids[0], self.members.primitive_ids[1]);
+        self.slot_subtype(Ty::named(double), ctx) == Some(true)
+            && self.slot_subtype(Ty::named(int), ctx) != Some(true)
+    }
+
+    /// The int-literal arm row: [`Self::primitive_literal`]'s shape refined
+    /// to the one head the conversion keys on.
+    fn is_int_literal_row(&self, row: &Row) -> bool {
+        Self::primitive_literal(row, &self.members.primitive_ids)
+            && matches!(row.ty, Ty::Named { name, .. } if name == self.members.primitive_ids[0])
+    }
+
+    /// The outermost live row occupying the window that opens after `after`
+    /// and closes by `limit`: the fold keeps a composite's own row above its
+    /// operands, so the widest end (then the widest start) is the
+    /// expression's result row.
+    fn row_spanning(&self, after: u32, limit: u32) -> Option<Row> {
+        self.rows
+            .iter()
+            .filter(|candidate| !matches!(candidate.shape, RowShape::TypeUse(..)))
+            .filter(|candidate| {
+                !self
+                    .interpolation_child_rows
+                    .contains(&candidate.range.offset)
+            })
+            .filter(|candidate| candidate.range.offset > after && candidate.range.end() <= limit)
+            .max_by_key(|candidate| {
+                (
+                    candidate.range.end(),
+                    std::cmp::Reverse(candidate.range.offset),
+                )
+            })
+            .cloned()
+    }
+
+    /// The `?`/`:` of a conditional spanning `[start, end)`, at the extent's
+    /// OWN bracket depth: a `?`…`:` nested in a grouping paren or a literal
+    /// body (`f(k: v)`, `{'k': v}`) belongs to that inner node, never to
+    /// this one. The ternary counter pairs a nested conditional's markers
+    /// with its own (`a ? b ? c : d : e` — the outer `?` matches the LAST
+    /// `:`). `??` is a distinct token kind, so the if-null fold never
+    /// matches.
+    fn conditional_markers(&self, start: u32, end: u32) -> Option<(u32, u32)> {
+        use dartq_scanner::TokenKind as TK;
+        let tokens = self.tokens.as_slice();
+        let lo = tokens.partition_point(|token| token.utf16_offset < start);
+        let hi = tokens.partition_point(|token| token.utf16_offset < end);
+        let mut depth = 0i32;
+        let mut open: Option<u32> = None;
+        let mut ternaries = 0i32;
+        for token in &tokens[lo..hi] {
+            match token.kind {
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => depth += 1,
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth -= 1,
+                TK::Question if depth == 0 => {
+                    open.get_or_insert(token.utf16_offset);
+                    ternaries += 1;
+                }
+                TK::Colon if depth == 0 && ternaries > 0 => {
+                    ternaries -= 1;
+                    if ternaries == 0 {
+                        return Some((open?, token.utf16_offset));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The then/else arm rows of the folded conditional spanning `row`.
+    /// [`Engine::fold_conditional`] leaves the arm rows live under the
+    /// composite `Value` row, so the written `?`/`:` pair alone identifies
+    /// them. The extent widens through a redundant grouping paren: the row
+    /// model parks the parenthesized group's own face on a one-unit row at
+    /// the `)`, with the inner conditional's composite row ending just
+    /// before it — `(a ? b : c)` and `a ? b : c` are the same node.
+    fn conditional_arms_in(&self, row: &Row) -> Option<(Row, Row)> {
+        let mut span = row.range;
+        let mut markers = None;
+        for _ in 0..4 {
+            if let Some(found) = self.conditional_markers(span.offset, span.end()) {
+                markers = Some(found);
+                break;
+            }
+            let Some(wider) = self
+                .rows
+                .iter()
+                .filter(|candidate| !matches!(candidate.shape, RowShape::TypeUse(..)))
+                .filter(|candidate| {
+                    !self
+                        .interpolation_child_rows
+                        .contains(&candidate.range.offset)
+                })
+                .filter(|candidate| {
+                    candidate.range.end() == span.offset && candidate.range.length > span.length
+                })
+                .min_by_key(|candidate| candidate.range.offset)
+            else {
+                break;
+            };
+            span = wider.range;
+        }
+        let (question, colon) = markers?;
+        let then_row = self.row_spanning(question, colon)?;
+        let else_row = self.row_spanning(colon, span.end())?;
+        Some((then_row, else_row))
+    }
+
+    /// The conditional's re-join under the context `to` — the arm conversion
+    /// upstream performs while it TYPES the node, recovered at the
+    /// assignability ask. `None` for every row that is not a conditional,
+    /// and for every context that converts nothing (the fold's upward join
+    /// already IS upstream's answer there, so nothing is re-derived).
+    fn conditional_context_join(&self, row: &Row, to: Ty) -> Option<Ty> {
+        if !self.int_literal_double_ctx(to) {
+            return None;
+        }
+        self.conditional_ctx_ty(row, self.fold_alias_ty(to), 0)
+    }
+
+    /// [`Self::conditional_context_join`]'s walk: each arm typed under the
+    /// (converting) context, then joined the way
+    /// [`Engine::fold_conditional`] joins them.
+    fn conditional_ctx_ty(&self, row: &Row, ctx: Ty, depth: u8) -> Option<Ty> {
+        if depth > 4 {
+            return None;
+        }
+        let (then_row, else_row) = self.conditional_arms_in(row)?;
+        let then_ty = self.arm_ctx_ty(&then_row, ctx, depth + 1);
+        let else_ty = self.arm_ctx_ty(&else_row, ctx, depth + 1);
+        if then_ty == Ty::UNKNOWN || else_ty == Ty::UNKNOWN {
+            return None;
+        }
+        Some(self.join_operand_ty(then_ty, else_ty, false))
+    }
+
+    /// [`Self::conditional_ctx_ty`]'s arm face: a nested conditional
+    /// re-joins under the same context, an int literal arm is `double` (the
+    /// context converts it — `analyzeIntLiteral`), and every other arm keeps
+    /// the type the fold read.
+    fn arm_ctx_ty(&self, row: &Row, ctx: Ty, depth: u8) -> Ty {
+        if let Some(joined) = self.conditional_ctx_ty(row, ctx, depth) {
+            return joined;
+        }
+        if self.is_int_literal_row(row) {
+            return Ty::named(self.members.primitive_ids[1]);
+        }
+        self.expression_row_ty(row)
+    }
+
+    /// [`Self::conditional_context_join`] applied to a declaration or write
+    /// face: the source type to ask when the arms' context-driven conversion
+    /// grants a verdict the upward join refused. A granted pair only — a
+    /// re-join the verdict still refuses leaves the row alone.
+    fn conditional_context_ty(&self, row: &Row, to: Ty, from: Ty, literal: bool) -> Option<Ty> {
+        let joined = self.conditional_context_join(row, to)?;
+        (joined != from && self.assignment_verdict(joined, to, literal) == Some(true))
+            .then_some(joined)
+    }
+
     /// The assignment check (`invalid_assignment`,
     /// `assignment_expression_resolver.dart:795`): a single-row right-hand
     /// side whose type the M1 facts know (`Null` or a captured declared
@@ -4398,6 +4571,16 @@ impl<'a> Engine<'a> {
                 );
             }
             return;
+        }
+        // The conditional's context-driven arm conversion (upstream
+        // `analyzeIntLiteral`): `double d = c ? 42 : 3.14` joins the arms
+        // upward into `num` before the write's type is known, while upstream
+        // types the int literal `double` off the target's schema — so the
+        // pair it decides is `double`/`double`, not `num`/`double`. Re-join
+        // the arms under the target's own type and adopt the result when it
+        // grants the verdict.
+        if let Some(joined) = self.conditional_context_ty(&rhs_row, to, from, literal) {
+            from = joined;
         }
         let stashed = self.stashed_fn_pair(&rhs_row, Some(&target_row), from, to);
         let verdict = stashed
@@ -4785,6 +4968,15 @@ impl<'a> Engine<'a> {
             self.emit_use_of_void_result(from, &row);
             self.init_mark = None;
             return;
+        }
+        // The conditional's context-driven arm conversion (see
+        // [`Self::conditional_context_ty`] and upstream
+        // `_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:950-967`):
+        // a declared `double` types the conditional's int-literal arm
+        // `double`, so `double d = c ? 42 : 3.14` asks `double` against
+        // `double` — never the arms' upward `num` join against `double`.
+        if let Some(joined) = self.conditional_context_ty(&row, to, from, literal) {
+            from = joined;
         }
         let stashed = self.stashed_fn_pair(&row, None, from, to);
         let verdict = stashed
@@ -8402,6 +8594,28 @@ impl<'a> Engine<'a> {
         if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
             return self.fn_shape_pair_verdict(from_fn, to_fn);
         }
+        // Left Bottom (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+        // element/subtype.dart:69-71 — `if (T0 is NeverTypeImpl &&
+        // T0.nullabilitySuffix == none) return true;`): a non-nullable
+        // `Never` source subtypes EVERY target, and the arm runs ahead of
+        // every target decomposition. The pair above is already normalized
+        // ([`Engine::is_never_ty`] folds the written spelling and the
+        // canonical variant onto [`Ty::Never`]), so the variant identity is
+        // the whole test. A `Never` target keeps its own answer from the
+        // Right Bottom block below, which agrees on this source.
+        //
+        // The strict-subtype twin ([`Engine::slot_subtype`]) has carried
+        // this arm since #2967; the assignability face did not, so every
+        // nested ask routing through it — the function rule's contravariant
+        // formal leg first of all — lost the bottom's universal acceptance:
+        // `Never <: Null` answered undecided, and `void Function(Null)`
+        // against `void Function(Never)` reported
+        // `argument_type_not_assignable` where the oracle stays silent
+        // (census: the `void Function(Null)` → `void Function(Never)`
+        // extras). #3836.
+        if from == Ty::Never {
+            return Some(true);
+        }
         // Right Bottom: no subtyping rule ever holds INTO `Never` but
         // reflexivity (upstream Dart SDK source, pkg/analyzer/lib/src/
         // dart/element/subtype.dart:74-77 answers the `Never` SOURCE; a
@@ -10964,3 +11178,21 @@ mod ticket_3472_tests;
 #[cfg(test)]
 #[path = "ticket_3619_tests.rs"]
 mod ticket_3619_tests;
+
+// The #3836 pins (Left Bottom on the assignability face: a non-nullable
+// `Never` source subtypes every target, which the function rule's
+// contravariant formal leg needs so `void Function(Null)` fits
+// `void Function(Never)`). A distinct file name from `tests.rs`'s
+// `ticket_3836_tests` module — another lane owns that one. Same `#[path]`
+// registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3836_assignability_tests.rs"]
+mod ticket_3836_assignability_tests;
+
+// The #3849 pins (an integer literal's `double` typing is decided by its
+// CONTEXT SCHEMA — `analyzeIntLiteral` — so the `?:` arm conversion follows
+// the declaration's/write's own type, and a `num`-typed arm keeps the `num`
+// join). Same `#[path]` registration as the pins above.
+#[cfg(test)]
+#[path = "ticket_3849_tests.rs"]
+mod ticket_3849_tests;

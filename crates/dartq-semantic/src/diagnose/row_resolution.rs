@@ -6537,13 +6537,21 @@ impl<'a> Engine<'a> {
             return;
         }
         let name_text = self.strings.resolve(row.name);
-        // The static-face type text is the element's `thisType` — a
-        // generic declaration keeps its own parameter spellings
+        // The static-face GETTER/SETTER text is the element's `thisType` —
+        // a generic declaration keeps its own parameter spellings
         // (`List.gone` names `List<E>`, `FutureOr.foo` `FutureOr<T>`,
         // lookup_failure_reporter.dart's `interface.thisType`; probed
         // 3.13.7). The extension face is exempt: its trio names the
         // declaration's bare `name!`, never the instantiated type
         // (`_extensionReadFailure`).
+        //
+        // The INVOKE face never carries the arguments: upstream reports it
+        // through `_reportUndefinedMethodOrNew(receiver, ...)`, which names
+        // `InterfaceElement.displayName` — the bare element (`C.gone()` over
+        // `class C<T>` reports 'C', `A.gone()` over `typedef A = List<int>`
+        // reports 'List'; probed 3.13.7), and that is the text the whole
+        // `undefined_method` family shares.
+        let method_text = self.strings.resolve(container).to_string();
         let mut type_text = self.strings.resolve(container).to_string();
         if resolved_kind != ContainerKind::Extension && !resolved.type_param_names.is_empty() {
             type_text.push('<');
@@ -6575,7 +6583,7 @@ impl<'a> Engine<'a> {
             ),
         };
         match row.intent {
-            Intent::Invoke => self.emit(invoke_code, row.range, name_text, &type_text),
+            Intent::Invoke => self.emit(invoke_code, row.range, name_text, &method_text),
             Intent::Read => self.emit(read_code, row.range, name_text, &type_text),
             Intent::Write => self.emit(write_code, row.range, name_text, &type_text),
             Intent::ReadWrite => {
@@ -7369,6 +7377,19 @@ impl<'a> Engine<'a> {
             // `fn!`'s assert): a promoted receiver read stands non-null —
             // the same face the general arm below re-decides through
             // `promoted_recv_reads`.
+            //
+            // The stand-down retypes the SHAPE too, not just the flag: the
+            // oracle's `resolve()` reads one promoted `receiverType` for
+            // both facts (`isNullable` and the `RecordTypeImpl` field arm,
+            // type_property_resolver.dart:95-99 and :224-229), while
+            // `record_field_ty` rejects a nullable record face outright
+            // (`nullable && !null_aware -> None`). Leaving the
+            // nullable shape standing made the guarded `r1.$1` over
+            // `typedef R1 = (int, String)?` miss a declared field. The
+            // UNGUARDED spelling keeps the nullable face — its row is the
+            // unchecked dereference the `isNullable` tail reports, never an
+            // `undefined_getter`.
+            let mut shape = folded;
             if receiver_nullable
                 && let Some(read_span) = self
                     .promoted_recv_reads
@@ -7380,9 +7401,10 @@ impl<'a> Engine<'a> {
                 && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
             {
                 receiver_nullable = false;
+                shape = Self::non_nullable_ty(folded);
             }
             let display = self.render_ty(ty);
-            self.check_shape_receiver(row, folded, &display, receiver_nullable);
+            self.check_shape_receiver(row, shape, &display, receiver_nullable);
             return;
         }
         // The extension-application faces read the receiver's nullability
@@ -16850,3 +16872,11 @@ mod ticket_3646_tests;
 #[cfg(test)]
 #[path = "ticket_3619_tests.rs"]
 mod ticket_3619_tests;
+
+// The #3857 pins — the promoted-record stand-down hands the shape check the
+// NON-NULL face: a `typedef R1 = (int, String)?` receiver under its own null
+// guard reads the record's declared fields instead of missing them, while the
+// unguarded twin keeps the unchecked-dereference row.
+#[cfg(test)]
+#[path = "ticket_3857_tests.rs"]
+mod ticket_3857_tests;

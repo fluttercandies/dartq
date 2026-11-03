@@ -3964,6 +3964,18 @@ impl<'a> Bounds<'a> {
     /// poisoned parameter bound (the snapshot read it `dynamic` — a
     /// default the written shape never spells, the false-positive
     /// direction), or an unconvertible default kind.
+    ///
+    /// The returned trees keep the oracle's alias decoration
+    /// (`getDisplayString(preferTypeAlias)`, display_string_builder.dart:
+    /// 379-382): a parameter whose written bound was an alias-headed tree
+    /// answers the bound's own spelling under the grounding substitution
+    /// (`X extends G` over `typedef G<X> = X Function()` renders
+    /// `G<dynamic>`, never the `dynamic Function()` expansion the interned
+    /// default carries), and a bare generic head anywhere in a returned
+    /// tree fills its own defaults recursively. A tree a written shape
+    /// cannot vouch for (a head the registry and the builtin spellings both
+    /// miss) falls back to the interned default's own projection — the
+    /// face's unmodelable direction is unchanged.
     pub(crate) fn itb_default_args(
         &self,
         strings: &'a StringTable,
@@ -3980,14 +3992,9 @@ impl<'a> Bounds<'a> {
             return None;
         }
         let snapshot = self.snapshot(strings);
-        let decl = *snapshot.registry.get(&head)?;
-        let params = snapshot.decl_params.get(&decl)?;
-        let defaults = instantiate_type_formals_to_bounds(&snapshot.table, &snapshot.facts, params);
-        defaults
-            .defaults
-            .iter()
-            .map(|&ty| snapshot.tree_of(ty))
-            .collect()
+        let mut visiting = FxHashSet::default();
+        visiting.insert(head);
+        snapshot.default_trees(&self.index, head, &mut visiting)
     }
 
     /// The extension-type `implements` faces of this file, in declaration
@@ -5645,6 +5652,335 @@ impl<'a> Snapshot<'a> {
         bounds
     }
 
+    /// One declaration's per-parameter instantiate-to-bounds trees for
+    /// [`Bounds::itb_default_args`]: the WRITTEN bound trees under the
+    /// grounding substitution ([`Snapshot::grounded_bound_trees`]), each
+    /// finished by [`Snapshot::fill_written_heads`] so every bare generic
+    /// head inside lands its own defaulted argument list — the alias
+    /// decoration the oracle's `getDisplayString(preferTypeAlias)` keeps
+    /// (`'A<G<dynamic>>'` over `class A<X extends G>` +
+    /// `typedef G<X> = X Function()`; the interned default carries the
+    /// `dynamic Function()` expansion instead). `visiting` is the
+    /// head-argument recursion guard: a head whose own defaults are still
+    /// being computed fills `dynamic` per parameter — the answer a raw
+    /// `A` inside `class A<X extends A>` spells (`'A<dynamic>'`, the
+    /// cycle-breaking fill upstream's `defaultType` loop reaches).
+    ///
+    /// `None` where the head is not a snapshot declaration with a
+    /// parameter list — the caller's raw-face silence. A parameter whose
+    /// grounded tree fails the written-head discipline (an unregistered
+    /// head inside, the under-report direction) falls back to the
+    /// interned default's own projection, so an unmodelable bound keeps
+    /// the exact answer the interned face gave before this pass existed.
+    fn default_trees(
+        &self,
+        index: &BoundsIndex,
+        head: StringId,
+        visiting: &mut FxHashSet<StringId>,
+    ) -> Option<Vec<TypeTree>> {
+        let decl = *self.registry.get(&head)?;
+        let params = self.decl_params.get(&decl)?;
+        if params.is_empty() {
+            return Some(Vec::new());
+        }
+        let (head_params, mut head_bounds): (Vec<StringId>, Vec<(Option<TypeTree>, bool)>) =
+            if let Some(capture) = index.containers.get(&head) {
+                (capture.params.clone(), capture.bounds.clone())
+            } else if let Some(capture) = index.aliases.get(&head) {
+                (
+                    capture.params.iter().map(|(name, _, _)| *name).collect(),
+                    capture
+                        .params
+                        .iter()
+                        .map(|(_, bound, poisoned)| (bound.clone(), *poisoned))
+                        .collect(),
+                )
+            } else {
+                // A registered declaration with no this-file capture (a
+                // builtin) declares only unbounded parameters — the
+                // implicit `dynamic` default each spells.
+                return Some(
+                    (0..params.len())
+                        .map(|_| {
+                            TypeTree::leaf(
+                                self.strings.intern("dynamic"),
+                                false,
+                                SourceRange { offset: 0, length: 0 },
+                            )
+                        })
+                        .collect(),
+                );
+            };
+        // `_breakRawTypeCycles` (default_types_builder.dart:35-66): a raw
+        // head inside a parameter's bound whose own bounds reach this
+        // declaration back-patches the whole bound `dynamic` before the
+        // default-type pass runs — `class A<X extends A>` answers
+        // `A<dynamic>` (the `X extends A` bound reads `dynamic`, never
+        // `A<dynamic>`), and `A<X extends B>` over `class B<Y extends A>`
+        // poisons the same way through the `B` head's own bounds.
+        for (tree, _) in &mut head_bounds {
+            if let Some(tree) = tree {
+                let mut visited = FxHashSet::default();
+                if self.raw_reaches_decl(index, tree, decl, &mut visited) {
+                    *tree = TypeTree::leaf(
+                        self.strings.intern("dynamic"),
+                        false,
+                        SourceRange { offset: 0, length: 0 },
+                    );
+                }
+            }
+        }
+        let grounded = self.grounded_bound_trees(decl, &head_params, &head_bounds);
+        let defaults =
+            instantiate_type_formals_to_bounds(&self.table, &self.facts, params).defaults;
+        grounded
+            .iter()
+            .zip(defaults.iter())
+            .map(|(tree, &fallback)| {
+                self.fill_written_heads(index, tree, visiting, 0)
+                    .or_else(|| self.tree_of(fallback))
+            })
+            .collect()
+    }
+
+    /// `_findRawTypePathsToDeclaration` (default_types_builder.dart:
+    /// 207-273) over the WRITTEN bound trees: whether `tree` spells a bare
+    /// parameterized head that is `end`, or one whose own declared bounds
+    /// reach `end` through the same walk — a `NamedTypeBuilder` with empty
+    /// arguments checks its element, with arguments it recurses into them,
+    /// and a `FunctionTypeBuilder` recurses its return, binder bounds, and
+    /// formal types (`:250-268`). `visited` is the upstream visited set —
+    /// a head already walked answers no new paths. A head the registry or
+    /// the captures cannot spell (a foreign `p.T`, a builtin scalar) adds
+    /// no paths — the under-report direction this face already holds.
+    fn raw_reaches_decl(
+        &self,
+        index: &BoundsIndex,
+        tree: &TypeTree,
+        end: TypeDeclId,
+        visited: &mut FxHashSet<StringId>,
+    ) -> bool {
+        if tree.poisoned {
+            return false;
+        }
+        if let Some((positional, named)) = &tree.record {
+            return positional
+                .iter()
+                .chain(named.iter().map(|(_, ty)| ty))
+                .any(|field| self.raw_reaches_decl(index, field, end, visited));
+        }
+        if let Some(function) = &tree.function {
+            return function
+                .ret
+                .as_deref()
+                .is_some_and(|ret| self.raw_reaches_decl(index, ret, end, visited))
+                || function.type_params_named.iter().any(|(_, bound)| {
+                    bound
+                        .as_ref()
+                        .is_some_and(|bound| self.raw_reaches_decl(index, bound, end, visited))
+                })
+                || function
+                    .positional
+                    .iter()
+                    .chain(function.named.iter().map(|(_, ty)| ty))
+                    .any(|formal| self.raw_reaches_decl(index, formal, end, visited));
+        }
+        // A written argument list recurses into each argument — the
+        // upstream `arguments.isEmpty` split (:215-245): only the BARE head
+        // itself can be `end`, never a parameterized application.
+        if !tree.args.is_empty() {
+            return tree
+                .args
+                .iter()
+                .any(|arg| self.raw_reaches_decl(index, arg, end, visited));
+        }
+        let Some(&decl) = self.registry.get(&tree.head) else {
+            return false;
+        };
+        // A non-parameterized head carries no raw instantiation — no path
+        // begins here.
+        if self.decl_params.get(&decl).is_none_or(Vec::is_empty) {
+            return false;
+        }
+        if decl == end {
+            return true;
+        }
+        if !visited.insert(tree.head) {
+            return false;
+        }
+        // The bare head's own declared bounds carry the walk forward —
+        // upstream recurses `declaration.typeParameters`'s bound nodes,
+        // the container/alias captures' written bound trees here.
+        let reaches = if let Some(capture) = index.containers.get(&tree.head) {
+            capture
+                .bounds
+                .iter()
+                .filter_map(|(tree, _)| tree.as_ref())
+                .any(|bound| self.raw_reaches_decl(index, bound, end, visited))
+        } else if let Some(capture) = index.aliases.get(&tree.head) {
+            capture
+                .params
+                .iter()
+                .filter_map(|(_, bound, _)| bound.as_ref())
+                .any(|bound| self.raw_reaches_decl(index, bound, end, visited))
+        } else {
+            false
+        };
+        visited.remove(&tree.head);
+        reaches
+    }
+
+    /// `tree` with every bare parameterized head filled to its own
+    /// instantiate-to-bounds argument list, recursively — the alias
+    /// decoration walk of [`Snapshot::default_trees`]. A head with
+    /// written arguments keeps them and only recurses into the argument
+    /// trees; a bare head fills [`Snapshot::default_trees`]'s answer for
+    /// that head, or `dynamic` per parameter while the head's own
+    /// defaults are still being computed (`visiting` — the cycle break a
+    /// raw `A` inside `class A<X extends A>` needs). `FutureOr` spelled
+    /// bare fills `FutureOr<dynamic>` — the sole builtin generic the
+    /// registry does not declare. Function and record nodes recurse into
+    /// their subtrees; a `dynamic`/`Null`/`Never`/`void`/`Function`
+    /// spelling and a non-generic head keep their shape.
+    ///
+    /// `None` where a named head neither registers nor spells a builtin —
+    /// the written shape cannot vouch for it (a foreign `p.T` leaf, a
+    /// parameter spelling that survived grounding), so the caller falls
+    /// back to the interned default's projection, which already read the
+    /// bound `dynamic` for the same unmodelable shape.
+    fn fill_written_heads(
+        &self,
+        index: &BoundsIndex,
+        tree: &TypeTree,
+        visiting: &mut FxHashSet<StringId>,
+        depth: u32,
+    ) -> Option<TypeTree> {
+        if depth > 16 || tree.poisoned {
+            return None;
+        }
+        if let Some((positional, named)) = &tree.record {
+            let positional = positional
+                .iter()
+                .map(|field| self.fill_written_heads(index, field, visiting, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            let named = named
+                .iter()
+                .map(|(name, field)| {
+                    Some((*name, self.fill_written_heads(index, field, visiting, depth + 1)?))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let mut out = tree.clone();
+            out.record = Some((positional, named));
+            return Some(out);
+        }
+        if let Some(function) = &tree.function {
+            let mut out = tree.clone();
+            out.function = Some(FnTree {
+                ret: match &function.ret {
+                    Some(ret) => Some(Box::new(self.fill_written_heads(
+                        index,
+                        ret.as_ref(),
+                        visiting,
+                        depth + 1,
+                    )?)),
+                    None => None,
+                },
+                type_params: function.type_params,
+                type_params_named: function
+                    .type_params_named
+                    .iter()
+                    .map(|(name, bound)| {
+                        Some((
+                            *name,
+                            match bound {
+                                Some(bound) => Some(self.fill_written_heads(
+                                    index,
+                                    bound,
+                                    visiting,
+                                    depth + 1,
+                                )?),
+                                None => None,
+                            },
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                required_positional: function.required_positional,
+                positional: function
+                    .positional
+                    .iter()
+                    .map(|formal| self.fill_written_heads(index, formal, visiting, depth + 1))
+                    .collect::<Option<Vec<_>>>()?,
+                named: function
+                    .named
+                    .iter()
+                    .map(|(name, formal)| {
+                        Some((
+                            *name,
+                            self.fill_written_heads(index, formal, visiting, depth + 1)?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            });
+            return Some(out);
+        }
+        let text = self.strings.resolve(tree.head);
+        if matches!(text, "dynamic" | "Null" | "Never" | "void" | "Function" | "Record") {
+            return Some(tree.clone());
+        }
+        // A user declaration shadowing a builtin name resolves through
+        // the registry first — the same scope order `map_tree` holds.
+        let shadowed = self.registry.contains_key(&tree.head);
+        if text == "FutureOr" && !shadowed {
+            let mut out = tree.clone();
+            if tree.args.is_empty() {
+                out.args = vec![TypeTree::leaf(
+                    self.strings.intern("dynamic"),
+                    false,
+                    SourceRange { offset: 0, length: 0 },
+                )];
+            } else {
+                out.args = tree
+                    .args
+                    .iter()
+                    .map(|arg| self.fill_written_heads(index, arg, visiting, depth + 1))
+                    .collect::<Option<Vec<_>>>()?;
+            }
+            return Some(out);
+        }
+        let &decl = self.registry.get(&tree.head)?;
+        let params = self.decl_params.get(&decl)?;
+        if !tree.args.is_empty() {
+            let mut out = tree.clone();
+            out.args = tree
+                .args
+                .iter()
+                .map(|arg| self.fill_written_heads(index, arg, visiting, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(out);
+        }
+        if params.is_empty() {
+            return Some(tree.clone());
+        }
+        // A bare parameterized head: fill its own defaults. A head whose
+        // defaults are still being computed (the visiting set already
+        // carries it) is a raw-type cycle the `raw_reaches_decl` pass
+        // could not spell — upstream's `_breakRawTypeCycles` poisons the
+        // whole bound `dynamic` in the same posture
+        // (default_types_builder.dart:59-63).
+        if !visiting.insert(tree.head) {
+            return Some(TypeTree::leaf(
+                self.strings.intern("dynamic"),
+                tree.nullable,
+                SourceRange { offset: 0, length: 0 },
+            ));
+        }
+        let args = self.default_trees(index, tree.head, visiting);
+        visiting.remove(&tree.head);
+        let mut out = tree.clone();
+        out.args = args?;
+        Some(out)
+    }
+
     /// The tree-level `_UpperLowerReplacementVisitor`
     /// (`default_types_builder.dart:431-479`): every leaf head in `tree`
     /// naming a member of `targets` returns `lower` when the walk's
@@ -6368,3 +6704,11 @@ mod ticket_3153_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3154_tests.rs"]
 mod ticket_3154_tests;
+
+// The #3850 pins (the `itb_default_args` alias-decoration face — the
+// Instantiate-to-bound/Simple-bounds message-text residuals) live beside
+// the tree face they fix, registered here so the module resolves against
+// this file's own imports.
+#[cfg(test)]
+#[path = "diagnose/ticket_3850_tests.rs"]
+mod ticket_3850_tests;

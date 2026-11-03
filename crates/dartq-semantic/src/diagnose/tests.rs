@@ -23632,3 +23632,38 @@ mod ticket_3823_tests;
 #[cfg(test)]
 #[path = "void_region_tests.rs"]
 mod void_region_tests;
+
+// —— #3836 ——
+// The `undefined_method` receiver text of the container-static invoke
+// face: the bare interface element (`C` over `class C<T>`), with the
+// getter/setter `thisType` text pinned as the positive direction.
+#[cfg(test)]
+#[path = "ticket_3836_tests.rs"]
+mod ticket_3836_tests;
+
+// —— #3837 ——
+// The `dead_code` write-target pins: null-aware dead chains retire when the
+// access is the write's own target (`l?[0] = v`, `l?[0]++`), while a chain
+// that climbed past its root and a cascade section keep their rows.
+#[cfg(test)]
+#[path = "ticket_3837_tests.rs"]
+mod ticket_3837_tests;
+
+// —— #3837 (unnecessary_type_check leg) ——
+// `unnecessary_type_check` over the nested function-type pair whose
+// differing argument sits inside the INNER signature (`List<int>` vs
+// `List<bool>` in a returned function type): the unprovable pairs stay
+// silent, the identical instantiation keeps reporting.
+#[cfg(test)]
+#[path = "ticket_3837_nested_fn_tests.rs"]
+mod ticket_3837_nested_fn_tests;
+
+// —— #3839 (type_argument_not_matching_bounds leg) ——
+// The invocation type-argument bounds face judges the ALIASED argument by
+// its expansion while the message keeps the written spelling: a function
+// typedef (`typedef num Foo(Object o)`) against
+// `T extends Object Function(num)` is silent, its non-conforming twin
+// still reports as `'Bar'`.
+#[cfg(test)]
+#[path = "ticket_3839_tests.rs"]
+mod ticket_3839_tests;

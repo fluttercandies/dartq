@@ -6377,6 +6377,25 @@ impl<'a> Engine<'a> {
         self.sentinel_walk(ty, true)
     }
 
+    /// Whether `shape` is the parameterized function-RHS alias's armed-head
+    /// stub: the anonymous signature's return head alone (`Unknown
+    /// Function()` — no formals, no own type parameters). [`Self::alias_
+    /// function_ty`]'s `var_ty` face and the `take_armed` capture both land
+    /// this face when the typedef's RHS is a nested function type, and it
+    /// carries no signature the `is` verdict could compare against.
+    fn is_armed_head_stub(&self, shape: crate::model::FnShapeId) -> bool {
+        if shape == crate::model::FnShapeId::EMPTY {
+            return false;
+        }
+        let pool = self.boundary.pool();
+        let shape = pool.function_shape(shape);
+        shape.type_params == 0
+            && shape.type_params_named.is_empty()
+            && shape.positional.is_empty()
+            && shape.named.is_empty()
+            && shape.return_ty == Ty::Unknown
+    }
+
     fn sentinel_walk(&self, ty: Ty, unknown_return_counts: bool) -> bool {
         match ty {
             Ty::Named { name, args, .. } => {
@@ -7992,12 +8011,12 @@ impl<'a> Engine<'a> {
         keyword_operand: Option<(Ty, SourceRange)>,
         negated: bool,
     ) {
-        let Some(checked) = self.armed_ty else { return };
+        let Some(armed) = self.armed_ty else { return };
         // The written target's own shape before the alias/canonical
         // folds: `last_fn_seal` matches it to recover the written
         // signature's required count — the per-site answer the shared
         // `FnShapeId` map cannot give (`fn_face_sig` at the verdict).
-        let checked_shape0 = match checked {
+        let checked_shape0 = match armed {
             Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => {
                 Some(shape)
             }
@@ -8017,7 +8036,31 @@ impl<'a> Engine<'a> {
         // #2813's collector capture) reads through the official function
         // face, the unwritten columns' `dynamic` leaves; the `Never`
         // unit fold canonicalizes its written formal leaves (#2842).
-        let mut checked = self.normalized_never(self.official_fn_face(self.fold_alias_ty(checked)));
+        // A parameterized function-RHS alias use (`f15 is F15<bool>`) folds
+        // from its ARMED HEAD first: `end_typedef`'s `take_armed` snapshots
+        // the anonymous signature's RETURN head alone, so `fold_alias_ty`
+        // substitutes the written arguments into an `Unknown Function()`
+        // stub carrying no formals. `official_fn_face` then reads that
+        // `Unknown` return as the `dynamic` top — the reserved empty shape
+        // (`dynamic Function()`) — and every alias-aware fold below is
+        // stranded, because they all key on the `Named` face. The pair's
+        // verdict then asks a `dynamic Function()` target, which every
+        // operand satisfies, and the check reports constant-true: the
+        // whole `language/function_type` family (`f15 is F15<bool>` over a
+        // `F15<int>` operand, `m13 is F13<int>` over a `F13<T>` one). The
+        // written `Named` face is the last point where
+        // [`Self::parameterized_alias_fn_ty`] can re-read the alias's own
+        // RHS and land the instantiated signature, so the stub hands over.
+        let mut checked = {
+            let folded = self.fold_alias_ty(armed);
+            match folded {
+                Ty::Function { shape, .. } if self.is_armed_head_stub(shape) => {
+                    self.parameterized_alias_fn_ty(armed).unwrap_or(folded)
+                }
+                _ => folded,
+            }
+        };
+        checked = self.normalized_never(self.official_fn_face(checked));
         // A function-RHS typedef whose own `<T>` group went missing
         // (`typedef Fn = void Function<S>(S) Function<T>(T)` — the RHS's
         // first signature group sealed `pending.type_params`, so the decl
@@ -14294,6 +14337,16 @@ mod ticket_3104_tests;
 #[cfg(test)]
 #[path = "ticket_2999_tests.rs"]
 mod ticket_2999_tests;
+
+/// The #3821 `unnecessary_type_check` precision pins: the oracle's single
+/// report gate (`_checkAllTypeChecks`, best_practices_verifier.dart:877-930
+/// — report `true`/`false` only through `TypeSystem.isSubtypeOf`) and the
+/// shapes the gate must stay silent on. The `#[ignore]`d cases are the
+/// measured over-reports whose root cause is type-argument substitution,
+/// not the gate itself — see the module docs.
+#[cfg(test)]
+#[path = "ticket_3821_tests.rs"]
+mod ticket_3821_tests;
 
 #[cfg(test)]
 mod tests {

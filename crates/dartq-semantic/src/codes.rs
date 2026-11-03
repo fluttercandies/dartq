@@ -92,6 +92,20 @@ pub enum SemanticCode {
     /// fold is a documented milestone deferral — an under-report, never a
     /// false positive.
     DuplicateDefinition,
+    /// `The field '{0}' can't be initialized by multiple parameters in the
+    /// same constructor.` — the FORMAL-PARAMETER scope's initializing-formal
+    /// swap: when the colliding pair is two `FieldFormalParameter`s
+    /// (`this.x`), upstream returns `diag.duplicateFieldFormalParameter`
+    /// instead of `diag.duplicateDefinition` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/duplicate_definition_verifier.dart:447-450`
+    /// — `_FormalParameterDuplicateIdentifierScope.getDiagnostic`; message at
+    /// `messages.yaml:5230-5236`). The row keeps the shared scope machinery
+    /// and the "first definition" context (`duplicateDefinitionForNodes`,
+    /// `diagnostic_factory.dart:114-131`), only the code and text differ.
+    ///
+    /// Emitted by [`mod@crate::diagnose`]'s duplicate fold for the pair shape
+    /// the capture records; see the collector's formal scope claim kind.
+    DuplicateFieldFormalParameter,
     /// `Undefined name '{0}' used as an annotation.` — the emit site is
     /// [`mod@crate::diagnose`]'s annotation check (a fully missing
     /// `MetadataReference` name), and upstream removed the
@@ -2376,6 +2390,10 @@ impl SemanticCode {
     pub fn code_info(self) -> CodeInfo {
         let (name, machine) = match self {
             Self::DuplicateDefinition => ("duplicate_definition", "DUPLICATE_DEFINITION"),
+            Self::DuplicateFieldFormalParameter => (
+                "duplicate_field_formal_parameter",
+                "DUPLICATE_FIELD_FORMAL_PARAMETER",
+            ),
             Self::UndefinedAnnotation => ("undefined_annotation", "UNDEFINED_ANNOTATION"),
             Self::UndefinedClass => ("undefined_class", "UNDEFINED_CLASS"),
             Self::UndefinedConstructorInInitializer => (
@@ -3825,6 +3843,9 @@ impl SemanticCode {
     pub fn message(self, a0: &str, a1: &str) -> String {
         match self {
             Self::DuplicateDefinition => format!("The name '{a0}' is already defined."),
+            Self::DuplicateFieldFormalParameter => format!(
+                "The field '{a0}' can't be initialized by multiple parameters in the same constructor."
+            ),
             // The three-placeholder bounds row routes through `message3`
             // (real emissions go through `emit3`).
             Self::TypeArgumentNotMatchingBounds => self.message3(a0, a1, ""),
@@ -7238,6 +7259,10 @@ mod tests {
             | SemanticCode::DeadCodeOnCatchSubtype
             | SemanticCode::DeadNullAwareExpression
             | SemanticCode::DuplicateDefinition
+            // The formal-scope swap row: an inline `message` arm (no
+            // `registry_message` call site), the descriptor round-trips
+            // through `code_info()`.
+            | SemanticCode::DuplicateFieldFormalParameter
             | SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded
             // The #3341 alias self-reference row: an inline `message` arm
             // (no `registry_message` call site — the name reaches
@@ -7661,6 +7686,7 @@ mod tests {
             SemanticCode::DotShorthandUndefinedMember,
             SemanticCode::DotShorthandUndefinedMemberInvocation,
             SemanticCode::DuplicateDefinition,
+            SemanticCode::DuplicateFieldFormalParameter,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
             SemanticCode::TypeAliasCannotReferenceItself,
             SemanticCode::EnumWithoutConstants,

@@ -927,7 +927,46 @@ impl DiagnoseListener<'_> {
             // source, `checkIndexExpressionIndex`,
             // error_detection_helpers.dart:260-289).
             engine.check_index_argument(bracket_offset, Some(OpWrite::Compound));
+            // The `++`/`--` write retires the dead chain rooted at THIS
+            // bracket (`l?[0]++` reports nothing upstream — the verifier's
+            // index face is a read-only call site); a chain grown past
+            // its root bracket is untouched (`l?[0][1]++` keeps `?[0][1]`).
+            engine.cancel_dead_chain_on_compound_write(bracket_offset);
         }
+    }
+
+    /// The `++`/`--` member-write twin of
+    /// [`Self::mark_index_compound_write`]: the operand's merged member row
+    /// is the compound write's own target (`c?.x++`, `++c?.x`, `c?.x--`),
+    /// so the latched dead chain rooted at that selector retires — the
+    /// official verifier's access faces are read-only call sites
+    /// (`_verifyUnassignedSimpleIdentifier`,
+    /// dead_code_verifier.dart:467-505). A chain the parent climb already
+    /// grew past its root keeps its row: `c?.a.b++` writes `.b` while the
+    /// `?.a` read still reports (`while (parent is PropertyAccess)`,
+    /// :492-497), and a `?..` cascade chain never joins here at all — the
+    /// `++` attaches outside its section (`l?..x++` keeps `?..x`).
+    fn cancel_dead_chain_on_member_write(&mut self) {
+        let engine = &mut self.engine;
+        let Some(row) = engine.operand_row() else {
+            return;
+        };
+        if !matches!(row.shape, RowShape::Member { .. }) {
+            return;
+        }
+        // The selector's offset: the merged member row's extent ends at
+        // the name, so the selector token is its trailing identifier.
+        let name_len = engine
+            .strings
+            .resolve(row.name)
+            .chars()
+            .map(char::len_utf16)
+            .sum::<usize>() as u32;
+        if name_len == 0 {
+            return;
+        }
+        let selector = row.range.end().saturating_sub(name_len);
+        engine.cancel_dead_chain_on_compound_write(selector);
     }
 }
 
@@ -6490,6 +6529,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // `resolveForWrite(hasRead: true)` consult the postfix face runs):
         // both `[]` spellings check.
         self.mark_index_compound_write();
+        // The member operand's own dead-chain retire (`++c?.x`): the
+        // `?.` access resolves for write, which upstream's verifier faces
+        // never see.
+        self.cancel_dead_chain_on_member_write();
         let _ = operator;
     }
 
@@ -6520,6 +6563,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // the compound write state the `+=` junction's marking already
         // sets, so the `[]`/`[]=` pair reports.
         self.mark_index_compound_write();
+        // The member operand's own dead-chain retire (`c?.x++`): the `?.`
+        // access resolves for write, which upstream's verifier faces
+        // never see.
+        self.cancel_dead_chain_on_member_write();
     }
 
     fn begin_conditional_expression(&mut self, question: Token) {

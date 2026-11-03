@@ -1142,11 +1142,15 @@ fn eval_binary(
                             Verdict::NotConstant(_) | Verdict::Unresolved(_) => {
                                 Verdict::NotConstant(span)
                             }
-                            // A `constEval*` fault keeps its own grade: it is
-                            // allow-listed, so the site default is overridden
-                            // either way and the inner anchor is the finer of
-                            // the two.
-                            r @ Verdict::Fault(..) => r,
+                            // The right operand's own verdict is re-anchored
+                            // at the whole binary: `computeRightOperand`
+                            // throws the inner `EvaluationException` and
+                            // `lazyAnd`/`lazyOr` catch it into
+                            // `InvalidConstant.forEntity(entity: node)` — the
+                            // code is the inner diagnostic, the entity the
+                            // lazy expression (evaluation.dart:697-736,
+                            // 2495-2530).
+                            Verdict::Fault(f, _) => Verdict::Fault(f, span),
                             Verdict::Constant => Verdict::Constant,
                         }
                     }
@@ -1154,7 +1158,10 @@ fn eval_binary(
                 // An unknown bool left (`bool.fromEnvironment && x`):
                 // `BoolState.logicalAnd`/`logicalOr` assert the right is
                 // bool — the unknown-left value itself never decides, so
-                // the right's own verdict carries the result.
+                // the right's own verdict carries the result. Every fault
+                // the lazy state throws is caught at `entity: node`
+                // (evaluation.dart:2495-2530), so it anchors at the whole
+                // binary rather than at the operand that triggered it.
                 Verdict::Value(ConstantValue::Created(c))
                     if lookup.created_state(c) == CreatedState::Bool =>
                 {
@@ -1165,13 +1172,16 @@ fn eval_binary(
                         {
                             Verdict::Constant
                         }
-                        Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, right.span),
-                        Verdict::Fault(f, s) => Verdict::Fault(f, s),
+                        Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, span),
+                        Verdict::Fault(f, _) => Verdict::Fault(f, span),
                         r @ (Verdict::NotConstant(_) | Verdict::Unresolved(_)) => r,
                         Verdict::Constant => Verdict::Constant,
                     }
                 }
-                Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, left.span),
+                // A known non-bool left fails `assertBool(this)` inside
+                // `lazyAnd`/`lazyOr`, which the computer catches at the
+                // binary (evaluation.dart:2495-2530).
+                Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, span),
                 other => other,
             }
         }
@@ -1231,12 +1241,6 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
         Add, And, BitAnd, BitOr, BitXor, Div, Eq, Ge, Gt, IfNull, IntDiv, Le, Lt, Mod, Mul, Ne, Or,
         Shl, Shr, Sub, Ushr,
     };
-    // String repetition (`'ab' * 3`) is a spec constant the subset cannot
-    // value (escapes undecoded) — defer; the oracle's StringState keeps it
-    // clean, so the numeric operand fault must never fire here.
-    if op == Mul && matches!(a, ConstantValue::Str(_)) {
-        return Verdict::Constant;
-    }
     match op {
         Add => match a {
             ConstantValue::Str(x) => match b {
@@ -1245,32 +1249,56 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                     t.push_str(y);
                     Verdict::Value(ConstantValue::Str(t.into()))
                 }
-                // `StringState.add`: the right operand passes the
-                // num/String/null assert, then the runtime add throws.
-                ConstantValue::Int(_) | ConstantValue::Double(_) => {
+                // `StringState` overrides no `add`, so `+` is the base
+                // `InstanceState.add` (value.dart:1659-1666): a num or
+                // null right operand passes both `assertNumStringOrNull`
+                // gates and the runtime add then throws.
+                ConstantValue::Int(_) | ConstantValue::Double(_) | ConstantValue::Null => {
                     Verdict::Fault(ConstFault::ThrowsException, span)
                 }
-                ConstantValue::Null => Verdict::Constant,
                 _ => Verdict::Fault(ConstFault::TypeNumString, span),
             },
-            ConstantValue::Int(_) | ConstantValue::Double(_) | ConstantValue::Null => match b {
-                ConstantValue::Int(_) | ConstantValue::Double(_) | ConstantValue::Null => {
-                    if is_num(a) && is_num(b) {
-                        numeric(op, span, a, b)
-                    } else {
-                        Verdict::Constant
-                    }
-                }
+            // `IntState`/`DoubleState` narrow their own gate to num/null
+            // first (value.dart:2053-2075): null passes that assert and
+            // the runtime add throws, any other non-num answers the num
+            // face.
+            ConstantValue::Int(_) | ConstantValue::Double(_) => match b {
+                ConstantValue::Int(_) | ConstantValue::Double(_) => numeric(op, span, a, b),
+                ConstantValue::Null => Verdict::Fault(ConstFault::ThrowsException, span),
                 _ => Verdict::Fault(ConstFault::TypeNum, span),
             },
-            // `assertNumOrNull(this)` fires before the right operand's.
-            _ => Verdict::Fault(ConstFault::TypeNum, span),
+            // `NullState` overrides no arithmetic, so `+` is the base
+            // `InstanceState.add`: num, String and null all pass the
+            // num-or-String gate and the runtime add throws; anything
+            // else fails the gate with the num-or-String face.
+            ConstantValue::Null => match b {
+                ConstantValue::Str(_)
+                | ConstantValue::Int(_)
+                | ConstantValue::Double(_)
+                | ConstantValue::Null => Verdict::Fault(ConstFault::ThrowsException, span),
+                _ => Verdict::Fault(ConstFault::TypeNumString, span),
+            },
+            // A created container's `InstanceState` family is the lookup's
+            // answer, so its operand face keeps the num gate the subset
+            // already reported for it.
+            ConstantValue::Created(_) => Verdict::Fault(ConstFault::TypeNum, span),
+            // Every concrete remaining state (`BoolState`, the collection
+            // states, `TypeState`, `SymbolState`) inherits the base
+            // `InstanceState.add`, whose first gate is
+            // `assertNumStringOrNull(this)`.
+            _ => Verdict::Fault(ConstFault::TypeNumString, span),
         },
         Sub | Mul | Div | IntDiv | Mod | Lt | Gt | Le | Ge => {
             if is_num(a) && is_num(b) {
                 numeric(op, span, a, b)
             } else if is_num_or_null(a) && is_num_or_null(b) {
-                Verdict::Constant
+                // A null side passes `assertNumOrNull` on both operands
+                // (value.dart:1686-1690) and the state's own method then
+                // throws `constEvalThrowsException` — `NullState` inherits
+                // the base `minus`/`times`/`divide`/… (value.dart:1956-2030)
+                // and `IntState`/`DoubleState` reach the same throw once
+                // the num/null gate admits a null right operand.
+                Verdict::Fault(ConstFault::ThrowsException, span)
             } else {
                 Verdict::Fault(ConstFault::TypeNum, span)
             }
@@ -1290,18 +1318,20 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                     _ => x ^ y,
                 }))
             }
-            (
-                ConstantValue::Null,
-                ConstantValue::Bool(_) | ConstantValue::Int(_) | ConstantValue::Null,
-            )
-            | (ConstantValue::Bool(_) | ConstantValue::Int(_), ConstantValue::Null) => {
-                Verdict::Constant
-            }
+            // Every other pair — including a null operand, which is
+            // neither `isBool` nor `isInt` in `eagerAnd`/`eagerOr`/
+            // `eagerXor` (value.dart:446-514) — answers the bool-or-int
+            // face.
             _ => Verdict::Fault(ConstFault::TypeBoolInt, span),
         },
         Shl | Shr | Ushr => match (a, b) {
+            // `assertIntOrNull` admits null on both operands and the
+            // state's own `shiftLeft`/`shiftRight`/`logicalShiftRight`
+            // then throws (value.dart:1987-2003; `NullState` inherits).
             (ConstantValue::Null, ConstantValue::Int(_) | ConstantValue::Null)
-            | (ConstantValue::Int(_), ConstantValue::Null) => Verdict::Constant,
+            | (ConstantValue::Int(_), ConstantValue::Null) => {
+                Verdict::Fault(ConstFault::ThrowsException, span)
+            }
             (ConstantValue::Int(x), ConstantValue::Int(shift)) => {
                 let v = match op {
                     Shl => {
@@ -4452,10 +4482,12 @@ mod tests {
             world.bin(Add, ConstantValue::Int(1), ConstantValue::Str("a".into())),
             Verdict::Fault(ConstFault::TypeNum, span(7))
         );
-        // `true + 1`: the LEFT operand fails the assert first.
+        // `true + 1`: the LEFT operand fails the base
+        // `InstanceState.add` gate first (`assertNumStringOrNull(this)`),
+        // so the face is the num-or-String one.
         assert_eq!(
             world.bin(Add, ConstantValue::Bool(true), ConstantValue::Int(1)),
-            Verdict::Fault(ConstFault::TypeNum, span(7))
+            Verdict::Fault(ConstFault::TypeNumString, span(7))
         );
     }
 
@@ -4543,8 +4575,10 @@ mod tests {
     #[test]
     fn logical_operators_short_circuit_like_lazyand() {
         let world = w();
-        // `false && <provably non-const>`: the right operand never
-        // evaluates — no diagnostic (evaluation.dart `lazyAnd`).
+        // `false && <provably non-const>`: the right operand's value is
+        // never computed, but the skipped operand is still scanned by
+        // `_reportNotPotentialConstants` and its failure replaces the
+        // settled value (evaluation.dart:708-723).
         let false_and_nc = World::node(
             Expr::Binary {
                 op: BinOp::And,
@@ -4555,7 +4589,10 @@ mod tests {
         );
         assert_eq!(
             world.eval(&false_and_nc),
-            Verdict::Value(ConstantValue::Bool(false))
+            Verdict::NotConstant(SourceRange {
+                offset: 9,
+                length: 1
+            })
         );
         // `true || <non-const>`: same.
         let true_or_nc = World::node(
@@ -4568,10 +4605,14 @@ mod tests {
         );
         assert_eq!(
             world.eval(&true_or_nc),
-            Verdict::Value(ConstantValue::Bool(true))
+            Verdict::NotConstant(SourceRange {
+                offset: 9,
+                length: 1
+            })
         );
         // A non-bool left operand faults with const_eval_type_bool at the
-        // operand's span.
+        // whole binary: `lazyAnd`/`lazyOr` catch every throw at
+        // `entity: node` (evaluation.dart:2495-2530).
         let int_and = World::node(
             Expr::Binary {
                 op: BinOp::And,
@@ -4582,7 +4623,7 @@ mod tests {
         );
         assert_eq!(
             world.eval(&int_and),
-            Verdict::Fault(ConstFault::TypeBool, span(0))
+            Verdict::Fault(ConstFault::TypeBool, span(7))
         );
         // `??`: a non-null left short-circuits; a null left takes the
         // right.
@@ -4600,7 +4641,9 @@ mod tests {
     #[test]
     fn conditional_takes_one_branch_and_checks_bool() {
         let world = w();
-        // A known condition skips the dead branch's non-constancy.
+        // A known condition still scans the dead branch for shapes the
+        // const grammar can never value; the first such node replaces the
+        // taken branch's verdict (evaluation.dart:825-837).
         let cond = World::node(
             Expr::Cond {
                 cond: Box::new(World::value_node(ConstantValue::Bool(true))),
@@ -4609,7 +4652,24 @@ mod tests {
             },
             7,
         );
-        assert_eq!(world.eval(&cond), Verdict::Value(ConstantValue::Int(1)));
+        assert_eq!(
+            world.eval(&cond),
+            Verdict::NotConstant(SourceRange {
+                offset: 9,
+                length: 1
+            })
+        );
+        // A dead branch the grammar can value leaves the taken branch
+        // alone.
+        let clean = World::node(
+            Expr::Cond {
+                cond: Box::new(World::value_node(ConstantValue::Bool(true))),
+                then: Box::new(World::value_node(ConstantValue::Int(1))),
+                els: Box::new(World::value_node(ConstantValue::Int(2))),
+            },
+            7,
+        );
+        assert_eq!(world.eval(&clean), Verdict::Value(ConstantValue::Int(1)));
         // A non-bool condition faults at the condition's span
         // (applyBooleanConversion → const_eval_type_bool).
         let bad = World::node(
@@ -4666,7 +4726,8 @@ mod tests {
             7,
         );
         assert_eq!(world.eval(&and), Verdict::Constant);
-        // A non-bool right still faults its gate at the right's span.
+        // A non-bool right still faults its gate, re-anchored at the whole
+        // binary (evaluation.dart:2495-2530).
         let and_bad = World::node(
             Expr::Binary {
                 op: BinOp::And,
@@ -4677,7 +4738,7 @@ mod tests {
         );
         assert_eq!(
             world.eval(&and_bad),
-            Verdict::Fault(ConstFault::TypeBool, span(0))
+            Verdict::Fault(ConstFault::TypeBool, span(7))
         );
         let cond = World::node(
             Expr::Cond {
@@ -4756,25 +4817,31 @@ mod tests {
         assert_eq!(world.eval(&clean), Verdict::Constant);
     }
 
-    /// `'ab' * 3` is a spec constant the oracle keeps clean
-    /// (`StringState`); the subset cannot value it, so it defers — the
-    /// numeric operand fault must never fire.
+    /// `*` has no `String` overload in Dart: `'ab' * 3`, `3 * 'ab'` and
+    /// `'a' * 'b'` all answer the num face (pinned against
+    /// `dart analyze --format=machine`, the oracle's
+    /// `CONST_EVAL_TYPE_NUM` at the whole binary).
     #[test]
-    fn string_repetition_defers_instead_of_faulting() {
+    fn string_operands_answer_the_num_face() {
         use BinOp::*;
         let world = w();
+        // `World::bin` builds every binary node at offset 7 with length 1.
+        let at = SourceRange { offset: 7, length: 1 };
         assert_eq!(
             world.bin(Mul, ConstantValue::Str("ab".into()), ConstantValue::Int(3)),
-            Verdict::Constant
+            Verdict::Fault(ConstFault::TypeNum, at)
         );
-        // A non-int repeat count is still not a numeric fault.
+        assert_eq!(
+            world.bin(Mul, ConstantValue::Int(3), ConstantValue::Str("ab".into())),
+            Verdict::Fault(ConstFault::TypeNum, at)
+        );
         assert_eq!(
             world.bin(
                 Mul,
                 ConstantValue::Str("a".into()),
                 ConstantValue::Str("b".into())
             ),
-            Verdict::Constant
+            Verdict::Fault(ConstFault::TypeNum, at)
         );
     }
 
@@ -6049,3 +6116,7 @@ mod null_aware_access_3825 {
         assert_eq!(eval(&node, &Deferred), Verdict::Constant);
     }
 }
+
+#[cfg(test)]
+#[path = "ticket_3852_tests.rs"]
+mod ticket_3852_tests;

@@ -2831,6 +2831,35 @@ impl<'a> Engine<'a> {
             });
     }
 
+    /// The `++`/`--` compound-write twin of
+    /// [`Self::cancel_dead_chains_on_write`]: the verifier's dead faces are
+    /// read-only call sites (`verifyIndexExpression` fires once, from the
+    /// index READ resolution — upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/resolver.dart:3404; the
+    /// property/method pair likewise runs only where the access resolves
+    /// for read), so a null-aware access that IS the compound write's own
+    /// target retires its latched chain — `l?[0]++`, `++l?[0]`, `l?[0]--`,
+    /// `c?.x++`, `c?.x--` all stay silent upstream.
+    ///
+    /// `slot` is the written access's own key token: the `[` of a `?[` (one
+    /// token past the `?`) or the member selector of a `?.` (two past).
+    /// A chain that already climbed past its root keeps its row —
+    /// `l?[0][1]++` writes the outer `[1]` while the inner `?[` read still
+    /// reports (`_verifyUnassignedSimpleIdentifier`'s parent climb,
+    /// dead_code_verifier.dart:491-497) — and a cascade chain keeps its row
+    /// on `++` too: the `++` attaches OUTSIDE the cascade section, so the
+    /// section still answers `verifyCascadeExpression`'s first-section
+    /// face (`l?..x++` reports `?..x`; `l?..[0]` is a parser error anyway).
+    pub(crate) fn cancel_dead_chain_on_compound_write(&mut self, slot: u32) {
+        self.dead_null_chains
+            .retain(|&(op, _, _, kind, _)| match kind {
+                crate::diagnose::types::DeadChainKind::Index => op + 1 != slot,
+                crate::diagnose::types::DeadChainKind::Member => op + 2 != slot,
+                crate::diagnose::types::DeadChainKind::CascadeMember
+                | crate::diagnose::types::DeadChainKind::CascadeIndex => true,
+            });
+    }
+
     /// `handle_assignment_expression` for `??=`: the target's read type
     /// strictly non-nullable anchors the report at the value (the official
     /// `visitIfNullAssignment` → `_checkForDeadNullCoalesce(target.read's

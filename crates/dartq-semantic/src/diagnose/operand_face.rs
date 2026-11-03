@@ -247,7 +247,7 @@ impl<'a> Engine<'a> {
             let Some(op_range) = self.operand_token_span(i) else {
                 continue;
             };
-            let Some((mut ty, probe)) = self.unary_operand_ty(tail) else {
+            let Some((mut ty, probe)) = self.checked_operand_ty(tail) else {
                 continue;
             };
             let latched = self.null_aware_members.contains(&probe.offset);
@@ -280,14 +280,18 @@ impl<'a> Engine<'a> {
             // An `on`-nullable extension whose face declares the spelling
             // resolves the application — the `Single` verdict the bare-row
             // arm's `operator_face_extension_resolved` already takes
-            // (only a `Named` head consults the extension faces).
-            if let Ty::Named { name: head, .. } = ty
-                && matches!(
-                    self.extension_application(head, ty, self.intern(op_text), false, true),
+            // (only a `Named` head consults the extension faces). A
+            // type-parameter operand answers through its declared bound
+            // (upstream `applicableTo` subtypes `T` via `bound(T)`), so the
+            // receiver question substitutes it.
+            if let Ty::Named { name: head, .. } = ty {
+                let (recv, recv_ty) = self.operand_extension_receiver(head, ty, op_range.offset);
+                if matches!(
+                    self.extension_application(recv, recv_ty, self.intern(op_text), false, true),
                     ExtensionApp::Single
-                )
-            {
-                continue;
+                ) {
+                    continue;
+                }
             }
             self.emit_operand_unchecked(op_range, op_text, UncheckedNullableKind::Operator, out);
         }
@@ -314,7 +318,7 @@ impl<'a> Engine<'a> {
             let Some(op_span) = self.operand_token_span(i) else {
                 continue;
             };
-            let Some((mut ty, probe)) = self.unary_operand_ty(tail) else {
+            let Some((mut ty, probe)) = self.checked_operand_ty(tail) else {
                 continue;
             };
             let latched = self.null_aware_members.contains(&probe.offset);
@@ -333,26 +337,32 @@ impl<'a> Engine<'a> {
             // adjacent-operator arm (the operand row carries no
             // `Intent::Operator` — `mark_operator` runs on binary tails
             // only — so the bare read's own row reports the same `unary-`
-            // method face at the same anchor). A member tail (`-c.bad`), a
-            // call close (`-c?.e()`), a keyword receiver (`-this`, whose
-            // row stays `Intent::Read` and early-returns the receiver
-            // arm), and every `?.`-latched operand stay with this pass:
-            // the resolved member-adjacent arm answers only the
-            // operator's definedness on those shapes, never the
-            // `isNullable` consult.
-            if !latched && self.bare_operator_operand(probe, false) {
+            // method face at the same anchor) EXCEPT the `void` operand:
+            // upstream's `isPotentiallyNullable(VoidType)` is true, so the
+            // oracle reports the unchecked row at `-`/`~` beside
+            // `use_of_void_result` at the operand, while the resolved
+            // arm's bare-read path never reaches the nullable tail on a
+            // `void` row (probed 3.13.7: `-x` on a `void` param emits the
+            // pair). A member tail (`-c.bad`), a call close (`-c?.e()`), a
+            // keyword receiver (`-this`, whose row stays `Intent::Read`
+            // and early-returns the receiver arm), and every
+            // `?.`-latched operand stay with this pass: the resolved
+            // member-adjacent arm answers only the operator's definedness
+            // on those shapes, never the `isNullable` consult.
+            if !latched && ty != Ty::Void && self.bare_operator_operand(probe, false) {
                 continue;
             }
             // The `~`/`unary-` resolution consults the extension faces on
             // the operand's named head — a `Single` application resolves
             // the send (the same suppression the binary arm above takes).
-            if let Ty::Named { name: head, .. } = ty
-                && matches!(
-                    self.extension_application(head, ty, self.intern(name), false, true),
+            if let Ty::Named { name: head, .. } = ty {
+                let (recv, recv_ty) = self.operand_extension_receiver(head, ty, op_span.offset);
+                if matches!(
+                    self.extension_application(recv, recv_ty, self.intern(name), false, true),
                     ExtensionApp::Single
-                )
-            {
-                continue;
+                ) {
+                    continue;
+                }
             }
             self.emit_operand_unchecked(op_span, name, UncheckedNullableKind::Method, out);
         }
@@ -698,6 +708,194 @@ impl<'a> Engine<'a> {
             .map(|ty| (ty, span))
     }
 
+    /// [`Self::unary_operand_ty`] gated on the operand's own InvalidType
+    /// faces — upstream's `isInvalidBounded` short-circuit
+    /// (type_property_resolver.dart:87-94) runs BEFORE the `isNullable`
+    /// tail, so an operand whose static type is `InvalidType` never
+    /// reaches the potentially-nullable consult: the oracle answers
+    /// silence on `x + 1` where `x` is an undefined name (probed 3.13.7 —
+    /// only `undefined_identifier` stands), on `x + bar(7)` where `x`'s
+    /// declared type `X?` spells an unresolvable class (the `TypeUse`
+    /// verdict's `Missing`/`NonType` head = the InvalidType spelling),
+    /// and on a chain `x.y + 1` whose receiver resolved to nothing (the
+    /// member read types `InvalidType`, resolver never runs the lookup).
+    /// The model spells the same faces three ways — the push-time
+    /// `refs` verdict `Missing` on the operand's own token, the
+    /// `member_reads` receiver span's `Missing` verdict on a selector
+    /// tail, and the [`Self::invalid_type_names`] head on the resolved
+    /// operand type (a flow-staged promotion over an undefined local —
+    /// `x is String? ? (x + 1) : z` — reads `String?` though the oracle's
+    /// `x` is `InvalidType`, and a parameter's `X?` face reads nullable
+    /// through the same unresolvable head). Each face suppresses here:
+    /// `None` keeps the under-report posture for everything that is not
+    /// decidable as InvalidType.
+    fn checked_operand_ty(&self, tail: usize) -> Option<(Ty, SourceRange)> {
+        let (ty, probe) = self.unary_operand_ty(tail)?;
+        // The operand token's own `refs` miss: a bare read (`x`), a
+        // callee (`x()` — an InvalidType invocation's result is
+        // InvalidType upstream), or a group's re-probed inner token
+        // (`(x)`). `refs` keys bare reads only — a member selector lives
+        // in `member_reads`, whose arm below asks the same question of
+        // its receiver span instead.
+        if self
+            .refs
+            .binary_search_by(|r| r.range.offset.cmp(&probe.offset))
+            .ok()
+            .is_some_and(|i| {
+                self.refs[i].range == probe && self.refs[i].target == RefTarget::Missing
+            })
+        {
+            return None;
+        }
+        // The selector tail's receiver miss: `x.y`/`x.y()` where `x`
+        // resolved to nothing — `member_reads`' `recv_span` names the
+        // receiver expression, and its own `refs` verdict is `Missing`
+        // for the undefined head (mirroring `operand_face`'s
+        // `Receiver::Unknown` InvalidType arm).
+        if let Ok(index) = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&probe.offset))
+        {
+            let recv_span = self.member_reads[index].recv_span;
+            if self
+                .refs
+                .binary_search_by(|r| r.range.offset.cmp(&recv_span.offset))
+                .ok()
+                .is_some_and(|i| {
+                    self.refs[i].range == recv_span
+                        && self.refs[i].target == RefTarget::Missing
+                })
+            {
+                return None;
+            }
+        }
+        // The resolved operand face spelling an InvalidType head — the
+        // `TypeUse` row's `Missing`/`NonType` verdict set. A parameter's
+        // declared `X?` (`X` undefined), a flow-staged `String?` over an
+        // undefined local, a member's unresolvable return head — every
+        // one is `isInvalidBounded` upstream. A type-parameter operand's
+        // bound chain answers the same question (a `T extends X?` bound
+        // is invalid-bounded); the hop count caps the recovered cycle.
+        let world = self.name_world();
+        let mut face = ty;
+        for _ in 0..8 {
+            let Ty::Named { name, args, .. } = face else {
+                break;
+            };
+            if self.invalid_type_names.contains(&name) {
+                return None;
+            }
+            // The bound hop answers only for a parameter head — a concrete
+            // container name stays put even when an unrelated executable's
+            // parameter collides with it.
+            if args != ArgListId::EMPTY || world.is_known_head(name) {
+                break;
+            }
+            match self.operand_param_bound(probe.offset, name) {
+                Some(bound) => face = bound,
+                None => break,
+            }
+        }
+        Some((ty, probe))
+    }
+
+    /// The operand's type-parameter bound from every capture that
+    /// survives to teardown: `param_bound_of` covers the
+    /// per-executable/per-method windows (a `T` the enclosing method's
+    /// own `<T>` declares), and the innermost enclosing CONTAINER's
+    /// `type_param_names`/`type_param_bounds` pair covers a class-level
+    /// `T` (`A<T extends C?>`'s `t` reads inside `test()` — the
+    /// `static_errors_A01_t1x` shape, where `param_bound_of` answers
+    /// `None` because container headers latch no exec window). An
+    /// unbounded container parameter reads `Object?` — the implicit
+    /// bound `param_bound_of` itself writes.
+    fn operand_param_bound(&self, offset: u32, name: StringId) -> Option<Ty> {
+        // The innermost scope wins: a container-level `T` reads its own
+        // declaration's bound before any same-named executable window's.
+        if let Some(container) = self.enclosing_container_at(offset)
+            && let Some(decl) = self
+                .index
+                .get(self.file)
+                .and_then(|elements| elements.container(container))
+            && let Some(index) = decl
+                .type_param_names
+                .iter()
+                .position(|&param| param == name)
+        {
+            return Some(match decl.type_param_bounds.get(index).copied() {
+                None | Some(Ty::Dynamic) => Ty::Named {
+                    name: self.intern("Object"),
+                    nullable: true,
+                    args: ArgListId::EMPTY,
+                },
+                Some(bound) => bound,
+            });
+        }
+        self.param_bound_of(name)
+    }
+
+    /// The extension-applicability receiver for an operand whose static
+    /// type spells an in-scope type parameter: upstream `applicableTo`
+    /// subtypes `T` through its declared bound (`T extends C?` satisfies
+    /// `on C?` — probed 3.13.7: `t + t` inside `A<T extends C?>` resolves
+    /// `extension on C?`'s `operator +` and reports nothing), while the
+    /// name-level `reaches` walk cannot order a parameter head. The
+    /// substitution mirrors `satisfies_bound`'s parameter chain —
+    /// [`Self::operand_param_bound`] answers the written bound, `T
+    /// extends S` chains through `S`'s bound, the operand's own `?`
+    /// folds into the answered face, and the hop count caps the
+    /// recovered cycle (`T extends T`). A non-parameter head or a bound
+    /// the captures never staged returns the operand verbatim.
+    fn operand_extension_receiver(
+        &self,
+        head: StringId,
+        ty: Ty,
+        offset: u32,
+    ) -> (StringId, Ty) {
+        let Ty::Named {
+            nullable: operand_nullable,
+            ..
+        } = ty
+        else {
+            return (head, ty);
+        };
+        let world = self.name_world();
+        let mut face = ty;
+        for _ in 0..8 {
+            let Ty::Named { name, args, .. } = face else {
+                break;
+            };
+            // A parameterized face is already concrete (`List<T>` answers
+            // on `List`, not a parameter bound), and a head some
+            // container declares is never a parameter — the guard keeps a
+            // concrete operand whose name collides with an unrelated
+            // executable's parameter off the bound walk.
+            if args != ArgListId::EMPTY || world.is_known_head(name) {
+                break;
+            }
+            let Some(bound) = self.operand_param_bound(offset, name) else {
+                break;
+            };
+            let Ty::Named {
+                name: bound_head,
+                nullable: bound_nullable,
+                args: bound_args,
+            } = bound
+            else {
+                break;
+            };
+            face = Ty::Named {
+                name: bound_head,
+                nullable: bound_nullable || operand_nullable,
+                args: bound_args,
+            };
+        }
+        let Ty::Named { name, .. } = face else {
+            return (head, ty);
+        };
+        (name, face)
+    }
+
     /// The completed send's RESULT type when [`Self::recv_expression_ty`]
     /// cannot answer the callee span at teardown: the callee's declared
     /// signature is the authoritative result source (upstream's
@@ -963,3 +1161,11 @@ impl<'a> Engine<'a> {
         );
     }
 }
+
+/// The #3841 pins (registered here because the diagnose.rs module list is
+/// owned by another lane): the oracle-pinned verdicts for this pass's
+/// InvalidType operand faces, the `void` prefix operand, and the
+/// extension application's parameter-bound receiver.
+#[cfg(test)]
+#[path = "ticket_3841_tests.rs"]
+mod ticket_3841_tests;

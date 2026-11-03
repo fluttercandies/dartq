@@ -748,13 +748,14 @@ impl<'a> Engine<'a> {
                 // unchanged face keeps the raw entry (the under-report
                 // posture).
                 if name != container {
-                    let found_entry =
-                        match self.mixin_env(writer, name, found_owner, &projected, &mut facts) {
-                            Instantiated::Applied(env) => Projected::Foreign(std::rc::Rc::new(
-                                self.substitute_entry(&projected, &env),
-                            )),
-                            Instantiated::Unchanged | Instantiated::Undecidable => projected,
-                        };
+                    let found_entry = self.hop_member(
+                        writer,
+                        name,
+                        found_owner,
+                        member,
+                        projected,
+                        &mut facts,
+                    );
                     return Walk::Found(found_entry);
                 }
                 return Walk::Found(projected);
@@ -853,20 +854,21 @@ impl<'a> Engine<'a> {
                     // declaring signature reads through the application's
                     // written arguments (`XmlHasChildren<T>`'s `children`
                     // types `XmlNodeList<XmlNode>` on `XmlElement`, not
-                    // `XmlNodeList<T>`). `mixin_env` composes the
+                    // `XmlNodeList<T>`). `hop_member` composes the
                     // environment from `name`'s own header clause — the
                     // same source `check_mixin_application_overrides`
                     // reads — and stays undecidable when the clause facts
                     // are unknowable (a foreign application class), where
                     // the raw entry keeps the under-report posture.
                     let projected = self.boundary.member(mixin_owner, mixin, member, entry);
-                    let found_entry =
-                        match self.mixin_env(mixin_writer, mixin, mixin_owner, &projected, &mut facts) {
-                            Instantiated::Applied(env) => Projected::Foreign(std::rc::Rc::new(
-                                self.substitute_entry(&projected, &env),
-                            )),
-                            Instantiated::Unchanged | Instantiated::Undecidable => projected,
-                        };
+                    let found_entry = self.hop_member(
+                        mixin_writer,
+                        mixin,
+                        mixin_owner,
+                        member,
+                        projected,
+                        &mut facts,
+                    );
                     self.member_faces
                         .found_origin
                         .set(Some((mixin, mixin_owner)));
@@ -2047,16 +2049,22 @@ impl<'a> Engine<'a> {
                 // rule); multi-parameter foreign hops stay undecidable and
                 // suppress the face.
                 let declared_cmp_owned;
-                let declared_cmp: &MemberEntry =
-                    match self.mixin_env(container, mixin, mixin_owner, projected, &mut facts) {
-                        Instantiated::Unchanged => face_entry.as_ref().unwrap_or(projected),
-                        Instantiated::Applied(env) => {
-                            declared_cmp_owned = self
-                                .substitute_entry(face_entry.as_ref().unwrap_or(projected), &env);
-                            &declared_cmp_owned
-                        }
-                        Instantiated::Undecidable => continue,
-                    };
+                let declared_cmp: &MemberEntry = match self.mixin_env(
+                    container,
+                    mixin,
+                    mixin_owner,
+                    *spelling,
+                    projected,
+                    &mut facts,
+                ) {
+                    Instantiated::Unchanged => face_entry.as_ref().unwrap_or(projected),
+                    Instantiated::Applied(env) => {
+                        declared_cmp_owned = self
+                            .substitute_entry(face_entry.as_ref().unwrap_or(projected), &env);
+                        &declared_cmp_owned
+                    }
+                    Instantiated::Undecidable => continue,
+                };
                 let lookup = if setter_face {
                     self.setter_spelling(*spelling)
                 } else {
@@ -2160,6 +2168,7 @@ impl<'a> Engine<'a> {
         container: StringId,
         mixin: StringId,
         mixin_owner: FileId,
+        member_name: StringId,
         member: &MemberEntry,
         facts: &mut Option<HeaderClauses>,
     ) -> Instantiated {
@@ -2168,11 +2177,14 @@ impl<'a> Engine<'a> {
         // (`XmlNodeList<T>`'s `T` is a free container parameter the bare
         // `super_free_params` walk deliberately misses, since the
         // substitution must reach into argument lists). Each spelling maps
-        // once, in first-seen order.
+        // once, in first-seen order. An inferred field carries no model
+        // signature at all, so its type comes from the diagnosing pass's
+        // inference overlay — reading the model slot alone left every such
+        // field looking parameter-free and the environment never composed.
         let mut free: Vec<StringId> = Vec::new();
         {
             let mut collect = |ty: Ty| self.free_params_in(ty, member, mixin_owner, &mut free);
-            collect(member.var_ty);
+            collect(self.declared_or_inferred_ty(mixin, mixin_owner, member_name, member.var_ty));
             collect(member.return_ty);
             if let Some(formals) = member.formals.as_deref() {
                 for formal in formals.positional.iter().chain(formals.named.iter()) {
@@ -2216,6 +2228,74 @@ impl<'a> Engine<'a> {
             return Instantiated::Applied(map);
         }
         Instantiated::Undecidable
+    }
+
+    /// The found member as the hop hands it on: the declaring container's
+    /// entry with the application-site environment applied — the
+    /// instantiated inherited executable `inheritance_manager3.dart` keeps
+    /// per supertype edge (:554-571) and per applied mixin (:589-608 with
+    /// `_addMixinMembers` :354-371), which the use site then instantiates
+    /// once more against the receiver (:266-287). An unchanged or
+    /// undecidable environment keeps the raw entry (the under-report
+    /// posture).
+    ///
+    /// An INFERRED member (`var field = A<T>();`) has no model slot for the
+    /// environment to reach: its type is the diagnosing pass's inferred
+    /// face, which the read site folds in AFTER the climb — still spelling
+    /// the declaring container's parameters. The environment is applied to
+    /// that face here and written onto the entry, so the hop's parameters
+    /// are replaced before the receiver's arguments land on it. Without
+    /// this step the raw leaf makes `x.field is A<String>` and
+    /// `x.field is A<int>` provably true at once.
+    fn hop_member(
+        &self,
+        writer: StringId,
+        declaring: StringId,
+        declaring_owner: FileId,
+        member_name: StringId,
+        entry: Projected<'a, MemberEntry>,
+        facts: &mut Option<HeaderClauses>,
+    ) -> Projected<'a, MemberEntry> {
+        let Instantiated::Applied(env) = self.mixin_env(
+            writer,
+            declaring,
+            declaring_owner,
+            member_name,
+            &entry,
+            facts,
+        ) else {
+            return entry;
+        };
+        let mut substituted = self.substitute_entry(&entry, &env);
+        if substituted.var_ty == Ty::UNKNOWN {
+            let inferred =
+                self.declared_or_inferred_ty(declaring, declaring_owner, member_name, Ty::UNKNOWN);
+            substituted.var_ty = self.substitute_ty(inferred, &env);
+        }
+        Projected::Foreign(std::rc::Rc::new(substituted))
+    }
+
+    /// A member's declared type face: the element model's slot, or — for an
+    /// inferred declaration, whose slot stays `Unknown` because the
+    /// collector runs before any inference — the diagnosing pass's inferred
+    /// type for the declaring container ([`Engine::field_inferred_tys`], the
+    /// same overlay [`Engine::field_model_ty`] applies at the read site).
+    /// The overlay keys carry no file, so a foreign declaration keeps its
+    /// model face alone.
+    fn declared_or_inferred_ty(
+        &self,
+        declaring: StringId,
+        declaring_owner: FileId,
+        member_name: StringId,
+        model: Ty,
+    ) -> Ty {
+        if model != Ty::UNKNOWN || declaring_owner != self.file {
+            return model;
+        }
+        self.field_inferred_tys
+            .get(&(declaring, member_name))
+            .copied()
+            .unwrap_or(model)
     }
 
     /// One type's contribution to the free-parameter set the
@@ -11560,3 +11640,22 @@ mod ticket_3484_tests;
 #[cfg(test)]
 #[path = "ticket_3661_tests.rs"]
 mod ticket_3661_tests;
+
+/// The #3844 pins: `emit_wildcard_dups`'s pre-feature `_` second-declaration
+/// `duplicate_definition` drain in both feature directions — the only
+/// `duplicate_definition` emission `overrides.rs` owns — plus the
+/// member-scope pair and duplicate-span suppression contracts it reads the
+/// capture log for.
+#[cfg(test)]
+#[path = "ticket_3844_tests.rs"]
+mod ticket_3844_tests;
+
+/// The #3859 pins: the hop substitution of an INFERRED member face — the
+/// mixin and superclass edges apply the application's written arguments to
+/// a `var` field's inferred type, which no element-model signature carries
+/// (the collector runs before any inference), in both verdict directions
+/// plus the assignability face, the non-generic and parameter-free
+/// controls, and the explicit-`dynamic` silence bound.
+#[cfg(test)]
+#[path = "ticket_3859_tests.rs"]
+mod ticket_3859_tests;
