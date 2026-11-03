@@ -441,6 +441,53 @@ fn concrete_member_of<'c>(
 }
 
 impl<'a> Engine<'a> {
+    /// The aliased type behind a receiver head spelling a `typedef` in
+    /// `owner`'s scope — the anchor-side fold [`Self::walk_climb_impl`] runs
+    /// before it gives the head up as unresolvable. Answers the RHS head
+    /// plus the scope it was written in (`typedef P = _P;` — the alias's
+    /// own file resolves the head); a non-named RHS (a function, record, or
+    /// builtin face) names no container to enter and answers `None`, as
+    /// does a head that resolves to anything but a `TypeAlias` declaration
+    /// (a container, a top-level variable, a local) — the caller's own
+    /// resolution order owns those.
+    fn alias_anchor(
+        &self,
+        name: StringId,
+        owner: FileId,
+        scope_lib: LibraryId,
+    ) -> Option<(StringId, FileId, LibraryId)> {
+        let (decl, decl_owner) =
+            match lookup_scoped(self.graph, self.namespaces, self.index, scope_lib, owner, name) {
+                ScopedHit::Local(decl) => (decl, owner),
+                ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                    (self.index.get(file)?.decl(name)?, file)
+                }
+                _ => return None,
+            };
+        if decl.kind != MicroKind::TypeAlias {
+            return None;
+        }
+        // A named right-hand side re-anchors at its head (`typedef P =
+        // _P;`, `typedef PubG<T> = _G<T>;` — the RHS parameter spellings
+        // ride as bare leaves, so the head alone enters the walk); a
+        // function or record right-hand side names no container.
+        let Ty::Named { name: head, .. } = decl.var_ty else {
+            return None;
+        };
+        // A self-referential RHS (`typedef A = A;`) is no fold target; the
+        // caller's cycle guard would answer it anyway, so skip the hop.
+        if head == name || head == StringId::NONE {
+            return None;
+        }
+        Some((
+            head,
+            decl_owner,
+            self.graph
+                .library_of_file(decl_owner)
+                .unwrap_or(scope_lib),
+        ))
+    }
+
     /// Walks `container`'s member face through the linearized supertype
     /// chain: the container's own members, then its `with` mixins in reverse
     /// application order (the official application sequence
@@ -583,6 +630,10 @@ impl<'a> Engine<'a> {
         // The unique-declaration re-anchor bypasses the seen gate once
         // (the anchor's spelling re-resolves in its declaring library).
         let mut retried = false;
+        // The `typedef` spellings the anchor fold already chased — an alias
+        // cycle (`typedef A = B; typedef B = A;`) stops here instead of
+        // re-anchoring forever.
+        let mut alias_hops: FxHashSet<StringId> = FxHashSet::default();
         loop {
             if !retried && !seen.insert(name) {
                 return Walk::ChainBroken;
@@ -616,6 +667,26 @@ impl<'a> Engine<'a> {
             };
             let Some((found, found_owner)) = found else {
                 if at_anchor {
+                    // A `typedef` receiver head resolves to its aliased
+                    // type before any member question reads it (upstream
+                    // Dart SDK source, pkg/analyzer/lib/src/dart/element/
+                    // element.dart — a `TypeAliasElement` use resolves
+                    // through the aliased type): `typedef P = _P;` makes
+                    // `P.sm()`/`P().im()` `_P`'s face, and an alias chain
+                    // keeps chasing. A non-container RHS (a function or
+                    // record type) aliases no container the walk can enter
+                    // and keeps the caller's own resolution order.
+                    if let Some((head, alias_owner, lib)) =
+                        self.alias_anchor(name, owner, scope_lib)
+                        && alias_hops.insert(name)
+                    {
+                        name = head;
+                        owner = alias_owner;
+                        scope_lib = lib;
+                        at_anchor = true;
+                        retried = true;
+                        continue;
+                    }
                     // A receiver head that arrived through a resolved
                     // member signature (a foreign getter's declared
                     // return, never spelled in this file) resolves in its

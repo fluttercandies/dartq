@@ -744,7 +744,10 @@ fn always_exhaustive_within(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bo
 /// as core's (the sealed/enum checks already filtered the closed
 /// shadows).
 fn future_or_shadowed(world: &NameWorld<'_>, name: StringId) -> bool {
-    if world.container(name).is_some() {
+    // A nominal container shadows the union — unless it IS dart:async's
+    // own `FutureOr` declaration (the SDK indexes the typedef-backed row
+    // as a container; resolving it answers the union, not a shadow).
+    if world.shadows_dart_async(name) {
         return true;
     }
     fold_engine().is_some_and(|engine| engine.is_scope_param(name))
@@ -1827,6 +1830,9 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             {
                 true
             }
+            // `FutureOr<T>` is sealed into `T | Future<T>`
+            // (types/future_or.dart:20-31).
+            NameTy::NamedArgs(name, false, _) if self.is_future_or_name(*name) => true,
             NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
                 self.is_sealed_name(*name)
             }
@@ -1892,6 +1898,15 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                         has_rest: true,
                     }))
                     .collect()
+            }
+            // `FutureOrStaticType.getSubtypes` (types/future_or.dart:29-32):
+            // the union splits into the argument then `Future<T>`. A union
+            // the pool cannot decompose keeps its leaf face.
+            NameTy::NamedArgs(name, false, _) if self.is_future_or_name(*name) => {
+                match self.future_or_split(&erased) {
+                    Some((base, future)) => vec![base, future],
+                    None => vec![erased],
+                }
             }
             NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
                 self.name_subtypes(*name, &erased)
@@ -2367,17 +2382,75 @@ impl<'a> NameWorld<'a> {
         !self.has_known_subtypes(head)
     }
 
-    /// The interned `Future` spelling, `None` when the unit declares its own
-    /// `Future` (the spelling no longer names dart:async's class) or an
-    /// in-scope type parameter shadows it.
+    /// The interned `Future` spelling, `None` when a declaration shadows
+    /// the spelling off dart:async's class (a `Future` container declared
+    /// outside `dart:async` — a unit's own `class Future` — or an in-scope
+    /// type parameter). dart:async's own `Future` class is the head the
+    /// union split names, never a shadow.
     fn future_head(&self) -> Option<StringId> {
         let future = self.strings.intern("Future");
-        if self.container(future).is_some()
+        if self.shadows_dart_async(future)
             || fold_engine().is_some_and(|engine| engine.is_scope_param(future))
         {
             return None;
         }
         Some(future)
+    }
+
+    /// Whether `name` resolves to a nominal container declared OUTSIDE
+    /// `dart:async` — a shadowing declaration, never the union's own
+    /// `Future`/`FutureOr` row (the SDK indexes both as containers;
+    /// resolving them answers the union, not a shadow). An owner the graph
+    /// cannot place in a library (`library_of_file` `None`, the bare-world
+    /// rig) is not a shadow — the spelling still names the union.
+    fn shadows_dart_async(&self, name: StringId) -> bool {
+        let Some((_, owner)) = self.locate(name) else {
+            return false;
+        };
+        self.scope.is_some_and(|scope| {
+            scope
+                .graph
+                .library_of_file(owner)
+                .is_some_and(|lib| scope.graph.uri(lib) != "dart:async")
+        })
+    }
+
+    /// Whether `name` is dart:async's `FutureOr` union spelling. A
+    /// declared container or an in-scope type parameter of that name
+    /// shadows it (`getFutureOrTypeArgument` reads the resolved alias, so
+    /// a shadowed spelling is no union).
+    fn is_future_or_name(&self, name: StringId) -> bool {
+        self.strings.resolve(name) == "FutureOr" && !future_or_shadowed(self, name)
+    }
+
+    /// The `FutureOr<T>` split (`FutureOrStaticType.getSubtypes`,
+    /// upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/types/future_or.dart:
+    /// 29-32): the argument `T` first, then `Future<T>`. `None` when the
+    /// union cannot be decomposed — no fold window (the argument slot's
+    /// pool is unreachable), a malformed argument list, or a shadowed
+    /// `Future` spelling — keeping the pre-existing leaf face (the
+    /// under-report direction).
+    fn future_or_split(&self, ty: &NameTy) -> Option<(NameTy, NameTy)> {
+        let NameTy::NamedArgs(name, false, args) = *ty else {
+            return None;
+        };
+        if !self.is_future_or_name(name) {
+            return None;
+        }
+        let engine = fold_engine()?;
+        let base = engine.boundary.pool().get(args).first().copied()?;
+        let future_head = self.future_head()?;
+        let future = engine
+            .boundary
+            .args
+            .borrow_mut()
+            .named(future_head, false, &[base]);
+        let future = match future {
+            Ty::Named { name, args, .. } => NameTy::NamedArgs(name, false, args),
+            _ => NameTy::Named(future_head, false),
+        };
+        Some((NameTy::from_semantic(base), future))
     }
 
     /// The head and the written argument slot of a named or instantiated
@@ -3447,11 +3520,18 @@ impl<'a> NameWorld<'a> {
     /// that container, yet its exhaustiveness face is fully decided here
     /// (not sealed, no coverable subtypes — [`Self::name_subtypes`]), so
     /// the covering verdict over it is the world's answer, not a blind
-    /// spot. An unresolvable name is opaque — its sealed classes and
-    /// enum constants are invisible, so a non-exhaustive verdict over it
-    /// may be false and the expression-face covering emit suppresses.
+    /// spot. A `FutureOr` spelling resolves to dart:async's union — not a
+    /// container — yet the world still decides its sealedness and subtype
+    /// set (`T | Future<T>`), so a `FutureOr<int>` switch expression's
+    /// covering verdict is no blind spot either. An unresolvable name is
+    /// opaque — its sealed classes and enum constants are invisible, so a
+    /// non-exhaustive verdict over it may be false and the expression-face
+    /// covering emit suppresses.
     pub(crate) fn name_resolvable(&self, name: StringId) -> bool {
-        name == self.enum_id || self.container(name).is_some() || self.is_sealed_name(name)
+        name == self.enum_id
+            || self.container(name).is_some()
+            || self.is_sealed_name(name)
+            || self.is_future_or_name(name)
     }
 
     /// The constant's declared instantiation as a [`NameTy`]

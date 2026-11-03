@@ -1705,6 +1705,38 @@ impl<'a> Engine<'a> {
             && capture.positional.is_empty()
             && capture.named.is_empty();
         self.fn_capture_type(fn_ty, StringId::NONE, 0);
+        // A written function type standing as a call-site type argument
+        // (`f2<void Function(), String>()`) joins the open group as ONE
+        // member here. A function type fires no `handle_type` leaf, so
+        // without this hand-over the group holds one member fewer and every
+        // LATER argument shifts one parameter left: `f2<String,
+        // void Function()>()` judged `String` against the FIRST parameter
+        // and never checked the second at all, while `f2<List<int>
+        // Function(), String>()` seated the return type's own `int` as the
+        // first member. The member is complete at this close (a function
+        // type never re-fires a parameterized head), so the hand-over
+        // clears the merge latch and appends once. The extent is the
+        // written annotation `_typeArgumentErrorNode` anchors — the return
+        // type's own head through the formals' `)`; a `Function` spelled
+        // without a return type records no start offset and keeps the
+        // under-report.
+        if let Some((_, _, start)) = capture.ret
+            && self.fn_type_capture.is_empty()
+            && let Some(closer_end) = self.fn_formal_closer_end
+            && closer_end > start
+            && self
+                .call_args_capture
+                .as_ref()
+                .is_some_and(|args| args.depth == self.type_arg_depth)
+        {
+            self.call_args_push_completed(
+                fn_ty,
+                SourceRange {
+                    offset: start,
+                    length: closer_end - start,
+                },
+            );
+        }
         // A body-position capture (#2359) arms its shape for the
         // annotation/test faces but claims no variable-signature stash: the
         // claim sites are formals and container-level groups, and a stash
@@ -2286,6 +2318,18 @@ impl<'a> Engine<'a> {
         offset: u32,
         span: SourceRange,
     ) {
+        // A completion inside an open written function type is that
+        // signature's own return/formal/parameter-bound part, never a
+        // member of the enclosing call-site group: `f2<List<int>
+        // Function(), String>()` completes `List`, `int` and the re-fired
+        // `List<int>` at depths that collide with the group's own, so the
+        // depth gate alone would seat `int` as the FIRST member and shift
+        // every later argument one parameter left. The signature close
+        // ([`Self::fn_capture_end`]) hands the whole type over as one
+        // member instead.
+        if !self.fn_type_capture.is_empty() {
+            return;
+        }
         let Some(capture) = self.call_args_capture.as_mut() else {
             return;
         };
@@ -2301,6 +2345,30 @@ impl<'a> Engine<'a> {
             capture.members.pop();
         }
         capture.pending = Some((head, offset));
+        capture.members.push((ty, span));
+    }
+
+    /// A member that completes WITHOUT a `handle_type` leaf of its own — a
+    /// written function type (`f2<void Function(), String>()`): the
+    /// signature close owns the whole member, so it appends as written and
+    /// clears the merge latch (no re-fire can follow a closed signature).
+    /// The return type parses BEFORE `begin_function_type` fires, so its
+    /// completions may already have seated themselves; every one of them
+    /// lies inside the closed signature's own written extent and is swept
+    /// here — otherwise `List<int> Function()` would consume two parameter
+    /// slots and shift the arguments after it.
+    fn call_args_push_completed(&mut self, ty: Ty, span: SourceRange) {
+        let Some(capture) = self.call_args_capture.as_mut() else {
+            return;
+        };
+        if capture.depth != self.type_arg_depth {
+            return;
+        }
+        let end = span.offset + span.length;
+        capture
+            .members
+            .retain(|(_, member)| member.offset >= end || member.offset < span.offset);
+        capture.pending = None;
         capture.members.push((ty, span));
     }
 
@@ -3037,6 +3105,85 @@ mod exec_bounds_pairing_tests {
         assert_eq!(
             bare, written,
             "a written return type must pair the same bound as a bare header"
+        );
+    }
+
+    /// The `type_argument_not_matching_bounds` rows of `report_ops`, as
+    /// `(offset, message)` pairs.
+    fn bounds_rows(source: &str) -> Vec<(u32, String)> {
+        report_ops(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "type_argument_not_matching_bounds")
+            .map(|d| (d.range.offset, d.message.to_string()))
+            .collect()
+    }
+
+    /// #3744: a written FUNCTION TYPE standing as an explicit call-site
+    /// type argument occupies exactly one parameter slot. Before the
+    /// `fn_capture_end` hand-over the group held one member fewer — a
+    /// function type fires no `handle_type` leaf — so every LATER argument
+    /// shifted one parameter left and the last one went unchecked:
+    /// `f2<String, void Function()>()` judged `String` against the FIRST
+    /// parameter (`A extends int`) and never checked `B` at all. Oracle
+    /// 3.13.7 reports both arguments at their own parameter.
+    #[test]
+    fn function_type_argument_seats_its_own_parameter_slot() {
+        let source = "void f2<A extends int, B extends int>() {}\n\
+                      void main() { f2<String, void Function()>(); }\n";
+        let messages: Vec<String> = bounds_rows(source).into_iter().map(|(_, m)| m).collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "both arguments check, each at its own parameter: {messages:?}"
+        );
+        assert!(
+            messages[0].starts_with("'String'") && messages[0].ends_with("'A'."),
+            "the first argument keeps the first parameter: {messages:?}"
+        );
+        assert!(
+            messages[1].starts_with("'void Function()'") && messages[1].ends_with("'B'."),
+            "the function type seats the second parameter: {messages:?}"
+        );
+    }
+
+    /// #3744: a function type whose RETURN TYPE carries a generic group
+    /// (`List<int> Function()`) hands its whole written extent over as one
+    /// member — the return type's own completions never stand as members of
+    /// their own, so the argument after it keeps its parameter slot.
+    #[test]
+    fn nested_group_in_function_return_keeps_the_next_slot() {
+        let source = "void f2<A extends int, B extends int>() {}\n\
+                      void main() { f2<List<int> Function(), String>(); }\n";
+        let messages: Vec<String> = bounds_rows(source).into_iter().map(|(_, m)| m).collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "one row per argument, no shifted duplicate: {messages:?}"
+        );
+        assert!(
+            messages[0].starts_with("'List<int> Function()'") && messages[0].ends_with("'A'."),
+            "the whole function type is the first argument: {messages:?}"
+        );
+        assert!(
+            messages[1].starts_with("'String'") && messages[1].ends_with("'B'."),
+            "the following argument keeps the second slot: {messages:?}"
+        );
+    }
+
+    /// #3744: the leading-position row anchors at the written annotation's
+    /// start — the return type's head, the face
+    /// `_typeArgumentErrorNode` returns — never at the `Function` keyword.
+    #[test]
+    fn leading_function_type_argument_anchors_at_its_return_head() {
+        let source = "void f2<A extends int, B extends int>() {}\n\
+                      void main() { f2<void Function(), String>(); }\n";
+        let rows = bounds_rows(source);
+        assert_eq!(rows.len(), 2, "both arguments check: {rows:?}");
+        let expected = source.find("void Function()").expect("fixture") as u32;
+        assert_eq!(
+            rows[0].0, expected,
+            "the row anchors at the written annotation's head: {rows:?}"
         );
     }
 

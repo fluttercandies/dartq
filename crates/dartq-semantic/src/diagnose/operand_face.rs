@@ -75,6 +75,13 @@ impl<'a> Engine<'a> {
                     || self.name_world().is_known_head(*type_name)
                 {
                     OperandFace::Gap
+                } else if self.alias_rhs(*type_name).is_some() {
+                    // A receiver head spelling a type alias resolves through
+                    // its aliased type upstream (`typedef P = _P;` — `P` is
+                    // `_P` before any member question), so the head is never
+                    // the oracle's InvalidType — the member miss or the
+                    // untyped result is the known-head arm's same gap.
+                    OperandFace::Gap
                 } else {
                     OperandFace::Invalid
                 }

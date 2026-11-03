@@ -18,7 +18,13 @@
 //! no solution *or* when the solution violates a parameter's own bound —
 //! `chooseTypes` merges that bound into the parameter's constraints,
 //! `pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer_operations.dart`
-//! :1080-1146) — and every repeated generic element merges through
+//! :1080-1146). A `with` clause whose mixin application is invalid —
+//! any `on` constraint the supertype and the earlier mixins cannot satisfy
+//! (`_checkForMixinSuperclassConstraints`, `error_verifier.dart` :6079) —
+//! contributes nothing to the merge: `element.mixins` never reaches the
+//! hierarchy then, so the clause's entries and their transitive interfaces
+//! are skipped whole, and `mixin_application_not_implemented_interface`
+//! reports instead. Every repeated generic element merges through
 //! `_ClassInterfaceType.update`: the first occurrence stands, and from the
 //! second distinct one on, NORM of both sides feeds `NNBD_TOP_MERGE`
 //! (`top_merge.dart`, `normalize.dart`). A merge that cannot proceed
@@ -194,7 +200,7 @@ impl<'a> Engine<'a> {
             let mut walk = IfaceWalk {
                 eng: self,
                 faces_by_name,
-                merged: FxHashMap::default(),
+                hierarchy: FxHashMap::default(),
                 visiting: FxHashSet::default(),
                 object: self.intern("Object"),
                 future: self.intern("Future"),
@@ -219,11 +225,11 @@ impl<'a> Engine<'a> {
                     // Extensions never join the class-family visit.
                     ContainerKind::Extension => continue,
                 };
-                let Some(faces) = walk.faces_by_name.get(&name).cloned() else {
+                if !walk.faces_by_name.contains_key(&name) {
                     continue;
-                };
+                }
                 let display = self.strings.resolve(name).to_owned();
-                for (first, second) in walk.declaration_conflicts(name, &faces) {
+                for (first, second) in walk.declaration_conflicts(name) {
                     let pool = walk.eng.boundary.pool();
                     let t1 = first.render(walk.eng.strings, &pool);
                     let t2 = second.render(walk.eng.strings, &pool);
@@ -584,13 +590,35 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// The per-element walk result — the official `_Hierarchy`: the collected
+/// interfaces (each element's running value) and the conflicts found while
+/// merging them.
+#[derive(Clone, Default)]
+struct Hierarchy {
+    interfaces: Vec<Iface>,
+    conflicts: Vec<(Ty, Ty)>,
+}
+
+/// The result of resolving one clause face: the element key the merge
+/// sees, the instantiated entry type, the target's own parameter
+/// spellings, the final argument list, and where the element lives.
+struct ResolvedFace {
+    prefix: Option<StringId>,
+    head: StringId,
+    ty: Ty,
+    params: Vec<StringId>,
+    args: Vec<Ty>,
+    file: FileId,
+    type_params: u16,
+}
+
 /// The interface-collection walk: faces per declared name, the memoized
-/// merged-interface list per same-file container, and the interned
-/// dart:async/core spellings the merge table keys on.
+/// hierarchy per same-file container, and the interned dart:async/core
+/// spellings the merge table keys on.
 struct IfaceWalk<'e, 'a> {
     eng: &'e Engine<'a>,
     faces_by_name: FxHashMap<StringId, Vec<Face>>,
-    merged: FxHashMap<StringId, Option<Vec<Iface>>>,
+    hierarchy: FxHashMap<StringId, Option<Hierarchy>>,
     visiting: FxHashSet<StringId>,
     object: StringId,
     future: StringId,
@@ -602,13 +630,9 @@ struct IfaceWalk<'e, 'a> {
 impl<'e, 'a> IfaceWalk<'e, 'a> {
     /// The declaration's conflicts: one operand pair per conflicting
     /// element, in collection order.
-    fn declaration_conflicts(&mut self, name: StringId, faces: &[Face]) -> Vec<(Ty, Ty)> {
-        let mut cells: Vec<((Option<StringId>, StringId), MergeCell)> = Vec::new();
-        self.collect_faces(name, faces, 0, &mut cells);
-        cells
-            .into_iter()
-            .filter_map(|(_, cell)| cell.error)
-            .collect()
+    fn declaration_conflicts(&mut self, name: StringId) -> Vec<(Ty, Ty)> {
+        self.hierarchy(name, 0)
+            .map_or_else(Vec::new, |hierarchy| hierarchy.conflicts)
     }
 
     /// Appends every face in the official clause order.
@@ -626,10 +650,175 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         let mut pool: Vec<Iface> = Vec::new();
         for clause in FaceClause::ORDER {
             let record = clause != FaceClause::Implements;
+            if clause == FaceClause::With && !self.with_clause_satisfied(name, faces, depth, &pool)
+            {
+                // A `with` face whose `on` constraint the supertype and the
+                // earlier mixins cannot satisfy makes the whole clause
+                // invalid: the official `element.mixins` never reaches the
+                // hierarchy merge then (`mixin_application_not_implemented_
+                // interface` reports instead), so neither the mixin entries
+                // nor their transitive interfaces participate — probed
+                // 3.13.7 (`class X extends A<double> with M` where `mixin M
+                // on A<int>`: no conflict, and even a satisfied sibling
+                // mixin contributes nothing).
+                continue;
+            }
             for face in faces.iter().filter(|face| face.clause == clause) {
                 self.append_face(name, face, depth, cells, &mut pool, record);
             }
         }
+    }
+
+    /// Whether every `with` face's `on` constraints are satisfied at its
+    /// application point — the name-keyed mirror of the official
+    /// `_checkForMixinSuperclassConstraints`: each instantiated constraint
+    /// must be a supertype of `element.supertype` or of an earlier mixin in
+    /// the clause (`enclosingClass.mixins[i]`). `pool` carries the merged
+    /// interfaces collected so far (the supertype chain, then earlier
+    /// mixins' entries) — the same shape `_MixinInference`'s
+    /// `interfacesMerger` builds for the constraint match.
+    fn with_clause_satisfied(
+        &mut self,
+        writer: StringId,
+        faces: &[Face],
+        depth: u32,
+        pool: &[Iface],
+    ) -> bool {
+        let mut applied: Vec<Iface> = pool.to_vec();
+        for face in faces.iter().filter(|face| face.clause == FaceClause::With) {
+            let Some(resolved) = self.resolve_face(writer, face, &applied) else {
+                // An unresolvable or non-interface face: `append_face`
+                // contributes nothing for it; it cannot fail a constraint.
+                continue;
+            };
+            let constraints: Vec<Ty> = self
+                .faces_by_name
+                .get(&resolved.head)
+                .map(|faces| {
+                    faces
+                        .iter()
+                        .filter(|face| face.clause == FaceClause::On)
+                        .map(|face| self.substitute(face.ty, &resolved.params, &resolved.args))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let satisfied = constraints
+                .iter()
+                .all(|constraint| self.constraint_satisfied(*constraint, &applied));
+            if !satisfied {
+                return false;
+            }
+            // The applied mixin joins the pool for the next constraint —
+            // its own entry plus its transitive interfaces, the same
+            // first-wins keyed merge `merge_entry` records.
+            match applied
+                .iter()
+                .position(|(k, _)| *k == (resolved.prefix, resolved.head))
+            {
+                Some(at) => applied[at].1 = resolved.ty,
+                None => applied.push(((resolved.prefix, resolved.head), resolved.ty)),
+            }
+            if resolved.file == self.eng.file
+                && !(resolved.type_params > 0 && resolved.params.is_empty())
+                && let Some(inner) = self.hierarchy(resolved.head, depth)
+            {
+                for ((ikey_prefix, ikey_head), ty) in inner.interfaces {
+                    let ty = self.substitute(ty, &resolved.params, &resolved.args);
+                    match applied.iter().position(|(k, _)| *k == (ikey_prefix, ikey_head)) {
+                        Some(at) => applied[at].1 = ty,
+                        None => applied.push(((ikey_prefix, ikey_head), ty)),
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether one instantiated `on` constraint is satisfied: some
+    /// collected interface names the constraint's element, and its merged
+    /// arguments are subtypes of the constraint's (`isSubtypeOf(superType,
+    /// constraint)` — covariant on the arguments).
+    fn constraint_satisfied(&self, constraint: Ty, pool: &[Iface]) -> bool {
+        let Ty::Named { name, .. } = constraint else {
+            // A non-named constraint (degraded `Ty::Unknown`, `dynamic`)
+            // cannot be demanded — treat as satisfied.
+            return true;
+        };
+        let Some((_, merged)) = pool.iter().find(|((_, key), _)| *key == name) else {
+            return false;
+        };
+        let merged_args = self.ty_args(*merged);
+        let constraint_args = self.ty_args(constraint);
+        if constraint_args.is_empty() {
+            // A raw constraint head reads as instantiate-to-bounds —
+            // head presence is the whole demand here.
+            return true;
+        }
+        if merged_args.len() != constraint_args.len() {
+            return false;
+        }
+        merged_args
+            .iter()
+            .zip(constraint_args.iter())
+            .all(|(merged, constraint)| self.is_subtype(*merged, *constraint))
+    }
+
+    /// `t <: s` for the clause-grammar's name-keyed types: tops accept
+    /// everything, `Never` is below everything, identity and the declared
+    /// hierarchy chain otherwise. `InvalidType` (`Ty::Unknown`) on either
+    /// side satisfies — the oracle's `isSubtypeOf` answers true for an
+    /// `InvalidType` operand.
+    fn is_subtype(&self, t: Ty, s: Ty) -> bool {
+        if t == s || self.is_top(s) || self.is_never(t) {
+            return true;
+        }
+        if matches!(t, Ty::Unknown) || matches!(s, Ty::Unknown) {
+            return true;
+        }
+        if matches!(t, Ty::Dynamic | Ty::Void) {
+            return false;
+        }
+        let (
+            Ty::Named {
+                name: t_name,
+                nullable: t_nullable,
+                ..
+            },
+            Ty::Named {
+                name: s_name,
+                nullable: s_nullable,
+                ..
+            },
+        ) = (t, s)
+        else {
+            return false;
+        };
+        // Nullability is covariant on the receiver too: `T? <: S` needs S
+        // nullable; `T <: S?` reduces to `T <: S`.
+        if t_nullable && !s_nullable {
+            return false;
+        }
+        if t_name == s_name {
+            let t_args = self.ty_args(t);
+            let s_args = self.ty_args(s);
+            return s_args.is_empty()
+                || (t_args.len() == s_args.len()
+                    && t_args
+                        .iter()
+                        .zip(s_args.iter())
+                        .all(|(t_arg, s_arg)| self.is_subtype(*t_arg, *s_arg)));
+        }
+        // dart:core scalar facts the declared-chain walk cannot see.
+        let t_str = self.eng.strings.resolve(t_name);
+        let s_str = self.eng.strings.resolve(s_name);
+        if s_str == "Object" {
+            // `T <: Object` for every non-nullable T.
+            return !t_nullable;
+        }
+        if s_str == "num" {
+            return t_str == "int" || t_str == "double";
+        }
+        self.full_supertype(t_name, s_name, 0) && self.ty_args(s).is_empty()
     }
 
     /// Appends one face the official way: the entry itself, then the
@@ -647,6 +836,50 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         if depth > MAX_WALK_DEPTH {
             return;
         }
+        let Some(resolved) = self.resolve_face(writer, face, pool) else {
+            return;
+        };
+        // A non-generic element's own instantiation is the merge
+        // identity — no entry — but its transitive interfaces still
+        // collect (the chain is where `class A implements I<int>` reaches
+        // the declaration that extends `A`).
+        if !resolved.params.is_empty() {
+            self.merge_entry(
+                cells,
+                pool,
+                record,
+                (resolved.prefix, resolved.head),
+                resolved.ty,
+            );
+        }
+        // The transitive interfaces: same-file targets only (a foreign
+        // container's clause arguments are invisible to this scanner); a
+        // generic target whose parameter spellings the model does not
+        // carry cannot substitute — its chain stays uncollected rather
+        // than leaking stale parameter leaves.
+        if resolved.file == self.eng.file
+            && !(resolved.type_params > 0 && resolved.params.is_empty())
+            && let Some(inner) = self.hierarchy(resolved.head, depth)
+        {
+            for ((ikey_prefix, ikey_head), ty) in inner.interfaces {
+                let ty = self.substitute(ty, &resolved.params, &resolved.args);
+                self.merge_entry(cells, pool, record, (ikey_prefix, ikey_head), ty);
+            }
+        }
+    }
+
+    /// Resolves one clause face to the element it names and the argument
+    /// list the merge uses — the entry instantiation and the recursion
+    /// facts `append_face` and `with_clause_satisfied` share. `pool` feeds
+    /// the mixin inference for a raw `with` face. `None` is the oracle's
+    /// `InvalidType` shape (unresolvable head, `dynamic`/`void`, arity
+    /// mismatch): no entry and no chain.
+    fn resolve_face(
+        &mut self,
+        writer: StringId,
+        face: &Face,
+        pool: &[Iface],
+    ) -> Option<ResolvedFace> {
         // The entry and the recursion target: a type alias expands through
         // its right-hand side (substituting the alias's own parameters by
         // the written arguments), anything else stands as written. The
@@ -695,11 +928,11 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
                     target_head = name;
                     prefix = None;
                 }
-                _ => return,
+                _ => return None,
             }
         }
         if target_head == StringId::NONE {
-            return;
+            return None;
         }
         let resolved = match scope {
             Some(owner) if owner != self.eng.file => resolve_container(
@@ -717,7 +950,7 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         let Some((target, target_file)) = resolved else {
             // No element: the oracle's `InvalidType` interface — it never
             // conflicts.
-            return;
+            return None;
         };
         let params = target.type_param_names.to_vec();
         let mut args = self.ty_args(entry_ty);
@@ -747,25 +980,17 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         // collect (the chain is where `class A implements I<int>` reaches
         // the declaration that extends `A`).
         if args.len() != params.len() {
-            return;
+            return None;
         }
-        if !params.is_empty() {
-            self.merge_entry(cells, pool, record, (prefix, target_head), entry_ty);
-        }
-        // The transitive interfaces: same-file targets only (a foreign
-        // container's clause arguments are invisible to this scanner); a
-        // generic target whose parameter spellings the model does not
-        // carry cannot substitute — its chain stays uncollected rather
-        // than leaking stale parameter leaves.
-        if target_file == self.eng.file
-            && !(target.type_params > 0 && params.is_empty())
-            && let Some(interfaces) = self.merged_interfaces(target_head, depth)
-        {
-            for ((ikey_prefix, ikey_head), ty) in interfaces {
-                let ty = self.substitute(ty, &params, &args);
-                self.merge_entry(cells, pool, record, (ikey_prefix, ikey_head), ty);
-            }
-        }
+        Some(ResolvedFace {
+            prefix,
+            head: target_head,
+            ty: entry_ty,
+            params,
+            args,
+            file: target_file,
+            type_params: target.type_params,
+        })
     }
 
     /// The written type with every bare generic type *argument* instantiated
@@ -917,12 +1142,33 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             }
         }
         // A parameter no constraint mentions keeps its bound — the official
-        // `chooseFinalTypes` bound fallback (`inference_using_bounds`).
+        // `chooseFinalTypes` bound fallback (`inference_using_bounds`). The
+        // bound is substituted through the partial solution: `M6<S,
+        // T extends S>` applied to `I<int>` binds S=int, so T reads
+        // `int`, not the bare `S` (probed 3.13.7: the inference lands
+        // `M6<int, int>`).
+        let partial: Vec<Ty> = bindings
+            .iter()
+            .enumerate()
+            .map(|(slot, bound)| {
+                bound.unwrap_or(Ty::Named {
+                    name: params[slot],
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                })
+            })
+            .collect();
         let args: Vec<Ty> = bindings
             .into_iter()
             .enumerate()
             .map(|(slot, bound)| {
-                bound.unwrap_or_else(|| bounds.get(slot).copied().unwrap_or(Ty::Dynamic))
+                bound.unwrap_or_else(|| {
+                    self.substitute(
+                        bounds.get(slot).copied().unwrap_or(Ty::Dynamic),
+                        params,
+                        &partial,
+                    )
+                })
             })
             .collect();
         // The official verification (`matchSupertypeConstraints`): substituting
@@ -980,6 +1226,19 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
     /// container's clause arguments are invisible to this scanner, so an
     /// unreachable answer is the honest one.
     fn declared_supertype(&self, name: StringId, target: StringId, depth: u32) -> bool {
+        self.supertype_of(name, target, depth, false)
+    }
+
+    /// Whether `name` reaches `target` through every clause kind — the
+    /// finished-hierarchy reading the official `isSubtypeOf` answers with:
+    /// a class whose only route to the bound runs through its own `with`
+    /// faces still implements the interface (probed 3.13.7:
+    /// `regress32353`'s `Local` satisfies `Dir` through `Fwd` itself).
+    fn full_supertype(&self, name: StringId, target: StringId, depth: u32) -> bool {
+        self.supertype_of(name, target, depth, true)
+    }
+
+    fn supertype_of(&self, name: StringId, target: StringId, depth: u32, full: bool) -> bool {
         /// A declared chain nests at most a few levels; a pathological one
         /// stops here (broken code reports elsewhere).
         const MAX_DEPTH: u32 = 16;
@@ -990,13 +1249,15 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             return false;
         };
         for face in faces {
-            if !matches!(face.clause, FaceClause::Extends | FaceClause::Implements) {
+            if !full
+                && !matches!(face.clause, FaceClause::Extends | FaceClause::Implements)
+            {
                 continue;
             }
             if face.head == target {
                 return true;
             }
-            if face.prefix.is_none() && self.declared_supertype(face.head, target, depth + 1) {
+            if face.prefix.is_none() && self.supertype_of(face.head, target, depth + 1, full) {
                 return true;
             }
         }
@@ -1128,35 +1389,39 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         }
     }
 
-    /// The merged-interface list of a same-file container, memoized —
-    /// the official `implementedInterfaces(element)`.
-    fn merged_interfaces(&mut self, name: StringId, depth: u32) -> Option<Vec<Iface>> {
-        if let Some(hit) = self.merged.get(&name) {
-            return hit.clone();
+    /// One container's interface walk, memoized — the official
+    /// `_getHierarchy`. The memo is what a hierarchy loop settles on: the
+    /// official publishes the in-progress result (empty) before walking, so
+    /// a cyclic re-entry sees no interfaces, and every later reader sees
+    /// the first computed — one substitution level short — hierarchy. An
+    /// unfolding walk (`class A implements B<List<T>>` / `class B
+    /// implements A<List<T>>`) therefore reports nothing.
+    fn hierarchy(&mut self, name: StringId, depth: u32) -> Option<Hierarchy> {
+        if let Some(hit) = self.hierarchy_map_get(name) {
+            return hit;
         }
         if !self.visiting.insert(name) {
-            // A hierarchy cycle: broken code reporting elsewhere — never
-            // cached (the outer computation owns the real result).
-            return None;
+            // The in-progress sentinel: no interfaces, never cached (the
+            // outer computation owns the real result).
+            return Some(Hierarchy::default());
         }
         let computed = match self.faces_by_name.get(&name).cloned() {
             Some(faces) if depth < MAX_WALK_DEPTH => {
                 let mut cells: Vec<((Option<StringId>, StringId), MergeCell)> = Vec::new();
                 self.collect_faces(name, &faces, depth + 1, &mut cells);
-                Some(
-                    cells
-                        .into_iter()
-                        .map(|(key, cell)| {
-                            (key, cell.current.or(cell.single).unwrap_or(Ty::Unknown))
-                        })
-                        .collect::<Vec<Iface>>(),
-                )
+                Some(hierarchy_of(cells))
             }
             _ => None,
         };
         self.visiting.remove(&name);
-        self.merged.insert(name, computed.clone());
+        self.hierarchy.insert(name, computed.clone());
         computed
+    }
+
+    /// The memo read (a separate helper so the `&mut` borrow of the walk
+    /// ends before the compute path takes it again).
+    fn hierarchy_map_get(&self, name: StringId) -> Option<Option<Hierarchy>> {
+        self.hierarchy.get(&name).cloned()
     }
 
     /// Merges one interface instantiation into its element's cell
@@ -1581,5 +1846,23 @@ fn named_parts(ty: Ty) -> Option<(StringId, bool, ArgListId)> {
             args,
         } => Some((name, nullable, args)),
         _ => None,
+    }
+}
+
+/// A walk's cell list as the official `_Hierarchy`: each element's running
+/// value (the merge result when it got that far, else the first
+/// occurrence) plus the conflicts, in collection order.
+fn hierarchy_of(cells: Vec<((Option<StringId>, StringId), MergeCell)>) -> Hierarchy {
+    let mut interfaces = Vec::with_capacity(cells.len());
+    let mut conflicts = Vec::new();
+    for (key, cell) in cells {
+        if let Some(error) = cell.error {
+            conflicts.push(error);
+        }
+        interfaces.push((key, cell.current.or(cell.single).unwrap_or(Ty::Unknown)));
+    }
+    Hierarchy {
+        interfaces,
+        conflicts,
     }
 }

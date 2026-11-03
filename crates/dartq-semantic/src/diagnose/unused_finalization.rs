@@ -1610,11 +1610,36 @@ impl<'a> Engine<'a> {
             }
             Some("[") => {
                 // `a[i]` → `[]`, `a[i] = v` → `[]=` — the token after the
-                // matching `]` decides.
-                let member = if tokens
+                // matching `]` decides. Upstream's `writeOrReadElement`
+                // resolves `[]=` for EVERY assignment form (`=`, `??=`,
+                // `+=`, `++`/`--`), so a compound tail credits the write
+                // element alone.
+                let member = if tokens.get(at).is_some_and(|token| {
+                    self.index_write_after(token.byte_offset as usize)
+                        || self.index_compound_after(token.byte_offset as usize)
+                }) {
+                    "[]="
+                } else {
+                    "[]"
+                };
+                return Some(self.intern(member));
+            }
+            Some("?")
+                if tokens
                     .get(at)
-                    .is_some_and(|token| self.index_write_after(token.byte_offset as usize))
-                {
+                    .is_some_and(|token| token.utf16_offset == end)
+                    && tokens
+                        .get(at + 1)
+                        .is_some_and(|token| &self.source[token.byte_range()] == "[") =>
+            {
+                // The null-aware index `a?[i]` — `?` scans as its own
+                // token glued to the name's end (a spaced `?` is a
+                // conditional and never reaches this arm). The same
+                // write-element rule applies after the `]`.
+                let member = if tokens.get(at + 1).is_some_and(|token| {
+                    self.index_write_after(token.byte_offset as usize)
+                        || self.index_compound_after(token.byte_offset as usize)
+                }) {
                     "[]="
                 } else {
                     "[]"
@@ -2661,6 +2686,53 @@ impl<'a> Engine<'a> {
         false
     }
 
+    /// Whether the index expression whose `[` begins at byte `open` is
+    /// followed by a COMPOUND write — `a[i] ??= v`, `a[i] += v`,
+    /// `a[i]++`, `a[i]--`, or any `op=` compound. Upstream's
+    /// `IndexExpression.writeOrReadElement` resolves `[]=` for every
+    /// assignment form (the read element applies only through the
+    /// compound's own read half — `unused_local_elements_verifier.dart`
+    /// :196-200 credits the single element the write resolved), so the
+    /// credit answer is the same `[]=` the lone `=` takes.
+    fn index_compound_after(&self, open: usize) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut depth: i32 = 0;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let mut k = i + 1;
+                        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        let tail = &bytes[k..];
+                        return tail.starts_with(b"??=")
+                            || tail.starts_with(b"<<=")
+                            || tail.starts_with(b">>>=")
+                            || tail.starts_with(b">>=")
+                            || tail.starts_with(b"+=")
+                            || tail.starts_with(b"-=")
+                            || tail.starts_with(b"*=")
+                            || tail.starts_with(b"/=")
+                            || tail.starts_with(b"%=")
+                            || tail.starts_with(b"~/=")
+                            || tail.starts_with(b"&=")
+                            || tail.starts_with(b"|=")
+                            || tail.starts_with(b"^=")
+                            || tail.starts_with(b"++")
+                            || tail.starts_with(b"--");
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Whether the source spells a member access `head.member` — an
     /// optional balanced `<...>` instantiation may sit between the head
     /// and the dot (the generic instantiation `foo<int>.m()`), and both
@@ -2902,6 +2974,11 @@ impl<'a> Engine<'a> {
             .used_names
             .iter()
             .filter(|name| !unresolved_member_only.contains(*name))
+            // An unresolved `import ''` head credits the synthetic empty
+            // spelling — a name-level `element_used` hit would spare every
+            // nameless decl site in the file. The nameless recovery has no
+            // use edge; scrub the mark.
+            .filter(|name| !self.is_nameless(**name))
             .copied()
             .collect();
         // The oracle's `usedElements.members` element set at (file,
@@ -3543,8 +3620,25 @@ impl<'a> Engine<'a> {
                         && self
                             .container_kind_of(site.name)
                             .is_some_and(|kind| kind == ContainerKind::Class);
+                    // The mixin-application `_` spare (#3738): upstream
+                    // reports a `class _ {}` wildcard container but never a
+                    // `class _ = S with M` application — the synthetic
+                    // application's element binds the `with` clause's
+                    // forwarding constructors into `usedElements.elements`
+                    // (`addElement`'s mixin-application super-constructor
+                    // arm), which the element check spares. The `=` after
+                    // the name token is the application's written shape.
+                    let mixin_app = {
+                        let mut at = self.byte_of(site.range.end());
+                        let bytes = self.source.as_bytes();
+                        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                            at += 1;
+                        }
+                        bytes.get(at) == Some(&b'=')
+                    };
                     if !js_spared
                         && !pragma_spared
+                        && !mixin_app
                         && self.is_private_name(site.name)
                         && !element_used.contains(&bare)
                         && !enum_declares_ctor
@@ -3767,12 +3861,34 @@ impl<'a> Engine<'a> {
                                 && self.pattern_field_read_of(container, bare))
                         }
                     };
+                    // `_overridesUsedElement`: the overridden element must
+                    // be USED — `walk_super`'s existence answer is the
+                    // over-spare the wildcard `get _` corpus pinned (a
+                    // `C1Extends extends ContainsWildcardVariable` getter
+                    // over an unread super field still reports). The
+                    // nameless container arms stay out — a synthetic
+                    // container has no supertype to climb.
+                    let overrides_used = !self.is_nameless(container)
+                        && self.overrides_used_element(
+                            container,
+                            site.name,
+                            &|file, decl_container, name| {
+                                member_used_elements.contains(&(file, decl_container, name))
+                                    || (file == self.file
+                                        && (self.member_was_read(decl_container, &name)
+                                            || ref_member_reads
+                                                .contains(&(decl_container, name))))
+                                    || (!self.is_wildcard(name)
+                                        && member_element_used.contains(&name))
+                            },
+                            8,
+                        );
                     let spared = unnamed_face_owns
                         || pragma_spared
                         || (!self.is_nameless(site.name)
                             && self.is_publicly_accessible(site.name, site.kind, false))
                         || member_used
-                        || matches!(self.walk_super(container, site.name), Walk::Found(_));
+                        || overrides_used;
                     if !spared {
                         // The nameless recovery member anchors like the
                         // field arm above: the enclosing container's
@@ -4845,6 +4961,36 @@ impl<'a> Engine<'a> {
     /// generative face, unused_local_elements_verifier.dart:1010-1014,
     /// upstream Dart SDK source — the constructor_body constFactory corpus,
     /// where the error'd factory body never turns into an unused row).
+    /// `_overridesUsedElement`
+    /// (unused_local_elements_verifier.dart:1016-1022): a member is used
+    /// when any element it overrides is used — recursively (the overridden
+    /// element's own overrides chain). The climb reads `walk_super`'s
+    /// `Found` + `found_origin` latch for the declaring
+    /// `(container, file)` hop, asks `is_used` of that element's own
+    /// verdict, then continues the climb from there. `depth` bounds the
+    /// recursion (an override cycle answers a miss the same way upstream's
+    /// memoized-any walk does — the bounded climb keeps the pass's
+    /// termination invariant without a fixpoint set).
+    fn overrides_used_element(
+        &self,
+        container: StringId,
+        member: StringId,
+        is_used: &dyn Fn(FileId, StringId, StringId) -> bool,
+        depth: u32,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if !matches!(self.walk_super(container, member), Walk::Found(_)) {
+            return false;
+        }
+        let Some((decl_container, decl_file)) = self.member_faces.found_origin.get() else {
+            return false;
+        };
+        is_used(decl_file, decl_container, member)
+            || self.overrides_used_element(decl_container, member, is_used, depth - 1)
+    }
+
     pub(crate) fn is_publicly_accessible(
         &self,
         name: StringId,
@@ -4874,7 +5020,14 @@ impl<'a> Engine<'a> {
         match c.kind {
             ContainerKind::Enum if is_ctor => is_factory && !self.is_private_name(container),
             ContainerKind::Enum => !(self.is_private_name(container) && is_static),
-            ContainerKind::Extension => !self.is_private_name(container),
+            // `enclosingElement.isPublic` for an `ExtensionElement`
+            // (unused_local_elements_verifier.dart:870-873): a private
+            // name is never public, and a NAMELESS face (`extension on T`)
+            // isn't public either — its members stay candidates for the
+            // unused family exactly as a private extension's do.
+            ContainerKind::Extension => {
+                !self.is_private_name(container) && !self.is_nameless(container)
+            }
             _ => !(self.is_private_name(container) && (is_static || is_ctor)),
         }
     }
@@ -6857,6 +7010,14 @@ impl<'a> Engine<'a> {
                         Some(dartq_scanner::TokenKind::Eq) => {
                             apps.push((head, write));
                         }
+                        // Every assignment form resolves `[]=` alone —
+                        // `IndexExpression.writeOrReadElement` answers the
+                        // write element for `=`/compound/`++`/`--` alike
+                        // (extensions.dart:244-246 +
+                        // unused_local_elements_verifier.dart:196-200);
+                        // the compound's read half stays a TYPE-level
+                        // consult (invocation.rs `check_index_argument`),
+                        // never a `usedElements` credit.
                         Some(
                             dartq_scanner::TokenKind::PlusPlus
                             | dartq_scanner::TokenKind::MinusMinus
@@ -6874,7 +7035,6 @@ impl<'a> Engine<'a> {
                             | dartq_scanner::TokenKind::GtGtGtEq
                             | dartq_scanner::TokenKind::QuestionQuestionEq,
                         ) => {
-                            apps.push((head, read));
                             apps.push((head, write));
                         }
                         _ => apps.push((head, read)),
