@@ -310,7 +310,19 @@ fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         return;
     };
     let selector_row = kids[head];
-    let member = slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some();
+    // The assignment adoption: a plain assignment adopts the childless
+    // trailing whole-access marker as the adopted window's sole row, so
+    // the send's own marker surfaces as a same-span Assignment row
+    // (`d = d.m(1)`) — the member faces still read the receiver.
+    let adopted = kids.get(pos + 1).is_some_and(|&row| {
+        c.kind(row) == NodeKind::Assignment
+            && c.utf16_span(row) == c.utf16_span(kids[pos])
+            && c.collect_direct(row)
+                .iter()
+                .any(|&kid| c.kind(kid) == NodeKind::DotAccess)
+    });
+    let member =
+        slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() || adopted;
     // The every-object exemptions (:103-114) need a receiver.
     if member {
         let name = c.lexeme(c.head_token(selector_row));
@@ -415,8 +427,43 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     if pos > 0 && c.kind(kids[pos - 1]) == NodeKind::Send {
         return;
     }
-    let Some(selector) = c.unit.ast.token_range(kids[pos]).next_back() else {
-        return;
+    // The assignment adoption: a plain assignment adopts the childless
+    // trailing whole-access marker as the adopted window's sole row, so
+    // the marker owns no sibling run here. The receiver read then rides
+    // the enclosing statement's rows before the assignment, at the
+    // marker's own name token — the adopted window swallows the access
+    // tail, so the row's last token is not the selector. An invocation
+    // marker's send tiles beside the assignment; the send face owns
+    // that verdict (the every-object exemptions count arguments).
+    let adopted = pos == 0
+        && kids.len() == 1
+        && c.ancestor(1).is_some_and(|row| c.kind(row) == NodeKind::Assignment);
+    let (raw, selector) = if adopted {
+        let Some(assignment) = c.ancestor(1) else {
+            return;
+        };
+        let Some(stmt) = c.unit.ast.parent(assignment) else {
+            return;
+        };
+        let stmt_kids = c.collect_direct(stmt);
+        let Some(stmt_pos) = stmt_kids.iter().position(|&kid| kid == assignment) else {
+            return;
+        };
+        if stmt_pos > 0 && c.kind(stmt_kids[stmt_pos - 1]) == NodeKind::Send {
+            return;
+        }
+        let Some(operator) = c.field(c.node(), PayloadField::Operator) else {
+            return;
+        };
+        (
+            std::borrow::Cow::Owned(slice::statement_run(c, &stmt_kids[..stmt_pos])),
+            operator + 1,
+        )
+    } else {
+        let Some(selector) = c.unit.ast.token_range(kids[pos]).next_back() else {
+            return;
+        };
+        (std::borrow::Cow::Borrowed(&kids[..pos]), selector)
     };
     if matches!(
         c.lexeme(selector),
@@ -424,18 +471,18 @@ fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     ) {
         return;
     }
-    let before = slice::statement_run(c, &kids[..pos]);
+    let before = slice::statement_run(c, &raw);
     if faces::is_explicit_cast(c, &before) {
         return;
     }
     // The receiver walk rides the raw prefix — `statement_run` strips
     // the childless access markers the chain extent ends at — bounded
     // by the walk's own abutment check.
-    let raw = &kids[..pos];
-    let Some((receiver_start, receiver_end, content_end)) = chain_receiver(c, raw, selector) else {
+    let Some((receiver_start, receiver_end, content_end)) = chain_receiver(c, &raw, selector)
+    else {
         return;
     };
-    let ty = receiver_ty(c, analysis, raw, receiver_start, receiver_end);
+    let ty = receiver_ty(c, analysis, &raw, receiver_start, receiver_end);
     if ty == Some(Ty::Dynamic) {
         let start = c.utf16_span(receiver_start).start;
         c.report(start..content_end, &[]);
@@ -1126,6 +1173,58 @@ mod tests {
                 })
                 .collect();
             if got != want {
+                mismatches.push(format!("{case}: want {want:?} got {got:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// The assignment-adoption tiling: an assignment whose right operand is
+    /// a member access adopts the childless trailing `DotAccess` marker as
+    /// the adopted window's sole row, so the access face dispatches at
+    /// position 0 with no send before it and hands `chain_receiver` an empty
+    /// run — the run the receiver walk stripped to zero and then indexed at
+    /// `len() - 1` (release: wrapped to `usize::MAX`, the census chunk
+    /// crash; a release build died on every `x = y.m(args)` in real
+    /// corpora). Oracle rows from
+    /// `dart analyze --format machine` with the lint enabled: the dynamic
+    /// read still reports at the right operand's receiver (`2,7,1` — the
+    /// invocation face owns the verdict, the marker face stays silent), the
+    /// typed shapes stay silent.
+    #[test]
+    fn avoid_dynamic_calls_assignment_rhs_access_pins() {
+        let cases: &[(&str, &str, &[(u32, u32)])] = &[
+            (
+                "typed invocation rhs",
+                "class C {\n  C m(int x) => this;\n}\n\nvoid f(C c) {\n  c = c.m(1);\n}\n",
+                &[],
+            ),
+            (
+                "dynamic invocation rhs",
+                "void f(dynamic d) {\n  d = d.m(1);\n}\n",
+                &[(26, 27)],
+            ),
+            (
+                "typed property rhs",
+                "class C {\n  C? p;\n}\n\nvoid f(C? c) {\n  c = c.p;\n}\n",
+                &[],
+            ),
+            (
+                "dynamic property rhs",
+                "void f(dynamic d) {\n  d = d.p;\n}\n",
+                &[(26, 27)],
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (case, source, want) in cases {
+            let f = Fixture::parse(source);
+            let mut lints = f.run_semantic(&one_rule("avoid_dynamic_calls"));
+            lints.sort_by_key(|lint| lint.range.start);
+            let got: Vec<(u32, u32)> = lints
+                .iter()
+                .map(|lint| (lint.range.start, lint.range.end))
+                .collect();
+            if got != want.to_vec() {
                 mismatches.push(format!("{case}: want {want:?} got {got:?}"));
             }
         }
