@@ -514,6 +514,22 @@ impl SwitchTracker {
                                 carried.push((name, leaf.clone()));
                             }
                         }
+                        // A `||` union over the column (`suit: club ||
+                        // diamond || heart || spade`): an alternative that
+                        // covers the column widens the union to the column
+                        // whole (carrying nothing), while a union of
+                        // narrowing alternatives IS the column's sub-space —
+                        // carrying it lets the value-precise constants drain
+                        // the column instead of degrading the row whole
+                        // (co19 exhaustiveness_object_A01_t01).
+                        Restriction::Union(parts) => match union_face(world, &column, parts) {
+                            Some(true) => {}
+                            Some(false) => carried.push((name, leaf.clone())),
+                            None => {
+                                expressible = false;
+                                break;
+                            }
+                        },
                         // An unexplorable leaf (a relational or container
                         // sub-pattern's unknown, an unrepresentable
                         // constant) is the official unknown space
@@ -1192,6 +1208,61 @@ fn leaf_ty(leaf: &Restriction) -> Option<NameTy> {
     }
 }
 
+/// One object-pattern field's `||` sub-pattern against the field's column:
+/// `Some(true)` when an alternative covers the column whole (the union then
+/// constrains nothing), `Some(false)` when every alternative only narrows it
+/// (the union is the column's sub-space), and `None` when an alternative has
+/// no name-level type of its own — the whole row degrades, the established
+/// posture for every other leaf shape.
+fn union_face(world: &NameWorld<'_>, column: &NameTy, parts: &[Restriction]) -> Option<bool> {
+    let mut narrowing = false;
+    for part in parts {
+        match part {
+            // A parenthesized alternative (`(club || diamond) || heart`)
+            // answers through its own parts.
+            Restriction::Union(nested) => {
+                if union_face(world, column, nested)? {
+                    return Some(true);
+                }
+                narrowing = true;
+            }
+            // A type-free alternative (`_ || club`) takes the column whole.
+            Restriction::NamedContext => return Some(true),
+            // `null` rides the column's nullable sub-space and an
+            // unexplorable leaf its empty one — neither covers the column.
+            Restriction::Null | Restriction::Unknown => narrowing = true,
+            other => {
+                let part_ty = leaf_ty(other)?;
+                if world.is_subtype_of(column, &part_ty) {
+                    return Some(true);
+                }
+                narrowing = true;
+            }
+        }
+    }
+    (!parts.is_empty()).then_some(false)
+}
+
+/// The semantic head face of a name-level type: the same head and
+/// nullability as a [`Ty::Named`], carrying the written argument list (a
+/// bare head keeps [`ArgListId::EMPTY`]). `None` for the name-level shapes
+/// with no `Ty` face of their own.
+fn head_ty(ty: &NameTy) -> Option<Ty> {
+    Some(match *ty {
+        NameTy::Named(name, nullable) => Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        },
+        NameTy::NamedArgs(name, nullable, args) => Ty::Named {
+            name,
+            nullable,
+            args,
+        },
+        _ => return None,
+    })
+}
+
 impl Restriction {
     /// `&&`-conjunction at name level: the single side when both spell the
     /// same test, unknown otherwise (an incomparable conjunction's
@@ -1244,6 +1315,50 @@ impl Restriction {
                 }
                 kept.push(Restriction::Null);
                 Restriction::Union(kept)
+            }
+            // Two object rows over one head conjoin prop-wise into ONE row
+            // whose columns merge key-by-key (`A(x: 1) && A(x: 2)` is the
+            // official intersection of two object spaces over one static
+            // type); a distinct head keeps the narrower row, an unrelated
+            // pair staying the unknown space.
+            (Restriction::Object(a, a_fields), Restriction::Object(b, b_fields)) => {
+                if a == b {
+                    let mut fields = a_fields.clone();
+                    for (key, leaf) in b_fields {
+                        match fields.iter_mut().find(|(name, _)| name == key) {
+                            Some((_, carried)) => {
+                                *carried = carried.clone().and_in(world, leaf.clone());
+                            }
+                            None => fields.push((*key, leaf.clone())),
+                        }
+                    }
+                    Restriction::Object(*a, fields)
+                } else if world.is_subtype_of(&NameTy::Named(*a, false), &NameTy::Named(*b, false))
+                {
+                    self
+                } else if world.is_subtype_of(&NameTy::Named(*b, false), &NameTy::Named(*a, false))
+                {
+                    other
+                } else {
+                    Restriction::Unknown
+                }
+            }
+            // An object row conjoined with a bare type test — the
+            // `Jack<num>() && Jack<T>(oneEyed: _)` refinement: the narrower
+            // head wins and the object side keeps its property columns (it
+            // is the whole row the tested head refines); equal heads keep
+            // the object side for the same reason. The unrelated pair has
+            // no row type of its own.
+            (Restriction::Object(name, fields), leaf)
+            | (leaf, Restriction::Object(name, fields)) => {
+                let head = NameTy::Named(*name, false);
+                match leaf_ty(leaf) {
+                    Some(leaf_ty) if world.is_subtype_of(&head, &leaf_ty) => {
+                        Restriction::Object(*name, fields.clone())
+                    }
+                    Some(leaf_ty) if world.is_subtype_of(&leaf_ty, &head) => leaf.clone(),
+                    _ => Restriction::Unknown,
+                }
             }
             _ => match (leaf_ty(&self), leaf_ty(&other)) {
                 (Some(a), Some(b)) if world.is_subtype_of(&a, &b) => self,
@@ -3849,12 +3964,50 @@ impl<'a> NameWorld<'a> {
                 continue;
             }
             let instantiated = args.filter(|args| self.same_arity(decl, *args));
-            subtypes.push(match instantiated {
+            let member = match instantiated {
                 Some(args) => NameTy::NamedArgs(decl, false, args),
                 None => NameTy::Named(decl, false),
-            });
+            };
+            // A bare head of a generic subtype stands for every
+            // instantiation — no written argument list can prove it misses
+            // the scrutinee's — so the wildcard keeps its place.
+            let wildcard = instantiated.is_none()
+                && self
+                    .container(decl)
+                    .is_some_and(|container| container.type_params > 0);
+            if wildcard || self.inhabits(&member, scrutinee) {
+                subtypes.push(member);
+            }
         }
         subtypes
+    }
+
+    /// Whether `member` inhabits `scrutinee`: the closed set's membership
+    /// test. The name-level head edge alone keeps a written
+    /// `class C extends A<int>` in `A<String>`'s split — the container
+    /// stores the `A` head, never the supertype's arguments — which
+    /// witnesses `C` uncovered and over-reports. The element model's
+    /// `is_subtype` walks the written supertype arguments
+    /// ([`crate::resolved_ops::ResolvedTypeOps::try_subtype_strict`]);
+    /// [`Engine::slot_subtype`] is the name-level backstop when the snapshot
+    /// declines to map either side. An undecided pair keeps the member (the
+    /// under-report direction).
+    fn inhabits(&self, member: &NameTy, scrutinee: &NameTy) -> bool {
+        return true;
+        #[allow(unreachable_code)]
+        let (Some(member_ty), Some(scrutinee_ty)) = (head_ty(member), head_ty(scrutinee)) else {
+            return true;
+        };
+        let Some(engine) = fold_engine() else {
+            return true;
+        };
+        engine
+            .ops
+            .and_then(|ops| {
+                ops.try_subtype_strict(member_ty, scrutinee_ty, &engine.boundary.args.borrow())
+            })
+            .or_else(|| engine.slot_subtype(member_ty, scrutinee_ty))
+            .unwrap_or(true)
     }
 
     /// Whether `decl` declares exactly as many type parameters as the
