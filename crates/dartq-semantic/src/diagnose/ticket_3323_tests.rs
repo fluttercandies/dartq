@@ -184,15 +184,12 @@ fn const_group_never_reaches_the_non_nullable_face() {
     );
 }
 
-/// The residual this file cannot reach: a **local** const group
-/// (`visitVariableDeclarationStatement`, error_verifier.dart:2204-2224).
-/// Nothing stages it today — the parser emits the field/top-level
-/// spelling and the listener latches non-const groups only — so the rows
-/// are missing. Flip by dropping `#[ignore]` once the parser/local-group
-/// owner (`crates/dartq-parser/src/statements.rs`, the
-/// `parse_variables_declaration_rest` path) arms its own latch.
+/// A **local** const group (`visitVariableDeclarationStatement`,
+/// error_verifier.dart:2204-2224): the const-group machinery's
+/// `disarm_const_group` flush emits `const_not_initialized` for every
+/// declared name whose initializer slot the cursor never consumed —
+/// covering local, field, and top-level const declarations uniformly.
 #[test]
-#[ignore = "local const group rows have no owner yet (parser statements.rs lane)"]
 fn local_const_group_reports_each_declarator() {
     let fixture = "void f() { const int a, b; }\n";
     let full = format!("{CORE_PRELUDE}{fixture}");
@@ -200,5 +197,50 @@ fn local_const_group_reports_each_declarator() {
     assert_eq!(
         spans_of(&report, &full, "const_not_initialized"),
         vec!["a".to_string(), "b".to_string()],
+    );
+}
+
+/// An initialized const declarator reports nothing; a mixed group
+/// reports only the uninitialized name.
+#[test]
+fn const_initializer_releases_its_own_declarator() {
+    let fixture = "void f() { const int a = 1, b; }\n";
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        spans_of(&report, &full, "const_not_initialized"),
+        vec!["b".to_string()],
+        "only the uninitialized declarator reports"
+    );
+}
+
+/// A const field inside a class body: `const_instance_field` fires at
+/// `const`, `const_not_initialized` at the name — the semantic engine
+/// owns both rows.
+#[test]
+fn const_field_reports_both_faces() {
+    let fixture = "class A {\n  const int v;\n}\n";
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        spans_of(&report, &full, "const_not_initialized"),
+        vec!["v".to_string()],
+    );
+    assert!(
+        !spans_of(&report, &full, "const_instance_field").is_empty(),
+        "const_instance_field also fires"
+    );
+}
+
+/// A top-level const declarator without an initializer reports
+/// `const_not_initialized` at the name.
+#[test]
+fn top_level_const_reports() {
+    let fixture = "const int v;\n";
+    let full = format!("{CORE_PRELUDE}{fixture}");
+    let report = report_ops(fixture);
+    assert_eq!(
+        spans_of(&report, &full, "const_not_initialized"),
+        vec!["v".to_string()],
     );
 }

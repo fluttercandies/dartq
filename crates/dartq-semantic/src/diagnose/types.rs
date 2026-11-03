@@ -3125,7 +3125,9 @@ pub(crate) struct Engine<'a> {
     /// (resolver.dart:2458/2484) reports `[type.offset, arm.end)` — so the
     /// initializer face [`Self::in_initializer`] must defer to it.
     pub(crate) cond_expr_depth: u32,
-    /// The const group's declared names, in initializer order.
+    /// The const group's declared names, in initializer order. A name
+    /// whose slot the cursor never consumes owns a `const_not_initialized`
+    /// row at its name token.
     pub(crate) const_group_names: Vec<StringId>,
     /// The next const-group name an initializer window consumes.
     pub(crate) const_group_cursor: usize,

@@ -121,6 +121,14 @@ impl ConstLookup for Engine<'_> {
     /// fold to type literals, top-level functions are constant tear-offs;
     /// everything else defers — the rows report genuine misses).
     fn ident(&self, name: StringId) -> IdentVerdict {
+        // A wildcard local (`_`) is never a readable name upstream — the
+        // const evaluator's `_` identifier resolves to nothing, so the
+        // read's verdict is the unresolved face (the oracle's
+        // `undefined_identifier` already reports it; the const site
+        // default fires beside it).
+        if self.is_wildcard(name) {
+            return IdentVerdict::Unresolved;
+        }
         for scope in self.const_scopes.iter().rev() {
             match scope.get(&name) {
                 Some(ConstBinding::Value(v)) => return IdentVerdict::Value(v.clone()),
@@ -376,9 +384,74 @@ impl<'a> Engine<'a> {
         best
     }
 
+    /// The const group closes: any declared name whose slot the cursor
+    /// never consumed had no initializer — `const_not_initialized` reports
+    /// at the name token (upstream `visitVariableDeclaration`'s
+    /// `variable.initializer == null` arm, `constant_verifier.dart:550-556`).
+    /// Only LOCAL groups emit here — field and top-level const declarations
+    /// are covered by the parser's own `constNotInitialized` message
+    /// (`members.rs`'s declarator walk), whose `parse_diagnostics` rows the
+    /// report merge already carries. A field group sits outside any
+    /// executable frame, so `frames.is_empty()` identifies the parser-owned
+    /// arm; inside a body `frames` is non-empty and this face owns the row.
+    /// The name's token range comes from the token table — the names arrive
+    /// in declaration order, so a forward walk from the previous match
+    /// lands on each one's spelling.
     pub fn disarm_const_group(&mut self) {
+        if self.const_group {
+            let names = std::mem::take(&mut self.const_group_names);
+            // Only a LOCAL group emits here — a field/top-level group's
+            // rows arrive through the parser's own `constNotInitialized`
+            // face (`members.rs`'s declarator walk). A field group sits
+            // inside a `Container` frame, a top-level group has no frame;
+            // a local group's innermost frame is `Executable`.
+            let local = self
+                .frames
+                .last()
+                .is_some_and(|f| matches!(f.kind, FrameKind::Executable { .. }));
+            if local {
+                // Resolve (name, span) pairs first — the emit borrows `&mut
+                // self`, so the token walk must finish before any row fires.
+                let spans: Vec<(StringId, SourceRange)> = {
+                    let toks = self.tokens.as_slice();
+                    let mut cursor = 0usize;
+                    names
+                        .iter()
+                        .skip(self.const_group_cursor)
+                        .map(|name| {
+                            let name_text = self.strings.resolve(*name);
+                            while cursor < toks.len()
+                                && self.tokens.lexeme(self.source, cursor) != name_text
+                            {
+                                cursor += 1;
+                            }
+                            let range = if cursor < toks.len() {
+                                let t = &toks[cursor];
+                                let end = self
+                                    .utf16_of((t.byte_offset + t.byte_len) as usize);
+                                let r = SourceRange {
+                                    offset: t.utf16_offset,
+                                    length: end - t.utf16_offset,
+                                };
+                                cursor += 1;
+                                r
+                            } else {
+                                SourceRange { offset: 0, length: 0 }
+                            };
+                            (*name, range)
+                        })
+                        .collect()
+                };
+                for (name, range) in spans {
+                    let name_text = self.strings.resolve(name);
+                    self.emit(SemanticCode::ConstNotInitialized, range, name_text, "");
+                }
+            }
+            // `std::mem::take` already cleared the vector; restore it for reuse.
+            self.const_group_names = names;
+            self.const_group_names.clear();
+        }
         self.const_group = false;
-        self.const_group_names.clear();
         self.const_group_cursor = 0;
     }
 

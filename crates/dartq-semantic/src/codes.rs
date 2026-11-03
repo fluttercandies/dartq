@@ -1462,6 +1462,10 @@ pub enum SemanticCode {
     /// generative constructor (one would own the
     /// `ConstructorFieldsVerifier` face).
     NotInitializedNonNullableInstanceField,
+    /// `The constant '{0}' must be initialized.` — a `const` declarator
+    /// with no initializer (local variables, top-level variables, fields;
+    /// `const_not_initialized`, diagnostic.g.dart:3148).
+    ConstNotInitialized,
     /// `The implicitly invoked unnamed constructor from '{0}' has required
     /// parameters.` — a generative constructor with no explicit
     /// super initializer whose superclass's unnamed constructor declares
@@ -3283,6 +3287,9 @@ impl SemanticCode {
                 "not_initialized_non_nullable_instance_field",
                 "NOT_INITIALIZED_NON_NULLABLE_INSTANCE_FIELD",
             ),
+            Self::ConstNotInitialized => {
+                ("const_not_initialized", "CONST_NOT_INITIALIZED")
+            }
             Self::ImplicitSuperInitializerMissingArguments => (
                 "implicit_super_initializer_missing_arguments",
                 "IMPLICIT_SUPER_INITIALIZER_MISSING_ARGUMENTS",
@@ -4718,6 +4725,9 @@ impl SemanticCode {
             Self::NotInitializedNonNullableInstanceField => {
                 format!("Non-nullable instance field '{a0}' must be initialized.")
             }
+            Self::ConstNotInitialized => {
+                format!("The constant '{a0}' must be initialized.")
+            }
             Self::ImplicitSuperInitializerMissingArguments => format!(
                 "The implicitly invoked unnamed constructor from '{a0}' has required parameters."
             ),
@@ -5632,6 +5642,9 @@ impl SemanticCode {
                  that initializes it, or mark it 'late'."
                     .to_string(),
             ),
+            Self::ConstNotInitialized => {
+                Some("Try adding an initialization to the declaration.".to_string())
+            }
             Self::ImplicitSuperInitializerMissingArguments => Some(
                 "Try adding an explicit super parameter with the required arguments."
                     .to_string(),
@@ -6195,6 +6208,7 @@ mod tests {
             SemanticCode::ExtendsNonClass,
             SemanticCode::NotInitializedNonNullableVariable,
             SemanticCode::NotInitializedNonNullableInstanceField,
+            SemanticCode::ConstNotInitialized,
             SemanticCode::ImplicitSuperInitializerMissingArguments,
             SemanticCode::NonFinalFieldInEnum,
             // The N7 field-/super-formal faces.
@@ -7175,6 +7189,7 @@ mod tests {
             | SemanticCode::RecursiveConstantConstructor
             | SemanticCode::ConstConstructorParamTypeMismatch
             | SemanticCode::NotInitializedNonNullableInstanceField
+            | SemanticCode::ConstNotInitialized
             | SemanticCode::ImplicitSuperInitializerMissingArguments
             | SemanticCode::NonFinalFieldInEnum
             | SemanticCode::NotInitializedNonNullableVariable
@@ -7569,6 +7584,7 @@ mod tests {
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NameSingular),
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NamePlural),
             SemanticCode::NotInitializedNonNullableInstanceField,
+            SemanticCode::ConstNotInitialized,
             SemanticCode::ImplicitSuperInitializerMissingArguments,
             SemanticCode::NonFinalFieldInEnum,
             SemanticCode::NotInitializedNonNullableVariable,
