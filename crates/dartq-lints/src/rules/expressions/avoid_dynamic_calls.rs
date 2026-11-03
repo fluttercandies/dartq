@@ -99,7 +99,10 @@ fn chain_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<(u32, u32
         }
         break;
     }
-    let mut end_idx = stripped.len() - 1;
+    // Every row opened at or after the selector: the selector has no
+    // receiver of its own, so there is no extent to report. An empty run
+    // reached this line as a `0 - 1` underflow and panicked at `[0]`.
+    let mut end_idx = stripped.len().checked_sub(1)?;
     // A bare tear-off group's tail rows (`[Id, wrappers, args, Send]`)
     // ride the head leaf: the receiver extent is the group's head
     // (`d` in `d.foo()` — an invocation group reduces the same way),
