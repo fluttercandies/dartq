@@ -312,3 +312,12 @@ mod ticket_3791_pins;
 
 #[cfg(test)]
 mod ticket_3798_tests;
+
+#[cfg(test)]
+mod promoted_at_tests;
+
+#[cfg(test)]
+mod never_cond_tests;
+
+#[cfg(test)]
+mod void_region_tests;

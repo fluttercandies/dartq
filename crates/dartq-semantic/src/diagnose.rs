@@ -7073,6 +7073,11 @@ mod if_null_literal_tests;
 #[cfg(test)]
 mod exhaustive_dynamic_tests;
 
+/// The assignment verdict's right-hand-side window: the span is resolved by
+/// offset, never by row-stack scan order — the order a back-dated fold breaks.
+#[cfg(test)]
+mod assignment_window_tests;
+
 /// A cascade section's argument resolves its member chain against its own
 /// receiver, never the cascade target.
 #[cfg(test)]

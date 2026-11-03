@@ -397,6 +397,12 @@ pub struct Flow<'t> {
     /// local (upstream `ConstructorFieldInitializer` writes `this.f`).
     init_starts: Vec<usize>,
     facts: Vec<FlowFact>,
+    /// The write-target reads' flow types, keyed on the read token's
+    /// offset (see [`Interp::write_target_read_tys`]): a plain
+    /// assignment's retraction removes its target read's fact rows, so
+    /// this unit-level side table keeps that face queryable through
+    /// [`Flow::promoted_type_at`].
+    write_target_read_tys: FxHashMap<u32, crate::ty::Ty>,
     /// Executables whose replay exhausted the step budget and bailed
     /// (see [`crate::interp::STEP_BUDGET_PER_EVENT`]): each contributed
     /// no flow facts. A bounded counter the engine can count and surface;
@@ -488,6 +494,7 @@ impl<'t> Flow<'t> {
             wildcard_inits: Vec::new(),
             init_starts: Vec::new(),
             facts: Vec::new(),
+            write_target_read_tys: FxHashMap::default(),
             bail_count: 0,
             max_step_permille: 0,
         }
@@ -999,6 +1006,21 @@ impl<'t> Flow<'t> {
         facts
     }
 
+    /// The flow type the read at `offset` carried in its replay, for the
+    /// reads a plain assignment's retraction removed from the fact stream
+    /// (the `=`/`??=` target identifier — writing it makes it no read, so
+    /// its `ReadType`/`PromotedRead`/`WhyNotPromoted` rows retract). The
+    /// type is the read-time [`Interp::promoted_type_of`] answer (the
+    /// promoted chain head, or the declared face when unpromoted); an
+    /// ordinary read needs no query — its rows ride the fact stream.
+    ///
+    /// `None` for every other offset, and for every call made before the
+    /// enclosing executable's replay has run (`exec_end`).
+    #[must_use]
+    pub fn promoted_type_at(&self, offset: u32) -> Option<crate::ty::Ty> {
+        self.write_target_read_tys.get(&offset).copied()
+    }
+
     /// Interns a name lexeme from outside the event stream — the
     /// staged-declaration face (#2140): an inferred local's flow-declared
     /// type spells a name the file may never write. Written occurrences
@@ -1365,6 +1387,12 @@ impl<'t> Flow<'t> {
             }
         }
         self.facts.append(&mut interp.facts);
+        // The retracted write-target reads' faces (see
+        // [`Interp::write_target_read_tys`]): the plain-assignment
+        // retraction dropped their fact rows, so the unit-level side table
+        // keeps them queryable at their read offsets.
+        self.write_target_read_tys
+            .extend(interp.write_target_read_tys.drain());
     }
 }
 

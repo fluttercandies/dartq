@@ -1293,6 +1293,14 @@ pub(crate) struct Interp<'o> {
     pub(crate) scopes: Vec<Scope>,
     pub(crate) vars: Vec<VarMeta>,
     pub(crate) facts: Vec<FlowFact>,
+    /// The write-target reads' own flow types, keyed on the read token's
+    /// offset: a plain assignment retracts its target read's
+    /// `PromotedRead`/`ReadType` rows (the target identifier is a write,
+    /// not a read), so a consumer that still needs that read's face — the
+    /// if-null composite's `LUB(NonNull(readType), rhsType)` — has no
+    /// fact channel. The retraction stashes the captured read face here
+    /// and [`crate::record::Flow::promoted_type_at`] serves it.
+    pub(crate) write_target_read_tys: FxHashMap<u32, crate::ty::Ty>,
     /// The property-key table (#1409): slot → `(receiver, field)` — the
     /// receiver is a variable id, [`THIS_RECEIVER`], or [`SUPER_RECEIVER`],
     /// the field an
@@ -1321,6 +1329,17 @@ pub(crate) struct Interp<'o> {
     /// captured write-version check stands in the official's
     /// `ValueVersion` rebasing).
     pub(crate) cond_vars: std::collections::HashMap<u32, CondVarEntry>,
+    /// The pre-exit state of the last bottom-typed, identifier-rooted read,
+    /// keyed on the read's end offset: the official's `_ExpressionInfo`
+    /// capture timing (`storeExpressionInfo` runs at the read, before
+    /// `recordStaticType`'s `handleExit` kills the flow, ast.dart:11146-
+    /// 11153). A construct whose condition IS that read therefore enters
+    /// its arms from the pre-exit state — `if (v)` over a `Never`
+    /// parameter leaves both arms live. A top-level getter read and an
+    /// invocation result record their type *after* the exit and are never
+    /// exempt: `if (gv)` / `if (never())` keep their arms dead.
+    /// [`Interp::cond_split`] consumes the latch.
+    pub(crate) cond_exempt: Option<(u32, State)>,
     /// The open constructor-initializer entry's head token (the
     /// `CtorInitBegin`/`CtorInitEnd` pair): the entry-extent dead row's
     /// begin.
@@ -1763,6 +1782,7 @@ impl<'o> Interp<'o> {
             }],
             vars: Vec::new(),
             facts: Vec::new(),
+            write_target_read_tys: FxHashMap::default(),
             props: Vec::new(),
             scope_gen: 1,
             coll_if: Vec::new(),
@@ -1771,6 +1791,7 @@ impl<'o> Interp<'o> {
             cond_split_var: None,
             if_branch_folded: false,
             cond_vars: std::collections::HashMap::new(),
+            cond_exempt: None,
             ctor_init_begin: None,
             ctor_init_began_dead: false,
             ctor_init_reported: None,
@@ -2235,6 +2256,29 @@ impl<'o> Interp<'o> {
         {
             return arms;
         }
+        // The bottom identifier-rooted condition (official
+        // `_ExpressionInfo` capture timing): the read's info was built
+        // before `handleExit` killed the flow, so both arms enter from the
+        // pre-exit state — `if (v)`/`while (v)` over a `Never` parameter or
+        // an identifier-rooted `Never` getter leave both arms live. The
+        // latch is keyed on the read's end and consumed here, so a
+        // top-level getter (`if (gv)`) or an invocation result
+        // (`if (never())`) keeps the dead arms its own record produced.
+        if self.ops.is_bottom(expr.ty)
+            && self.cond_exempt.as_ref().is_some_and(|(at, _)| {
+                expr.read_span
+                    .or(expr.callee_span)
+                    .is_some_and(|span| span.range.end() == *at)
+            })
+            && let Some((_, pre)) = self.cond_exempt.take()
+        {
+            // The captured state predates the exit, so the walk resumes
+            // from it: the constructs that inspect `reachable()` at their
+            // own dead-entry checks (`?:`, if-elements) must see the live
+            // state the official's info capture kept.
+            self.current = pre.clone();
+            return (pre.clone(), pre);
+        }
         match expr.bool_value {
             Some(true) => (
                 self.current.clone(),
@@ -2486,6 +2530,17 @@ impl<'o> Interp<'o> {
         // of the enclosing statement a separate row.
         let close = short.dead_at_open
             && (!short.cascade_head || short.unassigned_receiver)
+            // A statement that BEGAN dead owns its whole interval: the
+            // official's `_firstDeadNode` is the statement (or an arm
+            // enclosing the chain), which the chain's node does not
+            // contain, so `flowEnd(chainExpression)` reports nothing and
+            // the one row runs to the covering close. Without this gate an
+            // inner short whose receiver has no read span (a parenthesized
+            // conditional, a literal, a call result — `recv_offset` 0)
+            // trims the enclosing interval and the NEXT dead statement
+            // opens a second row (`(true ? 499 : x)?.toString();` followed
+            // by a dead cascade split one dead tail into two).
+            && !self.stmt_began_dead
             && self.dead.as_ref().is_some_and(|window| {
                 !window.suppressed && window.anchor.range.offset > short.recv_offset
             });
@@ -2563,6 +2618,13 @@ impl<'o> Interp<'o> {
             return;
         }
         short.face_end = short.face_end.max(end);
+        // A began-dead statement's interval is the statement's own row (the
+        // official `_firstDeadNode` is the statement, which does not
+        // contain the chain): the chain's `flowEnd` reports nothing and the
+        // row runs to the covering close, never trimmed to the face.
+        if self.stmt_began_dead {
+            return;
+        }
         let recv = short.recv_offset;
         if let Some(window) = &mut self.dead
             && !window.suppressed

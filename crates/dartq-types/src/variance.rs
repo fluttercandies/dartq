@@ -249,9 +249,28 @@ pub fn variance_in_type(
     parameter: TypeParamId,
     ty: TypeId,
 ) -> Variance {
+    variance_in_type_with(sys, &|p| facts.get(p), parameter, ty)
+}
+
+/// [`variance_in_type`] over a caller-held facts provider instead of a
+/// concrete [`ParamFactsTable`]. A snapshot whose parameter facts are split
+/// across the shared table and an overlay (the generic-function binder
+/// facts a signature map records per signature) answers `p`'s facts through
+/// the overlay first: the bound-invariance leg (variance_builder.dart:
+/// 131-140) keys on `facts_of(p).bound`, and a binder bound the shared
+/// table never saw would leave the leg silent — the `Contravariant` answer
+/// the `Never` default then grounds, where the oracle's `invariant` reads
+/// `dynamic`.
+#[must_use]
+pub fn variance_in_type_with(
+    sys: &TypeSystem<'_>,
+    facts_of: &dyn Fn(TypeParamId) -> ParamFacts,
+    parameter: TypeParamId,
+    ty: TypeId,
+) -> Variance {
     variance_in_type_bounded(
         sys.table(),
-        facts,
+        facts_of,
         parameter,
         ty,
         &|decl, i| {
@@ -260,7 +279,7 @@ pub fn variance_in_type(
                 .expect("declared owner")
                 .type_parameters
                 .get(i)
-                .map(|&p| facts.get(p).variance)
+                .map(|&p| facts_of(p).variance)
         },
         DEPTH_LIMIT,
     )
@@ -300,12 +319,29 @@ pub fn typedef_parameter_variances(
     body: TypeId,
     argument_variance: impl Fn(TypeDeclId, usize) -> Option<Variance>,
 ) -> Vec<Variance> {
+    typedef_parameter_variances_with(table, &|p| facts.get(p), parameters, body, argument_variance)
+}
+
+/// [`typedef_parameter_variances`] over a caller-held facts provider — the
+/// same overlay seam [`variance_in_type_with`] carries, so a snapshot whose
+/// generic-function binder bounds live outside the shared table forwards
+/// them to the bound-invariance leg (variance_builder.dart:131-140) instead
+/// of reading `None` and computing `Contravariant` where the oracle's
+/// `invariant` answers `dynamic`.
+#[must_use]
+pub fn typedef_parameter_variances_with(
+    table: &TypeTable,
+    facts_of: &dyn Fn(TypeParamId) -> ParamFacts,
+    parameters: &[TypeParamId],
+    body: TypeId,
+    argument_variance: impl Fn(TypeDeclId, usize) -> Option<Variance>,
+) -> Vec<Variance> {
     parameters
         .iter()
         .map(|&parameter| {
             variance_in_type_bounded(
                 table,
-                facts,
+                facts_of,
                 parameter,
                 body,
                 &argument_variance,
@@ -317,7 +353,7 @@ pub fn typedef_parameter_variances(
 
 fn variance_in_type_bounded(
     table: &TypeTable,
-    facts: &ParamFactsTable,
+    facts_of: &dyn Fn(TypeParamId) -> ParamFacts,
     parameter: TypeParamId,
     ty: TypeId,
     argument_variance: &dyn Fn(TypeDeclId, usize) -> Option<Variance>,
@@ -338,7 +374,7 @@ fn variance_in_type_bounded(
                 let parameter_variance = argument_variance(decl, i).unwrap_or(Variance::Covariant);
                 result = result.meet(parameter_variance.combine(variance_in_type_bounded(
                     table,
-                    facts,
+                    facts_of,
                     parameter,
                     arg,
                     argument_variance,
@@ -348,13 +384,20 @@ fn variance_in_type_bounded(
             result
         }
         TypeKind::FutureOr { base } => {
-            variance_in_type_bounded(table, facts, parameter, base, argument_variance, depth - 1)
+            variance_in_type_bounded(
+                table,
+                facts_of,
+                parameter,
+                base,
+                argument_variance,
+                depth - 1,
+            )
         }
         TypeKind::Function { signature } => {
             let sig = table.signature(signature);
             let mut result = variance_in_type_bounded(
                 table,
-                facts,
+                facts_of,
                 parameter,
                 sig.return_type,
                 argument_variance,
@@ -364,11 +407,11 @@ fn variance_in_type_bounded(
             // occurrence in any bound of the signature's own parameters
             // forces `invariant`.
             for p in table.function_type_parameters(sig.type_parameters) {
-                let bound = facts.get(p).bound;
+                let bound = facts_of(p).bound;
                 if let Some(bound) = bound
                     && variance_in_type_bounded(
                         table,
-                        facts,
+                        facts_of,
                         parameter,
                         bound,
                         argument_variance,
@@ -381,7 +424,7 @@ fn variance_in_type_bounded(
             for member in table.named_members(sig.named) {
                 result = result.meet(Variance::Contravariant.combine(variance_in_type_bounded(
                     table,
-                    facts,
+                    facts_of,
                     parameter,
                     member.ty,
                     argument_variance,
@@ -392,7 +435,7 @@ fn variance_in_type_bounded(
                 let p = table.arg(sig.positional.offset() + i);
                 result = result.meet(Variance::Contravariant.combine(variance_in_type_bounded(
                     table,
-                    facts,
+                    facts_of,
                     parameter,
                     p,
                     argument_variance,
@@ -408,7 +451,7 @@ fn variance_in_type_bounded(
                 let p = table.arg(shape.positional.offset() + i);
                 result = result.meet(variance_in_type_bounded(
                     table,
-                    facts,
+                    facts_of,
                     parameter,
                     p,
                     argument_variance,
@@ -418,7 +461,7 @@ fn variance_in_type_bounded(
             for member in table.named_members(shape.named) {
                 result = result.meet(variance_in_type_bounded(
                     table,
-                    facts,
+                    facts_of,
                     parameter,
                     member.ty,
                     argument_variance,

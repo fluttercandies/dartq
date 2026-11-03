@@ -51,7 +51,10 @@ fn ticket_3172_unassigned_method_invocation() {
 }
 
 /// A chained method call climbs to the OUTERMOST access — `i?.m().m()`
-/// reports `?.m().m()` whole, not `?.m()`.
+/// reports `?.m().m()` whole, not `?.m()` (oracle 3.13.7
+/// `4:4|23` over the fixture below: `?.truncate().truncate()` is 23
+/// characters; the upstream test's caret row is aligned one column left
+/// and had been read as 24).
 #[test]
 fn ticket_3172_unassigned_method_invocation_method_invocation() {
     let fixture = "void f() {\n  int? i;\n  i?.truncate().truncate();\n}";
@@ -65,7 +68,7 @@ fn ticket_3172_unassigned_method_invocation_method_invocation() {
     let offset =
         crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.truncate").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
-    assert_eq!(dead[0].range.length, 24, "{:?}", rows(&report));
+    assert_eq!(dead[0].range.length, 23, "{:?}", rows(&report));
 }
 
 /// A mixed chain climbs through the property access —
@@ -278,12 +281,27 @@ fn ticket_3172_unassigned_cascade_index_expression() {
     assert_eq!(dead[0].range.length, 14, "{:?}", rows(&report));
 }
 
-/// `l?..[0][1]` — the index continuation inside the cascade's first
-/// section keeps `first` an IndexExpression whose `period` is the `?..`:
-/// the bare-body gate holds and the row grows to `?..[0][1]`.
+/// `l?..[0][1]` — an index continuation chains the cascade's first
+/// section body (`first.body` is no bare `CascadeIndexExpression`), so
+/// `verifyCascadeExpression`'s gate fails and the cascade reports
+/// NOTHING (oracle 3.13.7 machine output over this fixture: no
+/// `DEAD_CODE` row; `l?..[0]` alone and `l?..[0]..length` do report).
 #[test]
 fn ticket_3172_unassigned_cascade_index_continuation() {
-    let fixture = "void f() {\n  List<List<int>>? l;\n  l?..[0][1];\n}";
+    let report = report_ops("void f() {\n  List<List<int>>? l;\n  l?..[0][1];\n}");
+    assert!(
+        !code_names(&report).iter().any(|name| *name == "dead_code"),
+        "{:?}",
+        rows(&report)
+    );
+}
+
+/// `(i)?.abs()` — the parenthesized receiver's method twin of
+/// `ticket_3172_unassigned_parenthesized_property_access`: the chain
+/// climbs to the invocation's `)` (oracle 3.13.7 `4:6|7` = `?.abs()`).
+#[test]
+fn ticket_3172_unassigned_parenthesized_method_invocation() {
+    let fixture = "void f() {\n  int? i;\n  (i)?.abs();\n}";
     let report = report_ops(fixture);
     let dead: Vec<_> = report
         .diagnostics
@@ -292,9 +310,43 @@ fn ticket_3172_unassigned_cascade_index_continuation() {
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
     let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..[0]").unwrap();
+        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.abs()").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
-    assert_eq!(dead[0].range.length, 10, "{:?}", rows(&report));
+    assert_eq!(dead[0].range.length, 7, "{:?}", rows(&report));
+}
+
+/// `(l)?[0]` — the parenthesized index face: the chain roots on the
+/// inner `l` read and the row runs `?[0]` (oracle 3.13.7 `4:6|4`).
+#[test]
+fn ticket_3172_unassigned_parenthesized_index_expression() {
+    let fixture = "void f() {\n  List<int>? l;\n  (l)?[0];\n}";
+    let report = report_ops(fixture);
+    let dead: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "dead_code")
+        .collect();
+    assert_eq!(dead.len(), 1, "{:?}", rows(&report));
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
+    assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
+    assert_eq!(dead[0].range.length, 4, "{:?}", rows(&report));
+}
+
+/// `(l)?..[0]` — the parenthesized cascade-index face: the row runs
+/// `?..[0]` through the section's `]` (oracle 3.13.7 `4:6|6`).
+#[test]
+fn ticket_3172_unassigned_parenthesized_cascade_index_expression() {
+    let fixture = "void f() {\n  List<int>? l;\n  (l)?..[0];\n}";
+    let report = report_ops(fixture);
+    let dead: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "dead_code")
+        .collect();
+    assert_eq!(dead.len(), 1, "{:?}", rows(&report));
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..[0]").unwrap();
+    assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
+    assert_eq!(dead[0].range.length, 6, "{:?}", rows(&report));
 }
 
 /// `i?..toInt().bitLength` — a plain `.` continuation at the cascade

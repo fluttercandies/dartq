@@ -463,15 +463,15 @@ fn attribute(diags: &[analyze_json::Diag], pkg_dir: &Path) -> (Vec<Row>, usize) 
             outside += 1;
             continue;
         }
-        rows.push(Row {
-            severity: diag.severity.clone(),
-            code: diag.code.clone(),
-            file: comps.join("/"),
-            line: diag.line,
-            column: diag.column,
-            length: diag.length,
-            message: diag.message.replace(root.as_str(), "<pkg>"),
-        });
+        rows.push(Row::new(
+            diag.severity.clone(),
+            diag.code.clone(),
+            comps.join("/"),
+            diag.line,
+            diag.column,
+            diag.length,
+            diag.message.replace(root.as_str(), "<pkg>"),
+        ));
     }
     sort_rows(&mut rows);
     (rows, outside)
@@ -838,15 +838,15 @@ mod tests {
     use super::*;
 
     fn row(sev: &str, code: &str, file: &str, line: u32, col: u32, len: u64, msg: &str) -> Row {
-        Row {
-            severity: sev.into(),
-            code: code.into(),
-            file: file.into(),
+        Row::new(
+            sev.into(),
+            code.into(),
+            file.into(),
             line,
-            column: col,
-            length: len,
-            message: msg.into(),
-        }
+            col,
+            len,
+            msg.into(),
+        )
     }
 
     #[test]

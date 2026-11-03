@@ -350,15 +350,15 @@ mod tests {
     use crate::case::Case;
 
     fn row(sev: &str, code: &str, file: &str, line: u32, col: u32, len: u64, msg: &str) -> Row {
-        Row {
-            severity: sev.into(),
-            code: code.into(),
-            file: file.into(),
+        Row::new(
+            sev.into(),
+            code.into(),
+            file.into(),
             line,
-            column: col,
-            length: len,
-            message: msg.into(),
-        }
+            col,
+            len,
+            msg.into(),
+        )
     }
 
     fn loaded(id: &str, content: &str) -> LoadedCase {

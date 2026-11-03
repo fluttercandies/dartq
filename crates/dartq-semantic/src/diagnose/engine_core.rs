@@ -678,8 +678,16 @@ impl<'a> Engine<'a> {
     /// own token — `at(methodName)` keeps a declared-method send's name,
     /// while every other shape reports the operand's whole expression.
     /// A non-`void` operand is a no-op.
+    ///
+    /// The gate reads the void SPELLING through the alias fold, not the
+    /// dedicated variant alone: a typedef-folded `void` (`typedef V =
+    /// void; V x = …; x == null`) reaches the operand faces as the alias
+    /// head `Named{V}` (or its RHS `Named{void}`) while upstream's
+    /// `staticType` answers `VoidTypeImpl` for the grounded use — the
+    /// dedicated-variant check would under-report both faces.
     pub(crate) fn emit_use_of_void_result(&mut self, ty: Ty, operand: &Row) {
-        if ty != Ty::Void {
+        let ty = self.fold_alias_ty(ty);
+        if !self.is_void_spelling(ty) {
             return;
         }
         // One row per consumed node. The same operand is folded from more
@@ -1964,6 +1972,37 @@ impl<'a> Engine<'a> {
             offset: tokens[first].utf16_offset,
             length: last_span.end().saturating_sub(tokens[first].utf16_offset),
         };
+        // A ParenthesizedExpression operand types as its INNER expression
+        // (`ParenthesizedExpression.staticType` is the child's), while the
+        // oracle's `.at(expression)` anchor still covers the parens
+        // (`for (var v in (x))` reports `(x)`). The grounding legs below
+        // read the operand's LAST token, which for a group is the closing
+        // `)` — a token no read row keys — so the group unwraps onto its
+        // own inner extent here and repeats (`((x))` walks out one pair at
+        // a time). The anchor stays the outer group.
+        let mut grounded_last = last;
+        loop {
+            if tokens[first].kind != dartq_scanner::TokenKind::OpenParen
+                || self.tokens.matching_end(first) != Some(grounded_last)
+            {
+                break;
+            }
+            let mut inner_first = first + 1;
+            while inner_first < grounded_last && tokens[inner_first].is_synthetic() {
+                inner_first += 1;
+            }
+            if inner_first >= grounded_last {
+                break;
+            }
+            let mut inner_last = grounded_last - 1;
+            while inner_last > inner_first && tokens[inner_last].is_synthetic() {
+                inner_last -= 1;
+            }
+            first = inner_first;
+            grounded_last = inner_last;
+        }
+        let last = grounded_last;
+        let last_span = self.token_utf16_span(last)?;
         // 1. The flow row at the operand's last token — the bare read
         //    (`for (var x in l)`), the promoted property read's member
         //    row; a `void` read joins through the side table the shared
@@ -9863,7 +9902,7 @@ impl<'a> Engine<'a> {
             }
             None => return,
         };
-        if ty == Ty::Void {
+        if self.is_void_spelling(self.fold_alias_ty(ty)) {
             // The `!`-postfix operand's own face (upstream
             // `visitPostfixExpression`'s `checkForUseOfVoidResult(node)` on
             // the whole `x!`, error_verifier.dart:1692 →
@@ -10236,7 +10275,12 @@ impl<'a> Engine<'a> {
         // resolved `==` face and on every face the name-level walk cannot
         // see — the under-report posture only carves out the declared-`void`
         // formal (`bool operator ==(void o)`).
-        if right_ty == Ty::Void {
+        // The spelled-`void` check reads through the alias fold: a
+        // typedef-`void` actual (`typedef V = void; V x`) carries the
+        // alias head upstream folds to `VoidTypeImpl` — the dedicated
+        // variant alone would under-report it ([`Self::emit_use_of_void
+        // _result`]'s own gate folds the same way).
+        if self.is_void_spelling(self.fold_alias_ty(right_ty)) {
             let void_formal = match left_ty {
                 Ty::Named { name, .. } => self
                     .member_formals_full(
@@ -10247,7 +10291,7 @@ impl<'a> Engine<'a> {
                         self.intern("=="),
                     )
                     .and_then(|formals| formals.positional.first().map(|f| f.ty))
-                    .is_some_and(|formal| formal == Ty::Void),
+                    .is_some_and(|formal| self.is_void_spelling(self.fold_alias_ty(formal))),
                 _ => false,
             };
             if !void_formal {
@@ -11140,7 +11184,27 @@ impl<'a> Engine<'a> {
     /// node's type, never the RHS's own. The rows stay untouched: an
     /// assignment's read/write bookkeeping keys on the target being the
     /// last real row, which a folded result row would disturb.
-    pub(crate) fn fold_if_null_assignment(&mut self, op_range: SourceRange, _end: SourceRange) {
+    pub(crate) fn fold_if_null_assignment(&mut self, op_range: SourceRange, end: SourceRange) {
+        self.fold_if_null_assignment_with(op_range, end, None);
+    }
+
+    /// [`Self::fold_if_null_assignment`] with the target read's FLOW type
+    /// when the caller has one (#3822). Upstream's `T1` is "the static
+    /// type `e1` would have as an expression with context type schema
+    /// `_`" — the PROMOTED read type, not the declared one: under
+    /// `if (local is Iterable<int>?)` the read is `Iterable<int>?`, so
+    /// `UP(NonNull(T1), T2')` is `Iterable<num>`, never `Object`. The
+    /// promotion facts only materialize after pass 1
+    /// ([`crate::diagnose::FileReport`]'s read-type table), so the walk
+    /// passes them in when its flow state can answer; `None` keeps the
+    /// declared-face answer (the under-report direction the join had
+    /// before the promotion plumbing).
+    pub(crate) fn fold_if_null_assignment_with(
+        &mut self,
+        op_range: SourceRange,
+        _end: SourceRange,
+        promoted_target: Option<Ty>,
+    ) {
         let rhs_index = match self
             .rows
             .iter()
@@ -11158,7 +11222,8 @@ impl<'a> Engine<'a> {
         }) else {
             return;
         };
-        let target_ty = self.operand_static_ty(&self.rows[target_index]);
+        let target_ty = promoted_target
+            .unwrap_or_else(|| self.operand_static_ty(&self.rows[target_index]));
         let rhs_ty = self.operand_static_ty(&self.rows[rhs_index]);
         if target_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN {
             return;
@@ -11171,7 +11236,30 @@ impl<'a> Engine<'a> {
         // `?.`-merged selector lives in `null_aware_members`; a plain
         // `local ??= v` carries no `?.` and keeps the `UP` face (`Function`,
         // never `Function?`).
-        let shorted = self.null_aware_members.contains(&lhs_offset);
+        //
+        // A STATIC qualifier target never short-circuits: `D?.staticE`
+        // reports `invalid_null_aware_operator` and resolves as the plain
+        // `.` access, so `F? f = (D?.staticE ??= e)` types the bare `E`
+        // (probed against the 3.13.7 oracle, whose row is
+        // `A value of type 'E' can't be assigned to a variable of type
+        // 'F?'.`). Upstream decides this by the receiver's syntax, not its
+        // nullability (`assignment_expression_resolver.dart`'s
+        // `analyzePropertyTargetReceiver` returns early for
+        // `StaticQualifierImpl`), and the same exclusion already gates the
+        // `=` twin at `listener.rs`'s `handle_assignment_expression`.
+        // The gate is NOT "any receiver the `?.` warns about": an extension
+        // override over a non-null receiver warns the same way yet still
+        // short-circuits (`EX(s)?.p ??= e` types `E?`, same probe), so only
+        // the `Container`/`PrefixedContainer` pair — the merge's own static
+        // classification, the one that emits the invalid-operator
+        // warning — is excluded.
+        let static_receiver = matches!(
+            &self.rows[target_index].shape,
+            RowShape::Member {
+                recv: Receiver::Container { .. } | Receiver::PrefixedContainer { .. }
+            }
+        );
+        let shorted = !static_receiver && self.null_aware_members.contains(&lhs_offset);
         let ty = self.composite_lub(target_ty, rhs_ty, true);
         let ty = if shorted { Self::nullable_form(ty) } else { ty };
         let rhs_offset = self.rows[rhs_index].range.offset;
@@ -11364,10 +11452,139 @@ impl<'a> Engine<'a> {
             }
             (Ty::Record { .. }, Ty::Record { .. }) => right,
             (Ty::Record { .. }, _) | (_, Ty::Record { .. }) => Ty::named(self.intern("Object")),
-            (Ty::Function { .. }, Ty::Function { .. }) => Ty::named(self.intern("Function")),
+            // The function-type LUB (upstream
+            // `LeastUpperBoundHelper.getLeastUpperBoundOfFunctionTypes`,
+            // least_upper_bound.dart:663-779): a compatible pair joins
+            // elementwise — the RETURN types lift (`C1<int> Function()` /
+            // `C2<int> Function()` → `A Function()`) and each paired formal
+            // takes the greatest lower bound. The forms need not be
+            // identical: surplus optional positionals and unmatched named
+            // formals drop out of the joined signature, exactly as the
+            // official walk does. Only a missing REQUIRED formal (or an
+            // undecidable formal type) falls back to the bare `Function`
+            // head — the same under-report direction the arm answered
+            // before the lift, never a fabricated rejection.
+            (
+                Ty::Function { shape: l, .. },
+                Ty::Function { shape: r, .. },
+            ) => self
+                .function_type_lub(l, r)
+                .unwrap_or_else(|| Ty::named(self.intern("Function"))),
             (Ty::Function { .. }, _) | (_, Ty::Function { .. }) => Ty::named(self.intern("Object")),
             _ => right,
         }
+    }
+
+    /// [`Self::composite_lub_stripped`]'s function-type join, mirroring
+    /// upstream `_functionType` (least_upper_bound.dart:663-779) gate for
+    /// gate:
+    ///
+    /// - the type-parameter COUNTS must agree, else the bare `Function`
+    ///   head (upstream :667-671);
+    /// - the required-positional counts must agree: upstream walks both
+    ///   lists until the kinds diverge, then rejects any *leftover*
+    ///   required formal (:757-769), and required positionals form a
+    ///   prefix — so a count difference always leaves a required formal
+    ///   behind (:695-704's break);
+    /// - the positional lists need NOT be the same length: the walk pairs
+    ///   `min(len)` entries and the surplus *optional* ones are simply
+    ///   dropped from the result (:757-769 skips non-required leftovers);
+    /// - the named sets need NOT match: upstream matches by name and skips
+    ///   an unmatched *optional* named formal, bailing only when the
+    ///   unmatched one is required (:715-753). The shape carries no
+    ///   per-named requiredness, so an unmatched name is dropped here —
+    ///   the under-report direction, never a fabricated rejection.
+    ///
+    /// The return slot takes the LUB (:771) and each paired formal the
+    /// GLB (:700/:710/:729). `None` — the bare-`Function` fallback —
+    /// whenever a gate or a formal cannot decide.
+    fn function_type_lub(
+        &self,
+        left: crate::model::FnShapeId,
+        right: crate::model::FnShapeId,
+    ) -> Option<Ty> {
+        let (type_params, required, ret, positional, named) = {
+            let pool = self.boundary.args.borrow();
+            let a = pool.function_shape(left);
+            let b = pool.function_shape(right);
+            // Upstream `relateTypeParameters` (least_upper_bound.dart:675)
+            // must also relate the BOUNDS and instantiate both sides with
+            // the shared fresh set; that substitution is not modelled here,
+            // so a differing count still bails as it did before.
+            if a.type_params != b.type_params {
+                return None;
+            }
+            // Required positionals are a prefix on both sides; a count
+            // difference always strands a required formal on the longer
+            // side, which upstream rejects (:757-769).
+            if a.required_positional != b.required_positional {
+                return None;
+            }
+            let paired = a.positional.len().min(b.positional.len());
+            if paired < a.required_positional as usize {
+                return None;
+            }
+            (
+                a.type_params,
+                a.required_positional,
+                (a.return_ty, b.return_ty),
+                (
+                    a.positional[..paired].to_vec(),
+                    b.positional[..paired].to_vec(),
+                ),
+                (a.named.to_vec(), b.named.to_vec()),
+            )
+        };
+        let return_ty = self.composite_lub(ret.0, ret.1, false);
+        let mut joined = Vec::with_capacity(positional.0.len());
+        for (x, y) in positional.0.iter().zip(positional.1.iter()) {
+            joined.push(self.composite_glb(*x, *y)?);
+        }
+        let mut joined_named = Vec::with_capacity(named.0.len());
+        for (name, x) in named.0.iter() {
+            let Some((_, y)) = named.1.iter().find(|(other, _)| other == name) else {
+                // An unmatched named formal is dropped (upstream skips the
+                // optional ones); a required one would bail upstream, which
+                // the shape cannot spell.
+                continue;
+            };
+            joined_named.push((*name, self.composite_glb(*x, *y)?));
+        }
+        Some(self.boundary.args.borrow_mut().function_required(
+            type_params,
+            required,
+            return_ty,
+            &joined,
+            &joined_named,
+            false,
+        ))
+    }
+
+    /// The two-type greatest lower bound the function-formal join needs
+    /// (upstream `getGreatestLowerBound`): equality, the `Never` bottom,
+    /// the top faces, and the subtype pair decide; everything else answers
+    /// `None` so the caller keeps the bare-`Function` fallback instead of
+    /// inventing a formal type.
+    fn composite_glb(&self, left: Ty, right: Ty) -> Option<Ty> {
+        if left == right {
+            return Some(left);
+        }
+        if left == Ty::Never || right == Ty::Never {
+            return Some(Ty::Never);
+        }
+        if matches!(left, Ty::Dynamic) {
+            return Some(right);
+        }
+        if matches!(right, Ty::Dynamic) {
+            return Some(left);
+        }
+        if self.name_subtype(left, right) {
+            return Some(left);
+        }
+        if self.name_subtype(right, left) {
+            return Some(right);
+        }
+        None
     }
 
     /// The cross-head common-supertype walk (the official interface LUB's
@@ -11490,8 +11707,10 @@ impl<'a> Engine<'a> {
         // `use_of_void_result` at the operand and answers no
         // `argument_type_not_assignable`. The `dynamic` operand still
         // suppresses — `isAssignableTo(dynamic, X)` holds upstream, and
-        // the const-eval verdict owns the row.
-        if right_ty == Ty::Void {
+        // the const-eval verdict owns the row. The spelled check folds the
+        // typedef-`void` faces the same way [`Self::emit_use_of_void
+        // _result`] does.
+        if self.is_void_spelling(self.fold_alias_ty(right_ty)) {
             self.emit_use_of_void_result(right_ty, right);
             return;
         }
@@ -12437,7 +12656,9 @@ impl<'a> Engine<'a> {
         loop_var_ty: Option<Ty>,
     ) -> Option<SourceRange> {
         match loop_var_ty {
-            Some(ty) if ty != Ty::UNKNOWN && ty != Ty::Void => {}
+            Some(ty)
+                if ty != Ty::UNKNOWN
+                    && !self.is_void_spelling(self.fold_alias_ty(ty)) => {}
             _ => return None,
         }
         let (ty, _, range) = self.single_row_since(mark)?;
@@ -12466,7 +12687,8 @@ impl<'a> Engine<'a> {
             return None;
         }
         let element = self.boundary.args.borrow().get(args).first().copied();
-        (element.is_some_and(|element| self.is_void_spelling(element))).then_some(range)
+        (element.is_some_and(|element| self.is_void_spelling(self.fold_alias_ty(element))))
+            .then_some(range)
     }
 
     /// The non-`bool` face the staged non-`bool` re-decision emits: a
@@ -14290,7 +14512,11 @@ mod tests {
     /// True-positive pin (evidence-2186 §A fixture 4's under-report bias):
     /// no `await` — a `Future`-typed receiver's member genuinely misses
     /// and the report keeps firing. The flatten is scoped to the await
-    /// close; a plain `Future` binding is untouched.
+    /// close; a plain `Future` binding is untouched. The message spells
+    /// the receiver's instantiated static type: oracle 3.13.7 reports
+    /// `The getter 'isEven' isn't defined for the type 'Future<DB>'.`
+    /// for this fixture (the pin previously expected the bare `'Future'`
+    /// — a spelling fitted to the un-instantiated face).
     #[test]
     fn unawaited_future_receiver_still_reports() {
         let report = report(
@@ -14308,7 +14534,7 @@ mod tests {
         );
         assert_eq!(
             report.diagnostics[0].message,
-            "The getter 'isEven' isn't defined for the type 'Future'."
+            "The getter 'isEven' isn't defined for the type 'Future<DB>'."
         );
     }
 

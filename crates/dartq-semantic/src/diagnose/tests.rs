@@ -23569,6 +23569,10 @@ mod ticket_3802_tests;
 mod ticket_3800_tests;
 
 #[cfg(test)]
+#[path = "null_aware_assignment_tests.rs"]
+mod null_aware_assignment_tests;
+
+#[cfg(test)]
 #[path = "ticket_3793_tests.rs"]
 mod ticket_3793_tests;
 
@@ -23619,3 +23623,12 @@ mod ticket_3809_tests;
 #[cfg(test)]
 #[path = "ticket_3823_tests.rs"]
 mod ticket_3823_tests;
+
+// —— void-region pins ——
+// A void-typed operand in a cascade/do-while keeps its
+// use_of_void_result row and reports no dead interval; a dead region
+// that starts on such a statement stays one row (the #3798 dead-interval
+// close fix).
+#[cfg(test)]
+#[path = "void_region_tests.rs"]
+mod void_region_tests;

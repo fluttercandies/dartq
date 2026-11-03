@@ -6934,6 +6934,19 @@ impl<'a> Engine<'a> {
         if level.mark != mark {
             return None;
         }
+        self.arg_slot_ty_ctx()
+            .and_then(|ty| self.function_ty_of(ty))
+    }
+
+    /// The open argument slot's own context type — the pending argument's
+    /// declared formal folded and inference-substituted exactly like
+    /// [`Self::argument_ctx_at`] resolves it, but returned raw (the
+    /// collection literal's channel reads `List<int>` itself, never a
+    /// function shape). `None` when no argument is open or the callee
+    /// answers no formal for the slot — including the unsolved-parameter
+    /// gate (a bare `T` is no context).
+    pub(crate) fn arg_slot_ty_ctx(&mut self) -> Option<Ty> {
+        let level = self.arg_levels.last()?;
         let slot = match level.pending_name {
             Some(label) => SchemaSlot::Named(label),
             None => SchemaSlot::Positional(
@@ -6992,7 +7005,7 @@ impl<'a> Engine<'a> {
         // receiver's written instantiation).
         let folded = self.fold_alias_ty(slot_ty);
         if folded != slot_ty {
-            return self.function_ty_of(folded);
+            return Some(folded);
         }
         // The schema's own inference parameters gate the latch: the call
         // solved them (explicit type arguments, the receiver's written
@@ -7006,7 +7019,7 @@ impl<'a> Engine<'a> {
         // solved signature; an unsolved `T` is no context at all).
         let inst = self.closure_schema_instantiate(slot_ty, &recv, callee_name, Some(callee_row));
         match inst {
-            Some(ty) => self.function_ty_of(ty),
+            Some(ty) => Some(ty),
             None => {
                 let has_open_param = self
                     .closure_callee_params(&recv, callee_name)
@@ -7018,7 +7031,7 @@ impl<'a> Engine<'a> {
                 if has_open_param {
                     None
                 } else {
-                    self.function_ty_of(slot_ty)
+                    Some(slot_ty)
                 }
             }
         }

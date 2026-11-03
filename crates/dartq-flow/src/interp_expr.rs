@@ -231,6 +231,15 @@ impl Interp<'_> {
                             // rows `+ b`. The continuation sits on the
                             // stack for the consumer like `Ev::Exit`'s.
                             if self.ops.is_bottom(ty) {
+                                // The read's own condition face: an
+                                // identifier read's `_ExpressionInfo` is
+                                // captured before this exit (official
+                                // `storeExpressionInfo`), so a construct
+                                // consuming the read as its condition
+                                // enters both arms from the pre-exit state
+                                // (`if (v)` over a `Never` parameter rows
+                                // nothing). [`Interp::cond_split`] reads it.
+                                self.cond_exempt = Some((token.range.end(), self.current.clone()));
                                 self.unreachable_cur();
                                 if !self.collecting() {
                                     self.exit_at = Some(token.range.end());
@@ -2008,6 +2017,15 @@ impl Interp<'_> {
                         )
                     });
                 }
+                // Every write target's own read face stays queryable at
+                // its offset (`Flow::promoted_type_at`): the `??=` if-null
+                // composite reads `LUB(NonNull(readType), rhsType)` of
+                // exactly this row, and a plain `=` has just retracted the
+                // row from the fact stream above.
+                if let Some(span) = target.read_span {
+                    self.write_target_read_tys
+                        .insert(span.range.offset, target.ty);
+                }
                 if let Some(var) = target.reference {
                     // `x ??= e`: the write's type is `LUB(NonNull(readType),
                     // rhsType)` (official `_computeIfNullType`,
@@ -2428,8 +2446,19 @@ impl Interp<'_> {
                 // access path makes the poll a no-op, and so does a
                 // statement that BEGAN dead — the top-down official walk
                 // latched that statement first, so its own row owns the
-                // whole extent (`return; a?[0];` is one row).
-                if !self.stmt_began_dead {
+                // whole extent (`return; a?[0];` is one row). A definitely
+                // unassigned local receiver's row belongs to the semantic
+                // `dead_null_chains` latch instead (the
+                // `_verifyUnassignedVariable` `?[` arm — the operator
+                // through the enclosing access's end), so the poll stays
+                // silent there: its own anchor would be the operand, never
+                // the operator.
+                if !self.stmt_began_dead
+                    && !self
+                        .null_shorts
+                        .last()
+                        .is_some_and(|short| short.unassigned_receiver)
+                {
                     self.dead_code(*operand);
                 }
             }
@@ -2455,8 +2484,17 @@ impl Interp<'_> {
                 // dead_code_verifier.dart:317-318) — `punct` IS that
                 // operator, so `x.=> 1` rows `.=> 1;`, `x..=> 1` rows
                 // `..=> 1;`, `null?.=> 1` rows `?.=> 1;`. A live access
-                // path makes the poll a no-op.
-                self.dead_code(*punct);
+                // path makes the poll a no-op, and a definitely unassigned
+                // local receiver's row belongs to the semantic
+                // `dead_null_chains` latch — the same split the `?.` member
+                // and `?[` operand polls carry.
+                if !self
+                    .null_shorts
+                    .last()
+                    .is_some_and(|short| short.unassigned_receiver)
+                {
+                    self.dead_code(*punct);
+                }
             }
             Ev::AnonMethodEnd { end } => {
                 // The member's own end: the `?.` member's chain-end face
@@ -2569,44 +2607,32 @@ impl Interp<'_> {
                     && !self.exit_at.is_some_and(|at| at >= member.range.offset)
                 {
                     // A `?.` whose access path was dead at open has TWO
-                    // official anchor faces. The definitely-unassigned
-                    // nullable local (`(i)?.sign`, `i?.sign` on an
-                    // unassigned `int? i`) reports from the `?.` operator —
-                    // `dead_code_verifier._verifyUnassignedVariable` emits
-                    // `operator.offset .. node.end` (`?.sign`), a separate
-                    // reporting path from `_firstDeadNode`. Every other
-                    // dead-at-open receiver (a `null` literal, a `Null`-
-                    // typed or `Never`-typed read) reports the member's
-                    // own node — `null?.m(1)` and `x?.m(1)` on an assigned
-                    // `Null x` both row `m(1)`. The event carries no `?`
-                    // span, but `?.` is exactly the two bytes before the
-                    // member identifier — the unassigned face reads
-                    // `ident.offset - 2`. `member` is the send's tiled end
-                    // (the #585 follower), unusable for the offset.
-                    let unassigned_receiver = *null_aware
-                        && self
-                            .null_shorts
-                            .last()
-                            .and_then(|short| {
-                                self.exprs.get(short.exprs_depth.saturating_sub(1))
-                            })
-                            .and_then(|recv| recv.reference)
-                            .is_some_and(|var| self.current.model(var).unassigned);
-                    let anchor = if unassigned_receiver {
-                        TokenSpan {
-                            id: ident.id,
-                            range: dartq_source::SourceRange {
-                                offset: ident.range.offset.saturating_sub(2),
-                                length: 0,
-                            },
-                        }
-                    } else {
-                        self.exprs
+                    // official anchor faces, and the flow layer owns only
+                    // one of them. The definitely-unassigned nullable local
+                    // (`i?.sign` on an unassigned `int? i`) reports through
+                    // `dead_code_verifier._verifyUnassignedVariable` — a
+                    // dedicated path (`operator.offset .. node.end`, with
+                    // the official parent climb through every enclosing
+                    // access) that the semantic `dead_null_chains` latch
+                    // already implements; the flow layer models the same
+                    // receiver only as its `unassigned` read fold, so a row
+                    // here would duplicate the chain face at the same span.
+                    // Every other dead-at-open receiver (a `null` literal, a
+                    // `Null`-typed or `Never`-typed read) reports the
+                    // member's own node — `null?.m(1)` and `x?.m(1)` on an
+                    // assigned `Null x` both row `m(1)`.
+                    if !self
+                        .null_shorts
+                        .last()
+                        .is_some_and(|short| short.unassigned_receiver)
+                    {
+                        let anchor = self
+                            .exprs
                             .last()
                             .and_then(|e| e.read_span)
-                            .unwrap_or(*ident)
-                    };
-                    self.dead_code(anchor);
+                            .unwrap_or(*ident);
+                        self.dead_code(anchor);
+                    }
                 }
                 // The member identifier's own entry sits on top (every
                 // member shape pushes through its primary parse); the
@@ -2871,6 +2897,15 @@ impl Interp<'_> {
                 if !post_send_tile
                     && self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
                 {
+                    // The same pre-exit capture the `Ident` arm keeps: a
+                    // member read rooted in an identifier (`a.f`, `this.f`,
+                    // the implicit `this` face) reports its condition info
+                    // before the exit, so its arms stay live; a call-rooted
+                    // access (`A().f`) records after the exit and keeps
+                    // them dead. `ref_chain` is exactly that root test.
+                    if self.exprs.last().is_some_and(|e| e.ref_chain) {
+                        self.cond_exempt = Some((access_end, self.current.clone()));
+                    }
                     self.unreachable_cur();
                     if !self.collecting() {
                         self.exit_at = Some(access_end);
@@ -3095,6 +3130,22 @@ impl Interp<'_> {
                     if self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
                         && let Ev::Send { end, .. } | Ev::SendNoArgs { end } = ev
                     {
+                        // The identifier-rooted member read's pre-exit
+                        // capture (`x.f`/`this.f`/the implicit `this` face):
+                        // its `_ExpressionInfo` predates this exit, so a
+                        // construct using it as its condition keeps both
+                        // arms live. A call-rooted access (`A().f`) and every
+                        // argumented invocation cleared `ref_chain` above and
+                        // stays dead.
+                        let exempt_key = self
+                            .exprs
+                            .last()
+                            .filter(|e| e.ref_chain)
+                            .and_then(|e| e.read_span.or(e.callee_span))
+                            .map(|span| span.range.end());
+                        if let Some(key) = exempt_key {
+                            self.cond_exempt = Some((key, self.current.clone()));
+                        }
                         self.unreachable_cur();
                         if !self.collecting() {
                             self.exit_at = Some(*end);
@@ -3448,13 +3499,19 @@ impl Interp<'_> {
                     // nullable target's value is `null` by construction, so
                     // `null_short_begin` folds its access path dead
                     // (`i?..m(1)` on an unassigned `int? i` is
-                    // `dead_at_open` like the `null` literal).
-                    let head_dead = self
+                    // `dead_at_open` like the `null` literal). That face is
+                    // the semantic `dead_null_chains` latch's row, though —
+                    // it owns the official parent climb and the cascade
+                    // expression's own end — so the flow layer stays silent
+                    // there and the `?..` poll below runs only for the
+                    // reachability receivers (`null` literals, `Null`-typed
+                    // and `Never`-typed reads).
+                    let (head_dead, head_unassigned) = self
                         .null_shorts
                         .last_mut()
-                        .is_some_and(|short| {
+                        .map_or((false, false), |short| {
                             short.cascade_head = true;
-                            short.dead_at_open
+                            (short.dead_at_open, short.unassigned_receiver)
                         });
                     // The `?..` head's own dead-interval anchor (official:
                     // the cascade SECTION is the first dead node and its
@@ -3484,7 +3541,7 @@ impl Interp<'_> {
                         events.get(i.wrapping_add(1)),
                         Some(Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin { .. })
                     );
-                    if head_dead && !self.stmt_began_dead && !recovered_section {
+                    if head_dead && !head_unassigned && !self.stmt_began_dead && !recovered_section {
                         if let Some(Ev::ParenBegin { span }) =
                             events.get(i.wrapping_sub(1))
                         {

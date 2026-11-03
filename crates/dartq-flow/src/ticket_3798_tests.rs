@@ -76,26 +76,27 @@ fn int_q(source: &str, name: &str) -> (u32, &'static str, bool) {
     )
 }
 
-/// The `?.`-member dead interval over a definitely-unassigned nullable
-/// local: `(i)?.sign` anchors `?.sign` (the member poll's own row,
-/// `DeadCodeTestCases_Language212.test_unassigned_propertyAccess`, oracle
-/// `3:6|6`).
+/// A definitely-unassigned nullable local's `?.` row is NOT the flow
+/// layer's: `_verifyUnassignedVariable` is its own reporting path
+/// (`operator.offset .. node.end`, with the official parent climb), and
+/// the semantic `dead_null_chains` latch owns it end to end. The flow
+/// layer models the receiver only as its `unassigned` read fold, so it
+/// must stay SILENT for `(i)?.sign` — a row here would duplicate the
+/// semantic chain's span (`dead_code @?` twice, the #3172 regression).
 #[test]
 fn paren_receiver_null_aware_property_rows() {
     let source = "void f() {\n  int? i;\n  (i)?.sign;\n}\n";
     let rows = dead_rows(source, &[int_q(source, "i;")]);
-    let q = source.find("?.sign").expect("?") as u32;
-    assert_eq!(rows, vec![(q, 6, "?.sign".to_string())], "{rows:?}");
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
-/// The bare receiver twin (`i?.sign`), oracle `3:4|6` —
-/// `test_unassigned_propertyAccess`'s sibling face.
+/// The bare twin of the face above (`i?.sign`): the same ownership split
+/// keeps the flow layer silent.
 #[test]
 fn bare_receiver_null_aware_property_rows() {
     let source = "void f() {\n  int? i;\n  i?.sign;\n}\n";
     let rows = dead_rows(source, &[int_q(source, "i;")]);
-    let q = source.find("?.sign").expect("?") as u32;
-    assert_eq!(rows, vec![(q, 6, "?.sign".to_string())], "{rows:?}");
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 /// The `(`-anchored dead interval of an invocation whose callee itself
@@ -215,16 +216,15 @@ fn null_typed_receiver_null_aware_member_rows() {
     assert_eq!(rows, vec![(member, 4, "m(1)".to_string())], "{rows:?}");
 }
 
-/// The method-invocation twin of the unassigned `?.` face: `i?.abs()`
-/// on an unassigned `int? i` reports `?.abs()` — `operator.offset` through
-/// the invocation's `)` (oracle `3:4|7`), the member-name anchor does not
-/// apply to a definitely-unassigned nullable receiver.
+/// The method-invocation twin of the unassigned face: `i?.abs()` on an
+/// unassigned `int? i` reports `?.abs()` (oracle `3:4|7`) — the semantic
+/// chain's row. The flow layer stays silent, the same split the property
+/// face above carries.
 #[test]
 fn unassigned_receiver_null_aware_call_rows() {
     let source = "void f() {\n  int? i;\n  i?.abs();\n}\n";
-    let q = source.find("?.abs()").expect("?.") as u32;
     let rows = dead_rows(source, &[int_q(source, "i;")]);
-    assert_eq!(rows, vec![(q, 7, "?.abs()".to_string())], "{rows:?}");
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 /// The `?..` cascade head on a `null` literal target: the section is the
@@ -251,17 +251,17 @@ fn null_typed_receiver_null_aware_cascade_rows() {
     assert_eq!(rows, vec![(q, 8, "?..m(1);".to_string())], "{rows:?}");
 }
 
-/// The `_verifyUnassignedVariable` face of the `?..` head: an unassigned
-/// nullable local target keeps the sections reachable, yet the official
-/// still reports `operator.offset .. node.end` — `i?..abs();` rows
-/// `?..abs();` (oracle `3:4|8`). The interval runs to `;` like the
-/// dead-at-open face.
+/// The `?..` cascade head over a definitively-unassigned nullable target:
+/// `_verifyUnassignedVariable`'s cascade arm (`verifyCascadeExpression`)
+/// gives the semantic chain the `?`-through-cascade-end row — `i?..abs()`
+/// rows `?..abs()` (oracle `3:4|8`) — so the flow layer stays silent. The
+/// reachability receivers (the `null`-literal and `Null`-typed pins
+/// below) still anchor here.
 #[test]
 fn unassigned_nullable_receiver_null_aware_cascade_rows() {
     let source = "void k() {\n  int? i;\n  i?..abs();\n}\n";
-    let q = source.find("?..").expect("?..") as u32;
     let rows = dead_rows(source, &[int_q(source, "i;")]);
-    assert_eq!(rows, vec![(q, 8, "?..abs()".to_string())], "{rows:?}");
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 /// A multi-section `?..` cascade on a dead target reports ONE interval

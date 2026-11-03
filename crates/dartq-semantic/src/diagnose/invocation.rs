@@ -297,6 +297,39 @@ impl<'a> Engine<'a> {
     /// nullable local's read latches the dead-chain candidate (the
     /// `_verifyUnassignedVariable` face — resolved at teardown against the
     /// definite-unassignment facts).
+    /// The identifier inside a paren group whose row spans only the
+    /// closing `)` (`(i)` folds `i` into a bare read row and the group
+    /// into a row over the `)`). `Some(offset)` only when the group's
+    /// content is exactly one token: the official
+    /// `target.unParenthesized` (`dead_code_verifier.dart:486-490`)
+    /// reaches a `SimpleIdentifier` under that shape alone — `(c ? a :
+    /// b)`'s joined face and every wider content answer `None`.
+    pub(crate) fn paren_group_single_ident(&self, close_offset: u32) -> Option<u32> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let close_idx = toks.partition_point(|t| t.utf16_offset < close_offset);
+        let close = toks.get(close_idx)?;
+        if close.kind != TK::CloseParen || close.utf16_offset != close_offset {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut open_idx = None;
+        for idx in (0..close_idx).rev() {
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                TK::OpenParen if depth == 0 => {
+                    open_idx = Some(idx);
+                    break;
+                }
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => depth -= 1,
+                _ => {}
+            }
+        }
+        let open_idx = open_idx?;
+        // Exactly one token between the parens: the bare identifier.
+        (close_idx == open_idx + 2).then(|| toks[open_idx + 1].utf16_offset)
+    }
+
     pub(crate) fn merge_member(
         &mut self,
         is_null_aware: bool,
@@ -691,11 +724,33 @@ impl<'a> Engine<'a> {
                     && matches!(popped.shape, RowShape::Bare(BareInfo::Plain { .. }))
                     && self.strings.resolve(popped.name).is_empty()
                 {
-                    if let Some((&inner_offset, _)) = self
+                    // A paren group's own row can span only its closing `)`
+                    // (`(i)` leaves a bare `i` read row and a group row over
+                    // the `)`) — the inner read then sits DIRECTLY beneath,
+                    // ending exactly at the group row's start. Only a group
+                    // whose content is EXACTLY one identifier qualifies
+                    // (official `target.unParenthesized` reaches a
+                    // `SimpleIdentifier` only then): `(c ? a : b)` and
+                    // `(i + 1)` never unwrap, their joined/binary faces
+                    // being no name.
+                    let inner = self
                         .local_hits
                         .iter()
                         .find(|&(&off, _)| recv_span.offset < off && off < recv_span.end())
-                    {
+                        .map(|(&off, _)| off)
+                        .or_else(|| {
+                            let inner = self.paren_group_single_ident(recv_span.offset)?;
+                            self.local_hits
+                                .contains_key(&inner)
+                                .then_some(inner)
+                                .filter(|off| {
+                                    self.rows.last().is_some_and(|row| {
+                                        row.range.offset == *off
+                                            && row.range.end() == recv_span.offset
+                                    })
+                                })
+                        });
+                    if let Some(inner_offset) = inner {
                         // The inner read's own span: the identifier token at
                         // the hit offset (`local_hits` keys the read's
                         // offset), spelled in UTF-16 like every row range.
@@ -8074,6 +8129,15 @@ impl<'a> Engine<'a> {
             let Some(judged) = self.subst_params(judged, &map) else {
                 continue;
             };
+            // A bound that still carries an UNDECIDABLE leaf after the
+            // substitution — an inference variable's spelling inside a
+            // compound bound (`Exactly<X1b>`) — never reaches a verdict:
+            // upstream checks explicit arguments against the instantiated
+            // bound and reports nothing when the solver left the bound
+            // unsolved ([`Self::bound_mentions_undecidable`]).
+            if self.bound_mentions_undecidable(judged) {
+                continue;
+            }
             if self.assignable(arg, judged, false) != Some(false) {
                 continue;
             }
@@ -8118,6 +8182,63 @@ impl<'a> Engine<'a> {
                 ..
             } => self.named_type_is_type(name),
             _ => true,
+        }
+    }
+
+    /// Whether a bounds-face type still carries an undecidable leaf
+    /// ANYWHERE in its tree: a bare named head the name layer cannot
+    /// resolve as a type — an inference variable's spelling (`X1b`), an
+    /// unresolvable name. [`Self::call_type_arg_decidable`] reads only the
+    /// top-level shape, so a compound bound (`Exactly<X1b>`) answers
+    /// "decidable" and the verdict fires against a bound the solver never
+    /// finished. Upstream verifies explicit arguments against the
+    /// INSTANTIATED bound and reports nothing when a parameter never got a
+    /// solution (the `could_not_infer` face owns that outcome instead).
+    ///
+    /// Oracle-confirmed on `derive_future_type_test`'s `Exactly<X1b>` /
+    /// `Exactly<X1d>` rows: dartq reported `type_argument_not_matching_
+    /// bounds` where the oracle is silent. A record or other leaf shape
+    /// keeps the decidable answer (its own nesting is not a parameter
+    /// spelling this seam can read).
+    fn bound_mentions_undecidable(&self, ty: Ty) -> bool {
+        self.bound_mentions_undecidable_at(ty, 0)
+    }
+
+    fn bound_mentions_undecidable_at(&self, ty: Ty, depth: u32) -> bool {
+        // A bound's own nesting is shallow; a pathological one stops here
+        // and keeps the pre-fix (reporting) face rather than looping.
+        const MAX_DEPTH: u32 = 8;
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        match ty {
+            Ty::Named { name, args, .. } => {
+                if args == ArgListId::EMPTY {
+                    return !self.named_type_is_type(name);
+                }
+                let args = self.boundary.pool().get(args).to_vec();
+                args.iter()
+                    .any(|&arg| self.bound_mentions_undecidable_at(arg, depth + 1))
+            }
+            Ty::Function { shape, .. } => {
+                let (ret, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                self.bound_mentions_undecidable_at(ret, depth + 1)
+                    || positional
+                        .iter()
+                        .any(|&formal| self.bound_mentions_undecidable_at(formal, depth + 1))
+                    || named
+                        .iter()
+                        .any(|&(_, formal)| self.bound_mentions_undecidable_at(formal, depth + 1))
+            }
+            _ => false,
         }
     }
 
@@ -11724,14 +11845,28 @@ impl<'a> Engine<'a> {
                     );
                     return;
                 }
-                if !bare && let Some(selector) = self.rows.get(callee) {
-                    let selector_text = self.strings.resolve(selector.name).to_string();
-                    self.emit(
-                        SemanticCode::UndefinedMethod,
-                        selector.range,
-                        &selector_text,
-                        "Type",
-                    );
+                if !bare
+                    && let Some((selector_name, selector_range)) =
+                        self.rows.get(callee).map(|row| (row.name, row.range))
+                {
+                    // The `Type` INSTANCE's own face answers first — the
+                    // `Object` members and every applicable extension of the
+                    // import closure ([`Engine::type_literal_face_resolves`],
+                    // the same predicate the read twin
+                    // [`Engine::check_type_literal_receiver`] and the keyword
+                    // heads ask). Probe 3.13.7 over `typedef Cb = void
+                    // Function()`: `Cb.toString();` reports nothing
+                    // (`Object.toString` answers), `Cb.named()` reports "The
+                    // method 'named' isn't defined for the type 'Type'.".
+                    if !self.type_literal_face_resolves(selector_name) {
+                        let selector_text = self.strings.resolve(selector_name).to_string();
+                        self.emit(
+                            SemanticCode::UndefinedMethod,
+                            selector_range,
+                            &selector_text,
+                            "Type",
+                        );
+                    }
                 }
                 // A bare non-const head reports through
                 // `check_invocation_face`'s spelled-alias leg — the same
@@ -17973,3 +18108,11 @@ mod ticket_3659_tests;
 #[cfg(test)]
 #[path = "ticket_3723_tests.rs"]
 mod ticket_3723_tests;
+
+/// The #3834 pins (the alias invoke face asks the `Type` instance's member
+/// face before reporting: `Cb.toString()` answers `Object.toString` and
+/// stays silent, while a clean miss — `Cb.named()` — still names `Type`).
+/// Registered here, not in `tests.rs` (other lanes' file), via `#[path]`.
+#[cfg(test)]
+#[path = "ticket_3834_tests.rs"]
+mod ticket_3834_tests;

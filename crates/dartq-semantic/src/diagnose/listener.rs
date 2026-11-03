@@ -5692,6 +5692,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // tree any non-named entry cannot spell drops (the unknown-written
         // demotion stands). The staging precedes the flow
         // forward: the fold inside the call adopts the staged type.
+        // The RHS face the staging below computes, kept beside it: the
+        // null-aware TARGET's fold (`d?.v = e`) reads the same face, and the
+        // staging closure owns its own lifetime — it may decline the flow
+        // tree without changing what the write was typed as.
+        let mut staged_from_ty = Ty::UNKNOWN;
         let staged = || -> Option<(u32, String, bool, Vec<dartq_flow::ty::StagedArg>)> {
             let engine = &mut self.engine;
             let text = engine.text_of(operator)?;
@@ -5953,6 +5958,11 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 from_ty
             };
+            // The write's own face, for the null-aware target's node type
+            // below: the join/await/bang adjustments above are the same ones
+            // upstream's `recordStaticType` carries into the assignment's
+            // value.
+            staged_from_ty = from_ty;
             if let Ty::Named {
                 name,
                 nullable,
@@ -6058,6 +6068,65 @@ impl ParserListener for DiagnoseListener<'_> {
         // (`(x ??= y).m`, `f(x ??= y)`, `..`) see the joined type.
         if engine.text_of(operator) == Some("??=") {
             engine.fold_if_null_assignment(operator.range, end.range);
+        }
+        // `d?.v = e` is null-short-circuited: the node's own static type is
+        // the RHS face made NULLABLE (`AssignmentExpression.staticType` —
+        // when the receiver is null the write never runs and the assignment
+        // evaluates to `null`, then `UP(T2, null)` is `T2?`). A plain target
+        // (`d.v = e`) keeps the bare RHS face, so the gate is the target
+        // row's own `?.`-merged membership — the same set that already
+        // answers `x = a?.b` above. The fold rides the `??=` twin's latch
+        // (`if_null_results`, keyed on the RHS row) rather than pushing a
+        // result row: the rows stay untouched for the assignment's own
+        // read/write bookkeeping, while `(d?.v = e)`'s group type and every
+        // member chain on it read the node's face (`end_parenthesized_
+        // expression`'s `inner_ty`, `invocation.rs`'s chain receiver).
+        //
+        // A STATIC qualifier receiver never short-circuits: `D?.staticE`
+        // reports `invalid_null_aware_operator` and resolves as the plain
+        // `.` access, so `F? f = (D?.staticE = e)` types the bare `E`
+        // (probed against the 3.13.7 oracle). Upstream decides this by the
+        // receiver's syntax, not its nullability —
+        // `assignment_expression_resolver.dart`'s
+        // `analyzePropertyTargetReceiver` returns early for
+        // `StaticQualifierImpl` and only stages an Expression receiver. The
+        // nullability of the receiver is NOT the gate either: a
+        // `d?.v = e` over a non-nullable `d` still types `E?` (same probe).
+        // The static face is the merged row's own receiver record — the
+        // same `Container`/`PrefixedContainer` pair the merge reports the
+        // invalid operator from.
+        if engine.text_of(operator) == Some("=") && staged_from_ty != Ty::UNKNOWN {
+            let limit = operator.range.offset;
+            let rhs = engine.rows.iter().rposition(|row| {
+                !matches!(row.shape, RowShape::TypeUse(..))
+                    && row.range.offset >= operator.range.end()
+            });
+            if let Some(rhs) = rhs
+                && let Some(target) = engine.rows[..rhs].iter().rposition(|row| {
+                    !matches!(row.shape, RowShape::TypeUse(..))
+                        && row.range.end() <= limit
+                })
+            {
+                let (static_receiver, lhs_offset) = {
+                    let target_row = &engine.rows[target];
+                    (
+                        matches!(
+                            &target_row.shape,
+                            RowShape::Member {
+                                recv: Receiver::Container { .. }
+                                    | Receiver::PrefixedContainer { .. }
+                            }
+                        ),
+                        target_row.range.offset,
+                    )
+                };
+                if !static_receiver && engine.null_aware_members.contains(&lhs_offset) {
+                    let rhs_offset = engine.rows[rhs].range.offset;
+                    engine
+                        .if_null_results
+                        .insert(rhs_offset, (lhs_offset, Engine::nullable_form(staged_from_ty)));
+                }
+            }
         }
         engine.nsm_poison();
     }

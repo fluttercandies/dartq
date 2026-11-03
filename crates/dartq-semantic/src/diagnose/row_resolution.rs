@@ -185,6 +185,26 @@ enum AdjacentOp {
     Missing,
 }
 
+/// The extension-internal basename shadow's verdict
+/// ([`Engine::extension_basename_shadow`]): the enclosing extension's own
+/// member map claims the name, and the row's intent decides whether that
+/// claim answers it — a read the extension does not spell reports the
+/// lexical miss, an invocation falls to `this` (the `on` type's member
+/// lookup), and a covered spelling keeps the ordinary path.
+enum ExtShadow {
+    /// A read the extension's member map claims but does not answer — the
+    /// basename never reaches the enclosing scope (upstream
+    /// `ExtensionMemberScope`, lexical_lookup.dart).
+    ReadMiss,
+    /// An invocation the extension claims with no callable face — the send
+    /// falls to `this`, and the `on` type's own lookup reports the miss.
+    /// The payload is the `on` type head (the reporting host), absent when
+    /// the `on` clause answered no resolved type.
+    InvokeMiss(Option<StringId>),
+    /// The extension answers the row's intent — nothing to report.
+    Covered,
+}
+
 /// The static type a cascade target receiver classifies to (#2459②③): the
 /// named faces answer the `..[` section's operator question directly, a
 /// prefix or unresolvable receiver has no type the model can walk.
@@ -1904,7 +1924,22 @@ impl<'a> Engine<'a> {
                 let mut extension_resolves_all = true;
                 let mut missing: Vec<String> = Vec::new();
                 for spelling in [read, write].into_iter().flatten() {
-                    if matches!(self.walk_members(resolved, spelling), Walk::Missing) {
+                    // The `on` type's member table answers first; an
+                    // applicable extension over `this` stands the miss down
+                    // (`this + 2` inside `extension E on C { operator + }`
+                    // is E's own application — probed silent).
+                    if matches!(self.walk_members(resolved, spelling), Walk::Missing)
+                        && !matches!(
+                            self.extension_application(
+                                resolved,
+                                this_ty,
+                                spelling,
+                                false,
+                                false
+                            ),
+                            ExtensionApp::Single | ExtensionApp::UnsafeSingle
+                        )
+                    {
                         missing.push(self.strings.resolve(spelling).to_string());
                     }
                     if nullable
@@ -2287,6 +2322,79 @@ impl<'a> Engine<'a> {
                 }
             }
             BareInfo::Plain { ty } => {
+                // The extension-internal basename shadow: inside an
+                // extension body the own member map claims the whole
+                // basename, so a read/invoke the map does not answer never
+                // reaches the enclosing (top-level) declaration the push
+                // published.
+                match self.extension_basename_shadow(row) {
+                    Some(ExtShadow::ReadMiss) => {
+                        if !Self::synthetic_reference(row.range)
+                            && !self.keyword_bare_reference(row.range)
+                            && !self.guard.ignore(None, row.name)
+                        {
+                            let name_text = self.strings.resolve(row.name).to_string();
+                            self.emit(
+                                SemanticCode::UndefinedIdentifier,
+                                row.range,
+                                &name_text,
+                                "",
+                            );
+                        }
+                        self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
+                        return;
+                    }
+                    Some(ExtShadow::InvokeMiss(on_type)) => {
+                        if let Some(container) = on_type {
+                            let type_text = self.strings.resolve(container).to_string();
+                            if !Self::synthetic_reference(row.range)
+                                && !self.keyword_bare_reference(row.range)
+                            {
+                                let name_text = self.strings.resolve(row.name).to_string();
+                                self.emit(
+                                    SemanticCode::UndefinedMethod,
+                                    row.range,
+                                    &name_text,
+                                    &type_text,
+                                );
+                            }
+                        }
+                        self.record_miss(row.name, row.range, false, NameUse::Invoke);
+                        return;
+                    }
+                    Some(ExtShadow::Covered) | None => {}
+                }
+                // A class-context bare read/write that loses to two
+                // applicable extensions reports the ambiguity verdict beside
+                // the lexical miss — the oracle double-reports
+                // (`ambiguous_extension_member_access` +
+                // `undefined_identifier`). The published top-level
+                // declaration is the push-time lookup's answer; upstream's
+                // implicit-`this` order resolves the applicable extensions
+                // first, and two faces answer ambiguously.
+                if matches!(row.intent, Intent::Read | Intent::Write | Intent::ReadWrite)
+                    && self.published_extension_question_face(row)
+                    && !Self::synthetic_reference(row.range)
+                    && let Some(container) = self.enclosing_container_at(row.range.offset)
+                    && !self.container_declares_member(container, row.name)
+                    && let ExtensionApp::Ambiguous(displays) = self.extension_application(
+                        container,
+                        Ty::named(container),
+                        row.name,
+                        matches!(row.intent, Intent::Write | Intent::ReadWrite),
+                        false,
+                    )
+                {
+                    self.emit_extension_ambiguity(row.name, row.range, displays);
+                    if !self.keyword_bare_reference(row.range)
+                        && !self.guard.ignore(None, row.name)
+                    {
+                        let name_text = self.strings.resolve(row.name).to_string();
+                        self.emit(SemanticCode::UndefinedIdentifier, row.range, &name_text, "");
+                    }
+                    self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
+                    return;
+                }
                 // Any resolved reference uses the name it resolved to (the
                 // official `_useIdentifierElement` / `members` faces; writes
                 // included — only the local-variable rows distinguish). The
@@ -2739,7 +2847,15 @@ impl<'a> Engine<'a> {
                                     ty,
                                 )
                                 .unwrap_or(ty);
-                            self.check_operator_expr_in(ty, row, member_container);
+                            // A `)`-group operand whose inner composite
+                            // types `dynamic` dispatches dynamically — the
+                            // outer application resolves against the dynamic
+                            // receiver and reports nothing (`(d < 5) < 2`
+                            // with `dynamic d`; the latch's `bool` is not
+                            // the oracle's static face).
+                            if !self.group_inner_dynamic(row.range) {
+                                self.check_operator_expr_in(ty, row, member_container);
+                            }
                         }
                     } else if let Some((op_text, op_range, kind, compound)) = adjacent {
                         // The compound/prefix/postfix face (#2815 R2 —
@@ -2766,6 +2882,14 @@ impl<'a> Engine<'a> {
                             if !compound {
                                 self.emit_unchecked_nullable(op_range, op_text, kind);
                             }
+                        } else if matches!(
+                            ty,
+                            Ty::Named { name, .. } if name == self.intern("Never")
+                        ) {
+                            // A `Never` operand forwards its own face and
+                            // declares no operator; the never-receiver
+                            // family owns the row (probed 3.13.7: `x++` on
+                            // `Never` is silent).
                         } else if self.potentially_nullable(ty)
                             && !self.null_aware_members.contains(&row.range.offset)
                             && !self.operator_face_extension_resolved(ty, row)
@@ -3171,13 +3295,37 @@ impl<'a> Engine<'a> {
                                     "",
                                 );
                             }
-                        } else if !Self::synthetic_reference(row.range)
-                            && !self.keyword_bare_reference(row.range)
-                            && !self.guard.ignore(None, row.name)
-                            && (initializer_container.is_some()
-                                || !self.write_target_rescues(&row, this_type))
-                        {
-                            self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
+                        } else {
+                            let rescued = initializer_container.is_some()
+                                || self.write_target_rescues(&row, this_type);
+                            // A class-context bare read/write that loses to
+                            // TWO+ applicable extensions reports the
+                            // ambiguity verdict beside the lexical miss — the
+                            // oracle double-reports there
+                            // (`ambiguous_extension_member_access` +
+                            // `undefined_identifier` at the same span).
+                            if !rescued
+                                && let Some(container) = this_type
+                                && !self.container_declares_member(container, row.name)
+                                && !Self::synthetic_reference(row.range)
+                                && !self.keyword_bare_reference(row.range)
+                                && let ExtensionApp::Ambiguous(displays) = self.extension_application(
+                                    container,
+                                    Ty::named(container),
+                                    row.name,
+                                    matches!(row.intent, Intent::Write | Intent::ReadWrite),
+                                    false,
+                                )
+                            {
+                                self.emit_extension_ambiguity(row.name, row.range, displays);
+                            }
+                            if !Self::synthetic_reference(row.range)
+                                && !self.keyword_bare_reference(row.range)
+                                && !self.guard.ignore(None, row.name)
+                                && !rescued
+                            {
+                                self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
+                            }
                         }
                         let use_kind = match row.intent {
                             Intent::Write | Intent::ReadWrite => NameUse::Write,
@@ -3213,6 +3361,465 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// The extension-internal basename shadow for a bare row (upstream Dart
+    /// SDK source, pkg/analyzer/lib/src/dart/scope/lexical_lookup.dart's
+    /// `ExtensionMemberScope` + resolver/extension_member_resolver.dart's
+    /// implicit-`this` consult): an unqualified name inside an extension
+    /// body resolves against the extension's OWN member map first, and the
+    /// claim covers the whole BASENAME — a `set n` alone blocks the
+    /// unqualified read of `n` from ever reaching the enclosing scope.
+    ///
+    /// The question runs only when the push-time resolution landed on a
+    /// top-level declaration (`RefTarget::Decl`) — a local, a type
+    /// parameter, an already-member resolution, or a genuine miss keeps its
+    /// own path. The verdict is the row's intent against the extension's
+    /// own member map: a read/operator the map does not answer reports the
+    /// lexical miss (`ReadMiss`), an invocation the map does not spell
+    /// callably falls to `this` — the `on` type's member lookup
+    /// (`InvokeMiss`), and a covered spelling keeps the ordinary path
+    /// (`Covered`). Writes never take this verdict: their push-time latches
+    /// already claim them (`ext_write_target_rows` and the setter-less-write
+    /// face), and the assignment face reports naming the extension.
+    fn extension_basename_shadow(&mut self, row: &Row) -> Option<ExtShadow> {
+        if matches!(row.intent, Intent::Write | Intent::ReadWrite) {
+            return None;
+        }
+        if !self.published_decl_target(row) {
+            return None;
+        }
+        let container = self.enclosing_extension_name(row.range.offset)?;
+        // The setter spelling interns FIRST (it takes `&mut self`); the face
+        // borrow below holds `self.index` immutably.
+        let setter = self.setter_spelling(row.name);
+        let (claimed, read_covered, callable, on_type) = {
+            let face = self
+                .index
+                .get(self.file)?
+                .extension_faces()
+                .iter()
+                .find(|face| face.name == Some(container))?;
+            let read_covered = face.members.get(&row.name).is_some_and(|entry| {
+                matches!(
+                    entry.kind,
+                    MemberKind::Getter | MemberKind::Method | MemberKind::Field
+                )
+            });
+            let callable = face
+                .members
+                .get(&row.name)
+                .is_some_and(|entry| matches!(entry.kind, MemberKind::Method));
+            (
+                read_covered || face.members.contains_key(&setter),
+                read_covered,
+                callable,
+                face.on_type,
+            )
+        };
+        if !claimed {
+            return None;
+        }
+        Some(match row.intent {
+            Intent::Invoke => {
+                if callable {
+                    ExtShadow::Covered
+                } else {
+                    ExtShadow::InvokeMiss(on_type)
+                }
+            }
+            _ if read_covered => ExtShadow::Covered,
+            _ => ExtShadow::ReadMiss,
+        })
+    }
+
+    /// Whether the row's published resolution names a top-level declaration
+    /// ([`RefTarget::Decl`]) — the shadow-gap and class-ambiguity questions
+    /// only run on that face.
+    fn published_decl_target(&self, row: &Row) -> bool {
+        self.refs
+            .binary_search_by(|published| published.range.offset.cmp(&row.range.offset))
+            .ok()
+            .filter(|&at| self.refs[at].range == row.range)
+            .is_some_and(|at| matches!(self.refs[at].target, RefTarget::Decl { .. }))
+    }
+
+    /// Whether the row's published resolution is one the extension consult
+    /// may override — a top-level declaration or the model's `Opaque` face.
+    /// A local, a type parameter, a real member, or a prefix keeps its own
+    /// verdict (the extensions never shadow those).
+    fn published_extension_question_face(&self, row: &Row) -> bool {
+        self.refs
+            .binary_search_by(|published| published.range.offset.cmp(&row.range.offset))
+            .ok()
+            .filter(|&at| self.refs[at].range == row.range)
+            .is_some_and(|at| {
+                matches!(
+                    self.refs[at].target,
+                    RefTarget::Decl { .. } | RefTarget::Opaque
+                )
+            })
+    }
+
+    /// The extension whose body owns `offset` (the token-stream walk behind
+    /// [`Self::extension_basename_shadow`]): extensions never join
+    /// `decl_sites` (the frames are torn down before the row passes), so the
+    /// enclosing header is recovered by walking outward through the
+    /// unmatched `{`s to each statement head and reading the declaration
+    /// keyword. A `class`/`mixin`/`enum` head answers `None` (the row sits
+    /// in a nonextension body); an unnamed `extension on T` also answers
+    /// `None` — its face has no name to look up, and the under-report
+    /// posture keeps such rows silent rather than misreporting.
+    fn enclosing_extension_name(&self, offset: u32) -> Option<StringId> {
+        use dartq_scanner::{Keyword, TokenKind};
+        let tokens = self.tokens.as_slice();
+        let mut cursor = tokens.partition_point(|t| t.utf16_offset < offset);
+        loop {
+            // The nearest unmatched `{` before `cursor`.
+            let mut depth = 0usize;
+            let mut open = None;
+            while cursor > 0 {
+                cursor -= 1;
+                match tokens[cursor].kind {
+                    TokenKind::CloseCurly | TokenKind::StringInterpolationExpression => {
+                        depth += 1;
+                    }
+                    TokenKind::OpenCurly => match depth.checked_sub(1) {
+                        Some(next) => depth = next,
+                        None => {
+                            open = Some(cursor);
+                            break;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            let open = open?;
+            // The statement head: back past the previous statement boundary.
+            let mut head = open;
+            while head > 0
+                && !matches!(
+                    tokens[head - 1].kind,
+                    TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::OpenCurly
+                )
+            {
+                head -= 1;
+            }
+            for at in head..open {
+                match tokens[at].kind {
+                    TokenKind::Keyword(Keyword::Extension) => {
+                        // `extension type X(...)` is a class declaration, not
+                        // an extension — the name token is the `type`
+                        // keyword, never an identifier.
+                        if at + 1 < open && tokens[at + 1].kind == TokenKind::Identifier {
+                            let text = self.tokens.lexeme(self.source, at + 1);
+                            if text != "type" {
+                                return Some(self.intern(text));
+                            }
+                        }
+                        return None;
+                    }
+                    TokenKind::Keyword(Keyword::Class)
+                    | TokenKind::Keyword(Keyword::Mixin)
+                    | TokenKind::Keyword(Keyword::Enum) => return None,
+                    _ => {}
+                }
+            }
+            // A method body or a closure: continue outward from the opener.
+            cursor = open;
+        }
+    }
+
+    /// A generic tear-off's `undefined_operator` display keeps the written
+    /// type-parameter group: the shape the row carries is count-only
+    /// (`type_params_named` empty), while the oracle spells the signature's
+    /// own group (`String Function<T1, T2>(int)` — `writeFunctionType`);
+    /// the name-bearing top-level declaration supplies the exact text.
+    /// Member tear-offs and shape receivers (no `RefTarget::Decl`) keep the
+    /// ordinary render.
+    fn generic_fn_display(&mut self, row: &Row, ty: Ty) -> String {
+        let rendered = ty.render(&self.strings, &self.boundary.pool());
+        let Ty::Function { shape, .. } = ty else {
+            return rendered;
+        };
+        let pool = self.boundary.pool();
+        let shape = pool.function_shape(shape);
+        // The authored group rides `type_params_named` when the shape kept
+        // it; a count-only shape (the tear-off push) spells none, and the
+        // declaration supplies the text.
+        if !shape.type_params_named.is_empty() {
+            return rendered;
+        }
+        let decl_hit = self
+            .refs
+            .binary_search_by(|published| published.range.offset.cmp(&row.range.offset))
+            .ok()
+            .filter(|&at| self.refs[at].range == row.range)
+            .is_some_and(|at| matches!(self.refs[at].target, RefTarget::Decl { .. }));
+        if !decl_hit {
+            return rendered;
+        }
+        let Some(decl) = self.top_level_decl(row.name) else {
+            return rendered;
+        };
+        let names = &decl.type_param_names;
+        if names.is_empty() {
+            return rendered;
+        }
+        // The written group, `extends`-bounds and all (an unbounded
+        // parameter — `Ty::Dynamic` — spells its name only).
+        let mut group = String::from("<");
+        for (index, name) in names.iter().enumerate() {
+            if index > 0 {
+                group.push_str(", ");
+            }
+            group.push_str(self.strings.resolve(*name));
+            if let Some(bound) = decl.type_param_bounds.get(index).copied()
+                && bound != Ty::Dynamic
+            {
+                group.push_str(" extends ");
+                group.push_str(&bound.render(&self.strings, &self.boundary.pool()));
+            }
+        }
+        group.push('>');
+        rendered.replacen(" Function", &format!(" Function{group}"), 1)
+    }
+
+    /// The static face of a token window ([`Self::recv_expression_ty`] over
+    /// the window's source span): `None` when no staged fact answers — the
+    /// under-suppress gate reads that as "not provably dynamic".
+    fn span_expression_ty(&self, lo: usize, hi: usize) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        if lo >= hi {
+            return None;
+        }
+        let offset = tokens[lo].utf16_offset;
+        let last = &tokens[hi - 1];
+        let end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
+        let span = SourceRange {
+            offset,
+            length: end.saturating_sub(offset),
+        };
+        if self.recv_walk_depth.get() >= RECV_WALK_DEPTH_CAP {
+            return None;
+        }
+        self.recv_walk_depth.set(self.recv_walk_depth.get() + 1);
+        let ty = self.recv_expression_ty(span);
+        self.recv_walk_depth.set(self.recv_walk_depth.get() - 1);
+        ty.filter(|ty| *ty != Ty::UNKNOWN)
+    }
+
+    /// The `)`-group composite's dynamic face: a binary or unary operator
+    /// applied to a `dynamic` operand forwards `dynamic` as the composite's
+    /// static type (upstream `binary_expression_resolver.dart`'s dynamic
+    /// receiver — `dynamic < 5` types `dynamic`, not `bool`), so the outer
+    /// application dispatches dynamically and reports nothing. The row's
+    /// pushed type is the latch's `bool` regardless of the operand, so the
+    /// question must be re-derived from the inner expression's tokens.
+    ///
+    /// Only the `)`-shape consults this: a row whose operand span is not a
+    /// parenthesized group already carries its own pushed type.
+    fn group_inner_dynamic(&mut self, read_span: SourceRange) -> bool {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let first = tokens.partition_point(|t| t.utf16_offset < read_span.offset);
+        let end = tokens.partition_point(|t| t.utf16_offset < read_span.end());
+        if end <= first {
+            return false;
+        }
+        // The row's span either covers the whole group (`(d < 5)`) or is
+        // just its closing paren — the operator rows carry the former and
+        // the parenthesized-operand rows the latter.
+        let (open, close) = if tokens[first].kind == K::OpenParen {
+            let Some(close) = self.tokens.matching_end(first) else {
+                return false;
+            };
+            if close + 1 != end {
+                return false;
+            }
+            (first, close)
+        } else {
+            if end != first + 1 || tokens[first].kind != K::CloseParen {
+                return false;
+            }
+            let close = first;
+            let mut depth = 0usize;
+            let mut open = None;
+            for at in (0..close).rev() {
+                match tokens[at].kind {
+                    K::CloseParen | K::CloseSquare | K::CloseCurly => depth += 1,
+                    K::OpenParen | K::OpenSquare | K::OpenCurly => match depth.checked_sub(1) {
+                        Some(next) => depth = next,
+                        None => {
+                            open = Some(at);
+                            break;
+                        }
+                    },
+                    _ => {}
+                }
+            }
+            let Some(open) = open else {
+                return false;
+            };
+            if self.tokens.matching_end(open) != Some(close) {
+                return false;
+            }
+            (open, close)
+        };
+        if open + 1 >= close {
+            return false;
+        }
+        self.inner_expr_dynamic(open + 1, close)
+    }
+
+    /// A token window whose DECLARATION is `dynamic`: a completed call of a
+    /// `dynamic`-returning top-level function (`confuse(a)`) or a bare read
+    /// of a `dynamic`-declared top-level variable. `recv_expression_ty`
+    /// stages no face for these sends, so the written declaration is the
+    /// only ground for the dynamic-dispatch question.
+    fn window_declared_dynamic(&mut self, lo: usize, hi: usize) -> bool {
+        use dartq_scanner::TokenKind as K;
+        if lo >= hi || self.tokens.as_slice()[lo].kind != K::Identifier {
+            return false;
+        }
+        let tokens = self.tokens.as_slice();
+        // A bare read or a completed call window (`ident(...)`).
+        let is_read = hi == lo + 1;
+        let is_call =
+            hi > lo + 1 && tokens[lo + 1].kind == K::OpenParen && self.tokens.matching_end(lo + 1) == Some(hi - 1);
+        if !is_read && !is_call {
+            return false;
+        }
+        let name = self.intern(self.tokens.lexeme(self.source, lo));
+        let Some(decl) = self.top_level_decl(name) else {
+            return false;
+        };
+        (is_call && decl.return_ty == Ty::Dynamic) || (is_read && decl.var_ty == Ty::Dynamic)
+    }
+
+    /// The token-window leg of [`Self::group_inner_dynamic`]: the window
+    /// `tokens[lo..hi]` is one expression whose static type is `dynamic`
+    /// exactly when this answers `true`. Strips nested groups and walks the
+    /// depth-0 root operator by the precedence table; the dynamic face
+    /// propagates through the shapes the invalid face does.
+    fn inner_expr_dynamic(&mut self, mut lo: usize, mut hi: usize) -> bool {
+        use dartq_scanner::TokenKind as K;
+        if self.recv_walk_depth.get() >= RECV_WALK_DEPTH_CAP {
+            return false;
+        }
+        {
+            let tokens = self.tokens.as_slice();
+            // Strip nested groups the same way the other window walks do.
+            while hi > lo + 1
+                && tokens[lo].kind == K::OpenParen
+                && self.tokens.matching_end(lo) == Some(hi - 1)
+            {
+                lo += 1;
+                hi -= 1;
+            }
+            if hi <= lo {
+                return false;
+            }
+            // The postfix faces: `x!` forwards `nonNull(x)` — dynamic on a
+            // dynamic operand; `x++`/`x--` type the operand's own face.
+            match tokens[hi - 1].kind {
+                K::Bang | K::PlusPlus | K::MinusMinus => {
+                    return self.inner_expr_dynamic(lo, hi - 1);
+                }
+                _ => {}
+            }
+            // The unary heads: `-d`/`~d`/`++d`/`--d` dispatch dynamically
+            // and type `dynamic`; `!e` types `bool` unconditionally.
+            match tokens[lo].kind {
+                K::Bang => return false,
+                K::Tilde | K::Minus | K::PlusPlus | K::MinusMinus => {
+                    return self.inner_expr_dynamic(lo + 1, hi);
+                }
+                _ => {}
+            }
+        }
+        // The depth-0 binary root — the loosest-binding rightmost token.
+        let mut root = None;
+        let mut rank = 0u8;
+        let mut at = lo;
+        {
+            let tokens = self.tokens.as_slice();
+            while at < hi {
+                let kind = tokens[at].kind;
+                match kind {
+                    // A type-argument list jumps its matching `>`; a
+                    // comparison `<` does not. The disambiguation is
+                    // structural: a generic instantiation is followed by a
+                    // call/index/selector (`f<int>(x)`, `a.c<int>.b`).
+                    K::Lt
+                        if self
+                            .tokens
+                            .matching_end(at)
+                            .filter(|&close| close < hi)
+                            .is_some_and(|close| {
+                                matches!(tokens[close + 1].kind, K::OpenParen | K::Period)
+                            }) =>
+                    {
+                        if let Some(close) = self.tokens.matching_end(at) {
+                            at = close + 1;
+                            continue;
+                        }
+                        at += 1;
+                    }
+                    K::OpenParen | K::OpenSquare | K::OpenCurly | K::StringInterpolationExpression => {
+                        if let Some(close) = self.tokens.matching_end(at) {
+                            if close < hi {
+                                at = close + 1;
+                                continue;
+                            }
+                        }
+                        at += 1;
+                    }
+                    _ => {
+                        let r = match kind {
+                            K::Star | K::Slash | K::Percent | K::TildeSlash => 1,
+                            K::Plus | K::Minus => 2,
+                            K::LtLt | K::GtGt | K::GtGtGt => 3,
+                            K::Ampersand => 4,
+                            K::Caret => 5,
+                            K::Bar => 6,
+                            K::LtEq | K::GtEq | K::Gt | K::Lt => 7,
+                            K::EqEq | K::BangEq => 8,
+                            K::AmpersandAmpersand => 9,
+                            K::BarBar => 10,
+                            K::QuestionQuestion => 11,
+                            K::Question => 12,
+                            _ => 0,
+                        };
+                        if r > 0 && r >= rank {
+                            rank = r;
+                            root = Some(at);
+                        }
+                        at += 1;
+                    }
+                }
+            }
+        }
+        let Some(root) = root else {
+            // No operator at all — an atomic window carries its own face.
+            return self
+                .span_expression_ty(lo, hi)
+                .is_some_and(|ty| ty == Ty::Dynamic)
+                || self.window_declared_dynamic(lo, hi);
+        };
+        // The fixed-result composites never type `dynamic`: `==`/`!=`,
+        // `&&`/`||`, `??`, `?:` answer `bool`/the LUB by construction.
+        if rank >= 8 {
+            return false;
+        }
+        // A dynamic left operand types every arithmetic/relational/shift/
+        // bitwise application `dynamic`; anything else keeps its own face.
+        if self.inner_expr_dynamic(lo, root) {
+            return true;
+        }
+        self.span_expression_ty(lo, root)
+            .is_some_and(|ty| ty == Ty::Dynamic)
+            || self.window_declared_dynamic(lo, root)
     }
 
     /// Whether a bare invocation miss actually resolves to a local function
@@ -6056,7 +6663,11 @@ impl<'a> Engine<'a> {
     /// `Object`/`Object?`, `dynamic`, `Type` itself, and an unbounded own
     /// parameter (`on T`). A concrete `on` type declares the member for ITS
     /// receivers and leaves the literal's miss standing.
-    fn type_literal_face_resolves(&mut self, member: StringId) -> bool {
+    ///
+    /// The alias INVOKE twin ([`Engine::check_arguments`]'s ungrounded-alias
+    /// head arm) asks this same question before it reports its `Type` row:
+    /// one face, one answer, whichever walk reaches the selector.
+    pub(crate) fn type_literal_face_resolves(&mut self, member: StringId) -> bool {
         if member == self.intern("==") || self.members.object_members.contains(&member) {
             return true;
         }
@@ -9120,18 +9731,14 @@ impl<'a> Engine<'a> {
             return true;
         }
         this_type.is_some_and(|container| {
-            resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                container,
-            )
-            .is_some_and(|(decl, owner)| {
-                decl.members.contains_key(&setter)
-                    && self.member_accessible_in(name, owner)
-            })
+            // The climb: an implicit-`this` write resolves an INHERITED
+            // setter too (`x = 2` inside `B extends A` reaching `A`'s
+            // `set x`) — upstream's member lookup walks the supertype
+            // chain, so the own-map check alone under-reports.
+            matches!(self.walk_members(container, setter), Walk::Found(_))
+                && self
+                    .last_landing()
+                    .is_some_and(|(owner, _)| self.member_accessible_in(name, owner))
         })
     }
 
@@ -10128,6 +10735,26 @@ impl<'a> Engine<'a> {
             ty
         };
         let (read, write) = self.operator_spellings(row);
+        // A `dynamic` receiver dispatches dynamically — upstream's
+        // `isDynamicBounded` short-circuit clears every operator miss
+        // (probed 3.13.7: `dynamic d; d < 2` is silent). The staged faces
+        // spell it both as `Ty::Dynamic` and as a `Named` head, so both
+        // answer silence.
+        if matches!(ty, Ty::Dynamic)
+            || matches!(ty, Ty::Named { name, .. } if name == self.intern("dynamic"))
+        {
+            return;
+        }
+        // The row's staged type can be a comparison latch's restamp
+        // (`bool` for `d < 5`), so a `dynamic`-declared operand's own read
+        // must be re-read from the flow face — that layer keeps the
+        // declaration and the dynamic dispatch owns the row.
+        if let Some(flow_ty) = self.read_type_at(row.range)
+            && (matches!(flow_ty, Ty::Dynamic)
+                || matches!(flow_ty, Ty::Named { name, .. } if name == self.intern("dynamic")))
+        {
+            return;
+        }
         let Ty::Named { name, .. } = ty else {
             match ty {
                 Ty::Record { .. } | Ty::Function { .. } => {
@@ -10142,7 +10769,7 @@ impl<'a> Engine<'a> {
                     // runs for shape receivers too: `(1, 'x') + r` resolves
                     // through `extension on (int, String)`, a function
                     // operand through `extension on Function`).
-                    let type_text = ty.render(&self.strings, &self.boundary.pool());
+                    let type_text = self.generic_fn_display(row, ty);
                     for spelling in [read, write].into_iter().flatten() {
                         if spelling == self.intern("==")
                             || self.record_extension_face(ty, spelling).is_some()
@@ -10232,16 +10859,33 @@ impl<'a> Engine<'a> {
                 walk_missing = false;
             }
             if walk_missing {
-                match self.extension_application(name, ty, spelling, false, false) {
-                    ExtensionApp::None => {
-                        missing.push(self.strings.resolve(spelling).to_string());
-                    }
-                    ExtensionApp::Single | ExtensionApp::UnsafeSingle => {}
-                    ExtensionApp::Ambiguous(displays) => {
-                        // The ambiguity verdict replaces the member family
-                        // (the oracle reports the ambiguous application, not
-                        // the operator miss) — anchored at the operator.
-                        self.emit_extension_ambiguity(spelling, op_range, displays);
+                // `[]` and `[]=` are ONE extension family (upstream
+                // `applicable_extensions.dart` resolves both spellings under
+                // the `[]` basename): an interface declaring EITHER spelling
+                // blocks every implicit extension index resolution, so
+                // `a[0] = v` on a class declaring only `[]` misses `[]=`.
+                let index_blocked = if spelling == self.intern("[]") {
+                    matches!(self.walk_members(name, self.intern("[]=")), Walk::Found(_))
+                } else if spelling == self.intern("[]=") {
+                    matches!(self.walk_members(name, self.intern("[]")), Walk::Found(_))
+                } else {
+                    false
+                };
+                if index_blocked {
+                    missing.push(self.strings.resolve(spelling).to_string());
+                } else {
+                    match self.extension_application(name, ty, spelling, false, false) {
+                        ExtensionApp::None => {
+                            missing.push(self.strings.resolve(spelling).to_string());
+                        }
+                        ExtensionApp::Single | ExtensionApp::UnsafeSingle => {}
+                        ExtensionApp::Ambiguous(displays) => {
+                            // The ambiguity verdict replaces the member
+                            // family (the oracle reports the ambiguous
+                            // application, not the operator miss) — anchored
+                            // at the operator.
+                            self.emit_extension_ambiguity(spelling, op_range, displays);
+                        }
                     }
                 }
             }

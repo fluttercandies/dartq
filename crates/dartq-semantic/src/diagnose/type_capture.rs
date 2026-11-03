@@ -3268,8 +3268,10 @@ impl<'a> Engine<'a> {
         self.accessible_extension_faces();
         // Each member read whose token is followed by a `<...>` type
         // argument group: `(group extent, member offset, member spelling,
-        // recv)`. Rows anchored inside the extent are the candidates.
-        let mut sends: Vec<(u32, u32, u32, StringId, Receiver)> = Vec::new();
+        // recv, recv_span)`. Rows anchored inside the extent are the
+        // candidates; `recv_span` is the receiver EXPRESSION's extent the
+        // context-shaped arms (`?:`/`??`/`??=`/`await`) re-decide against.
+        let mut sends: Vec<(u32, u32, u32, StringId, Receiver, SourceRange)> = Vec::new();
         for read in &self.member_reads {
             let at = self
                 .tokens
@@ -3304,6 +3306,7 @@ impl<'a> Engine<'a> {
                 read.offset,
                 read.name,
                 read.recv,
+                read.recv_span,
             ));
         }
         if sends.is_empty() {
@@ -3312,7 +3315,7 @@ impl<'a> Engine<'a> {
         // Per send, the group's argument spellings parsed once — the
         // `(arg utf16 start, Ty)` column the row's anchor keys on.
         let mut parsed: Vec<Option<Vec<(u32, Ty)>>> = Vec::with_capacity(sends.len());
-        for &(lt, gt, _, _, _) in &sends {
+        for &(lt, gt, _, _, _, _) in &sends {
             parsed.push(self.written_group_args(lt, gt));
         }
         // The candidates: `(row offset, send index)` pairs whose anchor
@@ -3324,7 +3327,7 @@ impl<'a> Engine<'a> {
             if row.code.name != "type_argument_not_matching_bounds" {
                 continue;
             }
-            for (index, &(lt, gt, _, _, _)) in sends.iter().enumerate() {
+            for (index, &(lt, gt, _, _, _, _)) in sends.iter().enumerate() {
                 if lt < row.range.offset && row.range.offset < gt && parsed[index].is_some() {
                     candidates.push((row.range.offset, index));
                 }
@@ -3332,7 +3335,7 @@ impl<'a> Engine<'a> {
         }
         let mut drop_offsets: FxHashSet<u32> = FxHashSet::default();
         for (offset, index) in candidates {
-            let (_, _, member_at, member, recv) = sends[index];
+            let (_, _, member_at, member, recv, recv_span) = sends[index];
             let args = parsed[index].as_deref().expect("gated above");
             let Some(arg_at) = args
                 .iter()
@@ -3351,7 +3354,7 @@ impl<'a> Engine<'a> {
                 continue;
             };
             let arg = args[arg_at].1;
-            if self.bounds_row_conforms(member_at, member, recv, args, arg, arg_at) {
+            if self.bounds_row_conforms(member_at, member, recv, recv_span, args, arg, arg_at) {
                 drop_offsets.insert(offset);
             }
         }
@@ -3369,11 +3372,21 @@ impl<'a> Engine<'a> {
     /// whose bound — instantiated over the receiver's RE-DERIVED face and
     /// the written group's arguments — the offending argument satisfies.
     /// `false` keeps the row (the under-report direction).
+    /// #3797 widens the receiver face the verdict re-decides against: the
+    /// promoted-read re-derivation first (the #3744 question), then the
+    /// context-shaped faces the frozen push-time face could not spell —
+    /// the `await` operand's flattened face and the `?:`/`??`/`??=`
+    /// composite's context-pushed result (the `inference_update_3`
+    /// family's `S = greatestClosure(K)` arm). Every retry runs the same
+    /// instantiated-bound question the original verdict asks — a
+    /// candidate that cannot re-decide to a conforming bound keeps the
+    /// row.
     fn bounds_row_conforms(
         &mut self,
         member_at: u32,
         member: StringId,
         recv: Receiver,
+        recv_span: SourceRange,
         args: &[(u32, Ty)],
         arg: Ty,
         arg_at: usize,
@@ -3382,19 +3395,73 @@ impl<'a> Engine<'a> {
         // link's settled result, or a narrowing reads here; the frozen
         // face unchanged answers the same verdict pass 1 gave.
         let recv = self.promoted_receiver(member_at, recv);
-        let (head, receiver_ty, receiver_nullable) = match recv {
+        let Some((head, receiver_ty, receiver_nullable)) = self.bounds_recv_face(recv) else {
+            return false;
+        };
+        if self.bounds_verdict_at(head, receiver_ty, receiver_nullable, member, args, arg, arg_at)
+        {
+            return true;
+        }
+        // The context-shaped alternates (#3797): each receiver face the
+        // oracle's resolver could have stamped over the frozen one. Every
+        // candidate re-decides the WHOLE verdict — the walk gate, the
+        // extension application, the bound substitution — since an
+        // `await`-flattened or context-pushed face can name a different
+        // head entirely (`SubFuture` → `int`).
+        for ty in self.context_shaped_recv_tys(recv_span, receiver_ty) {
+            let Some((alt_head, alt_ty, alt_nullable)) = self.bounds_alt_face(ty) else {
+                continue;
+            };
+            if self.bounds_verdict_at(alt_head, alt_ty, alt_nullable, member, args, arg, arg_at)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A candidate receiver face's `(head, ty, nullable)` triple, or
+    /// `None` when the face is not a resolvable named head — the same
+    /// deconstruction the promoted-receiver arm runs.
+    fn bounds_alt_face(&mut self, ty: Ty) -> Option<(StringId, Ty, bool)> {
+        let Ty::Named { name, .. } = ty else {
+            return None;
+        };
+        Some((name, ty, self.potentially_nullable(ty)))
+    }
+
+    /// The `(head, ty, nullable)` of a promoted receiver record — the
+    /// `Receiver::Typed`/`Receiver::This` deconstruction
+    /// [`Self::bounds_row_conforms`]'s primary arm performs; any other
+    /// receiver shape answers `None` (the keep direction).
+    fn bounds_recv_face(&mut self, recv: Receiver) -> Option<(StringId, Ty, bool)> {
+        match recv {
             Receiver::Typed { type_name, ty } => {
-                (type_name, ty, self.potentially_nullable(ty))
+                Some((type_name, ty, self.potentially_nullable(ty)))
             }
             Receiver::This { container, kind } => {
                 let ty = self.this_static_ty(container, kind);
-                let Ty::Named { name, .. } = ty else {
-                    return false;
-                };
-                (name, ty, self.potentially_nullable(ty))
+                self.bounds_alt_face(ty)
             }
-            _ => return false,
-        };
+            _ => None,
+        }
+    }
+
+    /// The instantiated-bound verdict over one concrete receiver face
+    /// (`head`/`receiver_ty`/`receiver_nullable`): the extension
+    /// resolution, the `on`-parameter binding, the bound projection, and
+    /// the written-argument conformance check. `true` drops the row;
+    /// `false` keeps it.
+    fn bounds_verdict_at(
+        &mut self,
+        head: StringId,
+        receiver_ty: Ty,
+        receiver_nullable: bool,
+        member: StringId,
+        args: &[(u32, Ty)],
+        arg: Ty,
+        arg_at: usize,
+    ) -> bool {
         // A member the receiver's own container declares never rode the
         // extension seam — its param table is the container's, and its
         // row keeps the frozen verdict.
@@ -3497,6 +3564,654 @@ impl<'a> Engine<'a> {
             return false;
         }
         self.assignable(arg, bound, false) == Some(true)
+    }
+
+    /// The context-shaped receiver faces the frozen push-time face could
+    /// not spell (#3797), as [`Ty`] candidates for
+    /// [`Self::bounds_row_conforms`]'s retry loop. Every arm is
+    /// conservative: each candidate must still re-decide the whole
+    /// extension-member bounds verdict, so a wrong guess keeps the row
+    /// exactly as the frozen face would.
+    ///
+    /// * **await** — `(await x).m<T>()`: the frozen receiver face is the
+    ///   operand's own type where the oracle stamps
+    ///   `flatten(operand)` — a user Future-like (`SubFuture`, an enum
+    ///   `implements Future<E>`, a bound-chained type parameter)
+    ///   flattens to the derived `E` upstream, while the push-time face
+    ///   stayed the operand. `x.expectStaticType<Exactly<int>>()` over an
+    ///   `await x` whose operand is `SubFuture` fires a fabricated row
+    ///   unless the verdict retries under `flatten(SubFuture) = int`.
+    /// * **context-pushed composite** — `f((c ? a : b)..m<T>())`,
+    ///   `f((x ??= y)..m<T>())`: upstream's `?:`/`??`/`??=` static type
+    ///   is `T` when `UP <: S` else `S = greatestClosure(K)` where `K` is
+    ///   the composite's downward context (inference_update_3's
+    ///   documented rule). The frozen face is the context-free UP, so a
+    ///   send inside `contextB1(...)`/`contextIterable(...)`/`context<..>`
+    ///   checks `Exactly<A>` where the oracle checks `Exactly<B1<Object?>>`.
+    ///
+    /// `frozen` is the re-derived (post-promotion) frozen face — the
+    /// composite arm's `T` for the `T <: S` branch decision.
+    fn context_shaped_recv_tys(&mut self, recv_span: SourceRange, frozen: Ty) -> Vec<Ty> {
+        let mut out = Vec::new();
+        // The pass-2 read face (#3797): `node.function.staticType`'s direct
+        // analogue — the receiver expression re-typed after the read-type
+        // join. This carries the promotions the frozen push-time face
+        // lacks (a `this`-promoted property read under `if (this is B)`
+        // reads the override's `int` where pass 1 froze `num`); the
+        // promotion latch excludes invoked callees, so a member CALL
+        // receiver keeps its declared face here and only a non-invoked
+        // read (`x.expectStaticType<Exactly<int>>` tear-off) moves.
+        if let Some(ty) = self.recv_expression_ty(recv_span) {
+            if ty != Ty::UNKNOWN && ty != frozen {
+                out.push(ty);
+            }
+        }
+        if let Some(ty) = self.await_flattened_recv_ty(recv_span) {
+            out.push(ty);
+        }
+        if let Some(ty) = self.context_pushed_composite_ty(recv_span, frozen) {
+            out.push(ty);
+        }
+        out
+    }
+
+    /// The `await`-flattened receiver face when the receiver expression
+    /// is literally `(await <operand>)`/`await <operand>` — the token
+    /// stream's first `await` inside the span's outer parens, the
+    /// operand's re-derived face flattened through
+    /// [`Self::prune_await_flatten`]. `None` on every other shape (the
+    /// keep direction).
+    fn await_flattened_recv_ty(&mut self, recv_span: SourceRange) -> Option<Ty> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let first = tokens.partition_point(|t| t.utf16_offset < recv_span.offset);
+        let last = tokens.partition_point(|t| t.utf16_offset < recv_span.end());
+        if last <= first {
+            return None;
+        }
+        // Strip the span's own outer parens, then require the `await`
+        // keyword as the first token — a `!await`-shaped receiver (the
+        // keyword nested deeper, e.g. `f(await x)`) never qualifies.
+        let mut lo = first;
+        let mut hi = last;
+        while hi > lo
+            && tokens[lo].kind == K::OpenParen
+            && self.tokens.matching_end(lo) == Some(hi - 1)
+        {
+            lo += 1;
+            hi -= 1;
+        }
+        if lo >= hi || self.tokens.lexeme(self.source, lo) != "await" {
+            return None;
+        }
+        // The operand is everything after `await`: `lo + 1 .. hi` in
+        // token indices — an empty operand keeps the row.
+        if lo + 1 >= hi {
+            return None;
+        }
+        let operand_start = tokens[lo + 1].utf16_offset;
+        let operand_end = {
+            let last = &tokens[hi - 1];
+            self.utf16_of((last.byte_offset + last.byte_len) as usize)
+        };
+        if operand_end <= operand_start {
+            return None;
+        }
+        let operand = SourceRange {
+            offset: operand_start,
+            length: operand_end - operand_start,
+        };
+        let ty = self.recv_expression_ty(operand).unwrap_or(Ty::UNKNOWN);
+        if ty == Ty::UNKNOWN {
+            return None;
+        }
+        let flat = self.prune_await_flatten(ty);
+        (flat != ty).then_some(flat)
+    }
+
+    /// `await`'s flatten over the receiver-expression face: upstream's
+    /// `flatten` — the written `Future`/`FutureOr` head peels one level,
+    /// a USER Future-like (`implements Future<E>` — `SubFuture`,
+    /// `MixFuture`, `ExtensionSubFuture` in the corpus) answers the
+    /// strict snapshot's instantiated `Future<E>` view, and a type
+    /// parameter derives its written bound's future (`X extends
+    /// SubFuture` → `int`). Mirrors `await_flatten`/`derived_future_walk`
+    /// (assignability.rs) — kept private here so the prune stays
+    /// self-contained in this file's lane.
+    fn prune_await_flatten(&self, ty: Ty) -> Ty {
+        self.prune_derived_future(self.flatten(ty), 0)
+    }
+
+    /// [`Self::prune_await_flatten`]'s depth-capped walk.
+    fn prune_derived_future(&self, ty: Ty, depth: u8) -> Ty {
+        if depth > 8 {
+            return ty;
+        }
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        // A written `Future`/`FutureOr` head already peeled through
+        // `flatten` — re-asking the instantiated view would double-
+        // flatten. User Future-like heads answer the `Future<E>` env's
+        // argument verbatim (the snapshot already walked the chain).
+        if name != self.intern("Future")
+            && name != self.intern("FutureOr")
+            && let Some(arg) = self.prune_future_type_arg(name, args)
+        {
+            return if nullable {
+                Self::nullable_form(arg)
+            } else {
+                arg
+            };
+        }
+        // The `X & B` walk: the parameter's written bound derives the
+        // future. A bound that derives nothing keeps the operand's own
+        // face.
+        if let Some(bound) = self.param_bound_of(name) {
+            let walked = self.prune_derived_future(self.flatten(bound), depth + 1);
+            if walked != bound {
+                return if nullable {
+                    Self::nullable_form(walked)
+                } else {
+                    walked
+                };
+            }
+        }
+        ty
+    }
+
+    /// The `Future<E>` argument a user Future-like type carries —
+    /// `ops.instance_env(ty, Future)`'s first binding, `None` when the
+    /// snapshot cannot answer (the keep direction).
+    fn prune_future_type_arg(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        let ops = self.ops?;
+        let env = ops.instance_env(
+            Ty::Named {
+                name,
+                nullable: false,
+                args,
+            },
+            self.intern("Future"),
+            &self.boundary.args,
+        );
+        env.and_then(|env| env.first().map(|(_, ty)| *ty))
+    }
+
+    /// The context-pushed receiver face of a `?:`/`??`/`??=` composite
+    /// receiver (#3797): upstream's inference-update-3 typing gives the
+    /// composite `T` when `UP <: S`, else `S = greatestClosure(K)` where
+    /// `K` is the composite's downward context (upstream
+    /// `conditional_expression`/`if_null` resolution, mirrored by the
+    /// corpus's own rule comments). The frozen push-time face is the
+    /// context-free UP — a `contextB1((b ? c1Int : c2Double)..m<T>())`
+    /// send checks `Exactly<A>` there where the oracle checks
+    /// `Exactly<B1<Object?>>` and stays silent.
+    ///
+    /// Decision, all under-report: `Some(S)` only when `S` resolves AND
+    /// `T <: S` is PROVEN false (`assignable == Some(false)`) — the
+    /// oracle's stamp is unconditional once `UP` cannot land inside the
+    /// context; any other verdict keeps the `T`-branch face the emit
+    /// already judged. `frozen` is the re-derived push-time face
+    /// standing in for the oracle's `T` — the same composite join
+    /// pass 1 computed.
+    fn context_pushed_composite_ty(&mut self, recv_span: SourceRange, frozen: Ty) -> Option<Ty> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let mut first = tokens.partition_point(|t| t.utf16_offset < recv_span.offset);
+        let mut last = tokens.partition_point(|t| t.utf16_offset < recv_span.end());
+        // A tail-anchored receiver row (`(x ??= A())` — the if-null join
+        // stages nothing, so the cascade target's read anchors at the
+        // paren close) spans one closer token; expand it to the matched
+        // group so the composite window is the whole parenthesized
+        // expression rather than its final `)`.
+        if last == first + 1 && tokens[first].kind == K::CloseParen {
+            if let Some(opener) = (0..first)
+                .rev()
+                .find(|&i| {
+                    tokens[i].kind == K::OpenParen && self.tokens.matching_end(i) == Some(first)
+                })
+            {
+                first = opener;
+            }
+        }
+        if last <= first {
+            return None;
+        }
+        // The composite's own token window, outer parens stripped — the
+        // cascade target `(b ? a : c)` spans its parens, the bare
+        // `x ??= y` spans the operands.
+        let mut lo = first;
+        let mut hi = last;
+        while hi > lo
+            && tokens[lo].kind == K::OpenParen
+            && self.tokens.matching_end(lo) == Some(hi - 1)
+        {
+            lo += 1;
+            hi -= 1;
+        }
+        if hi - lo < 3 {
+            return None;
+        }
+        // Depth-0 separator scan: a top-level `?`/`??`/`??=` marks the
+        // receiver as a composite whose static type the context shapes.
+        // The operator KIND matters — a conditional stamps `S` on
+        // `T <! S` alone, while the if-null forms carry a third arm.
+        let mut conditional_at = None;
+        let mut if_null_at = None;
+        let mut at = lo;
+        while at < hi && (conditional_at.is_none() || if_null_at.is_none()) {
+            match tokens[at].kind {
+                K::OpenCurly
+                | K::StringInterpolationExpression
+                | K::OpenParen
+                | K::OpenSquare
+                | K::Lt => {
+                    if let Some(close) = self.tokens.matching_end(at) {
+                        if close < hi {
+                            at = close + 1;
+                            continue;
+                        }
+                    }
+                    at += 1;
+                }
+                K::QuestionQuestion | K::QuestionQuestionEq => {
+                    if_null_at.get_or_insert(at);
+                    at += 1;
+                }
+                K::Question => {
+                    conditional_at.get_or_insert(at);
+                    at += 1;
+                }
+                _ => at += 1,
+            }
+        }
+        if conditional_at.is_none() && if_null_at.is_none() {
+            return None;
+        }
+        // `?:` is the lowest-precedence operator: a paired top-level `?`
+        // wins over an earlier `??` (`a ?? b ? c : d` groups as
+        // `(a ?? b) ? c : d`).
+        let if_null_at = conditional_at.is_none().then_some(if_null_at).flatten();
+        let context = self.prune_composite_context(recv_span, lo)?;
+        // `T <: S` proven false gates BOTH kinds — any other verdict
+        // (`Some(true)`, `None`) keeps the `T`-branch face the emit
+        // already judged. A mis-resolved `S` still cannot drop the row by
+        // itself: the candidate re-decides the whole bound verdict.
+        if self.assignable(frozen, context, false) != Some(false) {
+            return None;
+        }
+        let Some(op_at) = if_null_at else {
+            // Conditional (`c ? a : b`): oracle 3.13.7 stamps `S` on
+            // `T <! S` alone — verified silent for
+            // `contextB1((b ? C1<int>() : C2<double>())..m<…>())`.
+            return Some(context);
+        };
+        // If-null (`??`/`??=`) carries a THIRD arm
+        // (inference-update-3): `T` when `T <: S`; else `S` when
+        // `T2' <: S`; else `T`. Releasing `S` on `T <! S` alone drops
+        // rows the oracle reports — verified: `contextB1((x ??= A())..m)`
+        // reports `Exactly<A>` and `contextB1((x ?? B1<Object?>())..m)`
+        // reports `Exactly<Object>` on 3.13.7. `T2'` is only spellable
+        // when `T2 <: J'` (then `T2' = T2`); an opaque coercion keeps
+        // the row.
+        let lhs = self.prune_operand_ty(lo, op_at)?;
+        let rhs = self.prune_operand_ty(op_at + 1, hi)?;
+        let j_prime = if tokens[op_at].kind == K::QuestionQuestionEq {
+            // A bare local write is exactly `IDENT ??=` — the local's
+            // declared (unpromoted) face is `J'`. Any other lvalue's
+            // setter write type is outside this face's reach.
+            if op_at != lo + 1 || tokens[lo].kind != K::Identifier {
+                return None;
+            }
+            let name = self.strings.intern(self.tokens.lexeme(self.source, lo));
+            self.local_declared_ty(name)?
+        } else {
+            Self::non_null_form(lhs)
+        };
+        if self.assignable(rhs, j_prime, false) != Some(true) {
+            return None;
+        }
+        (self.assignable(rhs, context, false) == Some(true)).then_some(context)
+    }
+
+    /// One composite operand's re-derived face: `recv_expression_ty`
+    /// over the token slice `lo_tok..hi_tok`, trimming `?`/`:`/`??`
+    /// separators at both ends and anchoring at the tail token the way
+    /// the chain walk's keys do.
+    fn prune_operand_ty(&mut self, lo_tok: usize, hi_tok: usize) -> Option<Ty> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let (mut lo, mut hi) = (lo_tok, hi_tok);
+        while hi > lo && matches!(tokens[lo].kind, K::Question | K::Colon) {
+            lo += 1;
+        }
+        while hi > lo && matches!(tokens[hi - 1].kind, K::Question | K::Colon) {
+            hi -= 1;
+        }
+        if hi <= lo {
+            return None;
+        }
+        let first = &tokens[lo];
+        let last = &tokens[hi - 1];
+        let offset = if hi - lo > 1
+            && first.kind == K::OpenParen
+            && self.tokens.matching_end(lo) == Some(hi - 1)
+        {
+            first.utf16_offset
+        } else if hi - lo > 1 {
+            last.utf16_offset
+        } else {
+            first.utf16_offset
+        };
+        let end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
+        self.recv_expression_ty(SourceRange {
+            offset,
+            length: end.saturating_sub(offset),
+        })
+        .filter(|ty| *ty != Ty::UNKNOWN)
+    }
+
+    /// The composite's downward context `K` as `S = greatestClosure(K)`
+    /// (#3797): the enclosing ARGUMENT's instantiated formal schema —
+    /// `contextB1(<expr>)` reads `B1<T>`'s greatest closure
+    /// `B1<Object?>`, `context<Iterable<num>>(<expr>)` reads the
+    /// written-argument substitution `Iterable<num>`. Resolves a bare
+    /// top-level function callee's declared formals and substitutes:
+    /// the call's WRITTEN type arguments pair against the declaration's
+    /// parameter order; an unwritten group greatest-closes every
+    /// unsolved parameter occurrence (`Object?` covariant, `Never`
+    /// contravariant — default generic covariance). `None` on every
+    /// shape outside the argument-slot channel (an assignment target, a
+    /// nested composite's own context, a member/prefixed callee) — the
+    /// keep direction.
+    fn prune_composite_context(&mut self, recv_span: SourceRange, composite_lo: usize) -> Option<Ty> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        // The argument-list `(` enclosing the composite: the nearest
+        // `(` before `composite_lo` whose matched `)` extends past the
+        // composite's end AND that sits inside its own argument span —
+        // walking outward over nested groups, skipping the composite's
+        // own parens (they start inside `composite_lo`'s window).
+        let mut arglist = None;
+        for i in (0..composite_lo).rev() {
+            match tokens[i].kind {
+                K::CloseParen | K::CloseSquare | K::CloseCurly => break,
+                K::OpenParen => {
+                    // Is this `(` an argument list (callee-shaped tail)
+                    // rather than a grouping? The token before it must
+                    // read `IDENT`, `>`, `)`, `]`, or a literal — a
+                    // grouping's own opener follows an operator/`,`/`(`.
+                    let Some(close) = self.tokens.matching_end(i) else {
+                        continue;
+                    };
+                    if tokens[close].utf16_offset < recv_span.end() {
+                        // The `(` closes before the composite ends — it
+                        // cannot contain it.
+                        continue;
+                    }
+                    arglist = Some(i);
+                    break;
+                }
+                // A `,`/operator at depth 0 relative to our backward
+                // walk means no enclosing `(` before the argument —
+                // actually ANY non-opener token keeps walking (`,` of a
+                // sibling arg would sit INSIDE the arglist's own `(`).
+                _ => {}
+            }
+        }
+        let arglist = arglist?;
+        // The callee tail: `IDENT` or `IDENT<args>` directly before
+        // the `(`. Member sends (`o.m(`), prefixed callees (`p.f(`), and
+        // callable-expression tails (`f()()`— a `)`/`]` tail) stay out
+        // — only the bare top-level function resolves cleanly here.
+        let mut callee_at = arglist;
+        while callee_at > 0 && matches!(tokens[callee_at - 1].kind, K::Identifier) == false {
+            // Written type-argument group `f<W0..>(` — walk back over
+            // the matched `<...>`: the closer before `(` is `>`; its
+            // opener is a `<` at angle-depth 0.
+            if matches!(
+                tokens[callee_at - 1].kind,
+                K::Gt | K::GtGt | K::GtGtGt
+            ) {
+                let mut depth = 0usize;
+                let mut j = callee_at - 1;
+                let mut found = None;
+                while j > 0 {
+                    j -= 1;
+                    match tokens[j].kind {
+                        K::Gt | K::GtGt | K::GtGtGt => depth += 1,
+                        K::Lt => {
+                            if depth == 0 {
+                                found = Some(j);
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(lt) = found else {
+                    return None;
+                };
+                if lt == 0 || tokens[lt - 1].kind != K::Identifier {
+                    return None;
+                }
+                callee_at = lt;
+                break;
+            }
+            return None;
+        }
+        let name_token = callee_at.checked_sub(1)?;
+        if tokens[name_token].kind != K::Identifier {
+            return None;
+        }
+        // A member/cascade tail (`o.m(`, `o..m(`, `o?.m(`) is not a
+        // top-level callee — the identifier rides a receiver the context
+        // channel does not carry here.
+        if name_token > 0
+            && matches!(
+                tokens[name_token - 1].kind,
+                K::Period
+                    | K::QuestionPeriod
+                    | K::PeriodPeriod
+                    | K::QuestionPeriodPeriod
+                    | K::PeriodPeriodPeriod
+                    | K::PeriodPeriodPeriodQuestion
+            )
+        {
+            return None;
+        }
+        let name = self
+            .strings
+            .intern(self.tokens.lexeme(self.source, name_token));
+        let decl = self.top_level_decl(name)?;
+        let formals = decl.formals.as_ref()?;
+        // Which argument? Count depth-0 `,` inside the arglist before
+        // the composite's argument start (the composite's outer paren
+        // IS the argument's first token, or the token right after the
+        // arglist `(`/`,`).
+        let mut positional = 0usize;
+        let mut named: Option<StringId> = None;
+        {
+            let mut depth = 0usize;
+            let mut arg_start = arglist + 1;
+            let mut i = arglist + 1;
+            while i < composite_lo {
+                match tokens[i].kind {
+                    K::OpenParen | K::OpenSquare | K::OpenCurly | K::Lt => depth += 1,
+                    K::CloseParen | K::CloseSquare | K::CloseCurly | K::Gt | K::GtGt
+                    | K::GtGtGt => depth = depth.saturating_sub(1),
+                    K::Comma if depth == 0 => {
+                        positional += 1;
+                        arg_start = i + 1;
+                        named = None;
+                    }
+                    K::Identifier if depth == 0 && arg_start == i => {
+                        // `name:` — a named-argument label: the next
+                        // token is `:`.
+                        if tokens.get(i + 1).is_some_and(|t| t.kind == K::Colon) {
+                            named = Some(
+                                self.strings.intern(self.tokens.lexeme(self.source, i)),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        // The formal at the slot: `decl`'s Tys are projected through the
+        // declaring file's pool already (`Projected` carries them), so
+        // `formal.ty` is the boundary face.
+        let formal_ty = match named {
+            Some(label) => formals
+                .named
+                .iter()
+                .find(|f| f.name == label)
+                .map(|f| f.ty),
+            None => formals.positional.get(positional).map(|f| f.ty),
+        }?;
+        // The instantiation: written type arguments pair positionally
+        // against `type_param_names`; an unwritten group leaves every
+        // parameter unsolved (greatestClosure's `_`).
+        let params: &[StringId] = &decl.type_param_names;
+        if params.is_empty() {
+            return Some(formal_ty);
+        }
+        let mut subst: Vec<(StringId, Ty)> = Vec::new();
+        if callee_at != arglist {
+            // `f<W0, …>(`: the group's written args, `lt` is the `<`.
+            let lt = callee_at;
+            let gt = self.tokens.matching_end(lt)?;
+            let written = self.written_group_args(
+                tokens[lt].utf16_offset,
+                tokens[gt].utf16_offset + tokens[gt].byte_len - 1,
+            )?;
+            for (param, (_, ty)) in params.iter().zip(written.iter()) {
+                subst.push((*param, *ty));
+            }
+        }
+        if subst.len() == params.len() {
+            return self.subst_params(formal_ty, &subst);
+        }
+        // greatestClosure: each unsolved parameter binds `Object?` in
+        // covariant position, `Never` contravariant — the corpus's
+        // helpers (`contextB1`/`contextIterable`/`context`) are plain
+        // legacy-covariant generics, so the polarity walk covers them
+        // exactly. A partially solved map still greatest-closes the
+        // REST (the map substitutes what's known).
+        self.prune_greatest_closure(formal_ty, params, &subst, true)
+    }
+
+    /// `greatestClosure(K)` over the callee's unsolved inference
+    /// parameters (#3797): every `param` leaf not already bound in
+    /// `subst` binds `Object?` covariantly or `Never` contravariantly
+    /// (upstream `computeGreatestClosure` — `_` in covariant position
+    /// is `Object?`, in contravariant `Never`). `covariant` flips
+    /// through function-type parameter positions and stays through
+    /// named/record arguments and returns. A `Ty::Function` carrying
+    /// its own type-parameter group bails (a generic context cannot
+    /// spell here) — `None` keeps the row.
+    fn prune_greatest_closure(
+        &self,
+        ty: Ty,
+        params: &[StringId],
+        subst: &[(StringId, Ty)],
+        covariant: bool,
+    ) -> Option<Ty> {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if args == ArgListId::EMPTY {
+                    if let Some(bound) = subst.iter().find(|(p, _)| *p == name) {
+                        return Some(bound.1);
+                    }
+                    if params.contains(&name) {
+                        return Some(if covariant {
+                            self.object_question()
+                        } else {
+                            Ty::Never
+                        });
+                    }
+                    return Some(ty);
+                }
+                let inner: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+                let mut out = Vec::with_capacity(inner.len());
+                for arg in inner {
+                    out.push(self.prune_greatest_closure(arg, params, subst, covariant)?);
+                }
+                Some(
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .named(name, nullable, &out),
+                )
+            }
+            Ty::Function { shape, nullable } => {
+                let shape = self.boundary.pool().function_shape(shape).clone();
+                if shape.type_params != 0 || !shape.type_params_named.is_empty() {
+                    return None;
+                }
+                let ret = self.prune_greatest_closure(shape.return_ty, params, subst, covariant)?;
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for param in shape.positional.iter() {
+                    positional.push(self.prune_greatest_closure(
+                        *param,
+                        params,
+                        subst,
+                        !covariant,
+                    )?);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for (name, formal) in shape.named.iter() {
+                    named.push((
+                        *name,
+                        self.prune_greatest_closure(*formal, params, subst, !covariant)?,
+                    ));
+                }
+                Some(self.boundary.args.borrow_mut().function_required(
+                    0,
+                    shape.required_positional,
+                    ret,
+                    &positional,
+                    &named,
+                    nullable,
+                ))
+            }
+            Ty::Record { shape, nullable } => {
+                let shape = self.boundary.pool().record_shape(shape).clone();
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for field in shape.positional.iter() {
+                    positional.push(self.prune_greatest_closure(
+                        *field,
+                        params,
+                        subst,
+                        covariant,
+                    )?);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for (name, field) in shape.named.iter() {
+                    named.push((
+                        *name,
+                        self.prune_greatest_closure(*field, params, subst, covariant)?,
+                    ));
+                }
+                Some(self.boundary.args.borrow_mut().record(
+                    &positional,
+                    &named,
+                    nullable,
+                ))
+            }
+            other => Some(other),
+        }
     }
 
     /// The decidability gate of the bounds emit (`call_type_arg_decidable`

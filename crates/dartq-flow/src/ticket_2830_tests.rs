@@ -60,18 +60,19 @@ fn dead_of(source: &str) -> Vec<String> {
 #[test]
 fn recovered_cascade_block_does_not_kill() {
     // The recovered section itself contributes NO row (the divergence this
-    // ticket pins). The `statement` fixture's one row is a different face:
-    // its well-formed sibling `buffer?..g()` takes the
-    // `_verifyUnassignedVariable` row (`buffer` is a definitely-unassigned
-    // `C?`), which the oracle reports at the `?` operator —
-    // `dart analyze --format machine` 3.13.7 on that fixture:
-    // `DEAD_CODE 5:7|6` covering `?..g()`. The recovered `?..{` section
-    // above it still kills nothing (`use(v1);` and friends stay live).
+    // ticket pins), and none of the fixtures below carries a flow-layer
+    // row: a well-formed `buffer?..g()` over a definitely-unassigned `C?`
+    // target is the `_verifyUnassignedVariable` face, whose row (`?..g()`,
+    // oracle `dart analyze --format machine` 3.13.7 `5:7|6` on the
+    // `statement` fixture) belongs to the semantic `dead_null_chains`
+    // latch — the flow layer stays silent there (a row here duplicated the
+    // chain's span; the #3798/#3172 ownership split). The recovered `?..{`
+    // sections still kill nothing (`use(v1);` and friends stay live).
     for (label, src, expected) in [
         (
             "initializer",
             "class C {}\nint foo = 42;\nvoid use(Object? x) {}\nvoid f() { C? buffer; final v1 = buffer?..{\n  return foo;\n};\nuse(v1);\n}",
-            vec![],
+            Vec::<String>::new(),
         ),
         (
             "nested",
@@ -81,7 +82,7 @@ fn recovered_cascade_block_does_not_kill() {
         (
             "statement",
             "class C { void g() {} }\nvoid f() { C? buffer; buffer?..{\n  return 1;\n};\nbuffer?..g();\n}",
-            vec!["?..g()"],
+            vec![],
         ),
         (
             "chained_bare_sections",
@@ -105,16 +106,15 @@ fn real_sibling_block_after_cascade_still_kills() {
     // a REAL block statement after a healthy cascade keeps its events, so
     // its `return` kills the tail (the plain statement-block face).
     //
-    // The first row is the healthy cascade's own
+    // The oracle reports two rows on this fixture
+    // (`dart analyze --format machine` 3.13.7: `DEAD_CODE 3:29|6` for
+    // `?..g()` and `DEAD_CODE 7:1|12` for `use(buffer);`), but only the
+    // second is a flow-layer fact: the cascade's `?..g()` is the
     // `_verifyUnassignedVariable` face (`buffer` is a definitely-unassigned
-    // `C?`) — the oracle reports both rows on this fixture:
-    // `dart analyze --format machine` 3.13.7:
-    // `DEAD_CODE 3:29|6` (`?..g()`) and `DEAD_CODE 7:1|12` (`use(buffer);`).
+    // `C?`), owned by the semantic `dead_null_chains` latch — the flow
+    // layer stays silent there (the #3798/#3172 split).
     let src = "class C { void g() {} }\nvoid use(Object? x) {}\nvoid f() { C? buffer; buffer?..g();\n{\n  return 1;\n}\nuse(buffer);\n}";
-    assert_eq!(
-        dead_of(src),
-        vec!["?..g()".to_string(), "use(buffer);".to_string()]
-    );
+    assert_eq!(dead_of(src), vec!["use(buffer);".to_string()]);
 }
 
 #[test]

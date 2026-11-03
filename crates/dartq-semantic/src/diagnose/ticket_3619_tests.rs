@@ -399,10 +399,15 @@ void main() {{
     assert_one_assignment(&report_ops(&source), "of type 'int' can't be assigned");
 }
 
-/// `UP(int Function(), String Function()) = Function` — two distinct
-/// function shapes take the coarse `Function` head (the official
-/// correlation-failure fallback, least_upper_bound.dart:684-686; the
-/// kept-right face answered `String Function()`).
+/// `UP(int Function(), String Function()) = Object Function()` — the
+/// function join lifts the RETURN types (least_upper_bound.dart:663-779:
+/// equal type-parameter counts, no required positional to strand, then
+/// `getLeastUpperBound(f.returnType, g.returnType)` at :771) and
+/// `UP(int, String)` is `Object`. The `Function` head is only the
+/// structural-failure fallback (:667-671/:757-769), never the answer for
+/// two shape-compatible signatures — the pin previously encoded that
+/// fallback (probed oracle 3.13.7: `A value of type 'Object Function()'
+/// can't be assigned to a variable of type 'int'.`).
 #[test]
 fn join_two_functions_answers_bare_function() {
     let source = format!(
@@ -415,7 +420,7 @@ void main(bool b) {{
 }}
 "
     );
-    assert_one_assignment(&report_ops(&source), "of type 'Function' can't be assigned");
+    assert_one_assignment(&report_ops(&source), "of type 'Object Function()' can't be assigned");
 }
 
 /// The candidate walk's tied-level drop: `C implements I1, I2` and

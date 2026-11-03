@@ -215,9 +215,11 @@ Future<int> fi() async { return fs(); }
 fn await_return_row_anchors_at_keyword() {
     // The fixture's `await` sits 6 columns after `return`; the row's span
     // backs up to the keyword (operand start − 5) and runs through the
-    // operand's own end — `await s()` is 8 columns. The operand's type is
-    // a closed-declared `String` (the rig prelude's real class) so the
-    // verdict is decidable without the `Object` source arm.
+    // operand's own end — `await s()` is nine columns, closing over the
+    // `)` (probed: `dart analyze` 3.13.7 reports line 2 col 33, length 9).
+    // The operand's type is a closed-declared `String` (the rig prelude's
+    // real class) so the verdict is decidable without the `Object` source
+    // arm.
     let fixture = "String s() => \"x\";\nFuture<int> aw() async { return await s(); }\n";
     let report = report_ops(fixture);
     let rows = roit(&report);
@@ -228,8 +230,8 @@ fn await_return_row_anchors_at_keyword() {
         report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
     );
     assert_eq!(
-        rows[0].range.length, 8,
-        "the row spans `await s()` — keyword through operand end"
+        rows[0].range.length, 9,
+        "the row spans `await s()` — keyword through the operand's closing `)`"
     );
 }
 

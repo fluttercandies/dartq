@@ -142,7 +142,7 @@ pub use ty::{
 };
 pub use variance::{
     ParamFacts, ParamFactsTable, Variance, arguments_related, typedef_parameter_variances,
-    variance_in_type,
+    typedef_parameter_variances_with, variance_in_type, variance_in_type_with,
 };
 
 #[cfg(test)]

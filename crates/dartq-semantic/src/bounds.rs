@@ -82,7 +82,7 @@ use dartq_types::{
     Boundedness, CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy,
     TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedType,
     Variance, instantiate_type_formals_to_bounds, is_well_bounded, regular_bounded_issues,
-    replace_top_bottom_with_facts, variance_in_type,
+    replace_top_bottom_with_facts, variance_in_type_with,
 };
 
 // The written-type capture is shared with the collector's pool feeding
@@ -890,6 +890,19 @@ pub(crate) struct CreationInferenceRow {
     pub(crate) raw_bound: String,
     /// The bound substituted with every seed.
     pub(crate) bound: String,
+    /// The bound substituted with every seed, with the parameters the
+    /// inference left `unknown` rendered `_` — the spelling the
+    /// `could_not_infer` detail carries (`producing 'A<_, …>'`). The twin
+    /// keeps `bound`'s fully substituted display (the oracle spells the
+    /// same slot `dynamic` or its seed there — the two faces differ only
+    /// in this one rendering).
+    #[allow(
+        dead_code,
+        reason = "the `could_not_infer` detail builder still reads `bound`; \
+                  switching it to this field is the remaining half of the \
+                  `_`-for-unknown display"
+    )]
+    pub(crate) infer_bound: String,
 }
 
 /// `greatestClosure` (type_system.dart:592-620 over least_greatest_
@@ -3689,19 +3702,34 @@ impl<'a> Bounds<'a> {
     /// type_analyzer_operations.dart:1018-1076), then the extends constraint
     /// re-checks the seed against the bound substituted with all seeds
     /// (`TypeConstraintFromExtendsClause.isSatisfiedBy`,
-    /// type_constraint.dart:250-300). Answers one row per failing
+    /// type_constraint.dart:250-300). Answers one row per failing SOLVED
     /// parameter, declaration order: the seed, the declared bound as
     /// written, and the substituted bound — the message pieces of both the
     /// `could_not_infer` report and its creation-site
     /// `type_argument_not_matching_bounds` twin (the failed inference's
     /// kept types are the constructor's implicit arguments, the oracle's
-    /// error heuristic at generic_inferrer.dart:385-395). A non-function
-    /// type alias used as a constructor callee answers the same question
-    /// over the ALIAS's own parameters (#2841 — upstream infers the alias
-    /// application's arguments, so the `could_not_infer` text spells the
-    /// alias's type variable). An empty answer covers every suppression
-    /// path (no capture, a poisoned or unmapped bound reads `dynamic` and
-    /// always satisfies, an unsafe closure).
+    /// error heuristic at generic_inferrer.dart:385-395).
+    ///
+    /// The solved gate is upstream's `inferTypeParameterFromAll`
+    /// (type_analyzer_operations.dart:1210-1273): a parameter stays
+    /// `unknown` — answering NO row — when it has no declared bound (a
+    /// null `extendsConstraint` hands `chooseTypeFromConstraint` an empty
+    /// constraint, whose unknown lower is the answer) or when its bound
+    /// substituted with the types inferred so far is still a bare
+    /// parameter of this inference (`substituteTypeFromIterables` writes
+    /// `unknown` into the unsolved leaves, so a `X1 extends X2` bound
+    /// reads `unknown` and merges into the empty upper). The parameters
+    /// that DO solve substitute the earlier seeds — the same partial map
+    /// the seeds built from. `class A<X1 extends X2, X2 extends A<X1,
+    /// X2>>` is the shape: `X1`'s bound is the bare `X2`, so `X1` stays
+    /// unknown and silent while `X2` reports alone.
+    ///
+    /// A non-function type alias used as a constructor callee answers the
+    /// same question over the ALIAS's own parameters (#2841 — upstream
+    /// infers the alias application's arguments, so the `could_not_infer`
+    /// text spells the alias's type variable). An empty answer covers
+    /// every suppression path (no capture, a poisoned or unmapped bound
+    /// reads `dynamic` and always satisfies, an unsafe closure).
     pub(crate) fn check_creation_inference(
         &mut self,
         strings: &'a StringTable,
@@ -3767,9 +3795,41 @@ impl<'a> Bounds<'a> {
         }
         let merged_facts = snapshot.merged_facts(&snapshot.facts);
         let system = snapshot.system_with(&merged_facts);
+        // The `inferredTypes` pass upstream builds inside `chooseTypes`
+        // (type_analyzer_operations.dart:1080-1145): declaration order,
+        // each parameter's bound substituted with the types inferred for
+        // the EARLIER parameters (the unsolved slots read `unknown`, so a
+        // `X1 extends X2` bound comes back a bare `TypeParameter` kind),
+        // and a parameter marked solved exactly when it has a declared
+        // bound AND that partial substitution is no longer a bare
+        // parameter of this inference. A solved parameter's seed joins
+        // the map the later bounds substitute — `inferTypeParameterFromAll`
+        // reads `inferredTypes` for exactly those.
+        let mut solved = Vec::with_capacity(params.len());
+        let mut prior: Vec<(TypeParamId, TypeId)> = Vec::new();
+        for (index, (&param, &bound)) in params.iter().zip(&bounds).enumerate() {
+            let partial = snapshot.table.substitute(bound, &prior);
+            let inferred = snapshot.facts.get(param).bound.is_some()
+                && !matches!(
+                    snapshot.table.get(partial).kind(),
+                    TypeKind::TypeParameter { parameter } if targets.contains(&parameter)
+                );
+            solved.push(inferred);
+            if inferred {
+                prior.push((param, seeds[index]));
+            }
+        }
+        // The unsolved set the `_` display reads — every parameter of the
+        // inference that stayed `unknown`.
+        let unsolved: Vec<TypeParamId> = params
+            .iter()
+            .copied()
+            .zip(&solved)
+            .filter_map(|(param, &s)| (!s).then_some(param))
+            .collect();
         let mut rows = Vec::new();
         for (index, (&param, &bound)) in params.iter().zip(&bounds).enumerate() {
-            if !snapshot.type_is_safe(bound) {
+            if !solved[index] || !snapshot.type_is_safe(bound) {
                 continue;
             }
             let map: Vec<(TypeParamId, TypeId)> =
@@ -3783,6 +3843,7 @@ impl<'a> Bounds<'a> {
                 seed: snapshot.display(seeds[index]),
                 raw_bound: snapshot.display(bound),
                 bound: snapshot.display(substituted),
+                infer_bound: snapshot.display_with(substituted, &unsolved),
             });
         }
         rows
@@ -4780,10 +4841,36 @@ impl<'a> Snapshot<'a> {
                 let variances: Vec<Variance> = match (&provisional, alias_expansions.get(&decl)) {
                     (Some(hierarchy), Some(&body)) => {
                         let system = TypeSystem::new(&table, hierarchy);
-                        let no_facts = ParamFactsTable::new();
+                        // The walk's bound-invariance leg
+                        // (variance_builder.dart:131-140) keys on
+                        // `facts_of(p).bound` for each parameter of a
+                        // signature it descends into — and `body`'s
+                        // signature binders are exactly the ids
+                        // `expand_alias` recorded in the shared binder
+                        // overlay, whose bounds name the alias's own
+                        // parameters (`X1 extends X`). Feeding the walk an
+                        // empty table left every such bound `None`, the leg
+                        // silent, and `X`/`Y` contravariant — the `Never`
+                        // default where the oracle's invariant reads
+                        // `dynamic`. The provider answers a binder id
+                        // through the overlay and every other parameter
+                        // through the scratch face (the legacy reading a
+                        // bare table gave — the under-report direction),
+                        // the discriminator `signature_binder_bound`
+                        // hoisted to a full `ParamFacts`.
+                        let facts_of = |parameter: TypeParamId| -> ParamFacts {
+                            let is_binder = binder_names.borrow().contains_key(&parameter);
+                            if is_binder {
+                                binder_facts.borrow().get(parameter)
+                            } else {
+                                scratch_facts.get(parameter)
+                            }
+                        };
                         params
                             .iter()
-                            .map(|&parameter| variance_in_type(&system, &no_facts, parameter, body))
+                            .map(|&parameter| {
+                                variance_in_type_with(&system, &facts_of, parameter, body)
+                            })
                             .collect()
                     }
                     _ => vec![Variance::Covariant; params.len()],
@@ -5100,6 +5187,16 @@ impl<'a> Snapshot<'a> {
     /// The `getDisplayString` face of a snapshot type: the declaration's
     /// display name, the argument list, the `?` projection.
     fn display(&self, ty: TypeId) -> String {
+        self.display_with(ty, &[])
+    }
+
+    /// `display` with an unsolved-parameter set: a `TypeParameter` leaf
+    /// naming one of `unsolved` renders `_` — the spelling the
+    /// `could_not_infer` detail carries for a slot the inference left
+    /// `unknown` (`producing 'A<_, …>'`). Every other leaf renders its
+    /// own name, so a solved sibling still spells `X2` inside the same
+    /// bound.
+    fn display_with(&self, ty: TypeId, unsolved: &[TypeParamId]) -> String {
         let t = self.table.get(ty);
         let suffix = if t.is_nullable() { "?" } else { "" };
         match t.kind() {
@@ -5109,11 +5206,14 @@ impl<'a> Snapshot<'a> {
             TypeKind::Dynamic | TypeKind::Invalid => "dynamic".to_string(),
             TypeKind::Void => "void".to_string(),
             TypeKind::Null => "Null".to_string(),
+            TypeKind::TypeParameter { parameter } if unsolved.contains(&parameter) => {
+                format!("_{suffix}")
+            }
             TypeKind::TypeParameter { parameter } => {
                 format!("{}{suffix}", self.param_text(parameter))
             }
             TypeKind::FutureOr { base } => {
-                format!("FutureOr<{}>{suffix}", self.display(base))
+                format!("FutureOr<{}>{suffix}", self.display_with(base, unsolved))
             }
             TypeKind::Interface { decl, args } => {
                 let name = self.decl_text.get(&decl).cloned().unwrap_or_default();
@@ -5121,7 +5221,7 @@ impl<'a> Snapshot<'a> {
                     format!("{name}{suffix}")
                 } else {
                     let rendered: Vec<String> = (0..args.len())
-                        .map(|i| self.display(self.table.arg(args.offset() + i)))
+                        .map(|i| self.display_with(self.table.arg(args.offset() + i), unsolved))
                         .collect();
                     format!("{name}<{}>{suffix}", rendered.join(", "))
                 }
@@ -5135,7 +5235,8 @@ impl<'a> Snapshot<'a> {
             // of a bare `Function(...)` head.
             TypeKind::Function { signature } => {
                 let sig = self.table.signature(signature);
-                let mut text = format!("{} Function", self.display(sig.return_type));
+                let mut text =
+                    format!("{} Function", self.display_with(sig.return_type, unsolved));
                 let type_parameters = self.table.function_type_parameters(sig.type_parameters);
                 if !type_parameters.is_empty() {
                     // A binder's declared bound renders beside its name
@@ -5149,9 +5250,11 @@ impl<'a> Snapshot<'a> {
                     let names: Vec<String> = type_parameters
                         .iter()
                         .map(|&id| match binder_facts.get(id).bound {
-                            Some(bound) => {
-                                format!("{} extends {}", self.param_text(id), self.display(bound))
-                            }
+                            Some(bound) => format!(
+                                "{} extends {}",
+                                self.param_text(id),
+                                self.display_with(bound, unsolved)
+                            ),
                             None => self.param_text(id),
                         })
                         .collect();
@@ -5159,7 +5262,7 @@ impl<'a> Snapshot<'a> {
                     text.push_str(&format!("<{}>", names.join(", ")));
                 }
                 let mut formals: Vec<String> = (0..sig.positional.len())
-                    .map(|i| self.display(self.table.arg(sig.positional.offset() + i)))
+                    .map(|i| self.display_with(self.table.arg(sig.positional.offset() + i), unsolved))
                     .collect();
                 let named: Vec<String> = self
                     .table
@@ -5167,7 +5270,11 @@ impl<'a> Snapshot<'a> {
                     .into_iter()
                     .map(|member| {
                         let prefix = if member.required { "required " } else { "" };
-                        format!("{prefix}{} {}", self.display(member.ty), member.name)
+                        format!(
+                            "{prefix}{} {}",
+                            self.display_with(member.ty, unsolved),
+                            member.name
+                        )
                     })
                     .collect();
                 if !named.is_empty() {

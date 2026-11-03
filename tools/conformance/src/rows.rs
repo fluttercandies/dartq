@@ -19,6 +19,33 @@ pub struct Row {
 }
 
 impl Row {
+    /// The only construction point for a comparable row: the message is
+    /// canonicalized here so that every path — the chunked runner's
+    /// `attribute`, the realworld runner's `attribute`, and `parse_text` —
+    /// stores the same form the oracle side was written in. Skipping this
+    /// (e.g. a struct literal with a raw multi-line message) is what made
+    /// every multi-line diagnostic count once as missing and once as extra.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        severity: String,
+        code: String,
+        file: String,
+        line: u32,
+        column: u32,
+        length: u64,
+        message: String,
+    ) -> Row {
+        Row {
+            severity,
+            code,
+            file,
+            line,
+            column,
+            length,
+            message: sanitize(&message),
+        }
+    }
+
     pub fn key(&self) -> (String, String, String, u32, u32) {
         (
             self.severity.clone(),
@@ -50,15 +77,15 @@ impl Row {
             return None;
         }
         let (line, column) = parts[3].split_once(':')?;
-        Some(Row {
-            severity: parts[0].to_string(),
-            code: parts[1].to_string(),
-            file: parts[2].to_string(),
-            line: line.parse().ok()?,
-            column: column.parse().ok()?,
-            length: parts[4].parse().ok()?,
-            message: parts[5].to_string(),
-        })
+        Some(Row::new(
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+            line.parse().ok()?,
+            column.parse().ok()?,
+            parts[4].parse().ok()?,
+            parts[5].to_string(),
+        ))
     }
 }
 
@@ -175,15 +202,15 @@ mod tests {
     use super::*;
 
     fn row(sev: &str, code: &str, file: &str, line: u32, col: u32, len: u64, msg: &str) -> Row {
-        Row {
-            severity: sev.into(),
-            code: code.into(),
-            file: file.into(),
+        Row::new(
+            sev.into(),
+            code.into(),
+            file.into(),
             line,
-            column: col,
-            length: len,
-            message: msg.into(),
-        }
+            col,
+            len,
+            msg.into(),
+        )
     }
 
     #[test]
@@ -209,6 +236,40 @@ mod tests {
         let r = row("INFO", "c", "f.dart", 1, 1, 0, "a|b\tc\nd");
         let parsed = Row::parse_text(&r.text()).expect("parses");
         assert_eq!(parsed.message, "a|b c d");
+    }
+
+    /// Regression for the missing+extra double count: the oracle side stores
+    /// messages with `\n`/`\r`/`\t` already collapsed to spaces, so a dartq
+    /// row carrying the raw multi-line form must canonicalize to the same
+    /// message at construction — otherwise `diff_sorted` reports the row
+    /// once as missing and once as extra.
+    #[test]
+    fn multiline_message_matches_its_canonicalized_expected_row() {
+        let expected = row(
+            "ERROR",
+            "could_not_infer",
+            "lib/test.dart",
+            3,
+            9,
+            10,
+            "Couldn't infer type parameter 'T'. Tried to infer 'X' for 'T' which doesn't work:  Type parameter 'T' is declared to extend 'Y'.",
+        );
+        let actual = row(
+            "ERROR",
+            "could_not_infer",
+            "lib/test.dart",
+            3,
+            9,
+            10,
+            "Couldn't infer type parameter 'T'.\nTried to infer 'X' for 'T' which doesn't work:\r\nType parameter 'T' is declared to extend\t'Y'.",
+        );
+        let mut expected = vec![expected];
+        let mut actual = vec![actual];
+        sort_rows(&mut expected);
+        sort_rows(&mut actual);
+        let (missing, extra) = diff_sorted(&expected, &actual);
+        assert!(missing.is_empty(), "missing: {missing:?}");
+        assert!(extra.is_empty(), "extra: {extra:?}");
     }
 
     #[test]

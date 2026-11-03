@@ -356,65 +356,78 @@ impl<'a> Engine<'a> {
         // `=> [` opens an untyped switch-arm/arrow-body literal, and the
         // byte before its bracket is the arrow's `>`, never a group close.
         let declared = if cursor >= 2 && bytes[cursor - 1] == b'>' && bytes[cursor - 2] != b'=' {
-            // The nearest type reference ending before the bracket names the
-            // element type's GROUP — but a generic element type
-            // (`<Map<K, V>>[…]`) ends with its LAST inner argument, not the
-            // head. The group's own `<…>` span is walked back from the `>`
-            // (angle-balanced), and the FIRST use inside the group is the
-            // head — `Map`, not `V` — with the raw face the pool's
-            // covariant element rule answers against the written arguments.
-            let mut depth = 1usize;
-            let mut group_open = cursor - 1;
-            while group_open > 0 {
-                match bytes[group_open - 1] {
-                    b'>' => depth += 1,
-                    b'<' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
+            // The written `<E>` group's own argument IS the element type —
+            // `<Map<String, Folder>>[…]` asks each element against
+            // `Map<String, Folder>`, never the raw `Map` head (the pool's
+            // instantiate-to-bounds face would spell `Map<dynamic,
+            // dynamic>` — the args-dropped display the oracle never
+            // writes). The segment parser spells the generic argument
+            // whole; only a shape it cannot spell (a function-typed or
+            // record argument) falls to the head-only face below.
+            if let Some(args) = self.literal_group_args(left)
+                && let [element] = args.as_slice()
+            {
+                *element
+            } else {
+                // The nearest type reference ending before the bracket names the
+                // element type's GROUP — but a generic element type
+                // (`<Map<K, V>>[…]`) ends with its LAST inner argument, not the
+                // head. The group's own `<…>` span is walked back from the `>`
+                // (angle-balanced), and the FIRST use inside the group is the
+                // head — `Map`, not `V` — with the raw face the pool's
+                // covariant element rule answers against the written arguments.
+                let mut depth = 1usize;
+                let mut group_open = cursor - 1;
+                while group_open > 0 {
+                    match bytes[group_open - 1] {
+                        b'>' => depth += 1,
+                        b'<' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                    group_open -= 1;
                 }
-                group_open -= 1;
-            }
-            if depth != 0 {
-                return;
-            }
-            let head_start = group_open;
-            // The walked group bounds are bytes; `type_uses` ranges are UTF-16.
-            let (head_start16, group_close16) =
-                (self.utf16_of(head_start), self.utf16_of(cursor - 1));
-            let Some((name_range, name)) = self
-                .type_uses
-                .iter()
-                .filter(|(range, _)| range.offset >= head_start16 && range.end() <= group_close16)
-                .min_by_key(|(range, _)| range.offset)
-                .copied()
-            else {
-                return;
-            };
-            if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
-                return;
-            }
-            // The `?` suffix rides the token after the type-use range, the same
-            // suffix `typed_list_literal_ty` reads (`<String?>` declares `String?`
-            // elements, not `String` — #2161).
-            Ty::Named {
-                name,
-                nullable: self.written_nullable_suffix(name_range.end()),
-                args: crate::model::ArgListId::EMPTY,
+                if depth != 0 {
+                    return;
+                }
+                let head_start = group_open;
+                // The walked group bounds are bytes; `type_uses` ranges are UTF-16.
+                let (head_start16, group_close16) =
+                    (self.utf16_of(head_start), self.utf16_of(cursor - 1));
+                let Some((name_range, name)) = self
+                    .type_uses
+                    .iter()
+                    .filter(|(range, _)| range.offset >= head_start16 && range.end() <= group_close16)
+                    .min_by_key(|(range, _)| range.offset)
+                    .copied()
+                else {
+                    return;
+                };
+                if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+                    return;
+                }
+                // The `?` suffix rides the token after the type-use range, the same
+                // suffix `typed_list_literal_ty` reads (`<String?>` declares `String?`
+                // elements, not `String` — #2161).
+                Ty::Named {
+                    name,
+                    nullable: self.written_nullable_suffix(name_range.end()),
+                    args: crate::model::ArgListId::EMPTY,
+                }
             }
         } else {
             // No written group: the untyped literal resolves its elements
-            // against the position's context — `=> […]` and `return […]`
-            // read the innermost executable's effective return (the
-            // closure's matched context `K` for a literal, the folded
-            // declared return otherwise), whose element argument is the
-            // declared face each element answers (`typed_literal_resolver
-            // .dart` `_fromContextType`). A deeper position — an
-            // initializer, an argument, a nested slot — has no return
-            // context of its own here and keeps the opaque posture.
+            // against the position's context — the initializer's declared
+            // type, the assignment's write target, the argument's formal,
+            // an enclosing literal's element context, `=>`/`return`'s
+            // effective return — whose element argument is the declared
+            // face each element answers (`typed_literal_resolver.dart`
+            // `_fromContextType`). A position carrying no context keeps
+            // the opaque posture.
             let Some(declared) = self.list_literal_ctx_element(left) else {
                 return;
             };
@@ -497,22 +510,200 @@ impl<'a> Engine<'a> {
                     window_start = start as u32 + j as u32 + 1;
                 }
             }
-            // Row ranges are UTF-16; the window/segment bounds are bytes.
-            let (window16, stop16) = (self.utf16_of(window_start as usize), self.utf16_of(stop));
-            let Some((row_ty, row_range)) = self
-                .rows
-                .iter()
-                .rev()
-                .find(|row| {
-                    row.ty != Ty::UNKNOWN
-                        && row.range.offset >= window16
-                        && row.range.end() <= stop16
-                })
-                .map(|row| (row.ty, row.range))
-            else {
+            // The element expression's own row: the outermost row spanning
+            // the trimmed window exactly — an inner row (`{k: f()}`'s `f`
+            // leaf, `a + b`'s `b`) types its own operand, never the
+            // element. A nested literal's `]`/`}` row drains into the
+            // deferred queue at its own close, so both stacks scan.
+            let mut ws = window_start as usize;
+            while ws < stop && bytes[ws].is_ascii_whitespace() {
+                ws += 1;
+            }
+            let mut we = stop;
+            while we > ws && bytes[we - 1].is_ascii_whitespace() {
+                we -= 1;
+            }
+            if ws >= we {
                 continue;
+            }
+            // A nested collection literal owns the element position when
+            // the trimmed segment IS the literal — the `[`/`{` opens it
+            // and the matching `]`/`}` closes it. Transparent wrappers
+            // peel first: parens group without changing the face, and a
+            // `const`/`await`/`!` prefix sits before the bracket. The row
+            // model anchors the literal's value row at its CLOSE bracket
+            // (the empty `[]` at its `[` itself), so the key is the
+            // bracket's own offset, never a whole-span row.
+            let mut lw = ws;
+            loop {
+                while lw < we && bytes[lw].is_ascii_whitespace() {
+                    lw += 1;
+                }
+                let rest = &seg_text[lw - start..];
+                let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+                if (rest.starts_with("const") || rest.starts_with("await"))
+                    && lw + 5 < we
+                    && !ident(bytes[lw + 5])
+                {
+                    lw += 5;
+                    continue;
+                }
+                if lw < we && bytes[lw] == b'!' {
+                    lw += 1;
+                    continue;
+                }
+                // A `( e )` group peels when its own close is the
+                // segment's last byte — otherwise the paren groups only
+                // a prefix (`(a).b`) and the element is the whole.
+                if lw < we && bytes[lw] == b'(' {
+                    let mut d = 0usize;
+                    let mut close = None;
+                    for (j, &b) in bytes.iter().enumerate().take(we).skip(lw) {
+                        match b {
+                            b'(' | b'[' | b'{' => d += 1,
+                            b')' | b']' | b'}' => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    close = Some(j);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if close == Some(we - 1) {
+                        lw += 1;
+                        let mut nwe = we - 1;
+                        while nwe > lw && bytes[nwe - 1].is_ascii_whitespace() {
+                            nwe -= 1;
+                        }
+                        if nwe > lw {
+                            we = nwe;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            let literal = if lw < we {
+                match (bytes[lw], bytes[we - 1]) {
+                    (b'[', b']') | (b'{', b'}') => self
+                        .untyped_literals
+                        .get(&self.utf16_of(we - 1))
+                        .map(|kind| (*kind, self.utf16_of(we - 1)))
+                        .or_else(|| {
+                            // The empty `[]`'s row key rides its `[` — the
+                            // parser hands the empty list's right as its
+                            // own open bracket.
+                            self.untyped_literals
+                                .get(&self.utf16_of(lw))
+                                .map(|kind| (*kind, self.utf16_of(lw)))
+                        }),
+                    _ => None,
+                }
+            } else {
+                None
             };
-            let mut element_ty = row_ty;
+            // Row ranges are UTF-16; the window/segment bounds are bytes.
+            let (mut element_ty, row_range) = if let Some((kind, key)) = literal {
+                // A nested collection literal is the element: its static
+                // type adopts the context when the declared face's head
+                // matches (`['x']` under `List<int>` resolves `List<int>`
+                // and coerces), else the leaves' upward inference
+                // (`['x']` under `int` reads `List<String>`; `{k: v}`
+                // under `Map<K2, V2>` adopts and the entry face owns the
+                // key/value verdicts).
+                let operand = Row {
+                    name: self.intern(""),
+                    range: SourceRange {
+                        offset: key,
+                        length: 1,
+                    },
+                    qualified: false,
+                    shape: RowShape::Value,
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::UNKNOWN,
+                };
+                let adopt = self.literal_adopts_context(kind, declared);
+                let ty = if adopt {
+                    declared
+                } else {
+                    let family = match kind {
+                        UntypedLiteral::List => self.collection_heads[0],
+                        UntypedLiteral::SetElements => self.collection_heads[1],
+                        UntypedLiteral::MapEntries | UntypedLiteral::EmptyBraces => {
+                            match self.empty_literal_is_set(declared) {
+                                Some(true) => self.collection_heads[1],
+                                _ => self.collection_heads[2],
+                            }
+                        }
+                    };
+                    self.collection_literal_ty(&operand, family)
+                        .unwrap_or_else(|| self.literal_return_ty(kind, declared))
+                };
+                (
+                    ty,
+                    self.untyped_literal_span(&operand).unwrap_or(operand.range),
+                )
+            } else {
+                // The element expression's own row: the outermost row
+                // spanning the trimmed window exactly — an inner row
+                // (`{k: f()}`'s `f` leaf, `a + b`'s `b`) types its own
+                // operand, never the element. A nested literal's `]`/`}`
+                // row drains into the deferred queue at its own close,
+                // so both stacks scan.
+                let (s16, e16) = (self.utf16_of(ws), self.utf16_of(we));
+                let exact = |row: &&Row| {
+                    row.range.offset == s16
+                        && row.range.end() == e16
+                        && !matches!(row.shape, RowShape::TypeUse(..))
+                };
+                let row = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .take_while(|row| row.range.offset >= s16)
+                    .find(|row| exact(row))
+                    .or_else(|| {
+                        self.deferred_miss_rows
+                            .iter()
+                            .rev()
+                            .take_while(|row| row.range.offset >= s16)
+                            .find(|row| exact(row))
+                    })
+                    .cloned();
+                match row {
+                    Some(row) => {
+                        let ty = self.operand_static_ty(&row);
+                        if ty == Ty::UNKNOWN {
+                            continue;
+                        }
+                        (ty, row.range)
+                    }
+                    None => {
+                        // No single row spans the window (a composite
+                        // operand the row model leaves unfolded): keep the
+                        // legacy last-typed-row posture — the element's
+                        // inner row is the best face available.
+                        let stop16 = e16;
+                        let Some((row_ty, row_range)) = self
+                            .rows
+                            .iter()
+                            .rev()
+                            .find(|row| {
+                                row.ty != Ty::UNKNOWN
+                                    && row.range.offset >= s16
+                                    && row.range.end() <= stop16
+                            })
+                            .map(|row| (row.ty, row.range))
+                        else {
+                            continue;
+                        };
+                        (row_ty, row_range)
+                    }
+                }
+            };
             if spread {
                 // A spread element contributes its operand's ELEMENT type
                 // (type_analyzer.dart's spread-element resolution), never
@@ -522,9 +713,9 @@ impl<'a> Engine<'a> {
                 // `Null`/a non-iterable operand is the spread verifier's
                 // row (`not_iterable_spread`/`not_null_aware_null_spread`),
                 // and a raw `Iterable` donates `dynamic` — all silent here.
-                // Falling back to `row_ty` fabricates the element code on
-                // operands the oracle never asks this question of.
-                match row_ty {
+                // Falling back to the row's own ty fabricates the element
+                // code on operands the oracle never asks this question of.
+                match element_ty {
                     Ty::Named { name, args, .. } => {
                         let Some(first) = self.spread_element_face(name, args) else {
                             continue;
@@ -546,33 +737,19 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The untyped `[…]`'s context element type when the literal sits in a
-    /// return position: the token immediately before its bracket spells
-    /// `=>` or `return` (the token table's spelling — the same table
-    /// [`Self::assignment_ctx_at`] reads for the write channel), and the
-    /// innermost executable's effective return supplies the context. A
-    /// literal's return comes from its matched context `K`
-    /// ([`Self::closure_context_return`]); a declared executable's from
-    /// its folded written return. `List`/`Set`/`Iterable` donate their
-    /// single argument; every other shape answers `None` — including a
-    /// `Function`-returning context, whose element ask is meaningless.
-    fn list_literal_ctx_element(&self, left: Token) -> Option<Ty> {
-        let tokens = self.tokens.as_slice();
-        let index = tokens
-            .partition_point(|t| t.utf16_offset < left.range.offset)
-            .checked_sub(1)?;
-        let text = &self.source[tokens[index].byte_range()];
-        let in_return_position = text == "=>" || text == "return";
-        if !in_return_position {
-            return None;
-        }
-        let to = self.frames.iter().rev().find_map(|f| match &f.kind {
-            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
-            FrameKind::Executable { ret: None, .. } => self.closure_context_return(),
-            _ => None,
-        })?;
-        let to = self.fold_alias_ty(to);
-        let Ty::Named { name, args, .. } = to else {
+    /// The untyped `[…]`'s context element type: the literal's own
+    /// context type `C` resolved through [`Self::literal_ctx_ty`]'s
+    /// channel walk, of which the `List`/`Set`/`Iterable` head donates
+    /// its single argument — every other shape answers `None` (a
+    /// `Function`- or `Map`-returning context's element ask is
+    /// meaningless).
+    fn list_literal_ctx_element(&mut self, left: Token) -> Option<Ty> {
+        // The channel walk borrows `&mut`; the alias fold borrows `&`. Keep
+        // them sequential — a shared receiver borrow cannot stay live
+        // across the argument that needs the mutable form.
+        let ctx = self.literal_ctx_ty(left.range.offset, 0)?;
+        let ctx = self.fold_alias_ty(ctx);
+        let Ty::Named { name, args, .. } = ctx else {
             return None;
         };
         let heads = &self.collection_heads;
@@ -580,6 +757,266 @@ impl<'a> Engine<'a> {
             return None;
         }
         self.boundary.args.borrow().get(args).first().copied()
+    }
+
+    /// A literal's own context type `C` (upstream
+    /// `typed_literal_resolver.dart` `_contextTypeOf` —
+    /// `inferenceContext.getContext`): the position the bracket occupies
+    /// decides the channel — the declaration's `pending_decl_ty` or a
+    /// `=`/`??=` write's target type, the argument list's open slot, an
+    /// enclosing literal's element (or map-side) context, a grouping
+    /// `(`'s own context (parens are transparent), and the `=>`/`return`
+    /// innermost executable's effective return. Transparent prefix
+    /// tokens (`await`, `const`, `new`, `throw`, the unary heads) walk
+    /// through to the channel. `depth` bounds the enclosing-literal
+    /// recursion.
+    fn literal_ctx_ty(&mut self, left: u32, depth: u8) -> Option<Ty> {
+        if depth > 6 {
+            return None;
+        }
+        // `left` is the bracket's own UTF-16 offset; the channel reads the
+        // token immediately before it. Transparent prefixes walk through to
+        // the channel — the context the wrapper occupies IS the operand's
+        // (`await […]` reads the declaration's `List<int>`; a unary
+        // `!`/`-`/`~` head the same).
+        enum Chan {
+            Assign,
+            Return,
+            Yield,
+            Enclose,
+        }
+        let (chan, index, limit) = {
+            let tokens = self.tokens.as_slice();
+            let mut index = tokens
+                .partition_point(|t| t.utf16_offset < left)
+                .checked_sub(1)?;
+            loop {
+                let text = &self.source[tokens[index].byte_range()];
+                if matches!(
+                    text,
+                    "await" | "const" | "new" | "throw" | "!" | "-" | "~" | "++" | "--"
+                ) {
+                    index = index.checked_sub(1)?;
+                    continue;
+                }
+                break;
+            }
+            let chan = match &self.source[tokens[index].byte_range()] {
+                // `+=` joins the write channel: the compound operator's
+                // formal IS the collection face on every collection `+`
+                // (`List.+`/`Set.+` take `List<E>`/`Set<E>`), so the
+                // target's declared type is the context upstream's
+                // `operator.type` formal answers — other compounds differ
+                // (`Set.-` takes an element-typed parameter) and keep the
+                // opaque posture.
+                "=" | "??=" | "+=" => Chan::Assign,
+                "=>" | "return" => Chan::Return,
+                "yield" => Chan::Yield,
+                _ => Chan::Enclose,
+            };
+            (chan, index, tokens[index].utf16_offset)
+        };
+        match chan {
+            // The write channel: the declaration initializer's armed
+            // annotation (`in_initializer`/`init_frame_depth` gate the
+            // constructor-initializer world's own depth — a closure
+            // body's inner `=` is its own business), else the closest
+            // write target's declared face (`l = […]`, `l ??= […]`,
+            // `f = […]` on a field/top-level declarator — the target row
+            // IS the declaration's bound type).
+            Chan::Assign => {
+                if self.in_initializer
+                    && self.frames.len() == self.init_frame_depth
+                    && self.pending_decl_ty.is_some()
+                {
+                    return self.pending_decl_ty;
+                }
+                let target = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))?
+                    .clone();
+                // `c[i] = e` writes through `[]=` — the operator row's
+                // declared face is not the assignment's destination.
+                if matches!(target.intent, Intent::Operator(..)) {
+                    return None;
+                }
+                Some(self.assignment_target_ty(&target))
+            }
+            // The return channel: the innermost executable's effective
+            // return — a closure's matched context `K`
+            // ([`Self::closure_context_return`]), a declared one's folded
+            // written return.
+            Chan::Return => self.frames.iter().rev().find_map(|f| match &f.kind {
+                FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
+                FrameKind::Executable { ret: None, .. } => self.closure_context_return(),
+                _ => None,
+            }),
+            // A `yield` element's context is the stream's ELEMENT type —
+            // `Stream<E>`/`Iterable<E>` donate `E` (`Stream<List<int>>
+            // yield`s a `List<int>` context to `yield […]`).
+            Chan::Yield => {
+                let ret = self.frames.iter().rev().find_map(|f| match &f.kind {
+                    FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
+                    FrameKind::Executable { ret: None, .. } => self.closure_context_return(),
+                    _ => None,
+                })?;
+                let ctx = self.fold_alias_ty(ret);
+                if let Ty::Named { name, args, .. } = ctx
+                    && (name == self.intern("Stream") || name == self.collection_heads[3])
+                {
+                    return self.boundary.args.borrow().get(args).first().copied();
+                }
+                Some(ctx)
+            }
+            Chan::Enclose => self.enclosing_ctx_ty(index, left, depth),
+        }
+    }
+
+    /// The enclosing-position channel for [`Self::literal_ctx_ty`]: the
+    /// nearest unmatched bracket opener before `at` (balanced-pair walk
+    /// back over `)`/`]`/`}`) decides the context —
+    /// an argument list's `(` donates the open slot's formal, a grouping
+    /// `(` re-asks at its own position (parens are transparent), an
+    /// enclosing `[` donates its element context, an enclosing `{`
+    /// donates the map's value side after a top-level `:` (the key side
+    /// before it) or the set's element context when no entry `:` spells
+    /// it. `at` is the index of the token examined last (the one that
+    /// failed every spelling channel); `left` the literal bracket's own
+    /// UTF-16 offset.
+    fn enclosing_ctx_ty(&mut self, at: usize, left: u32, depth: u8) -> Option<Ty> {
+        use dartq_scanner::TokenKind as TK;
+        let (opener, open_b, callee_side) = {
+            let tokens = self.tokens.as_slice();
+            let mut i = at + 1;
+            let mut nest = 0usize;
+            let opener = loop {
+                i = i.checked_sub(1)?;
+                match tokens[i].kind {
+                    TK::CloseParen | TK::CloseSquare | TK::CloseCurly => nest += 1,
+                    TK::OpenParen | TK::OpenSquare | TK::OpenCurly => {
+                        if nest == 0 {
+                            break i;
+                        }
+                        nest -= 1;
+                    }
+                    _ => {}
+                }
+            };
+            // The `(` is the argument list's own open only when an
+            // expression could END directly before it (`f(`, `o.m(`,
+            // `C<int>(`, `)(`): a `,`/`(`/`=`/keyword ahead marks a
+            // grouping paren — the context flows through it.
+            let callee_side = opener > 0 && {
+                matches!(
+                    tokens[opener - 1].kind,
+                    TK::Identifier
+                        | TK::Int
+                        | TK::Double
+                        | TK::Hexadecimal
+                        | TK::String
+                        | TK::CloseParen
+                        | TK::CloseSquare
+                        | TK::CloseCurly
+                        | TK::Gt
+                        | TK::GtGt
+                        | TK::GtGtGt
+                        | TK::Bang
+                        | TK::Index
+                )
+            };
+            (
+                opener,
+                (tokens[opener].byte_offset + tokens[opener].byte_len) as usize,
+                callee_side,
+            )
+        };
+        let kind = self.tokens.as_slice()[opener].kind;
+        match kind {
+            TK::OpenParen => {
+                if callee_side && self.arg_levels.last().is_some() {
+                    self.arg_slot_ty_ctx()
+                } else {
+                    self.literal_ctx_ty(self.tokens.as_slice()[opener].utf16_offset, depth + 1)
+                }
+            }
+            // The enclosing list literal's element context IS this
+            // literal's own context (`f3([[…]])` reads
+            // `Iterable<Iterable<int>>`'s `Iterable<int>`).
+            TK::OpenSquare => {
+                let inner =
+                    self.literal_ctx_ty(self.tokens.as_slice()[opener].utf16_offset, depth + 1)?;
+                self.iterable_element_arg(inner)
+            }
+            TK::OpenCurly => {
+                // The enclosing `{}` literal's context: a `:` at depth 0
+                // before the bracket puts it in a map entry's VALUE side;
+                // no `:` answers the set-element side — both read the
+                // enclosing literal's own resolved context.
+                let ctx =
+                    self.literal_ctx_ty(self.tokens.as_slice()[opener].utf16_offset, depth + 1)?;
+                let left_b = self.byte_of(left);
+                let bytes = self.source.as_bytes();
+                let mut d = 0usize;
+                let mut colon = false;
+                for &b in &bytes[open_b..left_b] {
+                    match b {
+                        b'(' | b'[' | b'{' => d += 1,
+                        b')' | b']' | b'}' => d = d.saturating_sub(1),
+                        b':' if d == 0 => colon = true,
+                        _ => {}
+                    }
+                }
+                let ctx = self.fold_alias_ty(ctx);
+                let Ty::Named { name, args, .. } = ctx else {
+                    return None;
+                };
+                let heads = &self.collection_heads;
+                let list = self.boundary.args.borrow().get(args).to_vec();
+                if name == heads[2] {
+                    if colon { list.get(1) } else { list.first() }.copied()
+                } else if !colon && (name == heads[1] || name == heads[3]) {
+                    list.first().copied()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The `List`/`Set`/`Iterable` head's single argument — the context
+    /// element type an enclosing list-shaped position donates.
+    fn iterable_element_arg(&self, ctx: Ty) -> Option<Ty> {
+        let Ty::Named { name, args, .. } = self.fold_alias_ty(ctx) else {
+            return None;
+        };
+        let heads = &self.collection_heads;
+        if !(name == heads[0] || name == heads[1] || name == heads[3]) {
+            return None;
+        }
+        self.boundary.args.borrow().get(args).first().copied()
+    }
+
+    /// Whether an untyped literal of `kind` adopts `context` as its own
+    /// static type (upstream `_fromContextType`'s head match: a list
+    /// literal takes a `List`/`Set`/`Iterable` context's own face, a set
+    /// `Set`/`Iterable`, a map only `Map`, the empty `{}` any collection
+    /// head). Adopted contexts are assignable by construction — the
+    /// element verifier's entry faces own the inner verdicts.
+    fn literal_adopts_context(&self, kind: UntypedLiteral, context: Ty) -> bool {
+        let Ty::Named { name, .. } = self.fold_alias_ty(context) else {
+            return false;
+        };
+        let heads = &self.collection_heads;
+        let (list, set, map, iterable) = (heads[0], heads[1], heads[2], heads[3]);
+        match kind {
+            UntypedLiteral::List => name == list || name == set || name == iterable,
+            UntypedLiteral::SetElements => name == set || name == iterable,
+            UntypedLiteral::MapEntries => name == map,
+            UntypedLiteral::EmptyBraces => name == map || name == set || name == iterable,
+        }
     }
 
     /// The written `on` clause of a named extension, its head and written
@@ -2797,7 +3234,9 @@ impl<'a> Engine<'a> {
         // — `(a: 1, b: 2)`'s row sits ON the `)`) spans the whole group,
         // the same `.at(expression)` answer the oracle's RecordLiteral /
         // collection node gives. The balance walk finds the opener the
-        // close pairs with.
+        // close pairs with; the length is computed once, under `checked_sub`
+        // — a desynced pairing must never wrap into a four-gigabyte span
+        // (release wraps a plain subtraction silently).
         if span.length == 1 {
             let close_idx = toks.partition_point(|t| t.utf16_offset < span.offset);
             if let Some(&close) = toks.get(close_idx)
@@ -2808,30 +3247,17 @@ impl<'a> Engine<'a> {
                 )
             {
                 let mut depth = 0u32;
+                let mut opener = None;
                 for index in (0..=close_idx).rev() {
                     match toks[index].kind {
                         kind if kind == close.kind => depth += 1,
                         TK::OpenParen if close.kind == TK::CloseParen => {
                             depth -= 1;
-                            if depth == 0 {
-                                span = SourceRange {
-                                    offset: toks[index].utf16_offset,
-                                    length: close.utf16_offset + close.byte_len
-                                        - toks[index].utf16_offset,
-                                };
-                                break;
-                            }
+                            opener = (depth == 0).then_some(index);
                         }
                         TK::OpenSquare if close.kind == TK::CloseSquare => {
                             depth -= 1;
-                            if depth == 0 {
-                                span = SourceRange {
-                                    offset: toks[index].utf16_offset,
-                                    length: close.utf16_offset + close.byte_len
-                                        - toks[index].utf16_offset,
-                                };
-                                break;
-                            }
+                            opener = (depth == 0).then_some(index);
                         }
                         kind if close.kind == TK::CloseCurly
                             && matches!(
@@ -2840,17 +3266,22 @@ impl<'a> Engine<'a> {
                             ) =>
                         {
                             depth -= 1;
-                            if depth == 0 {
-                                span = SourceRange {
-                                    offset: toks[index].utf16_offset,
-                                    length: close.utf16_offset + close.byte_len
-                                        - toks[index].utf16_offset,
-                                };
-                                break;
-                            }
+                            opener = (depth == 0).then_some(index);
                         }
                         _ => {}
                     }
+                    if opener.is_some() {
+                        break;
+                    }
+                }
+                if let Some(index) = opener
+                    && let Some(length) = (close.utf16_offset + close.byte_len)
+                        .checked_sub(toks[index].utf16_offset)
+                {
+                    span = SourceRange {
+                        offset: toks[index].utf16_offset,
+                        length,
+                    };
                 }
             }
         }
@@ -3008,24 +3439,45 @@ impl<'a> Engine<'a> {
                     };
                 }
                 // `(e)`: a parenthesized operand's node includes the parens
-                // — extend only when this `(` pairs with a `)` at the
-                // current end AND its own left neighbor cannot end an
+                // — extend only when this `(` pairs with the `)` closing
+                // the current span AND its own left neighbor cannot end an
                 // expression (in `f((e))`, the inner `(e)` wraps `e` but the
-                // outer `(` is the call's argument list, not a prefix).
+                // outer `(` is the call's argument list, not a prefix). A
+                // span ending AT the `)` (the inner operand's own row) or
+                // THROUGH it (a `)`-inclusive fold — `e)`'s one-past end)
+                // both pair.
                 TK::OpenParen if !before_expr(at) => {
                     let Some(close) = self.tokens.matching_end(at - 1) else {
                         break;
                     };
-                    if toks[close].utf16_offset != span.end() {
+                    let close_end = toks[close].utf16_offset + toks[close].byte_len;
+                    if toks[close].utf16_offset != span.end() && close_end != span.end() {
                         break;
                     }
+                    // The pairing must close the group this `(` opens: a
+                    // desynced table entry (a synthetic closer, a recovered
+                    // group) can answer a token BEFORE the parenthesis, and
+                    // the subtraction would wrap silently in release.
+                    let Some(length) = close_end.checked_sub(prev.utf16_offset) else {
+                        break;
+                    };
                     span = SourceRange {
                         offset: prev.utf16_offset,
-                        length: toks[close].utf16_offset + toks[close].byte_len - prev.utf16_offset,
+                        length,
                     };
                 }
                 _ => break,
             }
+        }
+        // A span this walk cannot express is no span: every arm rebuilds
+        // the extent by arithmetic on token boundaries, and a desynced
+        // pairing or a recovered group can invert one subtraction —
+        // silently in release, where the wrapped length would reach
+        // `SourceRange::end` and kill the process on a real corpus case.
+        // The walk therefore answers the caller's own row range whenever
+        // the rebuilt extent does not survive `offset + length`.
+        if span.offset.checked_add(span.length).is_none() {
+            return range;
         }
         span
     }
@@ -3813,16 +4265,28 @@ impl<'a> Engine<'a> {
         // a : b` marks the ternary, `x = a ?? b` the pair — while a
         // single-row window is the row's own range exactly as before.
         let range = {
+            // The window's head is the LEFTMOST row of the right-hand side,
+            // taken by offset rather than by scan order: the row stack is a
+            // fold discipline, not an ordering guarantee
+            // (`fold_conditional` keeps the arm rows live under a result row
+            // dated at the condition's head, and `fold_binary` re-pushes a
+            // folded row at the head of the chain it consumed), so a
+            // scan-order head can sit past the result row's end. A candidate
+            // beyond that end cannot open this window — the result row's own
+            // start spans it, the single-row extent.
+            let end = rhs_row.range.end();
             let first = self
                 .rows
                 .iter()
-                .filter(|row| row.range.offset > limit)
+                .filter(|row| row.range.offset > limit && row.range.offset <= end)
                 .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
-                .find(|row| !self.interpolation_child_rows.contains(&row.range.offset))
-                .map_or(rhs_row.range.offset, |row| row.range.offset);
+                .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
+                .map(|row| row.range.offset)
+                .min()
+                .unwrap_or(rhs_row.range.offset);
             SourceRange {
                 offset: first,
-                length: rhs_row.range.end() - first,
+                length: end.checked_sub(first).unwrap_or(rhs_row.range.length),
             }
         };
         // A `?.`-merged right side reads the short-circuit's nullable
@@ -4066,10 +4530,18 @@ impl<'a> Engine<'a> {
         // window the flatten re-applies over). Upstream flattens the
         // AwaitExpression's staticType at endAwaitExpression — the same
         // `operand_static_ty` + `flatten` the listener's row rewrite runs.
+        // The extent's end is the await node's last token START (the
+        // listener pushes `end.range.offset`), so a `)`-terminated
+        // operand's row — `await Future<int>.value(v)` — legitimately ends
+        // one past it. Membership is therefore "the row STARTS inside the
+        // operand window", the same gate `end_await_expression`'s own row
+        // rewrite applies; a whole-span containment test would drop every
+        // call-shaped operand and leave its unflattened `Future<T>` to the
+        // numeric refinement.
         let in_await = self
             .await_operand_extents
             .iter()
-            .any(|&(start, end)| start <= rhs_row.range.offset && rhs_row.range.end() <= end);
+            .any(|&(start, end)| start <= rhs_row.range.offset && rhs_row.range.offset < end);
         let right_ty = if in_await {
             self.flatten(right_ty)
         } else {
@@ -4902,25 +5374,27 @@ impl<'a> Engine<'a> {
         // rtv.dart:155-205). `await_operand_extents` carries the
         // `(keyword end, end-token start)` of every await that closed
         // inside this frame: an operand row that starts inside the extent
-        // and closes over its end token is that operand, so the staged
-        // span re-anchors at the widest enclosing await (a nested
-        // `await await e` takes the outermost keyword's start — the
-        // official's outermost AwaitExpression node). The verdict's own
-        // lookups keep the operand's span — the untyped-literal and
-        // cast-rewrite maps key the row, not the wrapper.
+        // is that operand, so the staged span re-anchors at the widest
+        // enclosing await (a nested `await await e` takes the outermost
+        // keyword's start — the official's outermost AwaitExpression
+        // node). The verdict's own lookups keep the operand's span — the
+        // untyped-literal and cast-rewrite maps key the row, not the
+        // wrapper.
         let operand_range = range;
         let mut range = range;
         let mut widest: Option<(u32, u32)> = None;
         for &(operand_start, end_start) in &self.await_operand_extents {
-            // The row is the await's operand when it sits strictly inside
-            // the recorded extent — the head row's span need not reach the
+            // The row is the await's operand when it STARTS inside the
+            // recorded extent — the head row's span need not reach the
             // operand's own end (`await s()`'s `s` row is one column, so
-            // the row's end is the operand's head, not its `)`). A nested
+            // the row's end is the operand's head, not its `)`), while a
+            // whole-call row ends one past the close token's start. A
+            // row starting before the keyword (`await a + b`'s binary
+            // row) is a wider expression and keeps its own span. A nested
             // `await await e` matches every enclosing extent, and the
             // minimum start lands on the outermost keyword — the
-            // official's outermost AwaitExpression; the matching extent's
-            // own end stands in for the row's (the whole expression end).
-            if operand_start <= range.offset && range.end() <= end_start {
+            // official's outermost AwaitExpression.
+            if operand_start <= range.offset && range.offset <= end_start {
                 widest = Some(match widest {
                     Some((w, e)) if w <= operand_start => (w, e),
                     _ => (operand_start, end_start),
@@ -4928,9 +5402,31 @@ impl<'a> Engine<'a> {
             }
         }
         if let Some((operand_start, end_start)) = widest {
+            // The extent's end is the await node's LAST TOKEN start
+            // (`end_await_expression` pushes `end.range.offset`), and that
+            // token is not always part of the expression: a call operand
+            // ends at its own `)` while a bare operand's event token is the
+            // enclosing statement's `;`. The row's own end settles it — a
+            // row that reaches the last token already carries the true end
+            // (`await s;`'s `s`), while a row that stops short is a callee
+            // head and the extent's final token is the call's closer
+            // (`await g();`'s `g` → the `)`). Oracle 3.13.7 anchors
+            // `.at(expression)`: `return await g();` is the nine-character
+            // `await g()`, `return await s;` the seven-character `await s`.
+            let end = if operand_range.end() >= end_start {
+                operand_range.end()
+            } else {
+                let tokens = self.tokens.as_slice();
+                let end_len = tokens
+                    .get(tokens.partition_point(|t| t.utf16_offset < end_start))
+                    .filter(|t| t.utf16_offset == end_start)
+                    .map_or(1, |t| t.byte_len);
+                end_start + end_len
+            };
+            let await_start = operand_start.saturating_sub(5);
             range = SourceRange {
-                offset: operand_start.saturating_sub(5), // `await` keyword
-                length: end_start - operand_start.saturating_sub(5),
+                offset: await_start,
+                length: end - await_start,
             };
         }
         // An unannotated collection literal's row carries no type of its

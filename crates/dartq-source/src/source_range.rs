@@ -18,19 +18,17 @@ pub struct SourceRange {
 impl SourceRange {
     /// First position after the range (UTF-16 code units).
     ///
-    /// # Panics
-    ///
-    /// Panics (in all build profiles, including `const` evaluation) when
-    /// `offset + length` overflows [`u32`]. The crate-wide contract is to
-    /// surface broken offsets, never clamp; a plain `+` only panicked in
-    /// debug builds and wrapped silently in release, so the overflow check
-    /// is explicit here to keep that contract profile-independent.
+    /// **Total**: a range whose `offset + length` does not fit [`u32`]
+    /// answers `u32::MAX` rather than aborting the analysis. Such a range
+    /// is a construction defect (a subtraction that underflowed, a
+    /// synthetic token with no extent); it must never end the process,
+    /// because a diagnostic tool that dies on one range loses the whole
+    /// file's diagnostics. Constructions are guarded where they are built
+    /// (`Engine::staged_expression_span` answers the caller's own row range
+    /// whenever its rebuilt extent does not survive this sum).
     #[must_use]
     pub const fn end(self) -> u32 {
-        match self.offset.checked_add(self.length) {
-            Some(end) => end,
-            None => panic!("SourceRange offset + length overflows u32"),
-        }
+        self.offset.saturating_add(self.length)
     }
 }
 
@@ -250,10 +248,12 @@ impl LineIndex {
     ///
     /// Panics when `byte_offset` is greater than the source length — an
     /// out-of-range offset is an engine bug and must surface, not clamp —
-    /// or when the resulting line or column overflows [`u32`]. The
-    /// overflow check mirrors [`SourceRange::end`]: the crate-wide contract
-    /// is to surface broken offsets in every build profile, and a plain `+`
-    /// only panicked in debug builds.
+    /// or when the resulting line or column overflows [`u32`]. The line and
+    /// column are the diagnostic positions themselves, so an overflow there
+    /// is not a bounded approximation: it can only come from a decoder bug.
+    /// ([`SourceRange::end`] is deliberately total instead: a range's end
+    /// only positions a span, and a bounded answer keeps the rest of the
+    /// file's diagnostics alive.)
     #[must_use]
     pub fn byte_to_line_col(&self, byte_offset: u32) -> (u32, u32) {
         let line = u32::try_from(self.line_at(byte_offset)).expect("line number exceeds u32::MAX");
@@ -909,15 +909,31 @@ mod tests {
         );
     }
 
-    /// Audit A7: `end` surfaces overflow in every profile (the crate's
-    /// "surface, don't clamp" contract) instead of wrapping in release.
+    /// `end` is TOTAL: a range whose `offset + length` does not fit `u32`
+    /// answers the ceiling instead of aborting the process. The old
+    /// "surface, don't clamp" shape panicked in every profile, and a
+    /// diagnostic tool must not lose a whole file's diagnostics to one
+    /// mispositioned span — the construction sites guard themselves
+    /// (`Engine::staged_expression_span` falls back to the caller's own row
+    /// range when its rebuilt extent would overflow), so this is the
+    /// last-resort behaviour, not the intended one.
     #[test]
-    #[should_panic(expected = "overflows u32")]
-    fn source_range_end_panics_on_overflow() {
-        let _ = SourceRange {
-            offset: u32::MAX,
-            length: 1,
-        }
-        .end();
+    fn source_range_end_is_total_on_overflow() {
+        assert_eq!(
+            SourceRange {
+                offset: u32::MAX,
+                length: 1,
+            }
+            .end(),
+            u32::MAX
+        );
+        assert_eq!(
+            SourceRange {
+                offset: 2583,
+                length: u32::MAX - 30,
+            }
+            .end(),
+            u32::MAX
+        );
     }
 }
