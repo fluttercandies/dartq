@@ -455,6 +455,26 @@ pub enum SemanticCode {
     NonConstantMapValue,
     /// `The fields in a const record literal must be constants.`
     NonConstantRecordField,
+    /// `Record field names can't be private.` — a record type annotation's
+    /// or record literal's field whose written name starts with `_`
+    /// (`invalidFieldNamePrivate`, diagnostic.g.dart:8765-8774;
+    /// `reportInvalidFieldNames`/`_reportInvalidFieldNames`,
+    /// record_type_annotation_resolver.dart:72-78 /
+    /// record_literal_resolver.dart:113-119). A positional `_` in a record
+    /// type exempts under the wildcard-variables feature.
+    InvalidFieldNamePrivate,
+    /// `Record field names can't be a dollar sign followed by an integer
+    /// when the integer is the index of a positional field.` — a record
+    /// field named `$n` whose `n - 1` indexes a positional sibling
+    /// (`invalidFieldNamePositional`, diagnostic.g.dart:8752-8762). In a
+    /// record type the positional field's own `$self` spelling exempts;
+    /// in a record literal the named-field check is position-blind.
+    InvalidFieldNamePositional,
+    /// `Record field names can't be the same as a member from 'Object'.` —
+    /// a record field named `hashCode`, `runtimeType`, `noSuchMethod`, or
+    /// `toString` (`invalidFieldNameFromObject`, diagnostic.g.dart:8738-8748;
+    /// `isForbiddenNameForRecordField`, record_literal_resolver.dart:208-212).
+    InvalidFieldNameFromObject,
     /// `The expression of a constant pattern must be a valid constant.` —
     /// a `ConstantPattern` node's expression that fails const-evaluation
     /// (`constantPatternWithNonConstantExpression`, diagnostic.g.dart
@@ -1029,6 +1049,19 @@ pub enum SemanticCode {
     /// pattern that declares it (`referencedBeforeDeclaration`,
     /// `_hiddenElements` face, error_verifier.dart).
     ReferencedBeforeDeclaration,
+    /// `The constant expression type '{0}' is not assignable to the
+    /// parameter type '{1}' of the '{2}' operator.` — the resolved
+    /// relational operator's first parameter does not admit the operand
+    /// constant's static type (`relationalPatternOperandTypeNotAssignable`,
+    /// type_analyzer.dart:1988-1996; `.at(pattern.operand)`).
+    RelationalPatternOperandTypeNotAssignable,
+    /// `The return type of operators used in relational patterns must be
+    /// assignable to 'bool'.` — the resolved operator's return type is not
+    /// `bool`-assignable
+    /// (`relationalPatternOperatorReturnTypeNotAssignableToBool`,
+    /// type_analyzer.dart:1997-2006; `.at(pattern.operator)`, correction
+    /// `Try updating the operator declaration to return 'bool'.`).
+    RelationalPatternOperatorReturnTypeNotAssignableToBool,
     /// `The variable '{0}' doesn't have the same type and/or finality in all
     /// cases that share this body.` — shared-case-scope uniqueName
     /// `pattern_variable_shared_case_scope_different_finality_or_type`.
@@ -2496,6 +2529,11 @@ impl SemanticCode {
             Self::NonConstantRecordField => {
                 ("non_constant_record_field", "NON_CONSTANT_RECORD_FIELD")
             }
+            Self::InvalidFieldNamePrivate
+            | Self::InvalidFieldNamePositional
+            | Self::InvalidFieldNameFromObject => {
+                ("invalid_field_name", "INVALID_FIELD_NAME")
+            }
             Self::NonConstantCaseExpression => (
                 "non_constant_case_expression",
                 "NON_CONSTANT_CASE_EXPRESSION",
@@ -2798,6 +2836,16 @@ impl SemanticCode {
             Self::ReferencedBeforeDeclaration => (
                 "referenced_before_declaration",
                 "REFERENCED_BEFORE_DECLARATION",
+            ),
+            // The relational-signature pair (diagnostic.g.dart :14824-14851;
+            // `name` and `uniqueName` coincide for both).
+            Self::RelationalPatternOperandTypeNotAssignable => (
+                "relational_pattern_operand_type_not_assignable",
+                "RELATIONAL_PATTERN_OPERAND_TYPE_NOT_ASSIGNABLE",
+            ),
+            Self::RelationalPatternOperatorReturnTypeNotAssignableToBool => (
+                "relational_pattern_operator_return_type_not_assignable_to_bool",
+                "RELATIONAL_PATTERN_OPERATOR_RETURN_TYPE_NOT_ASSIGNABLE_TO_BOOL",
             ),
             Self::PatternVariableSharedCaseScopeDifferentFinalityOrType
             | Self::PatternVariableSharedCaseScopeHasLabel
@@ -3799,6 +3847,16 @@ impl SemanticCode {
                     "Local variable '{a0}' can't be referenced before it is declared."
                 )
             }
+            // The operand row's three placeholders route through
+            // `message3` (real emissions go through `emit3`).
+            Self::RelationalPatternOperandTypeNotAssignable => {
+                self.message3(a0, a1, "")
+            }
+            Self::RelationalPatternOperatorReturnTypeNotAssignableToBool => {
+                "The return type of operators used in relational patterns must be \
+                 assignable to 'bool'."
+                    .to_string()
+            }
             Self::PatternVariableSharedCaseScopeDifferentFinalityOrType => {
                 format!(
                     "The variable '{a0}' doesn't have the same type and/or finality in all cases that share this body."
@@ -4000,6 +4058,18 @@ impl SemanticCode {
             }
             Self::NonConstantRecordField => {
                 "The fields in a const record literal must be constants.".to_string()
+            }
+            // diagnostic.g.dart:8768, :8754-8756, :8742 (the three
+            // `invalid_field_name` uniqueName rows' verbatim problemMessages).
+            Self::InvalidFieldNamePrivate => {
+                "Record field names can't be private.".to_string()
+            }
+            Self::InvalidFieldNamePositional => {
+                "Record field names can't be a dollar sign followed by an integer when the integer is the index of a positional field."
+                    .to_string()
+            }
+            Self::InvalidFieldNameFromObject => {
+                "Record field names can't be the same as a member from 'Object'.".to_string()
             }
             Self::ConstantPatternWithNonConstantExpression => {
                 "The expression of a constant pattern must be a valid constant.".to_string()
@@ -4961,6 +5031,14 @@ impl SemanticCode {
             Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
                 format!("{a0} positional arguments expected by '{a2}', but {a1} found.")
             }
+            // The relational operand row (diagnostic.g.dart:14824-14834):
+            // `{0}` is the operand constant's static type, `{1}` the
+            // resolved operator's declared first-parameter type (never the
+            // `makeNullable` face the test itself runs), `{2}` the operator
+            // lexeme.
+            Self::RelationalPatternOperandTypeNotAssignable => format!(
+                "The constant expression type '{a0}' is not assignable to the parameter type '{a1}' of the '{a2}' operator."
+            ),
             Self::WrongNumberOfParametersForOperator => {
                 format!("Operator '{a0}' should declare exactly {a1} parameters, but {a2} found.")
             }
@@ -5353,6 +5431,11 @@ impl SemanticCode {
             Self::ReferencedBeforeDeclaration => Some(
                 "Try moving the declaration to before the first use, or renaming the local variable so that it doesn't hide a name from an enclosing scope."
                     .to_string(),
+            ),
+            // The return-type row's verbatim oracle correctionMessage
+            // (diagnostic.g.dart:14844-14845); the operand row declares none.
+            Self::RelationalPatternOperatorReturnTypeNotAssignableToBool => Some(
+                "Try updating the operator declaration to return 'bool'.".to_string(),
             ),
             Self::PatternVariableSharedCaseScopeDifferentFinalityOrType
             | Self::PatternVariableSharedCaseScopeNotAllCases => Some(
@@ -6041,11 +6124,14 @@ mod tests {
             SemanticCode::UnnecessaryCastPattern,
             SemanticCode::UnnecessaryNullCheckPattern,
             SemanticCode::UnnecessaryNullAssertPattern,
-            // The #3519 pattern-scope rule cluster.
+            // The #3519 pattern-scope rule cluster and the relational
+            // signature pair.
             SemanticCode::PatternTypeMismatchInIrrefutableContext,
             SemanticCode::NonConstantRelationalPatternExpression,
             SemanticCode::PatternVariableAssignmentInsideGuard,
             SemanticCode::ReferencedBeforeDeclaration,
+            SemanticCode::RelationalPatternOperandTypeNotAssignable,
+            SemanticCode::RelationalPatternOperatorReturnTypeNotAssignableToBool,
             SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType,
             SemanticCode::PatternVariableSharedCaseScopeHasLabel,
             SemanticCode::PatternVariableSharedCaseScopeNotAllCases,
@@ -7066,6 +7152,12 @@ mod tests {
             | SemanticCode::NonConstantMapKey
             | SemanticCode::NonConstantMapValue
             | SemanticCode::NonConstantRecordField
+            // The #3647 `invalid_field_name` faces: the inline `message`
+            // arms carry each uniqueName row's verbatim problemMessage
+            // (the registry table holds only the fromObject text).
+            | SemanticCode::InvalidFieldNamePrivate
+            | SemanticCode::InvalidFieldNamePositional
+            | SemanticCode::InvalidFieldNameFromObject
             | SemanticCode::NonConstantSetElement
             | SemanticCode::NonExhaustiveSwitchExpression
             | SemanticCode::NonExhaustiveSwitchStatement
@@ -7102,6 +7194,11 @@ mod tests {
             | SemanticCode::NonConstantRelationalPatternExpression
             | SemanticCode::PatternVariableAssignmentInsideGuard
             | SemanticCode::ReferencedBeforeDeclaration
+            // The relational-signature pair: none registry-backed (the
+            // inline `message`/`message3` arms are the sole template
+            // source).
+            | SemanticCode::RelationalPatternOperandTypeNotAssignable
+            | SemanticCode::RelationalPatternOperatorReturnTypeNotAssignableToBool
             | SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType
             | SemanticCode::PatternVariableSharedCaseScopeHasLabel
             | SemanticCode::PatternVariableSharedCaseScopeNotAllCases
@@ -7456,6 +7553,9 @@ mod tests {
             SemanticCode::NonConstantMapKey,
             SemanticCode::NonConstantMapValue,
             SemanticCode::NonConstantRecordField,
+            SemanticCode::InvalidFieldNamePrivate,
+            SemanticCode::InvalidFieldNamePositional,
+            SemanticCode::InvalidFieldNameFromObject,
             SemanticCode::NonConstantSetElement,
             SemanticCode::NonExhaustiveSwitchExpression,
             SemanticCode::NonExhaustiveSwitchStatement,
@@ -7485,6 +7585,8 @@ mod tests {
             SemanticCode::NonConstantRelationalPatternExpression,
             SemanticCode::PatternVariableAssignmentInsideGuard,
             SemanticCode::ReferencedBeforeDeclaration,
+            SemanticCode::RelationalPatternOperandTypeNotAssignable,
+            SemanticCode::RelationalPatternOperatorReturnTypeNotAssignableToBool,
             SemanticCode::PatternVariableSharedCaseScopeDifferentFinalityOrType,
             SemanticCode::PatternVariableSharedCaseScopeHasLabel,
             SemanticCode::PatternVariableSharedCaseScopeNotAllCases,

@@ -925,15 +925,26 @@ impl<'a> Engine<'a> {
                 // flow_analysis.dart), so the guarded chain links through
                 // the #2283 latch below (`this._p.isEven` under
                 // `if (this._p != null)` — the flow marker stands at `_p`'s
-                // token for both spellings). The cascade-section and
-                // invoked-callee exclusions mirror the bare-read latch
-                // (`this..a`'s selector re-classifies to the latched
-                // cascade target; recovery rows carrying an invoke intent
-                // keep the callee-value face). `super` takes no link: a
-                // `super.x` read has no promotion identity — the flow
-                // stages no marker for it.
-                if matches!(popped_shape, RowShape::Receiver(Receiver::This { .. }))
-                    && !(self.in_cascade && is_section)
+                // token for both spellings). `super` links the same way: a
+                // `super._p` read has its own promotion identity — the
+                // official `SuperPropertyTarget` carries a dedicated
+                // `_superVersion` chain separate from `this`'s
+                // (`_getSsaNode` answers `helper._superVersion`, upstream
+                // Dart SDK source,
+                // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+                // flow_analysis.dart:5946-5958), and the resolver feeds it
+                // to `flow.propertyGet` exactly like `this`
+                // (property_element_resolver.dart:2063-2069), so a private
+                // final field genuinely promotes through `super` —
+                // `if (super._p != null) super._p.isEven` stays clean. The
+                // cascade-section and invoked-callee exclusions mirror the
+                // bare-read latch (`this..a`'s selector re-classifies to
+                // the latched cascade target; recovery rows carrying an
+                // invoke intent keep the callee-value face).
+                if matches!(
+                    popped_shape,
+                    RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. })
+                ) && !(self.in_cascade && is_section)
                     && popped.intent != Intent::Invoke
                 {
                     let member_offset = member.range.offset;
@@ -1388,6 +1399,34 @@ impl<'a> Engine<'a> {
                         },
                     },
                 };
+                // A leading-dot shorthand consumed as this merge's
+                // receiver (`.member().field`, `.member().method()`,
+                // `.new(1).field` — the shorthand ROOTS the chain): the
+                // fold below rewrites its name row into `Member{recv}`,
+                // starving the shorthand sweep's `qualified && Bare` gate
+                // (#3711 — 212 census miss rows share this one mechanism).
+                // Preserve a bare copy for the sweep's verdict: upstream
+                // resolves the shorthand against its own context type
+                // (`binary_expression_resolver.dart`'s `'_'` arm here),
+                // never the member's declared return — the copy's
+                // `ty == UNKNOWN` keeps the once-only marker the send
+                // close's `recordStaticType` write otherwise poisons. The
+                // folded `.field` itself resolves on the member's real
+                // receiver below exactly like an ordinary chain.
+                if popped.qualified
+                    && matches!(popped_shape, RowShape::Bare(_))
+                    && self.dot_shorthand_context(popped.range.offset)
+                {
+                    self.deferred_miss_rows.push(Row {
+                        name: popped.name,
+                        range: popped.range,
+                        qualified: true,
+                        shape: popped_shape.clone(),
+                        intent: popped.intent.clone(),
+                        write_op: popped.write_op,
+                        ty: Ty::UNKNOWN,
+                    });
+                }
                 if deferred_receiver {
                     self.deferred_miss_rows.push(Row {
                         shape: popped_shape,
@@ -4322,6 +4361,148 @@ impl<'a> Engine<'a> {
                 spans: spans.into_boxed_slice(),
             },
         ));
+    }
+
+    /// The dot-shorthand send's context type (`A<A> a = A(.named(null))`):
+    /// upstream `analyzeDotShorthand` pushes the argument position's
+    /// contextType — the PARENT invocation's corresponding formal type,
+    /// already instantiated by the parent's own downward solve (upstream
+    /// Dart SDK source, pkg/_fe_analyzer_shared/lib/src/type_inference/
+    /// type_analyzer.dart `analyzeDotShorthand` → `pushDotShorthandContext`;
+    /// the shorthand then resolves its constructor against that type —
+    /// `A<dynamic>.named` accepts the `null` the enclosing `A<A>` context
+    /// would have rejected against `A`). The parent group's level still
+    /// sits on `arg_levels` when the shorthand's own argument list closes;
+    /// its callee row resolves the parent's formals, and the parent's
+    /// declared-type context (`pending_decl_ty`) supplies the parent's
+    /// parameter map — the same sources the send-close solver itself
+    /// reads, minus the upward phase the parent has not yet run.
+    fn shorthand_arg_context(&self, callee_offset: u32) -> Option<Ty> {
+        let level = self.arg_levels.last()?;
+        // The argument slot the shorthand occupies: the parent group's own
+        // argument rows are still open (its `args` fills only when ITS
+        // close flushes), so the position is the byte-level one — the
+        // count of depth-one commas between the group's `(` and the
+        // shorthand's dot, and `pending_name` for the `name:` label the
+        // parent captured before the shorthand began.
+        let named = level.pending_name;
+        let open_from = if let Some((_, head_range)) =
+            level.unnamed_head.or(level.named_head)
+        {
+            Some(head_range.end())
+        } else {
+            self.rows.get(level.callee_row?).map(|row| row.range.end())
+        };
+        let positional = open_from.map(|from| {
+            let open = self.creation_open_offset(from);
+            let bytes = self.source.as_bytes();
+            let mut cursor = self.byte_of(open) + 1;
+            let end = self.byte_of(callee_offset).min(bytes.len());
+            let mut depth = 0usize;
+            let mut commas = 0usize;
+            while cursor < end {
+                match bytes[cursor] {
+                    b'(' | b'[' | b'{' | b'<' => depth += 1,
+                    b')' | b']' | b'}' | b'>' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => commas += 1,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            commas
+        });
+        // The parent send's formals: a container callee row resolves its
+        // constructor schema (the unnamed face keys on the class's own
+        // name), a qualified selector on a class receiver keys on the
+        // selector's spelling, and a keyword/named creation — which pushes
+        // no callee row at all — reads the level's own head latches (the
+        // same sources `close_arguments` re-arms for the fold). Every
+        // other callee shape — a top-level function, an unresolvable head
+        // — leaves the context undecided and the shorthand keeps the
+        // ordinary `pending_decl_ty` face.
+        let (parent_class, parent_formals) = if let Some((head, _)) = level.unnamed_head
+        {
+            (Some(head), self.ctor_schema_formals(head, head))
+        } else if let Some((head, head_range)) = level.named_head {
+            let class = self
+                .creation_class_before(head_range)
+                .map(|(class, _)| class)
+                .unwrap_or(head);
+            (Some(class), self.ctor_schema_formals(class, head))
+        } else {
+            let parent_row = self.rows.get(level.callee_row?)?;
+            let class = match &parent_row.shape {
+                RowShape::Bare(BareInfo::Container {
+                    name,
+                    kind: ContainerKind::Class,
+                }) if !parent_row.qualified => Some(*name),
+                RowShape::Bare(BareInfo::Plain { .. }) if parent_row.qualified => {
+                    let below = self.rows.get(level.callee_row?.checked_sub(1)?)?;
+                    match self.argument_receiver(below) {
+                        Receiver::Container {
+                            name,
+                            kind: ContainerKind::Class,
+                        }
+                        | Receiver::Created {
+                            name,
+                            kind: ContainerKind::Class,
+                            ..
+                        } => Some(name),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            (
+                class,
+                class.and_then(|c| {
+                    self.ctor_schema_formals(c, match &parent_row.shape {
+                        RowShape::Bare(BareInfo::Plain { .. }) => parent_row.name,
+                        _ => c,
+                    })
+                }),
+            )
+        };
+        let formals = parent_formals?;
+        let formal = match named {
+            Some(n) => self.named_formal_for(&formals, n)?,
+            None => formals.positional.get(positional?)?,
+        };
+        // The parent's class-parameter map: the declared-type context's
+        // written arguments pair positionally with the container's
+        // parameters (`A<A>` seeds `X := A`), the same downward seed the
+        // send-close solver's `creation_container` arm runs — a bare or
+        // mismatched context leaves the formal raw.
+        let Ty::Named {
+            name: ctx_head,
+            args: ctx_args,
+            ..
+        } = self.pending_decl_ty?
+        else {
+            return Some(formal.ty);
+        };
+        let Some(parent_class) = parent_class else {
+            return Some(formal.ty);
+        };
+        let params = self.bounds.container_params(parent_class)?;
+        if ctx_head != parent_class || ctx_args == ArgListId::EMPTY {
+            return Some(formal.ty);
+        }
+        let ctx_args: Vec<Ty> = self.boundary.args.borrow().get(ctx_args).to_vec();
+        if ctx_args.len() != params.len() {
+            return Some(formal.ty);
+        }
+        let map: Vec<(StringId, Ty)> = params
+            .iter()
+            .map(|(param, _, _)| *param)
+            .zip(ctx_args.iter().copied())
+            .collect();
+        let substituted = self.subst_params(formal.ty, &map).unwrap_or(formal.ty);
+        // A class-spelling formal (`x: X` over `X := A`) hands the
+        // shorthand the bare head — its own resolution instantiates the
+        // to-bounds face (`A` → `A<dynamic>`), exactly the oracle's
+        // `getDotShorthandContext` answer.
+        Some(self.instantiated_head_ty(substituted))
     }
 
     /// The creation's static type when only its context names the class's
@@ -9722,6 +9903,14 @@ impl<'a> Engine<'a> {
         };
         let mut formals = formals;
         self.project_formals(face_owner, &mut formals);
+        // A `this.x`/`super.x` initializing formal carries no written
+        // annotation (the collector parks `Unknown`/`Ty::Never`), so
+        // `ctor_formals` alone leaves the argument check undecidable —
+        // patch it the way the send path does at :11841. Same-file only:
+        // a foreign face keeps the under-report posture.
+        if face_owner == self.file {
+            self.patch_field_formals(face_name, &mut formals);
+        }
         let named = level
             .args
             .iter()
@@ -9827,9 +10016,17 @@ impl<'a> Engine<'a> {
         // context-seeded `A<int, String> a = new A('s', 1)` keeps its
         // created type (`creation_call_site_ty`'s covariant pin) while each
         // conflict reports at the argument's own span — the oracle's two
-        // rows.
+        // rows. A written `<...>` group outranks inference the same way
+        // (`new B<String, int>("hello", 3)` checks `x` against the WRITTEN
+        // `int`, never the raw `T` spelling): `creation_call_site_ty`
+        // deliberately returns `None` for a written head, so the written
+        // group's own members carry the instantiation here.
         let instantiation = self
             .creation_call_site_ty(Some(level), level.unnamed_head)
+            .or_else(|| {
+                let (_, head_range) = level.unnamed_head?;
+                self.creation_row_ty(head, false, head_range.offset)
+            })
             .and_then(|ty| match ty {
                 Ty::Named { name, args, .. } if name == head && args != ArgListId::EMPTY => {
                     Some(self.boundary.args.borrow().get(args).to_vec())
@@ -11674,7 +11871,17 @@ impl<'a> Engine<'a> {
                     let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape else {
                         return None;
                     };
-                    match *ty {
+                    // The callee's declared face at the verdict ask:
+                    // `#3685`'s bind posture keeps a spelled alias use on
+                    // the row (`Predicate<String> pred`, `G<A<Never>,
+                    // A<Never>> t`), and the formals the send's arguments
+                    // count against belong to the INSTANTIATED expansion
+                    // (`bool Function(String)`) — `fold_alias_ty`
+                    // substitutes the written arguments through the
+                    // captured RHS the way `bind_parameter_type`'s own
+                    // fold did, landing the same `Ty::Function` arm a
+                    // foreign alias's pre-folded declared type takes.
+                    match self.fold_alias_ty(*ty) {
                         // A foreign alias's declared type already folded
                         // to the alias's function RHS (`bind_parameter_type`
                         // rewrites `FailureJoiner joiner` to the raw
@@ -11956,6 +12163,37 @@ impl<'a> Engine<'a> {
         let Some(row) = self.rows.get(callee) else {
             return;
         };
+        // The callee row's own offset, copied out of the `rows` borrow —
+        // the shorthand probe reads it after later `&mut self` emits.
+        let callee_offset = row.range.offset;
+        // The dot-shorthand callee in ARGUMENT position (#3676 —
+        // `A(.named(null))`, `A<A>(.named(null))`): the `.name` row borrows
+        // whatever row sits directly below it as its receiver — the still-
+        // open parent group's own callee row or a previous argument's —
+        // which is NOT the selector-chain receiver `call_args_for`'s
+        // named-selector re-key and `creation_head`'s publish key were
+        // built for. The discriminator is the byte right after the below
+        // row: a real selector chain spells `.` there (`A.named`, `C<T>.m`),
+        // while the shorthand's borrowed row is followed by the parent
+        // group's `(` or `,`. (`dot_shorthand_context` alone cannot answer
+        // this — `C<T>.named` spells `>` before its dot, which the probe's
+        // expression-position arm also claims.) Both `call_type_args`
+        // faces below gate on it: the shorthand spells no `<...>` of its
+        // own, so it must neither CONSUME the parent's latched entry
+        // (which fixed `T := A` where the oracle's `A<dynamic>` context
+        // binds `T := dynamic` — the `@722` miss) nor PUBLISH its own
+        // instantiation onto the parent callee's offset (which the
+        // parent's `call_args_for` then reads as written arguments —
+        // `T := dynamic` producing `A<dynamic>` where the context seeds
+        // `A<A>` — the `@682` miss).
+        let shorthand_arg = self.dot_shorthand_context(callee_offset)
+            && callee
+                .checked_sub(1)
+                .and_then(|index| self.rows.get(index))
+                .is_some_and(|below| {
+                    let next = self.byte_of(self.creation_open_offset(below.range.end()));
+                    self.source.as_bytes().get(next) != Some(&b'.')
+                });
         // The required-named coverage (`RequiredParametersVerifier._check`,
         // required_parameters_verifier.dart:123-156): a `required` named
         // formal with no same-named argument reports
@@ -12018,6 +12256,14 @@ impl<'a> Engine<'a> {
                         *name,
                     )
                     .is_some_and(|(decl, _)| self.ctor_face_exists(decl, *name, row.name))
+                    // A dot shorthand in argument position borrows the
+                    // parent group's callee row as its "below" — that row
+                    // is no class segment of the shorthand's own, so the
+                    // instantiation publish must not key on it (the
+                    // parent's `call_args_for` would read it back as
+                    // written type arguments — the `A<dynamic>` for
+                    // `A<A>` invalid_assignment).
+                    && !shorthand_arg
                 {
                     creation_head = Some(below.range.offset);
                 }
@@ -12478,7 +12724,22 @@ impl<'a> Engine<'a> {
         // (`_typesInferredSoFar`) and the final phase never revisits a
         // fixed type. Consumed even without parameters so a stale entry
         // cannot answer a later send on a reused row.
-        let explicit_args = self.call_args_for(callee);
+        let mut explicit_args = self.call_args_for(callee);
+        if shorthand_arg
+            && let Some(args) = explicit_args.take()
+            && let Some(below) = callee
+                .checked_sub(1)
+                .and_then(|index| self.rows.get(index))
+        {
+            // The shorthand `.name(...)` spells no type-argument group of
+            // its own: anything `call_args_for` answered came through the
+            // receiver re-key — the still-open PARENT group's latched
+            // entry sitting on the row the shorthand borrows as its
+            // "receiver". Hand it back so the parent's own close solves
+            // its instantiation (the shorthand's own context arrives
+            // through `shorthand_arg_context`'s downward seed instead).
+            self.call_type_args.push((below.range.offset, args));
+        }
         if unnamed_creation
             && explicit_args.is_none()
             && let (Some(container), Some(params)) = (creation_container, &exec_params)
@@ -12570,12 +12831,26 @@ impl<'a> Engine<'a> {
                 } if args == ArgListId::EMPTY => Some(name),
                 _ => None,
             };
+            // The dot-shorthand's own context (#3676): a `.name` callee
+            // inside an argument group resolves under the argument
+            // position's contextType — the parent send's corresponding
+            // formal, instantiated by the parent's downward solve
+            // (upstream's `pushDotShorthandContext`) — never the enclosing
+            // declaration's type, which would seed `A<A>`'s `X := A` where
+            // the oracle's `A<dynamic>.named` context binds `X := dynamic`
+            // and keeps the `null` argument silent. Every non-shorthand
+            // callee keeps the declaration context.
+            let shorthand_ctx = (self.dot_shorthand_context(callee_offset)
+                || self.dot_shorthand_context(callee_offset + 1))
+            .then(|| self.shorthand_arg_context(callee_offset))
+            .flatten();
+            let downward_ctx = shorthand_ctx.or(self.pending_decl_ty);
             // Downward face: the return type is exactly one parameter and
             // the surrounding declaration declared a type.
             if let Some(return_ty) = return_face
                 && let Some(param) = param_of(return_ty)
                 && let Some(index) = param_index(param)
-                && let Some(ctx) = self.pending_decl_ty
+                && let Some(ctx) = downward_ctx
                 && ctx != Ty::Unknown
                 && solutions[index].is_none()
             {
@@ -12594,7 +12869,7 @@ impl<'a> Engine<'a> {
                     name: head,
                     args,
                     nullable: false,
-                }) = self.pending_decl_ty
+                }) = downward_ctx
                 && args != ArgListId::EMPTY
             {
                 let inst: Option<Vec<Ty>> = if head == container {
@@ -14309,6 +14584,21 @@ impl<'a> Engine<'a> {
                 None => self.pairing.miss("paired literal ctor stash"),
             }
         }
+        // The callee IS a leading-dot shorthand (`.member(...)`,
+        // `.new(...)`, `.memberType<T>(...)`): upstream resolves the
+        // shorthand against its own context — never a receiver — so the
+        // send's `recordStaticType` result must NOT land on this row: the
+        // shorthand sweep's `is_shorthand_head` gate requires
+        // `ty == UNKNOWN`, and a written send result (the member's
+        // declared return, resolved through whatever row happened to sit
+        // below the selector) starves the verdict — 212 census miss rows
+        // (#3711). The callee row keeps the push-time `Bare`/Unknown shape
+        // so the sweep verdicts it; the send-result staging and the
+        // write-back below gate on this.
+        let shorthand_callee = self
+            .rows
+            .get(callee)
+            .is_some_and(|row| self.dot_shorthand_context(row.range.offset));
         if let Some(row) = self.rows.get(callee) {
             let callee_offset = row.range.offset;
             // The discarded-value machine: every completed send is a
@@ -14499,11 +14789,12 @@ impl<'a> Engine<'a> {
             // whose own callee read is an unknown face — adopts the real
             // return (the send-close inference's parameter solution
             // included, `readEnum(Tag.values)` answering the enum).
-            if send_result != Ty::UNKNOWN {
+            if send_result != Ty::UNKNOWN && !shorthand_callee {
                 if let Some(row) = self.rows.get(callee) {
                     self.send_return_staging = Some((row.range.offset, send_result));
                 }
-            } else if let Some(row) = self.rows.get(callee)
+            } else if send_result == Ty::UNKNOWN
+                && let Some(row) = self.rows.get(callee)
                 && self.unresolved_call_head(row)
             {
                 // The genuinely-unresolved head (#2860): the oracle types
@@ -14542,6 +14833,7 @@ impl<'a> Engine<'a> {
         // creation head keeps its own fold (the row is replaced below with
         // the instantiated/solved face).
         if send_result != Ty::UNKNOWN
+            && !shorthand_callee
             && let Some(row) = self.rows.get_mut(callee)
             && !matches!(row.shape, RowShape::Bare(BareInfo::Container { .. }))
         {
@@ -14728,6 +15020,10 @@ impl<'a> Engine<'a> {
         let Some(head) = self.rows.get(row) else {
             return;
         };
+        // The callee token's offset — the `NamedType`-face emit anchors
+        // `name<args>` (upstream `checkNamedType` `.at(node)`), not the
+        // bare `<...>` `range` the invocation faces keep.
+        let head_offset = head.range.offset;
         // A plain function head (`g<int>(...)`) — the oracle rewrites the
         // shape to a plain invocation (`ast_rewrite.dart`) — and a member
         // head reached through the creation syntax (`C.sm<int, String>(...)`,
@@ -14750,7 +15046,7 @@ impl<'a> Engine<'a> {
                 self.check_extension_arity(*name, count, range);
             }
             RowShape::Bare(BareInfo::Container { name, .. }) => {
-                self.check_annotation_arity(*name, count, range);
+                self.check_annotation_arity(*name, head_offset, count, range);
             }
             _ => {}
         }
@@ -14839,6 +15135,10 @@ impl<'a> Engine<'a> {
         };
         let name = row.name;
         let qualified = row.qualified;
+        // The callee token's offset — the `NamedType`-face emits anchor
+        // `name<args>` (upstream `_buildTypeArguments` `.at(node)`), not
+        // the bare `<...>` `range` the invocation faces keep.
+        let head_offset = row.range.offset;
         let shape = row.shape.clone();
         if let RowShape::Bare(BareInfo::Container {
             name,
@@ -14915,10 +15215,19 @@ impl<'a> Engine<'a> {
                 {
                     let declared = container.type_params;
                     if declared != count {
+                        // The prefixed-creation's NamedType anchor starts
+                        // at the class segment — the row's own range —
+                        // never the bare `<...>` group (upstream's
+                        // `NamedType` report reads `prefix.C<T>`'s
+                        // `C<T>`, `_buildTypeArguments` `.at(node)`).
+                        let span = SourceRange {
+                            offset: head_offset,
+                            length: range.end() - head_offset,
+                        };
                         let name_text = self.strings.resolve(name).to_string();
                         self.emit3(
                             SemanticCode::WrongNumberOfTypeArguments,
-                            range,
+                            span,
                             &name_text,
                             &declared.to_string(),
                             &count.to_string(),
@@ -14954,10 +15263,16 @@ impl<'a> Engine<'a> {
                 {
                     let declared = container.type_params;
                     if declared != count {
+                        // Same `NamedType` anchor: `Map<int>()` reports at
+                        // `Map<int>` (the head through `>`), not `<int>`.
+                        let span = SourceRange {
+                            offset: head_offset,
+                            length: range.end() - head_offset,
+                        };
                         let name_text = self.strings.resolve(name).to_string();
                         self.emit3(
                             SemanticCode::WrongNumberOfTypeArguments,
-                            range,
+                            span,
                             &name_text,
                             &declared.to_string(),
                             &count.to_string(),
@@ -14990,7 +15305,7 @@ impl<'a> Engine<'a> {
             // group counts the TYPE's declared arity (the base code,
             // `_buildTypeArguments`), not an executable's `_element`.
             RowShape::Bare(BareInfo::Container { name, .. }) => {
-                return self.check_annotation_arity(*name, count, range);
+                return self.check_annotation_arity(*name, head_offset, count, range);
             }
             _ => None,
         };
@@ -15146,6 +15461,10 @@ impl<'a> Engine<'a> {
         // must not reach them.
         let row_name = row.name;
         let row_qualified = row.qualified;
+        // The head token's offset — the `NamedType`-face emits anchor
+        // `name<args>` (upstream `checkNamedType` `.at(node)`), not the
+        // bare `<...>` `range` the invocation faces keep.
+        let row_offset = row.range.offset;
         // The generic-instantiation face needs the row's own value-read
         // intent and the whole row for [`Self::tear_off_sig`] below the
         // `&mut` arity/bounds emits — capture both before the match opens
@@ -15155,8 +15474,12 @@ impl<'a> Engine<'a> {
         match &row.shape {
             RowShape::Bare(BareInfo::Container { name, .. }) => {
                 let class_name = *name;
-                // Type-literal instantiation `C<int>`: the base code.
-                self.check_annotation_arity(class_name, count, range);
+                // Type-literal instantiation `C<int>`: the base code at
+                // the `NamedType` span (`C<int>` — the head through the
+                // group's `>`, upstream `checkNamedType`'s `.at(node)`);
+                // the same span answers `C<int>.filled`'s
+                // constructor-reference face.
+                self.check_annotation_arity(class_name, row_offset, count, range);
                 // #2890 — a `.` after the group is the constructor-reference
                 // spelling (`A<String>.new`): the rewrite keeps the type
                 // arguments on the constructor name's type whenever any exist
@@ -15177,6 +15500,39 @@ impl<'a> Engine<'a> {
                 }
             }
             RowShape::Bare(BareInfo::Plain { ty }) => {
+                // A type-alias head's instantiation checks the ALIAS's own
+                // declared arity — never the right-hand type's (upstream
+                // `TypeInstantiationTargetTypeDefiningElement`: `Fn<int>`
+                // over `typedef Fn<T, U>` reports `Fn` declared 2, and
+                // `MyList<int>.filled` over `typedef MyList = List`
+                // reports `MyList` declared 0). The anchor splits by parse
+                // shape: a `.` after the group makes it a
+                // `ConstructorReference` — the `NamedType`'s `MyList<int>`
+                // span (`checkNamedType` `.at(node)`); a bare group is the
+                // `TypeInstantiation`'s `<...>` list.
+                if let Some(decl) = self.top_level_decl(row_name)
+                    && decl.kind == MicroKind::TypeAlias
+                    && let Some(declared) = self.declared_type_params(row_name)
+                    && declared != count
+                {
+                    let span = if self.dot_follows_range_end(range) {
+                        SourceRange {
+                            offset: row_offset,
+                            length: range.end() - row_offset,
+                        }
+                    } else {
+                        range
+                    };
+                    let name_text = self.strings.resolve(row_name).to_string();
+                    self.emit3(
+                        SemanticCode::WrongNumberOfTypeArguments,
+                        span,
+                        &name_text,
+                        &declared.to_string(),
+                        &count.to_string(),
+                    );
+                    return;
+                }
                 // A named top-level function tear-off, or an implicit call
                 // reference through a declaration-typed receiver (`c<int>`
                 // checks `call`), or a function-typed local's
@@ -15454,7 +15810,36 @@ impl<'a> Engine<'a> {
                     // face the model cannot render; a broken chain is
                     // opaque. Both suppress (the under-report direction).
                     Walk::Found(_) | Walk::ChainBroken => {}
-                    Walk::Missing => self.check_annotation_arity(container, count, range),
+                    // `recv.name<T>` with `name` outside the member table:
+                    // the group applies to `name` itself — the oracle's
+                    // only arity verdict there is the constructor-selector
+                    // face (`C.new<int>`/`C.id<int>` — `_constructor`,
+                    // `.at(typeArgumentList)`); constructors never declare
+                    // type parameters, so any non-empty group reports. A
+                    // typed receiver's own arity is NEVER the verdict's
+                    // count — `x.expectStaticType<T>`'s `T` binds to the
+                    // unresolved/extension member, and `x`'s type stays
+                    // uninvolved (the `undefined_*`/`disallowedType-`
+                    // `Instantiation` faces own those spellings —
+                    // `FunctionReferenceResolutionTest`'s promoted/
+                    // typeParameter/explicitReceiver rows all carry only
+                    // `undefined_getter`).
+                    Walk::Missing => {
+                        if let Some((class, ctor)) =
+                            self.ctor_arity_target(&recv_ty, row_name)
+                            && count != 0
+                        {
+                            let class = self.strings.resolve(class).to_string();
+                            let ctor = self.strings.resolve(ctor).to_string();
+                            self.emit3(
+                                SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+                                range,
+                                &class,
+                                &ctor,
+                                "",
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -15620,9 +16005,18 @@ impl<'a> Engine<'a> {
     /// type-parameter count against the given count (`dynamic` and
     /// in-scope type parameters declare none; unresolved and external heads
     /// suppress).
+    /// The `NamedType`-face arity check (`_buildTypeArguments`,
+    /// named_type_resolver.dart): the report anchors at the TYPE NODE —
+    /// `head` (the type-name token) through the group's `>` — never the
+    /// bare `<...>` `range` the caller passes for the group's own span
+    /// (the invocation faces keep that span; `.at(typeArgumentList)`).
+    /// `head_offset` is the name token's offset (`C` of `p.C<T>` keeps the
+    /// continuation — the oracle's `NamedType` anchor starts at the leaf
+    /// name, not the prefix).
     pub(crate) fn check_annotation_arity(
         &mut self,
         name: StringId,
+        head_offset: u32,
         count: u16,
         range: SourceRange,
     ) {
@@ -15630,10 +16024,14 @@ impl<'a> Engine<'a> {
             return;
         };
         if declared != count {
+            let span = SourceRange {
+                offset: head_offset,
+                length: range.end() - head_offset,
+            };
             let name_text = self.strings.resolve(name).to_string();
             self.emit3(
                 SemanticCode::WrongNumberOfTypeArguments,
-                range,
+                span,
                 &name_text,
                 &declared.to_string(),
                 &count.to_string(),
@@ -15717,7 +16115,12 @@ impl<'a> Engine<'a> {
     /// [`Engine::check_annotation_arity`] for a continuation head: recover
     /// the written prefix from the head's span and count against the
     /// prefix-scoped element when one exists; bare heads (and continuations
-    /// whose prefix never registered) keep the ordinary lookup.
+    /// whose prefix never registered) keep the ordinary lookup. The report
+    /// anchors at the whole `NamedType` — `head_range`'s name token through
+    /// the group's `>` plus a written `?` (`A<B>?` is one node — the
+    /// oracle's `.at(node)` spans it, `test_class_tooFew`'s `A<A>?`
+    /// `3:1|5`): `range` stays the group's `<...>` span for the offset
+    /// math, never the anchor itself.
     pub(crate) fn check_prefixed_annotation_arity(
         &mut self,
         name: StringId,
@@ -15733,10 +16136,25 @@ impl<'a> Engine<'a> {
             return;
         };
         if declared != count {
+            // `end` is a UTF-16 offset: `byte_of` converts before the `?`
+            // probe so a wide char anywhere upstream cannot desync it.
+            let mut end = range.end();
+            let bytes = self.source.as_bytes();
+            let mut cursor = self.byte_of(end);
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && bytes[cursor] == b'?' {
+                end += 1;
+            }
+            let span = SourceRange {
+                offset: head_range.offset,
+                length: end - head_range.offset,
+            };
             let name_text = self.strings.resolve(name).to_string();
             self.emit3(
                 SemanticCode::WrongNumberOfTypeArguments,
-                range,
+                span,
                 &name_text,
                 &declared.to_string(),
                 &count.to_string(),
@@ -15754,10 +16172,22 @@ impl<'a> Engine<'a> {
     /// (`_buildTypeArguments`, upstream Dart SDK source,
     /// `pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart`:
     /// the count comes from the resolved element, whatever file declared it).
+    /// The declared type-parameter count `checkNamedType` /
+    /// `_buildTypeArguments` counts against (named_type_resolver.dart):
+    /// only a TYPE-DEFINING element answers — classes/mixins/enums/
+    /// extension-types/typedefs through the container and declaration
+    /// faces, `dynamic`/in-scope type parameters as the declared-0
+    /// spellings, `Never` the same (the bottom type is a zero-parameter
+    /// `TypeDefiningElement` upstream — `test_messageText_never`). A
+    /// top-level variable, function, or import prefix is no type — the
+    /// oracle's `*_non_type`/`notAType` faces own those spellings and the
+    /// arity verdict never runs on them (`new A<int>()` over `var A`,
+    /// `extends v<int>` over `int v`, `T<int>` over `void T()`).
     pub(crate) fn declared_type_params(&self, name: StringId) -> Option<u16> {
         if self.members.builtin_types.contains(&name)
             || self.type_params.contains(&name)
             || self.pending_type_params.contains(&name)
+            || name == self.intern("Never")
         {
             return Some(0);
         }
@@ -15811,6 +16241,17 @@ impl<'a> Engine<'a> {
                 .map(|(c, _)| c.type_params)
                 .or_else(|| {
                     self.top_level_decl(name)
+                        .filter(|d| {
+                            matches!(
+                                d.kind,
+                                MicroKind::Class
+                                    | MicroKind::Enum
+                                    | MicroKind::Mixin
+                                    | MicroKind::Extension
+                                    | MicroKind::TypeAlias
+                                    | MicroKind::TypeParam
+                            )
+                        })
                         .map(|d| d.type_params)
                         .or_else(|| {
                             // Defined in a file the index does not carry (the
@@ -15931,14 +16372,10 @@ impl<'a> Engine<'a> {
         if let Some((head, head_range)) = head {
             // Upstream anchors the NamedType arity face at the type node
             // (`named_type_resolver.dart` `_buildTypeArguments`:
-            // `.at(node)`): the head name through the group's `>`, not the
-            // bare `<...>` group (manual face
-            // type_arguments_on_type_variable/1: `S<int>` at 1:11|6).
-            let span = SourceRange {
-                offset: head_range.offset,
-                length: end.range.end() - head_range.offset,
-            };
-            self.check_prefixed_annotation_arity(head, head_range, count, span);
+            // `.at(node)`): the head name through the group's `>` plus a
+            // written `?` — `check_prefixed_annotation_arity` builds that
+            // span from the head token and the group's own range.
+            self.check_prefixed_annotation_arity(head, head_range, count, range);
             return;
         }
         // The metadata annotation's own type-argument group (`@A<int>()`,
@@ -16047,9 +16484,17 @@ impl<'a> Engine<'a> {
                     // The `.new` selector (or one spelled as the class) is
                     // the unnamed face: the explicit arguments check against
                     // the CLASS's declared count, not the constructor's
-                    // (constructors never declare type parameters).
+                    // (constructors never declare type parameters). The
+                    // anchor is the `NamedType` — the class row sits under
+                    // the ctor selector's, `C<int>` of `C<int>.new()`.
                     if ctor == class || self.strings.resolve(ctor) == "new" {
-                        self.check_annotation_arity(class, count, range);
+                        let head = self
+                            .rows
+                            .len()
+                            .checked_sub(2)
+                            .and_then(|i| self.rows.get(i))
+                            .map_or(range.offset, |r| r.range.offset);
+                        self.check_annotation_arity(class, head, count, range);
                         self.check_creation_ref_bounds(class);
                     } else if let BareInfo::Prefix { .. } = self.resolve_bare(class).0 {
                         // The wave-3 reference is `prefix.Class<T>` — the
@@ -16093,7 +16538,14 @@ impl<'a> Engine<'a> {
                     }
                 }
                 None => {
-                    self.check_annotation_arity(class, count, range);
+                    // `new C<int>()`/`const C<int>()`: the class head is
+                    // the stack's top row — the `NamedType` anchor is
+                    // `C<int>` (head through `>`), not the `<...>` alone.
+                    let head = self
+                        .rows
+                        .last()
+                        .map_or(range.offset, |r| r.range.offset);
+                    self.check_annotation_arity(class, head, count, range);
                     self.check_creation_ref_bounds(class);
                 }
             }
@@ -16167,7 +16619,13 @@ impl<'a> Engine<'a> {
                 return;
             }
             if let Some((class, _)) = named_ctor {
-                self.check_annotation_arity(class, count, range);
+                // `C.C<int>`/`C.new<int>` — the class row sits under the
+                // selector's: `C<int>` is the `NamedType` anchor.
+                let head = self
+                    .rows
+                    .get(callee - 1)
+                    .map_or(range.offset, |r| r.range.offset);
+                self.check_annotation_arity(class, head, count, range);
                 return;
             }
             let row = &self.rows[callee];
@@ -16186,7 +16644,8 @@ impl<'a> Engine<'a> {
                 }
                 RowShape::Bare(BareInfo::Container { name, .. }) => {
                     let name = *name;
-                    self.check_annotation_arity(name, count, range);
+                    let head = row.range.offset;
+                    self.check_annotation_arity(name, head, count, range);
                 }
                 _ => {
                     // A function invoked through the implicit-creation
@@ -16228,10 +16687,31 @@ impl<'a> Engine<'a> {
         {
             let declared = container.type_params;
             if declared != count {
+                // `C<int>`/`C<int>?` anchored through the head row — the
+                // `NamedType` span (head through `>`). A `TypeUse` head is
+                // an annotation — a written `?` belongs to the type node
+                // (`checkNamedType` `.at(node)`); a `Bare(Plain)` head is
+                // an expression, where `?` is the ternary's, not the
+                // type's.
+                let mut group_end = range.end();
+                if matches!(target.shape, RowShape::TypeUse(..)) {
+                    let bytes = self.source.as_bytes();
+                    let mut cursor = self.byte_of(group_end);
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    if cursor < bytes.len() && bytes[cursor] == b'?' {
+                        group_end += 1;
+                    }
+                }
+                let span = SourceRange {
+                    offset: target.range.offset,
+                    length: group_end - target.range.offset,
+                };
                 let name_text = self.strings.resolve(target.name).to_string();
                 self.emit3(
                     SemanticCode::WrongNumberOfTypeArguments,
-                    range,
+                    span,
                     &name_text,
                     &declared.to_string(),
                     &count.to_string(),
@@ -17212,3 +17692,13 @@ mod ticket_3436_tests;
 #[cfg(test)]
 #[path = "ticket_3659_tests.rs"]
 mod ticket_3659_tests;
+
+/// The #3723 pins (the `super._f` promoted-receiver latch: a private final
+/// field read through `super` carries the same promotion identity upstream
+/// keys on `SuperPropertyTarget`, so the member-merge arms
+/// `promoted_recv_reads` for `Receiver::Super` exactly like `this` — and a
+/// public or non-final `super` read keeps its unchecked verdict).
+/// Registered here, not in `tests.rs` (other lanes' file), via `#[path]`.
+#[cfg(test)]
+#[path = "ticket_3723_tests.rs"]
+mod ticket_3723_tests;

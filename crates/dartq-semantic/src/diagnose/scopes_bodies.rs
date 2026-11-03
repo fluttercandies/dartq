@@ -1019,6 +1019,29 @@ impl<'a> Engine<'a> {
                 args,
             });
         }
+        // An enum constant resolves as the enum's own type — the same
+        // arm `member()` runs in `const_eval_faces.rs` for the const
+        // face. `walk_members` finds enum constants only where the
+        // container model exposes them as `members` entries; an
+        // imported or augmented enum's `enum_constants` list never
+        // reaches that map, so the walk misses where this arm answers.
+        if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            context,
+        )
+        .is_some_and(|(decl, _)| {
+            decl.kind == ContainerKind::Enum && decl.enum_constants.contains(&name)
+        }) {
+            return Some(Ty::Named {
+                name: context,
+                nullable,
+                args,
+            });
+        }
         let Walk::Found(entry) = self.walk_members(context, name) else {
             return None;
         };
@@ -1468,7 +1491,9 @@ impl<'a> Engine<'a> {
         // The row whose written expression ends just before `token`'s
         // offset — the operand/context expression the position reads.
         // Searched from the shorthand's own index backward in `self.rows`,
-        // then the deferred tail.
+        // then the deferred tail. The `EqEq`/`BangEq` arm below prepends a
+        // `deferred_miss_rows`-first search to dodge the `==` composite's
+        // `Value` row; every other caller keeps this order.
         let operand_row_before = |engine: &Self, end: u32, before: usize| -> Option<Row> {
             engine
                 .rows
@@ -1476,13 +1501,11 @@ impl<'a> Engine<'a> {
                 .take(before)
                 .rev()
                 .find(|c| {
-                    let span = engine.staged_expression_span(c.range);
-                    engine.trivia_between(span.end(), end)
+                    engine.trivia_between(engine.staged_expression_span(c.range).end(), end)
                 })
                 .or_else(|| {
                     engine.deferred_miss_rows.iter().rev().find(|c| {
-                        let span = engine.staged_expression_span(c.range);
-                        engine.trivia_between(span.end(), end)
+                        engine.trivia_between(engine.staged_expression_span(c.range).end(), end)
                     })
                 })
                 .cloned()
@@ -1504,7 +1527,31 @@ impl<'a> Engine<'a> {
             // left operand keeps the under-report rather than a `'_'` the
             // oracle's `left.typeOrThrow` would still fill.
             TK::EqEq | TK::BangEq => {
-                match operand_row_before(self, prev.utf16_offset, self_index) {
+                // The `==`/`!=` fold drains the operand rows to
+                // `deferred_miss_rows` and pushes a `Value` composite
+                // (typed `bool`, spanning the whole binary) onto
+                // `self.rows` — searching `self.rows` first picks that
+                // composite and fabricates a `bool` context for the right
+                // operand's shorthand (`C() == .g` reads `'bool'` where
+                // the oracle resolves `C`). The real operand is the last
+                // `deferred_miss_rows` entry; `self.rows` is the fallback
+                // for shapes that leave no composite (unfolded literals
+                // in a `??` tail, a shorthand's own right operand).
+                let eq_operand = |engine: &Self, end: u32, before: usize| -> Option<Row> {
+                    engine
+                        .deferred_miss_rows
+                        .iter()
+                        .rev()
+                        .find(|c| {
+                            engine.trivia_between(
+                                engine.staged_expression_span(c.range).end(),
+                                end,
+                            )
+                        })
+                        .cloned()
+                        .or_else(|| operand_row_before(engine, end, before))
+                };
+                match eq_operand(self, prev.utf16_offset, self_index) {
                     // A shorthand as the LEFT operand arms no context for
                     // the right — upstream's special-case covers only the
                     // shorthand's own site; the right operand reads `'_'`.
@@ -3398,12 +3445,21 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let fields = self.pattern_fields(lo + 1, close);
+                let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
+                // The required record face (`analyzeRecordPattern`'s
+                // `requiredTypeNamedTypes`): every positional field adds
+                // one `Object?` slot; every named field adds one too, but
+                // a REPEATED name is a `duplicate_record_pattern_field`
+                // row upstream and contributes no second slot.
                 let mut positional = Vec::new();
                 let mut named: Vec<(StringId, Ty)> = Vec::new();
-                let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
                 for (name, _, _, _) in &fields {
                     match name {
-                        Some(name) => named.push((*name, object_q)),
+                        Some(name) => {
+                            if !named.iter().any(|(seen, _)| seen == name) {
+                                named.push((*name, object_q));
+                            }
+                        }
                         None => positional.push(object_q),
                     }
                 }
@@ -3415,40 +3471,57 @@ impl<'a> Engine<'a> {
                 if let Some(at) = self.token_span(lo, hi) {
                     self.emit_irrefutable(at, matched, required);
                 }
-                // Children read their slot's type when the matched record
-                // carries the same shape; every other matched face hands
-                // them `Object?` (`analyzeRecordPattern`'s dispatch). The
-                // per-field answers materialize ahead — the recursion
-                // below needs `&mut self`, so the pool read cannot stay
-                // inside a closure borrow.
-                let slots: Vec<Ty> = {
-                    let pool = self.boundary.pool();
-                    fields
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (name, _, _, _))| {
-                            if let Ty::Record { shape, .. } = matched {
-                                let shape = pool.record_shape(shape);
-                                if shape.positional.len() == positional.len()
-                                    && shape.named.len() == named.len()
-                                {
-                                    return match name {
-                                        Some(name) => shape
-                                            .named
-                                            .iter()
-                                            .find(|(n, _)| n == name)
-                                            .map_or(object_q, |(_, ty)| *ty),
-                                        None => shape
-                                            .positional
-                                            .get(index)
-                                            .copied()
-                                            .unwrap_or(object_q),
-                                    };
+                // Children read their slot's type only when the matched
+                // record carries the same shape — the official
+                // `_matchRecordTypeShape` gate: every named field must
+                // exist on the matched record, the positional fields must
+                // pair one-for-one, and the matched record must carry no
+                // field the pattern leaves out. Every other matched face
+                // hands them `Object?` (`dispatchFields(objectQuestionType)`)
+                // — except `dynamic`, which dispatches `dynamic`.
+                let slots: Vec<Ty> = match matched {
+                    Ty::Record { shape, .. } => {
+                        let pool = self.boundary.pool();
+                        let shape = pool.record_shape(shape);
+                        let mut slots = Vec::with_capacity(fields.len());
+                        let mut positional_cursor = 0usize;
+                        let mut named_seen = 0usize;
+                        let mut same_shape = true;
+                        for (name, _, _, _) in &fields {
+                            match name {
+                                Some(name) => {
+                                    named_seen += 1;
+                                    match shape.named.iter().find(|(n, _)| n == name) {
+                                        Some((_, ty)) => slots.push(*ty),
+                                        None => {
+                                            same_shape = false;
+                                            break;
+                                        }
+                                    }
                                 }
+                                None => match shape.positional.get(positional_cursor) {
+                                    Some(ty) => {
+                                        slots.push(*ty);
+                                        positional_cursor += 1;
+                                    }
+                                    None => {
+                                        same_shape = false;
+                                        break;
+                                    }
+                                },
                             }
-                            object_q
-                        })
-                        .collect()
+                        }
+                        if same_shape
+                            && positional_cursor == shape.positional.len()
+                            && named_seen == named.len()
+                        {
+                            slots
+                        } else {
+                            vec![object_q; fields.len()]
+                        }
+                    }
+                    Ty::Dynamic => vec![Ty::Dynamic; fields.len()],
+                    _ => vec![object_q; fields.len()],
                 };
                 for ((_, fld_lo, fld_hi, _), slot) in fields.iter().zip(slots) {
                     self.irrefutable_node(*fld_lo, *fld_hi, slot, assign);
@@ -3495,15 +3568,19 @@ impl<'a> Engine<'a> {
                 match close_kind {
                     TokenKind::CloseSquare => {
                         // `List<elementType>` — the written arg, else the
-                        // matched list's element, else `Object?`
-                        // (`analyzeListPattern`,
-                        // type_analyzer.dart:979-1009).
+                        // matched list's element, else `dynamic` for a
+                        // `dynamic` matched face and `Object?` otherwise
+                        // (`analyzeListPattern`, type_analyzer.dart:979-1009).
                         let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
                         let element = written
                             .as_ref()
                             .and_then(|args| args.first().copied())
                             .unwrap_or_else(|| {
-                                self.list_element_of(matched).unwrap_or(object_q)
+                                if matched == Ty::Dynamic {
+                                    Ty::Dynamic
+                                } else {
+                                    self.list_element_of(matched).unwrap_or(object_q)
+                                }
                             });
                         let required = {
                             let list = self.intern("List");
@@ -3644,7 +3721,13 @@ impl<'a> Engine<'a> {
                         // Getter-column dispatch: `Name(f: p)` reads
                         // `f`'s column through the written head
                         // (`resolveObjectPatternPropertyGet` —
-                        // [`Self::object_pattern_binder_ty`]).
+                        // [`Self::object_pattern_binder_ty`]). An
+                        // UNRESOLVED getter hands the child `dynamic`
+                        // upstream (`resolveObjectPatternPropertyGet`
+                        // answers `typeProvider.dynamicType` when the
+                        // getter is missing), never `Object?` — the
+                        // column is undecidable here, so the under-report
+                        // direction applies.
                         let head = match required {
                             Ty::Named { name, .. } => Some(name),
                             _ => None,
@@ -3656,9 +3739,7 @@ impl<'a> Engine<'a> {
                                 .and_then(|head| {
                                     getter.and_then(|g| self.object_pattern_binder_ty(head, g))
                                 })
-                                .unwrap_or_else(|| {
-                                    Self::nullable_form(Ty::named(self.intern("Object")))
-                                });
+                                .unwrap_or(Ty::Dynamic);
                             self.irrefutable_node(fld_lo, fld_hi, column, assign);
                         }
                     }
@@ -3936,6 +4017,13 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let (name, sub_lo) = match colon {
+                    // `: pattern` — the field name is omitted and inferred
+                    // from the sub-pattern's variable name
+                    // (`PatternFieldNameImpl.name`: `nameNode.name ??
+                    // pattern.variablePattern?.name`), the same rule the
+                    // object-pattern getter column reads. A sub-pattern
+                    // that is not a variable pattern infers no name.
+                    Some(at) if at == lo => (self.pattern_field_name(at + 1, hi), at + 1),
                     Some(at) => (
                         if matches!(toks[lo].kind, TokenKind::Identifier | TokenKind::Keyword(_))
                             && lo + 1 == at
@@ -3956,6 +4044,88 @@ impl<'a> Engine<'a> {
             i += 1;
         }
         fields
+    }
+
+    /// The name a `: pattern` field infers from its sub-pattern
+    /// (`PatternFieldNameImpl.name`: `nameNode.name ??
+    /// pattern.variablePattern?.name`). Only a variable pattern carries
+    /// one, and the official `variablePattern` getters reach it through
+    /// the transparent wrapper chain — cast (`p as T`), null-assert
+    /// (`p!`), null-check (`p?`) and parenthesized (`(p)`) all forward to
+    /// their operand. A leaf is `name` or `T name`, optionally behind a
+    /// `var`/`final` modifier. Every other shape (container, record,
+    /// constant, relational, logical) answers `None`.
+    fn pattern_field_name(&self, lo: usize, hi: usize) -> Option<StringId> {
+        let toks = self.tokens.as_slice();
+        let mut lo = lo;
+        let mut hi = hi;
+        loop {
+            if lo >= hi {
+                return None;
+            }
+            if toks[lo].kind == TokenKind::OpenParen {
+                let close = self.tokens.matching_end(lo)?;
+                if close + 1 != hi {
+                    return None;
+                }
+                lo += 1;
+                hi = close;
+                continue;
+            }
+            // A depth-0 `as` casts, and the variable pattern is its
+            // operand (`CastPatternImpl.variablePattern`).
+            let mut depth = 0i32;
+            let mut cast = None;
+            for i in lo..hi {
+                match toks[i].kind {
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        depth += 1;
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth -= 1;
+                    }
+                    TokenKind::Keyword(Keyword::As) if depth == 0 => cast = Some(i),
+                    _ => {}
+                }
+            }
+            if let Some(as_at) = cast {
+                hi = as_at;
+                continue;
+            }
+            // `p!` / `p?` unwrap to `p`.
+            match toks.get(hi - 1).map(|t| t.kind) {
+                Some(TokenKind::Bang | TokenKind::Question) => {
+                    hi -= 1;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        // The `var`/`final` modifier is the leaf's own keyword.
+        while lo < hi
+            && matches!(
+                toks[lo].kind,
+                TokenKind::Keyword(Keyword::Var | Keyword::Final)
+            )
+        {
+            lo += 1;
+        }
+        if lo >= hi {
+            return None;
+        }
+        // A bare `name`, or a declared `T name` leaf. A `_` is a WILDCARD
+        // pattern, not a variable pattern (`WildcardPatternImpl` inherits
+        // the base `variablePattern => null`), so it infers no name and
+        // the field stays positional.
+        let name_at = if hi == lo + 1 {
+            matches!(toks[lo].kind, TokenKind::Identifier).then_some(lo)
+        } else {
+            let mut carry = 0u32;
+            let (_, next) = self.reconstruct_ty_at(lo, &mut carry)?;
+            (next + 1 == hi && matches!(toks[next].kind, TokenKind::Identifier)).then_some(next)
+        }?;
+        let text = &self.source[toks[name_at].byte_range()];
+        (text != "_").then(|| self.intern(text))
     }
 
     /// The `List<X>` element face of a matched named type, `None` when
@@ -4020,12 +4190,25 @@ impl<'a> Engine<'a> {
     /// under-reports, never fabricates).
     fn emit_irrefutable(&mut self, at: SourceRange, matched: Ty, required: Ty) {
         // The undecidable faces answer NOTHING, never a fabricated row: a
+        // `dynamic` matched type (every upstream check site spells
+        // `matchedValueType is! SharedDynamicType`, so the sentinel never
+        // reaches the lattice whatever `strict-casts` says), a
         // scope-parameter matched head (the name level cannot read its
         // bound, so upstream's `isSubtypeOf` question stays open — the
-        // `T` vs `int` shape) and an unresolvable/invalid head both leave
+        // `T` vs `int` shape) and an unresolvable/invalid head all leave
         // the verdict `None`.
+        if matches!(matched, Ty::Dynamic | Ty::Unknown) || self.is_invalid_ty(matched) {
+            return;
+        }
+        // The 0c rule's other leg: `isAssignableTo` answers `true` when
+        // EITHER side is `InvalidType` (subtype.dart:274-276), so an
+        // unresolvable required head — `var Rectangle(:x) = o` with the
+        // class undefined — is silent here rather than a mismatch row.
+        if self.is_invalid_ty(required) {
+            return;
+        }
         if let Ty::Named { name, .. } = matched
-            && (self.is_scope_param(name) || self.is_invalid_ty(matched))
+            && self.is_scope_param(name)
         {
             return;
         }
@@ -4422,6 +4605,13 @@ impl<'a> Engine<'a> {
                 Some(u32::MAX - depth as u32)
             } else if self.switch.if_case_window {
                 if_case_site = true;
+                // The window's first binder latches the join floor at its
+                // own index (#3691): a same-name binder of an EARLIER
+                // head sits below it and must stay unreachable — upstream
+                // mints each `DeclaredVariablePattern` its own element.
+                self.switch
+                    .if_case_binder_floor
+                    .get_or_insert(self.locals.len());
                 None
             } else {
                 // A statement-level pattern-declared variable joins the
@@ -4480,6 +4670,12 @@ impl<'a> Engine<'a> {
         let Some(&lo) = self.frame_local_marks.last() else {
             return;
         };
+        // The if-case floor (#3691): inside an open window the sibling
+        // scan starts at the head's own first binder, so a completed
+        // head's same-named row below it can no longer be joined — its
+        // element is spent. Outside a window (the for-in conversion) the
+        // floor is `None` and the frame mark bounds as before.
+        let lo = lo.max(self.switch.if_case_binder_floor.unwrap_or(0));
         let name = self.locals[index].name;
         let Some(offset) = self.locals[lo..index]
             .iter()

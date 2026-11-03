@@ -19,21 +19,21 @@
 //! re-deriving the shape:
 //!
 //! - `if_case_element_else_does_not_see_the_binder` — C10, oracle
-//!   `.third/co19/LanguageFeatures/Patterns/scope_A06_t02`. Owner:
+//!   co19 case `LanguageFeatures/Patterns/scope_A06_t02`. Owner:
 //!   `diagnose/listener.rs` (`begin_if_control_flow` /
 //!   `handle_then_control_flow` / `end_if_else_control_flow` never fire
 //!   `if_condition_begin`/`if_then_begin`/`if_then_end`, so an if-case
 //!   **element**'s binders never close — the if-**statement** pair at
 //!   `begin_then_statement`/`begin_else_statement` is the only wiring).
 //! - `augment_declared_members_join_the_introduced_class` — C6, oracle
-//!   `.third/co19/LanguageFeatures/Augmentations/scoping_A01_t01`. Owner:
+//!   co19 case `LanguageFeatures/Augmentations/scoping_A01_t01`. Owner:
 //!   `collector.rs` (`Builder::member_scopes` is built per unit, so an
 //!   `augment class C` in a part file opens a fresh `MemberScope` instead
 //!   of joining the introduction's — the merge key must resolve across the
 //!   library's units, the way upstream keys the context on the merged
 //!   element's first fragment).
 //! - `wildcard_type_parameter_does_not_bind` — C11, oracle
-//!   `.third/co19/LanguageFeatures/Wildcards/binding_A01_t08`. Owner:
+//!   co19 case `LanguageFeatures/Wildcards/binding_A01_t08`. Owner:
 //!   `collector.rs`/`resolution.rs` (`resolve_bare`'s `type_params` arm;
 //!   upstream a wildcard `_` declaration introduces no element).
 

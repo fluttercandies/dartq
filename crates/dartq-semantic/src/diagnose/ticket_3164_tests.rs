@@ -47,13 +47,22 @@ fn assert_void_rows(report: &FileReport, expected: &[(usize, u32)], others: &[&s
 /// `Void` static type; the binary LEFT operand is checked for every
 /// operator (error_verifier.dart:482). A `MethodInvocation` operand
 /// anchors at the callee's name token — `v` inside `v() + 1`, length 1
-/// (error_detection_helpers.dart:250-252 `.at(methodName)`).
+/// (error_detection_helpers.dart:250-252 `.at(methodName)`). The `+`
+/// operator's own nullable-operand face reports beside it — the oracle
+/// emits both rows (`dart analyze` 3.13.7, `~/.dartq-oracle/3.13.7`,
+/// the fixture verbatim: `error - main.dart:3:3 - use_of_void_result`
+/// plus `error - main.dart:3:7 - unchecked_use_of_nullable_value`).
 #[test]
 fn ticket_3164_binary_left_invocation_anchors_method_name() {
     let fixture = "void v() {}\nvoid main() {\n  v() + 1;\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert_eq!(names, ["use_of_void_result"], "{:?}", rows(&report));
+    assert_eq!(
+        names,
+        ["use_of_void_result", "unchecked_use_of_nullable_value"],
+        "{:?}",
+        rows(&report)
+    );
     let diagnostic = &report.diagnostics[0];
     assert_eq!(diagnostic.message, VOID_MSG);
     let offset =
@@ -209,17 +218,32 @@ fn ticket_3164_condition_operands_report_void() {
 /// The ternary condition is the same `checkForNonBoolExpression` face —
 /// `v() ? 1 : 2` reports at `v`, and the `non_bool_condition` arm stays
 /// silent (`known_non_bool(void)` is false — the `void` operand is the
-/// void check's own verdict).
+/// void check's own verdict). The `var x` declarator rides the ordinary
+/// unused-local face beside it — the oracle emits both rows (`dart
+/// analyze` 3.13.7, `~/.dartq-oracle/3.13.7`, the fixture verbatim:
+/// `error - main.dart:3:11 - use_of_void_result` plus `warning -
+/// main.dart:3:7 - unused_local_variable`; the engine's source-ordered
+/// list puts the earlier `x` token first).
 #[test]
 fn ticket_3164_ternary_condition_reports_void() {
     let fixture = "void v() {}\nvoid main() {\n  var x = v() ? 1 : 2;\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert_eq!(names, ["use_of_void_result"], "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v()").unwrap();
     assert_eq!(
-        report.diagnostics[0].range.offset as usize, offset,
+        names,
+        ["unused_local_variable", "use_of_void_result"],
+        "{:?}",
+        rows(&report)
+    );
+    let offset =
+        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let void_row = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "use_of_void_result")
+        .expect("use_of_void_result row");
+    assert_eq!(
+        void_row.range.offset as usize, offset,
         "{:?}",
         rows(&report)
     );

@@ -2369,9 +2369,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         let at = self.peek_span();
         self.report(msg::expected_body(), at);
+        // Official `insertBlock` (:5006-5023) splices the `{}` pair right
+        // after `token` — BEFORE `next` — so a pending split-closer
+        // remainder stays the body's follower instead of draining with the
+        // caller's skip to `close` (oracle `f<T>>()`: the remainder `>`
+        // surfaces to the member loop as `top_level_operator`).
         let offset = at.range.offset;
+        let pending = self.cursor.detach_queue();
         let open = self.synthetic(TokenKind::OpenCurly, offset);
         let close = self.synthetic(TokenKind::CloseCurly, offset);
+        self.cursor.attach_queue(pending);
         (open, close)
     }
 

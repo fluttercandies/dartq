@@ -81,7 +81,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use dartq_types::{
     Boundedness, CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy,
     TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedType,
-    Variance, instantiate_type_formals_to_bounds, is_well_bounded, replace_top_bottom,
+    Variance, instantiate_type_formals_to_bounds, is_well_bounded, regular_bounded_issues,
     replace_top_bottom_with_facts, variance_in_type,
 };
 
@@ -2521,9 +2521,82 @@ impl<'a> Bounds<'a> {
         };
         // The super pass is forbidden at extension-type elements
         // (:750-752); annotation sites allow it.
-        let system = snapshot.system_with(facts);
-        match is_well_bounded(&system, facts, instantiation, allow_super) {
-            Boundedness::NotWellBounded(issues) => {
+        let merged_facts = snapshot.merged_facts(facts);
+        let system = snapshot.system_with(&merged_facts);
+        // `_isRegularBounded` first (well_bounded.dart:74-119), then —
+        // where super-bounded types are allowed — the inverted re-check.
+        // The inversion's own form is decided below: a written argument
+        // list inverts at the WRITTEN level (`Self::invert_to_ty`) so an
+        // alias application's declared variance shields its subtree the
+        // way the oracle's `_instantiatedTypeAlias` arm does
+        // (replace_top_bottom_visitor.dart:63-86) — a correlation the
+        // fully expanded TypeId-level walk cannot reproduce (an
+        // invariant alias argument's occurrences spread across return
+        // and formal positions and would flip independently, fabricating
+        // a passing inverted type and silently dropping the row the
+        // oracle reports).
+        let regular = regular_bounded_issues(&system, &merged_facts, instantiation);
+        let mut inverted_ty: Option<TypeId> = None;
+        let mut issues = regular;
+        if !issues.is_empty() && allow_super {
+            let inverted = if raw {
+                // A bare head's instantiation is already the
+                // instantiate-to-bounds answer: the arguments it carries
+                // are the grounded bound trees — the same written-level
+                // inversion, not the expanded walk (#3617: a bare `A`
+                // over `X extends G<C<X>>` must see `G<C<Never>>`, the
+                // invariant-shielded answer, not `C<Never>
+                // Function(C<dynamic>)`).
+                match Self::invert_instantiation(
+                    &self.index,
+                    &snapshot,
+                    &merged_facts,
+                    decl,
+                    &head_params,
+                    &head_bounds,
+                    args,
+                    &scope,
+                    true,
+                ) {
+                    Some(inverted) => inverted,
+                    None => replace_top_bottom_with_facts(
+                        &system,
+                        &merged_facts,
+                        instantiation,
+                    ),
+                }
+            } else {
+                match Self::invert_instantiation(
+                    &self.index,
+                    &snapshot,
+                    &merged_facts,
+                    decl,
+                    &head_params,
+                    &head_bounds,
+                    args,
+                    &scope,
+                    false,
+                ) {
+                    Some(inverted) => inverted,
+                    None => replace_top_bottom_with_facts(
+                        &system,
+                        &merged_facts,
+                        instantiation,
+                    ),
+                }
+            };
+            let inverted_issues = regular_bounded_issues(&system, &merged_facts, inverted);
+            if inverted_issues.is_empty() {
+                issues = Vec::new();
+            } else {
+                inverted_ty = Some(inverted);
+                issues = inverted_issues;
+            }
+        }
+        if issues.is_empty() {
+            return Vec::new();
+        }
+        {
                 // The type-parameter-argument gate (see `check_named`).
                 // An issue on an in-scope parameter argument `X`/`X?`
                 // keeps only when `X <: B` is decided false — the official
@@ -2616,21 +2689,16 @@ impl<'a> Bounds<'a> {
                 // The context face (`type_arguments_verifier.dart:427-465`):
                 // where the super-bounded pass ran, every report carries the
                 // inverted type's row — and the issues ARE the inverted
-                // pass's there (`is_well_bounded` reports those), so the
+                // pass's there (`_isSuperBounded` reports those), so the
                 // display re-runs the same inversion. The extension-type
                 // face skips the pass upstream too. A bare head keys the
-                // raw-type context row on the i2b instantiation. The
-                // inversion is the FACTS-carrying one — the same
-                // `replace_top_bottom_with_facts` the verdict ran inside
-                // `is_well_bounded`: an alias parameter's computed
-                // variance decides whether an argument flips at all, so
-                // the facts-less `replace_top_bottom` inverted the
-                // message's substitution where the verdict (correctly)
-                // flipped nothing (`G<X> = void Function(X)` keeps
-                // `A<dynamic>` — a contravariant parameter's top argument
-                // is not a covariant top).
-                let inverted_ty = allow_super
-                    .then(|| replace_top_bottom_with_facts(&system, facts, instantiation));
+                // raw-type context row on the i2b instantiation.
+                // `inverted_ty` is the instantiation the failing pass
+                // checked — the written-level alias-faithful inversion
+                // (`Self::invert_instantiation`), or the expanded
+                // `replace_top_bottom_with_facts` answer where a written
+                // inversion could not be derived. The display reads the
+                // same type the verdict rested on.
                 let inverted = inverted_ty.map(|ty| snapshot.display(ty));
                 let raw_instantiated = raw.then(|| snapshot.display(instantiation));
                 // The message's argument and bound are the WRITTEN
@@ -2771,9 +2839,393 @@ impl<'a> Bounds<'a> {
                         raw_instantiated: raw_instantiated.clone(),
                     })
                     .collect()
-            }
-            _ => Vec::new(),
         }
+    }
+
+    /// The alias-faithful inverted instantiation of a checked head (#3617):
+    /// `replaceTopAndBottom` applied to the WRITTEN argument trees (or, for
+    /// a bare head, the grounded bound trees — the instantiate-to-bounds
+    /// arguments as written), then mapped to the snapshot's interned types
+    /// and interned under the same declaration. The oracle's visitor keeps
+    /// each alias application's decoration and folds the alias parameter's
+    /// declared variance into the walk
+    /// (`_instantiatedTypeAlias`, upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/replace_top_bottom_visitor.dart`),
+    /// so an invariant alias parameter shields its whole subtree — a
+    /// correlation the expanded TypeId-level inversion cannot reproduce:
+    /// `A<G<A<Never>>>` over `typedef G<X> = X Function(X)` inverts to
+    /// itself upstream (X invariant), where the expanded `C<Never>
+    /// Function(C<Never>)` flips its contravariant formal independently to
+    /// `C<Never> Function(C<Object?>)`, fabricating a passing inverted
+    /// pass and silently dropping the reported row.
+    ///
+    /// `None` where some subtree could not be inverted faithfully (an
+    /// unmodelable shape); the caller then keeps the expanded
+    /// `replace_top_bottom_with_facts` answer — the under-report
+    /// direction, never a fabricated report.
+    #[expect(clippy::too_many_arguments)]
+    fn invert_instantiation<'s>(
+        index: &'s BoundsIndex,
+        snapshot: &'s Snapshot<'a>,
+        facts: &'s ParamFactsTable,
+        decl: TypeDeclId,
+        head_params: &'s [StringId],
+        head_bounds: &'s [(Option<TypeTree>, bool)],
+        args: &'s [TypeTree],
+        scope: &'s FxHashMap<StringId, TypeParamId>,
+        raw: bool,
+    ) -> Option<TypeId> {
+        let params = snapshot.decl_params.get(&decl)?;
+        let grounded;
+        let arg_trees: &[TypeTree] = if raw {
+            grounded = snapshot.grounded_bound_trees(decl, head_params, head_bounds);
+            &grounded
+        } else {
+            args
+        };
+        if arg_trees.len() != params.len() {
+            return None;
+        }
+        let mut inverted_args = Vec::with_capacity(arg_trees.len());
+        for (arg, &param) in arg_trees.iter().zip(params.iter()) {
+            let variance = snapshot.facts.get(param).variance;
+            // The top-level probe runs at `Variance.covariant`
+            // (replace_top_bottom_visitor.dart:120) — the argument's own
+            // position combines its parameter's declared variance with
+            // that incoming face (`typeParameter.variance.combine`, :78).
+            let ty = Self::invert_to_ty(
+                index,
+                snapshot,
+                facts,
+                arg,
+                scope,
+                variance.combine(Variance::Covariant),
+                0,
+            )?;
+            inverted_args.push(ty);
+        }
+        Some(
+            snapshot
+                .table
+                .intern(UninternedType::Interface { decl, args: inverted_args }, false),
+        )
+    }
+
+    /// `ReplaceTopBottomVisitor.process` over one WRITTEN tree
+    /// (replace_top_bottom_visitor.dart:20-121): the node's mapped shape
+    /// answers the `S <: Never` / `isTop` probes, and the walk then
+    /// descends the visitor's own arms — an interface or alias
+    /// application's arguments at each parameter's declared variance
+    /// combined with the incoming position (:78 / :99), a `FutureOr`
+    /// base at the incoming position, a function type's return at the
+    /// incoming position and its formal columns at the contravariant
+    /// combination (:47-53), a record node passed through unchanged
+    /// (the visitor has no record arm, :43). A bare parameterized head
+    /// resolves to its instantiate-to-bounds arguments as written
+    /// ([`Snapshot::grounded_bound_trees`]) — the alias decorations the
+    /// oracle's instantiated type keeps.
+    ///
+    /// `None` where a subtree fails to map — the same refusal contract
+    /// `map_tree` carries.
+    #[expect(clippy::too_many_arguments)]
+    fn invert_to_ty<'s>(
+        index: &'s BoundsIndex,
+        snapshot: &'s Snapshot<'a>,
+        facts: &'s ParamFactsTable,
+        tree: &TypeTree,
+        scope: &'s FxHashMap<StringId, TypeParamId>,
+        variance: Variance,
+        depth: u32,
+    ) -> Option<TypeId> {
+        let ctx = snapshot.ctx();
+        let system = snapshot.system_with(facts);
+        const DEPTH_LIMIT: u32 = 100;
+        if depth > DEPTH_LIMIT {
+            return ctx.map_tree(tree, scope);
+        }
+        if tree.poisoned {
+            return None;
+        }
+        // A record node has no visitor arm (:43) — pass the mapped shape
+        // through (the enclosing check refused records anyway).
+        if tree.record.is_some() {
+            return ctx.map_tree(tree, scope);
+        }
+        // A function node is neither top nor bottom — the position probe
+        // cannot fire — and `map_function`'s binder allocation must run
+        // exactly once per signature, so the walk goes straight to the
+        // structural arm.
+        if let Some(function) = &tree.function {
+            return Self::invert_function(
+                index,
+                snapshot,
+                facts,
+                function,
+                scope,
+                variance,
+                tree.nullable,
+                depth,
+            );
+        }
+        let mapped = ctx.map_tree(tree, scope)?;
+        let never = snapshot.table.intern(UninternedType::Never, false);
+        let object_q = snapshot.table.intern(
+            UninternedType::Interface {
+                decl: snapshot.hierarchy.core().object,
+                args: Vec::new(),
+            },
+            true,
+        );
+        // The position probe (replace_top_bottom_visitor.dart:20-33):
+        // `S <: Never` at a contravariant occurrence answers `Object?`,
+        // `isTop` at every other position answers `Never`. The bottom
+        // probe's type-parameter leg rides the merged facts face like
+        // `answers_bottom` (a bound that is itself `S <: Never` answers
+        // bottom for the variable).
+        if variance == Variance::Contravariant {
+            let leaf = snapshot.table.get(mapped);
+            let param_bottom = !leaf.is_nullable()
+                && matches!(leaf.kind(), TypeKind::TypeParameter { parameter }
+                    if facts
+                        .get(parameter)
+                        .bound
+                        .is_some_and(|bound| system.is_subtype(bound, never)));
+            if system.is_subtype(mapped, never) || param_bottom {
+                return Some(object_q);
+            }
+        } else if system.is_top(mapped) {
+            return Some(never);
+        }
+        // Structural arms. A scope-resolved leaf or a head the registry
+        // does not carry has nothing to descend — the mapped answer
+        // stands.
+        if scope.contains_key(&tree.head) {
+            return Some(mapped);
+        }
+        let text = ctx.strings.resolve(tree.head);
+        let shadowed = matches!(text, "Null" | "Never" | "FutureOr")
+            && ctx.registry.contains_key(&tree.head);
+        if !shadowed && text == "FutureOr" && tree.args.len() == 1 {
+            let base = Self::invert_to_ty(
+                index,
+                snapshot,
+                facts,
+                &tree.args[0],
+                scope,
+                variance,
+                depth + 1,
+            )?;
+            return Some(
+                snapshot
+                    .table
+                    .intern(UninternedType::FutureOr { base }, tree.nullable),
+            );
+        }
+        let Some(&decl) = ctx.registry.get(&tree.head) else {
+            return Some(mapped);
+        };
+        let Some(params) = ctx.decl_params.get(&decl) else {
+            return Some(mapped);
+        };
+        if params.is_empty() {
+            return Some(mapped);
+        }
+        // The argument list as written, or the bare head's
+        // instantiate-to-bounds arguments as written.
+        let grounded;
+        let arg_trees: &[TypeTree] = if tree.args.len() == params.len() {
+            &tree.args
+        } else if tree.args.is_empty() {
+            let Some((names, bounds)) = Self::captured_param_faces(index, tree.head) else {
+                return Some(mapped);
+            };
+            grounded = snapshot.grounded_bound_trees(decl, &names, &bounds);
+            &grounded
+        } else {
+            // An arity mismatch — the enclosing check refused the map
+            // upstream of this walk; keep the mapped answer.
+            return Some(mapped);
+        };
+        let mut inverted_args = Vec::with_capacity(arg_trees.len());
+        for (arg, &param) in arg_trees.iter().zip(params.iter()) {
+            let declared = snapshot.facts.get(param).variance;
+            inverted_args.push(Self::invert_to_ty(
+                index,
+                snapshot,
+                facts,
+                arg,
+                scope,
+                declared.combine(variance),
+                depth + 1,
+            )?);
+        }
+        let map: Vec<(TypeParamId, TypeId)> =
+            params.iter().copied().zip(inverted_args.iter().copied()).collect();
+        if let Some(&expansion) = ctx.alias_expansions.get(&decl) {
+            // The alias arm instantiates the decorated type
+            // (`aliasElement.instantiateImpl`, :82-85) — the snapshot
+            // answer is the expansion substituted with the inverted
+            // arguments, the use-site `?` landing on the instantiated
+            // alias like `map_tree`'s own arm.
+            let substituted = snapshot.table.substitute(expansion, &map);
+            return Some(if tree.nullable {
+                snapshot.table.with_nullability(substituted, true)
+            } else {
+                substituted
+            });
+        }
+        Some(
+            snapshot
+                .table
+                .intern(UninternedType::Interface { decl, args: inverted_args }, tree.nullable),
+        )
+    }
+
+    /// The written `(param names, bound faces)` pair of an in-file
+    /// declaration's captured parameters — the bare-head arm of
+    /// [`Self::invert_to_ty`]'s grounded-tree source.
+    fn captured_param_faces(
+        index: &BoundsIndex,
+        head: StringId,
+    ) -> Option<(Vec<StringId>, Vec<(Option<TypeTree>, bool)>)> {
+        if let Some(capture) = index.containers.get(&head) {
+            return Some((capture.params.clone(), capture.bounds.clone()));
+        }
+        let alias = index.aliases.get(&head)?;
+        Some((
+            alias.params.iter().map(|(name, _, _)| *name).collect(),
+            alias
+                .params
+                .iter()
+                .map(|(_, bound, poisoned)| (bound.clone(), *poisoned))
+                .collect(),
+        ))
+    }
+
+    /// `ReplaceTopBottomVisitor._functionType` over a written signature
+    /// (replace_top_bottom_visitor.dart:46-61): the signature's own type
+    /// parameters are kept verbatim (`typeParameters:
+    /// type.typeParameters`, :56) — the same fresh-id-per-signature
+    /// allocation and bound recording `map_function` performs — while the
+    /// return type processes at the incoming variance and every formal
+    /// column at the contravariant combination.
+    #[expect(clippy::too_many_arguments)]
+    fn invert_function<'s>(
+        index: &'s BoundsIndex,
+        snapshot: &'s Snapshot<'a>,
+        facts: &'s ParamFactsTable,
+        function: &FnTree,
+        scope: &'s FxHashMap<StringId, TypeParamId>,
+        variance: Variance,
+        nullable: bool,
+        depth: u32,
+    ) -> Option<TypeId> {
+        let ctx = snapshot.ctx();
+        // The binder allocation mirrors `map_function` verbatim: fresh
+        // ids per signature (the table's "globally unique per
+        // declaration" contract), the shared binder faces recording each
+        // declared bound in the PARENT scope, and the binders joining
+        // the child scope for the signature's own columns.
+        let mut type_parameters = Vec::with_capacity(function.type_params_named.len());
+        let mut child_scope: Option<FxHashMap<StringId, TypeParamId>> = None;
+        for (name, _) in &function.type_params_named {
+            let id = TypeParamId::from_raw(ctx.next_param.get());
+            ctx.next_param.set(ctx.next_param.get() + 1);
+            ctx.binder_names
+                .borrow_mut()
+                .insert(id, ctx.strings.resolve(*name).to_string());
+            type_parameters.push(id);
+            child_scope
+                .get_or_insert_with(|| scope.clone())
+                .insert(*name, id);
+        }
+        let body_scope = child_scope.as_ref().unwrap_or(scope);
+        for ((_, bound), &id) in function
+            .type_params_named
+            .iter()
+            .zip(type_parameters.iter())
+        {
+            let bound_ty = match bound {
+                Some(tree) => ctx.map_tree(tree, body_scope),
+                None => None,
+            };
+            ctx.binder_facts.borrow_mut().set(
+                id,
+                ParamFacts {
+                    variance: Variance::Covariant,
+                    bound: bound_ty,
+                },
+            );
+        }
+        let ret = match &function.ret {
+            Some(tree) => Self::invert_to_ty(
+                index, snapshot, facts, tree, body_scope, variance, depth + 1,
+            )?,
+            // An unwritten return type reads `dynamic` (a bare
+            // `Function(...)` head) — and `dynamic` is a top type, so the
+            // position probe the written arm runs applies here too
+            // (replace_top_bottom_visitor.dart:27-33 visits the resolved
+            // return, never the written spelling): `Never` at every
+            // non-contravariant occurrence, unchanged `dynamic` at a
+            // contravariant one (it is not `S <: Never`).
+            None if variance == Variance::Contravariant => {
+                ctx.table.intern(UninternedType::Dynamic, false)
+            }
+            None => snapshot.table.intern(UninternedType::Never, false),
+        };
+        let contravariant = variance.combine(Variance::Contravariant);
+        let positional = function
+            .positional
+            .iter()
+            .map(|tree| {
+                Self::invert_to_ty(
+                    index,
+                    snapshot,
+                    facts,
+                    tree,
+                    body_scope,
+                    contravariant,
+                    depth + 1,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let named = function
+            .named
+            .iter()
+            .map(|(name, tree)| {
+                Some(NamedMember {
+                    name: ctx.strings.resolve(*name).to_string(),
+                    ty: Self::invert_to_ty(
+                        index,
+                        snapshot,
+                        facts,
+                        tree,
+                        body_scope,
+                        contravariant,
+                        depth + 1,
+                    )?,
+                    required: true,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // `required_positional` mirrors `map_function`'s own answer
+        // (`positional.len()`): the inverted signature must intern
+        // identically to the same shape the mapper produced, or the
+        // bound-side comparison sees a different signature.
+        let required_positional = u32::try_from(positional.len()).ok()?;
+        snapshot
+            .table
+            .intern_function(
+                UninternedFunction {
+                    return_type: ret,
+                    type_parameters,
+                    positional,
+                    named,
+                    required_positional,
+                },
+                nullable,
+            )
+            .ok()
     }
 
     /// The declared bounds a use-site check reads for its in-scope type
@@ -2960,9 +3412,10 @@ impl<'a> Bounds<'a> {
         let Some(params) = snapshot.decl_params.get(&decl) else {
             return false;
         };
-        let system = snapshot.system();
         let instantiated =
             instantiate_type_formals_to_bounds(&snapshot.table, &snapshot.facts, params);
+        let merged_facts = snapshot.merged_facts(&snapshot.facts);
+        let system = snapshot.system_with(&merged_facts);
         let values_element = snapshot.table.intern(
             UninternedType::Interface {
                 decl,
@@ -2971,7 +3424,7 @@ impl<'a> Bounds<'a> {
             false,
         );
         matches!(
-            is_well_bounded(&system, &snapshot.facts, values_element, true),
+            is_well_bounded(&system, &merged_facts, values_element, true),
             Boundedness::NotWellBounded(_)
         )
     }
@@ -3172,7 +3625,8 @@ impl<'a> Bounds<'a> {
                 0,
             ));
         }
-        let system = snapshot.system();
+        let merged_facts = snapshot.merged_facts(&snapshot.facts);
+        let system = snapshot.system_with(&merged_facts);
         let mut rows = Vec::new();
         for (index, (&param, &bound)) in params.iter().zip(&bounds).enumerate() {
             if !snapshot.type_is_safe(bound) {
@@ -3434,7 +3888,10 @@ impl<'a> Bounds<'a> {
                         TypeKind::Interface { .. }
                     )
                 {
-                    row.verdict = Some(snapshot.system().is_subtype(rep_ty, face_ty));
+                    let merged_facts = snapshot.merged_facts(&snapshot.facts);
+                    row.verdict = Some(
+                        snapshot.system_with(&merged_facts).is_subtype(rep_ty, face_ty),
+                    );
                     row.displays = Some((snapshot.display(face_ty), snapshot.display(rep_ty)));
                 }
                 row
@@ -3533,6 +3990,17 @@ struct Snapshot<'a> {
     /// the id.
     lazy_params: RefCell<FxHashMap<StringId, (TypeParamId, String)>>,
     next_param: Cell<u32>,
+    /// Generic-function-type binder facts: a written signature's own
+    /// `X extends B` declarations (`T extends void Function<U extends
+    /// B>()`) mapped at whatever scope declared them. The subtype walk's
+    /// bounded-quantification leg (`relateTypeParameters`,
+    /// type_system.dart:1594-1635) reads these by id through the merged
+    /// facts face ([`Snapshot::merged_facts`]); without them every
+    /// signature binder reads `dynamic` and the leg is vacuous.
+    binder_facts: RefCell<ParamFactsTable>,
+    /// Generic-function-type binder display text (`param_text`'s fallback
+    /// face for ids allocated per signature, not through `lazy_params`).
+    binder_names: RefCell<FxHashMap<TypeParamId, String>>,
 }
 
 /// The tree-mapping context: the shared pieces of the build-time edge
@@ -3555,6 +4023,11 @@ struct MapCtx<'a, 'b> {
     alias_decls: &'b FxHashSet<TypeDeclId>,
     lazy_params: &'b RefCell<FxHashMap<StringId, (TypeParamId, String)>>,
     next_param: &'b Cell<u32>,
+    /// Shared GFT-binder faces (`map_function` writes, the verdict's
+    /// merged facts and `param_text` read) — one instance per snapshot so
+    /// every map call inside a check lands in the same overlay.
+    binder_facts: &'b RefCell<ParamFactsTable>,
+    binder_names: &'b RefCell<FxHashMap<TypeParamId, String>>,
 }
 
 impl MapCtx<'_, '_> {
@@ -3620,41 +4093,87 @@ impl MapCtx<'_, '_> {
     /// optional formal read required can only make the written side
     /// accept MORE (a bound) or report nothing new (the official
     /// optional formal admits every call the required reading does).
-    /// The signature's own type variables reuse the shared per-name lazy
-    /// ids (their written bounds stay unmapped — the official checks
-    /// those at the declaration site, #2878); a formal that fails to map
-    /// defers the whole function (`None`, the under-report direction).
+    /// A formal that fails to map defers the whole function (`None`,
+    /// the under-report direction).
+    ///
+    /// The signature's own type variables get FRESH ids per signature —
+    /// the table's "globally unique per declaration" contract
+    /// (substitute never rewrites a binder id, and `function_subtype`'s
+    /// bounds leg keys facts by id). They are NOT `lazy_params` entries:
+    /// that face is name-keyed for site-side parameters, so two
+    /// signatures both declaring `T` would collide on one id — and one
+    /// id can carry only one facts bound, misarming
+    /// `relateTypeParameters`. Each binder's declared bound maps in the
+    /// PARENT scope (a bound may name the enclosing parameter: `T
+    /// extends void Function<U extends B>` resolves `B` through the
+    /// caller's scope) into `binder_facts`, the overlay the verdict's
+    /// merged facts face reads; the id and its display name land in
+    /// `binder_names` for `param_text`. The binders then JOIN the scope
+    /// for the signature's own body — `U extends B`, `B` in a return or
+    /// formal position resolves through the child map, matching the
+    /// official scope chain where the signature's variables shadow the
+    /// enclosing ones.
     fn map_function(
         &self,
         function: &FnTree,
         scope: &FxHashMap<StringId, TypeParamId>,
         nullable: bool,
     ) -> Option<TypeId> {
+        let mut type_parameters = Vec::with_capacity(function.type_params_named.len());
+        // Allocation precedes mapping: every sibling binder is in scope
+        // for every bound — the official scope chain places all of a
+        // signature's variables inside it (F-bounded forms like `T
+        // extends Comparable<T>` and sibling refs like `U extends T`
+        // resolve through it, the same posture `decl_scope` takes for a
+        // declaration's own parameters). The child scope is only
+        // materialized when the signature actually declares variables —
+        // the common non-generic function type keeps the caller's scope
+        // untouched.
+        let mut child_scope: Option<FxHashMap<StringId, TypeParamId>> = None;
+        for (name, _) in &function.type_params_named {
+            let id = TypeParamId::from_raw(self.next_param.get());
+            self.next_param.set(self.next_param.get() + 1);
+            self.binder_names
+                .borrow_mut()
+                .insert(id, self.strings.resolve(*name).to_string());
+            type_parameters.push(id);
+            child_scope
+                .get_or_insert_with(|| scope.clone())
+                .insert(*name, id);
+        }
+        let body_scope = child_scope.as_ref().unwrap_or(scope);
+        // Each binder's declared bound maps in the child scope into
+        // `binder_facts` — an unbounded binder or an unmodelable bound
+        // records `None`, the vacuous (always-satisfied) answer
+        // `relateTypeParameters` gives a bound-less pair — the
+        // under-report direction.
+        for ((_, bound), &id) in function
+            .type_params_named
+            .iter()
+            .zip(type_parameters.iter())
+        {
+            let bound_ty = match bound {
+                Some(tree) => self.map_tree(tree, body_scope),
+                None => None,
+            };
+            self.binder_facts.borrow_mut().set(
+                id,
+                ParamFacts {
+                    variance: Variance::Covariant,
+                    bound: bound_ty,
+                },
+            );
+        }
         let ret = match &function.ret {
-            Some(tree) => self.map_tree(tree, scope)?,
+            Some(tree) => self.map_tree(tree, body_scope)?,
             // An unwritten return type reads `dynamic` (a bare
             // `Function(...)` head).
             None => self.table.intern(UninternedType::Dynamic, false),
         };
-        let mut type_parameters = Vec::with_capacity(function.type_params_named.len());
-        {
-            let mut lazy = self.lazy_params.borrow_mut();
-            for (name, _) in &function.type_params_named {
-                let id = lazy
-                    .entry(*name)
-                    .or_insert_with(|| {
-                        let id = TypeParamId::from_raw(self.next_param.get());
-                        self.next_param.set(self.next_param.get() + 1);
-                        (id, self.strings.resolve(*name).to_string())
-                    })
-                    .0;
-                type_parameters.push(id);
-            }
-        }
         let positional = function
             .positional
             .iter()
-            .map(|tree| self.map_tree(tree, scope))
+            .map(|tree| self.map_tree(tree, body_scope))
             .collect::<Option<Vec<_>>>()?;
         let named = function
             .named
@@ -3662,7 +4181,7 @@ impl MapCtx<'_, '_> {
             .map(|(name, tree)| {
                 Some(NamedMember {
                     name: self.strings.resolve(*name).to_string(),
-                    ty: self.map_tree(tree, scope)?,
+                    ty: self.map_tree(tree, body_scope)?,
                     required: true,
                 })
             })
@@ -3999,6 +4518,13 @@ impl<'a> Snapshot<'a> {
         // facts but the scratch face, so moving it up changes nothing for
         // the aliases.
         let scratch_facts = ParamFactsTable::new();
+        // The GFT-binder faces for the whole build: every ctx below
+        // shares them so a signature mapped at any pass (alias expansion,
+        // container bound, supertype edge) lands its binder ids and
+        // declared bounds in the snapshot's own overlay — the verdict's
+        // merged facts face reads them at check time.
+        let binder_facts = RefCell::new(ParamFactsTable::new());
+        let binder_names = RefCell::new(FxHashMap::default());
         // The captured aliases' expansions (#1351): each RHS maps in the
         // alias's own parameter scope (the declarations registered above);
         // an RHS referencing a not-yet-expanded alias defers to the next
@@ -4031,6 +4557,8 @@ impl<'a> Snapshot<'a> {
                         alias_decls: &alias_decls,
                         lazy_params: &RefCell::new(FxHashMap::default()),
                         next_param: &next_param,
+                        binder_facts: &binder_facts,
+                        binder_names: &binder_names,
                     };
                     expand_alias(capture, &ctx, scope)
                 };
@@ -4095,6 +4623,8 @@ impl<'a> Snapshot<'a> {
                 alias_decls: &alias_decls,
                 lazy_params: &RefCell::new(FxHashMap::default()),
                 next_param: &next_param,
+                binder_facts: &binder_facts,
+                binder_names: &binder_names,
             };
             let mut parameter_facts: Vec<(TypeParamId, ParamFacts)> = Vec::new();
             for (name, capture) in &index.aliases {
@@ -4163,6 +4693,8 @@ impl<'a> Snapshot<'a> {
                 alias_decls: &alias_decls,
                 lazy_params: &RefCell::new(FxHashMap::default()),
                 next_param: &next_param,
+                binder_facts: &binder_facts,
+                binder_names: &binder_names,
             };
             let mut mapped: Vec<(TypeParamId, TypeId)> = Vec::new();
             for (name, capture) in &index.containers {
@@ -4212,6 +4744,8 @@ impl<'a> Snapshot<'a> {
             alias_decls: &alias_decls,
             lazy_params: &RefCell::new(FxHashMap::default()),
             next_param: &next_param,
+            binder_facts: &binder_facts,
+            binder_names: &binder_names,
         };
         for (decl, supers) in &builtin_edges {
             for text in supers {
@@ -4332,11 +4866,32 @@ impl<'a> Snapshot<'a> {
             alias_decls,
             lazy_params: RefCell::new(FxHashMap::default()),
             next_param,
+            binder_facts,
+            binder_names,
         }
     }
 
     fn system(&self) -> TypeSystem<'_> {
         self.system_with(&self.facts)
+    }
+
+    /// The facts face a verdict must read: `base` (the snapshot's own or
+    /// a site overlay) plus every generic-function binder bound
+    /// `map_function` recorded while mapping the checked types — the
+    /// bounded-quantification leg keys on those ids. Zero cost when no
+    /// signature was mapped in this snapshot (the common check): the
+    /// base face returns borrowed-free, no clone.
+    fn merged_facts(&self, base: &ParamFactsTable) -> ParamFactsTable {
+        let names = self.binder_names.borrow();
+        if names.is_empty() {
+            return base.clone();
+        }
+        let overlay = self.binder_facts.borrow();
+        let mut merged = base.clone();
+        for &id in names.keys() {
+            merged.set(id, overlay.get(id));
+        }
+        merged
     }
 
     /// [`Self::system`] over a facts face other than the snapshot's own —
@@ -4365,11 +4920,18 @@ impl<'a> Snapshot<'a> {
             alias_decls: &self.alias_decls,
             lazy_params: &self.lazy_params,
             next_param: &self.next_param,
+            binder_facts: &self.binder_facts,
+            binder_names: &self.binder_names,
         }
     }
 
     fn param_text(&self, parameter: TypeParamId) -> String {
         if let Some(text) = self.param_text.get(&parameter) {
+            return text.clone();
+        }
+        // A generic-function binder: per-signature ids, text travels
+        // with the id in the shared binder face.
+        if let Some(text) = self.binder_names.borrow().get(&parameter) {
             return text.clone();
         }
         // A site-side lazy parameter: the text travels with the id in

@@ -1,7 +1,7 @@
 //! #3011 pins: combinator/directive tail recovery + type-variable name-slot
 //! keep-set + `await for` synthetic-`in` dispatch.
 //!
-//! Roots (upstream pin `.third/dart-sdk-3.13.7`
+//! Roots (upstream pin the pinned Dart SDK 3.13.7
 //! `pkg/_fe_analyzer_shared/lib/src/parser/`):
 //!
 //! * `CombinatorIdentifierContext.ensureIdentifier`

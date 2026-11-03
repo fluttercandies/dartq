@@ -17,7 +17,7 @@
 //! shadowed outer declaration, and an outer pattern declaration a same-named
 //! binder must not retire with it.
 //!
-//! Oracle provenance: `.third/co19/LanguageFeatures/Patterns/scope_A04_t01`
+//! Oracle provenance: `co19 case `LanguageFeatures/Patterns/scope_A04_t01`
 //! /`t02`, `A06_t01`/`t02` (pinned 3.13.7 corpus), the marked sites being
 //! the reported rows.
 

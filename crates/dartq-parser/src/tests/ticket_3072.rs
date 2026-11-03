@@ -1,5 +1,5 @@
 //! #3072 pins: `compute_rest`'s GFT type-variable-head gate (upstream pin
-//! `.third/dart-sdk-3.13.7`,
+//! the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart:1095-1103`).
 //!
 //! The `Function [<typeVarGroup>] (` chain must probe the `<...>` head with

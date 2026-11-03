@@ -27,13 +27,17 @@ fn assignment_messages(report: &FileReport) -> Vec<String> {
 }
 
 /// Shape 1.1 — the parameterized alias declared slot:
-/// `typedef Foo<S> = S Function<T>(T x)`; `Foo<int> y = foo;` keeps the
-/// written `Foo<int>` in the variable slot while the function-tearoff
-/// value spells its own `int Function(T)` face. Oracle row
-/// (`NonErrorResolverTest/
-/// test_genericTypeAlias_typeParameters`), exact text — the same
-/// case's `foo<String>("hello")` and `y<String>("hello")` invocations
-/// stay clean.
+/// `typedef Foo<S> = S Function<T>(T x)`; `Foo<int> y = foo;` is
+/// SILENT — the tear-off `foo`'s `int Function(T)` unifies with the
+/// slot's `int Function<T>(T)` α-equivalently (`relateTypeParameters`
+/// pairs the quantifiers by position), so the oracle emits no row at
+/// all. The earlier expectation of one `invalid_assignment` was wrong
+/// (it pinned the pre-α-recovery verdict). Oracle run (`dart analyze`
+/// 3.13.7, `~/.dartq-oracle/3.13.7`, the fixture verbatim):
+/// `Analyzing dq-3685... No issues found!` — upstream
+/// `NonErrorResolverTest/test_genericTypeAlias_typeParameters` is
+/// likewise a zero-row case. The `foo<String>("hello")` /
+/// `y<String>("hello")` invocations stay clean identically.
 #[test]
 fn declared_alias_slot_keeps_the_written_spelling() {
     let report = report_ops(
@@ -45,11 +49,10 @@ fn declared_alias_slot_keeps_the_written_spelling() {
            y<String>(\"hello\");\n\
          }\n",
     );
-    assert_eq!(
-        assignment_messages(&report),
-        ["A value of type 'int Function(T)' can't be assigned to a variable of type 'Foo<int>'."],
-        "{:?}",
-        assignment_messages(&report)
+    assert!(
+        assignment_messages(&report).is_empty(),
+        "the oracle emits no invalid_assignment for the α-equivalent pair: {:?}",
+        report.diagnostics
     );
 }
 

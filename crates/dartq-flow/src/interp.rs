@@ -2017,6 +2017,18 @@ impl<'o> Interp<'o> {
         literal_rhs: bool,
     ) {
         self.record_write(var);
+        // Every write hands the variable a fresh value version whose
+        // `conditionVariableState` is empty unless the write's own
+        // expression supplied one (the official `_write` at
+        // flow_analysis.dart:9522-9537) — the binding dies here for the
+        // write shapes without their own capture arm (`++`, for-in
+        // targets, pattern writes); `Ev::Assign`'s arms re-populate it
+        // after this call when the RHS is a split or another condition
+        // variable. `apply_write` is untouched: a declaration's own
+        // initialization is not a write in the official sets, and
+        // `InitializerEnd` relies on the just-inserted entry surviving
+        // that call.
+        self.cond_vars.remove(&var);
         self.apply_write(
             var,
             written,
@@ -2187,18 +2199,9 @@ impl<'o> Interp<'o> {
         // CURRENT state (an intervening write invalidates via the
         // version check).
         if let Some(var) = expr.reference
-            && let Some(entry) = self.cond_vars.get(&var)
-            && self.current.model(entry.tested).version == entry.version
+            && let Some(arms) = self.cond_var_arms(var)
         {
-            let t = self
-                .current
-                .clone()
-                .with_model(entry.tested, entry.if_true.model(entry.tested));
-            let f = self
-                .current
-                .clone()
-                .with_model(entry.tested, entry.if_false.model(entry.tested));
-            return (t, f);
+            return arms;
         }
         match expr.bool_value {
             Some(true) => (
@@ -2211,6 +2214,38 @@ impl<'o> Interp<'o> {
             ),
             None => (self.current.clone(), self.current.clone()),
         }
+    }
+
+    /// The condition-variable replay arms for a bool local read
+    /// (language#1274, official `restoreConditionVariableState` at
+    /// `flow_analysis.dart:6067-6089`): when `var` names a local bound
+    /// from a null-comparison/type-test split, its saved branch models
+    /// rebase onto the CURRENT state — the tested variable's model from
+    /// each saved arm — provided the tested variable's write-version
+    /// still matches (an intervening write invalidates the restore, the
+    /// official's `rebaseForward` version check at :3980-3983). `None`
+    /// when `var` is no condition variable or the entry went stale.
+    pub(crate) fn cond_var_arms(&self, var: u32) -> Option<(State, State)> {
+        let entry = self.cond_vars.get(&var)?;
+        if self.current.model(entry.tested).version != entry.version {
+            return None;
+        }
+        let t = self
+            .current
+            .clone()
+            .with_model(entry.tested, entry.if_true.model(entry.tested));
+        let f = self
+            .current
+            .clone()
+            .with_model(entry.tested, entry.if_false.model(entry.tested));
+        Some((t, f))
+    }
+
+    /// The tested variable a condition-variable binding replays, when
+    /// `var` names one — the binding's split target (for a write side
+    /// that re-captures an inverted operand's linkage, e.g. `neg = !b`).
+    pub(crate) fn cond_var_tested(&self, var: u32) -> Option<u32> {
+        self.cond_vars.get(&var).map(|entry| entry.tested)
     }
 
     pub(crate) fn join(&mut self, first: Option<State>, second: Option<State>) -> State {
@@ -4562,6 +4597,66 @@ impl Interp<'_> {
             // (The searched names declared in this buffer always resolve
             // local — the top-level face never reaches this write.)
             self.apply_write(var, element_ty.0, element_ty.1, false, None, false);
+        } else {
+            // The identifier-target head (`for (x in xs)`): the official
+            // writes the resolved target at `forEach_bodyBegin` with the
+            // element type and a `null` expressionInfo (upstream Dart SDK
+            // source, `pkg/analyzer/lib/src/dart/resolver/
+            // for_resolver.dart:234-243` — `flow?.write(target, element,
+            // elementType, null)`), but only when the target resolves to a
+            // promotable local element — a member or setter target takes
+            // no `flow.write`. The target's events sit before the
+            // iterable's `ForInExprBegin` marker; exactly one
+            // expression-position identifier resolving to a local is the
+            // promotable-target shape — a dotted or otherwise composite
+            // head stays untouched.
+            let target_end = events[head_start..i]
+                .iter()
+                .position(|ev| matches!(ev, Ev::ForInExprBegin))
+                .map_or(i, |p| head_start + p);
+            let mut target = None;
+            let mut composite = false;
+            for ev in &events[head_start..target_end] {
+                match ev {
+                    Ev::Ident {
+                        name,
+                        token,
+                        context,
+                    } if matches!(context, dartq_parser::IdentifierContext::Expression) => {
+                        if target.is_some() {
+                            composite = true;
+                            break;
+                        }
+                        target = Some((*name, *token));
+                    }
+                    // Any selector/access/member event between the head
+                    // start and the iterable marks a composite target
+                    // (`a.b`, `a[0]`, `a.b.c`) — not the promotable-local
+                    // face the official `flow.write` covers.
+                    Ev::DotAccess { .. }
+                    | Ev::IndexAccess { .. }
+                    | Ev::NullAwareMemberBegin { .. }
+                    | Ev::NullAwareIndexOperandBegin { .. }
+                    | Ev::CascadeAccess { .. } => {
+                        composite = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !composite
+                && let Some((name, token)) = target
+                && let Some(Resolved::Local(var)) = self.resolve(name)
+            {
+                self.write_var(
+                    var,
+                    element_ty.0,
+                    element_ty.1,
+                    false,
+                    Some(token.range),
+                    false,
+                );
+            }
         }
         let checkpoint = self.reach.parent(self.current.reach);
         self.stack.push(Frame::While {

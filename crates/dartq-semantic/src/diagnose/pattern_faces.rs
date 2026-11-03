@@ -89,18 +89,93 @@ pub(super) fn object_pattern_field_faces(
     shared_pattern_field_faces(listener, count, begin, Some(end), true);
 }
 
-/// The record pattern's close: the field-name faces. Hooked from the
-/// fold's `handle_record_pattern` — `mustBeNamed: false` upstream, so a
-/// positional field is legal and only the name faces
-/// (`missing_named_pattern_field_name`, `duplicate_pattern_field`) can
-/// fire. The hook carries no end token, so `None` routes the `)` lookup
-/// through the scanner's group table.
+/// The record pattern's close: the field-name faces plus the per-field
+/// column judging (`analyzeRecordPattern` pushes each field's own slot
+/// type as its sub-pattern's `matchedValueType`, upstream Dart SDK source,
+/// pkg/_fe_analyzer_shared/lib/src/type_inference/type_analyzer.dart:
+/// 1841-1855 — the record arm of `judge_object_field_rows`'s object face).
+/// `mustBeNamed: false` upstream, so a positional field is legal and only
+/// the name faces (`missing_named_pattern_field_name`,
+/// `duplicate_pattern_field`) can fire. The hook carries no end token, so
+/// `None` routes the `)` lookup through the scanner's group table.
 pub(super) fn record_pattern_field_faces(
     listener: &mut DiagnoseListener<'_>,
     count: usize,
     begin: Token,
 ) {
+    judge_record_field_rows(listener);
     shared_pattern_field_faces(listener, count, begin, None, false);
+}
+
+/// The per-field column face of a closing record pattern: each field's
+/// deferred never-match candidates are judged against the record slot the
+/// field reads — `matchedType.positional[i]` for the i-th positional
+/// field, `matchedType.named[n]` for a named one (upstream
+/// `analyzeRecordPattern`'s field dispatch, type_analyzer.dart:1841-1855).
+/// A field whose slot the matched record shape does not carry, and a
+/// matched type that is no record at all, read `dynamic` — the official's
+/// no-column posture, which the verdict never proves dead.
+fn judge_record_field_rows(listener: &mut DiagnoseListener<'_>) {
+    let Some(matched) = listener.engine.pattern_matched_ty() else {
+        return;
+    };
+    // The drained fields of this record's own bracket frame, index-aligned
+    // with `PatternNodeState::fields` (both append once per
+    // `handle_pattern_field` boundary): `ObjectField::name` is the field's
+    // record-slot key — `Some` for `n: p` and the `: p` shorthand, `None`
+    // for a positional field.
+    let names: Vec<Option<StringId>> = match listener.engine.switch.pattern_stack.last() {
+        Some(frame) => frame.fields.iter().map(|field| field.name).collect(),
+        None => return,
+    };
+    let buckets = match listener.pattern_rows.last_mut() {
+        Some(state) if state.fields.len() == names.len() => {
+            std::mem::take(&mut state.fields)
+        }
+        _ => return,
+    };
+    // The slot columns, pre-read so the emit pass borrows nothing but the
+    // engine: positional fields index only the positional slots (upstream's
+    // `positionalFields[i]` walks positional entries alone).
+    let mut columns: Vec<Ty> = Vec::with_capacity(names.len());
+    let mut positional = 0usize;
+    for name in &names {
+        let column = match (name, listener.engine.fold_alias_ty(matched)) {
+            (Some(name), Ty::Record { shape, .. }) => {
+                let pool = listener.engine.boundary.pool();
+                pool.record_shape(shape)
+                    .named
+                    .iter()
+                    .find(|(slot, _)| slot == name)
+                    .map(|(_, ty)| *ty)
+                    .unwrap_or(Ty::Dynamic)
+            }
+            (None, Ty::Record { shape, .. }) => {
+                let pool = listener.engine.boundary.pool();
+                let column = pool
+                    .record_shape(shape)
+                    .positional
+                    .get(positional)
+                    .copied()
+                    .unwrap_or(Ty::Dynamic);
+                positional += 1;
+                column
+            }
+            (None, _) => {
+                positional += 1;
+                Ty::Dynamic
+            }
+            (Some(_), _) => Ty::Dynamic,
+        };
+        columns.push(column);
+    }
+    for (rows, column) in buckets.into_iter().zip(columns) {
+        for (at, required) in rows {
+            listener
+                .engine
+                .judge_pattern_never_matches(at, required, column);
+        }
+    }
 }
 
 /// The shared field faces of `buildSharedPatternFields` +

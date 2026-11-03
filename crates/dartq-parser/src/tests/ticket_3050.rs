@@ -2,7 +2,7 @@
 //! the `on` and `implements` clauses surface on the junk token itself and
 //! never collapse into `expected_body` / `missing_function_parameters`.
 //!
-//! Root (upstream pin `.third/dart-sdk-3.13.7`,
+//! Root (upstream pin the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`):
 //!
 //! * `parseMixinHeaderRecovery` (:3445) opens every loop iteration with

@@ -3386,7 +3386,20 @@ impl<'a> Engine<'a> {
             // container alone (element.dart's `displayName`: `name == 'new'`
             // answers the enclosing class name).
             let display_text = match name_text.strip_suffix('=') {
-                Some(bare) if bare != "new" => bare.to_string(),
+                // Only identifier setter spellings lose the suffix — an
+                // operator's `=` is its own name (`operator []=`'s element
+                // displayName keeps `[]=` upstream; the setter-encoded
+                // `_s=` folds to `_s`). `new` folds to the container's
+                // spelling (element.dart's `displayName`).
+                Some(bare)
+                    if bare != "new"
+                        && bare
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_') =>
+                {
+                    bare.to_string()
+                }
                 _ => name_text.clone(),
             };
             // The `strict-inference` return-type face
@@ -3509,13 +3522,12 @@ impl<'a> Engine<'a> {
                     let enum_declares_ctor = self
                         .container_kind_of(site.name)
                         .is_some_and(|kind| kind == ContainerKind::Enum)
-                        && self
-                            .index
-                            .get(self.file)
-                            .and_then(|f| f.container(site.name))
-                            .is_some_and(|c| {
-                                c.constructors.len() + usize::from(c.has_unnamed_constructor) > 0
-                            });
+                        && self.decl_sites.iter().any(|s| {
+                            matches!(
+                                s.kind,
+                                DeclKind::Constructor { container: c } if c == site.name
+                            )
+                        });
                     // The `@JS` metadata gate spares the CLASS element
                     // (`visitClassDeclaration` adds it to
                     // `usedElements.elements`, unused_local_elements_verifier
@@ -4045,8 +4057,17 @@ impl<'a> Engine<'a> {
                 // The `{0}` argument is the element `displayName`: never the
                 // setter's `=` suffix.
                 let display_text = match name_text.strip_suffix('=') {
-                    Some(bare) => bare.to_string(),
-                    None => name_text.clone(),
+                    // Same operator-name guard as the decl-site arm — an
+                    // `operator []=` member's displayName keeps `[]=`.
+                    Some(bare)
+                        if bare
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_') =>
+                    {
+                        bare.to_string()
+                    }
+                    _ => name_text.clone(),
                 };
                 self.stage_usage(code, range, &display_text);
             }
@@ -7376,6 +7397,21 @@ impl<'a> Engine<'a> {
             },
         });
         let site = self.decl_sites.len() - 1;
+        // A method/getter/setter site opens the member face's span slots:
+        // the header's own type variables and formals fire while this
+        // frame is innermost — the depth keeps a nested executable's
+        // header events out (fields never need the face: their arms keep
+        // the name anchor).
+        if matches!(kind, DeclKind::Member {
+            kind: MemberKind::Method,
+            ..
+        }) {
+            self.open_member_face = Some(MemberFaceSpans {
+                site,
+                depth: self.frames.len().saturating_sub(1),
+                ..MemberFaceSpans::default()
+            });
+        }
         // The FFI-named annotations latch onto the declaration they
         // annotate (the `dart:ffi` verifier's post-parse pass reads them
         // by site). Anything still pending at the next site is the next
@@ -8053,9 +8089,10 @@ fn pattern_span_left_of(tokens: &[dartq_scanner::Token], eq: usize) -> Option<(u
 }
 
 /// Whether a token at this shape opens a pattern element position: the
-/// head of a sub-pattern, a positional/named separator, or a logical-and
-/// (`&&`) / logical-or (`||`) junction — the only places a variable
-/// pattern may start.
+/// head of a sub-pattern, a positional/named separator, a logical-and
+/// (`&&`) / logical-or (`||`) junction, or a rest element (`...` — its
+/// sub-pattern is an element position, so `... var c` declares `c`) —
+/// the only places a variable pattern may start.
 fn pattern_element_position(kind: dartq_scanner::TokenKind) -> bool {
     use dartq_scanner::TokenKind;
     matches!(
@@ -8067,6 +8104,7 @@ fn pattern_element_position(kind: dartq_scanner::TokenKind) -> bool {
             | TokenKind::Colon
             | TokenKind::AmpersandAmpersand
             | TokenKind::BarBar
+            | TokenKind::PeriodPeriodPeriod
     )
 }
 

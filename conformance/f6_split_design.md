@@ -1,7 +1,7 @@
 # F6 split-design — invalid_assignment / argument_type_not_assignable subtickets
 
-**Input:** `/tmp/wave_b/f6_rows.tsv` (3,585 rows; re-derived from
-`/tmp/clusters/report_full.tsv` snapshot 2026-10-30 20:14). Recon only —
+**Input:** the F6 row extract (3,585 rows; re-derived from the
+full-corpus report snapshot taken 2026-10-30 20:14). Recon only —
 no `crates/**` edits, no conformance/oracle runs. Per `wave_b_report.md` §F6,
 this family is multi-seam; below is the dispatchable split.
 

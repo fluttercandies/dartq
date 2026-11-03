@@ -43,7 +43,7 @@
 //! `#[ignore]`d until the owning lanes land it.
 //!
 //! Oracle provenance: the co19 cases the cluster was measured on,
-//! `.third/co19/LanguageFeatures/Wildcards/binding_A01_t08`/`t09`,
+//! `co19 case `LanguageFeatures/Wildcards/binding_A01_t08`/`t09`,
 //! `Patterns/scope_A04_t01`/`t02`, `A06_t01`/`t02` (pinned 3.13.7 corpus)
 //! — the marked sites are the reported rows, the unmarked ones the silent
 //! reads.

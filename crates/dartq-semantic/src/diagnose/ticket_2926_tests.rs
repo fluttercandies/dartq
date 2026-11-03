@@ -298,14 +298,18 @@ class C<T> {
 
 // —— rider: the fourth I2B fill point ——
 
-/// `fold_alias_ty`'s terminal bare head now instantiates through
-/// `instantiated_head_ty`: `typedef H = A` over `class A<X extends num>`
-/// unfolds an `H`-typed receiver to `A<num>`, so `A<int> x = h` asks the
-/// instantiated assignability question and reports the oracle's
-/// mismatch quoting `A<num>` — the `class_typedef_l1_t03` family's
-/// `G`-typed targets (`'G<A<Never>>' doesn't conform to the bound ...`)
-/// read the same fill. Before the adoption the raw `A` head answered
-/// `EMPTY` args and the arity-mismatched compare stayed silent.
+/// `fold_alias_ty`'s terminal bare head still decides the VERDICT
+/// through the instantiated expansion (`typedef H = A` over `class
+/// A<X extends num>` — `H`'s `h` is not assignable to `A<int>` because
+/// the fold's `A<num>` face fails the arg check), but the MESSAGE
+/// spells the written alias use `'H'` — the oracle's
+/// `preferTypeAlias` face keeps the use's spelling wherever the
+/// resolved type carries the `alias` reference (`#3685`'s bind
+/// posture). Oracle row (`dart analyze` 3.13.7, `~/.dartq-oracle/
+/// 3.13.7`, the fixture verbatim): `error - main.dart:4:14 - A value
+/// of type 'H' can't be assigned to a variable of type 'A<int>'. -
+/// invalid_assignment`. The earlier `A<num>` expectation pinned the
+/// pre-#3685 expansion-spelled message.
 #[test]
 fn bare_alias_head_instantiates_through_fold() {
     let source = r#"
@@ -319,7 +323,7 @@ void f(H h) {
     let rows = rows_named(&report, "invalid_assignment");
     assert_eq!(rows.len(), 1, "one invalid_assignment row: {rows:?}");
     assert!(
-        rows[0].2.contains("A<num>"),
-        "the instantiated head face: {rows:?}"
+        rows[0].2.contains("'H'"),
+        "the value face spells the written alias use `H`: {rows:?}"
     );
 }

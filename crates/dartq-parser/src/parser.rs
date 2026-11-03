@@ -296,6 +296,12 @@ pub(crate) struct BodilessKey {
     pub(crate) member_kind: u8,
     /// The member's declared name lexeme.
     pub(crate) name: String,
+    /// Whether the fragment declared `static`. An `augment` fragment only
+    /// joins the intro's element chain when its staticness matches
+    /// (`augment String X()` is an instance member — it does not augment
+    /// `static void X()`), so keys that disagree on `static` never
+    /// suppress each other's singleton verdict.
+    pub(crate) is_static: bool,
 }
 
 /// Representation-field shape state for one extension type primary

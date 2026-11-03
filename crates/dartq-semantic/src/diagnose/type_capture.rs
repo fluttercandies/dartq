@@ -2579,15 +2579,24 @@ impl<'a> Engine<'a> {
             }
         }
         // The member name anchors (the model carries no spans; the
-        // declaration sites do).
-        let member_ranges: FxHashMap<(StringId, StringId), SourceRange> = self
+        // declaration sites do) — keyed on the site index so the member
+        // face's per-node spans join by site.
+        let member_ranges: FxHashMap<(StringId, StringId), usize> = self
             .decl_sites
             .iter()
-            .filter_map(|site| match site.kind {
-                DeclKind::Member { container, .. } => Some((container, site.name, site.range)),
+            .enumerate()
+            .filter_map(|(index, site)| match site.kind {
+                DeclKind::Member { container, .. } => Some((container, site.name, index)),
                 _ => None,
             })
-            .map(|(container, name, range)| ((container, name), range))
+            .map(|(container, name, index)| ((container, name), index))
+            .collect();
+        // Owned clones: the face rows outlive the `&mut self` emissions
+        // below — one small struct per member method.
+        let member_faces: FxHashMap<usize, MemberFaceSpans> = self
+            .member_face_spans
+            .iter()
+            .map(|face| (face.site, face.clone()))
             .collect();
         for container in std::mem::take(&mut self.var_containers) {
             if container.open {
@@ -2667,9 +2676,16 @@ impl<'a> Engine<'a> {
                 if entry.is_static {
                     continue;
                 }
-                let Some(&anchor) = member_ranges.get(&(container.name, *member)) else {
+                let Some(&site) = member_ranges.get(&(container.name, *member)) else {
                     continue;
                 };
+                let anchor = self.decl_sites[site].range;
+                // The `_checkForWrongVariancePosition` node anchors the
+                // member face captured during the parse — each arm's own
+                // node (the return TypeAnnotation, each FormalParameter,
+                // each `X extends B` TypeParameter) or the member name
+                // when the face's slot is absent.
+                let face = member_faces.get(&site);
                 for (parameter, declared, _) in &container.params {
                     let Some(keyword) = declared.and_then(Variance::keyword) else {
                         continue;
@@ -2708,15 +2724,52 @@ impl<'a> Engine<'a> {
                         }
                         MemberKind::Method | MemberKind::Getter | MemberKind::Setter => {
                             let variance = self.variance_in_ty(entry.return_ty, parameter, &table);
+                            // The return-type arm anchors at the return
+                            // TypeAnnotation node (`T` in `T method1()`),
+                            // not the member name.
+                            let return_anchor = face
+                                .and_then(|face| face.return_span)
+                                .unwrap_or(anchor);
                             self.check_variance_position(
                                 variance,
                                 declared_variance,
                                 keyword,
                                 parameter,
-                                anchor,
+                                return_anchor,
                             );
+                            // The own type-parameter bound arm
+                            // (error_verifier.dart:7943-7956): the bound
+                            // reads in the `inout` position —
+                            // `Variance.invariant.combine` — anchored at
+                            // the `X extends B` TypeParameter node; an
+                            // absent bound (`Ty::Dynamic`) is upstream's
+                            // `bound == null → continue`.
+                            for (index, bound) in entry.type_param_bounds.iter().enumerate() {
+                                if matches!(*bound, Ty::Dynamic) {
+                                    continue;
+                                }
+                                let variance = Variance::Invariant.combine(
+                                    self.variance_in_ty(*bound, parameter, &table),
+                                );
+                                let bound_anchor = face
+                                    .and_then(|face| face.bounds.get(index))
+                                    .copied()
+                                    .unwrap_or(anchor);
+                                self.check_variance_position(
+                                    variance,
+                                    declared_variance,
+                                    keyword,
+                                    parameter,
+                                    bound_anchor,
+                                );
+                            }
                             if let Some(formals) = &entry.formals {
-                                for formal in formals.positional.iter().chain(&formals.named) {
+                                for (index, formal) in formals
+                                    .positional
+                                    .iter()
+                                    .chain(&formals.named)
+                                    .enumerate()
+                                {
                                     // A `covariant` formal skips the
                                     // contravariant-position check
                                     // (error_verifier.dart:7633-7635
@@ -2728,12 +2781,20 @@ impl<'a> Engine<'a> {
                                     }
                                     let variance = Variance::Contravariant
                                         .combine(self.variance_in_ty(formal.ty, parameter, &table));
+                                    // Each formal's contravariant row
+                                    // anchors at its own FormalParameter
+                                    // node (`Contra<T> x`,
+                                    // `required Contra<T> x`).
+                                    let formal_anchor = face
+                                        .and_then(|face| face.formals.get(index))
+                                        .copied()
+                                        .unwrap_or(anchor);
                                     self.check_variance_position(
                                         variance,
                                         declared_variance,
                                         keyword,
                                         parameter,
-                                        anchor,
+                                        formal_anchor,
                                     );
                                 }
                             }

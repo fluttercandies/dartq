@@ -1,7 +1,7 @@
 //! #2463 — regression pins for the small census families A9–A12, A15.
 //!
 //! Each pin mirrors a minimal repro of the corpus site the census ⑨ audit
-//! (`docs/audits/census/non-analyzer-clusters-2026-10-21.md`, families A9–A15)
+//! (the internal audit archive, families A9–A15)
 //! recorded, reduced until the oracle (Dart 3.13.5 `dart analyze`) is silent
 //! on it. The expectations therefore come from the oracle, never from the
 //! shape of our own output.

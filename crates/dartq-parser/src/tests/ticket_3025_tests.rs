@@ -1,7 +1,7 @@
 //! #3025 pins: statement-head `(...)` record-nullable vs conditional rescue,
 //! and the switch-statement `expected 'case'` endGroup skip.
 //!
-//! Roots (upstream pin `.third/dart-sdk-3.13.7`
+//! Roots (upstream pin the pinned Dart SDK 3.13.7
 //! `pkg/_fe_analyzer_shared/lib/src/parser/`):
 //!
 //! * `parseExpressionStatementOrDeclarationAfterModifiers`

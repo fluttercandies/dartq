@@ -1,6 +1,6 @@
 //! #3077 pins: the Map-face member cascade — a member-head type-variable
 //! list breaks at a variable followed by `<` (upstream pin
-//! `.third/dart-sdk-3.13.7`,
+//! the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`,
 //! `type_info_impl.dart`).
 //!

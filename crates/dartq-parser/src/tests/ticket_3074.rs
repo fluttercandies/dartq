@@ -1,6 +1,6 @@
 //! #3074 pins: the member-face cascade bound — a recovered type-argument
 //! group's re-parse may never swallow the member name (upstream pin
-//! `.third/dart-sdk-3.13.7`,
+//! the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`).
 //!
 //! For `List<void Function<T 5 6>()>? x;` the type scan's face ends before

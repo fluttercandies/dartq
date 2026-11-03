@@ -4,7 +4,7 @@
 //! `missing_identifier`, never a silent swallow); a reserved word reports
 //! `expected_type_name` and is consumed.
 //!
-//! Root (upstream pin `.third/dart-sdk-3.13.7`,
+//! Root (upstream pin the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/identifier_context_impl.dart`,
 //! `TypeReferenceIdentifierContext.ensureIdentifier` :1507-1560):
 //!

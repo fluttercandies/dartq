@@ -192,6 +192,24 @@ fn local_fn_tear_off_sig(engine: &Engine<'_>, name: StringId) -> Option<super::t
     None
 }
 
+/// The formal-list member kinds a `DeclKind::Member` executable carries
+/// (methods, getters, setters — constructors' `Factory`/
+/// `PrimaryConstructor` lists never join a member face): the gate that
+/// keeps function-typed formals' inner events and any non-member list
+/// out of the face's formal slots.
+fn member_formal_kind(kind: dartq_parser::MemberKind) -> bool {
+    use dartq_parser::MemberKind as Mk;
+    matches!(
+        kind,
+        Mk::NonStaticMethod
+            | Mk::StaticMethod
+            | Mk::ExtensionNonStaticMethod
+            | Mk::ExtensionStaticMethod
+            | Mk::ExtensionTypeNonStaticMethod
+            | Mk::ExtensionTypeStaticMethod
+    )
+}
+
 /// The relational pattern's nullable-matched verdict (#2843). The matched
 /// type is the open switch's scrutinee exactly when every frame above the
 /// root is a logical-or/and operand (`PatternFrame::binary` — the operands
@@ -297,6 +315,110 @@ impl DiagnoseListener<'_> {
         // at the opener instead of the recovered node.
         let at = self.engine.group_span(open).unwrap_or(open.range);
         self.engine.check_record_pattern(at, positional, &named);
+        self.record_pattern_leaf();
+    }
+
+    /// The name-level space one constant value covers
+    /// (`_convertConstantValue`, analyzer exhaustiveness.dart:744-788): a
+    /// value-precise constant's own restriction, a record's field-product
+    /// space (each field the same recursion over an all-`Object?` face —
+    /// the `ConstantValue` carries no field `Ty` to narrow through), and
+    /// every unrepresentable value the unknown space.
+    fn constant_leaf(engine: &mut Engine<'_>, value: &ConstantValue) -> Restriction {
+        match value {
+            ConstantValue::Null => Restriction::Null,
+            ConstantValue::Bool(value) => Restriction::BoolValue(*value),
+            ConstantValue::Enum { container, name } => Restriction::EnumValue(*container, *name),
+            ConstantValue::Record { positional, named } => {
+                let object = Engine::nullable_form(Ty::named(engine.intern("Object")));
+                let shape = engine.boundary.args.borrow_mut().intern_record(
+                    &vec![object; positional.len()],
+                    &named.iter().map(|(name, _)| (*name, object)).collect::<Vec<_>>(),
+                );
+                Restriction::Record {
+                    shape,
+                    positional: positional
+                        .iter()
+                        .map(|value| Self::constant_leaf(engine, value))
+                        .collect(),
+                    named: named
+                        .iter()
+                        .map(|(name, value)| (*name, Self::constant_leaf(engine, value)))
+                        .collect(),
+                }
+            }
+            _ => Restriction::Unknown,
+        }
+    }
+
+    /// The record pattern's coverage leaf (`createRecordSpace`,
+    /// shared.dart:556-583): the single's head is the pattern's static type —
+    /// the all-`Object?` required shape `analyzeRecordPattern` builds
+    /// (type_analyzer.dart:1841-1855), narrowed to the scrutinee's record
+    /// shape when the context type fits it
+    /// (`_createStaticTypeWithContext`, shared.dart:446-460) — and the
+    /// `RecordIndexKey`/`RecordNameKey` columns carry each field's
+    /// sub-restriction. A type-free field (`var x`, `_`) covers its whole
+    /// column (`NamedContext` lowers against the column type); a multi-leaf
+    /// field the name level cannot express narrows its column to the unknown
+    /// space, the established under-report.
+    fn record_pattern_leaf(&mut self) {
+        let Some(frame) = self.engine.switch.pattern_stack.last() else {
+            return;
+        };
+        let object = Engine::nullable_form(Ty::named(self.engine.intern("Object")));
+        let mut positional = Vec::new();
+        let mut named: Vec<(StringId, Restriction)> = Vec::new();
+        let mut named_ty: Vec<(StringId, Ty)> = Vec::new();
+        for field in &frame.fields {
+            let leaf = match field.leaves.as_slice() {
+                // The type-free field's column-full leaf: `NamedContext`
+                // resolves to the column's own type at `collect_singles`.
+                [] => Restriction::NamedContext,
+                [leaf] => leaf.clone(),
+                _ => Restriction::Unknown,
+            };
+            match field.name {
+                None => positional.push(leaf),
+                Some(name) => {
+                    named.push((name, leaf));
+                    named_ty.push((name, object));
+                }
+            }
+        }
+        let positional_ty = vec![object; positional.len()];
+        let required = self
+            .engine
+            .boundary
+            .args
+            .borrow_mut()
+            .intern_record(&positional_ty, &named_ty);
+        // The context narrows the required shape to the scrutinee's own
+        // record face only when the matched type inhabits it — an
+        // arity/name-set mismatch keeps the required shape (the case never
+        // matches at all; `check_record_pattern` already reported it).
+        let shape = match self.engine.pattern_matched_ty() {
+            Some(Ty::Record { shape: matched, .. })
+                if self.engine.name_world().is_subtype_of(
+                    &NameTy::Record {
+                        shape: matched,
+                        nullable: false,
+                    },
+                    &NameTy::Record {
+                        shape: required,
+                        nullable: false,
+                    },
+                ) =>
+            {
+                matched
+            }
+            _ => required,
+        };
+        self.engine.pattern_leaf(Restriction::Record {
+            shape,
+            positional,
+            named,
+        });
     }
 
     /// The per-field column face of a closing object pattern (#3242): each
@@ -394,9 +516,11 @@ impl DiagnoseListener<'_> {
     /// switch's scrutinee exactly when every frame above the root is a
     /// logical-or/and operand (the same posture the nullable twin
     /// documents; a pattern under a record/list/map/object field frame
-    /// carries a property column the name level never descends into), and
-    /// `==`/`!=` excluded (both spell `operator ==`, which every type
-    /// resolves on `Object`).
+    /// carries a property column the name level never descends into). The
+    /// `==`/`!=` spellings ride the same consult — the definedness face
+    /// drops them (every type resolves `operator ==` through `Object`)
+    /// while the signature face still reads their resolved operator's
+    /// parameter and return types.
     fn relational_pattern_operand(&self, operator: Token) -> Option<(Ty, String)> {
         let engine = &self.engine;
         let all_logical = engine
@@ -446,9 +570,6 @@ impl DiagnoseListener<'_> {
             engine.boundary.args.borrow_mut().named(list, false, &[element])
         };
         let op_text = engine.text_of(operator)?.to_owned();
-        if op_text == "==" || op_text == "!=" {
-            return None;
-        }
         Some((scrutinee, op_text))
     }
 
@@ -470,6 +591,11 @@ impl DiagnoseListener<'_> {
         let Some((scrutinee, op_text)) = self.relational_pattern_operand(operator) else {
             return;
         };
+        // `==`/`!=` always resolve — both spell `operator ==`, which every
+        // type answers through `Object`.
+        if op_text == "==" || op_text == "!=" {
+            return;
+        }
         let engine = &mut self.engine;
         // The extension walk runs on the alias-folded face (the nullable
         // twin's posture): `typedef A = C` reaches `C`'s extensions through
@@ -529,7 +655,229 @@ impl DiagnoseListener<'_> {
         matches!(engine.walk_members(name, probe), Walk::Found(_))
     }
 
-    /// The increment/decrement operand's index-write marking (`a[0]++`):
+    /// The relational pattern's resolved-operator signature consult (the
+    /// `operator != null` arm of `analyzeRelationalPattern`, upstream Dart
+    /// SDK source, pkg/_fe_analyzer_shared/lib/src/type_inference/
+    /// type_analyzer.dart:1985-2006): the operand constant's static type
+    /// must be assignable to the resolved operator's first parameter type
+    /// (`relational_pattern_operand_type_not_assignable` at the operand)
+    /// and the operator's return type must be assignable to `bool`
+    /// (`relational_pattern_operator_return_type_not_assignable_to_bool`
+    /// at the operator token).
+    ///
+    /// `resolveRelationalPatternOperator` (resolver.dart:1696-1751) answers
+    /// `null` — no rows — when the member walk finds nothing, when the
+    /// found member carries no first parameter, or when the matched value
+    /// is `dynamic`; `==`/`!=` resolve `operator ==`, and their parameter
+    /// type tests under `makeNullable` while the message still renders the
+    /// declared spelling. A nullable matched receiver keeps the walk
+    /// (`resolveToBound`'s recovery re-reads the bound face beside the
+    /// `unchecked` row), and a scope-parameter bound answers through the
+    /// same `param_bound` face the definedness arm consults. An
+    /// extension-resolved operator carries no member entry the name level
+    /// can read — the under-report direction beside `ExtensionApp`.
+    fn check_relational_pattern_signature(&mut self, operator: Token) {
+        let Some((scrutinee, op_text)) = self.relational_pattern_operand(operator) else {
+            return;
+        };
+        let equality = op_text == "==" || op_text == "!=";
+        // A nullable matched receiver consults `Object`'s face FIRST
+        // (type_property_resolver.dart:103-107): `==` is the only spelling
+        // `Object` answers, so an equality pattern over a nullable matched
+        // value always resolves `Object.==` — parameter `Object` (nullable
+        // under the equality arm) and return `bool`, both verdicts
+        // trivially silent. The non-equality spellings miss `Object` and
+        // reach the member face through the recovery lookup, so they fall
+        // through to the walk below.
+        if equality && self.engine.potentially_nullable(scrutinee) {
+            return;
+        }
+        let probe = self
+            .engine
+            .intern(if equality { "==" } else { &op_text });
+        let engine = &mut self.engine;
+        let face = engine.fold_alias_ty(scrutinee);
+        let Ty::Named { name, .. } = face else {
+            return;
+        };
+        let entry = match engine.walk_members(name, probe) {
+            Walk::Found(entry) => entry,
+            _ => {
+                // The scope-parameter bound's consult (`resolveToBound`):
+                // the operator resolves through the written bound's own
+                // member face.
+                let Some(bound) = engine
+                    .param_bound(name)
+                    .or_else(|| engine.param_bound_of(name))
+                else {
+                    return;
+                };
+                let Ty::Named { name: bound_name, .. } = engine.fold_alias_ty(bound) else {
+                    return;
+                };
+                match engine.walk_members(bound_name, probe) {
+                    Walk::Found(entry) => entry,
+                    _ => return,
+                }
+            }
+        };
+        // `element.firstParameterType == null` collapses the resolution —
+        // BOTH verdicts stay off (the official's early `return null`).
+        let Some(parameter) = entry
+            .formals
+            .as_ref()
+            .and_then(|formals| formals.positional.first())
+            .map(|formal| formal.ty)
+        else {
+            return;
+        };
+        let return_ty = entry.return_ty;
+        let operand_span = Self::relational_operand_span(engine, operator);
+        if let Some(at) = operand_span
+            && let Some(operand_ty) = engine.spread_operand_ty(at.offset, at.end())
+        {
+            let tested = if equality {
+                Engine::nullable_form(parameter)
+            } else {
+                parameter
+            };
+            if engine.assignable(operand_ty, tested, false) == Some(false) {
+                let a0 = engine.ty_display(operand_ty);
+                let a1 = engine.ty_display(parameter);
+                engine.emit3(
+                    SemanticCode::RelationalPatternOperandTypeNotAssignable,
+                    at,
+                    &a0,
+                    &a1,
+                    &op_text,
+                );
+            }
+        }
+        let bool_ty = Ty::named(engine.intern("bool"));
+        if engine.assignable(return_ty, bool_ty, false) == Some(false) {
+            engine.emit_corrected(
+                SemanticCode::RelationalPatternOperatorReturnTypeNotAssignableToBool,
+                operator.range,
+                "",
+            );
+        }
+    }
+
+    /// The relational operand's written extent (the `.at(pattern.operand)`
+    /// anchor): from the operator's end through the last token of the
+    /// `bitwiseOrExpression` operand — everything before the first
+    /// bracket-depth-zero token the operand grammar cannot carry (the
+    /// logical-pattern operators, the case's `:`/`,`/`=>`/`;` boundaries,
+    /// an enclosing group's closer, a lower-precedence operator, or a
+    /// non-expression keyword).
+    fn relational_operand_span(engine: &Engine<'_>, operator: Token) -> Option<SourceRange> {
+        let toks = engine.tokens.as_slice();
+        let mut i = engine.token_at_offset(operator.range.end());
+        let mut depth = 0i32;
+        let mut end = None;
+        while let Some(tok) = toks.get(i) {
+            let terminator = match tok.kind {
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly
+                | dartq_scanner::TokenKind::StringInterpolationExpression => {
+                    depth += 1;
+                    false
+                }
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare | dartq_scanner::TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        true
+                    } else {
+                        depth -= 1;
+                        false
+                    }
+                }
+                _ if depth == 0
+                    && matches!(
+                        tok.kind,
+                        dartq_scanner::TokenKind::Eof
+                            | dartq_scanner::TokenKind::AmpersandAmpersand
+                            | dartq_scanner::TokenKind::AmpersandEq
+                            | dartq_scanner::TokenKind::At
+                            | dartq_scanner::TokenKind::Backping
+                            | dartq_scanner::TokenKind::Backslash
+                            | dartq_scanner::TokenKind::BangEq
+                            | dartq_scanner::TokenKind::BangEqEq
+                            | dartq_scanner::TokenKind::BarBar
+                            | dartq_scanner::TokenKind::BarEq
+                            | dartq_scanner::TokenKind::CaretEq
+                            | dartq_scanner::TokenKind::Colon
+                            | dartq_scanner::TokenKind::Comma
+                            | dartq_scanner::TokenKind::Eq
+                            | dartq_scanner::TokenKind::EqEq
+                            | dartq_scanner::TokenKind::EqEqEq
+                            | dartq_scanner::TokenKind::Function
+                            | dartq_scanner::TokenKind::Gt
+                            | dartq_scanner::TokenKind::GtEq
+                            | dartq_scanner::TokenKind::GtGtEq
+                            | dartq_scanner::TokenKind::GtGtGtEq
+                            | dartq_scanner::TokenKind::Hash
+                            | dartq_scanner::TokenKind::IndexEq
+                            | dartq_scanner::TokenKind::Lt
+                            | dartq_scanner::TokenKind::LtEq
+                            | dartq_scanner::TokenKind::LtLtEq
+                            | dartq_scanner::TokenKind::MinusEq
+                            | dartq_scanner::TokenKind::PercentEq
+                            | dartq_scanner::TokenKind::PeriodPeriod
+                            | dartq_scanner::TokenKind::PeriodPeriodPeriod
+                            | dartq_scanner::TokenKind::PeriodPeriodPeriodQuestion
+                            | dartq_scanner::TokenKind::PlusEq
+                            | dartq_scanner::TokenKind::Question
+                            | dartq_scanner::TokenKind::QuestionPeriod
+                            | dartq_scanner::TokenKind::QuestionPeriodPeriod
+                            | dartq_scanner::TokenKind::QuestionQuestion
+                            | dartq_scanner::TokenKind::QuestionQuestionEq
+                            | dartq_scanner::TokenKind::ScriptTag
+                            | dartq_scanner::TokenKind::Semicolon
+                            | dartq_scanner::TokenKind::SlashEq
+                            | dartq_scanner::TokenKind::StarEq
+                            | dartq_scanner::TokenKind::TildeSlashEq
+                    ) =>
+                {
+                    true
+                }
+                // A keyword the operand's expression grammar cannot carry
+                // (`when`, `case`, `is`, `as`, `in`, `await`, `throw`, …)
+                // bounds it; the literal/primary spellings (`const`, `new`,
+                // `true`, `false`, `null`, `this`, `super`) stay inside.
+                dartq_scanner::TokenKind::Keyword(kw)
+                    if depth == 0
+                        && !matches!(
+                            kw,
+                            dartq_scanner::Keyword::Const
+                                | dartq_scanner::Keyword::False
+                                | dartq_scanner::Keyword::New
+                                | dartq_scanner::Keyword::Null
+                                | dartq_scanner::Keyword::Super
+                                | dartq_scanner::Keyword::This
+                                | dartq_scanner::Keyword::True
+                        ) =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if terminator {
+                end = Some(tok.utf16_offset);
+                break;
+            }
+            i += 1;
+        }
+        // No depth-0 terminator was reached (a recovery jump-off or a
+        // file-tail operand): the bound is the last token's own end — the
+        // operand consumed the rest of the table.
+        let end = end.or_else(|| {
+            toks.last()
+                .map(|t| engine.utf16_of((t.byte_offset + t.byte_len) as usize))
+        })?;
+        engine.trimmed_span(operator.range.end(), end)
+    }
+
     /// the operand resolves for write with read (upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/resolver/postfix_expression_resolver.dart
     /// :35-37 `resolveForWrite(hasRead: true)` and the prefix twin at
@@ -1295,6 +1643,10 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         self.engine.var_end_record_type(question.is_some());
         self.engine.record_type_depth -= 1;
+        // `reportInvalidFieldNames` (record_type_annotation_resolver.dart
+        // :65-98): the field-name walk runs while the closing level still
+        // heads `record_ty_stack` — the pop below consumes it.
+        self.engine.check_record_type_field_names();
         // Fold the captured fields into the interned `Ty::Record` — the
         // trailing `named_count` entries are the named pairs. The result
         // feeds the parent record's pending field type (nested record) or
@@ -1381,13 +1733,24 @@ impl ParserListener for DiagnoseListener<'_> {
     /// slots consume it at the formal's name.
     fn begin_formal_parameter(
         &mut self,
-        _token: Token,
-        _kind: dartq_parser::MemberKind,
+        token: Token,
+        kind: dartq_parser::MemberKind,
         required: Option<Token>,
         _covariant_kw: Option<Token>,
         _var_final_or_const: Option<Token>,
     ) {
         self.engine.capture_formal_required = required.is_some();
+        // The member face's FormalParameter node span opens at the
+        // formal's first token (`required`, `covariant`, the type's head,
+        // or the name itself) — only while the member's own header is
+        // innermost: a nested executable's or a function type's formals
+        // carry other member kinds and a deeper frame.
+        if let Some(face) = self.engine.open_member_face.as_mut()
+            && self.engine.frames.len().saturating_sub(1) == face.depth
+            && member_formal_kind(kind)
+        {
+            face.formal_starts.push(token.range.offset);
+        }
     }
 
     fn begin_formal_parameters(&mut self, _token: Token, kind: dartq_parser::MemberKind) {
@@ -1733,6 +2096,13 @@ impl ParserListener for DiagnoseListener<'_> {
         );
 
         let engine = &mut self.engine;
+        // The member face's span slots close with the declaration: the
+        // return annotation latch still rides `open_return_span` — the
+        // setter face below drains it — so the face copies it first.
+        if let Some(mut face) = engine.open_member_face.take() {
+            face.return_span = engine.open_return_span;
+            engine.member_face_spans.push(face);
+        }
         // The setter's written return annotation decides before the frame
         // pops (the `non_void_return_for_setter` face).
         engine.check_setter_return(get_or_set);
@@ -2215,7 +2585,18 @@ impl ParserListener for DiagnoseListener<'_> {
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
         engine.pop_frame();
-        engine.finish_local_fn_site();
+        // A named function expression's element is used by construction:
+        // upstream `visitFunctionExpression` adds it to `usedElements`
+        // (unused_local_elements_verifier.dart — the `addElement` face),
+        // so the `LocalFunction` tracked entry the name event staged must
+        // never materialize into the `locals` window. Dropping the pending
+        // slot — not `finish_local_fn_site` — is that `addElement`: the
+        // name still bound the body's self-references through
+        // `local_fn_stack` while it parsed, and no `unused_element` row
+        // survives the drop. A NAMED local function declaration keeps the
+        // declaration path's finish above (`end_local_function_declaration`)
+        // and still reports.
+        engine.pending_local_fn = None;
         engine.push_value_row(end);
     }
 
@@ -3052,6 +3433,34 @@ impl ParserListener for DiagnoseListener<'_> {
         // group closer); the keyword and the anchor come from this event.
         if let Some((var_name, var_range)) = engine.var_name_stack.pop() {
             engine.var_type_variable(var_name, variance, var_range);
+            // The member face's `X extends B` TypeParameter node span:
+            // the bound's just-armed annotation closes the node (an
+            // unbounded variable's name span is never read — upstream's
+            // `bound == null → continue` skips it before the anchor
+            // matters).
+            if let Some(face) = engine.open_member_face.as_mut()
+                && engine.frames.len().saturating_sub(1) == face.depth
+            {
+                let end = if extends_or_super.is_some() {
+                    engine
+                        .armed_ty_span
+                        .filter(|span| span.offset > var_range.offset)
+                        .map_or_else(
+                            || {
+                                extends_or_super.map_or(var_range.end(), |token| {
+                                    token.range.end()
+                                })
+                            },
+                            |span| span.end(),
+                        )
+                } else {
+                    var_range.end()
+                };
+                face.bounds.push(SourceRange {
+                    offset: var_range.offset,
+                    length: end.saturating_sub(var_range.offset),
+                });
+            }
         }
         // A literal's own `<T…>` variable counts toward the context-match
         // gate (a foreign variable's close — a nested annotation's —
@@ -5584,6 +5993,14 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.check_assignment(operator);
         engine.cancel_dead_chains_on_write(operator);
         engine.check_dead_null_assignment(operator);
+        // `x ??= v` is an expression with its own static type —
+        // `LUB(NonNull(T1), T2)` (the `_resolveIfNullAssignment` write
+        // face). The verdicts above read the live target/RHS rows; only
+        // then does the node fold into one result row so enclosing reads
+        // (`(x ??= y).m`, `f(x ??= y)`, `..`) see the joined type.
+        if engine.text_of(operator) == Some("??=") {
+            engine.fold_if_null_assignment(operator.range, end.range);
+        }
         engine.nsm_poison();
     }
 
@@ -5994,6 +6411,22 @@ impl ParserListener for DiagnoseListener<'_> {
         let outer_mark = engine.cond_mark.take();
         let outer_case = std::mem::take(&mut engine.cond_case);
         engine.check_condition_operand();
+        // The condition node's own extent: a parenthesized group's row sits
+        // at its `)` — the literal faces' narrow `in`-window anchor — while
+        // the oracle reports `.at(expression)`, the whole `( ... )`. The
+        // `literal_row_open` slot already carries that pair for the is-check
+        // face; the staged candidate takes it here so the emitted span is
+        // the ParenthesizedExpression's own.
+        if let Some((close, open)) = engine.literal_row_open
+            && let Some(check) = engine.staged_checks.last_mut()
+            && matches!(check.kind, StagedKind::NullableCondition)
+            && check.range.offset == close
+        {
+            check.range = SourceRange {
+                offset: open,
+                length: check.range.end().saturating_sub(open),
+            };
+        }
         engine.cond_mark = outer_mark;
         engine.cond_case = outer_case;
         engine.const_capture.begin_conditional();
@@ -6036,6 +6469,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.nsm_poison();
         engine.const_capture.end_conditional(end.range);
         engine.cond_expr_depth = engine.cond_expr_depth.saturating_sub(1);
+        // The node's own static type (`LUB(then, else)`, upstream
+        // `visitConditionalExpression`) folds into one result row so
+        // enclosing reads — the parenthesized group, a cascade target,
+        // an argument — see the conditional's type, never the else arm's.
+        engine.fold_conditional(question.range, end.range);
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, token: Token) {
@@ -6470,7 +6908,13 @@ impl ParserListener for DiagnoseListener<'_> {
             if let Some(ty) = cast_ty.filter(|ty| *ty != Ty::UNKNOWN) {
                 engine.cast_rewrites.push((cast_span, ty));
             }
-            engine.check_unnecessary_cast(cast_span, operand, cast_ty);
+            // `_isUnnecessaryCast`'s equality reads the operand's resolved
+            // face — a spelled alias (`x as int` over `IntAlias x`) stands
+            // for its aliased type before the operand-vs-target compare
+            // (TypeAliasElement use resolves through its aliased type).
+            // The `as` spelling face keeps the written operand; only this
+            // verdict face folds.
+            engine.check_unnecessary_cast(cast_span, engine.fold_alias_ty(operand), cast_ty);
             // `visitAsExpression`'s cast face
             // (best_practices_verifier.dart:180-190): the same pair decides
             // `cast_from_null_always_fails`.
@@ -6501,8 +6945,18 @@ impl ParserListener for DiagnoseListener<'_> {
                     .iter()
                     .rposition(|row| !matches!(row.shape, RowShape::TypeUse(..)))
             {
+                // The AsExpression node's own extent: the operand through
+                // the WRITTEN cast type (upstream `AsExpression`'s
+                // `endToken` is the type's last token, never the operand's
+                // — `x as bool?` spans all ten columns, so the enclosing
+                // condition checkpoint anchors there). The drained operand
+                // rows alone stop at the operand (`x`), one column wide.
                 let start = engine.rows[index].range.offset;
-                let end = engine.rows.last().map_or(start, |row| row.range.end());
+                let end = engine
+                    .rows
+                    .last()
+                    .map_or(start, |row| row.range.end())
+                    .max(engine.armed_ty_span.map_or(start, |span| span.end()));
                 for row in engine.rows.drain(index..) {
                     engine.deferred_miss_rows.push(row);
                 }
@@ -8039,6 +8493,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // spelled operator reports `undefined_operator` at the operator
         // token.
         self.check_relational_pattern_operator(operator);
+        // The resolved operator's signature consult (`analyzeRelationalPattern`'s
+        // `operator != null` arm): the operand's constant type against the
+        // parameter type, and the return type against `bool`.
+        self.check_relational_pattern_signature(operator);
         // The shape's failure arm joins the flow's unmatched chain — a
         // top-level `case == 5`/`case > 0` can fail, so the code after an
         // if-case stays live (flow_analysis.dart's pattern dispatch).
@@ -8103,6 +8561,18 @@ impl ParserListener for DiagnoseListener<'_> {
             left,
             right,
         );
+        // The Map kind of `checkPatternNeverMatchesValueType`
+        // (resolver.dart:1632-1637): `analyzeMapPattern`'s required type is
+        // `Map<K, V>` of the matched map's type arguments — or
+        // `Map<Object?, Object?>` when the matched value is no map at all —
+        // so a matched face that cannot be a `Map` proves the pattern dead.
+        // The row spans the whole `{...}` node (`.at(pattern)`), the
+        // type-argument group included.
+        let at = SourceRange {
+            offset: left.range.offset,
+            length: right.range.end() - left.range.offset,
+        };
+        Self::defer_pattern_row(&mut self.pattern_rows, self.engine.check_map_pattern(at));
         // `visitMapPattern`'s duplicate-key walk (constant_verifier.dart
         // :325-355) drains here: every entry key that folded to a value was
         // collected in source order, and a key equal to an EARLIER one
@@ -8240,10 +8710,10 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(state) = self.pattern_rows.last_mut() {
             state.pending_record_open = Some(left_paren);
         }
-        // Record shapes live in the interned lattice (`dartq-types`); the
-        // name level has no record type, so the row is unknown-shaped and
-        // the engine under-reports.
-        self.engine.pattern_leaf(Restriction::Unknown);
+        // The coverage leaf builds at the bracket's own close
+        // (`close_record_pattern`) — the fields' sub-restrictions only
+        // exist then, and a marker leaf here would join the collapse's
+        // `&&` reduce as an `Unknown` conjunct, erasing that leaf.
         // One close per record pattern in the declaration window — the
         // flat `final (a, b) = pair()` binds read exactly one; nested
         // records close more and gate the destructure bind off.
@@ -8355,6 +8825,47 @@ impl ParserListener for DiagnoseListener<'_> {
                     ConstantValue::Bool(value) => Restriction::BoolValue(*value),
                     ConstantValue::Enum { container, name } => {
                         Restriction::EnumValue(*container, *name)
+                    }
+                    // A record constant IS its record static type with the
+                    // per-field value spaces (`RecordState`'s
+                    // `_convertConstantValue` arm, analyzer
+                    // exhaustiveness.dart:754-765): `(E.a, false)` covers
+                    // the `($1: E.a, $2: false)` product slice. The shape
+                    // is the value's own record type; a value whose type
+                    // never resolved keeps the all-`Object?` face.
+                    ConstantValue::Record { positional, named } => {
+                        let positional_restr: Vec<Restriction> = positional
+                            .iter()
+                            .map(|value| Self::constant_leaf(engine, value))
+                            .collect();
+                        let named_restr: Vec<(StringId, Restriction)> = named
+                            .iter()
+                            .map(|(name, value)| {
+                                (*name, Self::constant_leaf(engine, value))
+                            })
+                            .collect();
+                        let shape = match constant {
+                            Some(Ty::Record { shape, .. }) => shape,
+                            _ => {
+                                let object = Engine::nullable_form(Ty::named(
+                                    engine.intern("Object"),
+                                ));
+                                let positional_ty = vec![object; positional.len()];
+                                let named_ty: Vec<(StringId, Ty)> = named
+                                    .iter()
+                                    .map(|(name, _)| (*name, object))
+                                    .collect();
+                                engine.boundary.args.borrow_mut().intern_record(
+                                    &positional_ty,
+                                    &named_ty,
+                                )
+                            }
+                        };
+                        Restriction::Record {
+                            shape,
+                            positional: positional_restr,
+                            named: named_restr,
+                        }
                     }
                     _ => leaf,
                 };
@@ -8881,6 +9392,12 @@ impl ParserListener for DiagnoseListener<'_> {
                         Restriction::Named(ty_name, nullable)
                     });
                 }
+                // The non-`Named` declared faces: a written `Null` covers
+                // the `null` space exactly (the `Null` static type,
+                // static_type.dart:21 — the same leaf the wildcard face
+                // pushes), a record-typed binder its unrestricted record
+                // face, `dynamic` the whole context, and the
+                // unrepresentable rest the unknown space.
                 ty => {
                     // The logical-and binder's staging pair (bound inside
                     // the engine borrow below, staged into the flow's
@@ -8888,6 +9405,18 @@ impl ParserListener for DiagnoseListener<'_> {
                     let mut staged_and: Option<(StringId, SourceRange)> = None;
                     if let Some(ty) = ty {
                         engine.bind_var_type(name, ty);
+                        match ty {
+                            Ty::Null => engine.pattern_leaf(Restriction::Null),
+                            Ty::Record { shape, .. } => {
+                                engine.pattern_leaf(Restriction::Record {
+                                    shape,
+                                    positional: Vec::new(),
+                                    named: Vec::new(),
+                                });
+                            }
+                            Ty::Dynamic => engine.pattern_leaf(Restriction::NamedContext),
+                            _ => {}
+                        }
                     } else if !in_assignment_pattern {
                         // A type-free binder on the RIGHT operand of a
                         // logical-and inside a case window (`AsyncData() &&
@@ -8957,19 +9486,46 @@ impl ParserListener for DiagnoseListener<'_> {
         let declared = engine.armed_ty;
         engine.armed_ty_span = None;
         engine.check_wildcard_pattern(wildcard.range, declared);
-        let Some(Ty::Named {
-            name,
-            nullable,
-            args,
-        }) = engine.armed_ty.take()
-        else {
-            return;
+        // The declared type's coverage leaf (`createWildcardSpace`,
+        // shared.dart:586-604): a written `Null` IS the `Null` static type
+        // (static_type.dart:21 — it covers the same space `case null:`
+        // does, so `unreachable_switch_case` lands where the oracle puts
+        // it); a record type carries its unrestricted record face; a
+        // `Never` annotation's bottom matches nothing (the unknown space
+        // the name level cannot represent); a type-free face (`dynamic`,
+        // `Unknown`) covers its whole context like the bare `_` it
+        // spells. `Ty::Function`'s name-level sentinel keeps the old
+        // under-report — an identical function-typed case behind it still
+        // reports live.
+        let armed = engine.armed_ty.take();
+        let leaf = match armed {
+            Some(Ty::Named {
+                name,
+                nullable,
+                args,
+            }) => {
+                if args != ArgListId::EMPTY {
+                    Restriction::NamedArgs(name, nullable, args)
+                } else {
+                    Restriction::Named(name, nullable)
+                }
+            }
+            Some(Ty::Null) => Restriction::Null,
+            Some(Ty::Record { shape, .. }) => Restriction::Record {
+                shape,
+                positional: Vec::new(),
+                named: Vec::new(),
+            },
+            // `dynamic` covers its whole context like the bare `_` it
+            // spells; `Never`/`Unknown`/`Void` and the `Ty::Function`
+            // name-level sentinel match nothing (the established
+            // under-report — an identical case behind one still reports
+            // live).
+            Some(Ty::Dynamic) => Restriction::NamedContext,
+            Some(_) => Restriction::Unknown,
+            None => return,
         };
-        engine.pattern_leaf(if args != ArgListId::EMPTY {
-            Restriction::NamedArgs(name, nullable, args)
-        } else {
-            Restriction::Named(name, nullable)
-        });
+        engine.pattern_leaf(leaf);
     }
 
     // —— switch statements ————————————————————————————————————————————
@@ -10529,8 +11085,7 @@ impl ParserListener for DiagnoseListener<'_> {
                             .iter()
                             .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
                             .collect();
-                        let first_named = field_rows.len().saturating_sub(named.len());
-                        for (index, row) in field_rows.iter().enumerate() {
+                        for row in field_rows {
                             if anchors.len() == void_fields {
                                 break;
                             }
@@ -10541,11 +11096,11 @@ impl ParserListener for DiagnoseListener<'_> {
                                 .invocation_span(row.range)
                                 .or_else(|| engine.property_access_span(row.range))
                                 .unwrap_or(row.range);
-                            anchors.push(if index >= first_named {
-                                engine.named_field_span(value).unwrap_or(value)
-                            } else {
-                                value
-                            });
+                            // `named_field_span` self-detects: a `:` must
+                            // adjoin the value for the label re-open, so a
+                            // positional field falls back to `value` on its
+                            // own — no positional/named split is needed.
+                            anchors.push(engine.named_field_span(value).unwrap_or(value));
                         }
                     }
                     for anchor in anchors {
@@ -11426,6 +11981,35 @@ impl ParserListener for DiagnoseListener<'_> {
         kind: FormalParameterKind,
         member_kind: dartq_parser::MemberKind,
     ) {
+        // The member face's FormalParameter node span closes here
+        // (upstream anchors the contravariant-position row at the whole
+        // parameter node — `required Contra<T> x` spans the keyword
+        // through the name, a default value's tokens included).
+        if let Some(face) = self.engine.open_member_face.as_mut()
+            && self.engine.frames.len().saturating_sub(1) == face.depth
+            && member_formal_kind(member_kind)
+        {
+            let start = face.formal_starts.pop().unwrap_or_else(|| {
+                var_or_final
+                    .or(covariant_kw)
+                    .or(this_keyword)
+                    .or(super_keyword)
+                    .map_or_else(
+                        || {
+                            self.engine
+                                .armed_ty_span
+                                .filter(|span| span.end() <= name.range.offset)
+                                .map_or(name.range.offset, |span| span.offset)
+                        },
+                        |token| token.range.offset,
+                    )
+            });
+            let end = initializer_end.map_or(name.range.end(), |token| token.range.end());
+            face.formals.push(SourceRange {
+                offset: start,
+                length: end.saturating_sub(start),
+            });
+        }
         // An unnamed GFT formal's pending type claims at its own close (a
         // named formal's identifier event already claimed it — no-op).
         self.engine.fn_capture_formal_unnamed();
@@ -12234,7 +12818,13 @@ impl ParserListener for DiagnoseListener<'_> {
             return;
         };
         engine.last_pattern_variable = Some((name, variable.range));
-        if engine.resolve_local(name).is_some() {
+        if let Some(decl) = engine.resolve_local(name) {
+            // `resolveAssignedVariablePattern`'s final-local arm runs
+            // before the ledger note (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/dart/resolver/resolver.dart:1429-1455):
+            // a target that resolves to a `final` and already-assigned
+            // local reports `assignment_to_final_local` at the name.
+            engine.pattern_target_final_check(name, decl, variable.range);
             // A resolved local target joins the assignment context's
             // `assignedVariables` ledger (type_analyzer.dart:331-345): a
             // second assignment of the same variable reports
@@ -12251,7 +12841,16 @@ impl ParserListener for DiagnoseListener<'_> {
         if !matches!(bare, BareInfo::Missing { .. }) {
             if matches!(target, RefTarget::Local) {
                 // The frameless-initializer local face: still a local
-                // target, so the `assignedVariables` ledger applies.
+                // target, so the `assignedVariables` ledger applies — and
+                // the same final-local verdict runs first (the tracked
+                // entry sits in `self.locals` even without a frame).
+                if let Some(decl) = engine
+                    .locals
+                    .iter()
+                    .rposition(|d| d.name == name && !d.retired)
+                {
+                    engine.pattern_target_final_check(name, decl as u32, variable.range);
+                }
                 super::pattern_faces::note_assigned_variable(
                     &mut self.pattern_rows,
                     engine,
@@ -13416,17 +14015,17 @@ fn group_head_exempts_init(engine: &Engine<'_>, name_offset: u32) -> bool {
         .rposition(|token| {
             matches!(
                 token.kind,
-                TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::CloseCurly
+                dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::OpenCurly | dartq_scanner::TokenKind::CloseCurly
             )
         })
         .map_or(0, |boundary| boundary + 1);
     tokens[start..at]
         .iter()
-        .take_while(|token| token.kind != TokenKind::Eq)
+        .take_while(|token| token.kind != dartq_scanner::TokenKind::Eq)
         .any(|token| {
             matches!(
                 token.kind,
-                TokenKind::Keyword(Keyword::Abstract | Keyword::External)
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Abstract | dartq_scanner::Keyword::External)
             )
         })
 }
@@ -14871,6 +15470,845 @@ impl Engine<'_> {
             self.emit(SemanticCode::UseOfVoidResult, anchor, "", "");
         }
     }
+
+    // —— #3708: the assigned-variable pattern's final-local verdict ————
+    //
+    // `handle_assigned_variable_pattern` resolves its target at parse
+    // time (no row reaches the pass-2 write face), so the
+    // `checkFinalAlreadyAssigned` mirror runs here on the same token
+    // facts `row_resolution.rs`'s `final_local_face` cluster reads
+    // (upstream `resolveAssignedVariablePattern`,
+    // resolver.dart:1429-1455 — a resolved LOCAL target that is `final`
+    // and already assigned reports `assignment_to_final_local` at the
+    // name). The predicate set below mirrors that cluster verbatim —
+    // `final_local_face`, `catch_param_decl`, `has_prior_write`,
+    // `captured_write` and their bracket/block walkers — specialized to
+    // a write that is never a for-in target and never the declaration
+    // token itself.
+
+    /// The `checkFinalAlreadyAssigned` verdict for a pattern-assignment
+    /// write to the local declared at `decl` (a `locals` stack index):
+    /// `assignment_to_final_local` at the write name when the target is
+    /// a `final` local or formal that is not definitely unassigned —
+    /// declared with an initializer, bound on entry (formal, catch
+    /// parameter, pattern binder, for-in variable), written before on a
+    /// dominating path, or written inside a nested function body (the
+    /// captured variable is `potentiallyMutatedInScope` upstream).
+    pub(crate) fn pattern_target_final_check(
+        &mut self,
+        name: StringId,
+        decl: u32,
+        write: SourceRange,
+    ) {
+        let decl_offset = self.locals[decl as usize].range.offset;
+        // A catch clause's parameters are implicitly final and bound on
+        // entry — every write reports (the element's `isFinal` reads
+        // unconditionally upstream).
+        if self.pa_catch_param_decl(decl_offset) {
+            let name_text = self.strings.resolve(name);
+            self.emit(SemanticCode::AssignmentToFinalLocal, write, name_text, "");
+            return;
+        }
+        let PaFinalFace::Final { assigned } = self.pa_final_local_face(decl_offset) else {
+            return;
+        };
+        if !assigned
+            && !self.pa_captured_write(decl_offset, write.offset)
+            && !self.pa_prior_write(name, decl_offset, write.offset)
+        {
+            return;
+        }
+        let name_text = self.strings.resolve(name);
+        self.emit(SemanticCode::AssignmentToFinalLocal, write, name_text, "");
+    }
+
+    /// The byte offset's token index, `None` when no token starts there.
+    fn pa_token_index(&self, utf16: u32) -> Option<usize> {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < utf16);
+        tokens
+            .get(at)
+            .is_some_and(|token| token.utf16_offset == utf16)
+            .then_some(at)
+    }
+
+    /// Whether the declaration name token at `decl` is a catch clause's
+    /// parameter: `catch (e, s)` puts `catch` `(` before the exception
+    /// name and a `,` before the stack-trace name.
+    fn pa_catch_param_decl(&self, decl: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let Some(at) = self.pa_token_index(decl) else {
+            return false;
+        };
+        let mut cursor = at;
+        let mut steps = 0;
+        while let Some(prev) = cursor.checked_sub(1) {
+            steps += 1;
+            if steps > 4 {
+                return false;
+            }
+            match tokens[prev].kind {
+                dartq_scanner::TokenKind::OpenParen => {
+                    return matches!(
+                        prev.checked_sub(1).map(|i| tokens[i].kind),
+                        Some(dartq_scanner::TokenKind::Keyword(
+                            dartq_scanner::Keyword::Catch
+                        ))
+                    );
+                }
+                dartq_scanner::TokenKind::Identifier | dartq_scanner::TokenKind::Comma => {}
+                _ => return false,
+            }
+            cursor = prev;
+        }
+        false
+    }
+
+    /// The declaration face behind a pattern-assignment target's local:
+    /// the header keywords (`final`/`const`/`late`/`var`), plus the two
+    /// facts that make the FIRST write legal — an initializer, or a
+    /// formal parameter (bound on entry) — and the binders/for-in shapes
+    /// whose match itself assigns.
+    fn pa_final_local_face(&self, decl: u32) -> PaFinalFace {
+        let tokens = self.tokens.as_slice();
+        let Some(at) = self.pa_token_index(decl) else {
+            return PaFinalFace::Other;
+        };
+        // A field/super formal (`this.x`, `super.a`) never reports
+        // `assignment_to_final_local` — its writes resolve to the FIELD.
+        if let Some(receiver) = at.checked_sub(2)
+            && tokens.get(at - 1).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
+            && matches!(
+                tokens[receiver].kind,
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::This | dartq_scanner::Keyword::Super
+                )
+            )
+        {
+            return PaFinalFace::Other;
+        }
+        let mut is_final = false;
+        let mut formal = false;
+        // A binder inside a pattern: the `final`/`var` keyword heads the
+        // OUTERMOST pattern, so the backward walk steps through the
+        // pattern's bracket structure. `patterned` latches once an
+        // unmatched pattern bracket is crossed; `binder` marks a `final`
+        // in binder position — both bind the variable on entry.
+        let mut patterned = false;
+        let mut binder = false;
+        // A `,` the walk crossed: a `final` reached across one heads a
+        // sibling declarator unless it opens a pattern bracket itself.
+        let mut crossed_comma = false;
+        let mut cursor = at;
+        while let Some(prev) = cursor.checked_sub(1) {
+            if at - prev > 32 {
+                break;
+            }
+            let token = &tokens[prev];
+            match token.kind {
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final) => {
+                    if crossed_comma
+                        && !matches!(
+                            tokens.get(prev + 1).map(|t| t.kind),
+                            Some(
+                                dartq_scanner::TokenKind::OpenParen
+                                    | dartq_scanner::TokenKind::OpenSquare
+                                    | dartq_scanner::TokenKind::OpenCurly
+                            )
+                        )
+                    {
+                        break;
+                    }
+                    is_final = true;
+                    // A `final` nested inside a pattern marks its binder:
+                    // after a `,`, `:`, `&&`, `||`, `case`, `required`, or
+                    // a pattern bracket opener.
+                    let pred = tokens.get(prev.wrapping_sub(1)).map(|t| t.kind);
+                    binder |= matches!(
+                        pred,
+                        Some(
+                            dartq_scanner::TokenKind::Comma
+                                | dartq_scanner::TokenKind::Colon
+                                | dartq_scanner::TokenKind::AmpersandAmpersand
+                                | dartq_scanner::TokenKind::BarBar
+                        ) | Some(dartq_scanner::TokenKind::Keyword(
+                            dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Required,
+                        ))
+                    ) || matches!(
+                        pred,
+                        Some(
+                            dartq_scanner::TokenKind::OpenParen
+                                | dartq_scanner::TokenKind::OpenSquare
+                                | dartq_scanner::TokenKind::OpenCurly
+                        )
+                    ) && self.pa_bracket_is_pattern(prev.wrapping_sub(1));
+                }
+                // `late` vetoes outright (`late final x`'s first write is
+                // legal); `var`/`const`/statement keywords end the walk.
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Late) => {
+                    return PaFinalFace::Other;
+                }
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Var
+                    | dartq_scanner::Keyword::Case
+                    | dartq_scanner::Keyword::In
+                    | dartq_scanner::Keyword::If
+                    | dartq_scanner::Keyword::For
+                    | dartq_scanner::Keyword::While
+                    | dartq_scanner::Keyword::Switch
+                    | dartq_scanner::Keyword::Return
+                    | dartq_scanner::Keyword::Do
+                    | dartq_scanner::Keyword::Else
+                    | dartq_scanner::Keyword::Try
+                    | dartq_scanner::Keyword::Catch
+                    | dartq_scanner::Keyword::On
+                    | dartq_scanner::Keyword::Throw
+                    | dartq_scanner::Keyword::Yield
+                    | dartq_scanner::Keyword::Assert
+                    | dartq_scanner::Keyword::Await
+                    | dartq_scanner::Keyword::Async
+                    | dartq_scanner::Keyword::Sync
+                    | dartq_scanner::Keyword::Rethrow
+                    | dartq_scanner::Keyword::Break
+                    | dartq_scanner::Keyword::Continue
+                    | dartq_scanner::Keyword::New
+                    | dartq_scanner::Keyword::Default
+                    | dartq_scanner::Keyword::When,
+                ) => break,
+                dartq_scanner::TokenKind::OpenParen => {
+                    match tokens.get(prev.wrapping_sub(1)).map(|t| t.kind) {
+                        // A `(` after a name/type head opens a formal
+                        // list — the parameter is bound on entry — unless
+                        // the head itself sits in pattern context.
+                        Some(dartq_scanner::TokenKind::Identifier) => {
+                            let before_head = prev
+                                .checked_sub(2)
+                                .map(|i| tokens[i].kind);
+                            if matches!(
+                                before_head,
+                                Some(
+                                    dartq_scanner::TokenKind::Keyword(
+                                        dartq_scanner::Keyword::Final
+                                            | dartq_scanner::Keyword::Var
+                                            | dartq_scanner::Keyword::Case
+                                            | dartq_scanner::Keyword::Required
+                                    ) | dartq_scanner::TokenKind::OpenParen
+                                        | dartq_scanner::TokenKind::OpenSquare
+                                        | dartq_scanner::TokenKind::OpenCurly
+                                        | dartq_scanner::TokenKind::Comma
+                                        | dartq_scanner::TokenKind::Colon
+                                        | dartq_scanner::TokenKind::AmpersandAmpersand
+                                        | dartq_scanner::TokenKind::BarBar
+                                        | dartq_scanner::TokenKind::Period
+                                        | dartq_scanner::TokenKind::Question
+                                        | dartq_scanner::TokenKind::Bang
+                                        | dartq_scanner::TokenKind::Gt
+                                )
+                            ) {
+                                patterned = true;
+                            } else {
+                                formal = true;
+                                break;
+                            }
+                        }
+                        Some(
+                            dartq_scanner::TokenKind::CloseParen
+                            | dartq_scanner::TokenKind::CloseSquare
+                            | dartq_scanner::TokenKind::Question
+                            | dartq_scanner::TokenKind::Gt,
+                        ) => {
+                            formal = true;
+                            break;
+                        }
+                        // A control-head `(` opens the STATEMENT's head,
+                        // not a pattern or a formal list.
+                        Some(
+                            dartq_scanner::TokenKind::Keyword(
+                                dartq_scanner::Keyword::For
+                                    | dartq_scanner::Keyword::If
+                                    | dartq_scanner::Keyword::While
+                                    | dartq_scanner::Keyword::Switch
+                                    | dartq_scanner::Keyword::Catch
+                                    | dartq_scanner::Keyword::On
+                                    | dartq_scanner::Keyword::Assert
+                                    | dartq_scanner::Keyword::Return
+                                    | dartq_scanner::Keyword::Throw
+                                    | dartq_scanner::Keyword::Await
+                                    | dartq_scanner::Keyword::Do
+                                    | dartq_scanner::Keyword::Else
+                            ),
+                        )
+                        | Some(dartq_scanner::TokenKind::Function)
+                        | Some(dartq_scanner::TokenKind::Eq)
+                        | Some(dartq_scanner::TokenKind::Semicolon) => break,
+                        // Any other predecessor is a pattern group opener.
+                        _ => patterned = true,
+                    }
+                }
+                // A `[`/`{` not following a callable head is a pattern
+                // bracket; a `{` after `)` or a statement keyword is a
+                // block.
+                dartq_scanner::TokenKind::OpenSquare | dartq_scanner::TokenKind::OpenCurly => {
+                    if matches!(
+                        tokens.get(prev.wrapping_sub(1)).map(|t| t.kind),
+                        Some(
+                            dartq_scanner::TokenKind::Identifier
+                                | dartq_scanner::TokenKind::CloseParen
+                                | dartq_scanner::TokenKind::CloseSquare
+                                | dartq_scanner::TokenKind::Question
+                        )
+                    ) {
+                        break;
+                    }
+                    patterned = true;
+                }
+                dartq_scanner::TokenKind::Comma => crossed_comma = true,
+                dartq_scanner::TokenKind::Semicolon
+                | dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::Function
+                | dartq_scanner::TokenKind::Eq => break,
+                _ => {}
+            }
+            cursor = prev;
+        }
+        if !is_final {
+            return PaFinalFace::Other;
+        }
+        // A parameter is always assigned; a pattern binder is bound by
+        // its match; a declarator's `=` (or a pattern group's trailing
+        // `=`) initializes it; a for-in loop variable is bound by the
+        // loop.
+        let mut assigned = formal || patterned || binder;
+        let mut probe = at + 1;
+        let mut steps = 0;
+        while !assigned && let Some(token) = tokens.get(probe) {
+            steps += 1;
+            if steps > 8 {
+                break;
+            }
+            match token.kind {
+                dartq_scanner::TokenKind::Eq
+                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In) => {
+                    assigned = true;
+                    break;
+                }
+                dartq_scanner::TokenKind::Comma
+                | dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => probe += 1,
+                _ => break,
+            }
+        }
+        PaFinalFace::Final { assigned }
+    }
+
+    /// Whether the same spelling took a write between the declaration at
+    /// `decl` and the pattern write at `write` — the "not definitely
+    /// unassigned" stand-in: an assignment target (`x =`, `x +=`, `x++`,
+    /// `++x`), a for-in head (`x in`), or an assigned-variable pattern
+    /// (`(x) = …`). A write inside a sibling branch (`if/else`, `switch`
+    /// cases) does not count — it is not flow-preceding on this path.
+    fn pa_prior_write(&self, name: StringId, decl: u32, write: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let lexeme = self.strings.resolve(name);
+        let start = tokens.partition_point(|token| token.utf16_offset <= decl);
+        let end = tokens.partition_point(|token| token.utf16_offset < write);
+        (start..end).any(|at| {
+            tokens[at].kind == dartq_scanner::TokenKind::Identifier
+                && self.tokens.lexeme(self.source, at) == lexeme
+                && (pa_write_follower(tokens.get(at + 1).map(|t| t.kind))
+                    || matches!(
+                        tokens.get(at.wrapping_sub(1)).map(|t| t.kind),
+                        Some(
+                            dartq_scanner::TokenKind::PlusPlus
+                                | dartq_scanner::TokenKind::MinusMinus
+                        )
+                    )
+                    || self.pa_pattern_lhs_write(at))
+                && !self.pa_sibling_branch_write(at, end)
+        })
+    }
+
+    /// Whether the identifier token at `at` sits inside a pattern's
+    /// bracket group an `=` closes (`(a, _) = e`, `{"k": a} = e`).
+    fn pa_pattern_lhs_write(&self, at: usize) -> bool {
+        let tokens = self.tokens.as_slice();
+        let first = tokens.get(at + 1).map(|t| t.kind);
+        match first {
+            Some(
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::Comma,
+            ) => {}
+            _ => return false,
+        }
+        let mut depth: u32 = 0;
+        let mut probe = at + 1;
+        while let Some(token) = tokens.get(probe) {
+            match token.kind {
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        if !matches!(
+                            tokens.get(probe + 1).map(|t| t.kind),
+                            Some(dartq_scanner::TokenKind::Eq)
+                        ) {
+                            return false;
+                        }
+                        // `x[i] = e` is an index write, not a pattern
+                        // write: a `]`-closed group whose `[` follows an
+                        // expression tail is subscript syntax.
+                        if token.kind == dartq_scanner::TokenKind::CloseSquare {
+                            return self.pa_square_group_is_pattern(probe);
+                        }
+                        return true;
+                    }
+                    depth -= 1;
+                }
+                dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Function => {
+                    return false;
+                }
+                _ => {}
+            }
+            probe += 1;
+        }
+        false
+    }
+
+    /// Whether the `]` at token index `close` ends a pattern list
+    /// bracket (not a subscript): the matching `[` must not follow an
+    /// expression tail.
+    fn pa_square_group_is_pattern(&self, close: usize) -> bool {
+        let tokens = self.tokens.as_slice();
+        let mut depth: u32 = 1;
+        let mut cursor = close;
+        while let Some(prev) = cursor.checked_sub(1) {
+            match tokens[prev].kind {
+                dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                dartq_scanner::TokenKind::OpenSquare => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return !matches!(
+                            prev.checked_sub(1).map(|i| tokens[i].kind),
+                            Some(
+                                dartq_scanner::TokenKind::Identifier
+                                    | dartq_scanner::TokenKind::CloseParen
+                                    | dartq_scanner::TokenKind::CloseSquare
+                                    | dartq_scanner::TokenKind::CloseCurly
+                                    | dartq_scanner::TokenKind::Gt
+                                    | dartq_scanner::TokenKind::Question
+                                    | dartq_scanner::TokenKind::Bang
+                                    | dartq_scanner::TokenKind::String
+                                    | dartq_scanner::TokenKind::Int
+                                    | dartq_scanner::TokenKind::Double
+                            )
+                        );
+                    }
+                }
+                dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenCurly => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            cursor = prev;
+        }
+        false
+    }
+
+    /// Whether the `(`/`[`/`{` token at index `open` opens a PATTERN
+    /// group rather than a statement block, a signature formal list, or
+    /// a control head — decided by the bracket's own predecessor.
+    fn pa_bracket_is_pattern(&self, open: usize) -> bool {
+        let tokens = self.tokens.as_slice();
+        let Some(pred) = open.checked_sub(1).map(|i| tokens[i].kind) else {
+            return false;
+        };
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        match pred {
+            dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::Final | dartq_scanner::Keyword::Var | dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Required | dartq_scanner::Keyword::In,
+            )
+            | dartq_scanner::TokenKind::OpenParen
+            | dartq_scanner::TokenKind::OpenSquare
+            | dartq_scanner::TokenKind::OpenCurly
+            | dartq_scanner::TokenKind::Comma
+            | dartq_scanner::TokenKind::AmpersandAmpersand
+            | dartq_scanner::TokenKind::BarBar
+            | dartq_scanner::TokenKind::Eq
+            | dartq_scanner::TokenKind::Question
+            | dartq_scanner::TokenKind::Bang
+            | dartq_scanner::TokenKind::Gt
+            | dartq_scanner::TokenKind::Period
+            | dartq_scanner::TokenKind::Identifier => true,
+            // A `:` after `)` opens a constructor's initializer list;
+            // every other `:` is a pattern label/default separator.
+            dartq_scanner::TokenKind::Colon => !matches!(
+                open.checked_sub(2).map(|i| tokens[i].kind),
+                Some(dartq_scanner::TokenKind::CloseParen)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the candidate prior write at `at` sits inside a clause of
+    /// a branching construct whose OTHER clause holds the write (the
+    /// `end` token bound): `if/else`, `switch` case clauses. On such a
+    /// row the prior write is a sibling alternative — flow reaches the
+    /// write without crossing it.
+    fn pa_sibling_branch_write(&self, at: usize, end: usize) -> bool {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let mut depth: u32 = 0;
+        let mut probe = at + 1;
+        while probe < end {
+            match tokens[probe].kind {
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => depth = depth.saturating_sub(1),
+                dartq_scanner::TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        let Some(next) = tokens.get(probe + 1) else {
+                            return false;
+                        };
+                        if !matches!(next.kind, dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Else)) {
+                            return false;
+                        }
+                        if self.pa_write_in_clause(probe + 1, end) {
+                            return true;
+                        }
+                        return self.pa_chain_continues(probe + 1, end);
+                    }
+                    depth -= 1;
+                }
+                dartq_scanner::TokenKind::Semicolon => {
+                    if depth == 0 {
+                        let Some(next) = tokens.get(probe + 1) else {
+                            return false;
+                        };
+                        match next.kind {
+                            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Else) => {
+                                return self.pa_write_in_clause(probe + 1, end)
+                                    || self.pa_chain_continues(probe + 1, end);
+                            }
+                            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Default) => return true,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            probe += 1;
+        }
+        false
+    }
+
+    /// Whether the token at `head` (an `else`) opens a clause containing
+    /// the token bound `end` — a `{…}` block or a single statement
+    /// ending at `;`.
+    fn pa_write_in_clause(&self, head: usize, end: usize) -> bool {
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let cursor = head + 1;
+        match tokens.get(cursor).map(|t| t.kind) {
+            Some(dartq_scanner::TokenKind::OpenCurly) => {
+                let mut depth: u32 = 1;
+                let mut probe = cursor + 1;
+                while let Some(token) = tokens.get(probe) {
+                    match token.kind {
+                        dartq_scanner::TokenKind::OpenCurly | dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                            depth += 1;
+                        }
+                        dartq_scanner::TokenKind::CloseCurly | dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return probe >= end;
+                            }
+                        }
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+                false
+            }
+            _ => {
+                // A single-statement clause (`else x = 2;`): the write
+                // lands inside iff no `;` at depth 0 precedes it.
+                let mut depth: u32 = 0;
+                let mut probe = cursor;
+                while probe < end {
+                    match tokens[probe].kind {
+                        dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare
+                        | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare
+                        | dartq_scanner::TokenKind::CloseCurly => {
+                            if depth == 0 {
+                                return false;
+                            }
+                            depth -= 1;
+                        }
+                        dartq_scanner::TokenKind::Semicolon if depth == 0 => return false,
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+                true
+            }
+        }
+    }
+
+    /// After an `else` clause that does not contain the write, the chain
+    /// may continue (`else if … else`): whether the write sits in any
+    /// clause of the same chain.
+    fn pa_chain_continues(&self, head: usize, end: usize) -> bool {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let cursor = head + 1;
+        let clause_end = match tokens.get(cursor).map(|t| t.kind) {
+            Some(dartq_scanner::TokenKind::OpenCurly) => {
+                let mut depth: u32 = 1;
+                let mut probe = cursor + 1;
+                loop {
+                    let Some(token) = tokens.get(probe) else {
+                        return false;
+                    };
+                    match token.kind {
+                        dartq_scanner::TokenKind::OpenCurly | dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                            depth += 1;
+                        }
+                        dartq_scanner::TokenKind::CloseCurly | dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break probe + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+            }
+            _ => {
+                // Single-statement clause — its `;` at depth 0.
+                let mut depth: u32 = 0;
+                let mut probe = cursor;
+                loop {
+                    let Some(token) = tokens.get(probe) else {
+                        return false;
+                    };
+                    match token.kind {
+                        dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare
+                        | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare
+                        | dartq_scanner::TokenKind::CloseCurly => depth = depth.saturating_sub(1),
+                        dartq_scanner::TokenKind::Semicolon if depth == 0 => break probe + 1,
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+            }
+        };
+        if clause_end >= end {
+            return false;
+        }
+        match tokens.get(clause_end).map(|t| t.kind) {
+            Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Else)) => {
+                self.pa_write_in_clause(clause_end, end) || self.pa_chain_continues(clause_end, end)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the write at `write` sits inside a nested function body
+    /// the declaration at `decl` does not share — the captured-variable
+    /// face: a `final` local written only from inside a closure is still
+    /// `potentiallyMutatedInScope`, so `isUnassigned` inside the closure
+    /// answers false (upstream `AssignedVariables` anywhere sets mark the
+    /// variable written for the whole scope).
+    fn pa_captured_write(&self, decl: u32, write: u32) -> bool {
+        self.pa_function_body_boundary(write) != self.pa_function_body_boundary(decl)
+    }
+
+    /// The offset of the innermost function-body `{`/`=>` enclosing the
+    /// token position `at`, `None` at file top level.
+    fn pa_function_body_boundary(&self, at: u32) -> Option<u32> {
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let start = tokens.partition_point(|token| token.utf16_offset < at);
+        let mut depth: u32 = 0;
+        let mut cursor = start;
+        while let Some(prev) = cursor.checked_sub(1) {
+            match tokens[prev].kind {
+                dartq_scanner::TokenKind::CloseCurly | dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                    depth += 1;
+                }
+                dartq_scanner::TokenKind::OpenCurly => {
+                    if depth == 0 {
+                        if self.pa_brace_opens_function(prev) {
+                            return Some(tokens[prev].utf16_offset);
+                        }
+                    } else {
+                        depth -= 1;
+                    }
+                }
+                dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            cursor = prev;
+        }
+        None
+    }
+
+    /// Whether the `{` at token index `brace` opens a function body: a
+    /// signature `)` whose `(` is not a control head, a `sync`/`async`
+    /// marker, or a constructor initializer list's `:`. Any other owner
+    /// — `else`, `try`, `do`, `finally`, `case`-block, a statement
+    /// `;`/`{`/`}` — keeps the block a plain statement group.
+    fn pa_brace_opens_function(&self, brace: usize) -> bool {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let Some(prev) = brace.checked_sub(1) else {
+            return false;
+        };
+        match tokens[prev].kind {
+            dartq_scanner::TokenKind::CloseParen => {
+                // The `(` matching this `)`: a control keyword before it
+                // makes the `{` a statement block, anything else a
+                // signature.
+                let mut depth: u32 = 1;
+                let mut cursor = prev;
+                while let Some(open) = cursor.checked_sub(1) {
+                    match tokens[open].kind {
+                        dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => depth += 1,
+                        dartq_scanner::TokenKind::OpenParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return !matches!(
+                                    open.checked_sub(1).map(|i| tokens[i].kind),
+                                    Some(dartq_scanner::TokenKind::Keyword(
+                                        dartq_scanner::Keyword::If
+                                            | dartq_scanner::Keyword::For
+                                            | dartq_scanner::Keyword::While
+                                            | dartq_scanner::Keyword::Switch
+                                            | dartq_scanner::Keyword::Catch
+                                            | dartq_scanner::Keyword::Assert
+                                    ))
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    cursor = open;
+                }
+                false
+            }
+            // `sync {` / `async {` / `sync* {` / `async* {` bodies, and a
+            // constructor body's `{` after its initializer list's `:`.
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Sync | dartq_scanner::Keyword::Async) => true,
+            dartq_scanner::TokenKind::Star => matches!(
+                prev.checked_sub(1).map(|i| tokens[i].kind),
+                Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Sync | dartq_scanner::Keyword::Async))
+            ),
+            _ => {
+                // A constructor's `this : f = 0 {` body: scan back over
+                // the initializer expressions for the list's `:` at
+                // paren-depth 0 (preceded by the signature `)`).
+                let mut depth: u32 = 0;
+                let mut cursor = prev;
+                while let Some(at) = cursor.checked_sub(1) {
+                    match tokens[at].kind {
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare
+                        | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                        dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        dartq_scanner::TokenKind::OpenCurly => {
+                            if depth == 0 {
+                                return false;
+                            }
+                            depth -= 1;
+                        }
+                        dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Function if depth == 0 => {
+                            return false;
+                        }
+                        dartq_scanner::TokenKind::Colon if depth == 0 => {
+                            return matches!(
+                                at.checked_sub(1).map(|i| tokens[i].kind),
+                                Some(dartq_scanner::TokenKind::CloseParen)
+                            );
+                        }
+                        _ => {}
+                    }
+                    cursor = at;
+                }
+                false
+            }
+        }
+    }
+}
+
+/// The declaration face behind a pattern-assignment target's local — the
+/// `assignment_to_final_local` arm's read of the declaration header.
+#[derive(Clone, Copy)]
+enum PaFinalFace {
+    /// Not a `final` declaration, or one whose own row owns the write
+    /// (`const` → `assignment_to_const`; `late` → the late-final row;
+    /// `var`/plain → writable).
+    Other,
+    /// A `final` local or formal. `assigned` marks a declaration that is
+    /// not definitely unassigned at a later write: an initializer, a
+    /// formal parameter (bound on entry), a pattern binder, or a for-in
+    /// loop variable.
+    Final { assigned: bool },
+}
+
+/// Whether the token kind after a bare name turns it into a WRITE: the
+/// assignment operators (`=`, `op=`, `??=`), the increment/decrement
+/// suffixes, or the for-in head's `in` (the loop assigns its target).
+fn pa_write_follower(kind: Option<dartq_scanner::TokenKind>) -> bool {
+    use dartq_scanner::TokenKind;
+    matches!(
+        kind,
+        Some(
+            dartq_scanner::TokenKind::Eq
+                | dartq_scanner::TokenKind::PlusEq
+                | dartq_scanner::TokenKind::MinusEq
+                | dartq_scanner::TokenKind::StarEq
+                | dartq_scanner::TokenKind::SlashEq
+                | dartq_scanner::TokenKind::PercentEq
+                | dartq_scanner::TokenKind::TildeSlashEq
+                | dartq_scanner::TokenKind::LtLtEq
+                | dartq_scanner::TokenKind::GtGtEq
+                | dartq_scanner::TokenKind::GtGtGtEq
+                | dartq_scanner::TokenKind::AmpersandEq
+                | dartq_scanner::TokenKind::BarEq
+                | dartq_scanner::TokenKind::CaretEq
+                | dartq_scanner::TokenKind::QuestionQuestionEq
+                | dartq_scanner::TokenKind::PlusPlus
+                | dartq_scanner::TokenKind::MinusMinus
+                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
+        )
+    )
 }
 
 /// The literal kind a spread-element verification runs against.

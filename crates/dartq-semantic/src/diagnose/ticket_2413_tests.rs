@@ -223,18 +223,21 @@ fn foreign_parameterized_alias_argument_is_checked() {
     assert_eq!(row.range.length, 2, "the span covers the `42` argument");
 }
 
-/// N5, lambda-argument cell — documented under-report: a function literal
-/// leaves a multi-row window the row recovery cannot attribute (pushed as the
-/// zero-span `Unknown` face), and the only banked signature
-/// (`closure_capture_end`) renders `return_ty: Ty::Void` for the
-/// `could_not_infer` face — not the inferred return the function-subtype
-/// decision needs. Wiring it into `arg_sigs` misjudged every non-void formal
-/// (the `argument_position_literal_never_leaks` pin proved `() => DB()` into
-/// `Str Function()` would false-positive), so this cell stays silent until the
-/// closure's real inferred return reaches the subtype face. The oracle emits
-/// `argument_type_not_assignable` on `takes((String s) => true)`.
+/// N5, lambda-argument cell — RESOLVED: the fold-at-ask seam lands the
+/// alias's instantiated signature at the callee face, so the literal's
+/// own inferred `int Function(String)` decides against the folded
+/// `FailureJoiner` formals. The oracle emits both rows on the same
+/// fixture (`dart analyze` 3.13.7, `~/.dartq-oracle/3.13.7`,
+/// `/tmp/dq-2413l` verbatim): `error - main.dart:4:9 - The argument
+/// type 'int Function(String)' can't be assigned to the parameter
+/// type 'FailureJoiner'. - argument_type_not_assignable` plus `error -
+/// main.dart:4:23 - The returned type 'bool' isn't returnable from a
+/// 'int' function, as required by the closure's context. -
+/// return_of_invalid_type_from_closure`. The earlier silence was the
+/// documented under-report (the spelled alias reached the callee face
+/// un-folded, so no signature decided the literal at all).
 #[test]
-fn foreign_alias_formal_lambda_argument_is_an_unresolved_under_report() {
+fn foreign_alias_formal_lambda_argument_reports_like_the_oracle() {
     let main = "import 'lib.dart';\n\
                 void takes(FailureJoiner f) {}\n\
                 void run() {\n\
@@ -242,8 +245,12 @@ fn foreign_alias_formal_lambda_argument_is_an_unresolved_under_report() {
                 }\n";
     let names = code_names(&report_two_file(main, TYPEDEF_LIB));
     assert!(
-        !names.contains(&"argument_type_not_assignable"),
-        "closure inferred-return wired — flip this pin: {names:?}"
+        names.contains(&"argument_type_not_assignable"),
+        "the aliased formals substitute: {names:?}"
+    );
+    assert!(
+        names.contains(&"return_of_invalid_type_from_closure"),
+        "the closure's return face reports with it: {names:?}"
     );
 }
 

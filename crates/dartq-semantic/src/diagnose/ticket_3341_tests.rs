@@ -128,7 +128,13 @@ fn ticket_3341_class_bound_descent_reports_the_alias() {
 /// so assigning one to an `int` reports nothing, while the identical
 /// non-self-referencing shape (`typedef R = int Function();`) still
 /// reports its `invalid_assignment`. Before the #3341 fold, `F` unfolded
-/// to `F Function()` and the first statement reported too.
+/// to `F Function()` and the first statement reported too. The reported
+/// row spells the alias use `'R'` — the oracle's `preferTypeAlias`
+/// face (`dart analyze` 3.13.7, `~/.dartq-oracle/3.13.7`, the fixture
+/// verbatim: `error - main.dart:5:11 - A value of type 'R' can't be
+/// assigned to a variable of type 'int'. - invalid_assignment`; the
+/// same run also emits `type_alias_cannot_reference_itself` on `F`
+/// and the two `unused_local_variable` warnings).
 #[test]
 fn ticket_3341_self_referencing_alias_folds_to_dynamic() {
     let source = "typedef F = F Function();\n\
@@ -150,7 +156,7 @@ fn ticket_3341_self_referencing_alias_folds_to_dynamic() {
         "only the non-recursive control reports: {rows:?}"
     );
     assert!(
-        rows[0].contains("Function"),
-        "the reported row is the control's function type: {rows:?}"
+        rows[0].contains("'R'"),
+        "the reported row spells the alias use `R`: {rows:?}"
     );
 }

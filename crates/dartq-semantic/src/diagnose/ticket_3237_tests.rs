@@ -19,8 +19,8 @@
 //! (`_resolveLogicalAnd`/`_resolveLogicalOr`).
 //!
 //! The receiver's `Never` reaches the resolver through three spellings, and
-//! the oracle's verdicts were probed (`.third/dart-sdk-3.13.7` `dart
-//! analyze`):
+//! the oracle's verdicts were probed against the pinned Dart SDK 3.13.7
+//! with `dart analyze`:
 //!
 //! * **Declared `Never`** — `void f(Never x) { x.foo(); }` fires. The
 //!   written `Ty::Named{"Never"}` is the parse-time arm.

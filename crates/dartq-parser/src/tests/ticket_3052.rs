@@ -1,7 +1,7 @@
 //! #3052 pins: Lane-E — index-expression junk recovery and the
 //! nested-generic type-argument `>` boundary.
 //!
-//! Roots (upstream pin `.third/dart-sdk-3.13.7`,
+//! Roots (upstream pin the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/`):
 //!
 //! * Index junk (`parser_impl.dart:8017-8032`,

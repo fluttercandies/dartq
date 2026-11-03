@@ -1,7 +1,7 @@
 //! #3034 pins: the expression-tail residual — infix `~` parses as a binary
 //! expression with zero parser rows, matching the oracle.
 //!
-//! Root (upstream pin `.third/dart-sdk-3.13.7`
+//! Root (upstream pin the pinned Dart SDK 3.13.7
 //! `pkg/_fe_analyzer_shared/lib/src/`):
 //!
 //! * `_computePrecedence` (`parser_impl.dart:7707-7744`): the default arm

@@ -2611,6 +2611,20 @@ impl<'a> Engine<'a> {
         member_name: StringId,
         recv_ty: Ty,
     ) -> Ty {
+        // The kept alias spelling at the read face (#3685's bind posture
+        // lets `IntBox b` carry `Named{IntBox}` into the receiver record,
+        // and `typedef IntBox = Box<int>` declares no members of its own):
+        // hop the alias head to its right-hand container before the member
+        // walk, exactly like the clause-face fold
+        // ([`Engine::alias_clause_hop`]) — the write verdict asks the
+        // expanded face the oracle resolves (`IntBox` → `Box<int>`), while
+        // the message keeps the receiver's written spelling. `recv_ty`
+        // folds to the same expanded form so `member_recv_env` pairs the
+        // written arguments onto the container's own parameters.
+        let (container, recv_ty) = match self.alias_clause_hop(container, self.file, self.lib) {
+            Some((_, head)) if head != container => (head, self.fold_alias_ty(recv_ty)),
+            _ => (container, recv_ty),
+        };
         let declared = self.member_write_ty(container, member_name);
         let setter = self.setter_spelling(member_name);
         let entry = match self.walk_members(container, member_name) {
@@ -4158,9 +4172,12 @@ impl<'a> Engine<'a> {
 
     /// The variable-declaration initializer check
     /// (`variable_declaration_resolver.dart:140`): the same decision as the
-    /// assignment check against the declaration group's declared type.
+    /// assignment check against the declaration group's declared type. An
+    /// unannotated group checks nothing — its declarator's type IS the
+    /// initializer's, refined here ([`Self::refine_null_inferred_declarator`]).
     pub(crate) fn check_decl_initializer(&mut self) {
         let Some(to) = self.pending_decl_ty else {
+            self.refine_null_inferred_declarator();
             return;
         };
         let Some(mark) = self.init_mark else {
@@ -4307,6 +4324,89 @@ impl<'a> Engine<'a> {
             self.stage(StagedKind::Assignment, anchor, from, to, literal);
         }
         self.init_mark = None;
+    }
+
+    /// The declared type of an unannotated declarator whose initializer's
+    /// static type is `Null` is `dynamic` (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/resolver.dart
+    /// `variableTypeFromInitializerType`, applied to a local by
+    /// pkg/analyzer/lib/src/dart/resolver/variable_declaration_resolver.dart;
+    /// pkg/analyzer/lib/src/summary2/top_level_inference.dart `_refineType`
+    /// for a top-level variable or a field): `var x = null; x = 'hi';` writes
+    /// into `dynamic` and stays silent. The initializer's close bound the raw
+    /// `Null` into the declarator's slot just before this check — a local's
+    /// frame slot, or a top-level variable's or field's inferred overlay
+    /// ([`Self::bind_inferred_ty`]) — and this re-states that slot, so every
+    /// later read and write sees `dynamic`. Only an unannotated group reaches
+    /// here: a written `Null x = null;` keeps its `Null` (the group's
+    /// `pending_decl_ty` is armed).
+    fn refine_null_inferred_declarator(&mut self) {
+        // The model declarators' window — the initializer of a field group
+        // or of a top-level group, at the group's own frame depth (the
+        // const close's routing in `end_variable_initializer`).
+        let model_window = self.frames.len() == self.init_frame_depth
+            && if self.field_group_open {
+                self.init_frame_depth == self.field_group_depth
+            } else {
+                self.init_frame_depth == 0
+            };
+        if model_window {
+            let Some(name) = self.initializer_declarator() else {
+                return;
+            };
+            let slot = match self.container_context() {
+                Some((container, _)) => self.field_inferred_tys.get_mut(&(container, name)),
+                None => self.top_var_inferred_tys.get_mut(&name),
+            };
+            if let Some(ty) = slot
+                && *ty == Ty::Null
+            {
+                *ty = Ty::Dynamic;
+            }
+            return;
+        }
+        // A local declarator is the newest tracked local: every declaration
+        // nested in its initializer (a closure's, a for-element's) closed
+        // with its own frame, which truncates the locals stack.
+        let Some(&LocalDecl {
+            name,
+            kind: LocalKind::Variable,
+            ..
+        }) = self.locals.last()
+        else {
+            return;
+        };
+        let Some(ty) = self
+            .frames
+            .last_mut()
+            .and_then(|frame| frame.var_types.get_mut(&name))
+        else {
+            return;
+        };
+        if *ty == Ty::Null {
+            *ty = Ty::Dynamic;
+        }
+    }
+
+    /// The declarator owning the open initializer window: the identifier
+    /// directly ahead of the `=` that opens it (`x` in `var x = null;`),
+    /// grouping parentheses between the `=` and the window's first row
+    /// skipped. `None` when no such `name =` precedes the first row (a
+    /// prefix operator, a merged member row) — the slot keeps its face.
+    fn initializer_declarator(&self) -> Option<StringId> {
+        use dartq_scanner::TokenKind as TK;
+        let first = self.rows.get(self.init_mark?)?.range.offset;
+        let toks = self.tokens.as_slice();
+        let mut index = toks.partition_point(|t| t.utf16_offset < first);
+        let eq = loop {
+            index = index.checked_sub(1)?;
+            if toks[index].kind != TK::OpenParen {
+                break index;
+            }
+        };
+        let name = toks.get(eq.checked_sub(1)?)?;
+        (toks[eq].kind == TK::Eq && name.kind == TK::Identifier)
+            .then(|| self.intern(&self.source[name.byte_range()]))
     }
 
     /// The untyped collection literal's own static type against the
@@ -4560,7 +4660,17 @@ impl<'a> Engine<'a> {
         }
         let from_sig = from_stash.or_else(|| self.function_shape_sig(from))?;
         let to_sig = to_stash.or_else(|| self.function_shape_sig(to))?;
-        let verdict = self.fn_sig_subtype(&from_sig, &to_sig)?;
+        // The pair's verdict is the shared function-shape predicate
+        // (`fn_shape_pair_verdict`): it keeps `fn_sig_subtype`'s
+        // `relateTypeParameters` count + bound-equality rule AND the
+        // α-recovery arm that re-relates a quantifier-dropped source
+        // (the expression-position `Ty::Function` leaves `T` where the
+        // stash's count-only `StringId::NONE` params lose them — `const
+        // void Function(int) h = g` over `void Function<T>(T) h` — by
+        // binding the source-only leaves to the target's paired types).
+        // A bare `fn_sig_subtype` here rejected those pairs on name-map
+        // misses the oracle's positional unification accepts.
+        let verdict = self.fn_shape_pair_verdict(&from_sig, &to_sig)?;
         Some((verdict, from_sig, to_sig))
     }
 
@@ -5026,7 +5136,22 @@ impl<'a> Engine<'a> {
     /// signature but absent from every target type. A candidate appearing
     /// at no pairable position proves nothing (`List<T>` under an
     /// unrelated target head stays unbound) and keeps `None`.
-    fn instantiated_fn_sig_subtype(&self, from: &FnVarSig, to: &FnVarSig) -> Option<bool> {
+    ///
+    /// `generic_target` marks the α-equivalence recovery (#3686): the
+    /// target is itself generic, so its signature's bare heads are its
+    /// OWN quantified parameters — the shared fresh representatives
+    /// `relateTypeParameters` instantiates both sides with. A source leaf
+    /// spelling the same name is therefore the source's own parameter,
+    /// and stays a binding candidate (the target-spelling exclusion would
+    /// wrongly drop it). When the target is non-generic the exclusion
+    /// stands: a shared name is a shared declared type, never a
+    /// parameter.
+    fn instantiated_fn_sig_subtype(
+        &self,
+        from: &FnVarSig,
+        to: &FnVarSig,
+        generic_target: bool,
+    ) -> Option<bool> {
         // The arity shape the instantiation cannot change: subtype needs
         // every target parameter covered — `from.positional.len() >=
         // to.positional.len()`, `from.required_positional <=
@@ -5074,7 +5199,7 @@ impl<'a> Engine<'a> {
             }
             candidates = from_heads
                 .into_iter()
-                .filter(|head| !to_heads.contains(head))
+                .filter(|head| generic_target || !to_heads.contains(head))
                 // A name that resolves to a real type — a core primitive,
                 // a declared container, an in-scope type parameter — is
                 // never the signature's own type variable: it just happens
@@ -5084,6 +5209,25 @@ impl<'a> Engine<'a> {
                     !self.members.primitive_ids.contains(head)
                         && !self.type_params.contains(head)
                         && !self.pending_type_params.contains(head)
+                        // The reserved spellings the container walk
+                        // cannot see are real types too — `Never`,
+                        // `Null`, `void`, `dynamic`, `Function`,
+                        // `Record`, `FutureOr` are named leaves in a
+                        // signature, never its type variables (the
+                        // co19 instantiate-to-bounds family spells
+                        // them inside the bound faces: `A<dynamic>`
+                        // vs `A<Never>` must not fabricate a
+                        // `Never := dynamic` unification).
+                        && !matches!(
+                            self.strings.resolve(*head),
+                            "Never"
+                                | "Null"
+                                | "void"
+                                | "dynamic"
+                                | "Function"
+                                | "Record"
+                                | "FutureOr"
+                        )
                         && resolve_container(
                             self.graph,
                             self.namespaces,
@@ -5099,7 +5243,45 @@ impl<'a> Engine<'a> {
         if candidates.is_empty() {
             return None;
         }
+        // The α-equivalence count rule: `relateTypeParameters` refuses a
+        // quantifier-count mismatch outright, and the recovered parameter
+        // spellings are the only count evidence a quantifier-dropped
+        // source carries — one candidate per declared parameter. A
+        // mismatch means the pairing is no positional unification
+        // (`T Function<T>(T)` against `U Function<U, V>(U, V)`), so the
+        // signature verdict keeps its own count-gate rejection rather
+        // than over-accepting a partial instantiation.
+        if generic_target && candidates.len() != to.params.len() {
+            return None;
+        }
         let candidate_set: FxHashSet<StringId> = candidates.iter().copied().collect();
+        // `relateTypeParameters` unifies the pair's parameters by
+        // position — never a parameter with a concrete type. When the
+        // target is itself generic (`generic_target`), a candidate leaf
+        // may therefore only bind a target type spelled as one of the
+        // target's own parameter names (`T` against `U` — the fresh
+        // `Z` representative); a concrete pairing (`T` against `int`)
+        // is not a unification, so the leaf stays unbound and the call
+        // abstains to the signature verdict's own gate (`Some(false)`
+        // for `String Function<T>(T)` into `String Function<S>(int)`).
+        // For a non-generic target the concrete pairing IS downward
+        // tear-off inference (`T := int`), which the oracle runs.
+        let to_params: FxHashSet<StringId> = to
+            .params
+            .iter()
+            .filter_map(|(name, _)| (*name != StringId::NONE).then_some(*name))
+            .collect();
+        let binding_ok = |to_ty: Ty| {
+            !generic_target
+                || matches!(
+                    to_ty,
+                    Ty::Named {
+                        name,
+                        args: ArgListId::EMPTY,
+                        ..
+                    } if to_params.contains(&name)
+                )
+        };
         // Bind each candidate from its structurally-paired target type: a
         // bare `Named` leaf binds the whole target type, a shared head
         // recurses into its arguments (`List<T>` against `List<int>` binds
@@ -5110,17 +5292,32 @@ impl<'a> Engine<'a> {
         let mut bindings: FxHashMap<StringId, Ty> = FxHashMap::default();
         let mut failed = false;
         for (from_ty, to_ty) in from.positional.iter().zip(to.positional.iter()) {
-            self.bind_sig_leaves(*from_ty, *to_ty, &candidate_set, &mut bindings, &mut failed);
+            self.bind_sig_leaves(
+                *from_ty,
+                *to_ty,
+                &candidate_set,
+                &binding_ok,
+                &mut bindings,
+                &mut failed,
+            );
         }
         for (name, to_ty, _) in &to.named {
             if let Some((_, from_ty, _)) = from.named.iter().find(|(n, _, _)| n == name) {
-                self.bind_sig_leaves(*from_ty, *to_ty, &candidate_set, &mut bindings, &mut failed);
+                self.bind_sig_leaves(
+                    *from_ty,
+                    *to_ty,
+                    &candidate_set,
+                    &binding_ok,
+                    &mut bindings,
+                    &mut failed,
+                );
             }
         }
         self.bind_sig_leaves(
             from.return_ty,
             to.return_ty,
             &candidate_set,
+            &binding_ok,
             &mut bindings,
             &mut failed,
         );
@@ -5231,6 +5428,7 @@ impl<'a> Engine<'a> {
         from_ty: Ty,
         to_ty: Ty,
         candidates: &FxHashSet<StringId>,
+        binding_ok: &dyn Fn(Ty) -> bool,
         bindings: &mut FxHashMap<StringId, Ty>,
         failed: &mut bool,
     ) {
@@ -5246,6 +5444,9 @@ impl<'a> Engine<'a> {
                 },
                 _,
             ) if candidates.contains(&name) => {
+                if !binding_ok(to_ty) {
+                    return;
+                }
                 if let Some(bound) = bindings.get(&name) {
                     if *bound != to_ty {
                         *failed = true;
@@ -5274,7 +5475,14 @@ impl<'a> Engine<'a> {
                     (pool.get(from_args).to_vec(), pool.get(to_args).to_vec())
                 };
                 for (from_arg, to_arg) in from_args.iter().zip(to_args.iter()) {
-                    self.bind_sig_leaves(*from_arg, *to_arg, candidates, bindings, failed);
+                    self.bind_sig_leaves(
+                        *from_arg,
+                        *to_arg,
+                        candidates,
+                        binding_ok,
+                        bindings,
+                        failed,
+                    );
                 }
             }
             (
@@ -5295,7 +5503,14 @@ impl<'a> Engine<'a> {
                 for (from_field, to_field) in
                     from_shape.positional.iter().zip(to_shape.positional.iter())
                 {
-                    self.bind_sig_leaves(*from_field, *to_field, candidates, bindings, failed);
+                    self.bind_sig_leaves(
+                        *from_field,
+                        *to_field,
+                        candidates,
+                        binding_ok,
+                        bindings,
+                        failed,
+                    );
                 }
                 for ((from_name, from_field), (to_name, to_field)) in
                     from_shape.named.iter().zip(to_shape.named.iter())
@@ -5303,7 +5518,14 @@ impl<'a> Engine<'a> {
                     if from_name != to_name {
                         return;
                     }
-                    self.bind_sig_leaves(*from_field, *to_field, candidates, bindings, failed);
+                    self.bind_sig_leaves(
+                        *from_field,
+                        *to_field,
+                        candidates,
+                        binding_ok,
+                        bindings,
+                        failed,
+                    );
                 }
             }
             _ => {}
@@ -6492,7 +6714,6 @@ impl<'a> Engine<'a> {
         let scrutinee =
             crate::switch_tracker::enum_bound_scrutinee(&world, &ctx).unwrap_or(ctx.scrutinee);
         let value = NameTy::from_semantic(scrutinee);
-        for (i, c) in ctx.cases.iter().enumerate() {}
         let cases: Vec<Case<NameTy>> = ctx
             .cases
             .iter()
@@ -7455,7 +7676,35 @@ impl<'a> Engine<'a> {
     /// wanted) reports through the same shape rules.
     fn fn_shape_pair_verdict(&self, from_fn: &FnVarSig, to_fn: &FnVarSig) -> Option<bool> {
         if from_fn.params.len() > to_fn.params.len() && to_fn.params.is_empty()
-            && let Some(verdict) = self.instantiated_fn_sig_subtype(from_fn, to_fn)
+            && let Some(verdict) = self.instantiated_fn_sig_subtype(from_fn, to_fn, false)
+        {
+            return Some(verdict);
+        }
+        // The α-equivalence arm (#3686): `relateTypeParameters` unifies
+        // the pair's parameters by POSITION, but the pooled `Ty::Function`
+        // shape of an expression-position type keeps only the quantified
+        // leaves — the parameter list arrives empty or name-less, so
+        // `fn_sig_subtype`'s name-map can never relate `T Function<T>(T)`
+        // to `U Function<U>(U)` (or to `Foo<int>`'s instantiated
+        // `int Function<T>(T)`). The instantiation walk recovers the
+        // positional pairing: every bare head the source spells that no
+        // declared type owns is a parameter leaf, bound to the target's
+        // structurally-paired type — the target's own parameter spellings
+        // included (`generic_target`). A truly non-generic source has no
+        // such leaves, so `instantiated_fn_sig_subtype` abstains
+        // (`None`) and `fn_sig_subtype`'s count gate still reports the
+        // genericity mismatch (`void Function()` into
+        // `void Function<Y extends num>()`).
+        let quantifier_lost = |sig: &FnVarSig| {
+            sig.params.is_empty()
+                || sig
+                    .params
+                    .iter()
+                    .any(|(name, _)| *name == StringId::NONE)
+        };
+        if (quantifier_lost(from_fn) || quantifier_lost(to_fn))
+            && let Some(verdict) =
+                self.instantiated_fn_sig_subtype(from_fn, to_fn, !to_fn.params.is_empty())
         {
             return Some(verdict);
         }
@@ -8424,7 +8673,7 @@ impl<'a> Engine<'a> {
         // the bound `num`), `void Function() f = C()` reads `dynamic
         // Function(dynamic)` (no positional pairs the context).
         if !call_sig.params.is_empty() && to_fn.params.is_empty()
-            && let Some(verdict) = self.instantiated_fn_sig_subtype(&call_sig, to_fn)
+            && let Some(verdict) = self.instantiated_fn_sig_subtype(&call_sig, to_fn, false)
         {
             return Some(verdict);
         }

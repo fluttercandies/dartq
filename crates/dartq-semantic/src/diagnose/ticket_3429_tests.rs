@@ -199,19 +199,23 @@ fn nullable_fn_receiver_miss_reports_unchecked() {
     );
 }
 
-/// A `!= null`-guarded read keeps the conservative posture the
-/// promotion latch holds for shape-typed locals today (the flow's
-/// `promoted` answer never spells a function face, so the receiver
-/// stays nullable — `unchecked_use_of_nullable_value`, pinned so the
-/// family cannot drift to `undefined_getter` or silence unnoticed).
+/// A `!= null`-guarded read promotes the receiver to its non-null
+/// function shape — `g.bar` resolves no member on `void Function()`
+/// and reports `undefined_getter`, exactly the oracle's verdict
+/// (`dart analyze` 3.13.7, `~/.dartq-oracle/3.13.7`, the fixture
+/// verbatim: `error - main.dart:1:49 - The getter 'bar' isn't defined
+/// for the type 'void Function()'. - undefined_getter`). The earlier
+/// `unchecked_use_of_nullable_value` expectation pinned the
+/// pre-promotion posture (the flow's `promoted` face never spelled the
+/// function type), which the wave's promoted-receiver read fixed.
 #[test]
-fn guarded_fn_receiver_miss_reports_unchecked() {
+fn guarded_fn_receiver_miss_reports_undefined_getter() {
     let report =
         report_ops("void f(void Function()? g) { if (g != null) { g.bar; } }\n");
     let names = code_names(&report);
     assert_eq!(names.len(), 1, "{:?}", rows(&report));
     assert!(
-        names[0].starts_with("unchecked_use_of_nullable_value"),
+        names[0].starts_with("undefined_getter"),
         "{:?}",
         rows(&report)
     );

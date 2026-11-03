@@ -58,10 +58,19 @@ fn offsets(report: &FileReport, code: &str) -> Vec<u32> {
 /// `F<num>` — the `var`-inferred `from` reads `decl.var_ty`'s folded
 /// right-hand shape with `X := num` substituted, so the bound reads
 /// `Y extends num`. Assigned into a written `void Function<Y extends
-/// int>()` target the equality leg rejects (`num` vs `int` bounds) —
-/// and the row's message spells the resolved source type with its
-/// bound, `void Function<Y extends num>()` (pre-fix: `void
-/// Function<Y>()`, the count-only residue).
+/// int>()` target the equality leg rejects (`num` vs `int` bounds).
+///
+/// The row's value face is the ALIAS use `F<num>` — the oracle's
+/// `getDisplayString(preferTypeAlias: true)` keeps the use's written
+/// alias spelling wherever the element's resolved type carries the
+/// `alias` reference (`#3685`'s bind-posture wave made the value face
+/// spell it too; pre-wave this pin demanded the expanded
+/// `void Function<Y extends num>()`).
+///
+/// Oracle row (`dart analyze` 3.13.7, `~/.dartq-oracle/3.13.7`):
+/// `error - main.dart:5:43 - A value of type 'F<num>' can't be assigned
+/// to a variable of type 'void Function<Y extends int>()'. -
+/// invalid_assignment`
 #[test]
 fn var_inferred_folded_alias_bound_mismatch_reports() {
     let fixture = "\
@@ -88,9 +97,9 @@ void main() {
         .unwrap()
         .message;
     assert!(
-        msg.contains("void Function<Y extends num>()"),
-        "the resolved source type must spell its substituted bound \
-         `Y extends num` (pre-fix rendered `Y()` count-only): {msg}"
+        msg.contains("'F<num>'"),
+        "the value face spells the alias use `F<num>` — the oracle's \
+         preferTypeAlias form — not the expanded signature: {msg}"
     );
 }
 

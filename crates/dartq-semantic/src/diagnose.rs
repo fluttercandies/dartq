@@ -1035,6 +1035,17 @@ pub struct UnitFold {
     /// reachable identifier read, offset-sorted (the query face's
     /// family-a table).
     pub read_types: Vec<(SourceRange, Ty)>,
+    /// The write-site rows (the query face's family-c table, #3709): one
+    /// `(declaration name span, in_closure)` row per (declaration,
+    /// in-closure) pair the flow layer's `AssignedVariables` anywhere sets
+    /// aggregate — `false` for a declaration written outside nested
+    /// closures, `true` for one written inside a nested closure, both rows
+    /// for one written both ways, no row for one never written (an
+    /// initializer is not a write). Sorted by `(offset, in_closure)`, so
+    /// the key is unique and a `(decl, true)` probe binary-searches
+    /// directly — the exact captured-write verdict the
+    /// assignment-to-final face's token probe approximates.
+    pub write_sites: Vec<(SourceRange, bool)>,
     /// The published bare-reference resolutions, parse order.
     pub refs: Vec<UnitRef>,
     /// The published type-reference positions, parse order.
@@ -1488,6 +1499,11 @@ pub fn fold_unit_with_ops<'t>(
     // verdicts read).
     let mut condition_types: Vec<(SourceRange, Ty)> = Vec::new();
     let mut matched_types: Vec<(SourceRange, Ty)> = Vec::new();
+    // The write-site rows (#3709): the flow layer's per-(declaration,
+    // in-closure) write classification stages for the fold product (the
+    // query face's family-c table) instead of being dropped at the match
+    // below. Sorted by `(offset, in_closure)` once the loop ends.
+    let mut write_sites: Vec<(SourceRange, bool)> = Vec::new();
     let mut flow_diagnostics = Vec::new();
     let mut body_rows = Vec::new();
     // The flow layer's dead intervals: every `DeadCode` fact's range is
@@ -1952,9 +1968,24 @@ pub fn fold_unit_with_ops<'t>(
             // The async-gap rows (`use_build_context_synchronously`'s
             // core) publish verbatim to their downstream consumer — the
             // lints face's mounted-guard verdict — and carry no semantic
-            // diagnostic of their own; write sites are likewise the
-            // assignment face's payload only.
-            FlowFact::WriteSite { .. } | FlowFact::AsyncContextUse { .. } => {}
+            // diagnostic of their own.
+            FlowFact::AsyncContextUse { .. } => {}
+            // The write-site rows (#3709): no diagnostic of their own
+            // either, but the (declaration, in-closure) classification is
+            // the exact captured-write verdict — a `final` local written
+            // only from inside a nested closure is `potentiallyMutatedIn
+            // Scope`, so `isUnassigned` inside the closure is false
+            // (upstream `AssignedVariables` anywhere-set capture) — that
+            // the assignment-to-final face's token probe approximates
+            // (`captured_write`, #3697). The rows stage verbatim for the
+            // fold product; the consumer keys on the declaration's name
+            // offset.
+            FlowFact::WriteSite {
+                decl_name_span,
+                in_closure,
+            } => {
+                write_sites.push((decl_name_span, in_closure));
+            }
             // The non-promotion substrate rows (the flow layer's W4, the
             // diagnoser's W4-attach #1877): each row stages into the
             // context face's table — the reasons resolve through the
@@ -1967,6 +1998,13 @@ pub fn fold_unit_with_ops<'t>(
             }
         }
     }
+    // The write-site table's contract is the explicit `(offset,
+    // in_closure)` key: the flow layer emits a body's direct rows ahead of
+    // its captured rows and the fact sort is offset-stable, but the fold
+    // product does not lean on that emission order — at most one row per
+    // key, so a `(decl, true)` probe binary-searches without scanning
+    // neighbours.
+    write_sites.sort_unstable_by_key(|&(range, in_closure)| (range.offset, in_closure));
     // The #1877 deferred contexts: the fact rows are staged, so the
     // parse-time emissions take their why-not-promoted rows (before the
     // tail merges re-home the report — the recorded indices hold only in
@@ -2902,6 +2940,7 @@ pub fn fold_unit_with_ops<'t>(
         face,
         facts,
         read_types: std::mem::take(&mut engine.read_types),
+        write_sites,
         refs: std::mem::take(&mut engine.refs),
         type_uses: std::mem::take(&mut engine.type_uses),
         parse_diagnostics,
@@ -4262,15 +4301,24 @@ fn non_nullable_callee_container(engine: &Engine, recv: Receiver) -> Option<Stri
 /// verdict are exactly the rows the oracle never emits.
 ///
 /// The teardown join reads the same scope face the `undefined_class` rows
-/// came from ([`resolve_container`], namespace-only — never the fallback):
-/// a scrutinee identifier whose latched `Ty::Named` head resolves nowhere
-/// is the `InvalidType` shape, and its switch's
-/// `non_exhaustive_switch_statement` / `non_exhaustive_switch_expression` /
-/// `unreachable_switch_case` rows drop. Everything else keeps verbatim — a
-/// resolved head stays decidable (the promotion-narrowed unions the oracle
-/// exhausts are a separate face), and an unattributable header or a
-/// non-identifier scrutinee keeps its rows (fail-open, the pre-existing
-/// behavior).
+/// came from (namespace-only — never the fallback): a scrutinee identifier
+/// whose latched `Ty::Named` head resolves nowhere is the `InvalidType`
+/// shape, and its switch's `non_exhaustive_switch_statement` /
+/// `non_exhaustive_switch_expression` / `unreachable_switch_case` rows
+/// drop. Everything else keeps verbatim — a resolved head stays decidable
+/// (the promotion-narrowed unions the oracle exhausts are a separate
+/// face), and an unattributable header or a non-identifier scrutinee keeps
+/// its rows (fail-open, the pre-existing behavior).
+///
+/// The decidable arm mirrors the oracle's `InvalidType` production
+/// (named_type_resolver.dart:201-202, :525-526): a bare type head is
+/// `InvalidType` when its scope lookup misses, hits an ambiguous name
+/// (`MultiplyDefinedElement`), a prefix, or a non-type declaration — and
+/// NOT when it resolves to a declaration whose elements the index never
+/// collected. A names-only stub (the test rigs' `Object`, or a library
+/// declared but never analyzed) resolves to a real element upstream, so
+/// its scrutinee is a live `InterfaceType` whose exhaustiveness verdict
+/// stands — [`scrutinee_head_is_invalid`] keeps that arm.
 #[allow(clippy::too_many_arguments)] // the analysis context, one field each
 fn gate_invalid_scrutinee_switches(
     diagnostics: &mut Vec<Diagnostic>,
@@ -4307,10 +4355,51 @@ fn gate_invalid_scrutinee_switches(
         let Ty::Named { name, .. } = read_types[join].1 else {
             return true;
         };
-        *resolvable.entry(name).or_insert_with(|| {
-            resolve_container(graph, namespaces, index, lib, file, name).is_some()
-        })
+        *resolvable
+            .entry(name)
+            .or_insert_with(|| !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name))
     })
+}
+
+/// The gate's decidable arm: whether the scrutinee's bare `Ty::Named` head
+/// is the oracle's `InvalidType` — the scope lookup misses entirely, hits
+/// an ambiguous (`MultiplyDefinedElement`) or non-type element, or answers
+/// a declaration whose indexed model carries no type-shaped row
+/// (named_type_resolver.dart:201-202, :525-526).
+///
+/// A `Found(Decl(owner))` whose owner the [`ElementIndex`] never collected
+/// is NOT invalid: the name resolved to a declaration — the names-only
+/// `dart:core` stubs of the test rigs, or a sibling library declared but
+/// never analyzed — which upstream's resolver reads as a real element
+/// (`InterfaceType`, never `InvalidType`). Treating it as unresolvable
+/// would drop rows for a scrutinee whose exhaustiveness verdict the engine
+/// computed correctly (#3722). Only a model that IS indexed and lacks a
+/// container row for `name` (a top-level variable or function in a type
+/// position) mirrors the oracle's non-type `InvalidType`.
+fn scrutinee_head_is_invalid(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    lib: LibraryId,
+    file: FileId,
+    name: StringId,
+) -> bool {
+    if resolve_container(graph, namespaces, index, lib, file, name).is_some() {
+        return false;
+    }
+    let Lookup::Found(NamespaceEntry::Decl(owner)) =
+        namespaces.lookup_in_file(graph, lib, Some(file), name)
+    else {
+        return true;
+    };
+    match index.get(owner) {
+        // The declaring unit was never analyzed — a resolved declaration
+        // upstream (real `InterfaceType`), so the head stays decidable.
+        None => false,
+        // The model IS indexed: a declaration with no type-shaped row is
+        // the oracle's non-type element — `InvalidType`, gate the rows.
+        Some(elements) => elements.container(name).is_none(),
+    }
 }
 
 /// The scrutinee identifier a switch-family row answers for: the single
@@ -4415,9 +4504,9 @@ fn switch_scrutinee_head(offset: u32, tokens: &TokenTable) -> Option<u32> {
 ///
 /// The teardown re-decides under the oracle's own posture: a switch whose
 /// scrutinee is a bare identifier, or a `<id>.<id>` select's receiver
-/// identifier, whose latched `Ty::Named` head resolves nowhere through
-/// [`resolve_container`] (namespace-only — the same face the #2336 gate
-/// reads) is that `InvalidType`. The clause walk fails the whole switch
+/// identifier, whose latched `Ty::Named` head answers
+/// [`scrutinee_head_is_invalid`] (namespace-only — the same face the #2336
+/// gate reads) is that `InvalidType`. The clause walk fails the whole switch
 /// open on every shape the verdict cannot mirror: a `default` or a
 /// constant/wildcard/`p.c`-pattern clause before the absorber, a `when`
 /// guard on it (the guard-false arm joins the unmatched state — probed:
@@ -4485,7 +4574,7 @@ fn synthesize_invalid_scrutinee_dead_cases(
             continue;
         };
         if *resolvable.entry(name).or_insert_with(|| {
-            resolve_container(graph, namespaces, index, lib, file, name).is_some()
+            !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
         }) {
             continue;
         }
@@ -4597,7 +4686,7 @@ fn synthesize_invalid_scrutinee_dead_cases(
             }
             let name = strings.intern(tokens.lexeme(source, p));
             if *resolvable.entry(name).or_insert_with(|| {
-                resolve_container(graph, namespaces, index, lib, file, name).is_some()
+                !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
             }) && !object_pattern_property_invalid(
                 slice,
                 tokens,
@@ -4836,7 +4925,7 @@ fn object_pattern_property_invalid(
         };
         if let Ty::Named { name, .. } = ty
             && !*resolvable.entry(name).or_insert_with(|| {
-                resolve_container(graph, namespaces, index, lib, file, name).is_some()
+                !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
             })
             && !resolves_as_core_type(strings.resolve(name))
         {
@@ -5054,7 +5143,7 @@ fn synthesize_unknown_scrutinee_dead_cases(
                         || (!statement
                             && !resolves_as_core_type(strings.resolve(name))))
                     && !*resolvable.entry(name).or_insert_with(|| {
-                        resolve_container(graph, namespaces, index, lib, file, name).is_some()
+                        !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
                     })
             }
             Ty::Named { name, .. } => {
@@ -5350,7 +5439,7 @@ fn switch_clause_absorber(
         }
         let name = strings.intern(tokens.lexeme(source, p));
         if *resolvable.entry(name).or_insert_with(|| {
-            resolve_container(graph, namespaces, index, lib, file, name).is_some()
+            !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
         }) && !object_pattern_property_invalid(
             slice, tokens, source, strings, p, graph, namespaces, index, file, lib, name,
             resolvable,

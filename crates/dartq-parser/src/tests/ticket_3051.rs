@@ -1,7 +1,7 @@
 //! #3051 pins: partial-code directive recovery — the conditional-URI
 //! synthetic closer and the directive-tail junk faces.
 //!
-//! Roots (upstream pin `.third/dart-sdk-3.13.7`,
+//! Roots (upstream pin the pinned Dart SDK 3.13.7,
 //! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`):
 //!
 //! * `parseConditionalUri` :1117-1141: when the condition group's scanner

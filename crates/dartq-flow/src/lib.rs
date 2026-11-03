@@ -298,3 +298,6 @@ mod ticket_3652_pins;
 
 #[cfg(test)]
 mod ticket_3657_tests;
+
+#[cfg(test)]
+mod ticket_3627_tests;

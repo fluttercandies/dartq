@@ -588,6 +588,30 @@ impl Interp<'_> {
                     // rejoins both arms exactly like the bare test's value
                     // context ([`Interp::rejoin_value_split`]).
                     expr.test_split = operand.test_split;
+                    // The condition-variable face (official
+                    // `logicalNot_end` = `operandInfo._invert()`,
+                    // flow_analysis.dart:7336): a bare read carries no
+                    // branch pair of its own, but a condition-variable
+                    // read's `ExpressionInfo` IS non-trivial — the
+                    // replayed arms — so `!b` is non-trivial too and the
+                    // `||` right operand sees the inverted replay
+                    // (`!hasFlags || flags.x` runs in `hasFlags`'s true
+                    // arm). The replay is eager: the operand's read and
+                    // this `!` are adjacent events, so the write-version
+                    // check here is the use-site's check. `test_split`
+                    // marks the pair a split for `rejoin_value_split`,
+                    // and `cond_split_var` re-points the write side's
+                    // capture at the tested variable so `neg = !b`
+                    // stores the inverted binding upstream's
+                    // `conditionVariableState` carries.
+                    if expr.branches.is_none()
+                        && let Some(var) = operand.reference
+                        && let Some((if_true, if_false)) = self.cond_var_arms(var)
+                    {
+                        expr.branches = Some((if_false, if_true));
+                        expr.test_split = true;
+                        self.cond_split_var = self.cond_var_tested(var);
+                    }
                     // `!x` is a boolean — non-null by construction (the
                     // `??`/`?.` kills' literal face).
                     expr.non_null_literal = true;

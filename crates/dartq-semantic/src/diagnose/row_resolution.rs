@@ -3648,8 +3648,18 @@ impl<'a> Engine<'a> {
         let Ty::Named { name, .. } = ty else {
             return false;
         };
+        // `operator -()` declares the `unary-` face but registers under
+        // `-` in the member table (the `-` token is the written spelling);
+        // the lookup spelling pair covers both forms.
+        let unary = self.intern("unary-");
+        let minus = self.intern("-");
         [read, write, adjacent].into_iter().flatten().any(|spelling| {
             spelling == self.intern("==")
+                || (spelling == unary
+                    && matches!(
+                        self.extension_application(name, ty, minus, false, true),
+                        ExtensionApp::Single
+                    ))
                 || matches!(
                     self.extension_application(name, ty, spelling, false, true),
                     ExtensionApp::Single
@@ -5402,12 +5412,34 @@ impl<'a> Engine<'a> {
                             )
                         })
                         .unwrap_or(record);
-                    let receiver_nullable = match record {
+                    let mut receiver_nullable = match record {
                         Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
                             nullable && !self.null_aware_members.contains(&row.range.offset)
                         }
                         _ => false,
                     };
+                    // The promoted-variable face: a bare-read receiver whose
+                    // flow promotion stands — `r1 != null` then `r1.i` — the
+                    // same stand-down `check_instance_member`'s record arm
+                    // applies. A member receiver read (`x._r.$1`) is the
+                    // promotable-field arm's job; a bare local's `Unknown`
+                    // flow marker (a record spelling carries no `Base` head)
+                    // is strictly non-null for the unchecked verdict.
+                    if receiver_nullable
+                        && let Some(read_span) = self
+                            .promoted_recv_reads
+                            .binary_search_by(|(member, _)| {
+                                member.cmp(&row.range.offset)
+                            })
+                            .ok()
+                            .map(|index| self.promoted_recv_reads[index].1)
+                        && !self.read_offset_is_member(read_span.offset)
+                        && let Some(promoted) = promotions.promoted(read_span)
+                        && (promoted == Ty::Unknown
+                            || promoted.is_strictly_non_nullable())
+                    {
+                        receiver_nullable = false;
+                    }
                     // The type-literal head (the `dynamic` keyword or an
                     // ungrounded alias spelling) denotes the `Type`
                     // instance, never a value of the shape.
@@ -7172,7 +7204,25 @@ impl<'a> Engine<'a> {
                 self.fold_alias_ty(receiver_ty),
                 Ty::Named { name, .. } if name == container
             )
-            && let Some(bound) = self.param_bound_of(container)
+            && let Some(bound) = self.param_bound_of(container).or_else(|| {
+                // A CONTAINER-level parameter's bound survives the frame
+                // teardown in `bounds`'s capture — `class A<T extends C?>`
+                // registers `T` under `A` exactly like `param_bound` reads
+                // it live (`bounds.rs`'s `container_param_bound`). The exec
+                // windows' `param_bound_of` answers the same question for
+                // function/method parameters alone. `Some(None)` — a param
+                // declared with no written bound — maps to the implicit
+                // `Object?` the same way `param_bound_of` answers it.
+                match self.bounds.container_param_bound(container) {
+                    Some(Some(tree)) => Some(self.tree_ty(&tree)),
+                    Some(None) => Some(Ty::Named {
+                        name: self.intern("Object"),
+                        nullable: true,
+                        args: ArgListId::EMPTY,
+                    }),
+                    None => None,
+                }
+            })
         {
             // A parameter bound to another parameter (`T extends S`)
             // resolves on the LAST hop's bound — the same chase
@@ -10564,11 +10614,34 @@ impl<'a> Engine<'a> {
         if decl == row.range.offset {
             return;
         }
+        // A catch clause's parameters are implicitly final and bound on
+        // entry — every write reports (upstream `checkFinalAlreadyAssigned`
+        // reads the element's `isFinal`, which the catch binder sets
+        // unconditionally; resolver.dart:429-432). The declaration face
+        // owns the token probe: `catch (e, s)` puts `catch`+`(` (or the
+        // trace param's `,`) before the name.
+        if self.catch_param_decl(decl) {
+            let name_text = self.strings.resolve(row.name);
+            self.emit(
+                SemanticCode::AssignmentToFinalLocal,
+                row.range,
+                name_text,
+                "",
+            );
+            return;
+        }
         let FinalLocalFace::Final { assigned } = self.final_local_face(decl) else {
             return;
         };
+        // A write inside a nested function body to an enclosing scope's
+        // `final` local reports even when it is the variable's only write
+        // site: the captured variable is `potentiallyMutatedInScope`, so
+        // `isUnassigned` inside the closure is false
+        // (`AssignedVariables` anywhere-set capture; upstream
+        // resolution_visitor.dart:170-173 adds the element on ANY write).
         if !assigned
             && !for_each
+            && !self.captured_write(decl, row.range.offset)
             && !self.has_prior_write(row.name, decl, row.range.offset)
         {
             return;
@@ -10592,9 +10665,16 @@ impl<'a> Engine<'a> {
         let Some(at) = self.token_index_at(decl) else {
             return FinalLocalFace::Other;
         };
-        // A field/super formal (`this.x`, `super.a`) is a final local
-        // regardless of any written keyword (the initializing-formal
-        // scope's rule, language spec 10.6.1).
+        // A field/super formal (`this.x`, `super.a`) scopes into the
+        // constructor's initializer list only — writes there resolve to the
+        // FIELD (the `field_initialized_*`/`assignment_to_final` family
+        // owns them), and a body write to the same spelling resolves to
+        // the field member, not the parameter. Neither shape ever reports
+        // `assignment_to_final_local` (upstream: the initializing-formal
+        // element is a `FormalParameterElement` in the initializer scope
+        // but `ConstructorFieldInitializer`'s LHS is not a
+        // `SimpleIdentifier` assignment — `checkFinalAlreadyAssigned`
+        // never runs for it).
         if let Some(receiver) = at.checked_sub(2)
             && tokens.get(at - 1).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
             && matches!(
@@ -10604,10 +10684,25 @@ impl<'a> Engine<'a> {
                 )
             )
         {
-            return FinalLocalFace::Final { assigned: true };
+            return FinalLocalFace::Other;
         }
         let mut is_final = false;
         let mut formal = false;
+        // A binder inside a pattern: the `final`/`var` keyword heads the
+        // OUTERMOST pattern (`final (a, b) = …`, `for (final (v) in …)`,
+        // `case final (a)`), so the backward walk must step through the
+        // pattern's bracket structure instead of stopping at it.
+        // `patterned` latches once an unmatched pattern bracket is
+        // crossed; `binder` marks a `final` seen in binder position
+        // (`(var a, final b)`, `case final a`, `{final a}`) — both make
+        // the variable bound on entry the way a formal or an initializer
+        // does.
+        let mut patterned = false;
+        let mut binder = false;
+        // A `,` the walk crossed: a `final` reached across one heads a
+        // sibling declarator (`f(final a, int b)` — the `final` binds `a`
+        // only) unless it opens a pattern bracket itself (`final (…, b)`).
+        let mut crossed_comma = false;
         let mut cursor = at;
         while let Some(prev) = cursor.checked_sub(1) {
             if at - prev > 32 {
@@ -10616,21 +10711,175 @@ impl<'a> Engine<'a> {
             let token = &tokens[prev];
             match token.kind {
                 dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final) => {
+                    if crossed_comma
+                        && !matches!(
+                            tokens.get(prev + 1).map(|t| t.kind),
+                            Some(
+                                dartq_scanner::TokenKind::OpenParen
+                                    | dartq_scanner::TokenKind::OpenSquare
+                                    | dartq_scanner::TokenKind::OpenCurly
+                            )
+                        )
+                    {
+                        break;
+                    }
                     is_final = true;
+                    // A `final` nested inside a pattern marks its binder.
+                    // The unambiguous positions are after a `,`, `:`, `&&`,
+                    // `||`, `case`, or `required`. A `(`/`[`/`{` opener
+                    // before `final` is a pattern bracket ONLY when that
+                    // bracket itself sits in pattern position — a plain
+                    // block `{` (preceded by `)`, `{`, `;`, `}`, or a
+                    // statement keyword) opens a body, so `{ final x; }`
+                    // is a declaration, not a binder.
+                    let pred = tokens.get(prev.wrapping_sub(1)).map(|t| t.kind);
+                    binder |= matches!(
+                        pred,
+                        Some(
+                            dartq_scanner::TokenKind::Comma
+                                | dartq_scanner::TokenKind::Colon
+                                | dartq_scanner::TokenKind::AmpersandAmpersand
+                                | dartq_scanner::TokenKind::BarBar
+                        ) | Some(dartq_scanner::TokenKind::Keyword(
+                            dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Required,
+                        ))
+                    ) || matches!(
+                        pred,
+                        Some(
+                            dartq_scanner::TokenKind::OpenParen
+                                | dartq_scanner::TokenKind::OpenSquare
+                                | dartq_scanner::TokenKind::OpenCurly
+                        )
+                    ) && self.bracket_is_pattern(prev.wrapping_sub(1));
                 }
-                // `const` owns `assignment_to_const`; `late` (with or
-                // without an initializer) owns the late-final row; `var`
-                // is not final at all.
+                // `late` owns the late-final row whatever else the walk
+                // saw (`late final int x` — a first write is legal); it
+                // cannot be a pattern subterm, so any `late` in the window
+                // vetoes outright. `var` and `const` only END the walk:
+                // sibling binders carry their own markers (`(var a, final
+                // b)` keeps `b`'s `final`), and a `const` inside a pattern
+                // is a constant subterm (`final (const C(), b)`), not the
+                // declaration's keyword — a `const` declarator's own name
+                // scan never reaches a `final` anyway (`const int x` ends
+                // at `int` then `;`/`{`/`=`/`(` before one).
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Late) => {
+                    return FinalLocalFace::Other;
+                }
+                // A `case` head or a statement keyword ends the walk
+                // without a `final` verdict (the refutable-context binders
+                // a `case` introduces are mutable unless individually
+                // marked `final`).
                 dartq_scanner::TokenKind::Keyword(
-                    dartq_scanner::Keyword::Const
-                    | dartq_scanner::Keyword::Late
-                    | dartq_scanner::Keyword::Var,
-                ) => return FinalLocalFace::Other,
+                    dartq_scanner::Keyword::Var
+                    | dartq_scanner::Keyword::Case
+                    | dartq_scanner::Keyword::In
+                    | dartq_scanner::Keyword::If
+                    | dartq_scanner::Keyword::For
+                    | dartq_scanner::Keyword::While
+                    | dartq_scanner::Keyword::Switch
+                    | dartq_scanner::Keyword::Return
+                    | dartq_scanner::Keyword::Do
+                    | dartq_scanner::Keyword::Else
+                    | dartq_scanner::Keyword::Try
+                    | dartq_scanner::Keyword::Catch
+                    | dartq_scanner::Keyword::On
+                    | dartq_scanner::Keyword::Throw
+                    | dartq_scanner::Keyword::Yield
+                    | dartq_scanner::Keyword::Assert
+                    | dartq_scanner::Keyword::Await
+                    | dartq_scanner::Keyword::Async
+                    | dartq_scanner::Keyword::Sync
+                    | dartq_scanner::Keyword::Rethrow
+                    | dartq_scanner::Keyword::Break
+                    | dartq_scanner::Keyword::Continue
+                    | dartq_scanner::Keyword::New
+                    | dartq_scanner::Keyword::Default
+                    | dartq_scanner::Keyword::When,
+                ) => break,
                 dartq_scanner::TokenKind::OpenParen => {
-                    // A `(` after a name/type head opens a formal list; the
-                    // parameter is bound on entry, so a later write is not
-                    // its first assignment.
-                    formal = matches!(
+                    match tokens.get(prev.wrapping_sub(1)).map(|t| t.kind) {
+                        // A `(` after a name/type head opens a formal
+                        // list — the parameter is bound on entry — unless
+                        // the head itself sits in pattern context
+                        // (`Square(:a) = …`, `C.named(:a)`, `f<T>(…)`):
+                        // an object pattern keeps the walk moving.
+                        Some(dartq_scanner::TokenKind::Identifier) => {
+                            let before_head = prev
+                                .checked_sub(2)
+                                .map(|i| tokens[i].kind);
+                            if matches!(
+                                before_head,
+                                Some(
+                                    dartq_scanner::TokenKind::Keyword(
+                                        dartq_scanner::Keyword::Final
+                                            | dartq_scanner::Keyword::Var
+                                            | dartq_scanner::Keyword::Case
+                                            | dartq_scanner::Keyword::Required
+                                    ) | dartq_scanner::TokenKind::OpenParen
+                                        | dartq_scanner::TokenKind::OpenSquare
+                                        | dartq_scanner::TokenKind::OpenCurly
+                                        | dartq_scanner::TokenKind::Comma
+                                        | dartq_scanner::TokenKind::Colon
+                                        | dartq_scanner::TokenKind::AmpersandAmpersand
+                                        | dartq_scanner::TokenKind::BarBar
+                                        | dartq_scanner::TokenKind::Period
+                                        | dartq_scanner::TokenKind::Question
+                                        | dartq_scanner::TokenKind::Bang
+                                        | dartq_scanner::TokenKind::Gt
+                                )
+                            ) {
+                                patterned = true;
+                            } else {
+                                formal = true;
+                                break;
+                            }
+                        }
+                        Some(
+                            dartq_scanner::TokenKind::CloseParen
+                            | dartq_scanner::TokenKind::CloseSquare
+                            | dartq_scanner::TokenKind::Question
+                            | dartq_scanner::TokenKind::Gt,
+                        ) => {
+                            formal = true;
+                            break;
+                        }
+                        // A control-head `(` (`for (`, `if (`, `while (`,
+                        // `catch (`, `assert (`) opens the STATEMENT's
+                        // head, not a pattern or a formal list — the walk
+                        // stops at the declaration's boundary.
+                        Some(
+                            dartq_scanner::TokenKind::Keyword(
+                                dartq_scanner::Keyword::For
+                                    | dartq_scanner::Keyword::If
+                                    | dartq_scanner::Keyword::While
+                                    | dartq_scanner::Keyword::Switch
+                                    | dartq_scanner::Keyword::Catch
+                                    | dartq_scanner::Keyword::On
+                                    | dartq_scanner::Keyword::Assert
+                                    | dartq_scanner::Keyword::Return
+                                    | dartq_scanner::Keyword::Throw
+                                    | dartq_scanner::Keyword::Await
+                                    | dartq_scanner::Keyword::Do
+                                    | dartq_scanner::Keyword::Else
+                            ),
+                        )
+                        | Some(dartq_scanner::TokenKind::Function)
+                        | Some(dartq_scanner::TokenKind::Eq)
+                        | Some(dartq_scanner::TokenKind::Semicolon) => break,
+                        // Any other predecessor — `final`, `(`, `,`, `:`
+                        // — is a pattern group opener; the walk
+                        // continues toward the pattern's head keyword.
+                        _ => patterned = true,
+                    }
+                }
+                // A `[`/`{` that does not follow a callable head is a
+                // list/map pattern bracket; the walk continues the same
+                // way. A `{` following `)` or a statement keyword is a
+                // block — the keyword arms above already stopped those,
+                // and the `)` arm's own head check keeps `f() {` out of
+                // this arm.
+                dartq_scanner::TokenKind::OpenSquare | dartq_scanner::TokenKind::OpenCurly => {
+                    if matches!(
                         tokens.get(prev.wrapping_sub(1)).map(|t| t.kind),
                         Some(
                             dartq_scanner::TokenKind::Identifier
@@ -10638,15 +10887,16 @@ impl<'a> Engine<'a> {
                                 | dartq_scanner::TokenKind::CloseSquare
                                 | dartq_scanner::TokenKind::Question
                         )
-                    );
-                    break;
+                    ) {
+                        break;
+                    }
+                    patterned = true;
                 }
+                dartq_scanner::TokenKind::Comma => crossed_comma = true,
                 dartq_scanner::TokenKind::Semicolon
-                | dartq_scanner::TokenKind::OpenCurly
                 | dartq_scanner::TokenKind::CloseCurly
                 | dartq_scanner::TokenKind::Function
-                | dartq_scanner::TokenKind::Eq
-                | dartq_scanner::TokenKind::Comma => break,
+                | dartq_scanner::TokenKind::Eq => break,
                 _ => {}
             }
             cursor = prev;
@@ -10654,13 +10904,13 @@ impl<'a> Engine<'a> {
         if !is_final {
             return FinalLocalFace::Other;
         }
-        // A parameter is always assigned; a declarator's `=` (or a pattern
-        // group's trailing `=`) initializes it; a for-in loop variable is
-        // bound by the loop.
-        let mut assigned = formal;
+        // A parameter is always assigned; a pattern binder is bound by its
+        // match; a declarator's `=` (or a pattern group's trailing `=`)
+        // initializes it; a for-in loop variable is bound by the loop.
+        let mut assigned = formal || patterned || binder;
         let mut probe = at + 1;
         let mut steps = 0;
-        while let Some(token) = tokens.get(probe) {
+        while !assigned && let Some(token) = tokens.get(probe) {
             steps += 1;
             if steps > 8 {
                 break;
@@ -10681,12 +10931,49 @@ impl<'a> Engine<'a> {
         FinalLocalFace::Final { assigned }
     }
 
+    /// Whether the declaration name token at `decl` is a catch clause's
+    /// parameter: `catch (e, s)` puts `catch` `(` before the exception
+    /// name and a `,` before the stack-trace name; `on T catch (e)` and
+    /// the keyword-less `catch (e)` share the shape.
+    fn catch_param_decl(&self, decl: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let Some(at) = self.token_index_at(decl) else {
+            return false;
+        };
+        let mut cursor = at;
+        let mut steps = 0;
+        while let Some(prev) = cursor.checked_sub(1) {
+            steps += 1;
+            if steps > 4 {
+                return false;
+            }
+            match tokens[prev].kind {
+                dartq_scanner::TokenKind::OpenParen => {
+                    return matches!(
+                        prev.checked_sub(1).map(|i| tokens[i].kind),
+                        Some(dartq_scanner::TokenKind::Keyword(
+                            dartq_scanner::Keyword::Catch
+                        ))
+                    );
+                }
+                dartq_scanner::TokenKind::Identifier | dartq_scanner::TokenKind::Comma => {}
+                _ => return false,
+            }
+            cursor = prev;
+        }
+        false
+    }
+
     /// Whether the same spelling took a write between the declaration at
     /// `decl` and the row at `write` — the model's stand-in for the flow
     /// layer's "not definitely unassigned" (`isDefinitelyUnassigned` is
     /// false once ANY path assigns). A token counts when it is an
-    /// assignment target (`x =`, `x +=`, `x++`, `++x`) or a for-in head
-    /// (`x in`).
+    /// assignment target (`x =`, `x +=`, `x++`, `++x`), a for-in head
+    /// (`x in`), or an assigned-variable pattern (`(x) = …`, `[x, _] = …`,
+    /// `{"k": x} = …` — the name sits inside a bracket group an `=`
+    /// closes). A write inside a sibling branch (`if/else`, `try/catch`,
+    /// `switch` cases) does not count: it is not flow-preceding on the
+    /// write's own path.
     fn has_prior_write(&self, name: StringId, decl: u32, write: u32) -> bool {
         let tokens = self.tokens.as_slice();
         let lexeme = self.strings.resolve(name);
@@ -10702,8 +10989,498 @@ impl<'a> Engine<'a> {
                             dartq_scanner::TokenKind::PlusPlus
                                 | dartq_scanner::TokenKind::MinusMinus
                         )
-                    ))
+                    )
+                    || self.pattern_lhs_write(at))
+                && !self.sibling_branch_write(at, end)
         })
+    }
+
+    /// Whether the identifier token at `at` sits inside a pattern's
+    /// bracket group an `=` closes — an assigned-variable pattern's write
+    /// position (`(a, _) = e`, `{"k": a} = e`, `Square(:a) = e`). The
+    /// forward scan skips the name's own bracket level content until the
+    /// group's outermost closer; `=` directly after it marks the write.
+    fn pattern_lhs_write(&self, at: usize) -> bool {
+        let tokens = self.tokens.as_slice();
+        // Cheap gate: the name's follower must be a token a pattern can
+        // carry next — an inner closer or a separator — before the scan
+        // pays for the bracket walk.
+        let first = tokens.get(at + 1).map(|t| t.kind);
+        match first {
+            Some(
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::Comma,
+            ) => {}
+            _ => return false,
+        }
+        let mut depth: u32 = 0;
+        let mut probe = at + 1;
+        while let Some(token) = tokens.get(probe) {
+            match token.kind {
+                dartq_scanner::TokenKind::OpenParen
+                | dartq_scanner::TokenKind::OpenSquare
+                | dartq_scanner::TokenKind::OpenCurly => depth += 1,
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        if !matches!(
+                            tokens.get(probe + 1).map(|t| t.kind),
+                            Some(dartq_scanner::TokenKind::Eq)
+                        ) {
+                            return false;
+                        }
+                        // `x[i] = e` is an index write, not a pattern
+                        // write: a `]`-closed group whose `[` follows an
+                        // expression tail (a receiver) is subscript
+                        // syntax. `(…)`/`{…}` heads have no such shape —
+                        // a `f(a) =` left side is not valid code, and an
+                        // object pattern `Square(:a) =` legitimately puts
+                        // `(` after its type name.
+                        if token.kind == dartq_scanner::TokenKind::CloseSquare {
+                            return self.square_group_is_pattern(probe);
+                        }
+                        return true;
+                    }
+                    depth -= 1;
+                }
+                // A statement boundary before any closer means the name
+                // was never inside a group — nothing closes it.
+                dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Function => {
+                    return false;
+                }
+                _ => {}
+            }
+            probe += 1;
+        }
+        false
+    }
+
+    /// Whether the `(`/`[`/`{` token at index `open` opens a PATTERN
+    /// group rather than a statement block, a signature formal list, or a
+    /// control head. The decider is the bracket's own predecessor: a
+    /// pattern bracket follows `final`/`var`/`case`/`required`, an opener
+    /// or separator (`(`, `[`, `{`, `,`, `:`), `&&`/`||`, `in`, `=`, `?`,
+    /// `!`, `>`, `.`, or a type/identifier head (object pattern
+    /// `Square(…)`); a block/signature/head `(`/`{` follows `)`, `}`, `;`,
+    /// a statement keyword (`if`/`for`/`while`/`else`/`do`/`try`/`catch`/
+    /// `on`/`return`/`throw`/`switch`), `=>`, or `:` that opens a
+    /// constructor's initializer list.
+    fn bracket_is_pattern(&self, open: usize) -> bool {
+        let tokens = self.tokens.as_slice();
+        let Some(pred) = open.checked_sub(1).map(|i| tokens[i].kind) else {
+            return false;
+        };
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        match pred {
+            // Pattern-position heads.
+            TokenKind::Keyword(
+                Keyword::Final | Keyword::Var | Keyword::Case | Keyword::Required | Keyword::In,
+            )
+            | TokenKind::OpenParen
+            | TokenKind::OpenSquare
+            | TokenKind::OpenCurly
+            | TokenKind::Comma
+            | TokenKind::AmpersandAmpersand
+            | TokenKind::BarBar
+            | TokenKind::Eq
+            | TokenKind::Question
+            | TokenKind::Bang
+            | TokenKind::Gt
+            | TokenKind::Period
+            | TokenKind::Identifier => true,
+            // A `:` after `)` opens a constructor's initializer list —
+            // its `{`-bodies are blocks, not patterns. Every other `:` is
+            // a pattern label/default separator.
+            TokenKind::Colon => !matches!(
+                open.checked_sub(2).map(|i| tokens[i].kind),
+                Some(TokenKind::CloseParen)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the `]` at token index `close` ends a pattern list bracket
+    /// (not a subscript): the matching `[` must not follow an expression
+    /// tail — an identifier, a closer, a literal, or `>`/`?`/`!`.
+    fn square_group_is_pattern(&self, close: usize) -> bool {
+        let tokens = self.tokens.as_slice();
+        let mut depth: u32 = 1;
+        let mut cursor = close;
+        while let Some(prev) = cursor.checked_sub(1) {
+            match tokens[prev].kind {
+                dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseCurly => depth += 1,
+                dartq_scanner::TokenKind::OpenSquare => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return !matches!(
+                            prev.checked_sub(1).map(|i| tokens[i].kind),
+                            Some(
+                                dartq_scanner::TokenKind::Identifier
+                                    | dartq_scanner::TokenKind::CloseParen
+                                    | dartq_scanner::TokenKind::CloseSquare
+                                    | dartq_scanner::TokenKind::CloseCurly
+                                    | dartq_scanner::TokenKind::Gt
+                                    | dartq_scanner::TokenKind::Question
+                                    | dartq_scanner::TokenKind::Bang
+                                    | dartq_scanner::TokenKind::String
+                                    | dartq_scanner::TokenKind::Int
+                                    | dartq_scanner::TokenKind::Double
+                            )
+                        );
+                    }
+                }
+                dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenCurly => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            cursor = prev;
+        }
+        false
+    }
+
+    /// Whether the candidate prior write at `at` sits inside a clause of
+    /// a branching construct whose OTHER clause holds the row's write
+    /// (the `end` token bound): `if (c) { x = 1; } else { x = 2; }`,
+    /// `switch` case clauses, and the unbraced `if (c) x = 1; else x = 2;`
+    /// shape. On such a row the prior write is a sibling alternative —
+    /// flow reaches the write without crossing it — so it leaves the
+    /// variable unassigned on this path. (`try`/`catch`/`finally` are NOT
+    /// alternative clauses for assignment purposes: their bodies see the
+    /// join of the try's exit paths, where a completed prior write is
+    /// already visible.)
+    fn sibling_branch_write(&self, at: usize, end: usize) -> bool {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        // Walk outward through the candidate's enclosing blocks: a block
+        // whose `}` is followed by `else` is a clause; the write lying
+        // inside the following clause (or a later sibling clause of the
+        // same chain) makes the pair alternative. `case`/`default` marks
+        // a switch-clause boundary at the same depth outright.
+        let mut depth: u32 = 0;
+        let mut probe = at + 1;
+        while probe < end {
+            match tokens[probe].kind {
+                TokenKind::OpenParen
+                | TokenKind::OpenSquare
+                | TokenKind::OpenCurly => depth += 1,
+                TokenKind::CloseParen | TokenKind::CloseSquare => depth = depth.saturating_sub(1),
+                TokenKind::CloseCurly => {
+                    if depth == 0 {
+                        // The candidate's innermost block closed before
+                        // the write: a `}`-led clause.
+                        let Some(next) = tokens.get(probe + 1) else {
+                            return false;
+                        };
+                        if !matches!(next.kind, TokenKind::Keyword(Keyword::Else)) {
+                            return false;
+                        }
+                        if self.write_in_clause(probe + 1, end) {
+                            return true;
+                        }
+                        // Past this clause chain the write may still sit
+                        // in a later construct — keep walking from the
+                        // chain's end.
+                        return self.chain_continues(probe + 1, end);
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Semicolon => {
+                    if depth == 0 {
+                        // An unbraced clause boundary: `x = 1; else …`
+                        // (then-statement), or a `case`'s last statement
+                        // before the next clause head.
+                        let Some(next) = tokens.get(probe + 1) else {
+                            return false;
+                        };
+                        match next.kind {
+                            TokenKind::Keyword(Keyword::Else) => {
+                                return self.write_in_clause(probe + 1, end)
+                                    || self.chain_continues(probe + 1, end);
+                            }
+                            TokenKind::Keyword(Keyword::Case | Keyword::Default) => return true,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            probe += 1;
+        }
+        false
+    }
+
+    /// Whether the token at `head` (an `else`) opens a clause containing
+    /// the token bound `end` — the clause is a `{…}` block or a single
+    /// statement ending at `;`.
+    fn write_in_clause(&self, head: usize, end: usize) -> bool {
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let cursor = head + 1;
+        match tokens.get(cursor).map(|t| t.kind) {
+            Some(TokenKind::OpenCurly) => {
+                let mut depth: u32 = 1;
+                let mut probe = cursor + 1;
+                while let Some(token) = tokens.get(probe) {
+                    match token.kind {
+                        TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
+                            depth += 1;
+                        }
+                        TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return probe >= end;
+                            }
+                        }
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+                false
+            }
+            _ => {
+                // A single-statement clause (`else x = 2;`): the write
+                // lands inside iff no `;` at depth 0 precedes it.
+                let mut depth: u32 = 0;
+                let mut probe = cursor;
+                while probe < end {
+                    match tokens[probe].kind {
+                        TokenKind::OpenParen
+                        | TokenKind::OpenSquare
+                        | TokenKind::OpenCurly => depth += 1,
+                        TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly => {
+                            if depth == 0 {
+                                return false;
+                            }
+                            depth -= 1;
+                        }
+                        TokenKind::Semicolon if depth == 0 => return false,
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+                true
+            }
+        }
+    }
+
+    /// After an `else` clause that does not contain the write, the chain
+    /// may continue (`else if`, `else if … else`): whether the write sits
+    /// in any clause of the same chain.
+    fn chain_continues(&self, head: usize, end: usize) -> bool {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        // Skip the clause the head opens, then decide by the token after
+        // it: another `else` continues the chain; anything else ends it
+        // (the write then sits past the construct — the prior write IS
+        // flow-preceding there and counts).
+        let cursor = head + 1;
+        let clause_end = match tokens.get(cursor).map(|t| t.kind) {
+            Some(TokenKind::OpenCurly) => {
+                let mut depth: u32 = 1;
+                let mut probe = cursor + 1;
+                loop {
+                    let Some(token) = tokens.get(probe) else {
+                        return false;
+                    };
+                    match token.kind {
+                        TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
+                            depth += 1;
+                        }
+                        TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break probe + 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+            }
+            _ => {
+                // Single-statement clause — its `;` at depth 0.
+                let mut depth: u32 = 0;
+                let mut probe = cursor;
+                loop {
+                    let Some(token) = tokens.get(probe) else {
+                        return false;
+                    };
+                    match token.kind {
+                        TokenKind::OpenParen
+                        | TokenKind::OpenSquare
+                        | TokenKind::OpenCurly => depth += 1,
+                        TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly => depth = depth.saturating_sub(1),
+                        TokenKind::Semicolon if depth == 0 => break probe + 1,
+                        _ => {}
+                    }
+                    probe += 1;
+                }
+            }
+        };
+        if clause_end >= end {
+            return false;
+        }
+        match tokens.get(clause_end).map(|t| t.kind) {
+            Some(TokenKind::Keyword(Keyword::Else)) => {
+                self.write_in_clause(clause_end, end) || self.chain_continues(clause_end, end)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the write at `write` sits inside a nested function body
+    /// the declaration at `decl` does not share — the captured-variable
+    /// face: a `final` local written only from inside a closure is still
+    /// `potentiallyMutatedInScope`, so `isUnassigned` inside the closure
+    /// answers false (upstream `AssignedVariables` anywhere sets mark the
+    /// variable written for the whole scope). The function boundary is a
+    /// `{` owned by a signature (`)` whose `(` does not follow a control
+    /// keyword), a `sync`/`async` marker, or a constructor's `:`-list —
+    /// `if`/`for`/`while`/`switch`/`catch`/`on`/`else`/`try`/`do` blocks
+    /// do not isolate assignment.
+    fn captured_write(&self, decl: u32, write: u32) -> bool {
+        self.function_body_boundary(write) != self.function_body_boundary(decl)
+    }
+
+    /// The offset of the innermost function-body `{`/`=>` enclosing the
+    /// token position `at`, `None` at file top level.
+    fn function_body_boundary(&self, at: u32) -> Option<u32> {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let start = tokens.partition_point(|token| token.utf16_offset < at);
+        let mut depth: u32 = 0;
+        let mut cursor = start;
+        while let Some(prev) = cursor.checked_sub(1) {
+            match tokens[prev].kind {
+                TokenKind::CloseCurly | TokenKind::CloseParen | TokenKind::CloseSquare => {
+                    depth += 1;
+                }
+                TokenKind::OpenCurly => {
+                    if depth == 0 {
+                        if self.brace_opens_function(prev) {
+                            return Some(tokens[prev].utf16_offset);
+                        }
+                    } else {
+                        depth -= 1;
+                    }
+                }
+                TokenKind::OpenParen | TokenKind::OpenSquare => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            cursor = prev;
+        }
+        None
+    }
+
+    /// Whether the `{` at token index `brace` opens a function body: a
+    /// signature `)` whose `(` is not a control head (`if`/`for`/`while`/
+    /// `switch`/`catch`/`assert`/`on`), a `sync`/`async`/`sync*` tail, or
+    /// a constructor initializer list's `:`. Any other owner — `else`,
+    /// `try`, `do`, `finally`, `case`-block, a statement `;`/`{`/`}` —
+    /// keeps the block a plain statement group.
+    fn brace_opens_function(&self, brace: usize) -> bool {
+        use dartq_scanner::Keyword;
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let Some(prev) = brace.checked_sub(1) else {
+            return false;
+        };
+        match tokens[prev].kind {
+            TokenKind::CloseParen => {
+                // The `(` matching this `)`: a control keyword before it
+                // makes the `{` a statement block (`if (c) {`), anything
+                // else a signature (`f() {`, `() {`, `C(this.x) {`).
+                let mut depth: u32 = 1;
+                let mut cursor = prev;
+                while let Some(open) = cursor.checked_sub(1) {
+                    match tokens[open].kind {
+                        TokenKind::CloseParen | TokenKind::CloseSquare => depth += 1,
+                        TokenKind::OpenParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return !matches!(
+                                    open.checked_sub(1).map(|i| tokens[i].kind),
+                                    Some(TokenKind::Keyword(
+                                        Keyword::If
+                                            | Keyword::For
+                                            | Keyword::While
+                                            | Keyword::Switch
+                                            | Keyword::Catch
+                                            | Keyword::Assert
+                                    ))
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    cursor = open;
+                }
+                false
+            }
+            // `sync {` / `async {` / `sync* {` / `async* {` bodies, and a
+            // constructor body's `{` after its initializer list's last
+            // initializer (the `:`-led chain ends with an expression —
+            // the `}`-unmatched scan below lands on the `:` itself).
+            TokenKind::Keyword(Keyword::Sync | Keyword::Async) => true,
+            TokenKind::Star => matches!(
+                prev.checked_sub(1).map(|i| tokens[i].kind),
+                Some(TokenKind::Keyword(Keyword::Sync | Keyword::Async))
+            ),
+            _ => {
+                // A constructor's `this : f = 0 {` body: scan back over
+                // the initializer expressions for the list's `:` at
+                // paren-depth 0 (preceded by the signature `)`).
+                let mut depth: u32 = 0;
+                let mut cursor = prev;
+                while let Some(at) = cursor.checked_sub(1) {
+                    match tokens[at].kind {
+                        TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly => depth += 1,
+                        TokenKind::OpenParen | TokenKind::OpenSquare => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        TokenKind::OpenCurly => {
+                            if depth == 0 {
+                                return false;
+                            }
+                            depth -= 1;
+                        }
+                        TokenKind::Semicolon | TokenKind::Function if depth == 0 => {
+                            return false;
+                        }
+                        TokenKind::Colon if depth == 0 => {
+                            return matches!(
+                                at.checked_sub(1).map(|i| tokens[i].kind),
+                                Some(TokenKind::CloseParen)
+                            );
+                        }
+                        _ => {}
+                    }
+                    cursor = at;
+                }
+                false
+            }
+        }
     }
 
     pub(crate) fn member_defined(

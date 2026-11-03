@@ -1077,10 +1077,16 @@ impl<'a> Engine<'a> {
     /// container). The eligibility gate
     /// ([`Engine::promotable_field_substitution`]) and the why-not-promoted
     /// context face (#1877) share the resolution.
+    ///
+    /// The third element is the entry's defining file — the cross-file
+    /// context anchor. It is `None` only when BOTH sources are silent (the
+    /// boundary's registration never saw the projection AND the climb
+    /// recorded no declaring file); that degrades the context anchor
+    /// alone, never the resolution.
     pub(crate) fn member_read_resolution(
         &self,
         read: u32,
-    ) -> Option<(Projected<'a, MemberEntry>, StringId, FileId)> {
+    ) -> Option<(Projected<'a, MemberEntry>, StringId, Option<FileId>)> {
         if let Ok(index) = self
             .member_reads
             .binary_search_by(|row| row.offset.cmp(&read))
@@ -1108,7 +1114,7 @@ impl<'a> Engine<'a> {
             };
             return match walk {
                 Walk::Found(entry) => {
-                    let origin = self.boundary.member_origin(&entry)?;
+                    let origin = self.member_entry_origin(&entry);
                     Some((entry, row.name, origin))
                 }
                 _ => None,
@@ -1120,11 +1126,25 @@ impl<'a> Engine<'a> {
         };
         match self.walk_members(container, found.name) {
             Walk::Found(entry) => {
-                let origin = self.boundary.member_origin(&entry)?;
+                let origin = self.member_entry_origin(&entry);
                 Some((entry, found.name, origin))
             }
             _ => None,
         }
+    }
+
+    /// The defining file of one resolved member entry — the cross-file
+    /// context anchor (#1877). The boundary's own registration answers for
+    /// every entry it projected; an **instantiated ancestor** entry
+    /// (`class D extends Base<N>` reaching `Base`'s `T? _t`) is a fresh
+    /// projection the registration never saw
+    /// ([`Engine::substitute_entry`]), so the climb's recorded declaring
+    /// file answers instead. `None` (both sources silent) degrades the
+    /// context anchor alone, never the resolution that reads the entry.
+    fn member_entry_origin(&self, entry: &Projected<'a, MemberEntry>) -> Option<FileId> {
+        self.boundary
+            .member_origin(entry)
+            .or_else(|| self.member_faces.last_found_file())
     }
 
     // —— why-not-promoted context rows (#1877) ————————————————————————
@@ -1294,6 +1314,9 @@ impl<'a> Engine<'a> {
                 if entry.name_range.offset == u32::MAX {
                     return Vec::new();
                 }
+                let Some(origin) = origin else {
+                    return Vec::new();
+                };
                 vec![ContextMessage {
                     message: SharedStr::from(format!(
                         "'{name}' refers to a {kind} so it couldn't be promoted."
@@ -4360,9 +4383,12 @@ impl<'a> Engine<'a> {
     /// (`(a, b, c)` — a comma inside a nested group does not split), and
     /// each field's type is the last row strictly inside its token span.
     /// An empty field (`(42, ,)`) carries [`Ty::Unknown`] — the recovery's
-    /// `InvalidType` splice, the under-report direction. The named fields
-    /// `names` are the trailing [`Self::record_literal_names`] entries of
-    /// the split. A field whose window rows disagree on one known type
+    /// `InvalidType` splice, the under-report direction. A field is named
+    /// iff its own window spells `ident :` — `names` (the
+    /// [`Self::record_literal_names`] entries in source order) pairs the
+    /// labels onto those windows; a named field may precede a positional
+    /// one, so field position never decides the split. A field whose window
+    /// rows disagree on one known type
     /// stays undecided (`None`, the literal keeps its opaque value row).
     /// The stacks pop either way — the literal's own `(` window never
     /// leaks into the enclosing expression.
@@ -4396,6 +4422,73 @@ impl<'a> Engine<'a> {
         if boundaries.len() == count + 1 {
             // A trailing comma's empty tail is not a field — drop it.
             boundaries.pop();
+        }
+        // `invalid_field_name` on the literal's named fields (upstream
+        // `_reportInvalidFieldNames`, pkg/analyzer/lib/src/dart/resolver/
+        // record_literal_resolver.dart:101-136): every `ident :` field
+        // window's label reports on its own span — `_`-private, a `$n`
+        // name whose index lands inside the positional run, and the
+        // `Object`-member collision set. The check is type-blind, so it
+        // runs before the count bail below — a recovery shape whose split
+        // disagrees with the written count still owes the rows upstream
+        // emits walking the AST's field nodes.
+        {
+            let windows: Vec<(u32, u32)> = boundaries
+                .windows(2)
+                .map(|w| (w[0], w[1]))
+                .chain(std::iter::once((*boundaries.last()?, close as u32)))
+                .collect();
+            // Each named window contributes `(label token index)`; a
+            // positional window contributes nothing. Positional count is
+            // the upstream `positionalCount` — the non-named fields.
+            let named_labels: Vec<u32> = windows
+                .iter()
+                .filter(|&&(lo, hi)| {
+                    lo + 2 < hi
+                        && self
+                            .tokens
+                            .get((lo + 2) as usize)
+                            .is_some_and(|t| t.kind == TokenKind::Colon)
+                })
+                .map(|&(lo, _)| lo + 1)
+                .collect();
+            let positional_count = (windows.len() - named_labels.len()) as u32;
+            let mut pending: Vec<(SemanticCode, SourceRange)> = Vec::new();
+            for label_id in named_labels {
+                let Some(label) = self.tokens.get(label_id as usize) else {
+                    continue;
+                };
+                let name = &self.source[label.byte_range()];
+                let range = SourceRange {
+                    offset: label.utf16_offset,
+                    length: self
+                        .utf16_of((label.byte_offset + label.byte_len) as usize)
+                        .saturating_sub(label.utf16_offset),
+                };
+                let code = if name.starts_with('_') {
+                    Some(SemanticCode::InvalidFieldNamePrivate)
+                } else if let Some(index) = Self::positional_field_index(name) {
+                    (index < positional_count)
+                        .then_some(SemanticCode::InvalidFieldNamePositional)
+                } else if Self::is_forbidden_record_field_name(name) {
+                    Some(SemanticCode::InvalidFieldNameFromObject)
+                } else {
+                    None
+                };
+                if let Some(code) = code {
+                    pending.push((code, range));
+                }
+            }
+            for (code, range) in pending {
+                self.report.diagnostics.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message("", ""),
+                    self.file,
+                    range,
+                    None,
+                ));
+            }
         }
         if boundaries.len() != count {
             // The written count and the split disagree — a recovery shape
@@ -4434,14 +4527,33 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        // The named pairs trail the positional list (the parser's own
-        // field order — `(1, s: 'x', b: true)` keeps `s` before `b`).
-        let named_start = fields.len().saturating_sub(names.len());
-        let named: Vec<(StringId, Ty)> = names
-            .into_iter()
-            .zip(fields[named_start..].iter().copied())
-            .collect();
-        Some((mark, fields[..named_start].into(), named.into_boxed_slice()))
+        // Each field window's own `ident :` prefix decides its slot —
+        // the parser's named-field rule (upstream parser_impl.dart:
+        // `next.next.isA(COLON)` fires `handleNamedRecordField`); source
+        // order is not the partition, a named field may precede a
+        // positional one (`(n: 1, 2)`), and the trailing `names.len()`
+        // split keys the last fields' types onto the wrong slots.
+        let mut names = names.into_iter();
+        let mut positional: Vec<Ty> = Vec::with_capacity(count);
+        let mut named: Vec<(StringId, Ty)> = Vec::new();
+        for (index, ty) in fields.into_iter().enumerate() {
+            let boundary = boundaries[index];
+            let end = boundaries
+                .get(index + 1)
+                .copied()
+                .unwrap_or(close as u32);
+            let is_named = boundary + 2 < end
+                && self
+                    .tokens
+                    .get((boundary + 2) as usize)
+                    .is_some_and(|t| t.kind == TokenKind::Colon);
+            if is_named {
+                named.push((names.next().unwrap_or(StringId::NONE), ty));
+            } else {
+                positional.push(ty);
+            }
+        }
+        Some((mark, positional.into(), named.into_boxed_slice()))
     }
 
     /// The record type's official display (`(int,)`, `(int, String)`): the

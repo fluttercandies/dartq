@@ -1980,6 +1980,37 @@ pub(crate) enum DeclKind {
     Constructor { container: StringId },
 }
 
+/// The `_checkForWrongVariancePosition` member-face node spans of one
+/// declaration (`error_verifier.dart:7565-7658`): the model keeps no
+/// per-node spans, so the member walk anchors at the member name —
+/// these slots carry the annotation-level anchors upstream emits.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MemberFaceSpans {
+    /// The member's `DeclKind::Member` `decl_sites` index.
+    pub(crate) site: usize,
+    /// The declaring frame's `Engine::frames` index at the site's
+    /// registration — header events of nested executables fire deeper.
+    pub(crate) depth: usize,
+    /// The written return annotation's span (`open_return_span`, latched
+    /// at `end_method`); `None` for an absent annotation — the check
+    /// then stays silent anyway (`unrelated` satisfies every keyword).
+    pub(crate) return_span: Option<SourceRange>,
+    /// One `X extends B` TypeParameter node span per own type variable,
+    /// aligned with [`MemberEntry::type_param_names`] — an unbounded
+    /// variable keeps its name span (upstream's `bound == null` arm
+    /// never reads it).
+    pub(crate) bounds: Vec<SourceRange>,
+    /// One FormalParameter node span per member-level formal, aligned
+    /// with `formals.positional` then `formals.named` — both sides keep
+    /// written order (the `required` keyword rides the node).
+    pub(crate) formals: Vec<SourceRange>,
+    /// Open member-level formal starts, pushed at `begin_formal_parameter`
+    /// and popped at the matching `end_formal_parameter` — a stack because
+    /// a function-typed formal's own events nest inside (its inner
+    /// formals carry a different member kind and stay out).
+    pub(crate) formal_starts: Vec<u32>,
+}
+
 /// One import directive of this file (the `unused_import` side): the
 /// written URI, its prefix, and the source-matched graph edge.
 pub(crate) struct ImportSite {
@@ -2393,8 +2424,10 @@ pub(crate) struct Engine<'a> {
     pub(crate) record_marks: Vec<(usize, Token)>,
     /// Per open literal, the named-field labels in source order
     /// (`handle_named_record_field` — the name token precedes the colon);
-    /// parallel to [`Self::record_marks`]. The trailing `names.len()`
-    /// fields of the split window are the named pairs.
+    /// parallel to [`Self::record_marks`]. Consumers pair the labels with
+    /// the fields each window's own `ident :` prefix marks named — source
+    /// order is not the partition (a named field may precede a positional
+    /// one, `(n: 1, 2)`).
     pub(crate) record_literal_names: Vec<Vec<StringId>>,
     /// The open record-type annotations' field stack: each level collects
     /// one field `Ty` per `record_type_entry` plus the named region's field
@@ -3387,6 +3420,19 @@ pub(crate) struct Engine<'a> {
     /// Declaration sites of this file, parse order (= source order): the
     /// library-level side of the usage cluster.
     pub(crate) decl_sites: Vec<DeclSite>,
+    /// The `_checkForWrongVariancePosition` node spans of the member
+    /// currently being parsed, opened when its `DeclKind::Member` site
+    /// registers. `depth` is the declaring frame's `frames` index: the
+    /// header's own type variables and formals fire while it is
+    /// innermost, so a nested executable's deeper frame keeps its header
+    /// events out of the member's slots.
+    pub(crate) open_member_face: Option<MemberFaceSpans>,
+    /// Completed member faces, consumed by `finalize_variance`'s member
+    /// walk — the model carries no per-node spans, so the return
+    /// annotation's, each formal's, and each own type parameter's node
+    /// anchor ride this side table (a missing entry keeps the member
+    /// name anchor, the under-report direction).
+    pub(crate) member_face_spans: Vec<MemberFaceSpans>,
     /// The open field group's static bit (`begin_fields` arms it, the
     /// group's `FieldDeclaration` identifiers read it).
     /// Metadata of the declaration in flight (`MetadataReference`

@@ -9,7 +9,7 @@
 
 use crate::diagnose::Engine;
 use crate::library::{ElementIndex, resolve_container};
-use crate::model::{ArgListId, Container, ContainerKind, MemberKind, Ty};
+use crate::model::{ArgListId, Container, ContainerKind, MemberKind, RecordShapeId, Ty};
 use dartq_resolution::{LibraryGraph, LibraryId, Namespaces};
 use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
@@ -109,6 +109,17 @@ pub(crate) struct SwitchTracker {
     /// the exact open/close pairing the engine's root branch reads to
     /// tell an if-case root from a case header's.
     pub(crate) if_case_window: bool,
+    /// The engine-`locals` index of the open if-case window's first
+    /// binder (#3691): upstream mints one element per
+    /// `DeclaredVariablePattern` and the same-name element join spans a
+    /// single head's logical-or alternatives only — a use in head N's
+    /// body must never spare head N+1's same-named binder. The scan in
+    /// `join_pattern_site_binder` therefore starts at this floor, not at
+    /// the frame mark (a completed head's binder stays registered below
+    /// it). Latched by the window's first binder (`None` until then and
+    /// outside any window — the for-in site conversion's scan reads the
+    /// unbounded mark).
+    pub(crate) if_case_binder_floor: Option<usize>,
     /// The in-flight constant pattern's classification, armed by the
     /// literal/identifier events inside it.
     pub(crate) pending_const: Option<Restriction>,
@@ -132,6 +143,7 @@ impl SwitchTracker {
             pattern_roots: Vec::new(),
             case_sink_open: false,
             if_case_window: false,
+            if_case_binder_floor: None,
             pending_const: None,
             switch_kw_latch: None,
             root_begin: 0,
@@ -324,14 +336,22 @@ impl SwitchTracker {
         });
         self.case_sink_open = true;
         self.if_case_window = true;
+        // A fresh window carries no binder floor: the head's first binder
+        // latches its own index, so a floor surviving an earlier head can
+        // never bound this head's join scan.
+        self.if_case_binder_floor = None;
     }
 
     /// Closes the if-case window at the root pattern's completion: the
     /// context pops unreported (an if-case carries no exhaustiveness
-    /// question) and no root is captured — the stale-root pins.
+    /// question) and no root is captured — the stale-root pins. The binder
+    /// floor disarms with the window: the next head's binders start their
+    /// own scan range, and the for-in conversion outside a window reads
+    /// the unbounded frame mark.
     pub(crate) fn close_if_case(&mut self) {
         self.if_case_window = false;
         self.case_sink_open = false;
+        self.if_case_binder_floor = None;
         self.switches.pop_discard();
     }
 
@@ -352,7 +372,14 @@ impl SwitchTracker {
                 // space — never the empty one, which reported a bare
                 // `switch (null) { case Null _: }` as non-exhaustive.
                 NameTy::Null => Restriction::Null,
-                // A record/function context (a name-level sentinel) has no
+                // A record context keeps the type-free leaf's full coverage:
+                // [`collect_singles`] lowers `NamedContext` to the context
+                // single verbatim, so the case's `var x`/`_` covers the
+                // whole record (and, on a nullable record, its null half —
+                // the same space `Named` carries). The pre-#3525 `Unknown`
+                // made such a case match nothing at all.
+                NameTy::Record { .. } => Restriction::NamedContext,
+                // A function context (a name-level sentinel) has no
                 // head to name: the type-free pattern covers exactly that
                 // context type, which [`collect_singles`] lowers verbatim.
                 // The pre-#3236 `Unknown` made such a case match nothing at
@@ -598,6 +625,17 @@ pub(crate) fn restriction_disjoint_from(
         Restriction::NamedArgs(name, nullable, args) => {
             !world.can_be_subtype_of(&NameTy::NamedArgs(*name, *nullable, *args), &matched)
         }
+        // The record pattern's head test decides the overlap; the field
+        // refinements only narrow the case's own space.
+        Restriction::Record { shape, .. } => {
+            !world.can_be_subtype_of(
+                &NameTy::Record {
+                    shape: *shape,
+                    nullable: false,
+                },
+                &matched,
+            )
+        }
         Restriction::BoolValue(value) => {
             !world.can_be_subtype_of(&NameTy::BoolValue(*value), &matched)
         }
@@ -670,6 +708,29 @@ fn always_exhaustive_within(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bo
             }
             always_exhaustive_param(world, ty, budget)
         }
+        // The `RecordType` arm (type_system.dart:878-884): a record is
+        // always-exhaustive when every field's type is — the product's
+        // closed split is the fields' closed splits. The shape resolves
+        // through the parse-time engine's pool; outside a fold window the
+        // pre-existing `false` answer stands (the under-report direction).
+        NameTy::Record { shape, .. } => match fold_engine() {
+            Some(engine) => {
+                let pool = engine.boundary.pool();
+                let shape = pool.record_shape(shape);
+                shape
+                    .positional
+                    .iter()
+                    .chain(shape.named.iter().map(|(_, ty)| ty))
+                    .all(|field| {
+                        always_exhaustive_within(
+                            world,
+                            NameTy::from_semantic(*field),
+                            budget - 1,
+                        )
+                    })
+            }
+            None => false,
+        },
         _ => false,
     }
 }
@@ -859,6 +920,17 @@ pub(crate) enum NameTy {
         /// A rest element (`...`) covers the middle.
         has_rest: bool,
     },
+    /// A record type (`RecordStaticType` over the interned field shape,
+    /// types/record.dart): the shape slot resolves the field columns the
+    /// checker's `RecordIndexKey`/`RecordNameKey` properties read — the
+    /// multiplicative product face (a case's `(E.a, false)` single
+    /// restricts `$1`/`$2` independently of the head it narrows).
+    Record {
+        /// The interned field shape (positional order + named set).
+        shape: RecordShapeId,
+        /// The syntactic `?`.
+        nullable: bool,
+    },
     /// A unique unknown (relational patterns, unrepresentable constants):
     /// matched by nothing.
     Unknown(u64),
@@ -1047,6 +1119,24 @@ pub(crate) enum Restriction {
     /// it into [`Restriction::List`] (a list frame) or drops the whole
     /// pattern to [`Restriction::Unknown`] (every other bracket).
     RestMark { had_sub: bool },
+    /// A record pattern's coverage (`RecordStaticType` over the interned
+    /// field shape, built by `createRecordSpace`, shared.dart:556-583):
+    /// `shape` is the pattern's required record type — the all-`dynamic`
+    /// face `convertRecordPattern` writes, or the scrutinee's record shape
+    /// when the context narrows it (`_createStaticTypeWithContext`,
+    /// shared.dart:446-460) — and `positional`/`named` are the per-field
+    /// sub-restrictions the `RecordIndexKey`/`RecordNameKey` columns read.
+    /// A field whose leaf covers its whole column keeps the type-free
+    /// leaf; the multiplicative product the engine expands over
+    /// ([`NameWorld::property_type`]) carries each column independently.
+    Record {
+        /// The interned required record shape (the single's static type).
+        shape: RecordShapeId,
+        /// Positional field sub-restrictions, in declaration order.
+        positional: Vec<Restriction>,
+        /// Named field sub-restrictions `(name, restriction)`.
+        named: Vec<(StringId, Restriction)>,
+    },
     /// A list pattern's coverage: `head` fixed elements, an optional rest
     /// (`Bare` `...` or `Sub` `...p`), and `tail` fixed elements after it
     /// (`ListPatternStaticType` over `ListTypeRestriction`,
@@ -1088,6 +1178,12 @@ fn leaf_ty(leaf: &Restriction) -> Option<NameTy> {
         }
         Restriction::BoolValue(value) => Some(NameTy::BoolValue(value)),
         Restriction::EnumValue(enum_name, constant) => Some(NameTy::EnumValue(enum_name, constant)),
+        // The record pattern's own type face: the record static type its
+        // single carries — `A && (x, y)` intersects on the record head.
+        Restriction::Record { shape, .. } => Some(NameTy::Record {
+            shape,
+            nullable: false,
+        }),
         _ => None,
     }
 }
@@ -1278,6 +1374,59 @@ fn collect_singles(
             }
             out.push(Single::with_additional(ty, additional));
         }
+        // A record pattern's single (`createRecordSpace`, shared.dart:
+        // 556-583): the `RecordIndexKey`/`RecordNameKey` property columns
+        // the checker expands over — each field's sub-space reads the
+        // shape's own column type as its context, so a type-free field
+        // leaf covers that column whole. The head is always the NON-NULL
+        // record face — a record pattern never matches `null`.
+        Restriction::Record {
+            shape,
+            positional,
+            named,
+        } => {
+            let head = NameTy::Record {
+                shape: *shape,
+                nullable: false,
+            };
+            // The columns' context types resolve through the parse-time
+            // pool when a fold window is open; outside one every column is
+            // the unknown type — the under-report direction (a field's
+            // constraint then narrows an already-unknown column).
+            let pool = fold_engine().map(|engine| engine.boundary.pool());
+            let mut props = Vec::with_capacity(positional.len() + named.len());
+            for (index, leaf) in positional.iter().enumerate() {
+                let column = pool
+                    .as_deref()
+                    .and_then(|pool| pool.record_shape(*shape).positional.get(index).copied())
+                    .map_or_else(|| world.unknown(), NameTy::from_semantic);
+                let mut singles = Vec::new();
+                collect_singles(world, leaf, column, &mut singles);
+                props.push((
+                    Key::RecordIndex(index),
+                    Space::from_singles(world, Vec::new(), singles),
+                ));
+            }
+            for (name, leaf) in named {
+                let column = pool
+                    .as_deref()
+                    .and_then(|pool| {
+                        pool.record_shape(*shape)
+                            .named
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, ty)| *ty)
+                    })
+                    .map_or_else(|| world.unknown(), NameTy::from_semantic);
+                let mut singles = Vec::new();
+                collect_singles(world, leaf, column, &mut singles);
+                props.push((
+                    Key::RecordName(world.strings.resolve(*name).to_string()),
+                    Space::from_singles(world, Vec::new(), singles),
+                ));
+            }
+            out.push(Single::with_props(head, props));
+        }
         // The rest mark never survives `collapse` (a non-list frame drops
         // the whole pattern to `Unknown` before this point).
         Restriction::RestMark { .. } => {
@@ -1375,7 +1524,15 @@ impl NameTy {
                 nullable,
                 args,
             } => NameTy::NamedArgs(name, nullable, args),
-            // Record and function types have no name-level decomposition
+            // A record type keeps its name-level decomposition: the field
+            // columns the checker's `RecordIndexKey`/`RecordNameKey`
+            // properties read live in the interned shape, so the value
+            // joins as the record face the case singles' product columns
+            // expand over (the pre-#3525 sentinel folded every record to a
+            // keyed unknown — the whole check suppressed, `report_switch`'s
+            // unknown-scrutinee arm).
+            Ty::Record { shape, nullable } => NameTy::Record { shape, nullable },
+            // Function types have no name-level decomposition
             // (the columns live in the `Ty` shape, not here): a sentinel
             // keyed by the canonically-interned shape id keeps equal
             // spellings self-equal (`void Function()` covers itself)
@@ -1390,9 +1547,6 @@ impl NameTy {
             // face rides the key: an `F`-vs-`F?` pair stays unprovable at
             // this level (the under-report direction — never a false
             // constant verdict).
-            Ty::Record { shape, nullable } => {
-                NameTy::Unknown((1 << 41) | (u64::from(shape.raw()) << 1) | u64::from(nullable))
-            }
             Ty::Function { shape, nullable } => {
                 NameTy::Unknown((2 << 41) | (u64::from(shape.raw()) << 1) | u64::from(nullable))
             }
@@ -1483,6 +1637,10 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             }
             NameTy::BoolValue(value) => NameTy::BoolOrNull(*value),
             NameTy::TopNonNullable => NameTy::TopNullable,
+            NameTy::Record { shape, .. } => NameTy::Record {
+                shape: *shape,
+                nullable: true,
+            },
             other => *other,
         }
     }
@@ -1508,7 +1666,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 NameTy::Named(_, true)
                 | NameTy::NamedArgs(_, true, _)
                 | NameTy::EnumValueOrNull(..)
-                | NameTy::BoolOrNull(_),
+                | NameTy::BoolOrNull(_)
+                | NameTy::Record { nullable: true, .. },
             ) => true,
             // `S <: T?` iff `S <: T` (static_type.dart:365-372); `S? <: T?`
             // likewise; `S? <: T` never (null matches no plain T).
@@ -1543,9 +1702,37 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 | NameTy::NamedArgs(_, false, _)
                 | NameTy::EnumValue(..)
                 | NameTy::BoolValue(_)
-                | NameTy::ListPat { .. },
+                | NameTy::ListPat { .. }
+                | NameTy::Record { nullable: false, .. },
                 NameTy::TopNonNullable,
             ) => true,
+            // A record-pair subtype (subtype.dart's record arm): the same
+            // shape — positional arity plus named-name set — with every
+            // field pairwise a subtype. The pool resolves the two shapes
+            // inside a fold window; outside one the raw `sub == sup`
+            // answer above carries the equal-shape pair (the under-report
+            // direction for the rest).
+            (
+                NameTy::Record {
+                    shape: sub_shape,
+                    nullable: sub_nullable,
+                },
+                NameTy::Record {
+                    shape: sup_shape,
+                    nullable: sup_nullable,
+                },
+            ) => (!*sub_nullable || *sup_nullable) && self.record_sub(*sub_shape, *sup_shape),
+            // A record subtypes the interface heads every record inhabits
+            // (`subtype.dart`'s `Record <: Object`/`Record <: Record`
+            // edges): the non-nullable `Object` target and the core
+            // `Record` type. `Record?` reaches only the nullable faces.
+            (
+                NameTy::Record { nullable, .. },
+                NameTy::Named(name, target_nullable) | NameTy::NamedArgs(name, target_nullable, _),
+            ) => {
+                (!*nullable || *target_nullable)
+                    && (*name == self.object_id || self.strings.resolve(*name) == "Record")
+            }
             // A constant's type is its declared instantiation
             // (`enumField.type`, `EnumElementStaticType._type`): `E.b`
             // of `enum E<T> { b<String>(…) }` is `E<String>`, not the
@@ -1629,7 +1816,8 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             | NameTy::NamedArgs(_, true, _)
             | NameTy::TopNullable
             | NameTy::EnumValueOrNull(..)
-            | NameTy::BoolOrNull(_) => true,
+            | NameTy::BoolOrNull(_)
+            | NameTy::Record { nullable: true, .. } => true,
             // `ListTypeStaticType.isSealed` (types/list.dart:62): the core
             // `List` face splits over the size buckets. The restricted
             // `ListPat` face inherits `TypeBasedStaticType.isSealed` —
@@ -1660,6 +1848,20 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 vec![NameTy::EnumValue(*enum_name, *constant), NameTy::Null]
             }
             NameTy::BoolOrNull(value) => vec![NameTy::BoolValue(*value), NameTy::Null],
+            // The nullable record splits the same way — the non-null
+            // projection plus `Null` (the record itself is a
+            // `TypeBasedStaticType` leaf: `isSealed` false, so a non-null
+            // record never reaches this walk).
+            NameTy::Record {
+                shape,
+                nullable: true,
+            } => vec![
+                NameTy::Record {
+                    shape: *shape,
+                    nullable: false,
+                },
+                NameTy::Null,
+            ],
             // `ListTypeStaticType.getSubtypes` (types/list.dart:65-121):
             // the case rows' head/tail keys bound the fixed-size split —
             // sizes `0..maxSize-1` then `size=maxSize, hasRest` — over the
@@ -1699,12 +1901,32 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     }
 
     /// `getPropertyType` (static_type.dart:36-46): the declared type of
-    /// the instance member `key` names, or `None` when the world does not
-    /// know it (the checker's columns then fall back to the nullable
-    /// object, exhaustive.dart:396-406).
+    /// the instance member `key` names — or, for a record static type,
+    /// the field type the `RecordIndexKey`/`RecordNameKey` column reads
+    /// (types/record.dart's `fields` table, the interned shape's own
+    /// slots) — or `None` when the world does not know it (the checker's
+    /// columns then fall back to the nullable object,
+    /// exhaustive.dart:396-406).
     fn property_type(&self, ty: &NameTy, key: &Key) -> Option<NameTy> {
-        let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = &self.extension_erasure(ty)
-        else {
+        let ty = &self.extension_erasure(ty);
+        if let NameTy::Record { shape, .. } = ty {
+            let pool = fold_engine()?.boundary.pool();
+            let shape = pool.record_shape(*shape);
+            let field = match key {
+                Key::RecordIndex(index) => shape.positional.get(*index).copied(),
+                Key::RecordName(name) => {
+                    let name = self.strings.intern(name);
+                    shape
+                        .named
+                        .iter()
+                        .find(|(field, _)| *field == name)
+                        .map(|(_, ty)| *ty)
+                }
+                _ => None,
+            };
+            return field.map(|ty| NameTy::from_semantic(ty));
+        }
+        let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = ty else {
             return None;
         };
         let Key::Name(member) = key else {
@@ -1810,6 +2032,50 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             let mut inner_comma = "";
             for (key, field) in fields {
                 if matches!(key, Key::Head(_) | Key::Rest { .. } | Key::Tail(_)) {
+                    continue;
+                }
+                text.push_str(start);
+                start = "";
+                close = ")";
+                text.push_str(inner_comma);
+                inner_comma = ", ";
+                text.push_str(&format!("{}: {field}", key.name_text()));
+            }
+            text.push_str(close);
+            return text;
+        }
+        // `RecordStaticType.witnessToDart` (types/record.dart:63-118): the
+        // record fields lay out in declaration order — positionals first
+        // (`_` per missing slot), named fields `name: _` — and a
+        // non-record field trails as `&& Object(k: w)` (the same
+        // and-pattern tail the object and list faces build).
+        if let NameTy::Record { shape, .. } = ty
+            && let Some(engine) = fold_engine()
+        {
+            let pool = engine.boundary.pool();
+            let shape = pool.record_shape(*shape);
+            let field = |key: &Key| fields.iter().find(|(k, _)| k == key).map(|(_, t)| t.as_str());
+            let mut text = String::from("(");
+            let mut comma = "";
+            for index in 0..shape.positional.len() {
+                text.push_str(comma);
+                text.push_str(field(&Key::RecordIndex(index)).unwrap_or("_"));
+                comma = ", ";
+            }
+            for (name, _) in shape.named.iter() {
+                text.push_str(comma);
+                comma = ", ";
+                let name = self.strings.resolve(*name);
+                text.push_str(name);
+                text.push_str(": ");
+                text.push_str(field(&Key::RecordName(name.to_string())).unwrap_or("_"));
+            }
+            text.push(')');
+            let mut start = " && Object(";
+            let mut close = "";
+            let mut inner_comma = "";
+            for (key, field) in fields {
+                if matches!(key, Key::RecordIndex(_) | Key::RecordName(_)) {
                     continue;
                 }
                 text.push_str(start);
@@ -2351,6 +2617,7 @@ impl<'a> NameWorld<'a> {
                 | NameTy::EnumValue(..)
                 | NameTy::BoolValue(_)
                 | NameTy::ListPat { .. }
+                | NameTy::Record { nullable: false, .. }
                 | NameTy::Never
         )
     }
@@ -2546,6 +2813,40 @@ impl<'a> NameWorld<'a> {
     /// same face, matching the official's `dynamic <: dynamic`.
     fn elem_sub(&self, sub: Ty, sup: Ty) -> bool {
         self.is_subtype_of(&NameTy::from_semantic(sub), &NameTy::from_semantic(sup))
+    }
+
+    /// The record-pair subtype rule (subtype.dart's record arm —
+    /// `RecordType` subtypes only a same-shape record: equal positional
+    /// arity, equal named-name set, every field pairwise a subtype of the
+    /// target's). Both shapes resolve through the boundary pool inside a
+    /// fold window; outside one the pair is undecidable and answers
+    /// `false` (the under-report direction — the `sub == sup` fast path
+    /// already carried the identical-shape case).
+    fn record_sub(&self, sub: RecordShapeId, sup: RecordShapeId) -> bool {
+        if sub == sup {
+            return true;
+        }
+        let Some(engine) = fold_engine() else {
+            return false;
+        };
+        let pool = engine.boundary.pool();
+        let (sub, sup) = (pool.record_shape(sub), pool.record_shape(sup));
+        if sub.positional.len() != sup.positional.len() || sub.named.len() != sup.named.len() {
+            return false;
+        }
+        if !sub
+            .named
+            .iter()
+            .zip(sup.named.iter())
+            .all(|((a, _), (b, _))| a == b)
+        {
+            return false;
+        }
+        sub.positional
+            .iter()
+            .zip(sup.positional.iter())
+            .chain(sub.named.iter().zip(sup.named.iter()).map(|((_, a), (_, b))| (a, b)))
+            .all(|(a, b)| self.is_subtype_of(&NameTy::from_semantic(*a), &NameTy::from_semantic(*b)))
     }
 
     /// The element type of a `List`-headed static type: the written
@@ -2782,6 +3083,21 @@ impl<'a> NameWorld<'a> {
             }
             NameTy::BoolValue(value) => value.to_string(),
             NameTy::BoolOrNull(value) => format!("{value}?"),
+            // The record display is the field type list in declaration
+            // order (`RecordType.getDisplayString` — `(E, bool)`); the
+            // interned shape resolves through the boundary pool inside a
+            // fold window, and outside one the name level spells the
+            // under-report `?`.
+            NameTy::Record { shape, nullable } => fold_engine().map_or_else(
+                || "?".to_string(),
+                |engine| {
+                    Ty::Record {
+                        shape: *shape,
+                        nullable: *nullable,
+                    }
+                    .render(self.strings, &engine.boundary.pool())
+                },
+            ),
             NameTy::Unknown(_) => "?".to_string(),
             // `ListTypeRestriction.toString` (types/list.dart:295-312): the
             // element type's argument text then `()`-per-slot and `...`
@@ -3360,6 +3676,24 @@ impl<'a> NameWorld<'a> {
             // as A` covers `A(b: true)`, never the whole context.
             Restriction::Object(name, fields) => {
                 fields.is_empty() && self.is_subtype_of(&ty, &NameTy::Named(*name, false))
+            }
+            // A record single is unrestricted only with no fields at all
+            // (the `()` shape — the field columns `createRecordSpace`
+            // always builds make every other record restricted).
+            Restriction::Record {
+                shape,
+                positional,
+                named,
+            } => {
+                positional.is_empty()
+                    && named.is_empty()
+                    && self.is_subtype_of(
+                        &ty,
+                        &NameTy::Record {
+                            shape: *shape,
+                            nullable: false,
+                        },
+                    )
             }
             _ => leaf_ty(space).is_some_and(|leaf| self.is_subtype_of(&ty, &leaf)),
         }

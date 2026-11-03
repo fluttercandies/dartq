@@ -575,6 +575,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     .cursor
                     .lexeme(declared_name.unwrap_or(name).id)
                     .to_owned(),
+                // Top-level fragments carry no `static` modifier.
+                is_static: false,
             };
             if augment.is_some() {
                 self.augment_sigs.push(key);
@@ -1685,6 +1687,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     container_kind: kind as u8,
                     member_kind,
                     name: self.cursor.lexeme(name.id).to_owned(),
+                    is_static: static_kw.is_some(),
                 };
                 if mods.augment.is_some() {
                     self.augment_sigs.push(key);
@@ -1692,12 +1695,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     && self.async_state == AsyncModifier::Sync
                     && !is_constructor
                     && mods.external.is_none()
-                    && (static_kw.is_some()
-                        || matches!(
-                            kind,
-                            DeclarationKind::Extension | DeclarationKind::ExtensionType
-                        ))
+                    && static_kw.is_some()
                 {
+                    // The deferred `missingFunctionBody` verdict only applies
+                    // to fragments whose completeness is decided by the
+                    // augmentation chain. Upstream's member gate
+                    // (`error_verifier.dart:5273-5280`) exempts instance
+                    // members outright — class/enum/mixin instance members
+                    // stay silent because abstract classes may leave them
+                    // bodiless, while extension/extension-type instance
+                    // members take their dedicated codes
+                    // (`extensionDeclaresAbstractMember` /
+                    // `extensionTypeWithAbstractMember`, reported by the
+                    // semantic tier). Only `static` members route through the
+                    // singleton/missing-body arm.
                     self.deferred_bodiless.push((key, end));
                 }
             }
@@ -2387,6 +2398,42 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if enclosing == Some(name_text) {
             self.report(msg::member_with_same_name_as_class(), name);
         }
+        // An `augment` variable induces an implicit getter fragment — and a
+        // setter fragment whenever the variable is assignable (`final` and
+        // `const` suppress it; `late` alone does not). Upstream's
+        // `_checkForFunctionBodyCompleteness` walks the induced accessor
+        // elements like declared ones: the getter's `fragments` list already
+        // contains this variable's implicit getter, so an intro `get foo;`
+        // stops being a singleton and leaves the `missingFunctionBody` arm
+        // for the multi-fragment `functionNotCompleteAfterAugmentations`
+        // face (error_verifier.dart:5286-5321). Register the induced
+        // accessor signatures so the same-unit flush drops the deferred
+        // candidate exactly like an explicit `augment get foo();` would.
+        if mods.augment.is_some() && self.features.augmentations_enabled {
+            let container_kind = kind as u8;
+            let is_static = mods.static_kw.is_some();
+            let base = crate::parser::BodilessKey {
+                container: enclosing.map(str::to_owned),
+                container_kind,
+                member_kind: 1,
+                name: name_text.to_owned(),
+                is_static,
+            };
+            self.augment_sigs.push(base);
+            let induces_setter = !matches!(
+                mods.var_final_or_const.map(|v| self.cursor.lexeme(v.id)),
+                Some("final") | Some("const")
+            );
+            if induces_setter {
+                self.augment_sigs.push(crate::parser::BodilessKey {
+                    container: enclosing.map(str::to_owned),
+                    container_kind,
+                    member_kind: 2,
+                    name: name_text.to_owned(),
+                    is_static,
+                });
+            }
+        }
         self.listener.begin_initialized_identifier(name);
         if self.peek_kind() == TokenKind::Eq {
             self.parse_variable_initializer_opt();
@@ -2722,9 +2769,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.report(msg::missing_parameters(kind), anchor);
             self.last_parameter_count = 0;
             self.synthetic_formals = true;
+            // `rewriter.insertParens` (:1705) splices the `()` pair right
+            // after `token` — BEFORE `token.next`, so a pending split-closer
+            // remainder (the `>` of `f<T>>()`) stays the body's follower and
+            // carries its `missingFunctionBody` row (the template arm
+            // reports on `next`, :5001). The synthetics stamp with
+            // `next.charOffset` (the follower's offset), and detach/attach
+            // keeps the queue order `(` `)` remainder instead of eating the
+            // remainder with the drain advances.
             let at = self.peek_span();
+            let pending = self.cursor.detach_queue();
             let open = self.synthetic(TokenKind::OpenParen, at.range.offset);
             let close = self.synthetic(TokenKind::CloseParen, at.range.offset);
+            self.cursor.attach_queue(pending);
             self.listener.begin_formal_parameters(open, kind);
             self.listener.end_formal_parameters(0, open, close, kind);
             self.cursor.advance();

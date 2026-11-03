@@ -3,8 +3,8 @@
 //! # The defect
 //!
 //! 197 corpus rows carried the right code at the right offset with a
-//! short length, from the anchor computations the recon
-//! (docs/audits/recon-underreport-wave.md T1) mapped to the
+//! short length, from the anchor computations the under-report recon's
+//! T1 item mapped to the
 //! `type_argument_not_matching_bounds`/`could_not_infer` emission
 //! points. The oracle anchors each row over the whole written extent
 //! while the engine kept a token-sized face:
