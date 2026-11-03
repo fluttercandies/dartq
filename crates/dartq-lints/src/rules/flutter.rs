@@ -6,18 +6,19 @@
 //! shapes (`use_key_in_widget_constructors`, `no_logic_in_create_state`,
 //! `diagnostic_describe_all_properties`).
 //!
-//! Domain-wide approximation register (risk class R4): no flutter
-//! framework library-identity face exists (dependency packages are
-//! unindexed — GAP-4/5), so widget identity (`Container`, `SizedBox`,
-//! `Color`, `StatefulWidget`, `Diagnosticable`, ...) is by
-//! ctor/identifier SPELLING with a NEGATIVE-IDENTITY refutation: a
-//! same-file declaration of the name is user code (the spelling bail),
-//! and a creation head or supertype spelling that RESOLVES to an indexed
-//! container is user code too (`Check::semantics` answers; the official
-//! element-identity posture for that case). An unindexed spelling keeps
-//! the framework verdict — `semantics: None` (the plain run) and
-//! unresolved heads included — so a user class inside an unindexed
-//! dependency still matches (what full dependency indexing would close).
+//! Domain-wide approximation register (risk class R4): widget identity
+//! (`Container`, `SizedBox`, `Color`, `StatefulWidget`, `Diagnosticable`,
+//! ...) is by ctor/identifier SPELLING with a NEGATIVE-IDENTITY
+//! refutation: a same-file declaration of the name is user code (the
+//! spelling bail), and a creation head or supertype spelling that
+//! RESOLVES to an indexed container is user code too (`Check::semantics`
+//! answers; the official element-identity posture for that case) — except
+//! a resolution landing in the framework package itself
+//! (`package:flutter/...`), which is the container the rule wants and
+//! keeps the verdict. An unindexed spelling keeps the framework verdict —
+//! `semantics: None` (the plain run) and unresolved heads included — so a
+//! user class inside an unindexed dependency still matches (what full
+//! dependency indexing would close).
 //! Member-kind facts (a `key` parameter, a `createState` override, the
 //! debug-method references) read their syntactic shapes; each rule's
 //! module doc registers its direction.
@@ -50,23 +51,49 @@ fn query_span(c: &Check<'_>, row: u32) -> dartq_source::SourceRange {
     }
 }
 
+/// The framework package's URI prefix: the oracle's framework-identity
+/// predicates match on the declaring library's URI under
+/// `package:flutter/...` (`upstream Dart SDK source,
+/// pkg/linter/lib/src/util/flutter_utils.dart` — `_uriFramework` and
+/// friends read `package:flutter/src/widgets/...`). A spelling resolving
+/// into that package IS the framework container, so the negative-identity
+/// refutation must never fire on it: an imported `StatefulWidget`,
+/// `Diagnosticable`, or `Container` is the very element the rule wants.
+const FRAMEWORK_URI_PREFIX: &str = "package:flutter/";
+
+/// Whether the library owning `file` is the flutter framework package. A
+/// `None` URI — an unindexed SDK or unanalyzed file — answers `false`, so
+/// the refutation keeps its direction where the identity is unknown.
+fn is_framework_file(analysis: &dartq_semantic::Analysis<'_>, file: dartq_source::FileId) -> bool {
+    analysis
+        .uri_of_file(file)
+        .is_some_and(|uri| uri.starts_with(FRAMEWORK_URI_PREFIX))
+}
+
 /// Whether the written position of `row` resolves to an indexed container
-/// — proof the spelling is user code, not the framework family's (the
-/// negative-identity refutation; the official element-identity posture).
-/// `false` when the semantic face is unmounted (the plain run), the
-/// position carries no semantic row, or the spelling is unindexed: the
-/// framework verdict stands there (a user class inside an unindexed
-/// dependency keeps it too — what dependency indexing would close).
+/// of user code — proof the spelling is user code, not the framework
+/// family's (the negative-identity refutation; the official
+/// element-identity posture). A resolution landing inside the framework
+/// package (`package:flutter/...`) is the framework container itself and
+/// never refutes. `false` when the semantic face is unmounted (the plain
+/// run), the position carries no semantic row, or the spelling is
+/// unindexed: the framework verdict stands there (a user class inside an
+/// unindexed dependency keeps it too — what dependency indexing would
+/// close).
 fn resolves_user_container(c: &Check<'_>, row: u32) -> bool {
     let Some(analysis) = c.semantics() else {
         return false;
     };
     let span = query_span(c, row);
-    analysis.resolve_constructor(span, None).is_some()
-        || matches!(
-            analysis.binding_of(span).map(|b| b.kind),
-            Some(dartq_semantic::BindingKind::Decl)
-        )
+    if let Some(ctor) = analysis.resolve_constructor(span, None) {
+        return !is_framework_file(analysis, ctor.file);
+    }
+    match analysis.binding_of(span) {
+        Some(binding) if binding.kind == dartq_semantic::BindingKind::Decl => {
+            !is_framework_file(analysis, binding.target_file)
+        }
+        _ => false,
+    }
 }
 
 /// The framework-identity spelling gate over an instance-creation head:
@@ -2827,6 +2854,13 @@ mod semantic_identity {
     /// pins' hot face (several creation rules refute the identical rows in
     /// one run, the first verdict computed, the rest memo hits).
     fn run_semantic_set(source: &str, rules: &EnableSet, dep: Option<&str>) -> Vec<Lint> {
+        run_semantic_in(source, rules, dep.map(|dep| (dep, "package:t/kit.dart")))
+    }
+
+    /// [`run_semantic_set`] with the dependency's own library URI spelled:
+    /// `package:flutter/...` is the framework package (the identity the
+    /// rules want), any other URI is user code that refutes the spelling.
+    fn run_semantic_in(source: &str, rules: &EnableSet, dep: Option<(&str, &str)>) -> Vec<Lint> {
         let fixture = Fixture::parse(source);
         let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
         let mut files = FileTable::new();
@@ -2842,6 +2876,7 @@ mod semantic_identity {
         let elements = collect(source, &scanned.tokens, features, strings);
         let mut builder = LibraryGraphBuilder::new(strings);
         let lib = builder.intern("package:t/lint_semantic.dart");
+        builder.unit(lib, file);
         for (name, declaration) in elements.declarations() {
             if declaration.kind == MicroKind::TypeParam {
                 continue;
@@ -2850,7 +2885,7 @@ mod semantic_identity {
         }
         let mut index = ElementIndex::default();
         index.insert(file, elements);
-        if let Some(dep) = dep {
+        if let Some((dep, dep_uri)) = dep {
             let dep_file = files.intern(std::path::Path::new("kit.dart"));
             let scanned_dep = dartq_scanner::scan(dep, crate::testsupport::CONFIG, dep_file);
             assert!(
@@ -2858,7 +2893,8 @@ mod semantic_identity {
                 "scanner diagnostics: {dep:?}"
             );
             let dep_elements = collect(dep, &scanned_dep.tokens, features, strings);
-            let dep_lib = builder.intern("package:t/kit.dart");
+            let dep_lib = builder.intern(dep_uri);
+            builder.unit(dep_lib, dep_file);
             for (name, declaration) in dep_elements.declarations() {
                 if declaration.kind == MicroKind::TypeParam {
                     continue;
@@ -2979,6 +3015,64 @@ mod semantic_identity {
             Some("class Diagnosticable {}"),
         );
         assert!(resolved.is_empty(), "{resolved:?}");
+    }
+
+    /// The framework-resolution face: a root spelling resolving INTO
+    /// `package:flutter/...` is the framework container the oracle's
+    /// element identity matches, so the refutation must not fire — the
+    /// imported-supertype cases (`test_missingConstructor`,
+    /// `test_constructorInAugmentedClass`, the `doc_bad_*` faces) report.
+    #[test]
+    fn framework_resolved_widget_root_chain_keeps_the_verdict() {
+        let src = "class MyWidget extends StatefulWidget {}\n";
+        let (rules, unknown) = EnableSet::resolve(["use_key_in_widget_constructors"]);
+        assert!(unknown.is_empty());
+        let resolved = run_semantic_in(
+            src,
+            &rules,
+            Some((
+                "class StatefulWidget {}",
+                "package:flutter/src/widgets/framework.dart",
+            )),
+        );
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+    }
+
+    /// The `createState` gate under a framework-resolved `StatefulWidget`:
+    /// the lint reports the creation with arguments even though the
+    /// supertype is imported and indexed.
+    #[test]
+    fn framework_resolved_stateful_widget_fires_create_state() {
+        let src = "class MyWidget extends StatefulWidget {\n  S createState() => S(1);\n}\n";
+        let (rules, unknown) = EnableSet::resolve(["no_logic_in_create_state"]);
+        assert!(unknown.is_empty());
+        let resolved = run_semantic_in(
+            src,
+            &rules,
+            Some((
+                "class StatefulWidget {}",
+                "package:flutter/src/widgets/framework.dart",
+            )),
+        );
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
+    }
+
+    /// The `Diagnosticable` chain under a framework-resolved supertype: the
+    /// public property still reports.
+    #[test]
+    fn framework_resolved_diagnosticable_chain_fires() {
+        let src = "class C implements Diagnosticable {\n  int get z => 1;\n}\n";
+        let (rules, unknown) = EnableSet::resolve(["diagnostic_describe_all_properties"]);
+        assert!(unknown.is_empty());
+        let resolved = run_semantic_in(
+            src,
+            &rules,
+            Some((
+                "class Diagnosticable {}",
+                "package:flutter/src/foundation/diagnostics.dart",
+            )),
+        );
+        assert_eq!(resolved.len(), 1, "{resolved:?}");
     }
 
     /// The seven creation rules share `spells_framework` verdicts through

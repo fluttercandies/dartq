@@ -1036,9 +1036,10 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
     /// info string is everything after the ticks, `null` when only
     /// whitespace remains; indented blocks (four-space runs after an empty
     /// line) never report and shadow fence parsing while they last. The
-    /// report anchor is the opening line's content span (marker and one
-    /// space stripped), whose length covers the whole line. Lines inside a
-    /// markdown code region never open blocks. Message:
+    /// report anchor is the opening line's content span (only the `///`
+    /// marker stripped — the separating space belongs to the content, and
+    /// the length covers the whole line, indentation included). Lines
+    /// inside a markdown code region never open blocks. Message:
     /// `diagnostic.g.dart` `missingCodeBlockLanguageInDocComment`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "missing_code_block_language_in_doc_comment",
@@ -1152,19 +1153,22 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
     }
 
     /// The `(content offset, content)` lines of one comment — the
-    /// `_CharacterSequence` faces. Line comments strip `///` and one
-    /// optional space; block comments strip leading whitespace, the `*`/
-    /// `* ` markers, the `/**`/`*/` delimiters, and drop lines that are
-    /// only the end-of-comment marker. The callers' doc-form gate anchors
-    /// every fixed marker offset in ASCII.
+    /// `_CharacterSequence` faces. A line comment strips exactly the `///`
+    /// marker: the analyzer's sequence keeps everything after those three
+    /// characters, the separating space included (the fence anchor below
+    /// and `isPreviousLineEmpty` both read that raw content). Block
+    /// comments strip leading whitespace, the `*`/`* ` markers, the
+    /// `/**`/`*/` delimiters, and drop lines that are only the
+    /// end-of-comment marker. The callers' doc-form gate anchors every
+    /// fixed marker offset in ASCII.
     fn comment_lines<'a>(source: &'a str, comment: &Comment) -> Vec<(usize, &'a str)> {
         let base = comment.range.start as usize;
         let lexeme = &source[base..comment.range.end as usize];
         match comment.kind {
             crate::comments::CommentKind::Line => {
                 let lexeme = lexeme.strip_suffix('\r').unwrap_or(lexeme);
-                let prefix = usize::from(lexeme.starts_with("/// ")) + 3;
-                vec![(base + prefix, &lexeme[prefix..])]
+                const PREFIX: usize = 3;
+                vec![(base + PREFIX, &lexeme[PREFIX..])]
             }
             crate::comments::CommentKind::Block => {
                 let mut lines = Vec::new();
@@ -3238,7 +3242,8 @@ mod w5_pins {
     // —— missing_code_block_language_in_doc_comment —————————————————————
 
     /// `test_missingLanguage` — an un-language fenced block reports at its
-    /// opening fence line.
+    /// opening fence line. The oracle's machine output for this source is
+    /// `1:4|4` (` ``` ` — the space after `///` is part of the line).
     #[test]
     fn missing_code_block_language_reports_the_opening_fence() {
         let f = Fixture::parse("/// ```\n/// test\n/// ```\nclass A {}\n");
@@ -3248,7 +3253,7 @@ mod w5_pins {
             lints[0].message,
             "The code block is missing a specified language."
         );
-        assert_eq!(lints[0].range, 4..7);
+        assert_eq!(lints[0].range, 3..7);
     }
 
     /// `test_hasLanguage` and `test_indentedCodeBlock` — an info string
@@ -3272,20 +3277,20 @@ mod w5_pins {
 
     /// `test_missingLanguage_noEndingFence` and
     /// `test_missingLanguage_leadingWhitespace` — an unterminated block
-    /// reports once, and the anchor is the fence line's content span
-    /// (marker plus one separator space stripped, indentation included —
-    /// the upstream markup marks `[!  ```!]`).
+    /// reports once, and the anchor is the fence line's content span (only
+    /// the `///` marker stripped, indentation and the separator space
+    /// included — the oracle's machine rows are `2:4|4` and `2:4|6`).
     #[test]
     fn missing_code_block_language_unterminated_and_indent_faces() {
         let f = Fixture::parse("/// ```\n/// test\n/// more test\nclass A {}\n");
         let lints = f.run(&one_rule("missing_code_block_language_in_doc_comment"));
         assert_eq!(lints.len(), 1, "{lints:?}");
-        assert_eq!(lints[0].range, 4..7);
+        assert_eq!(lints[0].range, 3..7);
 
         let f = Fixture::parse("///   ```\n/// test\n/// ```\nclass A {}\n");
         let lints = f.run(&one_rule("missing_code_block_language_in_doc_comment"));
         assert_eq!(lints.len(), 1);
-        assert_eq!(lints[0].range, 4..9);
+        assert_eq!(lints[0].range, 3..9);
     }
 
     /// Multi-byte info strings and fenced content stay byte-safe: a
@@ -3299,7 +3304,7 @@ mod w5_pins {
         );
         let lints = f.run(&one_rule("missing_code_block_language_in_doc_comment"));
         assert_eq!(lints.len(), 1, "{lints:?}");
-        assert_eq!(lints[0].range, 33..36);
+        assert_eq!(lints[0].range, 32..36);
     }
 
     // —— public_member_api_docs ——————————————————————————————————————————
