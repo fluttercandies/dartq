@@ -3104,8 +3104,18 @@ impl ConstCapture {
         );
     }
 
-    /// `receiver.member` — merges the top two operands.
-    pub fn dot_access(&mut self, is_null_aware: bool, end: SourceRange) {
+    /// `receiver.member` / `receiver?.member` — merges the top two
+    /// operands. The null-aware spelling folds through the same
+    /// [`Expr::Member`] node as the plain one: upstream
+    /// `_evaluatePropertyAccess` (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart) takes the
+    /// target's value identically for both and only the `length` arm
+    /// distinguishes them (`String.length` folds, `Null.length` answers
+    /// null) — every other member lands on the same decision. A `null`
+    /// target therefore folds to a constant, never to a non-constant
+    /// node: `const int? c = s?.length` over `const String? s = ''` is a
+    /// valid constant.
+    pub fn dot_access(&mut self, _is_null_aware: bool, _end: SourceRange) {
         if !self.open() {
             return;
         }
@@ -3120,22 +3130,12 @@ impl ConstCapture {
             self.stack.push(name);
             return;
         };
-        if is_null_aware {
-            self.pop_clamped(base);
-            self.push(
-                Node {
-                    expr: Expr::Other,
-                    span: end,
-                },
-                true,
-            );
-            return;
-        }
         let Some(recv) = self.pop_clamped(base) else {
             return;
         };
-        // The access ends at its selector: `end` is the parser's following
-        // token, so the selector node's own span is the oracle anchor.
+        // The access runs from the receiver through its selector — the
+        // oracle anchors a failing `recv.member` / `recv?.member` at the
+        // whole access node, not at the member.
         let span = SourceRange {
             offset: recv.span.offset,
             length: name_end.saturating_sub(recv.span.offset),
@@ -5950,5 +5950,102 @@ const other = {a, c};
 "#,
         );
         assert!(differing.is_empty(), "differing text defers");
+    }
+}
+
+/// #3825 — the null-aware property access in a constant expression. The
+/// oracle's rows for the corpus shapes (`dart analyze --format machine`,
+/// SDK 3.13.7) are all silent: `const String? s = ''; const int? c =
+/// s?.length;` and `const dynamic d = null; const int? c = d?.length;`
+/// are valid constants, while `const List? l = []; const int? c =
+/// l?.length;` reports `const_eval_property_access` (a face this unit does
+/// not model) and never `const_initialized_with_non_constant_value`. The
+/// capture therefore must hand the fold a member node, not the opaque
+/// node the null-aware spelling used to fold to — upstream
+/// `visitPropertyAccess` evaluates the target for both spellings and only
+/// `_evaluatePropertyAccess`'s `length` arm tells them apart.
+#[cfg(test)]
+mod null_aware_access_3825 {
+    use super::{
+        ConstCapture, ConstLookup, ConstantValue, Expr, IdentVerdict, Node, Verdict, eval,
+    };
+    use dartq_source::{SourceRange, StringId, StringTable};
+
+    fn span(offset: u32, end: u32) -> SourceRange {
+        SourceRange {
+            offset,
+            length: end - offset,
+        }
+    }
+
+    /// A lookup whose every member defers (an unknown-but-constant value)
+    /// and whose names defer too: the pins below only need the node's
+    /// shape and the null-target arm.
+    struct Deferred;
+
+    impl ConstLookup for Deferred {
+        fn ident(&self, _: StringId) -> IdentVerdict {
+            IdentVerdict::Constant
+        }
+
+        fn member(&self, recv: &ConstantValue, _: StringId) -> Verdict {
+            // A null target never reaches a member read upstream (the
+            // `length` arm answers null, every other member fails the
+            // property-access face); `Constant` is the deferral.
+            assert!(
+                !matches!(recv, ConstantValue::Null),
+                "a null receiver must short-circuit before the member"
+            );
+            Verdict::Constant
+        }
+
+        fn is_identical(&self, _: StringId) -> bool {
+            false
+        }
+    }
+
+    /// `s?.length` — the null-aware access merges into the same
+    /// [`Expr::Member`] node as `s.length`, spanning the receiver through
+    /// the selector. Folding to `Expr::Other` instead made every valid
+    /// null-aware const access read as non-constant.
+    #[test]
+    fn null_aware_access_merges_into_a_member_node() {
+        let strings = StringTable::new();
+        let mut capture = ConstCapture::new(strings.intern("identical"));
+        capture.open_initializer();
+        // `s?.length`: receiver `s`, selector `length`, then the access.
+        capture.identifier(strings.intern("s"), span(0, 1));
+        capture.selector_identifier(strings.intern("length"), span(3, 9));
+        capture.dot_access(true, span(9, 10));
+        let root = capture.close_initializer().expect("one root node");
+        let Expr::Member { recv, name } = &root.expr else {
+            panic!("the null-aware access must merge into a member: {root:?}");
+        };
+        assert_eq!(*name, strings.intern("length"));
+        assert!(matches!(&recv.expr, Expr::Ident(_)), "receiver kept");
+        assert_eq!(
+            (root.span.offset, root.span.end()),
+            (0, 9),
+            "the access node covers `s?.length`"
+        );
+    }
+
+    /// A `null` target short-circuits to a constant — the fold arm the
+    /// merged node relies on for `const int? c = s?.length` over a
+    /// null-valued `s`.
+    #[test]
+    fn member_over_a_null_target_is_constant() {
+        let strings = StringTable::new();
+        let node = Node {
+            expr: Expr::Member {
+                recv: Box::new(Node {
+                    expr: Expr::Value(ConstantValue::Null),
+                    span: span(0, 1),
+                }),
+                name: strings.intern("length"),
+            },
+            span: span(0, 9),
+        };
+        assert_eq!(eval(&node, &Deferred), Verdict::Constant);
     }
 }
