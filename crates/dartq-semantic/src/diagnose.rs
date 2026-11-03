@@ -1505,6 +1505,13 @@ pub fn fold_unit_with_ops<'t>(
     // below. Sorted by `(offset, in_closure)` once the loop ends.
     let mut write_sites: Vec<(SourceRange, bool)> = Vec::new();
     let mut flow_diagnostics = Vec::new();
+    // The flow face's `dead_code` rows with their anchor token
+    // (`(index in flow_diagnostics, emitted range, anchor token id)`): a
+    // definitely-unassigned receiver's null-aware chain reports through
+    // BOTH this interval face and the staged chain face, and only the
+    // latter matches the official span at every edge — the resolution pass
+    // below drops the interval row when the chain face owns it.
+    let mut flow_dead_rows: Vec<(usize, SourceRange, u32)> = Vec::new();
     let mut body_rows = Vec::new();
     // The flow layer's dead intervals: every `DeadCode` fact's range is
     // one unreachable region — a diagnostic face anchored inside it never
@@ -1790,6 +1797,11 @@ pub fn fold_unit_with_ops<'t>(
                     }
                 }
                 let code = SemanticCode::DeadCode;
+                // The row joins the flow face's own list, whose
+                // null-aware duplicates the chain face resolves after the
+                // fold (see [`Self::drop_flow_dead_duplicates`]'s caller) —
+                // the anchor token and the final range are the join keys.
+                flow_dead_rows.push((flow_diagnostics.len(), range, span.id));
                 flow_diagnostics.push(Diagnostic::new(
                     code.severity(),
                     code.code_info(),
@@ -2058,6 +2070,61 @@ pub fn fold_unit_with_ops<'t>(
             },
             code.correction_message(""),
         ));
+    }
+    // One official face, two engines: the flow layer reports a
+    // definitely-unassigned receiver's null-aware chain as a dead
+    // INTERVAL, and the staged chain rows above report the same construct
+    // through `_verifyUnassignedSimpleIdentifier`
+    // (dead_code_verifier.dart:460-505). Upstream reports the AST row once,
+    // so an interval that the chain face claims is the duplicate — and the
+    // chain row carries the official span, which the interval's drifts at
+    // the index operand (`n?[i]` opens at `i`) and at the cascade section
+    // tail (`n?..p;` runs through the `;`).
+    //
+    // An interval the chain face DECLINED is the chained-body cascade
+    // (`n?..p().q`): the official's `first.operator` is then the inner `.`,
+    // so no row lands, but the interval still opens on the operator when
+    // its receiver is an unassigned local. Only that pair drops — a `null`
+    // literal or an assigned `Null` receiver keeps its interval row (the
+    // dead-at-open face, `n?..p();` rows `?..p();`).
+    if !flow_dead_rows.is_empty() {
+        let mut dropped = vec![false; flow_diagnostics.len()];
+        for (index, range, anchor) in flow_dead_rows {
+            let claimed = chain_rows
+                .iter()
+                .any(|row| row.range.offset < range.end() && range.offset < row.range.end());
+            let orphaned_cascade = !claimed && {
+                let operator = tokens.get(anchor as usize);
+                let null_aware = operator.is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        dartq_scanner::TokenKind::QuestionPeriod
+                            | dartq_scanner::TokenKind::QuestionPeriodPeriod
+                    )
+                });
+                null_aware
+                    && anchor > 0
+                    && tokens
+                        .get(anchor as usize - 1)
+                        .filter(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+                        .is_some_and(|t| {
+                            unassigned.staged(SourceRange {
+                                offset: t.utf16_offset,
+                                length: t.byte_len as u32,
+                            })
+                        })
+            };
+            if claimed || orphaned_cascade {
+                dropped[index] = true;
+            }
+        }
+        let mut kept = Vec::with_capacity(flow_diagnostics.len());
+        for (index, row) in flow_diagnostics.into_iter().enumerate() {
+            if !dropped[index] {
+                kept.push(row);
+            }
+        }
+        flow_diagnostics = kept;
     }
     // The staged null-aware faces (`_checkForUnnecessaryNullAware`), keyed
     // on the receiver reads the promotions are now complete for — locals
@@ -7042,6 +7109,11 @@ mod ticket_2828_tests;
 #[cfg(test)]
 mod ticket_2831_tests;
 
+/// The #3801 pins: the raw-creation parameters the inference leaves `unknown`
+/// answer no row (and print `_` in a sibling's substituted bound).
+#[cfg(test)]
+mod ticket_3801_tests;
+
 /// The #2851 const-condition dead-arm pins: the whole-branch statement
 /// spans and the element-extent arm rows the literal-condition faces
 /// already emit, the const-variable and non-condition live negatives,
@@ -7734,3 +7806,13 @@ mod ticket_3511_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3648_tests.rs"]
 mod ticket_3648_tests;
+
+/// The #3785 pins: object-pattern field unions (`suit: a || b`) keep
+/// their property sub-space instead of degrading whole-pattern, and
+/// `&&` head/object conjunctions (`Jack<num>() && Jack<T>(oneEyed: _)`)
+/// intersect the bare test into the narrower head — the
+/// `non_exhaustive_switch_expression` extension-type/sealed-split
+/// cluster's two name-level defects.
+#[cfg(test)]
+#[path = "diagnose/ticket_3785_tests.rs"]
+mod ticket_3785_tests;
