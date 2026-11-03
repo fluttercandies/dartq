@@ -11,12 +11,15 @@ impl<'a> Engine<'a> {
     /// Closes the window and latches its unbounded count with the group's
     /// closing offset (`end_type_variables`): the owning declaration's name
     /// precedes that offset, so a container head adopts the latch by token
-    /// order alone.
+    /// order alone. A nested group's close (`<X extends void Function<U>()>`
+    /// — the bound's own `<U>` re-opens `tv_window`) consumes the inner
+    /// window first, so the enclosing close finds `None` and must leave the
+    /// latched `pending_tv` alone: clearing it here would erase the inner
+    /// group's latch before the container head adopts it.
     pub(crate) fn close_type_variables(&mut self, window_end: Token) {
-        self.pending_tv = self
-            .tv_window
-            .take()
-            .map(|window| (window.unbounded, window_end.range.offset));
+        if let Some(window) = self.tv_window.take() {
+            self.pending_tv = Some((window.unbounded, window_end.range.offset));
+        }
     }
 
     /// #1314 FAM10: pairs the closed type-variable window with the latched
@@ -1717,25 +1720,49 @@ impl<'a> Engine<'a> {
         // type never re-fires a parameterized head), so the hand-over
         // clears the merge latch and appends once. The extent is the
         // written annotation `_typeArgumentErrorNode` anchors — the return
-        // type's own head through the formals' `)`; a `Function` spelled
-        // without a return type records no start offset and keeps the
-        // under-report.
-        if let Some((_, _, start)) = capture.ret
-            && self.fn_type_capture.is_empty()
+        // type's own head through the formals' `)` (#3571). A return the
+        // grammar leaves unwritten (`f2<Function(), String>()`) or that is
+        // itself a function type — the inner close seats it through
+        // `fn_capture_type` with no head offset (`f2<int Function()
+        // Function()>()`) — has no anchor of its own: the written start
+        // comes from the backward chain scan, and a chain the grammar
+        // would not admit keeps the under-report. The trailing `?`
+        // belongs to the type and joins the extent
+        // (`f2<void Function()?>()` anchors its `?`).
+        if self.fn_type_capture.is_empty()
             && let Some(closer_end) = self.fn_formal_closer_end
-            && closer_end > start
             && self
                 .call_args_capture
                 .as_ref()
                 .is_some_and(|args| args.depth == self.type_arg_depth)
         {
-            self.call_args_push_completed(
-                fn_ty,
-                SourceRange {
-                    offset: start,
-                    length: closer_end - start,
-                },
-            );
+            let anchor = match capture.ret {
+                Some((_, leaf, start)) if leaf != StringId::NONE || start != 0 => Some(start),
+                // A return-less spelling: the chain head is the start. A
+                // function-typed return: the chain head extends to the
+                // return's own head (`int Function() Function()` starts at
+                // `int`).
+                Some(_) => self.written_function_chain_start(closer_end, true),
+                None => self.written_function_chain_start(closer_end, false),
+            };
+            if let Some(start) = anchor
+                && closer_end > start
+            {
+                let end = if nullable {
+                    self.nullable_suffix_end(closer_end)
+                } else {
+                    closer_end
+                };
+                if end > start {
+                    self.call_args_push_completed(
+                        fn_ty,
+                        SourceRange {
+                            offset: start,
+                            length: end - start,
+                        },
+                    );
+                }
+            }
         }
         // A body-position capture (#2359) arms its shape for the
         // annotation/test faces but claims no variable-signature stash: the
@@ -2370,6 +2397,148 @@ impl<'a> Engine<'a> {
             .retain(|(_, member)| member.offset >= end || member.offset < span.offset);
         capture.pending = None;
         capture.members.push((ty, span));
+    }
+
+    /// The written start of a function type sealed at `closer_end` (its
+    /// formals' `)` end, exclusive) whose return type carries no head
+    /// anchor: the return is absent (`A<Function()>()`) or itself a
+    /// function type (`A<int Function() Function()>()`). The start is the
+    /// FIRST `Function` keyword of the backward written chain, each unit
+    /// spelled `Function [<...>] (...)`; a chain the grammar would not
+    /// admit — any residue before a unit that is not another unit's
+    /// formals — keeps the under-report (`None`). With
+    /// `extend_to_return_head` (a function-TYPED return: the type's start
+    /// is its return's own head), the walk then takes the head that
+    /// precedes the chain — its own `<...>` group (`List<int> …`) and
+    /// identifier run (`int`, `p.C`) — falling back to the chain head
+    /// when no head is spelled.
+    fn written_function_chain_start(
+        &self,
+        closer_end: u32,
+        extend_to_return_head: bool,
+    ) -> Option<u32> {
+        let bytes = self.source.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut i = self.byte_of(closer_end);
+        let mut units = 0usize;
+        loop {
+            while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            if i == 0 || bytes[i - 1] != b')' {
+                return None;
+            }
+            i -= 1;
+            let mut depth = 0usize;
+            loop {
+                if i == 0 {
+                    return None;
+                }
+                i -= 1;
+                match bytes[i] {
+                    b')' => depth += 1,
+                    b'(' if depth == 0 => break,
+                    b'(' => depth -= 1,
+                    _ => {}
+                }
+            }
+            while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            // The unit's own type-variable group (`Function<T>(...)`).
+            if i > 0 && bytes[i - 1] == b'>' {
+                let mut angles = 0usize;
+                loop {
+                    if i == 0 {
+                        return None;
+                    }
+                    i -= 1;
+                    match bytes[i] {
+                        b'>' => angles += 1,
+                        b'<' => {
+                            angles -= 1;
+                            if angles == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+                    i -= 1;
+                }
+            }
+            if i < 8 || &bytes[i - 8..i] != b"Function" || (i >= 9 && ident(bytes[i - 9])) {
+                return None;
+            }
+            i -= 8;
+            units += 1;
+            // The chain continues when another unit's formals close right
+            // before this keyword (`Function() Function()`); anything else
+            // ends it — the group's `<`, a `,`, or the declaration ahead.
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+            if !(j > 0 && bytes[j - 1] == b')' && units < 8) {
+                break;
+            }
+            i = j;
+        }
+        if !extend_to_return_head {
+            return Some(self.utf16_of(i));
+        }
+        // The function-typed return's own head precedes the chain: its
+        // `<...>` group first (`List<int> Function() Function()`), then the
+        // identifier run (`int`, `p.C`). No head spelled — the chain head
+        // is the type's own start.
+        let mut j = i;
+        while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        if j > 0 && bytes[j - 1] == b'>' {
+            let mut angles = 0usize;
+            loop {
+                if j == 0 {
+                    return Some(self.utf16_of(i));
+                }
+                j -= 1;
+                match bytes[j] {
+                    b'>' => angles += 1,
+                    b'<' => {
+                        angles -= 1;
+                        if angles == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+        }
+        while j > 0 && (ident(bytes[j - 1]) || bytes[j - 1] == b'.') {
+            j -= 1;
+        }
+        Some(self.utf16_of(j))
+    }
+
+    /// The written end when the sealed function type carries its own
+    /// nullable suffix: the position after the `?` that follows the
+    /// formals' `)` (whitespace between belongs to the type), else
+    /// `closer_end` unchanged.
+    fn nullable_suffix_end(&self, closer_end: u32) -> u32 {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(closer_end);
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'?' {
+            self.utf16_of(i) + 1
+        } else {
+            closer_end
+        }
     }
 
     /// `end_type_arguments`: the headless group closed; its written

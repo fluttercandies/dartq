@@ -450,7 +450,7 @@ impl<'a> Engine<'a> {
     /// does a head that resolves to anything but a `TypeAlias` declaration
     /// (a container, a top-level variable, a local) — the caller's own
     /// resolution order owns those.
-    fn alias_anchor(
+    pub(crate) fn alias_anchor(
         &self,
         name: StringId,
         owner: FileId,

@@ -2096,6 +2096,15 @@ impl ParserListener for Flow<'_> {
                 aliased_args,
                 nullable || aliased_ty.nullable,
             ),
+            // A parameterized right-hand side (`typedef L = List<int>?;`)
+            // keeps the name-level face — splicing the right-hand argument
+            // tree would freeze it where the use site's own rows (or a
+            // parameterized alias's substitutions) belong — but
+            // nullability is not an argument-tree fact: the right-hand `?`
+            // still rides the declared face, exactly as the bare arm's
+            // does. Without it the `?` dies with the declined
+            // substitution and `l != null` stages no promotion.
+            Some(&(aliased_ty, _)) => (base, args, nullable || aliased_ty.nullable),
             _ => (base, args, nullable),
         };
         if let Some(group) = self.type_arg_groups.last_mut() {
@@ -2401,6 +2410,24 @@ impl ParserListener for Flow<'_> {
             nullable: question.is_some(),
             args: crate::ty::EMPTY_ARGS,
         });
+        // The top-level header latch (see `top_last_type`): a record-typed
+        // typedef right-hand side (`typedef R = (int, String)?;`) fires no
+        // named-head `handle_type`, so without latching here `end_typedef`
+        // binds its `(Function, nullable: false)` fallback — a wrong base
+        // that also drops the written `?`. The latch rides the same opaque
+        // face the row above records, nullability included; every other
+        // top-level consumer of the record spelling (fields, parameters)
+        // parses inside an executable or is cleared by
+        // `end_top_level_declaration` before the next header.
+        if self.buffer.is_none() {
+            self.top_last_type = Some((
+                crate::ty::Ty {
+                    base: crate::ty::Base::Unknown,
+                    nullable: question.is_some(),
+                },
+                crate::ty::EMPTY_ARGS,
+            ));
+        }
     }
 
     fn end_typedef(

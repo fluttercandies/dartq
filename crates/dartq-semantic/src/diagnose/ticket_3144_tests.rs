@@ -16,8 +16,9 @@
 //!   wildcards never collide (`isWildcard`, :350-360).
 //! - `unused_local_variable`'s verdict: a tracked local reports when no
 //!   READ lands on it (unused_local_elements_verifier.dart —
-//!   `_isReadIdentifier`; a write-only or statement-discarded read never
-//!   spares), a pattern-declaration group reports all-or-nothing
+//!   `_isReadIdentifier`; a write-only read never spares, while a bare
+//!   `x;` statement read does — the getter-context read is credited), a
+//!   pattern-declaration group reports all-or-nothing
 //!   (`visitPatternVariableDeclaration`), and the wildcard feature's
 //!   all-underscores names spare (:985-994 — only the exact `_`, never
 //!   `__`/`___`).
@@ -76,7 +77,7 @@ fn block_two_named_locals_collide_at_second() {
     let report = report_ops("void f() {\n  int x;\n  int x;\n}\n");
     assert_eq!(
         rows_of(&report, "duplicate_definition"),
-        vec![(CORE_PRELUDE.len() as u32 + 19, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 26, 1)],
         "second `x` anchors the row: {:?}",
         rows_of(&report, "duplicate_definition")
     );
@@ -127,7 +128,7 @@ fn for_head_list_collides_at_second() {
     let report = report_ops("void f() {\n  for (int i = 0, i = 0; i < 5;) {}\n}\n");
     assert_eq!(
         rows_of(&report, "duplicate_definition"),
-        vec![(CORE_PRELUDE.len() as u32 + 26, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 29, 1)],
         "the for-head list scope collides at the second `i`: {:?}",
         rows_of(&report, "duplicate_definition")
     );
@@ -140,7 +141,7 @@ fn local_variable_and_function_same_name_collide() {
     let report = report_ops("void f() {\n  int x;\n  void x() {}\n}\n");
     assert_eq!(
         rows_of(&report, "duplicate_definition"),
-        vec![(CORE_PRELUDE.len() as u32 + 26, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 27, 1)],
         "variable + function same name collides: {:?}",
         rows_of(&report, "duplicate_definition")
     );
@@ -154,7 +155,7 @@ fn pattern_element_then_local_collides() {
     let report = report_ops("void f() {\n  var (a, b) = (0, 1);\n  int a = 0;\n}\n");
     assert_eq!(
         rows_of(&report, "duplicate_definition"),
-        vec![(CORE_PRELUDE.len() as u32 + 37, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 40, 1)],
         "pattern element joins the statement-list scope: {:?}",
         rows_of(&report, "duplicate_definition")
     );
@@ -182,7 +183,7 @@ fn single_unused_local_reports() {
     let report = report_ops("void f() {\n  int x;\n}\n");
     assert_eq!(
         rows_of(&report, "unused_local_variable"),
-        vec![(CORE_PRELUDE.len() as u32 + 14, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 17, 1)],
         "the unused local reports at its name: {:?}",
         rows_of(&report, "unused_local_variable")
     );
@@ -208,8 +209,8 @@ fn two_unused_locals_each_report() {
     assert_eq!(
         rows_of(&report, "unused_local_variable"),
         vec![
-            (CORE_PRELUDE.len() as u32 + 14, 1),
-            (CORE_PRELUDE.len() as u32 + 21, 1),
+            (CORE_PRELUDE.len() as u32 + 17, 1),
+            (CORE_PRELUDE.len() as u32 + 26, 1),
         ],
         "every unused tracked row reports: {:?}",
         rows_of(&report, "unused_local_variable")
@@ -222,24 +223,22 @@ fn only_the_read_local_is_spared() {
     let report = report_ops("void f() {\n  int a;\n  int b;\n  print(a);\n}\n");
     assert_eq!(
         rows_of(&report, "unused_local_variable"),
-        vec![(CORE_PRELUDE.len() as u32 + 21, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 26, 1)],
         "only `b` is unused: {:?}",
         rows_of(&report, "unused_local_variable")
     );
 }
 
-/// A statement-discarded read (`x;` alone) never spares — the official
-/// `_isReadIdentifier`/`ExpressionStatement` discard. The bare `x;` reads
-/// `x` but the statement window throws the read away.
+/// A bare `x;` statement is a real read that spares the local — upstream
+/// `_isReadIdentifier` counts the getter-context read (the discard arms
+/// cover only `v++`/`++v` and `v ??=` parents); the oracle reports nothing
+/// on `int x = 0; x;`.
 #[test]
-fn bare_statement_read_still_reports() {
+fn bare_statement_read_spares_the_local() {
     let report = report_ops("void f() {\n  int x = 0;\n  x;\n}\n");
-    // `x;` is a discarded single-read statement — `check_statement_use`
-    // drops the credit and `x` stays unused.
-    assert_eq!(
-        rows_of(&report, "unused_local_variable"),
-        vec![(CORE_PRELUDE.len() as u32 + 14, 1)],
-        "a discarded bare read never spares: {:?}",
+    assert!(
+        rows_of(&report, "unused_local_variable").is_empty(),
+        "the oracle spares `x`: a bare `x;` is a getter-context read: {:?}",
         rows_of(&report, "unused_local_variable")
     );
 }
@@ -252,8 +251,8 @@ fn unused_pattern_group_reports_each_binder() {
     assert_eq!(
         rows_of(&report, "unused_local_variable"),
         vec![
-            (CORE_PRELUDE.len() as u32 + 15, 1),
             (CORE_PRELUDE.len() as u32 + 18, 1),
+            (CORE_PRELUDE.len() as u32 + 21, 1),
         ],
         "each unused pattern binder reports: {:?}",
         rows_of(&report, "unused_local_variable")
@@ -281,8 +280,8 @@ fn multi_underscore_names_report() {
     assert_eq!(
         rows_of(&report, "unused_local_variable"),
         vec![
-            (CORE_PRELUDE.len() as u32 + 14, 2),
-            (CORE_PRELUDE.len() as u32 + 24, 3),
+            (CORE_PRELUDE.len() as u32 + 17, 2),
+            (CORE_PRELUDE.len() as u32 + 31, 3),
         ],
         "`__`/`___` are real names, not wildcards: {:?}",
         rows_of(&report, "unused_local_variable")
@@ -310,7 +309,7 @@ fn string_return_under_int_reports() {
     let report = report_ops("int f() {\n  return \"s\";\n}\n");
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
-        vec![(CORE_PRELUDE.len() as u32 + 21, 3)],
+        vec![(CORE_PRELUDE.len() as u32 + 19, 3)],
         "String into int reports: {:?}",
         rows_of(&report, "return_of_invalid_type")
     );
@@ -345,7 +344,7 @@ fn null_return_under_non_nullable_reports() {
     let report = report_ops("int f() {\n  return null;\n}\n");
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
-        vec![(CORE_PRELUDE.len() as u32 + 21, 4)],
+        vec![(CORE_PRELUDE.len() as u32 + 19, 4)],
         "Null into int reports: {:?}",
         rows_of(&report, "return_of_invalid_type")
     );
@@ -369,7 +368,7 @@ fn nullable_local_return_under_int_reports() {
     let report = report_ops("int f() {\n  int? x;\n  return x;\n}\n");
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
-        vec![(CORE_PRELUDE.len() as u32 + 30, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 29, 1)],
         "int? into int reports: {:?}",
         rows_of(&report, "return_of_invalid_type")
     );
@@ -380,9 +379,11 @@ fn nullable_local_return_under_int_reports() {
 #[test]
 fn async_future_int_returning_string_reports() {
     let report = report_ops_bare("Future<int> f() async {\n  return \"s\";\n}\n");
+    // The bare rig carries no prelude, so the row anchors at the bare
+    // fixture's `"s"` (oracle offset 33) — no prelude shift.
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
-        vec![(CORE_PRELUDE.len() as u32 + 33, 3)],
+        vec![(33, 3)],
         "String into Future<int>'s int reports: {:?}",
         rows_of(&report, "return_of_invalid_type")
     );
@@ -393,9 +394,11 @@ fn async_future_int_returning_string_reports() {
 #[test]
 fn sync_future_int_returning_string_reports() {
     let report = report_ops_bare("Future<int> f() {\n  return \"s\";\n}\n");
+    // The bare rig carries no prelude, so the row anchors at the bare
+    // fixture's `"s"` (oracle offset 27) — no prelude shift.
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
-        vec![(CORE_PRELUDE.len() as u32 + 25, 3)],
+        vec![(27, 3)],
         "String into Future<int> reports: {:?}",
         rows_of(&report, "return_of_invalid_type")
     );
@@ -407,7 +410,7 @@ fn int_return_under_void_reports() {
     let report = report_ops("void f() {\n  return 0;\n}\n");
     assert_eq!(
         rows_of(&report, "return_of_invalid_type"),
-        vec![(CORE_PRELUDE.len() as u32 + 22, 1)],
+        vec![(CORE_PRELUDE.len() as u32 + 20, 1)],
         "int into void reports: {:?}",
         rows_of(&report, "return_of_invalid_type")
     );

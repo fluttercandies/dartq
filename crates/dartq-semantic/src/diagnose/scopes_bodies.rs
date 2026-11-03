@@ -1476,6 +1476,20 @@ impl<'a> Engine<'a> {
         if self.shorthand_nested_in_equality_rhs(dot_idx) {
             return Some((None, "_".to_string()));
         }
+        // A shorthand that roots the LEFT operand of `is`/`as` resolves
+        // against NO context: upstream analyzes a type test's and a cast's
+        // operands under the unknown schema (`binary_expression_resolver.dart`
+        // — neither operator pushes a dot-shorthand context), so the read
+        // arm reports the whole-span `missing_context` and the invocation
+        // arm the empty schema. The enclosing bool position never leaks into
+        // that operand (`if (.one is C)` reports `missing_context`, not a
+        // `'bool'` member miss).
+        if matches!(
+            self.shorthand_chain_end(name_idx),
+            Some(end) if matches!(toks[end].kind, TK::Keyword(Kw::Is | Kw::As))
+        ) {
+            return Some((None, "_".to_string()));
+        }
         // A shorthand whose selector chain an increment/decrement
         // terminates (`.new()++`, `.red++`) — the operand schema is the
         // unknown one upstream (test_postfixOperator's `C c = .new()++`
@@ -2550,15 +2564,19 @@ impl<'a> Engine<'a> {
         // `checkForUseOfVoidResult(node.leftOperand)` at error_verifier.
         // dart:482): `x ?? d` reads the LEFT operand's value unconditionally
         // — a `void`-typed `x` reports at its own span. The left operand is
-        // the row directly below the `??` group mark.
+        // the row directly below the `??` group mark. The anchor is the
+        // operand's use-site span, never the raw row: a member read's row
+        // holds the selector (`a.x`'s `x`) where the oracle spans `a.x`,
+        // and a parenthesized operand's row sits on the `)` where the
+        // oracle covers the whole group (`(x)` reports `(x)`).
         if let Some(left) = mark
             .checked_sub(1)
             .and_then(|index| self.rows.get(index))
             .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
             && self.operand_static_ty(left) == Ty::Void
         {
-            let range = left.range;
-            self.emit(SemanticCode::UseOfVoidResult, range, "", "");
+            let left = left.clone();
+            self.emit_use_of_void_result(Ty::Void, &left);
         }
         let mut lhs_is_bool_comparison = false;
         if let Some(eq) = self.eq_spans.last().copied() {
@@ -8098,13 +8116,18 @@ impl<'a> Engine<'a> {
                 if !self.named_type_is_type(name) && !*is_async {
                     return None;
                 }
-                match self.future_or_base(ret) {
-                    Ty::Named { nullable: true, .. }
-                    | Ty::Record { nullable: true, .. }
-                    | Ty::Function { nullable: true, .. } => {
-                        SemanticCode::BodyMightCompleteNormallyNullable
-                    }
-                    _ => SemanticCode::BodyMightCompleteNormally,
+                // `isPotentiallyNonNullable` splits the twins — the union's
+                // `isNullable` answer delegates to the argument's own
+                // nullability (type_system.dart:1227-1230), so
+                // `FutureOr<FutureOr<int>?>` reads `FutureOr<int>?`'s `?`
+                // (the nullable twin) while `FutureOr<FutureOr<int>>`
+                // stays potentially non-nullable (the ERROR). A base that
+                // escaped the first arm's silent faces makes the nullable
+                // answer the WARNING twin — never the silent face.
+                if self.completion_nullable(ret) {
+                    SemanticCode::BodyMightCompleteNormallyNullable
+                } else {
+                    SemanticCode::BodyMightCompleteNormally
                 }
             }
             Ty::Named {
@@ -8165,6 +8188,55 @@ impl<'a> Engine<'a> {
             return ty;
         }
         let folded = self.fold_alias_ty(ty);
+        // An argument-bearing head answers through resolved arguments:
+        // `returnType?.type` upstream is the element-typed face, where an
+        // argument that names no type is `InvalidType` and an alias use
+        // keeps its spelled head while answering through the right-hand
+        // side. The fold's `InvalidType` arm writes [`Ty::Unknown`] — the
+        // verdict's silent-base face — because the staged row outlives
+        // this declaration's scope: the teardown walk can no longer tell
+        // `FutureOr<NonExistent>` from `FutureOr<R>` once the type
+        // parameters pop, so the unresolved spelling must be decided here.
+        if let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = folded
+            && args != ArgListId::EMPTY
+        {
+            // The element list must copy out before the fold — each
+            // argument's rewrite can intern into the same pool, and a live
+            // `Ref` across `borrow_mut` is a runtime panic, not a borrow
+            // error the compiler sees.
+            let source_args = {
+                let pool = self.boundary.pool();
+                pool.get(args).to_vec()
+            };
+            let rewritten: Vec<Ty> = source_args
+                .iter()
+                .map(|arg| self.completion_arg_fold(*arg))
+                .collect();
+            return Ty::Named {
+                name,
+                nullable,
+                args: self.boundary.intern_list(&rewritten),
+            };
+        }
+        self.completion_alias_face(folded)
+    }
+
+    /// The terminal face of the shared alias fold — the right-hand sides
+    /// [`Engine::fold_alias_ty`] deliberately keeps written (`Null`/`void`/
+    /// `Never`/`Unknown` are "not the modeled face" there) but the
+    /// completion verdict reads resolved (`typedef Nothing = void; Nothing
+    /// f() {}` answers `void`, never the alias head). A bare `Named` whose
+    /// captured right-hand side is one of those terminals answers the
+    /// terminal; every other folded shape keeps its own face. Runs at the
+    /// verdict join too — `alias_rhs` reads declaration tables that
+    /// outlive the declaring frame's scope (a type parameter's `Local`
+    /// decl is no `TypeAlias`, so `R` keeps its written head either way).
+    fn completion_alias_face(&self, ty: Ty) -> Ty {
+        let folded = self.fold_alias_ty(ty);
         let Ty::Named {
             name,
             nullable,
@@ -8182,6 +8254,48 @@ impl<'a> Engine<'a> {
             // no nullability) — the written use stays.
             Some(Ty::Never) if !nullable => Ty::Never,
             _ => folded,
+        }
+    }
+
+    /// One resolved type argument of the completion walk's staged declared
+    /// return: the alias fold answers the argument's own right-hand side
+    /// (`FutureOr<Nothing>`'s argument reads `void`, the verdict's silent
+    /// face; `FutureOr<NF>`'s reads `FutureOr<void>`), and a `Named` head
+    /// that resolves to no type in scope is the oracle's `InvalidType` —
+    /// [`Ty::Unknown`]. A type parameter, a primitive, and every resolvable
+    /// declaration keep the written head so the diagnostic's display text
+    /// stays spelled (`'FutureOr<NInt>'`, never `'FutureOr<int>'`). Runs at
+    /// staging while the declaring frame's type parameters still bind.
+    fn completion_arg_fold(&self, ty: Ty) -> Ty {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        if !self.named_type_is_type(name) {
+            return Ty::UNKNOWN;
+        }
+        if args == ArgListId::EMPTY {
+            return ty;
+        }
+        // The element list copies out before the fold for the same
+        // `Ref`-across-`borrow_mut` reason [`Self::completion_declared_ty`]
+        // notes.
+        let source_args = {
+            let pool = self.boundary.pool();
+            pool.get(args).to_vec()
+        };
+        let rewritten: Vec<Ty> = source_args
+            .iter()
+            .map(|arg| self.completion_arg_fold(*arg))
+            .collect();
+        Ty::Named {
+            name,
+            nullable,
+            args: self.boundary.intern_list(&rewritten),
         }
     }
 
@@ -8244,11 +8358,20 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// `TypeSystem::futureOrBase` at name level: a written `FutureOr<T>`
-    /// with exactly one type argument unwraps to `T`, every other type is
-    /// its own base (the written `?` never strips — `FutureOr<int>?`'s
-    /// base is `int`). A bare `FutureOr` spells `FutureOr<dynamic>` — its
-    /// base is `dynamic`, one of the silent faces.
+    /// `TypeSystem::futureOrBase` at name level (type_system.dart:473-482):
+    /// a `FutureOr<T>` head with exactly one type argument unwraps to `T`
+    /// and the question asks again — the base recurses through nested
+    /// `FutureOr` heads, so `FutureOr<FutureOr<void>>`'s base is `void` and
+    /// `FutureOr<FutureOr<int>>`'s is `int`. The written spelling resolves
+    /// before the official asks: each hop folds the argument's own alias
+    /// (`FutureOr<Nothing>`'s `void` right-hand side IS the base upstream,
+    /// and `FutureOr<NF>` over `typedef NF = FutureOr<void>` bases on the
+    /// unfolded union), while an argument that names no type arrives
+    /// already spelled [`Ty::Unknown`] — the staged `InvalidType` stand-in
+    /// [`Engine::completion_declared_ty`] writes. Every other type is its
+    /// own base (the written `?` never strips — `FutureOr<int>?`'s base is
+    /// `int`). A bare `FutureOr` spells `FutureOr<dynamic>` — its base is
+    /// `dynamic`, one of the silent faces.
     pub(crate) fn future_or_base(&self, ret: Ty) -> Ty {
         let Ty::Named { name, args, .. } = ret else {
             return ret;
@@ -8259,12 +8382,61 @@ impl<'a> Engine<'a> {
         if args == ArgListId::EMPTY {
             return Ty::Dynamic;
         }
-        let pool = self.boundary.pool();
-        let list = pool.get(args);
-        if list.len() != 1 {
-            return ret;
+        let inner = {
+            let pool = self.boundary.pool();
+            let list = pool.get(args);
+            if list.len() != 1 {
+                return ret;
+            }
+            list[0]
+        };
+        self.future_or_base(self.completion_alias_face(inner))
+    }
+
+    /// `TypeSystem::isNullable` (type_system.dart:1216-1233) over the
+    /// completion walk's resolved face — the nullability question the
+    /// `body_might_complete_normally` verdict splits on. The top faces
+    /// (`dynamic`, `void`, `Null`, and the [`Ty::Unknown`] `InvalidType`
+    /// stand-in the staging fold writes) are nullable; a `?` suffix is
+    /// nullable; a `FutureOr<T>` head delegates to its argument — through
+    /// the argument's own resolution, so `FutureOr<Nothing>`'s `void`
+    /// right-hand side and `FutureOr<NF>`'s unfolded union answer instead
+    /// of the spelled name. Every other resolved head is non-nullable — a
+    /// `Named` here is a real type or a type parameter, never an
+    /// unresolved spelling (the staging fold already turned those into
+    /// [`Ty::Unknown`], which the top-face arm answers before scope is
+    /// consulted).
+    fn completion_nullable(&self, ty: Ty) -> bool {
+        match self.completion_alias_face(ty) {
+            Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if nullable {
+                    return true;
+                }
+                if name != self.intern("FutureOr") {
+                    return false;
+                }
+                // `FutureOr<T>` delegates to `T` (`isDartAsyncFutureOr`
+                // arm); a bare `FutureOr` spells `FutureOr<dynamic>` —
+                // nullable. Any other arity is a malformed list the
+                // conservative non-nullable face answers.
+                if args == ArgListId::EMPTY {
+                    return true;
+                }
+                let arg = {
+                    let pool = self.boundary.pool();
+                    let list = pool.get(args);
+                    (list.len() == 1).then_some(list[0])
+                };
+                arg.is_some_and(|arg| self.completion_nullable(arg))
+            }
+            Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => nullable,
+            Ty::Never => false,
         }
-        list[0]
     }
 
     /// A `super` expression while the innermost executable frame is open:

@@ -15,6 +15,8 @@
 
 mod analyze_json;
 mod case;
+#[cfg(test)]
+mod chunk_race_fixtures;
 mod dart;
 mod docs;
 mod exclusions;

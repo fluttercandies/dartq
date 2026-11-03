@@ -301,3 +301,7 @@ mod ticket_3657_tests;
 
 #[cfg(test)]
 mod ticket_3627_tests;
+
+#[cfg(test)]
+#[path = "ticket_3775_pins.rs"]
+mod ticket_3775_pins;

@@ -23463,3 +23463,87 @@ mod ticket_3741_tests;
 #[cfg(test)]
 #[path = "ticket_3742_tests.rs"]
 mod ticket_3742_tests;
+
+#[cfg(test)]
+#[path = "ticket_3746_tests.rs"]
+mod ticket_3746_tests;
+
+#[cfg(test)]
+#[path = "ticket_3750_tests.rs"]
+mod ticket_3750_tests;
+
+#[cfg(test)]
+#[path = "ticket_3751_tests.rs"]
+mod ticket_3751_tests;
+
+#[cfg(test)]
+#[path = "ticket_3748_tests.rs"]
+mod ticket_3748_tests;
+
+#[cfg(test)]
+#[path = "ticket_3754_tests.rs"]
+mod ticket_3754_tests;
+
+#[cfg(test)]
+#[path = "ticket_3752_tests.rs"]
+mod ticket_3752_tests;
+
+#[cfg(test)]
+#[path = "ticket_3753_tests.rs"]
+mod ticket_3753_tests;
+
+#[cfg(test)]
+#[path = "ticket_3757_tests.rs"]
+mod ticket_3757_tests;
+
+#[cfg(test)]
+#[path = "ticket_3762_tests.rs"]
+mod ticket_3762_tests;
+
+#[cfg(test)]
+#[path = "ticket_3767_tests.rs"]
+mod ticket_3767_tests;
+
+#[cfg(test)]
+#[path = "ticket_3763_tests.rs"]
+mod ticket_3763_tests;
+
+#[cfg(test)]
+#[path = "ticket_3761_tests.rs"]
+mod ticket_3761_tests;
+
+#[cfg(test)]
+#[path = "ticket_3724_tests.rs"]
+mod ticket_3724_tests;
+
+#[cfg(test)]
+#[path = "ticket_3765_tests.rs"]
+mod ticket_3765_tests;
+
+#[cfg(test)]
+#[path = "ticket_3779_tests.rs"]
+mod ticket_3779_tests;
+
+#[cfg(test)]
+#[path = "ticket_3780_tests.rs"]
+mod ticket_3780_tests;
+
+#[cfg(test)]
+#[path = "ticket_3561_tests.rs"]
+mod ticket_3561_tests;
+
+#[cfg(test)]
+#[path = "ticket_3552_tests.rs"]
+mod ticket_3552_tests;
+
+#[cfg(test)]
+#[path = "ticket_3693_tests.rs"]
+mod ticket_3693_tests;
+
+#[cfg(test)]
+#[path = "ticket_3380_tests.rs"]
+mod ticket_3380_tests;
+
+#[cfg(test)]
+#[path = "ticket_3497_tests.rs"]
+mod ticket_3497_tests;

@@ -176,9 +176,17 @@ fn warn(message: &str) {
     let _ = writeln!(std::io::stderr().lock(), "warn: {message}");
 }
 
+/// Materializes `indices` into `chunk_dir`, one package root per case.
+///
 /// A case that cannot be materialized (missing mock package, file path
-/// escaping its package root). The case is recorded like a crash on the
-/// oracle side, never silently skipped.
+/// escaping its package root) comes back in the map: it is recorded like a
+/// crash on the oracle side, never silently skipped.
+///
+/// The `Err` arm is a *chunk* failure — the directory cannot be emptied or
+/// created. It is deliberately not folded into the per-case map: a stale or
+/// unwritable chunk root makes every case in it unanalyzable, and reporting
+/// that as N case crashes is how a harness bug turns into a phantom
+/// regression.
 ///
 /// `chunk_dir` may be relative (the runner's `target/conformance/chunks`
 /// spelling); it is canonicalized here so every registered package rootUri
@@ -189,10 +197,10 @@ pub fn materialize(
     indices: &[usize],
     chunk_dir: &Path,
     mocks_root: &Path,
-) -> BTreeMap<usize, String> {
-    let _ = std::fs::remove_dir_all(chunk_dir);
-    std::fs::create_dir_all(chunk_dir).expect("creates chunk dir");
-    let chunk_dir = std::fs::canonicalize(chunk_dir).expect("chunk dir was just created");
+) -> Result<BTreeMap<usize, String>, String> {
+    reset_chunk_dir(chunk_dir)?;
+    let chunk_dir = std::fs::canonicalize(chunk_dir)
+        .map_err(|e| format!("cannot resolve chunk dir {}: {e}", chunk_dir.display()))?;
     let mocks_abs = std::fs::canonicalize(mocks_root).unwrap_or_else(|_| mocks_root.to_path_buf());
     let mut errors = BTreeMap::new();
     for &i in indices {
@@ -201,7 +209,29 @@ pub fn materialize(
             errors.insert(i, e);
         }
     }
-    errors
+    Ok(errors)
+}
+
+/// Empties and recreates the chunk root.
+///
+/// A removal failure is an error, never swallowed: a half-cleared root leaves
+/// the previous case set's files in place, the analyzer reports them, and
+/// attribution drops those rows as "outside the chunk package roots" — the
+/// case then reads as "missing rows, no extra rows", which is
+/// indistinguishable from a real emission regression.
+fn reset_chunk_dir(chunk_dir: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(chunk_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot clear chunk dir {}: {e}",
+                chunk_dir.display()
+            ));
+        }
+    }
+    std::fs::create_dir_all(chunk_dir)
+        .map_err(|e| format!("cannot create chunk dir {}: {e}", chunk_dir.display()))
 }
 
 fn materialize_one(
@@ -524,7 +554,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mocks);
         std::fs::create_dir_all(mocks.join("meta")).expect("creates mocks");
         let chunk = std::env::temp_dir().join(format!("conf-chunk-{}", std::process::id()));
-        let errors = materialize(&[case], &[0], &chunk, &mocks);
+        let errors = materialize(&[case], &[0], &chunk, &mocks).expect("materializes");
         assert!(errors.is_empty(), "{errors:?}");
         let root = chunk.join("0");
         let test_dart =
@@ -589,7 +619,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mocks);
         std::fs::create_dir_all(mocks.join("meta/lib")).expect("creates mocks");
         let chunk = std::env::temp_dir().join(format!("conf-aux-chunk-{}", std::process::id()));
-        let errors = materialize(&[case], &[0], &chunk, &mocks);
+        let errors = materialize(&[case], &[0], &chunk, &mocks).expect("materializes");
         assert!(errors.is_empty(), "{errors:?}");
         let root = chunk.join("0");
         // Inline aux files land under .aux/<name>/ in declared layout.
@@ -641,7 +671,7 @@ mod tests {
         // resolve the package.
         let rel = Path::new("target").join(format!("conf-rel-chunk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&rel);
-        let errors = materialize(&[case], &[0], &rel, &mocks);
+        let errors = materialize(&[case], &[0], &rel, &mocks).expect("materializes");
         assert!(errors.is_empty(), "{errors:?}");
         let config = std::fs::read_to_string(rel.join("0/.dart_tool/package_config.json"))
             .expect("reads config");
@@ -676,10 +706,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mocks);
         std::fs::create_dir_all(&mocks).expect("creates");
         let chunk = std::env::temp_dir().join(format!("conf-chunk2-{}", std::process::id()));
-        let errors = materialize(&[case], &[0], &chunk, &mocks);
+        let errors = materialize(&[case], &[0], &chunk, &mocks).expect("materializes");
         assert_eq!(errors.len(), 1);
         assert!(errors[&0].contains("no_such_mock"));
         let _ = std::fs::remove_dir_all(&chunk);
+        let _ = std::fs::remove_dir_all(&mocks);
+    }
+
+    /// The chunk root is emptied before every chunk. A root that cannot be
+    /// cleared is a chunk failure, never something to write into — this is
+    /// the pin for the swallowed `remove_dir_all` error that let a stale root
+    /// turn into a phantom "missing rows" regression.
+    #[test]
+    fn materialize_reports_an_unclearable_chunk_dir() {
+        let case = loaded(
+            "diagnostics/x/t#blocked",
+            &[("lib/test.dart", "var x = 1;\n")],
+        );
+        let mocks = std::env::temp_dir().join(format!("conf-mat3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&mocks);
+        std::fs::create_dir_all(&mocks).expect("creates");
+        let chunk = std::env::temp_dir().join(format!("conf-chunk3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&chunk);
+        // A regular file occupies the chunk root: removal fails with ENOTDIR.
+        std::fs::write(&chunk, "not a directory").expect("writes blocker");
+        let error = materialize(&[case], &[0], &chunk, &mocks)
+            .expect_err("a chunk root that cannot be cleared is a chunk error");
+        assert!(error.contains("chunk dir"), "{error}");
+        let _ = std::fs::remove_file(&chunk);
         let _ = std::fs::remove_dir_all(&mocks);
     }
 
@@ -750,7 +804,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mocks);
         std::fs::create_dir_all(&mocks).expect("creates mocks");
         let chunk = std::env::temp_dir().join(format!("conf-pubspec-chunk-{}", std::process::id()));
-        let errors = materialize(&cases, &[0, 1, 2], &chunk, &mocks);
+        let errors = materialize(&cases, &[0, 1, 2], &chunk, &mocks).expect("materializes");
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             std::fs::read_to_string(chunk.join("0/pubspec.yaml")).expect("reads"),
@@ -800,7 +854,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mocks);
         std::fs::create_dir_all(&mocks).expect("creates mocks");
         let chunk = std::env::temp_dir().join(format!("conf-options-chunk-{}", std::process::id()));
-        let errors = materialize(&cases, &[0, 1], &chunk, &mocks);
+        let errors = materialize(&cases, &[0, 1], &chunk, &mocks).expect("materializes");
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             std::fs::read_to_string(chunk.join("0/analysis_options.yaml")).expect("reads"),

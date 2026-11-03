@@ -127,9 +127,15 @@ fn nonconforming_generic_function_arguments_report() {
 /// `<U>` binders are dropped before `relateTypeParameters` can read them.
     /// `bounds.rs::is_well_bounded`/`system.rs::function_subtype` (this fix's
     /// path) is not the emitter for these rows, so the `TypeId`-engine
-    /// correct answer never surfaces here. Un-ignorable once the `Ty` engine
-    /// carries `type_params_named`.
-#[ignore = "pooled Ty engine drops alias/signature binders (alias_fn_sig params) — outside bounds.rs scope"]
+    /// correct answer never surfaces here. The `Ty`-engine side landed its
+    /// half in #3693 (`alias_fn_sig` fills `sig.params` from the RHS
+    /// function's own `<T>` group — the alias-bound repro passes), but the
+    /// INLINE bound `void Function<U>()` still reaches the judged side with
+    /// its binder row dropped: `Snapshot::tree_of`'s Function arm
+    /// (bounds.rs) writes `type_params_named` entries as `(name, None)`
+    /// and the clause-site bound check never sees a decidable bound.
+    /// Un-ignorable once the inline bound's own binder facts survive
+    /// `tree_of` — bounds.rs, outside this lane's scope.
 #[test]
 fn inline_generic_function_bound_is_honored() {
     let report = report_ops(
@@ -172,7 +178,12 @@ fn inline_generic_function_bound_is_honored() {
 /// the signature's `<U>`/`<V>` binders AND their written bounds before
 /// `fn_sig_subtype`'s `relateTypeParameters` equality leg runs — the
 /// unbounded/bounded pair reads count-only and never decides.
-#[ignore = "pooled Ty engine drops signature binders+bounds (alias_fn_sig params, type_params_named) — outside bounds.rs scope"]
+/// The judged bound's `U extends num` must reach `relateTypeParameters`
+/// as `num`, not `dynamic`: `Snapshot::tree_of`'s Function arm
+/// (bounds.rs) records every signature binder as `(name, None)`, so an
+/// unbounded `V` and a `num`-bounded `U` compare `dynamic`-to-`dynamic`
+/// and the mismatch accepts vacuously. Un-ignorable once `tree_of`
+/// carries the written bound — bounds.rs, outside this lane's scope.
 #[test]
 fn signature_bound_mismatch_rejects() {
     let report = report_ops(

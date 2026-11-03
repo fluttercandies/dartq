@@ -361,6 +361,44 @@ fn tree_any_head(tree: &TypeTree, pred: &dyn Fn(StringId) -> bool) -> bool {
     pred(tree.head) || tree.args.iter().any(|arg| tree_any_head(arg, pred))
 }
 
+/// Attaches a sealed function node's own signature variables to its
+/// quantifier columns (#3692). The parser parses a signature's `<...>`
+/// groups ahead of its formals (upstream Dart SDK source,
+/// pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart :627-636),
+/// and the diagnose-side sinks never receive the collector's per-variable
+/// pairing, so without the stitch every generic-function-type bound and
+/// clause (`T extends void Function<U extends B>()`) degraded to its
+/// binder-less shape (`void Function()`) and every face that reads the
+/// captured tree under-reported. A variable whose bound tree was never
+/// captured keeps the unbounded reading — the same semantics the sink's
+/// own mark-past-the-list pairing gives an unwritten bound; a node that
+/// already carries variables keeps them (the stitch never overwrites a
+/// richer fact).
+fn stitch_signature_variables(
+    sealed: Option<&mut TypeTree>,
+    windows: &[Vec<(StringId, Option<TypeTree>, bool)>],
+) {
+    if windows.is_empty() {
+        return;
+    }
+    let Some(node) = sealed else {
+        return;
+    };
+    let Some(function) = node.function.as_mut() else {
+        return;
+    };
+    if !function.type_params_named.is_empty() {
+        return;
+    }
+    let named: Vec<(StringId, Option<TypeTree>)> = windows
+        .iter()
+        .flatten()
+        .map(|(name, bound, _)| (*name, bound.clone()))
+        .collect();
+    function.type_params = u16::try_from(named.len()).unwrap_or(u16::MAX);
+    function.type_params_named = named;
+}
+
 /// Collects the indices of the `params` members a leaf head of `tree`
 /// names — the free type-parameter leaves
 /// [`Snapshot::grounded_bound_trees`]'s dependency graph reads. Named and
@@ -666,6 +704,29 @@ fn expand_alias(
                 .iter()
                 .map(|(var, _, _)| scope.get(var).copied())
                 .collect::<Option<Vec<_>>>()?;
+            // The RHS binders' declared bounds join the shared binder
+            // overlay (#3692): the subtype walk's bounded-quantification
+            // leg reads them by id at check time, and this path bypasses
+            // `map_function`'s recording — without the record every
+            // alias-expansion binder read `dynamic` and the correlate leg
+            // passed vacuously (`F <: void Function<U extends B>()` over
+            // `typedef F = void Function<T extends A>()`). A bound that
+            // fails to map keeps the vacuous reading (the under-report
+            // direction).
+            for ((var, bound, _), &id) in type_params.iter().zip(type_parameters.iter()) {
+                ctx.binder_names
+                    .borrow_mut()
+                    .entry(id)
+                    .or_insert_with(|| ctx.strings.resolve(*var).to_string());
+                let bound_ty = bound.as_ref().and_then(|tree| ctx.map_tree(tree, scope));
+                ctx.binder_facts.borrow_mut().set(
+                    id,
+                    ParamFacts {
+                        variance: Variance::Covariant,
+                        bound: bound_ty,
+                    },
+                );
+            }
             // An unwritten return type reads `dynamic` (`Function` bare).
             // A tree that fails to map defers the whole alias.
             let ret = match ret {
@@ -972,6 +1033,21 @@ pub(crate) struct Bounds<'a> {
     /// declarations cannot nest, so one slot serves; a container's
     /// `VarHeader`-equivalent overwrite path never coexists with it.
     alias: Option<AliasSink>,
+    /// A function signature's own `<...>` group windows, recorded at the
+    /// group's close while a function level was open (#3692). The
+    /// diagnose-side sinks never receive the collector's
+    /// `function_type_variable` pairing, so the variables ride here until
+    /// [`Self::end_function`] seals the signature's node and stitches them
+    /// into its own quantifier columns. FILO against `fn_sig_marks`.
+    sig_windows: Vec<Vec<(StringId, Option<TypeTree>, bool)>>,
+    /// The `sig_windows` length latched at each `begin_function` — the
+    /// slice above the matching mark is that function level's own
+    /// signature variables (the parser parses a signature's groups before
+    /// its formals, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart
+    /// :627-636, so every group of a level closes before the level
+    /// seals).
+    fn_sig_marks: Vec<usize>,
     /// The lazy `dartq_types` snapshot (interior-mutable so the
     /// `&self` compare faces — #2838's raw-type arm — can build it
     /// mid-parse; the rebuild-aware count keeps a later teardown build
@@ -1055,6 +1131,14 @@ impl<'a> Bounds<'a> {
             // enclosing group's in-flight capture resumes, and the
             // signature's bounds still answer `checkNamedType` — the
             // bound-annotation face reads them as an unclaimed window.
+            // The same window also rides the signature-variable side
+            // channel (#3692): the enclosing sink's open function level
+            // never learned these variables (the diagnose-side sinks
+            // receive no per-variable name events), so `end_function`'s
+            // stitch reads them back out of `sig_windows`.
+            if !window.is_empty() && !self.fn_sig_marks.is_empty() {
+                self.sig_windows.push(window.clone());
+            }
             self.index.param_windows.push(window);
             return;
         }
@@ -1332,6 +1416,12 @@ impl<'a> Bounds<'a> {
     /// open window routes — a bare function annotation outside the
     /// capture windows opens no site here, matching [`Self::leaf`].
     pub(crate) fn begin_function(&mut self) {
+        // The level's signature-variable mark (#3692): everything
+        // `sig_windows` records above this index belongs to the function
+        // level this call opens, and `end_function`'s matching pop
+        // stitches (or, where the sealed node is unreachable, drops)
+        // exactly that slice.
+        self.fn_sig_marks.push(self.sig_windows.len());
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.begin_function();
         } else if let Some(sink) = self.bound_sink.as_mut() {
@@ -1359,19 +1449,44 @@ impl<'a> Bounds<'a> {
     /// the same window [`Self::begin_function`] opened it (the cascade is
     /// static, and the parser pairs the two events).
     pub(crate) fn end_function(&mut self, nullable: bool, end: SourceRange) {
+        let mark = self.fn_sig_marks.pop().unwrap_or(0);
+        // The stitch's only live path is the bound window's own sink
+        // (`T extends void Function<U extends B>()`): signature groups
+        // record only while a declaration's `<...>` window is open, and
+        // no other sink is open then. Every other arm just drops the
+        // slice — a header clause's GFT argument (`class C extends G<void
+        // Function<U>>()`) folds its sealed node into the clause group's
+        // private level, and the alias RHS carries its signature
+        // variables itself (`alias_type_variables` → `rhs_vars`).
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.end_function(nullable, end);
+            self.sig_windows.truncate(mark);
         } else if let Some(sink) = self.bound_sink.as_mut() {
             sink.end_function(nullable, end);
+            if sink.stack.is_empty() {
+                let windows = self.sig_windows.split_off(mark);
+                stitch_signature_variables(sink.done.last_mut(), &windows);
+            } else {
+                // The sealed level folded into an open parent level the
+                // sink keeps private (a function-typed formal inside the
+                // bound) — its variables cannot reach their node from
+                // here, so they drop (the under-report direction, the
+                // same posture the unpatched capture had).
+                self.sig_windows.truncate(mark);
+            }
         } else if let Some(alias) = self.alias.as_mut()
             && alias.sink_fn_levels > 0
         {
             alias.sink.end_function(nullable, end);
             alias.sink_fn_levels -= 1;
+            self.sig_windows.truncate(mark);
         } else if let Some(site) = self.site.as_mut()
             && self.alias.is_none()
         {
             site.end_function(nullable, end);
+            self.sig_windows.truncate(mark);
+        } else {
+            self.sig_windows.truncate(mark);
         }
     }
 
@@ -3528,9 +3643,34 @@ impl<'a> Bounds<'a> {
                 .into_iter()
                 .map(|(param, bound, poisoned)| {
                     let judged = match &bound {
-                        Some(tree) if !poisoned => ctx
-                            .map_tree(tree, &scope)
-                            .and_then(|ty| snapshot.tree_of(ty)),
+                        Some(tree) if !poisoned => {
+                            let mapped = ctx.map_tree(tree, &scope);
+                            // #3750 — a bound whose expansion is function-
+                            // shaped rides `tree_of` back as a `FnTree`
+                            // (`exp1` → `T Function<T>(T)`), losing the
+                            // alias identity AND every binder's declared
+                            // bound (the projection writes `None` for each
+                            // signature variable). The engine's assignable
+                            // face unfolds alias heads itself — through
+                            // `alias_fn_sig`/`instantiated_alias_sig`,
+                            // which keep the RHS binders' bounds — so the
+                            // written spelling is the richer judged face:
+                            // `C1<exp1>` then compares `exp1 <: exp1`
+                            // (identical unfold, silent like the oracle)
+                            // instead of `exp1 <: T Function<T>(T)` (a
+                            // fabricated self-pair rejection).
+                            let keeps_alias = mapped.is_some_and(|ty| {
+                                matches!(snapshot.table.get(ty).kind(), TypeKind::Function { .. })
+                                    && tree_any_head(tree, &|head| {
+                                        self.index.aliases.contains_key(&head)
+                                    })
+                            });
+                            if keeps_alias {
+                                bound.clone()
+                            } else {
+                                mapped.and_then(|ty| snapshot.tree_of(ty))
+                            }
+                        }
                         _ => None,
                     };
                     (param, judged.or(bound), poisoned)
@@ -4998,8 +5138,24 @@ impl<'a> Snapshot<'a> {
                 let mut text = format!("{} Function", self.display(sig.return_type));
                 let type_parameters = self.table.function_type_parameters(sig.type_parameters);
                 if !type_parameters.is_empty() {
-                    let names: Vec<String> =
-                        type_parameters.iter().map(|&id| self.param_text(id)).collect();
+                    // A binder's declared bound renders beside its name
+                    // (`void Function<U extends B>()`) — the official
+                    // display writes each type parameter through
+                    // `writeTypeParameterElement` (`' extends '` + the
+                    // bound's own display, display_string_builder.dart
+                    // :330-343); a binder with no modelable bound keeps
+                    // its bare name (the under-report direction).
+                    let binder_facts = self.binder_facts.borrow();
+                    let names: Vec<String> = type_parameters
+                        .iter()
+                        .map(|&id| match binder_facts.get(id).bound {
+                            Some(bound) => {
+                                format!("{} extends {}", self.param_text(id), self.display(bound))
+                            }
+                            None => self.param_text(id),
+                        })
+                        .collect();
+                    drop(binder_facts);
                     text.push_str(&format!("<{}>", names.join(", ")));
                 }
                 let mut formals: Vec<String> = (0..sig.positional.len())
@@ -5155,10 +5311,34 @@ impl<'a> Snapshot<'a> {
                 None => render_leaf("dynamic", false),
             };
             let mut text = format!("{ret} Function");
+            // Each binder renders `name` or `name extends <written bound>`
+            // — the official `_writeTypeParameters` writes the bound beside
+            // its parameter (display_string_builder.dart:330-343, :498-509),
+            // so a written `void Function<V extends String>()` argument
+            // keeps its quantifier's bound in the message (the oracle's
+            // `'Never Function<V extends String>()'` row). A bound tree
+            // that cannot render (the shared `Option` discipline) leaves
+            // the bare name.
             let type_parameters: Vec<String> = function
                 .type_params_named
                 .iter()
-                .map(|(name, _)| self.strings.resolve(*name).to_string())
+                .map(|(name, bound)| match bound {
+                    Some(bound) => {
+                        let rendered = self.display_written_argument(
+                            bound,
+                            Variance::Covariant,
+                            false,
+                            scope,
+                        );
+                        match rendered {
+                            Some(bound_text) => {
+                                format!("{} extends {}", self.strings.resolve(*name), bound_text)
+                            }
+                            None => self.strings.resolve(*name).to_string(),
+                        }
+                    }
+                    None => self.strings.resolve(*name).to_string(),
+                })
                 .collect();
             if !type_parameters.is_empty() {
                 text.push_str(&format!("<{}>", type_parameters.join(", ")));
@@ -5495,6 +5675,22 @@ impl<'a> Snapshot<'a> {
     /// same reading the capture takes). A kind the written world cannot
     /// spell (a record default or the error sentinel) answers `None`: the
     /// caller keeps the silence.
+    /// A signature binder's declared bound as a tree — the fact face
+    /// [`Self::merged_facts`] would answer, read without cloning the
+    /// whole table: the shared GFT-binder overlay owns the ids
+    /// `map_function` allocated (they key `binder_names`), every other
+    /// parameter reads the declaration facts. `None` — no bound, or one
+    /// the table cannot render — keeps the vacuous reading
+    /// (`relateTypeParameters`' bound-less pair).
+    fn signature_binder_bound(&self, id: TypeParamId) -> Option<TypeTree> {
+        let bound = if self.binder_names.borrow().contains_key(&id) {
+            self.binder_facts.borrow().get(id).bound
+        } else {
+            self.facts.get(id).bound
+        };
+        bound.and_then(|ty| self.tree_of(ty))
+    }
+
     fn tree_of(&self, ty: TypeId) -> Option<TypeTree> {
         let range = SourceRange {
             offset: 0,
@@ -5538,7 +5734,16 @@ impl<'a> Snapshot<'a> {
                     if text.is_empty() {
                         return None;
                     }
-                    type_params_named.push((self.strings.intern(&text), None));
+                    // Each binder's declared bound rides the projection
+                    // (#3692): writing `None` unconditionally collapsed
+                    // every signature to `void Function<U>()`-with-no-
+                    // bounds, and the judged leg of the annotation faces
+                    // (`expanded_params` → `tree_ty`) then correlated the
+                    // written binders against bound-less ones — the
+                    // vacuous `relateTypeParameters` pass, the under-report
+                    // the oracle's row exposed.
+                    let bound = self.signature_binder_bound(id);
+                    type_params_named.push((self.strings.intern(&text), bound));
                 }
                 let mut positional = Vec::with_capacity(sig.positional.len());
                 for index in 0..sig.positional.len() {
@@ -5945,6 +6150,107 @@ mod tests {
         // still checks it through the instantiate-to-bounds face.
         let bare_issues = bounds.check_site(&strings, f, &[TypeTree::leaf(a, false, range(60, 1))], &[], range(58, 5));
         assert!(bare_issues.is_empty());
+    }
+
+    /// #3692 — a generic-function-type BOUND keeps its signature's own
+    /// variables: the `<U extends B>` group inside `class C<X extends
+    /// void Function<U extends B>()>` closes while the bound window's
+    /// function level is open, and the stitch at `end_function` arms the
+    /// sealed node's quantifier columns. Pre-stitch the bound degraded to
+    /// `void Function()` — the correlate leg read both binders unbounded
+    /// and every GFT-bound face under-reported.
+    #[test]
+    fn gft_bound_keeps_signature_type_variables() {
+        let strings = StringTable::new();
+        let b = strings.intern("B");
+        let c = strings.intern("C");
+        let x = strings.intern("X");
+        let u = strings.intern("U");
+        let void_id = strings.intern("void");
+        let mut bounds = Bounds::new();
+        // `class C<X extends void Function<U extends B>()> {}`
+        bounds.begin_type_variables();
+        bounds.begin_function();
+        bounds.leaf(void_id, false, range(20, 4));
+        // The signature's own `<U extends B>` group.
+        bounds.begin_type_variables();
+        bounds.leaf(b, false, range(41, 1));
+        bounds.end_type_variable(u, true);
+        bounds.end_type_variables();
+        bounds.function_formals_begin();
+        bounds.end_function(false, range(51, 1));
+        bounds.end_type_variable(x, true);
+        bounds.end_type_variables();
+        bounds.note_container(Some(c), 6, 54, false, false);
+        let capture = bounds.index.containers.get(&c).expect("C captured");
+        let (tree, poisoned) = &capture.bounds[0];
+        assert!(!*poisoned, "the stitched bound is not recovery residue");
+        let function = tree
+            .as_ref()
+            .expect("the bound tree sealed")
+            .function
+            .as_ref()
+            .expect("the bound is a function type");
+        assert_eq!(function.type_params, 1);
+        assert_eq!(function.type_params_named.len(), 1);
+        assert_eq!(strings.resolve(function.type_params_named[0].0), "U");
+        assert!(
+            function.type_params_named[0].1.is_some(),
+            "U's written bound tree rides the sealed node"
+        );
+    }
+
+    /// The nested-typed-formal boundary: a function-typed FORMAL inside a
+    /// GFT bound seals into the parent level's private columns — its own
+    /// `<V>` group drops (the under-report direction), never fabricating a
+    /// binder on the PARENT signature (`void Function<U>(int Function<V>()
+    /// x)` keeps exactly one binder, `U`).
+    #[test]
+    fn gft_bound_nested_formal_drops_own_variables_not_parents() {
+        let strings = StringTable::new();
+        let c = strings.intern("C");
+        let x = strings.intern("X");
+        let u = strings.intern("U");
+        let v = strings.intern("V");
+        let int = strings.intern("int");
+        let void_id = strings.intern("void");
+        let mut bounds = Bounds::new();
+        // `class C<X extends void Function<U>(int Function<V>(int) x)> {}`
+        bounds.begin_type_variables();
+        bounds.begin_function();
+        bounds.leaf(void_id, false, range(20, 4));
+        bounds.begin_type_variables();
+        bounds.end_type_variable(u, false);
+        bounds.end_type_variables();
+        bounds.function_formals_begin();
+        // The function-typed formal: its own level, its own `<V>` group.
+        bounds.begin_function();
+        bounds.begin_type_variables();
+        bounds.end_type_variable(v, false);
+        bounds.end_type_variables();
+        bounds.function_formals_begin();
+        bounds.leaf(int, false, range(48, 3));
+        bounds.function_formal_end(false, None);
+        bounds.end_function(false, range(52, 1));
+        bounds.function_formal_end(false, None);
+        bounds.end_function(false, range(54, 1));
+        bounds.end_type_variable(x, true);
+        bounds.end_type_variables();
+        bounds.note_container(Some(c), 6, 58, false, false);
+        let capture = bounds.index.containers.get(&c).expect("C captured");
+        let function = capture.bounds[0]
+            .0
+            .as_ref()
+            .expect("the bound tree sealed")
+            .function
+            .as_ref()
+            .expect("the bound is a function type");
+        assert_eq!(
+            function.type_params_named.len(),
+            1,
+            "the formal's dropped `<V>` never lands on the parent signature"
+        );
+        assert_eq!(strings.resolve(function.type_params_named[0].0), "U");
     }
 }
 

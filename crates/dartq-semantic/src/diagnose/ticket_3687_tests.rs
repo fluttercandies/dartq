@@ -187,10 +187,11 @@ fn non_this_private_function_field_call_promotes() {
 }
 
 /// Genuine-error control: the same function-typed field invoked with **no**
-/// guard still reports — at the callee's member token.
+/// guard still reports — the function variant anchors on the whole callee
+/// expression (`c._foo`), receiver through selector.
 ///
 /// Oracle (probe 3.13.7: `c._foo()` outside a guard is the function
-/// variant of the shared code).
+/// variant of the shared code, anchored on `c._foo`).
 #[test]
 fn non_this_private_function_field_unguarded_reports() {
     let body = "class C {\n  final void Function()? _foo;\n  C(this._foo);\n}\n\
@@ -198,9 +199,8 @@ fn non_this_private_function_field_unguarded_reports() {
     let report = report_ops(body);
     assert_eq!(
         single_unchecked_offset(&report),
-        offset_of(&format!("{CORE_PRELUDE}{body}"), "c._foo();")
-            + u32::try_from("c.".len()).unwrap(),
-        "the unguarded callee row anchors on the member token: {:#?}",
+        offset_of(&format!("{CORE_PRELUDE}{body}"), "c._foo();"),
+        "the unguarded callee row anchors on the callee expression: {:#?}",
         rows(&report)
     );
 }

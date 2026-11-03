@@ -118,16 +118,32 @@ fn ticket_3164_logical_operators_check_both_operands() {
     );
 }
 
-/// Non-logical binaries never check the RIGHT operand — `1 + v()` is the
-/// resolver's assignability question (error_verifier.dart:471-472's
-/// `// Assignability checking is done by the resolver.` arm), not a void
-/// use, and reports nothing here.
+/// Non-logical binaries DO check the RIGHT operand — `1 + v()` reports
+/// `use_of_void_result` on the void-valued operand, exactly like the
+/// logical `&&`/`||` forms and the `==`/`!=` operator invocation.
+///
+/// Oracle 3.13.7 (`dart analyze --format machine`), one file containing
+/// `flag && v();`, `1 + v();` and `3 == v();`:
+/// ```
+/// ERROR|COMPILE_TIME_ERROR|USE_OF_VOID_RESULT|...|4|11|1|This expression has a type of 'void' so its value can't be used.
+/// ERROR|COMPILE_TIME_ERROR|USE_OF_VOID_RESULT|...|5|7|1|...
+/// ERROR|COMPILE_TIME_ERROR|USE_OF_VOID_RESULT|...|6|8|1|...
+/// ```
+/// Three rows, one per statement — the non-logical `+` fires at col 7 on
+/// the `v` of `1 + v()`, i.e. the operand's own use-site span.
+///
+/// This pin previously asserted silence, on the theory that the resolver
+/// owns the assignability question for non-logical binaries. The oracle
+/// refutes that for a `void` operand: the void-use check runs first and
+/// answers, so the row is owed. Renamed from `..._stays_silent` to match
+/// what it now asserts.
 #[test]
-fn ticket_3164_binary_right_non_logical_stays_silent() {
+fn ticket_3164_binary_right_non_logical_reports_void_use() {
     let report = report_ops("void v() {}\nvoid main() {\n  1 + v();\n}");
+    let codes = code_names(&report);
     assert!(
-        !code_names(&report).iter().any(|name| *name == "use_of_void_result"),
-        "{:?}",
+        codes.iter().any(|name| *name == "use_of_void_result"),
+        "the void operand of `1 + v()` owes a use_of_void_result row; got {:?}",
         rows(&report)
     );
 }

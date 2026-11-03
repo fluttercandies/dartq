@@ -10265,7 +10265,30 @@ impl<'a> Engine<'a> {
                 })
             })
             .or_else(|| self.written_creation_args(class, class_offset));
-        let map: Vec<(StringId, Ty)> = match (written, self.bounds.container_params(class)) {
+        // The inferred instantiation (`resolveArgumentsToParameters` pairs
+        // each argument against the formal's INSTANTIATED type): no written
+        // group means the send's own solve decides — the downward context
+        // pins (`A<int, String> a = new A.named('s', 1)` checks `'s'`
+        // against `int`), the argument constraints fill the open slots.
+        // `creation_call_site_ty` reads the selector as the head — its
+        // `creation_class_before` arm recovers the class segment — and
+        // returns `None` over a written group, so the written face below
+        // stays the last fallback. `creation_row_ty` re-reads the fold's
+        // published instantiation for the non-keyword spelling whose send
+        // already solved.
+        let instantiation = self
+            .creation_call_site_ty(Some(level), Some((selector, selector_range)))
+            .or_else(|| self.creation_row_ty(class, false, class_offset))
+            .and_then(|ty| match ty {
+                Ty::Named { name, args, .. }
+                    if name == class && args != ArgListId::EMPTY =>
+                {
+                    Some(self.boundary.args.borrow().get(args).to_vec())
+                }
+                _ => None,
+            })
+            .or(written);
+        let map: Vec<(StringId, Ty)> = match (instantiation, self.bounds.container_params(class)) {
             (Some(args), Some(params)) if params.len() == args.len() => params
                 .iter()
                 .map(|(param, _, _)| *param)
@@ -10299,6 +10322,21 @@ impl<'a> Engine<'a> {
     }
 
     /// The explicit super-constructor invocation's argument faces
+    /// (`constructor_invocation_resolver.dart` resolves the
+    /// `SuperConstructorInvocation`, then `resolveArgumentsToParameters`
+    /// pairs the arguments): the resolved super constructor's formals
+    /// decide the count faces (`extra_positional_arguments[_could_be_named]`
+    /// / `not_enough_positional_arguments`) and the per-argument
+    /// assignability face at the argument's own span. The named-coverage
+    /// face splits by geometry: the bare callee-row shape's label misses
+    /// belong to `Walk::check_named_argument` (it reads the same row at
+    /// label time — `bare && super_container.is_some()` suppresses the
+    /// emit here), every selector shape and every empty-table face
+    /// (unresolved superclass, no `extends`) reports at this walk. An
+    /// unresolvable superclass or selector keeps the under-report posture
+    /// (the selector existence face, `undefined_constructor_in_initializer`,
+    /// reports separately at the list's close). `super.new(...)` selects
+    /// the unnamed face, the same filter the super-formal drain applies.
     /// (`constructor_invocation_resolver.dart` resolves the
     /// `SuperConstructorInvocation`, then `resolveArgumentsToParameters`
     /// pairs the arguments): the resolved super constructor's formals

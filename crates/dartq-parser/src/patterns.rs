@@ -572,6 +572,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
         self.cursor.advance(); // `[`
         let mut count = 0usize;
+        // List-pattern element expressions run with function literals
+        // re-enabled (official `parseListPatternSuffix` :11983-11984).
+        let saved_function_expressions = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let end;
         loop {
             if self.is_bailed() {
@@ -631,6 +635,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
             }
         }
+        self.may_parse_function_expressions = saved_function_expressions;
         self.listener.handle_list_pattern(count, begin, end);
         end
     }
@@ -649,6 +654,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let left = self.peek_span();
         self.cursor.advance();
         let mut count = 0usize;
+        // Map-pattern key/value expressions run with function literals
+        // re-enabled (official `parseMapPatternSuffix` :12063-12064).
+        let saved_function_expressions = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let end;
         let mut stale_next = self.peek_id();
         loop {
@@ -737,6 +746,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
             }
         }
+        self.may_parse_function_expressions = saved_function_expressions;
         self.listener.handle_map_pattern(count, left, end);
         end
     }
@@ -749,6 +759,11 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let mut count = 0usize;
         let mut was_record = false;
         let mut was_valid_record = false;
+        // Parenthesized/record-pattern sub-expressions run with function
+        // literals re-enabled (official
+        // `parseParenthesizedPatternOrRecordPattern` :12149-12150).
+        let saved_function_expressions = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let end;
         loop {
             let kind = self.peek_kind();
@@ -808,6 +823,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 break;
             }
         }
+        self.may_parse_function_expressions = saved_function_expressions;
         if was_record {
             if count == 1 && !was_valid_record {
                 self.report(msg::record_literal_one_positional_no_trailing_comma(), end);
@@ -824,6 +840,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let begin = self.peek_span();
         self.cursor.advance();
         let mut argument_count = 0usize;
+        // Object-pattern field expressions run with function literals
+        // re-enabled (official `parseObjectPatternRest` :12227-12228): a
+        // switch-expression case pattern otherwise parses with the flag
+        // cleared, and `Foo(bar: == () => 0)` would strand the `=> 0` body as
+        // a spurious `expected_token ')'`.
+        let saved_function_expressions = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
         let end;
         loop {
             if self.is_bailed() {
@@ -900,6 +923,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
             }
         }
+        self.may_parse_function_expressions = saved_function_expressions;
         self.listener
             .handle_object_pattern_fields(argument_count, begin, end);
         end

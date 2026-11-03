@@ -2822,8 +2822,16 @@ pub fn fold_unit_with_ops<'t>(
     // IS the oracle's constant verdict — where the flow's own fold cannot
     // reach it (typedef operand, catch parameter, `this`-property), the
     // dead arm's `dead_code` row still owes. The walk decides from the
-    // row's own message polarity and the token table alone.
-    let dead_arms = synthesize_verdict_dead_branches(&report.diagnostics, tokens, file);
+    // row's own message polarity and the token table alone. The sound-flow
+    // posture gates the whole synthesis: the oracle's dead-code report
+    // here rides the flow engine (`// @dart = 3.8` keeps the verdict row
+    // but emits NO `dead_code` — sound-only folds stand down), so a
+    // pre-3.9 unit synthesizes nothing.
+    let dead_arms = if features.sound_flow_analysis {
+        synthesize_verdict_dead_branches(&report.diagnostics, tokens, file)
+    } else {
+        Vec::new()
+    };
     report.diagnostics = merge_source_ordered(report.diagnostics, dead_arms);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).

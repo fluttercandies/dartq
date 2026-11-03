@@ -2162,6 +2162,45 @@ pub enum SemanticCode {
     /// shape enum picks the plain vs with-reason text; both print the
     /// shared `missing_required_param` name).
     MissingRequiredParam(MissingRequiredParamShape),
+    // —— #3768: the private-named-parameter and colon-default faces (the
+    //    listener emits these; every text is pinned verbatim against the
+    //    3.13.7 registry, `data/syntax-codes.tsv` / `data/analyzer-codes.tsv`,
+    //    and `tools/experimental_features.yaml`'s
+    //    `private-named-parameters`, `enabledIn: '3.12.0'`)
+    //    ————————————————————————————————————————————————————————————
+    /// `Named parameters can't start with an underscore.` — a named
+    /// parameter whose name starts with `_` while the
+    /// private-named-parameters feature is off and the parameter is not a
+    /// field formal, at the parameter's name token (SYNTACTIC_ERROR,
+    /// analyzer-codes.tsv).
+    PrivateOptionalParameter,
+    /// `This requires the 'private-named-parameters' language feature to be
+    /// enabled.` — a private *field* formal named parameter before 3.12, at
+    /// the parameter's name token. The syntax-tier registry template
+    /// (`data/syntax-codes.tsv`) parameterizes the feature flag (`{0}`);
+    /// this gate's flag is fixed, so the row renders filled.
+    ExperimentNotEnabled,
+    /// `Named parameters that don't refer to instance variables can't start
+    /// with underscore.` — a non-field named parameter starting with `_`
+    /// under the enabled feature, at the name token (SYNTACTIC_ERROR,
+    /// analyzer-codes.tsv).
+    PrivateNamedNonFieldParameter,
+    /// `A private named parameter must be a public identifier after removing
+    /// the leading underscore.` — the private name has no public spelling
+    /// after the strip, at the name token (COMPILE_TIME_ERROR,
+    /// analyzer-codes.tsv).
+    PrivateNamedParameterWithoutPublicName,
+    /// `The corresponding public name '{0}' is already the name of another
+    /// parameter.` — two private parameters strip to the same public name,
+    /// at the later name token (COMPILE_TIME_ERROR, analyzer-codes.tsv).
+    PrivateNamedParameterDuplicatePublicName,
+    /// `Using a colon as the separator before a default value is deprecated
+    /// and will not be supported in language version 3.0 and later.` — a
+    /// `x: default` optional parameter under a 2.x language version, at the
+    /// colon (HINT, analyzer-codes.tsv; `_checkForColonDefaultValue` picks
+    /// this row for `languageVersion.major < 3`, else
+    /// `obsolete_colon_for_default_value`).
+    DeprecatedColonForDefaultValue,
 }
 
 /// The message shape of [`SemanticCode::MissingRequiredParam`]: the
@@ -3477,6 +3516,28 @@ impl SemanticCode {
             Self::MissingRequiredParam(_) => {
                 ("missing_required_param", "MISSING_REQUIRED_PARAM")
             }
+            // The #3768 private-named-parameter and colon-default rows.
+            Self::PrivateOptionalParameter => (
+                "private_optional_parameter",
+                "PRIVATE_OPTIONAL_PARAMETER",
+            ),
+            Self::ExperimentNotEnabled => ("experiment_not_enabled", "EXPERIMENT_NOT_ENABLED"),
+            Self::PrivateNamedNonFieldParameter => (
+                "private_named_non_field_parameter",
+                "PRIVATE_NAMED_NON_FIELD_PARAMETER",
+            ),
+            Self::PrivateNamedParameterWithoutPublicName => (
+                "private_named_parameter_without_public_name",
+                "PRIVATE_NAMED_PARAMETER_WITHOUT_PUBLIC_NAME",
+            ),
+            Self::PrivateNamedParameterDuplicatePublicName => (
+                "private_named_parameter_duplicate_public_name",
+                "PRIVATE_NAMED_PARAMETER_DUPLICATE_PUBLIC_NAME",
+            ),
+            Self::DeprecatedColonForDefaultValue => (
+                "deprecated_colon_for_default_value",
+                "DEPRECATED_COLON_FOR_DEFAULT_VALUE",
+            ),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -3523,6 +3584,9 @@ impl SemanticCode {
                 | Self::AugmentsConstantVariable
                 | Self::ConstantVariableAugmentation
                 | Self::DefaultValueAlreadySpecifiedInAugmentationChain
+                // The #3768 syntax-tier gate row carries none either
+                // (syntax-codes.tsv, hasPublishedDocs: false).
+                | Self::ExperimentNotEnabled
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -3549,7 +3613,13 @@ impl SemanticCode {
             // upstream (`DiagnosticType.SYNTACTIC_ERROR`,
             // diagnostic.g.dart:6194-6203 / :14963-14971).
             | Self::RepresentationFieldTrailingComma
-            | Self::FactoryWithoutBody => DiagnosticType::SyntacticError,
+            | Self::FactoryWithoutBody
+            // The #3768 private-named-parameter family is syntax-tier
+            // upstream (`ParserErrorCode`, SYNTACTIC_ERROR,
+            // analyzer-codes.tsv) except the two compile-time rows.
+            | Self::PrivateOptionalParameter
+            | Self::ExperimentNotEnabled
+            | Self::PrivateNamedNonFieldParameter => DiagnosticType::SyntacticError,
             Self::InvalidNullAwareOperator
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
@@ -3652,7 +3722,9 @@ impl SemanticCode {
             | Self::UnnecessarySetLiteral
             | Self::UnnecessaryFinal
             | Self::MissingRequiredParam(_) => DiagnosticType::StaticWarning,
-            Self::UnnecessaryImport => DiagnosticType::Hint,
+            // The #3768 2.x colon-default row is the hint-tier partner of
+            // `obsolete_colon_for_default_value` (analyzer-codes.tsv, HINT).
+            Self::UnnecessaryImport | Self::DeprecatedColonForDefaultValue => DiagnosticType::Hint,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -5021,6 +5093,33 @@ impl SemanticCode {
             Self::MissingRequiredParam(MissingRequiredParamShape::WithDetails) => {
                 format!("The parameter '{a0}' is required. {a1}.")
             }
+            // The #3768 private-named-parameter faces (analyzer-codes.tsv,
+            // the 3.12 feature rows): the three syntactic texts take no
+            // arguments; the duplicate row's `{0}` is the conflicting
+            // public name, and the experiment row's `{0}` is the feature
+            // flag, fixed by this gate's single caller.
+            Self::PrivateOptionalParameter => {
+                "Named parameters can't start with an underscore.".to_string()
+            }
+            Self::PrivateNamedNonFieldParameter => {
+                "Named parameters that don't refer to instance variables can't start with underscore."
+                    .to_string()
+            }
+            Self::PrivateNamedParameterWithoutPublicName => {
+                "A private named parameter must be a public identifier after removing the leading underscore."
+                    .to_string()
+            }
+            Self::PrivateNamedParameterDuplicatePublicName => format!(
+                "The corresponding public name '{a0}' is already the name of another parameter."
+            ),
+            Self::ExperimentNotEnabled => {
+                "This requires the 'private-named-parameters' language feature to be enabled."
+                    .to_string()
+            }
+            Self::DeprecatedColonForDefaultValue => {
+                "Using a colon as the separator before a default value is deprecated and will not be supported in language version 3.0 and later."
+                    .to_string()
+            }
         }
     }
 
@@ -5900,6 +5999,20 @@ impl SemanticCode {
             }
             Self::DuplicateRestElementInPattern => {
                 Some("Try removing the duplicate rest element.".to_string())
+            }
+            // The #3768 rows' verbatim oracle correctionMessages
+            // (analyzer-codes.tsv / syntax-codes.tsv); the other four rows
+            // of the family declare none. The experiment row's `{1}` SDK
+            // floor is the feature's `enabledIn: '3.12.0'`.
+            Self::PrivateNamedParameterDuplicatePublicName => {
+                Some("Try renaming one of the parameters.".to_string())
+            }
+            Self::ExperimentNotEnabled => Some(
+                "Try updating your pubspec.yaml to set the minimum SDK constraint to 3.12.0 or higher, and running 'pub get'."
+                    .to_string(),
+            ),
+            Self::DeprecatedColonForDefaultValue => {
+                Some("Try replacing the colon with an equal sign.".to_string())
             }
             _ => None,
         }
@@ -7015,6 +7128,10 @@ mod tests {
         "expected_representation_type",
         "representation_field_trailing_comma",
         "factory_without_body",
+        // The #3768 gate row is a syntax-tier registry row
+        // (syntax-codes.tsv); its message renders filled from the local arm
+        // (the template's `{0}` is this gate's fixed feature flag).
+        "experiment_not_enabled",
     ];
 
     /// The exhaustive enum walk: one arm per `SemanticCode` variant, no
@@ -7449,6 +7566,16 @@ mod tests {
             | SemanticCode::DuplicatePatternAssignmentVariable
             | SemanticCode::DuplicateRestElementInPattern
             | SemanticCode::ExpectedOneListPatternTypeArguments
+            // The #3768 private-named-parameter and colon-default faces: five
+            // rows carry their inline `message` arms (no `registry_message`
+            // call site); the experiment row is the syntax-tier
+            // `REGISTRY_BACKED` row whose text renders filled.
+            | SemanticCode::PrivateOptionalParameter
+            | SemanticCode::ExperimentNotEnabled
+            | SemanticCode::PrivateNamedNonFieldParameter
+            | SemanticCode::PrivateNamedParameterWithoutPublicName
+            | SemanticCode::PrivateNamedParameterDuplicatePublicName
+            | SemanticCode::DeprecatedColonForDefaultValue
             | SemanticCode::AbstractSuperMemberReference(_)
             => code.code_info(),
         }
@@ -7800,6 +7927,13 @@ mod tests {
             SemanticCode::DuplicatePatternAssignmentVariable,
             SemanticCode::DuplicateRestElementInPattern,
             SemanticCode::ExpectedOneListPatternTypeArguments,
+            // The #3768 private-named-parameter and colon-default faces.
+            SemanticCode::PrivateOptionalParameter,
+            SemanticCode::ExperimentNotEnabled,
+            SemanticCode::PrivateNamedNonFieldParameter,
+            SemanticCode::PrivateNamedParameterWithoutPublicName,
+            SemanticCode::PrivateNamedParameterDuplicatePublicName,
+            SemanticCode::DeprecatedColonForDefaultValue,
         ]
     }
 

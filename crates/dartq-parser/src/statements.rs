@@ -1392,7 +1392,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // drops the for-in dispatch entirely (the junk then falls to
                 // the C-style `parseForRest` and mints `expected ';'` +
                 // `unexpected <junk>` cascades the oracle never carries).
-                let at = self.peek_span();
+                // The report anchors on `next`, the first non-zero-length
+                // token — upstream's `token.next` walks past the zero-width
+                // synthetics the initializer recovery queued at the same
+                // offset (`findNonZeroLengthToken`, util.dart:56).
+                let mut n = 0usize;
+                let mut at = self.look_span_at(n);
+                while at.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
+                    n += 1;
+                    at = self.look_span_at(n);
+                }
                 self.report(msg::expected_but_got("in"), at);
                 let _ = self.synthetic(TokenKind::Keyword(Keyword::In), at.range.offset);
             }
@@ -1524,8 +1533,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // resolver (pseudo-shared `asyncForInWrongContext`): events only.
         if let Some((identifier, identifier_pos)) = identifier {
             if !is_identifier(self.cursor.resolve(identifier.id).0) {
-                let at = identifier;
-                self.report(msg::missing_identifier(), at);
+                // A scanner-parked synthetic closer (the `)` of the
+                // unclosed `(` group in `await for ( }`) is zero-width;
+                // upstream reports the row at that token with the
+                // synthetic's lexeme length (1), so the row dedups with
+                // the expression recovery's own `missing_identifier`.
+                // `report_missing_identifier` borrows the first
+                // non-zero-length look-ahead — the same shape.
+                self.report_missing_identifier(identifier);
             } else if self.cursor.real_pos() > identifier_pos + 1 {
                 // The head consumed more than the lone identifier.
                 let follower = self.kind_at(identifier_pos + 1);

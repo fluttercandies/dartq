@@ -192,7 +192,9 @@ impl Engine<'_> {
         if args != crate::model::ArgListId::EMPTY {
             return ty;
         }
-        if let Some(defaults) = self.bounds.itb_default_args(self.strings, name) {
+        if let Some(defaults) = self.bounds.itb_default_args(self.strings, name)
+            && !defaults.is_empty()
+        {
             let filled: Vec<Ty> = defaults.iter().map(|tree| self.tree_ty(tree)).collect();
             return self
                 .boundary

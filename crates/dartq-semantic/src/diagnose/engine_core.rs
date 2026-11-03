@@ -720,13 +720,111 @@ impl<'a> Engine<'a> {
     /// Declared-method sends, bare reads, and every other operand keep the
     /// row's own span. A declared-method send must NOT take the
     /// property-access widening: `x.m()` anchors `m`, never `x.m`.
+    ///
+    /// One last widening precedes every shape's answer: an operand row
+    /// anchored at a closing `)` is the fold's face of a
+    /// ParenthesizedExpression (the listener pushes the `)` token as the
+    /// group's row). The oracle's `.at(expression)` covers the parens —
+    /// `(x)` reports `(x)`, `((x))` reports `((x))` — so the resolved span
+    /// grows back to each matching `(` ([`Self::junction_operand`]'s
+    /// parenthesized-operand walk, minus its operator probe).
     pub(crate) fn use_site_range(&self, operand: &Row) -> SourceRange {
-        if matches!(operand.intent, Intent::Invoke) {
+        let range = if matches!(operand.intent, Intent::Invoke) {
             self.value_send_span(operand).unwrap_or(operand.range)
         } else {
             self.property_access_span(operand.range)
                 .unwrap_or(operand.range)
+        };
+        let mut range = self.enclosing_paren_span(range);
+        // The caller may hand in a leaf row nested inside a
+        // ParenthesizedExpression's `)`-anchored group row — a `?:` arm or
+        // a bare read the seam picked instead of the group's own face
+        // (`(true ? x : x) is T` reads the arm `x` where the oracle's
+        // operand is the whole group). While the resolved span's tail sits
+        // exactly where a `)`-anchored GROUP row begins, the operand's
+        // expression face is that group: expand through its matching `(`
+        // and repeat (`((x))` walks out one pair at a time). A call's
+        // closing `)` carries no group row — only `end_parenthesized
+        // _expression` pushes one — so an argument leaf like the `x` of
+        // `f(x)` never expands.
+        loop {
+            let has_group_row = self.rows.iter().any(|row| {
+                row.range.offset == range.end()
+                    && row.range.length == 1
+                    && self
+                        .tokens
+                        .as_slice()
+                        .iter()
+                        .any(|t| {
+                            t.utf16_offset == row.range.offset
+                                && matches!(t.kind, dartq_scanner::TokenKind::CloseParen)
+                        })
+            });
+            if !has_group_row {
+                return range;
+            }
+            range = self.enclosing_paren_span(SourceRange {
+                offset: range.end(),
+                length: 1,
+            });
+            if range.length == 1 {
+                // The `)` matched nothing (unbalanced recovery shape) —
+                // the expanded span still sits on the same `)`, so any
+                // further pass can only repeat it. Keep the leaf's span.
+                return range;
+            }
+            // `enclosing_paren_span` grew the span to the `(`..`)` pair;
+            // a still-deeper group may follow (`((x))`'s outer `)` row).
+            if self
+                .tokens
+                .as_slice()
+                .iter()
+                .find(|t| t.utf16_offset == range.end() && t.byte_len == 1)
+                .is_none()
+            {
+                return range;
+            }
         }
+    }
+
+    /// The span's enclosing-paren expansion for a `)`-anchored row: while
+    /// the resolved span sits exactly on a `)` token, grow it to cover the
+    /// matching `(` (and repeat — `((x))` walks out one pair at a time).
+    /// Any other anchor returns unchanged.
+    fn enclosing_paren_span(&self, mut range: SourceRange) -> SourceRange {
+        let tokens = self.tokens.as_slice();
+        while let Some(index) = tokens
+            .iter()
+            .position(|t| t.utf16_offset == range.offset && t.byte_len == range.length)
+            .filter(|index| {
+                matches!(
+                    tokens[*index].kind,
+                    dartq_scanner::TokenKind::CloseParen
+                )
+            })
+        {
+            let mut depth = 1u32;
+            let mut open = None;
+            for back in (0..index).rev() {
+                match tokens[back].kind {
+                    dartq_scanner::TokenKind::CloseParen => depth += 1,
+                    dartq_scanner::TokenKind::OpenParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(back);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(open) = open else { break };
+            range = SourceRange {
+                offset: tokens[open].utf16_offset,
+                length: range.end() - tokens[open].utf16_offset,
+            };
+        }
+        range
     }
 
     /// The `name: operand` span when the two tokens directly before
@@ -766,36 +864,7 @@ impl<'a> Engine<'a> {
         if !matches!(operand.intent, Intent::Invoke) {
             return None;
         }
-        let value_callee = match &operand.shape {
-            RowShape::Member { recv } => {
-                let type_name = match recv {
-                    Receiver::Typed { type_name, .. }
-                    | Receiver::This {
-                        container: type_name,
-                        ..
-                    }
-                    | Receiver::Super {
-                        container: type_name,
-                        ..
-                    } => *type_name,
-                    _ => return None,
-                };
-                matches!(
-                    self.walk_members(type_name, operand.name),
-                    Walk::Found(entry)
-                        if matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
-                )
-            }
-            _ => {
-                self.fn_var_sigs.contains_key(&operand.name)
-                    || (self
-                        .frames
-                        .iter()
-                        .any(|f| f.locals.contains(&operand.name))
-                        && self.local_fn_sig(operand.name).is_none())
-            }
-        };
-        if !value_callee {
+        if !self.is_value_callee(operand) {
             return None;
         }
         let range = self.invocation_span(operand.range).unwrap_or(operand.range);
@@ -815,6 +884,52 @@ impl<'a> Engine<'a> {
             offset: range.offset,
             length: end - range.offset,
         })
+    }
+
+    /// Whether an `Invoke` row's callee is a VALUE — the
+    /// `FunctionExpressionInvocation` shape upstream's resolver splits
+    /// from a `MethodInvocation`: a member send whose resolved member is a
+    /// field or getter (a function-typed property — a `Method` member's
+    /// send is a declared-method invocation whose static type is the
+    /// method's own return, never a `.call` dispatch), or a bare send on a
+    /// `void Function()`-typed formal/local or a local with no
+    /// declared-function capture. `false` for every non-send row and every
+    /// declared-callee send — the predicate [`Self::value_send_span`]'s
+    /// span arm, [`Self::callable_call_ret`]'s implicit-`call` arm, and
+    /// [`Self::operand_static_ty`]'s misfired-`call`-ret salvage share.
+    fn is_value_callee(&self, row: &Row) -> bool {
+        match &row.shape {
+            RowShape::Member { recv } => {
+                let type_name = match recv {
+                    Receiver::Typed { type_name, .. }
+                    | Receiver::This {
+                        container: type_name,
+                        ..
+                    }
+                    | Receiver::Super {
+                        container: type_name,
+                        ..
+                    } => *type_name,
+                    _ => return false,
+                };
+                matches!(
+                    self.walk_members(type_name, row.name),
+                    Walk::Found(entry)
+                        if matches!(entry.kind, MemberKind::Field | MemberKind::Getter)
+                )
+            }
+            _ => {
+                self.fn_var_sigs.contains_key(&row.name)
+                    || (self
+                        .frames
+                        .iter()
+                        .any(|f| {
+                            f.locals.contains(&row.name)
+                                || f.fn_formal_rets.contains_key(&row.name)
+                        })
+                        && self.local_fn_sig(row.name).is_none())
+            }
+        }
     }
 
     /// The correction-carrying emit: the correction renders from the table
@@ -8591,6 +8706,28 @@ impl<'a> Engine<'a> {
             return sig.return_ty;
         }
         if row.ty != Ty::UNKNOWN {
+            // A stored `void` on a DECLARED-callee send can be a misfired
+            // implicit-`call` retyping: the send-close fold rewrites the
+            // row to the callee type's `call` return whenever
+            // `implicit_call_face(row.ty)` answers, and a declared
+            // method's or function's return type that happens to name a
+            // callable class (`C m()` on `class C { void call() {} }`,
+            // invoked `d.m()`/`D.m()`) folds the row to `void` where the
+            // send's static type is `C`. Upstream only a value callee
+            // runs `.call` — when the callee is a declared head and its
+            // declared return is not itself `void`, the declared answer
+            // is the send's static type and the stored `void` is wrong.
+            // A genuine `void` return keeps `void` (the recompute answers
+            // `Void` identically); a value callee's `void` is its real
+            // `.call`-dispatch face and never reaches this arm.
+            if row.ty == Ty::Void
+                && !self.is_value_callee(row)
+                && let declared @ (Ty::Void | Ty::Named { .. } | Ty::Function { .. } | Ty::Dynamic) =
+                    self.callee_return_ty(row)
+                && declared != Ty::Void
+            {
+                return declared;
+            }
             // The row keeps the callee's DECLARED type, never the send's
             // result — a spelled named type that is a type alias's head
             // (`Predicate<T> p` invoked as `p(x)`) answers nothing about
@@ -8794,6 +8931,20 @@ impl<'a> Engine<'a> {
     /// [`MemberEntry::type_param_names`]), so a return type mentioning the
     /// class's `T` would substitute to nothing — the declared face stays
     /// (under-report, never a wrong head).
+    ///
+    /// The callee must additionally be a VALUE — the same predicate
+    /// [`Self::value_send_span`] runs: a member send's resolved member is
+    /// a field or getter (a `Method` member's send IS its declared return,
+    /// never a `.call` dispatch — `localFunction()` on `void Function()
+    /// localFunction` is the field face; `instanceMethod()` on a declared
+    /// method is the method's own return), and a bare send is a
+    /// function-typed formal/local or a local with no declared-function
+    /// capture. A declared-function send (`topLevelFunction()`,
+    /// `D.staticMethod()`) carries the function's return type on the row —
+    /// that face never names a callable container, but a spelled return
+    /// type that happens to be a callable class name must not re-dispatch:
+    /// `C topLevel()` invoked `topLevel()` returns `C`, not `C.call`'s
+    /// return.
     fn callable_call_ret(&self, row: &Row, callee_ty: Ty) -> Option<Ty> {
         let Ty::Named {
             name,
@@ -8803,30 +8954,7 @@ impl<'a> Engine<'a> {
         else {
             return None;
         };
-        let value = match &row.shape {
-            RowShape::Bare(BareInfo::Plain { .. }) => true,
-            RowShape::Member { recv } => match recv {
-                Receiver::Typed { type_name, .. }
-                | Receiver::This {
-                    container: type_name,
-                    ..
-                }
-                | Receiver::Super {
-                    container: type_name,
-                    ..
-                } => matches!(
-                    self.walk_members(*type_name, row.name),
-                    Walk::Found(entry)
-                        if matches!(
-                            entry.kind,
-                            MemberKind::Field | MemberKind::Getter | MemberKind::Method
-                        )
-                ),
-                _ => false,
-            },
-            _ => false,
-        };
-        if !value {
+        if !self.is_value_callee(row) {
             return None;
         }
         let entry = self.resolved_member(name, self.intern("call"))?;
@@ -10096,7 +10224,38 @@ impl<'a> Engine<'a> {
     /// int-literal → `double` context conversion all suppress (the
     /// under-report posture).
     pub(crate) fn check_equals_argument(&mut self, left: &Row, right: &Row) {
-        let left_ty @ Ty::Named { name, .. } = self.equality_operand_ty(left) else {
+        let right_ty = self.equality_operand_ty(right);
+        let left_ty = self.equality_operand_ty(left);
+        // The right operand's void face precedes every formal lookup —
+        // upstream `checkForArgumentTypeNotAssignable`'s `checkForUseOf
+        // VoidResult` short-circuit (error_detection_helpers.dart:49-50)
+        // reports `use_of_void_result` whenever a `void` actual lands in a
+        // non-`void` formal. The `==`/`!=` invocation's default formal is
+        // `Object` (`Object.==(Object)` — the receiver's own `==`
+        // redeclaration aside), so a `void` right operand fires on every
+        // resolved `==` face and on every face the name-level walk cannot
+        // see — the under-report posture only carves out the declared-`void`
+        // formal (`bool operator ==(void o)`).
+        if right_ty == Ty::Void {
+            let void_formal = match left_ty {
+                Ty::Named { name, .. } => self
+                    .member_formals_full(
+                        &Receiver::Typed {
+                            type_name: name,
+                            ty: left_ty,
+                        },
+                        self.intern("=="),
+                    )
+                    .and_then(|formals| formals.positional.first().map(|f| f.ty))
+                    .is_some_and(|formal| formal == Ty::Void),
+                _ => false,
+            };
+            if !void_formal {
+                self.emit_use_of_void_result(right_ty, right);
+            }
+            return;
+        }
+        let left_ty @ Ty::Named { name, .. } = left_ty else {
             return;
         };
         // The operand's INSTANTIATED type rides the receiver: `C<int>(1)`'s
@@ -10120,9 +10279,10 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        let right_ty = self.equality_operand_ty(right);
-        if matches!(formal.ty, Ty::Unknown | Ty::Void) || matches!(right_ty, Ty::Unknown | Ty::Void)
-        {
+        if matches!(formal.ty, Ty::Unknown | Ty::Void) {
+            return;
+        }
+        if right_ty == Ty::Unknown {
             return;
         }
         let unbound = |engine: &Self, head| {
@@ -10918,11 +11078,48 @@ impl<'a> Engine<'a> {
         // top is the node's face — every upward read
         // (`operand_static_ty`, the parenthesized group's `inner_ty`,
         // `rhs_row_ty`, the cascade receiver) reads `rows.last()`.
+        //
+        // `end` is the token the listener hands in — the else arm's own
+        // consumed tail for a send or a postfix/type-test expression
+        // (`)`, `++`, `!`, a type tail), but the send-leaf followER for a
+        // bare read or member read whose tiling consumed no delimiter
+        // (#585): the unconsumed `;`/`,`/`)`/`]`/`}`/`=`/`:` that begins
+        // the surrounding construct. A follower always sits at or past
+        // the else arm's use-site end and is always one of those
+        // delimiter kinds — a consumed tail token can never be one — so
+        // kind decides before the position check even runs.
+        let else_row = &self.rows[else_index];
+        let arm_site_end = if matches!(else_row.intent, Intent::Invoke) {
+            self.value_send_span(else_row)
+        } else {
+            self.property_access_span(else_row.range)
+        }
+        .map_or(else_row.range.end(), |span| span.end())
+        .max(else_row.range.end());
+        let is_follower = end.offset >= arm_site_end
+            && self
+                .tokens
+                .as_slice()
+                .iter()
+                .find(|t| t.utf16_offset == end.offset && t.byte_len == end.length)
+                .is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        dartq_scanner::TokenKind::Semicolon
+                            | dartq_scanner::TokenKind::Comma
+                            | dartq_scanner::TokenKind::CloseParen
+                            | dartq_scanner::TokenKind::CloseSquare
+                            | dartq_scanner::TokenKind::CloseCurly
+                            | dartq_scanner::TokenKind::Eq
+                            | dartq_scanner::TokenKind::Colon
+                    )
+                });
+        let tail = if is_follower { arm_site_end } else { end.end() };
         self.rows.push(Row {
             name: self.intern(""),
             range: SourceRange {
                 offset: head,
-                length: end.end().saturating_sub(head),
+                length: tail.saturating_sub(head),
             },
             qualified: false,
             shape: RowShape::Value,
@@ -10966,9 +11163,18 @@ impl<'a> Engine<'a> {
         if target_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN {
             return;
         }
-        let ty = self.composite_lub(target_ty, rhs_ty, true);
-        let rhs_offset = self.rows[rhs_index].range.offset;
         let lhs_offset = self.rows[target_index].range.offset;
+        // A `?.`-merged target null-shorts the whole `??=` —
+        // `Extension(s)?.p ??= v` reads `Null` whenever `s` is null, so the
+        // node's type keeps the nullable form (`resolveIfNull`'s
+        // `nullAware` join), never the bare non-null `UP` face. The
+        // `?.`-merged selector lives in `null_aware_members`; a plain
+        // `local ??= v` carries no `?.` and keeps the `UP` face (`Function`,
+        // never `Function?`).
+        let shorted = self.null_aware_members.contains(&lhs_offset);
+        let ty = self.composite_lub(target_ty, rhs_ty, true);
+        let ty = if shorted { Self::nullable_form(ty) } else { ty };
+        let rhs_offset = self.rows[rhs_index].range.offset;
         self.if_null_results.insert(rhs_offset, (lhs_offset, ty));
     }
 
@@ -11056,6 +11262,19 @@ impl<'a> Engine<'a> {
         if let (Ty::Null, other) | (other, Ty::Null) = (left, right) {
             return Self::nullable_form(other);
         }
+        // The if-null callable coercion (`resolveIfNull`'s `T2'`): the
+        // `??=`/`??` value operand's static type already carries the `.call`
+        // tear-off rewrite (`analyzeExpression`'s popRewrite applies the
+        // callable-interface coercion), so a `call`-declaring class right
+        // operand facing a function-shaped left joins as its `call`
+        // signature — `local ??= callableClass` against a `Function?` local
+        // is `UP(Function, int Function())` = `Function`, never `Object`.
+        // The `??` arm [`Self::join_operand_ty`] runs the same rewrite.
+        let (left, right) = if non_null_left {
+            self.coerce_if_null_callable(left, right)
+        } else {
+            (left, right)
+        };
         // Nullability merge: `UP(T1?, T2) = UP(T1, T2)?`.
         if Self::nullable_lub_leg(left) || Self::nullable_lub_leg(right) {
             return Self::nullable_form(self.composite_lub_stripped(
@@ -11262,9 +11481,21 @@ impl<'a> Engine<'a> {
     /// top-type formal, and the int-literal → `double` conversion all
     /// stay silent.
     pub(crate) fn check_binary_argument(&mut self, right_ty: Ty, formal: Ty, right: &Row) {
-        if matches!(formal, Ty::Unknown | Ty::Void)
-            || matches!(right_ty, Ty::Unknown | Ty::Void | Ty::Dynamic)
-        {
+        if matches!(formal, Ty::Unknown | Ty::Void) {
+            return;
+        }
+        // The void-operand face rides `checkForArgumentTypeNotAssignable`'s
+        // `checkForUseOfVoidResult` short-circuit (upstream
+        // `error_detection_helpers.dart:49-50`): `3 + v()` reports
+        // `use_of_void_result` at the operand and answers no
+        // `argument_type_not_assignable`. The `dynamic` operand still
+        // suppresses — `isAssignableTo(dynamic, X)` holds upstream, and
+        // the const-eval verdict owns the row.
+        if right_ty == Ty::Void {
+            self.emit_use_of_void_result(right_ty, right);
+            return;
+        }
+        if matches!(right_ty, Ty::Unknown | Ty::Dynamic) {
             return;
         }
         let unbound = |engine: &Self, head| {

@@ -466,6 +466,15 @@ struct PendingAug {
     ctor_completion: bool,
 }
 
+/// An enclosing type-variable group's four pending buffers, parked while a
+/// nested `<>` inside one of its bounds parses its own quantifier (#3748).
+struct TypeVarFrame {
+    group: Vec<StringId>,
+    bounds: Vec<Ty>,
+    ranges: Vec<SourceRange>,
+    bound_ranges: Vec<Option<SourceRange>>,
+}
+
 /// The capture state shared between the listener and [`collect`].
 #[expect(clippy::struct_excessive_bools)] // latch flags mirror the parser's event stream
 struct Builder<'src, 'tab> {
@@ -734,6 +743,12 @@ struct Builder<'src, 'tab> {
     /// `type_var_group` mutation mirrors here, and a group without a bound
     /// leaves its slot at `Dynamic`.
     type_var_bounds: Vec<Ty>,
+    /// The outer `<>` groups' pending state, saved when a nested group
+    /// opens inside a bound (`class C<X extends T Function<T extends
+    /// num>(T)>` — the inner `<>` clobbers the outer buffers without it,
+    /// #3748). Pushed at `begin_type_variables` (depth > 1), popped at
+    /// `end_type_variables` back into the four per-group buffers it took.
+    type_var_saved: Vec<TypeVarFrame>,
     /// Count of the open depth-1 type-parameter list.
     type_param_count: u16,
     /// A depth-1 count that closed before its declaration's container
@@ -911,6 +926,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             type_arg_depth: 0,
             type_var_group: Vec::new(),
             type_var_bounds: Vec::new(),
+            type_var_saved: Vec::new(),
             type_param_count: 0,
             header_type_params: 0,
             header_super_open: false,
@@ -4428,13 +4444,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn begin_type_variables(&mut self, _token: Token) {
         let builder = &mut self.builder;
         builder.type_group_depth += 1;
-        if builder.type_group_depth == 1 {
+        // A nested `<>` group inside a bound (`class C<X extends T
+        // Function<T extends num>(T)>`) must not clobber the enclosing
+        // group's pending names/bounds — save them for `end_type_variables`
+        // to restore. The outer state sits at depth > 1 only.
+        if builder.type_group_depth > 1 {
+            builder.type_var_saved.push(TypeVarFrame {
+                group: std::mem::take(&mut builder.type_var_group),
+                bounds: std::mem::take(&mut builder.type_var_bounds),
+                ranges: std::mem::take(&mut builder.type_var_ranges),
+                bound_ranges: std::mem::take(&mut builder.type_var_bound_ranges),
+            });
+        } else {
             builder.type_param_count = 0;
+            builder.type_var_group.clear();
+            builder.type_var_bounds.clear();
+            builder.type_var_ranges.clear();
+            builder.type_var_bound_ranges.clear();
         }
-        builder.type_var_group.clear();
-        builder.type_var_bounds.clear();
-        builder.type_var_ranges.clear();
-        builder.type_var_bound_ranges.clear();
         builder.type_group_close = None;
         if let Some(site) = builder.capture.as_mut() {
             site.type_variables_begin();
@@ -4548,6 +4575,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             site.type_variables_end();
         }
         builder.type_group_depth -= 1;
+        // A nested `<>` group closes: hand the enclosing group's saved
+        // state back — the inner `<T extends num>` inside `class C<X
+        // extends T Function<T extends num>(T)>` consumed its own
+        // `T`/`num` slot and now restores `X`'s (#3748).
+        if builder.type_group_depth > 0
+            && let Some(frame) = builder.type_var_saved.pop()
+        {
+            builder.type_var_group = frame.group;
+            builder.type_var_bounds = frame.bounds;
+            builder.type_var_ranges = frame.ranges;
+            builder.type_var_bound_ranges = frame.bound_ranges;
+        }
     }
 
     fn begin_fields(

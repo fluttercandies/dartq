@@ -1158,7 +1158,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// (182, length 4) — got at 182, walked-to segment `foo.` length 4).
     /// The message is always the registry text `Expected an identifier.` —
     /// the template carries no lexeme parameter.
-    fn report_missing_identifier(&mut self, got: crate::token_id::TokenSpan) {
+    pub(crate) fn report_missing_identifier(&mut self, got: crate::token_id::TokenSpan) {
         if got.range.length > 0 {
             self.report(msg::missing_identifier(), got);
             return;
@@ -1267,6 +1267,32 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
         self.cursor.advance();
         self.span_of(id)
+    }
+
+    /// The `ClassOrMixinOrExtensionIdentifierContext` keep-set evaluated at
+    /// the declaration-name position (`identifier_context_impl.dart:80-86`
+    /// read through `reserved_name_recovery_at`): a top-level-declaration
+    /// keyword head splices a synthetic name and stays for the declaration
+    /// loop when its FOLLOWER does not continue the declaration header
+    /// (`<` `{` `extends` `with` `implements` `on` `=` `(` `.` EOF).
+    /// `mixin extension E on C {}` splices at `extension` (the keyword never
+    /// becomes the mixin name, so no `built_in_identifier_in_declaration`
+    /// row exists upstream); `mixin abstract class X {}` does not splice —
+    /// `abstract` is not a declaration-head keyword and does become the name.
+    pub(crate) fn class_name_head_splices(&self) -> bool {
+        self.looks_like_start_of_next_top_level_declaration_at(0)
+            && !matches!(
+                self.cursor.look_kind(1),
+                TokenKind::Lt
+                    | TokenKind::OpenCurly
+                    | TokenKind::Keyword(
+                        Keyword::Extends | Keyword::With | Keyword::Implements | Keyword::On
+                    )
+                    | TokenKind::Eq
+                    | TokenKind::OpenParen
+                    | TokenKind::Period
+                    | TokenKind::Eof
+            )
     }
 
     /// `looksLikeStatementStart` (`identifier_context.dart:402`) evaluated
@@ -1771,6 +1797,18 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// only non-keyword junk falls back to the normal `ensureIdentifier`
     /// template. The typedef callers pass `isIdentifierRecovered` for the
     /// `name (`/`name <T>(` group shapes (parser_impl.dart:1494/:1590).
+    ///
+    /// The member-name contexts override the base `=> ensureIdentifier`
+    /// route (`identifier_context_impl.dart`): `FieldDeclaration`
+    /// (:512-535), `MethodDeclaration` (:1187-1209, shared by the
+    /// continuation/operatorName/primaryConstructor constructors), and
+    /// `TopLevelDeclaration` (:1357-1384, shared by
+    /// topLevelVariableDeclaration and topLevelFunctionDeclaration). On the
+    /// recovered route an identifier-shaped head is consumed silently and a
+    /// keyword head is consumed AS THE NAME under
+    /// `expectedIdentifierButGotKeyword` — the keep-set reparse is
+    /// bypassed, so `int const(int x) {}` names the method `const` instead
+    /// of reparsing `const` as the next member's modifier.
     pub(crate) fn ensure_identifier_recovered(
         &mut self,
         context: crate::listener::IdentifierContext,
@@ -1794,6 +1832,72 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             let span = self.span_of(id);
             self.listener.handle_identifier(span, context);
             return span;
+        }
+        let recovered_name_route = matches!(
+            context,
+            crate::listener::IdentifierContext::FieldDeclaration
+                | crate::listener::IdentifierContext::MethodDeclaration
+                | crate::listener::IdentifierContext::MethodDeclarationContinuation
+                | crate::listener::IdentifierContext::OperatorName
+                | crate::listener::IdentifierContext::PrimaryConstructorDeclaration
+                | crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                | crate::listener::IdentifierContext::TopLevelFunctionDeclaration
+        );
+        if recovered_name_route {
+            let peek = self.cursor.peek();
+            // Official fast path: an identifier-shaped head is consumed
+            // silently. The `TopLevelDeclaration` flavors additionally veto
+            // a head that starts the next top-level declaration unless its
+            // follower continues the name (the context's `followingValues`,
+            // identifier_context_impl.dart:1366-1372).
+            if is_identifier(peek.kind) {
+                let fast_path_ok = match context {
+                    crate::listener::IdentifierContext::TopLevelVariableDeclaration => {
+                        !self.looks_like_start_of_next_top_level_declaration_at(0)
+                            || matches!(
+                                self.cursor.look_kind(1),
+                                TokenKind::Semicolon
+                                    | TokenKind::Eq
+                                    | TokenKind::Comma
+                                    | TokenKind::Eof
+                            )
+                    }
+                    crate::listener::IdentifierContext::TopLevelFunctionDeclaration => {
+                        !self.looks_like_start_of_next_top_level_declaration_at(0)
+                            || matches!(
+                                self.cursor.look_kind(1),
+                                TokenKind::Lt
+                                    | TokenKind::OpenParen
+                                    | TokenKind::OpenCurly
+                                    | TokenKind::Function
+                                    | TokenKind::Keyword(Keyword::Async | Keyword::Sync)
+                                    | TokenKind::Eof
+                            )
+                    }
+                    _ => true,
+                };
+                if fast_path_ok {
+                    let id = self.cursor.advance();
+                    let span = self.span_of(id);
+                    self.listener.handle_identifier(span, context);
+                    return span;
+                }
+            }
+            // Recovery route: a keyword head is the name under
+            // `expectedIdentifierButGotKeyword`; only non-keyword junk falls
+            // back to the normal template (upstream `!isRecovered ||
+            // !identifier.isKeywordOrIdentifier` — `isRecovered` is always
+            // true on this route by construction of the call sites).
+            if is_keyword_or_identifier(peek.kind) {
+                self.report(
+                    msg::expected_identifier_but_got_keyword(self.cursor.lexeme(peek.span.id)),
+                    peek.span,
+                );
+                let id = self.cursor.advance();
+                let span = self.span_of(id);
+                self.listener.handle_identifier(span, context);
+                return span;
+            }
         }
         self.ensure_identifier(context)
     }

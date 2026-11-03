@@ -2,7 +2,7 @@
 //! family the 20261102-080528 census isolated (920 extra rows): the
 //! extension-member bounds face over an UNGROUNDED receiver face.
 
-use super::test_rig::{code_names, report_ops, rows};
+use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The shared `expectStaticType` scaffolding: the census cluster's
 /// receiver-typing shapes all ride `extension StaticType<T> on T` with
@@ -20,15 +20,27 @@ extension StaticType<T> on T {
 }
 ";
 
-/// Oracle evidence (2026-11-02, `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart
-/// analyze --format=machine`, fixture `/tmp/3593fx/fx1/lib/test2.dart`
-/// mirroring the census shapes): NO `type_argument_not_matching_bounds`
-/// rows — the receiver `(local2 ??= callableClassC2Int)` types as the
-/// coerced join `B1<int> Function()`/`A Function()`
-/// (`UP(NonNull(T1), T2')` with the callable-object coercion), never the
-/// RHS's `CallableClass<C2<int>>`.
+/// Oracle evidence (2026-11-03 re-run for ticket #3782,
+/// `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze --format machine` on
+/// this exact fixture): the bounds row IS emitted — line 19, column 26,
+/// length 21, message `'Exactly<A Function()>' doesn't conform to the
+/// bound 'Exactly<B1<int> Function()>' of the type parameter 'R'.` — the
+/// receiver types as the join of the promoted local (`C1<int>
+/// Function()`) with the callable-object coercion of the RHS
+/// (`CallableClass<C2<int>>`), so `Exactly<A Function()>` misses that
+/// bound.
+///
+/// History (ticket #3782): this pin used to assert silence and passed only
+/// while `CallableClass<C2<int>>` was unresolvable — `operand_static_ty`
+/// answered UNKNOWN, `fold_if_null_assignment` exited early, the receiver
+/// face stayed ungrounded, and the bounds face abstained (the census
+/// under-report mechanism). #3517 grounded callable-class types, the
+/// abstain lifted, and the row the oracle always emitted surfaced — the
+/// old silence was the stale expectation, never the oracle's verdict. The
+/// genuine-abstain shape keeps its own control below
+/// [`if_null_assignment_ungrounded_operand_abstains`].
 #[test]
-fn if_null_assignment_receiver_abstains() {
+fn if_null_assignment_receiver_reports_bounds_row() {
     let source = format!(
         "{EXTENSION_SCAFFOLD}\
 void main() {{
@@ -44,6 +56,59 @@ void main() {{
 }}
 "
     );
+    let report = report_ops(&source);
+    let bounds_rows: Vec<String> = rows(&report)
+        .into_iter()
+        .filter(|row| row.contains("type_argument_not_matching_bounds"))
+        .collect();
+    assert_eq!(bounds_rows.len(), 1, "rows: {bounds_rows:#?}");
+    let at = (CORE_PRELUDE.len() + source.find("Exactly<A Function()>>()").expect("anchor")) as u32;
+    let row = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "type_argument_not_matching_bounds")
+        .expect("bounds row");
+    assert_eq!(row.range.offset, at, "rows: {bounds_rows:#?}");
+    assert_eq!(row.range.length, "Exactly<A Function()>".len() as u32);
+    assert_eq!(
+        row.message.as_str(),
+        "'Exactly<A Function()>' doesn't conform to the bound 'Exactly<B1<int> Function()>' of the type parameter 'R'."
+    );
+}
+
+/// The genuine-abstain negative control for the face above: the same
+/// fixture with `class CallableClass<T>` dropped, so the `??=` RHS
+/// operand's static type is unresolvable — `operand_static_ty` answers
+/// UNKNOWN, `fold_if_null_assignment` exits early, the receiver face stays
+/// ungrounded, and the bounds face abstains. Silence is the correct
+/// verdict on this shape, not the stale expectation the old pin carried:
+/// the oracle (2026-11-03, 3.13.7, same fixture) emits no bounds rows
+/// either — only the `UNDEFINED_FUNCTION` row for the missing class. This
+/// keeps the abstain mechanism's own coverage, no longer conflated with
+/// the grounded receiver that reports above.
+#[test]
+fn if_null_assignment_ungrounded_operand_abstains() {
+    let source = "\
+class A {}
+class B1<T> implements A {}
+class C1<T> implements B1<T> {}
+class C2<T> implements B1<T> {}
+typedef Exactly<T> = T Function(T);
+extension StaticType<T> on T {
+  T expectStaticType<R extends Exactly<T>>() => this;
+}
+void main() {
+  Function? local2;
+  var callableClassC2Int = CallableClass<C2<int>>();
+  local2 = null as Function?;
+  Object? o;
+  o = (() => C1<int>()) as Object?;
+  if (local2 is C1<int> Function()? && o is C1<int> Function()) {
+    o = (local2 ??= callableClassC2Int)
+      ..expectStaticType<Exactly<A Function()>>();
+  }
+}
+";
     let report = report_ops(&source);
     assert!(
         !code_names(&report).contains(&"type_argument_not_matching_bounds"),

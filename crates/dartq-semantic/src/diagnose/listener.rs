@@ -1782,10 +1782,16 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // #1314 FAM10: a formal list without a preceding type-variable
         // window closes the pairing latch — the declaration is non-generic
-        // and a later foreign window must not adopt its name.
+        // and a later foreign window must not adopt its name. Inside a
+        // still-open type-variables group the latch is mid-pairing (a
+        // bound's own function-type formals open a list at depth 0 before
+        // `pair_exec_window` runs), so the clears are gated off and the
+        // latch survives to the enclosing group's close.
         if engine.formal_list_depth == 0 {
-            engine.pending_exec_name = None;
-            engine.pending_exec_is_method = false;
+            if !engine.bounds.in_type_variables() {
+                engine.pending_exec_name = None;
+                engine.pending_exec_is_method = false;
+            }
             // The outer list's claims start in the required-positional
             // section; the group events re-arm it.
             engine.fn_formal_named_section = false;
@@ -2608,11 +2614,12 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_typedef(
         &mut self,
-        _augment: Option<Token>,
-        _typedef: Token,
-        _equals: Option<Token>,
-        _end: Token,
+        augment: Option<Token>,
+        typedef: Token,
+        equals: Option<Token>,
+        end: Token,
     ) {
+        self.flow().end_typedef(augment, typedef, equals, end);
         let engine = &mut self.engine;
         // The #1351 capture finalizes with the declaration.
         engine.bounds.end_alias();
@@ -10860,8 +10867,14 @@ impl ParserListener for DiagnoseListener<'_> {
             };
             // `node.key.staticType` / `node.value.staticType` — the
             // operand's composite type (see `handle_spread_expression`'s
-            // note), never the row's push-time payload.
-            let ty = engine.operand_static_ty(&engine.rows[pos]);
+            // note), never the row's push-time payload. A `?.`-shorted
+            // access (`{?f(1)?.abs(): 1}`) reads the chain's own nullable
+            // type (`null_aware_members`), so the `?` stays live.
+            let mut ty = engine.operand_static_ty(&engine.rows[pos]);
+            if ty != Ty::UNKNOWN && engine.null_aware_members.contains(&engine.rows[pos].range.offset)
+            {
+                ty = Engine::nullable_form(ty);
+            }
             if engine.strictly_non_nullable(ty) {
                 // The `_mapEntryKey`/`_mapEntryValue` uniqueNames' verbatim
                 // pair (diagnostic.g.dart invalidNullAwareMapEntryKey/Value
@@ -13236,9 +13249,20 @@ impl ParserListener for DiagnoseListener<'_> {
             // AssignmentExpression's resolved-operator result
             // (`compound_element_ty`), not the RHS literal's face the tail
             // row carries.
-            let ty = engine
+            // A `?.`-shorted composite (`?f(1)?.abs()`) reads the chain's
+            // own nullable type, never the trailing member's declared
+            // return: the official `staticType` of a null-shorted access
+            // carries the `?` join (`null_aware_members`, the same face
+            // `Engine::condition_operand_ty` widens for the condition
+            // checkpoints), so the element is potentially nullable and the
+            // `?` stays live.
+            let mut ty = engine
                 .compound_element_ty()
                 .unwrap_or_else(|| engine.operand_static_ty(&engine.rows[pos]));
+            if ty != Ty::UNKNOWN && engine.null_aware_members.contains(&engine.rows[pos].range.offset)
+            {
+                ty = Engine::nullable_form(ty);
+            }
             if engine.strictly_non_nullable(ty) {
                 // The `_element` uniqueName's verbatim pair
                 // (diagnostic.g.dart invalidNullAwareElement :9404-9415):

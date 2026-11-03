@@ -829,7 +829,7 @@ impl<'a> Engine<'a> {
             }
             return;
         }
-        let Some(on_type) = self
+        let Some((on_type, on_nullable)) = self
             .index
             .get(self.file)
             .and_then(|f| {
@@ -837,7 +837,7 @@ impl<'a> Engine<'a> {
                     .iter()
                     .find(|face| face.name == Some(name))
             })
-            .and_then(|face| face.on_type)
+            .and_then(|face| face.on_type.map(|on| (on, face.on_type_nullable)))
         else {
             return;
         };
@@ -855,14 +855,56 @@ impl<'a> Engine<'a> {
         if self.extension_on_is_generic(name) {
             return;
         }
+        // A `?.` null-aware member access on the override's result
+        // (`E(s)?.f()`) only reaches the extension when the receiver arg is
+        // non-null — the override application itself promotes the
+        // argument's `String?` to `String`. The `?.` sits after the call's
+        // closing `)` (the override IS the send `E(s)`), so the source
+        // scan is the reliable read: skip whitespace past the arg's end,
+        // expect the `)` that closes `E(`, then ask for `?.`. Any other
+        // byte (`f(E(s))`'s `,`, `E(s).f()`'s `.`, `E(s)[0]`'s `[`)
+        // declines the promotion — the plain-access arg keeps its
+        // nullable face. Verified: `dart analyze` reports
+        // `extension_override_argument_not_assignable` on `E(s).f()`
+        // (`String?` vs `String`) and stays silent on `E(s)?.f()`.
+        let null_aware = {
+            let bytes = self.source.as_bytes();
+            // The byte past the arg's whitespace: the `)` that closes `E(`.
+            let close = self.byte_of(self.skip_whitespace(arg_range.end()));
+            bytes.get(close) == Some(&b')')
+                && {
+                    // One past `)`, skipping whitespace: `?.` is the
+                    // null-aware arm; `,`/`.`/`[`/`)` decline the promotion.
+                    let op =
+                        self.byte_of(self.skip_whitespace(self.utf16_of(close) + 1));
+                    bytes.get(op..op + 2) == Some(b"?.")
+                }
+        };
+        let arg_ty = if null_aware {
+            self.non_null_face(*arg_ty)
+        } else {
+            *arg_ty
+        };
+        // The `on` face's own `?` rides the head — `extension E on int?`
+        // extends the NULLABLE `int?`, so a `Null`/`Never` receiver
+        // (`E(null)?.f()`) satisfies it and no row fires. Dropping the flag
+        // fabricated `extension_override_argument_not_assignable` on every
+        // null-argument override into a nullable `on` type (#3748).
         let extended = match self.extension_on_type_args(name) {
             Some((head, args)) if head == on_type && !args.is_empty() => {
                 let arg_tys: Vec<Ty> = args.iter().map(|arg| Ty::named(*arg)).collect();
-                self.boundary.args.borrow_mut().named(head, false, &arg_tys)
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(head, on_nullable, &arg_tys)
             }
-            _ => Ty::named(on_type),
+            _ => self
+                .boundary
+                .args
+                .borrow_mut()
+                .named(on_type, on_nullable, &[]),
         };
-        let rejects = match self.assignable(*arg_ty, extended, *literal) {
+        let rejects = match self.assignable(arg_ty, extended, *literal) {
             Some(verdict) => !verdict,
             // Name-level generic faces answer `None` (`on List<Book>`
             // against a `List<int>` receiver — the subtype walk cannot
@@ -870,7 +912,7 @@ impl<'a> Engine<'a> {
             // decides from the written arguments alone: different heads
             // reject outright, a same-head pair rejects on any differing
             // argument (unknown slots defer — the under-report posture).
-            None => match (*arg_ty, extended) {
+            None => match (arg_ty, extended) {
                 (
                     Ty::Named {
                         name: from_name,
@@ -914,7 +956,7 @@ impl<'a> Engine<'a> {
             .invocation_span(*arg_range)
             .or_else(|| self.property_access_span(*arg_range))
             .unwrap_or(*arg_range);
-        let (a0, a1) = (self.ty_display(*arg_ty), self.ty_display(extended));
+        let (a0, a1) = (self.ty_display(arg_ty), self.ty_display(extended));
         // The why-not-promoted rows hang on the receiver expression's read
         // (#1877; upstream Dart SDK source,
         // pkg/analyzer/lib/src/dart/resolver/extension_member_resolver.dart:297-313
@@ -3452,7 +3494,7 @@ impl<'a> Engine<'a> {
     /// `Function?`/`CallableClass<int>` is `UP(Function, int Function())` =
     /// `Function`. Only the RIGHT operand coerces (the rule coerces the
     /// if-null VALUE); the left keeps its own face.
-    fn coerce_if_null_callable(&self, left: Ty, right: Ty) -> (Ty, Ty) {
+    pub(crate) fn coerce_if_null_callable(&self, left: Ty, right: Ty) -> (Ty, Ty) {
         let function_shaped =
             |ty: Ty| matches!(ty, Ty::Function { .. }) || self.is_bare_function_head(ty);
         if !function_shaped(left) {
@@ -4568,6 +4610,25 @@ impl<'a> Engine<'a> {
     /// reaches a default's closed world). `None`/undecidable verdicts
     /// keep the under-report direction.
     pub(crate) fn check_default_value_assignable(&mut self, to: Ty) {
+        // Upstream `handleValuedFormalParameter` reads the resolved
+        // `paramElement.type`: an unresolved formal's type is `InvalidType`,
+        // which `checkForInvalidAssignment` short-circuits on
+        // (`InvalidType` short-circuits every subtype question) —
+        // `void f({A a = null})` reports `undefined_class` only, never
+        // `invalid_assignment`. The function-typed formal's element type is
+        // `InvalidType Function()` — still a `Function`, so the check DOES
+        // run for `{A a() = null}` even when `A` is missing
+        // (`fn_typed_formal_open` stays latched through the `=` event).
+        // Upstream `handleValuedFormalParameter` reads the resolved
+        // `paramElement.type`: an unresolved formal's type is `InvalidType`,
+        // which `checkForInvalidAssignment` short-circuits on —
+        // `void f({A a = null})` reports `undefined_class` only, never
+        // `invalid_assignment`.
+        if let Ty::Named { name, .. } = to
+            && !self.named_type_is_type(name)
+        {
+            return;
+        }
         let Some(rhs_row) = self
             .rows
             .iter()
@@ -5942,7 +6003,7 @@ impl<'a> Engine<'a> {
             self.fn_sig_ty(&sig)
         } else {
             match &row.shape {
-                RowShape::Receiver(Receiver::Created { name, kind, .. })
+                RowShape::Receiver(Receiver::Created { name, kind, ty, .. })
                     if *kind != ContainerKind::Extension =>
                 {
                     // The expression's static type is the instantiated head:
@@ -5951,9 +6012,32 @@ impl<'a> Engine<'a> {
                     // difference (#2838's raw-type arm reads a raw head as
                     // its to-bounds defaults, which reports a written
                     // creation against its own instantiation).
-                    self.creation_row_ty(*name, false, row.range.offset)
-                        .filter(|ty| *ty != Ty::UNKNOWN)
-                        .unwrap_or_else(|| self.instantiated_head_ty(Ty::named(*name)))
+                    //
+                    // The send-close solve's own face wins first (#3758): the
+                    // unnamed creation's fold adopts `pending_send_ty` into
+                    // `row.ty` (`=> Box(1)` in a `Box<int>` slot solves
+                    // `Box<int>` through the enclosing return context), and a
+                    // context-instantiated residual publishes through
+                    // `creation_row_ty`'s `call_type_args` peek. Neither was
+                    // consulted — the arm re-derived `Box<dynamic>` from the
+                    // bare head and the return check reported a solvable
+                    // pair. The `with_explicit_creation_args` reader orders
+                    // the same three faces.
+                    if let Ty::Named {
+                        args,
+                        nullable: false,
+                        ..
+                    } = row.ty
+                        && args != ArgListId::EMPTY
+                    {
+                        row.ty
+                    } else if let Some(solved) = ty {
+                        *solved
+                    } else {
+                        self.creation_row_ty(*name, false, row.range.offset)
+                            .filter(|ty| *ty != Ty::UNKNOWN)
+                            .unwrap_or_else(|| self.instantiated_head_ty(Ty::named(*name)))
+                    }
                 }
                 _ => row.ty,
             }
@@ -6447,6 +6531,24 @@ impl<'a> Engine<'a> {
         };
         if from_name == to_name || *to_name == self.intern("Object") {
             return None;
+        }
+        // The bare `Function` head's callable-class acceptance is NOT a
+        // nominal edge: `isAssignableTo` accepts any non-nullable source
+        // with a resolvable `call` method into `Function`/`Function?`
+        // (type_system.dart:875-884 + `acceptsFunctionType` :121-126), and
+        // the declared-supertype closure below never contains `Function`
+        // for an ordinary class. `CallableClass<int> ??=` into a
+        // `Function?` setter therefore must not let the nominal negative
+        // overturn the Right-Top `true` — [`Self::call_tear_off_verdict`]
+        // decides it (a resolvable `call` accepts outright; a provable
+        // no-`call` container still rejects; an unresolvable head keeps the
+        // under-report `None`). Non-`Function` heads keep the nominal walk.
+        if *to_name == self.intern("Function") {
+            return self.call_tear_off_verdict(*from).and_then(|verdict| {
+                // `verdict` answers the `call` existence; the negative gate
+                // only overturns on a proven no-`call` fact.
+                (!verdict).then_some(false)
+            });
         }
         let from_container = resolve_container(
             self.graph,
@@ -7563,9 +7665,18 @@ impl<'a> Engine<'a> {
             } = folded
                 && self.alias_rhs_any(name).is_none()
             {
-                let mut hit = None;
-                let mut ambiguous = false;
-                for lib in self.graph.libraries() {
+                // The chase answers the first declaring unit's captured RHS.
+                // Multiple units may declare the same private spelling across
+                // mutually invisible libraries (the conformance harness packs
+                // many same-named package roots — every `library expect` copy
+                // declares its own `_CheckExceptionFn`): a genuinely divergent
+                // set stays unfolded, but candidates that ALL project to one
+                // identical right-hand type are one denotation at the use
+                // site — fold to it. Decls with `UNKNOWN` captures count as
+                // divergent (an unreadable RHS never proves agreement).
+                let mut hit: Option<Ty> = None;
+                let mut divergent = false;
+                'chase: for lib in self.graph.libraries() {
                     for &unit in self.graph.unit_files(lib) {
                         let Some(decl) = self.index.get(unit).and_then(|f| f.decl(name)) else {
                             continue;
@@ -7573,20 +7684,27 @@ impl<'a> Engine<'a> {
                         if decl.kind != MicroKind::TypeAlias {
                             continue;
                         }
-                        if hit.replace((unit, decl.var_ty)).is_some() {
-                            ambiguous = true;
-                            break;
+                        if decl.var_ty == Ty::UNKNOWN {
+                            // An uncaptured right-hand side can never prove
+                            // agreement — count it as divergent, the
+                            // under-report direction.
+                            divergent = true;
+                            break 'chase;
+                        }
+                        let rhs = self.boundary.ty(unit, decl.var_ty);
+                        match hit {
+                            None => hit = Some(rhs),
+                            Some(seen) if seen == rhs => {}
+                            Some(_) => {
+                                divergent = true;
+                                break 'chase;
+                            }
                         }
                     }
-                    if ambiguous {
-                        break;
-                    }
                 }
-                if !ambiguous
-                    && let Some((owner, var_ty)) = hit
-                    && var_ty != Ty::UNKNOWN
+                if !divergent
+                    && let Some(rhs) = hit
                 {
-                    let rhs = self.boundary.ty(owner, var_ty);
                     folded = Self::join_nullable(rhs, nullable);
                 }
             }

@@ -120,6 +120,7 @@ pub fn oracle_command(args: &OracleArgs) -> i32 {
             crashed: BTreeSet::new(),
             peak_rss_kb: 0,
             processes: 0,
+            fatal: None,
         }
     } else {
         let runner = Runner {
@@ -132,6 +133,12 @@ pub fn oracle_command(args: &OracleArgs) -> i32 {
         };
         let build = |chunk_dir: &Path| runner::oracle_command(&dart_bin, chunk_dir);
         let analysis = runner.analyze(&to_analyze, &build);
+        // A chunk-infrastructure failure leaves whole chunks unanalyzed;
+        // caching that as rows would poison every later run.
+        if let Some(detail) = &analysis.fatal {
+            eprintln!("error: {detail}");
+            return 2;
+        }
         // Store every analyzed case in the cache.
         for &i in &to_analyze {
             let loaded = &all_cases[i];

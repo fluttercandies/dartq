@@ -769,13 +769,13 @@ impl<'a> Engine<'a> {
         // zip them against the arriving param list. `B = A<int, String>`
         // over `A<S, T>` binds `S → int`, `T → String`.
         let mut pending_args: Vec<TypeTree> = Vec::new();
-        let (ret, positional, named, required_positional) = loop {
+        let (ret, positional, named, required_positional, rhs_type_params) = loop {
             if !seen.insert(cur) {
                 return None;
             }
             let args = std::mem::take(&mut pending_args);
             let subst_args: Vec<TypeTree> = args.iter().map(|a| subst_tree(a, &subst)).collect();
-            if let Some((params, _rhs_type_params, ret, positional, named, required_positional)) =
+            if let Some((params, rhs_type_params, ret, positional, named, required_positional)) =
                 self.bounds.alias_fn_shape(cur)
             {
                 subst.clear();
@@ -787,6 +787,7 @@ impl<'a> Engine<'a> {
                     positional.to_vec(),
                     named.to_vec(),
                     required_positional,
+                    rhs_type_params.to_vec(),
                 );
             }
             let (_params, tree) = match self.bounds.alias_named_shape(cur) {
@@ -808,11 +809,28 @@ impl<'a> Engine<'a> {
             cur = tree.head;
         };
         let sig = FnVarSig {
-            // The alias's own type parameters are bound by the written use
-            // (`Predicate<T> test` already instantiates them) — they are
-            // not call-site inference variables, so the signature carries
-            // none; their leaves stay named `T` in the formal types.
-            params: Box::default(),
+            // The signature's own binders (`typedef F<X> = void Function<Y
+            // extends X>()`) ride the params column — `fn_sig_subtype`'s
+            // `relateTypeParameters` count gate and bound-equality legs
+            // decide over them (#3693). The alias's own parameters are bound
+            // by the written use (`Predicate<T> test` already instantiates
+            // them), so they never join this list; a binder's written bound
+            // substitutes through the same co-alias map as the formal
+            // pieces, and a poisoned bound reads unwritten (`None` — the
+            // `dynamic` arm), mirroring `instantiated_alias_sig`.
+            params: rhs_type_params
+                .iter()
+                .map(|(var, bound, poisoned)| {
+                    let bound = if *poisoned {
+                        None
+                    } else {
+                        bound
+                            .as_ref()
+                            .map(|tree| self.tree_ty(&subst_tree(tree, &subst)))
+                    };
+                    (*var, bound)
+                })
+                .collect(),
             positional: positional
                 .iter()
                 .map(|tree| self.tree_ty(&subst_tree(tree, &subst)))
@@ -870,8 +888,21 @@ impl<'a> Engine<'a> {
         };
         let pool = self.boundary.pool();
         let shape = pool.function_shape(shape);
+        // The interned shape's own `<T extends B>` group rides the sig —
+        // the same column `alias_fn_sig`'s capture face fills from
+        // `rhs_vars` (#3693): `relateTypeParameters`'s count gate and
+        // bound-equality legs decide over the real names and bounds. A
+        // count-only shape keeps its anonymous entries — no name, no
+        // bound, never deciding.
+        let params: Vec<(StringId, Option<Ty>)> = if shape.type_params_named.is_empty() {
+            (0..usize::from(shape.type_params))
+                .map(|_| (StringId::NONE, None))
+                .collect()
+        } else {
+            shape.type_params_named.to_vec()
+        };
         Some(Box::new(FnVarSig {
-            params: Box::default(),
+            params: params.into(),
             positional: shape.positional.iter().copied().collect(),
             required_positional: u16::try_from(shape.positional.len()).unwrap_or(u16::MAX),
             named: shape
@@ -5323,12 +5354,19 @@ impl<'a> Engine<'a> {
         &self,
         name: StringId,
     ) -> (TypeResolution, Option<(FileId, SourceRange)>) {
-        if self.type_params.contains(&name)
-            || self.pending_type_params.contains(&name)
-            || self
-                .fn_type_capture
-                .iter()
-                .any(|capture| capture.scope.contains(&name))
+        // A wildcard type parameter enters none of these scopes (upstream
+        // `TypeParameterScope` skips the `_` element under the feature —
+        // scope.dart:944-960 — and the written-signature capture's own
+        // scope mirrors it), so the `_` spelling falls through to the
+        // element lookup exactly like an undeclared name.
+        let wildcard = self.is_wildcard(name);
+        if !wildcard
+            && (self.type_params.contains(&name)
+                || self.pending_type_params.contains(&name)
+                || self
+                    .fn_type_capture
+                    .iter()
+                    .any(|capture| capture.scope.contains(&name)))
         {
             return (TypeResolution::Type, None);
         }

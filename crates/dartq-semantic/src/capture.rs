@@ -570,6 +570,14 @@ impl TreeSink {
         match self.stack.last_mut() {
             Some(parent) if parent.in_type_variables && parent.function => parent.bounds.push(node),
             Some(parent) if !parent.in_type_variables => parent.nodes.push(node),
+            // A sealed function/record shape inside a non-function
+            // type-variables group is the bound itself — arm it as the
+            // root so `end_function_type`'s arm reads it (the class's
+            // own `<X extends T Function<...>(T)>` bound drops here
+            // otherwise, #3748).
+            Some(_) if node.function.is_some() || node.record.is_some() => {
+                self.done.push(node)
+            }
             Some(_) => {}
             None => self.done.push(node),
         }

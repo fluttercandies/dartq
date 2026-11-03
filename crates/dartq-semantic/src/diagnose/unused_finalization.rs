@@ -76,11 +76,49 @@ impl<'a> Engine<'a> {
                     head,
                 )
             };
+            // The container-miss alias fold (`_checkForAllMixinErrorCodes`
+            // reads `mixinType.element` — the instantiated alias's element,
+            // error_verifier.dart:2879-2890): `with A` over `typedef A = C`
+            // resolves C's element and reports with C's name; the same fold
+            // lands a mixin-class target (`typedef A = MixinClass`) silent.
+            let (resolved, element) = match resolved {
+                Some(face) => (Some(face), head),
+                None => match self.mixin_use_alias_fold(head) {
+                    Some((container, owner, folded)) => {
+                        (Some((container, owner)), folded)
+                    }
+                    None => (None, head),
+                },
+            };
             let Some((container, owner)) = resolved else {
                 continue;
             };
             if container.kind != ContainerKind::Class
                 || container_modifiers(container).is_mixin_class
+            {
+                continue;
+            }
+            // The resolved element's non-subtypable-class gate
+            // (`_checkForAllMixinErrorCodes`'s first arm reads
+            // `_checkForExtendsOrImplementsDisallowedClass`, which answers
+            // `isNonSubtypableClass`, error_verifier.dart:2886-2888 and
+            // :5176-5188): a restricted `dart:*` element routes to the
+            // `subtype_of_disallowed_type` face this engine already emits
+            // and never reaches `classUsedAsMixin` — except `Enum`, whose
+            // `isDartCoreEnum` conjunct lets the element fall through to
+            // the class arm. The element leaf decides; a user shadow
+            // resolves off `dart:*` and keeps the report.
+            let element_leaf = {
+                let spelled = self.strings.resolve(element);
+                spelled.rsplit('.').next().unwrap_or(spelled)
+            };
+            let element_is_sdk = self
+                .graph
+                .library_of_file(owner)
+                .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
+            if element_is_sdk
+                && element_leaf != "Enum"
+                && super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&element_leaf)
             {
                 continue;
             }
@@ -98,18 +136,115 @@ impl<'a> Engine<'a> {
                 continue;
             }
             // The oracle's message names the resolved ELEMENT (the leaf of
-            // a prefixed spelling, the head of a parameterized one), not
-            // the whole written entry.
+            // a prefixed spelling, the head of a parameterized one, the
+            // folded head of an alias entry), not the whole written entry.
             let name_text = {
-                let head_text = self.strings.resolve(head);
-                head_text
+                let element_text = self.strings.resolve(element);
+                element_text
                     .rsplit('.')
                     .next()
-                    .unwrap_or(head_text)
+                    .unwrap_or(element_text)
                     .to_string()
             };
             self.emit(SemanticCode::ClassUsedAsMixin, span, &name_text, "");
         }
+    }
+
+    /// The container element a `with`-clause entry's alias spelling stands
+    /// for (`typedef A = C` written as `with A` or `with p.A`): the entry's
+    /// head resolves to a type alias rather than a container, so the
+    /// element the upstream `mixinType.element` read sees is the aliased
+    /// one — the right-hand side's named head, chased through co-alias
+    /// chains (`A = B`, `B = C`) until a container resolves in the alias's
+    /// OWN library scope (a foreign alias's RHS names resolve where the
+    /// alias declared them). Only the RHS head matters — written arguments
+    /// ride the application, never the element. Returns the container,
+    /// its owning file, and the folded element spelling (the message
+    /// reports this name, error_verifier.dart:2923-2926's
+    /// `mixinElement.name`). `None` under-reports: a non-alias head, a
+    /// function/record/`dynamic` right-hand side (the
+    /// `mixin_of_non_class` face's shapes), a self-referencing or
+    /// eight-hop-unresolved chain, or a right-hand head nothing resolves.
+    fn mixin_use_alias_fold(&self, head: StringId) -> Option<(&'a Container, FileId, StringId)> {
+        let (mut name, mut scope_lib, mut scope_file) = (head, self.lib, self.file);
+        for _ in 0..8 {
+            // The alias declaration `name` resolves to in this hop's scope:
+            // a dot-joined spelling reads its leaf through the prefix's
+            // merged table, a bare name walks the file-local then
+            // import-scope chain — the same order the container arm
+            // resolves.
+            let (owner, decl) = if self.strings.resolve(name).contains('.') {
+                let spelled = self.strings.resolve(name);
+                let (prefix, leaf) = spelled.split_once('.')?;
+                let (prefix, leaf) = (self.intern(prefix), self.intern(leaf));
+                match self
+                    .namespaces
+                    .lookup_prefixed(self.graph, scope_lib, prefix, leaf)
+                {
+                    Lookup::Found(NamespaceEntry::Decl(owner)) => {
+                        (owner, self.index.get(owner)?.decl(leaf)?)
+                    }
+                    _ => return None,
+                }
+            } else {
+                match lookup_scoped(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    scope_lib,
+                    scope_file,
+                    name,
+                ) {
+                    ScopedHit::Local(decl) => (scope_file, decl),
+                    ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
+                        (owner, self.index.get(owner)?.decl(name)?)
+                    }
+                    _ => return None,
+                }
+            };
+            if decl.kind != MicroKind::TypeAlias || decl.var_ty == Ty::UNKNOWN {
+                return None;
+            }
+            let Ty::Named { name: next, .. } = self.boundary.ty(owner, decl.var_ty) else {
+                return None;
+            };
+            if next == name {
+                return None;
+            }
+            // The RHS names resolve in the alias's declaring library: an
+            // imported `typedef A = C` stands for its own scope's `C`, not
+            // the use site's same-spelled import. A dot-joined hop name is
+            // not a scoped spelling — the owning file's library answers.
+            let next_lib = if self.strings.resolve(name).contains('.') {
+                self.graph.library_of_file(owner).unwrap_or(scope_lib)
+            } else {
+                self.owner_library_of(owner, name).unwrap_or(scope_lib)
+            };
+            let resolved = if self.strings.resolve(next).contains('.') {
+                resolve_joined_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    next_lib,
+                    self.strings,
+                    next,
+                )
+            } else {
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    next_lib,
+                    owner,
+                    next,
+                )
+            };
+            if let Some((container, found)) = resolved {
+                return Some((container, found, next));
+            }
+            (name, scope_lib, scope_file) = (next, next_lib, owner);
+        }
+        None
     }
 
     /// The end-of-unit boundedness checks (#610): the deferred explicit
@@ -1454,7 +1589,27 @@ impl<'a> Engine<'a> {
             let promoted = self.promoted_receiver(read.offset, read.recv);
             let receiver = match promoted {
                 Receiver::Typed { ty, .. } => Some(ty),
-                Receiver::This { container, kind } => Some(self.this_static_ty(container, kind)),
+                Receiver::This { container, kind } => {
+                    // An UNNAMED extension's `this` face resolves through the
+                    // frame latch, and no frame is live at finalize: the
+                    // lookup falls back to the container spelling itself
+                    // (never the `on` head), so `this.p ??= v` inside
+                    // `extension on String` credits nothing and the accessor
+                    // pair reports. The header scan re-derives the `on` head
+                    // the fallback lost (`this` inside an extension body is
+                    // the `on` type by definition, upstream
+                    // `ExtensionElement.extendedType`).
+                    let ty = self.this_static_ty(container, kind);
+                    let unresolved_unnamed = kind == ContainerKind::Extension
+                        && matches!(&ty, Ty::Named { name, .. } if *name == container);
+                    if unresolved_unnamed
+                        && let Some(head) = self.enclosing_extension_on(read.offset)
+                    {
+                        Some(Ty::named(self.intern(&head)))
+                    } else {
+                        Some(ty)
+                    }
+                }
                 Receiver::Created { ty: Some(ty), .. } => Some(ty),
                 Receiver::Created { name, .. } => Some(Ty::named(name)),
                 _ => None,

@@ -254,6 +254,7 @@ impl<'a> Engine<'a> {
             if latched {
                 ty = Self::nullable_form(ty);
             }
+            ty = self.alias_expanded_operand_ty(ty);
             if ty == Ty::Null {
                 self.emit_operand_null_row(op_range, out);
                 continue;
@@ -320,6 +321,7 @@ impl<'a> Engine<'a> {
             if latched {
                 ty = Self::nullable_form(ty);
             }
+            ty = self.alias_expanded_operand_ty(ty);
             if ty == Ty::Null {
                 self.emit_operand_null_row(op_span, out);
                 continue;
@@ -810,6 +812,30 @@ impl<'a> Engine<'a> {
             | Ty::Function { nullable, .. } => nullable,
             _ => false,
         }
+    }
+
+    /// The operand's static type with a type-alias head's right-hand-side
+    /// nullability expanded (#3724): an operand the lattice spells by its
+    /// written alias head (`IAlias pick()`'s call result, a member whose
+    /// declared type the model captured as the alias spelling) carries the
+    /// alias's `?` on the right-hand side — invisible at the name level,
+    /// so the [`Self::operand_ty_nullable`] consult answered `false` and
+    /// the pass under-reported where the oracle emits the unchecked row
+    /// (the oracle's `staticType` IS the resolved interface type; the
+    /// `isNullable` tail upstream runs on it). The expansion is
+    /// [`Engine::fold_alias_ty`] — the same resolved face the verdict
+    /// layer unfolds at the ask — gated on the head actually naming an
+    /// alias (the bare-head/parameterized-head pair
+    /// `bind_declared_type`'s keep-at-bind tests use), so every other
+    /// named face keeps the written spelling and its nullability bit.
+    fn alias_expanded_operand_ty(&self, ty: Ty) -> Ty {
+        if let Ty::Named { name, args, .. } = ty
+            && ((args == ArgListId::EMPTY && self.alias_rhs(name).is_some())
+                || (args != ArgListId::EMPTY && self.alias_rhs_any(name).is_some()))
+        {
+            return self.fold_alias_ty(ty);
+        }
+        ty
     }
 
     /// Whether an unchecked/null row already stands at `offset` in the

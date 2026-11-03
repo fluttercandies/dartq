@@ -2,6 +2,11 @@
 //! materialize a chunk of package roots, run one analyzer process over the
 //! chunk directory, attribute its JSON rows back to cases by package-root
 //! index, and bisect a crashed/timeout chunk down to the offending case.
+//!
+//! Every run gets its own package-root directory ([`fresh_chunk_dir`]): two
+//! harness processes — a census beside a filtered probe is the normal case —
+//! must never share roots, because the second materialization deletes the
+//! first one's files while its analyzer is still walking them.
 
 use crate::analyze_json;
 use crate::materialize::{self, LoadedCase};
@@ -11,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub struct Analysis {
@@ -21,6 +27,10 @@ pub struct Analysis {
     pub crashed: BTreeSet<usize>,
     pub peak_rss_kb: u64,
     pub processes: usize,
+    /// A chunk-infrastructure failure (the root cannot be materialized). The
+    /// run's verdicts are incomplete, so they must not be reported as a
+    /// board: the caller aborts instead of writing `expected.tsv`/`status.tsv`.
+    pub fatal: Option<String>,
 }
 
 pub struct Runner<'a> {
@@ -41,13 +51,11 @@ enum ChunkOutcome {
     },
     /// The analyzer process crashed, hung or was watchdog-killed.
     Crashed { detail: String },
+    /// The chunk root itself is unusable; no case verdict can be derived.
+    Fatal { detail: String },
 }
 
 impl Runner<'_> {
-    pub fn chunk_dir(&self) -> PathBuf {
-        self.work_root.join(self.label)
-    }
-
     /// Analyzes the given case indices (any order; chunked in list order).
     pub fn analyze(&self, indices: &[usize], build: &dyn Fn(&Path) -> Command) -> Analysis {
         let mut analysis = Analysis {
@@ -55,14 +63,18 @@ impl Runner<'_> {
             crashed: BTreeSet::new(),
             peak_rss_kb: 0,
             processes: 0,
+            fatal: None,
         };
         let started = Instant::now();
         let total = indices.len();
+        // One directory for the whole run: chunks and bisected halves reuse
+        // it sequentially, and no other process can observe it.
+        let chunk_dir = fresh_chunk_dir(&self.work_root, self.label);
         for (chunk_no, batch) in indices.chunks(self.chunk_size.max(1)).enumerate() {
             let batch_no = chunk_no + 1;
             let batch_total = indices.len().div_ceil(self.chunk_size.max(1));
             let chunk_started = Instant::now();
-            match self.run_chunk(batch, build, &mut analysis.peak_rss_kb) {
+            match self.run_chunk(batch, &chunk_dir, build, &mut analysis.peak_rss_kb) {
                 ChunkOutcome::Done {
                     rows,
                     materialize_errors,
@@ -92,7 +104,10 @@ impl Runner<'_> {
                         total,
                         detail
                     ));
-                    self.bisect(batch, build, &mut analysis);
+                    self.bisect(batch, &chunk_dir, build, &mut analysis);
+                    if analysis.fatal.is_some() {
+                        break;
+                    }
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "{} chunk {batch_no}/{batch_total}: {} cases, bisected, {} crashers so far, {:.1}s",
@@ -102,8 +117,14 @@ impl Runner<'_> {
                         chunk_started.elapsed().as_secs_f64(),
                     );
                 }
+                ChunkOutcome::Fatal { detail } => {
+                    warn(&format!("chunk {batch_no}/{batch_total} failed: {detail}"));
+                    analysis.fatal = Some(detail);
+                    break;
+                }
             }
         }
+        remove_chunk_dir(&chunk_dir);
         let _ = writeln!(
             std::io::stderr().lock(),
             "{}: {} cases, {} processes, peak RSS {:.2} GB, {:.1}s total",
@@ -116,7 +137,13 @@ impl Runner<'_> {
         analysis
     }
 
-    fn bisect(&self, indices: &[usize], build: &dyn Fn(&Path) -> Command, analysis: &mut Analysis) {
+    fn bisect(
+        &self,
+        indices: &[usize],
+        chunk_dir: &Path,
+        build: &dyn Fn(&Path) -> Command,
+        analysis: &mut Analysis,
+    ) {
         if indices.len() == 1 {
             let i = indices[0];
             analysis.crashed.insert(i);
@@ -125,7 +152,7 @@ impl Runner<'_> {
         }
         let mid = indices.len() / 2;
         for half in [&indices[..mid], &indices[mid..]] {
-            match self.run_chunk(half, build, &mut analysis.peak_rss_kb) {
+            match self.run_chunk(half, chunk_dir, build, &mut analysis.peak_rss_kb) {
                 ChunkOutcome::Done {
                     rows,
                     materialize_errors,
@@ -139,7 +166,11 @@ impl Runner<'_> {
                         ));
                     }
                 }
-                ChunkOutcome::Crashed { .. } => self.bisect(half, build, analysis),
+                ChunkOutcome::Crashed { .. } => self.bisect(half, chunk_dir, build, analysis),
+                ChunkOutcome::Fatal { detail } => {
+                    analysis.fatal = Some(detail);
+                    return;
+                }
             }
         }
     }
@@ -147,11 +178,15 @@ impl Runner<'_> {
     fn run_chunk(
         &self,
         indices: &[usize],
+        chunk_dir: &Path,
         build: &dyn Fn(&Path) -> Command,
         peak_rss_kb: &mut u64,
     ) -> ChunkOutcome {
-        let chunk_dir = self.chunk_dir();
-        let errors = materialize::materialize(self.cases, indices, &chunk_dir, &self.mocks_root);
+        let errors =
+            match materialize::materialize(self.cases, indices, chunk_dir, &self.mocks_root) {
+                Ok(errors) => errors,
+                Err(detail) => return ChunkOutcome::Fatal { detail },
+            };
         let runnable: Vec<usize> = indices
             .iter()
             .copied()
@@ -165,11 +200,14 @@ impl Runner<'_> {
         }
         // The analyzers report absolute paths; canonicalize once and use
         // the same prefix for attribution.
-        let abs_dir = std::fs::canonicalize(&chunk_dir).unwrap_or_else(|_| {
-            std::fs::canonicalize(&self.work_root)
-                .expect("work root exists")
-                .join(self.label)
-        });
+        let abs_dir = match std::fs::canonicalize(chunk_dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                return ChunkOutcome::Fatal {
+                    detail: format!("cannot resolve chunk dir {}: {e}", chunk_dir.display()),
+                };
+            }
+        };
         let mut command = build(&abs_dir);
         let result = match watchdog::run(&mut command, self.timeout, watchdog::RSS_LIMIT_KB) {
             Ok(result) => result,
@@ -200,6 +238,38 @@ impl Runner<'_> {
         ChunkOutcome::Done {
             rows: attribute(&diags, &abs_dir, indices),
             materialize_errors: errors,
+        }
+    }
+}
+
+/// A chunk root no other run can be using: `<work_root>/<label>-<pid>-<n>`.
+///
+/// The harness used to materialize every run into `<work_root>/<label>`, so
+/// two harness processes (a census beside a filtered probe is the normal
+/// shape) deleted each other's package roots mid-analysis. The analyzer then
+/// hit ENOENT during discovery, the chunk "crashed", bisection re-ran the
+/// halves into that same directory, and rows from roots that had already been
+/// replaced were dropped as "outside the chunk package roots" — the
+/// missing-rows/no-extra-rows signature that reads exactly like a semantic
+/// regression.
+pub fn fresh_chunk_dir(work_root: &Path, label: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    work_root.join(format!("{label}-{}-{n}", std::process::id()))
+}
+
+/// Removes this run's chunk roots. A leftover directory is reported rather
+/// than swallowed; it can never collide with another run's.
+fn remove_chunk_dir(chunk_dir: &Path) {
+    if !chunk_dir.is_dir() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(chunk_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn(&format!(
+                "cannot remove chunk dir {}: {e}",
+                chunk_dir.display()
+            ));
         }
     }
 }

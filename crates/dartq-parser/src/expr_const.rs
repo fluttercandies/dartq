@@ -535,7 +535,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.parse_selector_chain(end, context)
             }
             TokenKind::OpenParen => {
-                let end = self.parse_parenthesized_or_record_literal(None);
+                // Official `parsePrimary` `(` arm routes through
+                // `parseParenthesizedExpressionFunctionLiteralOrRecordLiteral`
+                // (:8188-8192): with function expressions enabled, `() => e`
+                // parses as a function literal (object/map/list/paren
+                // patterns re-enable the flag inside their fields); the plain
+                // record-literal path would strand the `=> e` body as a
+                // spurious `expected_token ')'`.
+                let end =
+                    self.parse_parenthesized_expression_function_literal_or_record_literal();
                 self.parse_selector_chain(end, context)
             }
             TokenKind::OpenSquare | TokenKind::Index => {

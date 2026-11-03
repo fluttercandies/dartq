@@ -119,25 +119,36 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
         }
 
-        // sealed / base / interface pseudo-keyword modifiers.
+        // sealed / base / interface pseudo-keyword modifiers
+        // (parser_impl.dart:595-626): they are NOT declaration modifiers —
+        // the capture applies only when the keyword is followed by
+        // `class`/`mixin`/`enum` (`sealed` also `abstract class`). Before any
+        // other token — including `extension` and `typedef` — the pseudo
+        // keyword stays in the token stream and `parse_top_level_member_impl`
+        // decomposes the construct as a member (`sealed extension E on C {}`:
+        // `sealed` commits as the field type; `interface extension E on C {}`:
+        // `interface` is the field NAME).
         let mut sealed: Option<TokenSpan> = None;
         let mut base: Option<TokenSpan> = None;
         let mut interface: Option<TokenSpan> = None;
-        if self.peek_is_pseudo(Keyword::Sealed) {
+        let next_is_decl_keyword = matches!(
+            self.cursor.look_kind(1),
+            TokenKind::Keyword(Keyword::Class | Keyword::Mixin | Keyword::Enum)
+        );
+        if self.peek_is_pseudo(Keyword::Sealed) && next_is_decl_keyword {
             sealed = Some(self.peek_span());
             self.cursor.advance();
-            if !matches!(
-                self.peek_kind(),
-                TokenKind::Keyword(Keyword::Class | Keyword::Mixin | Keyword::Enum)
-            ) && self.peek_is_pseudo(Keyword::Abstract)
-                && self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::Class)
-            {
-                self.cursor.advance(); // `abstract` (deferred error)
-            }
-        } else if self.peek_is_pseudo(Keyword::Base) {
+        } else if self.peek_is_pseudo(Keyword::Sealed)
+            && self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::Abstract)
+            && self.cursor.look_kind(2) == TokenKind::Keyword(Keyword::Class)
+        {
+            sealed = Some(self.peek_span());
+            self.cursor.advance(); // `sealed`
+            self.cursor.advance(); // `abstract` (deferred error)
+        } else if self.peek_is_pseudo(Keyword::Base) && next_is_decl_keyword {
             base = Some(self.peek_span());
             self.cursor.advance();
-        } else if self.peek_is_pseudo(Keyword::Interface) {
+        } else if self.peek_is_pseudo(Keyword::Interface) && next_is_decl_keyword {
             interface = Some(self.peek_span());
             self.cursor.advance();
         }
@@ -787,13 +798,24 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if self.kind_at(intro + 1) != TokenKind::Lt {
             return None;
         }
-        let name = self.kind_at(intro + 2);
+        // A leading `@m`/`@pkg.m(...)` metadata block inside the type
+        // parameters is legal (`Function<@m X>(...)`); skip it before
+        // classifying the variable name — upstream's metadata-star consumes
+        // it ahead of the name slot, so it must not flip the group to the
+        // degraded `Function`-as-member face.
+        let mut name_at = intro + 2;
+        let mut meta = self.metadata_skip_len(name_at);
+        while meta > 0 {
+            name_at += meta;
+            meta = self.metadata_skip_len(name_at);
+        }
+        let name = self.kind_at(name_at);
         if matches!(name, TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt) {
             // Empty group (`<>`): no name position, the classification
             // validates.
             return None;
         }
-        let follower = self.kind_at(intro + 3);
+        let follower = self.kind_at(name_at + 1);
         let name_is_type = is_valid_non_record_type_reference(name, follower)
             || name == TokenKind::OpenParen
             || matches!(
@@ -2275,13 +2297,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             const_keyword = Some(self.peek_span());
             self.cursor.advance();
         }
-        // Mixin names take the type-name face unconditionally
-        // (visitMixinDeclaration, error_verifier.dart:1840 — mixin
-        // declarations have no `=` mixin-application form). Reserved heads
-        // carry the row like built-in ones (oracle `mixin if {}`: keyword
-        // row + built-in row, both 1:7 len 2). ensure_identifier consumes
-        // the keyword silently (no keyword-name gate arm for this context).
-        if self.is_built_in_or_reserved_name_token(0) {
+        // Mixin names take the type-name face — but only when the keyword
+        // actually becomes the mixin name (the class-lane `at.id == name.id`
+        // pattern). The `ClassOrMixinOrExtensionDeclaration` keep-set
+        // splices a synthetic name at a declaration-head keyword
+        // (`mixin extension/enum/typedef/mixin <name>`) — the keyword stays
+        // for the reparse and no built-in-name row exists upstream. A
+        // non-declaration head (`mixin abstract class X {}` / `mixin if {}`)
+        // does become the name and keeps the row (visitMixinDeclaration,
+        // error_verifier.dart:1840; oracle `mixin if {}`: keyword row +
+        // built-in row, both 1:7 len 2).
+        if self.is_built_in_or_reserved_name_token(0) && !self.class_name_head_splices() {
             self.report(
                 msg::built_in_identifier_as_name(
                     msg::BuiltInNameKind::Type,

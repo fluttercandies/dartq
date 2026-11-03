@@ -1320,31 +1320,49 @@ impl<'a> Engine<'a> {
     /// `resolve_bare` read (their `Missing`/`Receiver` faces would
     /// otherwise reach the emit).
     fn emit_const_type_param_call_args(&mut self) {
-        let Some(callee_index) = self.invokes.last().and_then(|slot| *slot) else {
-            return;
-        };
         // Resolve the head row: the callee itself for a bare reference, or
-        // the last non-`TypeUse` row below a qualified selector.
-        let head = match self.rows.get(callee_index) {
-            Some(callee) if callee.qualified => {
-                let mut index = callee_index;
-                while index > 0
-                    && matches!(
-                        self.rows.get(index - 1).map(|r| &r.shape),
-                        Some(RowShape::TypeUse(..))
-                    )
-                {
-                    index -= 1;
+        // the class-segment `type_uses` entry for a qualified
+        // `C<T>.named(` shape (the selector row is `named` — the class head
+        // `C` never pushes a row when it resolves to a defined type, so a
+        // `rows` walk cannot find it). The bare path keeps the row-based
+        // walk for `C<T>(`.
+        let head = match self.invokes.last().and_then(|slot| *slot) {
+            Some(callee_index) => {
+                match self.rows.get(callee_index) {
+                    Some(callee) if callee.qualified => {
+                        let mut index = callee_index;
+                        while index > 0
+                            && matches!(
+                                self.rows.get(index - 1).map(|r| &r.shape),
+                                Some(RowShape::TypeUse(..))
+                            )
+                        {
+                            index -= 1;
+                        }
+                        index
+                            .checked_sub(1)
+                            .and_then(|i| self.rows.get(i))
+                            .map(|row| (row.name, row.range))
+                    }
+                    other => other.map(|row| (row.name, row.range)),
                 }
-                index.checked_sub(1).and_then(|i| self.rows.get(i))
             }
-            other => other,
+            None => {
+                // `C<T>.named(` — `creation_ref` carries the class head `C`;
+                // its `type_uses` entry is the span the `<` follows.
+                self.creation_ref.and_then(|(class, _)| {
+                    self.type_uses
+                        .iter()
+                        .rev()
+                        .find(|(_, entry_name)| *entry_name == class)
+                        .map(|(range, _)| (class, *range))
+                })
+            }
         };
-        let Some(head) = head else {
+        let Some((head_name, head_range)) = head else {
             return;
         };
-        let head_name = head.name;
-        let head_end = head.range.end();
+        let head_end = head_range.end();
         // `this`/`super`/`new` heads carry no class the check accepts.
         match self.strings.resolve(head_name) {
             "this" | "super" | "new" => return,

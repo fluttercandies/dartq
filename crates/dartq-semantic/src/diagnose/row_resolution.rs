@@ -1878,12 +1878,17 @@ impl<'a> Engine<'a> {
                 // oracle's `isNullable` tail precedes the member lookup, so
                 // `this[0]`/`this[0] = v`/`-this` inside `extension on A?`
                 // reports the shared unchecked code at the operator before
-                // the spelling's definedness is ever asked (`this?[0]` the
-                // `?.` latch stands down; a `Missing` on name's
-                // `InvalidType` face the helper screens). Each applied
+                // the spelling's definedness is ever asked (a `Missing` on
+                // name's `InvalidType` face the helper screens). Each applied
                 // spelling is a method invocation on the nullable receiver.
+                // The `?` byte after the receiver row's own end marks the
+                // null-aware forms (`this?[0]`) — the bracket's null-aware
+                // merge marks the folded value row's offset, not this
+                // receiver row's, so the `?` itself is the probe (the same
+                // check the bare-operand arm runs).
                 let nullable = self.nullable_this_receiver(&recv)
-                    && !self.null_aware_members.contains(&row.range.offset);
+                    && !self.null_aware_members.contains(&row.range.offset)
+                    && self.byte_at(self.skip_whitespace(row.range.end())) != Some(b'?');
                 // An extension applicable to the nullable `this` type
                 // resolves the spelling WITHOUT dereferencing it (upstream
                 // `type_property_resolver`'s `_lookupExtension` runs ahead of
@@ -1914,16 +1919,41 @@ impl<'a> Engine<'a> {
                 if nullable {
                     if !extension_resolves_all {
                         // The receiver's own dereference reports once at the
-                        // operator token, under the base spelling the send
-                        // applied (`this[0]` and `this[0] = v` both name `[]`
-                        // — the oracle's one row per operator access).
-                        let applied = read.or(write).map(|s| self.strings.resolve(s));
-                        if let Some(text) = applied {
-                            self.emit_unchecked_nullable(
-                                op_range,
-                                text,
-                                UncheckedNullableKind::Method,
-                            );
+                        // operator token, under the BASE spelling the send
+                        // applied: `this[0]` and `this[0] = v` both name `[]`
+                        // (the oracle's one row per operator access — the
+                        // `[]=` spelling is the element lookup's question,
+                        // never the dereference's text), anchored at the
+                        // opening bracket with length 1 (`[`), where a binary
+                        // application keeps its operator token and reports
+                        // the OPERATOR face (`The operator '+' …` — the
+                        // BinaryExpression arm of the node-shape dispatch;
+                        // the index and unary spellings take the method
+                        // face).
+                        let Intent::Operator(op, _) = row.intent else {
+                            return;
+                        };
+                        let is_index = op == self.intern("[]");
+                        let applied = if is_index {
+                            Some(op)
+                        } else {
+                            read.or(write)
+                        };
+                        if let Some(text) = applied.map(|s| self.strings.resolve(s)) {
+                            let anchor = if is_index {
+                                SourceRange {
+                                    offset: op_range.offset,
+                                    length: 1,
+                                }
+                            } else {
+                                op_range
+                            };
+                            let kind = if is_index {
+                                UncheckedNullableKind::Method
+                            } else {
+                                UncheckedNullableKind::Operator
+                            };
+                            self.emit_unchecked_nullable(anchor, text, kind);
                         }
                     }
                     return;
@@ -6266,15 +6296,25 @@ impl<'a> Engine<'a> {
     /// keeps the literal face; a named one this pass cannot ground (a
     /// foreign alias whose private target is not in the diagnosing scope)
     /// answers `None` and keeps the under-report.
+    ///
+    /// The right-hand head is read together with the scope it was WRITTEN
+    /// in: this unit's parse capture answers the same-file aliases, and any
+    /// other alias — an imported one (`typedef Pub = _Private;` declared in
+    /// another library, whose target is private to THAT library and so never
+    /// resolvable from the diagnosing scope) — re-anchors through its own
+    /// declaration ([`Self::alias_anchor`]), which hands back the declaring
+    /// file and library beside the head.
     fn alias_interface_head(&self, alias: StringId) -> Option<(&'a Container, FileId, StringId)> {
-        let (_, tree) = self.bounds.alias_named_shape(alias)?;
-        let head = tree.head;
+        let (head, scope_file, scope_lib) = match self.bounds.alias_named_shape(alias) {
+            Some((_, tree)) => (tree.head, self.file, self.lib),
+            None => self.alias_anchor(alias, self.file, self.lib)?,
+        };
         let (container, owner) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
-            self.lib,
-            self.file,
+            scope_lib,
+            scope_file,
             head,
         )?;
         Some((container, owner, head))
@@ -11611,8 +11651,30 @@ impl<'a> Engine<'a> {
                     if self.potentially_nullable(result)
                         && self.invoke_callee_function_shaped(result)
                     {
+                        // The oracle anchors the function variant on the
+                        // whole callee expression (`x.first`, `this.f`) —
+                        // receiver through selector — not the member token
+                        // alone (function_expression_invocation_resolver
+                        // reports on the FunctionExpressionInvocation's
+                        // function node). The staged member-read record
+                        // carries the receiver's span; fall back to the
+                        // selector when no record staged or the receiver
+                        // shares the selector's span.
+                        let range = self
+                            .member_read_ends
+                            .get(&row.range.end())
+                            .map(|&index| self.member_reads[index as usize])
+                            .filter(|read| {
+                                read.offset == row.range.offset
+                                    && read.recv_span.offset < row.range.offset
+                            })
+                            .map(|read| SourceRange {
+                                offset: read.recv_span.offset,
+                                length: row.range.end() - read.recv_span.offset,
+                            })
+                            .unwrap_or(row.range);
                         self.emit_unchecked_nullable(
-                            row.range,
+                            range,
                             "",
                             UncheckedNullableKind::Function,
                         );

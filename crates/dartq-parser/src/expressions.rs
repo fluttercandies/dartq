@@ -2390,7 +2390,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// :7563: `(...)` is a function literal when a body shape follows the
     /// group (or an async/sync modifier, or a stray identifier the user is
     /// typing); otherwise a parenthesized expression or record literal.
-    fn parse_parenthesized_expression_function_literal_or_record_literal(&mut self) -> TokenSpan {
+    pub(crate) fn parse_parenthesized_expression_function_literal_or_record_literal(
+        &mut self,
+    ) -> TokenSpan {
         let open = self.peek_span();
         let close = self.cursor.table_matching_end(open.id);
         let after = close.map(|c| self.kind_at(self.offset_of(c) + 1));

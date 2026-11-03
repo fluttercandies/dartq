@@ -97,6 +97,10 @@ pub fn run_command(args: &RunArgs) -> i32 {
     let build =
         |chunk_dir: &Path| runner::dartq_command(&args.dartq_bin, args.sdk.as_deref(), chunk_dir);
     let analysis = runner.analyze(&runnable, &build);
+    if let Some(detail) = &analysis.fatal {
+        eprintln!("error: {detail}");
+        return 2;
+    }
 
     let mut actual: BTreeMap<String, Vec<Row>> = BTreeMap::new();
     let mut crashed: BTreeSet<String> = BTreeSet::new();

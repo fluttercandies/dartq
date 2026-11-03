@@ -636,7 +636,17 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 scan += metadata_len;
             }
-            let len = self.skip_type_len_in(scan, in_declaration, depth + 1);
+            let mut len = self.skip_type_len_in(scan, in_declaration, depth + 1);
+            if len == 0 {
+                // Official `computeType(required: true)` at the member slot
+                // admits a built-in keyword via `computeBuiltinOrVarAsType`
+                // (type_info.dart:167-192) — `extension <as> on List {}`
+                // keeps `as` as the recovered member instead of dropping the
+                // whole group. The upstream shape is `..recovered = true`
+                // (:178/:190), so the group is flagged recovered too.
+                len = self.builtin_recovered_type_len(scan, in_declaration, depth + 1);
+                recovered |= len > 0;
+            }
             if len == 0 {
                 let here = self.kind_at(scan);
                 if here == TokenKind::Comma {
@@ -678,7 +688,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             scan = end;
             if self.kind_at(scan) == TokenKind::Keyword(Keyword::Extends) {
                 scan += 1;
-                let super_len = self.skip_type_len_in(scan, in_declaration, depth + 1);
+                // The bound site calls the same `computeType(required: true)`
+                // (type_info_impl.dart:1383-1388) — a built-in head admits
+                // through `computeBuiltinOrVarAsType` exactly like the member
+                // slot above. Upstream does NOT fold the bound's recovered
+                // flag into the group's (:1357 covers the member only).
+                let mut super_len = self.skip_type_len_in(scan, in_declaration, depth + 1);
+                if super_len == 0 {
+                    super_len = self.builtin_recovered_type_len(scan, in_declaration, depth + 1);
+                }
                 let (end, super_backed) = self.step_over_type(scan, super_len);
                 scan = end;
                 backed_up = super_backed;
@@ -934,6 +952,200 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// [`TYPE_DEPTH_CRASH_GUARD`] stack discipline: the group probe recurses
     /// once per type-nesting level, mirroring the official unguarded
     /// `computeType` descent.
+    /// The recovery arm of `computeType` for a built-in keyword head
+    /// (type_info.dart:167-192 → `computeBuiltinOrVarAsType`,
+    /// type_info_impl.dart:1037-1044): the group-scan member and
+    /// `extends`-bound sites call `computeType(next, required: true)`, which
+    /// admits a built-in as a recovered type — `extension <as> on List {}`
+    /// admits `as` as the group's single member. `0` = not admitted.
+    ///
+    /// Two upstream admission arms (required is always true at the call
+    /// sites):
+    ///
+    /// 1. A `<...>` group after the keyword validates → admitted with the
+    ///    group, no introducer exclusion (type_info.dart:168-179).
+    /// 2. No valid group → admitted bare unless the keyword introduces a
+    ///    member (`get`/`set`/`factory`/`operator`) or reads as a typedef
+    ///    head (`typedef` followed by an identifier) (type_info.dart:180-192).
+    ///
+    /// The tail mirrors `computeRest`: `?` then the `Function [<...>] (...)`
+    /// chain, each suffix counting only when the formal-parameter group
+    /// follows — the same math as the identifier arm below, minus the
+    /// `.id` prefix and the optional-position follower checks.
+    /// The contents shape check of
+    /// `_checkIfRecordTypeParenthesisAreRecovered`
+    /// (type_info_impl.dart:882-945): each field is `@meta?` + a
+    /// `computeType` type + an optional identifier name, comma-separated,
+    /// with `{`-opened named-field groups and a `})` close. `offset` is the
+    /// `(` position, `end` its real matching `)`. A single positional field
+    /// with no trailing comma is NOT a record type (`(int x)` is a
+    /// parenthesized-shape, not `(int,)`); that case returns `false` like the
+    /// official `parameterCount == 1 && !hasComma` recovery.
+    fn record_type_fields_valid(&self, offset: usize, end: usize, depth: u32) -> bool {
+        if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
+            return false;
+        }
+        let mut scan = offset + 1;
+        let mut parameter_count = 0usize;
+        let mut has_named_fields = false;
+        let mut has_comma = false;
+        loop {
+            let kind = self.kind_at(scan);
+            if scan == end || kind == TokenKind::CloseParen {
+                break;
+            }
+            if has_named_fields && kind == TokenKind::CloseCurly {
+                // `...}` then `)` ends the named group.
+                if scan + 1 == end || self.kind_at(scan + 1) == TokenKind::CloseParen {
+                    break;
+                }
+                return false;
+            }
+            parameter_count += 1;
+            if !has_named_fields && kind == TokenKind::OpenCurly {
+                has_named_fields = true;
+                scan += 1;
+            }
+            if self.kind_at(scan) == TokenKind::At {
+                let meta = self.metadata_skip_len(scan);
+                if meta == 0 {
+                    return false;
+                }
+                scan += meta;
+            }
+            let type_len = self.skip_type_len_in(scan, true, depth + 1);
+            if type_len == 0 {
+                return false;
+            }
+            scan += type_len;
+            // Optional field name (identifier) — required inside `{...}`.
+            if is_identifier(self.kind_at(scan)) {
+                scan += 1;
+            } else if has_named_fields {
+                return false;
+            }
+            match self.kind_at(scan) {
+                TokenKind::Comma => {
+                    has_comma = true;
+                    scan += 1;
+                }
+                TokenKind::CloseParen => break,
+                TokenKind::CloseCurly if has_named_fields => {
+                    // `...}` then `)`: the named group close.
+                    if scan + 1 == end || self.kind_at(scan + 1) == TokenKind::CloseParen {
+                        break;
+                    }
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        !(parameter_count == 1 && !has_named_fields && !has_comma)
+    }
+
+    fn builtin_recovered_type_len(&self, offset: usize, in_declaration: bool, depth: u32) -> usize {
+        if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
+            return 0;
+        }
+        let TokenKind::Keyword(kw) = self.kind_at(offset) else {
+            return 0;
+        };
+        if kw.style() != dartq_scanner::KeywordStyle::BuiltIn {
+            return 0;
+        }
+        let mut n = 1usize;
+        if self.kind_at(offset + n) == TokenKind::Lt {
+            match self.group_skip_len(offset + n, in_declaration, depth + 1) {
+                Some(len) => {
+                    n += len;
+                    // Shared compound closer: the group's own `>` is the
+                    // compound's last unit and the successor is the split
+                    // remainder — never `?`, never a `Function` intro — so
+                    // the type ends on the compound (the identifier arm's
+                    // math below).
+                    let tail = self.kind_at(offset + n - 1);
+                    let shared = is_compound_closer(tail) && {
+                        let mut opens = 0usize;
+                        let mut closed = 0usize;
+                        for i in offset..offset + n - 1 {
+                            match self.kind_at(i) {
+                                TokenKind::Lt => opens += 1,
+                                kind => closed += closer_units(kind),
+                            }
+                        }
+                        closer_units(tail) > opens.saturating_sub(closed)
+                    };
+                    if shared {
+                        return n;
+                    }
+                    if self.kind_at(offset + n) == TokenKind::Question {
+                        n += 1;
+                    }
+                }
+                // Rejected group: the bare-builtin arm applies (the introducer
+                // exclusion) — the `<...>` tail stays outside the type.
+                None => {
+                    if matches!(
+                        kw,
+                        Keyword::Get | Keyword::Set | Keyword::Factory | Keyword::Operator
+                    ) || (kw == Keyword::Typedef && is_identifier(self.kind_at(offset + 1)))
+                    {
+                        return 0;
+                    }
+                }
+            }
+        } else {
+            // Bare-builtin arm: member-introducer keywords are never type
+            // names (`get`/`set`/`factory`/`operator` start the member; a
+            // `typedef` head followed by an identifier reads as the typedef
+            // declaration) — the upstream `stringValue` exclusion at
+            // type_info.dart:181-186.
+            if matches!(
+                kw,
+                Keyword::Get | Keyword::Set | Keyword::Factory | Keyword::Operator
+            ) || (kw == Keyword::Typedef && is_identifier(self.kind_at(offset + 1)))
+            {
+                return 0;
+            }
+            if self.kind_at(offset + n) == TokenKind::Question {
+                n += 1;
+            }
+        }
+        // `Function` suffix chain (computeRest, type_info_impl.dart:1094-1133):
+        // each `Function [<typeVarGroup>] (...) [?]` counts only when the
+        // formal-parameter group follows; the type-variable groups scan with
+        // `inDeclaration: true` (:1099).
+        while self.kind_at(offset + n) == TokenKind::Keyword(Keyword::Function) {
+            let mut probe = n + 1;
+            if self.kind_at(offset + probe) == TokenKind::Lt {
+                match self.group_skip_len(offset + probe, true, depth + 1) {
+                    Some(len) => probe += len,
+                    None => break,
+                }
+            }
+            if self.kind_at(offset + probe) != TokenKind::OpenParen {
+                break;
+            }
+            let Some(close) = self.cursor.table_matching_end(self.real_id(offset + probe)) else {
+                break;
+            };
+            n = self.offset_of(close) - offset + 1;
+            if self.kind_at(offset + n) == TokenKind::Question {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// [`Self::skip_type_len`] with the official `inDeclaration` threading:
+    /// `computeType(next, required, inDeclaration)` passes its flag into
+    /// `computeTypeParamOrArg(next, inDeclaration)` for the `<...>` group
+    /// after an identifier (type_info.dart:264-278), so a nested group's
+    /// acceptance — and therefore the type's end — follows the caller's
+    /// declaration context. The `depth` counter is the scan-path share of the
+    /// [`TYPE_DEPTH_CRASH_GUARD`] stack discipline: the group probe recurses
+    /// once per type-nesting level, mirroring the official unguarded
+    /// `computeType` descent.
     pub(crate) fn skip_type_len_in(&self, offset: usize, in_declaration: bool, depth: u32) -> usize {
         if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
             return 0;
@@ -964,9 +1176,27 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 n
             }
             TokenKind::OpenParen => {
-                // Record type `(...)` — only with a real (non-synthetic) pair.
+                // Record type `(...)` — only with a real (non-synthetic)
+                // pair AND a record-type-shaped interior. Upstream
+                // `computeRecordType` runs
+                // `_checkIfRecordTypeParenthesisAreRecovered`
+                // (type_info_impl.dart:882-945) which marks the group
+                // recovered when its contents are not `type (, type)*` /
+                // `{...}` named fields; the `!required` follower veto
+                // (:849-857) then rejects the whole record read. A
+                // parenthesized expression like `(o as int)` therefore does
+                // NOT classify as a type-argument entry — `f(x < y,
+                // (o as int) > (p as int))` stays a comparison, not a generic
+                // invocation. `in_declaration` maps to upstream `required`,
+                // which keeps the recovered group (the parse reports the
+                // junk) so only the non-declaration read validates contents.
                 match self.cursor.table_matching_end(self.real_id(offset)) {
                     Some(end) if !self.cursor.resolve(end).1 => {
+                        if !in_declaration
+                            && !self.record_type_fields_valid(offset, self.offset_of(end), depth + 1)
+                        {
+                            return 0;
+                        }
                         let mut n = self.offset_of(end) - offset + 1;
                         if self.kind_at(offset + n) == TokenKind::Question {
                             n += 1;

@@ -110,8 +110,8 @@ fn local_function_empty_body_reports_at_name() {
     let rows = completion_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", completion_rows(&report));
     assert_eq!(rows[0].0, "body_might_complete_normally");
-    // `g` is at UTF-16 offset 15.
-    assert_eq!(rows[0].1, 15);
+    // `g` is at UTF-16 offset 14.
+    assert_eq!(rows[0].1, 14);
 }
 
 /// Two sibling local functions each report at their own name — the
@@ -123,8 +123,8 @@ fn two_local_functions_each_report_at_own_name() {
     assert_eq!(
         rows,
         vec![
-            ("body_might_complete_normally", 15),
-            ("body_might_complete_normally", 26),
+            ("body_might_complete_normally", 14),
+            ("body_might_complete_normally", 25),
         ],
         "{:?}",
         completion_rows(&report)
@@ -138,7 +138,7 @@ fn local_function_inside_method_reports() {
     let report = report("class A { int m() { int g() {} return g(); } }");
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally", 25)]
+        vec![("body_might_complete_normally", 24)]
     );
 }
 
@@ -148,7 +148,7 @@ fn local_function_inside_constructor_reports() {
     let report = report("class A { A() { int g() {} g(); } }");
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally", 21)]
+        vec![("body_might_complete_normally", 20)]
     );
 }
 
@@ -158,7 +158,7 @@ fn local_function_inside_closure_reports() {
     let report = report("var f = () { int g() {} return g(); };");
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally", 18)]
+        vec![("body_might_complete_normally", 17)]
     );
 }
 
@@ -170,7 +170,7 @@ fn local_function_inside_switch_case_reports() {
     );
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally", 41)]
+        vec![("body_might_complete_normally", 40)]
     );
 }
 
@@ -183,8 +183,8 @@ fn nested_local_function_reports_both_names() {
     assert_eq!(
         completion_rows(&report),
         vec![
-            ("body_might_complete_normally", 15),
-            ("body_might_complete_normally", 5),
+            ("body_might_complete_normally", 14),
+            ("body_might_complete_normally", 4),
         ]
     );
 }
@@ -196,7 +196,7 @@ fn deep_nested_local_function_reports_only_fallen_bodies() {
     let report = report("int f() { int g() { int h() {} return h(); } return g(); }");
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally", 25)]
+        vec![("body_might_complete_normally", 24)]
     );
 }
 
@@ -245,7 +245,7 @@ fn local_function_nullable_return_reports_nullable_twin() {
     let report = report("int f() { int? g() {} return g() ?? 0; }");
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally_nullable", 16)]
+        vec![("body_might_complete_normally_nullable", 15)]
     );
 }
 
@@ -256,7 +256,7 @@ fn local_function_never_return_reports_error() {
     let report = report("int f() { Never g() {} return g(); }");
     assert_eq!(
         completion_rows(&report),
-        vec![("body_might_complete_normally", 17)]
+        vec![("body_might_complete_normally", 16)]
     );
 }
 

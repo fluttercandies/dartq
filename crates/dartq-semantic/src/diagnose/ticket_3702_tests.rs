@@ -86,8 +86,8 @@ void f(void x) {
     );
     assert_eq!(
         rows(&report, "use_of_void_result"),
-        vec![(at("x);", fixture) + 1, 1)],
-        "the operand's void-consumption row anchors at the group's `)`"
+        vec![(at("(x)", fixture), 3)],
+        "the operand's void-consumption row anchors at the group `(x)` — the oracle's `.at(expression)` (#3767)"
     );
 }
 
