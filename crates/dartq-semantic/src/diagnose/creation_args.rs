@@ -86,7 +86,7 @@ impl Engine<'_> {
     /// the written instantiation. `None` when the head spells no group or
     /// the group's tail is not `.`/`(` (an `is`/`as` comparison the same
     /// bytes could otherwise mimic).
-    fn written_creation_args(&self, name: StringId, offset: u32) -> Option<Vec<Ty>> {
+    pub(crate) fn written_creation_args(&self, name: StringId, offset: u32) -> Option<Vec<Ty>> {
         let head_len = self.strings.resolve(name).encode_utf16().count() as u32;
         let mut cursor = self.byte_of(offset + head_len);
         let bytes = self.source.as_bytes();
@@ -120,7 +120,46 @@ impl Engine<'_> {
                 length: 1,
             },
         };
-        self.literal_group_args(left)
+        self.literal_group_args(left).or_else(|| {
+            // A `void` type argument (`A<void>`): `literal_group_args` reads
+            // the registered type-uses only, and `void` carries none — the
+            // group's whole parse declines and the raw parameter spelling
+            // survives into the argument check (`new A<void>(null)` reported
+            // `Null` against `T`). Re-derive the group's segments directly:
+            // a `void` segment answers `Ty::Void`, every other shape keeps
+            // the under-report posture rather than a partial substitution.
+            let bytes = self.source.as_bytes();
+            let inner_start = self.byte_of(offset + head_len) + 1;
+            let inner_end = cursor;
+            let mut segments = Vec::new();
+            let mut depth = 0usize;
+            let mut seg = inner_start;
+            for c in inner_start..inner_end {
+                match bytes[c] {
+                    b'<' | b'(' | b'[' => depth += 1,
+                    b'>' | b')' | b']' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => {
+                        segments.push((seg, c));
+                        seg = c + 1;
+                    }
+                    _ => {}
+                }
+            }
+            segments.push((seg, inner_end));
+            segments
+                .iter()
+                .map(|&(mut s, e)| {
+                    while s < e && bytes[s].is_ascii_whitespace() {
+                        s += 1;
+                    }
+                    let mut e = e;
+                    while e > s && bytes[e - 1].is_ascii_whitespace() {
+                        e -= 1;
+                    }
+                    (&bytes[s..e] == b"void").then_some(Ty::Void)
+                })
+                .collect()
+        })
     }
 
     /// The instantiate-to-bounds display of a raw generic head

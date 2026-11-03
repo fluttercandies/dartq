@@ -3836,13 +3836,27 @@ impl<'a> Engine<'a> {
             // would collapse the `Type`-display miss the alias literal
             // family pins (the `followed_by_period` lookahead is the same
             // `p.C` head probe the type-use arm runs).
-            BareInfo::Plain { ty }
-                if ty != Ty::UNKNOWN
-                    && !self.followed_by_period(range.end())
+            // The `Type` literal answer stands even when the alias's RHS
+            // never interned — a generic `typedef F<T> = …` whose right
+            // side leaves `var_ty` unknown still reads `Type` upstream
+            // (`_resolve2` rewrites on the element kind, not on whether
+            // the RHS rendered), so the decl-kind check outranks the
+            // `ty != UNKNOWN` gate and the plain face's ty order.
+            BareInfo::Plain { .. }
+                if !self.followed_by_period(range.end())
                     && self
                         .top_level_decl(name)
                         .is_some_and(|d| d.kind == MicroKind::TypeAlias) =>
             {
+                Ty::named(self.intern("Type"))
+            }
+            // A container name read in expression position is the same
+            // `Type` literal the alias arm above gives — `C` in `f(C)`
+            // types `Type`, never `Unknown` (a bare class/enum/mixin/
+            // extension name is the `TypeLiteral` upstream; a member-
+            // selector head `C.foo` keeps the receiver face through
+            // `shape.ty` — the same split the alias arm observes).
+            BareInfo::Container { .. } if !self.followed_by_period(range.end()) => {
                 Ty::named(self.intern("Type"))
             }
             BareInfo::Plain { ty } if ty != Ty::UNKNOWN => ty,

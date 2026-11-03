@@ -3548,6 +3548,36 @@ impl<'a> Engine<'a> {
             self.capture_ffi_invocation(level, close);
         } else {
         }
+        // The implicit named-selector creation's argument faces run here —
+        // the fold arm below drains the group's rows, so the check must
+        // precede `check_arguments` (which takes the level). A
+        // `new`/`const` keyworded head with no selector is the unnamed
+        // arm's own fold; only the selector-qualified spelling reaches this
+        // face. The head must be THIS level's own `named_head` — the
+        // `pending_bare_creation` fallback slot still carries an inner
+        // creation's head at the enclosing send's close (`f(A<int>.named
+        // (null))` would pair the outer arguments against `named`'s
+        // formals). An armed `pending_annotations` marks this group as a
+        // metadata argument list — `check_annotation_arguments` already
+        // walked its faces (the `@A.named("s")` arg would double-report).
+        if self.pending_send.is_none()
+            && !enum_const
+            && self.pending_annotations.is_empty()
+            && let Some(level) = levels.as_ref()
+            && let Some((head, head_range)) = level.named_head
+            && let Some((class, class_offset)) = self.creation_class_before(head_range)
+            && matches!(self.type_resolution(class).0, TypeResolution::Type)
+        {
+            self.check_named_creation_arguments(
+                level,
+                positional,
+                close,
+                class,
+                head,
+                head_range,
+                class_offset,
+            );
+        }
         self.check_arguments(levels, positional, close);
         self.pending_send = self
             .invokes
@@ -3701,6 +3731,14 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+        // The bare-creation latch is consumed by this close: it was armed
+        // at THIS group's `(` and re-armed at a nested one's, so a survivor
+        // would read as the enclosing group's head at the outer close
+        // (`f(A<int>.named(null))` folded `f`'s own arguments onto the
+        // inner `named` head — a phantom `A<int> -> int` verdict and a
+        // drained `Created` row — and `f2<int>(A<int>.named(null))` lost
+        // its outer `A<int> -> int` row to the same stale fold).
+        self.pending_bare_creation = None;
     }
 
     /// The `dart:ffi` verifier's invocation capture ([`super::ffi`]): the
@@ -10032,6 +10070,17 @@ impl<'a> Engine<'a> {
                     Some(self.boundary.args.borrow().get(args).to_vec())
                 }
                 _ => None,
+            })
+            .or_else(|| {
+                // The written `<...>` group the context-inference face
+                // declined (`creation_call_site_ty` returns `None` over a
+                // written head by design — the explicit group outranks the
+                // solve): the group still IS the instantiation
+                // (`new A<void>(null)` checks `t` against `void`, never the
+                // raw `T`). `written_creation_args` re-derives it from the
+                // bytes the fold's armed head never latched.
+                let (_, head_range) = level.unnamed_head?;
+                self.written_creation_args(head, head_range.offset)
             });
         let map: Vec<(StringId, Ty)> = match (instantiation, self.bounds.container_params(head)) {
             (Some(args), Some(params)) if params.len() == args.len() => params
@@ -10063,6 +10112,190 @@ impl<'a> Engine<'a> {
                 self.stage(StagedKind::Argument, *range, *ty, formal_ty, *literal);
             }
         }
+    }
+
+    /// The implicit named-selector creation's argument faces
+    /// (`C.named(...)`, `new C<T>.named(...)`, `C<T>.named(...)`, and the
+    /// `const` keyworded spellings): the constructor-reference posture
+    /// pushes no callee row, so [`Engine::check_arguments`] returns at its
+    /// invokes-less seam and the group's own close runs every face here —
+    /// the count faces, the required-named coverage, and the per-argument
+    /// assignability check against the selector's own formals. The
+    /// selector names a constructor the class declares; a selector the
+    /// class never declares reports `new_with_undefined_constructor` at
+    /// its own span and keeps the per-argument walk silent (the oracle
+    /// emits no `argument_type_not_assignable` against a constructor it
+    /// cannot resolve). The class segment's written `<...>` group is the
+    /// instantiation the formals substitute through (the same
+    /// `resolveArgumentsToParameters` pairing the keyworded unnamed arm
+    /// runs); a `new`/`const` keyworded head with no selector is the
+    /// unnamed arm's own fold, never this one's.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    fn check_named_creation_arguments(
+        &mut self,
+        level: &ArgLevel,
+        positional: u16,
+        close: SourceRange,
+        class: StringId,
+        selector: StringId,
+        selector_range: SourceRange,
+        class_offset: u32,
+    ) {
+        let Some((decl, owner)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            class,
+        ) else {
+            return;
+        };
+        if !self.ctor_face_exists(decl, class, selector) {
+            // A selector the class never declares is a different family's
+            // verdict (`new_with_undefined_constructor` for a `new`/`const`
+            // spelling, `undefined_method` for the non-keyword send) — its
+            // emit lives outside this ticket's code family, and the
+            // per-argument walk has no resolved formals to check against.
+            return;
+        }
+        // The mixin-application hop resolves the terminal container's
+        // forwarded constructor tables; a class's own selector reads its
+        // own. `ctor_schema_formals` carries the schema projection the
+        // send-close path reads (the element model's `ctor_formals` keeps
+        // the written spellings through it).
+        let Some((face, face_owner, face_name)) =
+            self.effective_ctor_container(decl, owner, class)
+        else {
+            return;
+        };
+        let key = if selector == class { face_name } else { selector };
+        let Some(mut formals) = face.ctor_formals.get(&key).map(|f| (**f).clone()) else {
+            return;
+        };
+        self.project_formals(face_owner, &mut formals);
+        if face_owner == self.file {
+            self.patch_field_formals(face_name, &mut formals);
+        }
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        if let Some(given) = positional.checked_sub(named) {
+            let given = usize::from(given);
+            let required = formals.positional.iter().filter(|f| f.required).count();
+            let capacity = formals.positional.len();
+            if given < required {
+                let anchor = level
+                    .args
+                    .iter()
+                    .filter(|(name, .., range)| name.is_none() && range.length > 0)
+                    .next_back()
+                    .map(|(.., range)| SourceRange {
+                        offset: range.offset + range.length,
+                        length: 1,
+                    })
+                    .or(level.first_label)
+                    .unwrap_or(close);
+                let selector_text = self.strings.resolve(selector).to_string();
+                let (shape, a0, a1) = if required == 1 {
+                    (
+                        ArgCountShape::NameSingular,
+                        selector_text.clone(),
+                        String::new(),
+                    )
+                } else {
+                    (
+                        ArgCountShape::NamePlural,
+                        required.to_string(),
+                        given.to_string(),
+                    )
+                };
+                let code = SemanticCode::NotEnoughPositionalArguments(shape);
+                let message = match shape {
+                    ArgCountShape::NamePlural => code.message3(&a0, &a1, &selector_text),
+                    _ => code.message(&a0, &a1),
+                };
+                self.emit_message_with_correction(code, anchor, message);
+            } else if given > capacity {
+                let distinct = level
+                    .args
+                    .iter()
+                    .filter_map(|(name, ..)| *name)
+                    .collect::<FxHashSet<_>>()
+                    .len();
+                let code = if formals.named.len() > distinct {
+                    SemanticCode::ExtraPositionalArgumentsCouldBeNamed
+                } else {
+                    SemanticCode::ExtraPositionalArguments
+                };
+                let mut seen = 0usize;
+                let mut surplus = None;
+                for (name, .., range) in &level.args {
+                    if name.is_some() {
+                        continue;
+                    }
+                    seen += 1;
+                    if seen == capacity + 1 && range.length > 0 {
+                        surplus = Some(*range);
+                    }
+                }
+                let anchor = (seen == given)
+                    .then_some(surplus)
+                    .flatten()
+                    .unwrap_or(close);
+                let message = code.message(&capacity.to_string(), &given.to_string());
+                self.emit_message_with_correction(code, anchor, message);
+            }
+        }
+        // The class segment's written `<...>` group instantiates the
+        // created type — the same face the unnamed fold resolves the group
+        // through; keyed on the class segment's offset (`A<int>.named(..)`
+        // reads `T := int`, `new A<void>.named(..)` reads `T := void`).
+        let written = self
+            .selector_dot_before(selector_range)
+            .and_then(|dot| {
+                self.literal_group_args(Token {
+                    id: 0,
+                    range: SourceRange {
+                        offset: dot,
+                        length: 1,
+                    },
+                })
+            })
+            .or_else(|| self.written_creation_args(class, class_offset));
+        let map: Vec<(StringId, Ty)> = match (written, self.bounds.container_params(class)) {
+            (Some(args), Some(params)) if params.len() == args.len() => params
+                .iter()
+                .map(|(param, _, _)| *param)
+                .zip(args)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut positional_index = 0usize;
+        for (name, ty, literal, range) in &level.args {
+            let formal = match name {
+                Some(name) => self.named_formal_for(&formals, *name),
+                None => {
+                    let formal = formals.positional.get(positional_index);
+                    positional_index += 1;
+                    formal
+                }
+            };
+            let Some(formal) = formal else {
+                continue;
+            };
+            let formal_ty = if map.is_empty() {
+                formal.ty
+            } else {
+                self.subst_params(formal.ty, &map).unwrap_or(formal.ty)
+            };
+            if self.argument_verdict(*ty, formal_ty, *literal) == Some(false) {
+                self.stage(StagedKind::Argument, *range, *ty, formal_ty, *literal);
+            }
+        }
+        self.emit_missing_required(&formals, &level.args, &[], selector_range);
     }
 
     /// The explicit super-constructor invocation's argument faces

@@ -8836,8 +8836,100 @@ impl<'a> Engine<'a> {
         (self.declared_type_params_of_container(name) == Some(0)).then_some(entry.return_ty)
     }
 
-    /// `TypeSystem::flatten` at name level — see [`flatten_ty`].
+    /// `TypeSystem::flatten` at name level — see [`flatten_ty`] for the
+    /// head/nullability arms. This method adds the type-parameter arm the
+    /// name-level helper cannot reach (type_system.dart:437-454): an
+    /// in-scope parameter `X` flattens through its captured bound — `X
+    /// extends Future<A>` awaits to `A`, `X extends FutureOr<A>` to `A`,
+    /// `X extends A` stays `X`, a chained parameter (`X extends Y`,
+    /// `Y extends Future<A>`) recurses through `Y`. The bound itself is
+    /// fed back through this method so a `Future<A>?` bound awaits to
+    /// `A?` and a bare `Future` bound awaits to `dynamic`. Unbounded or
+    /// non-Future bounds leave the parameter spelled as written
+    /// (identity), mirroring the oracle's `otherwise flatten(X)` return.
+    /// The walk is bounded by the parameter chain: a bound that names
+    /// the parameter itself (`X extends X` — rejected upstream) or loops
+    /// back would re-enter; the `depth` guard caps the recursion at the
+    /// in-scope parameter count, beyond which the parameter stays its
+    /// own flatten (under-report, never a hang).
     pub(crate) fn flatten(&self, ty: Ty) -> Ty {
+        // The chain cap doubles as the post-walk budget: in-scope the
+        // parameter count bounds the chain exactly, but the replays run
+        // with `type_params` emptied — a fixed small bound still covers
+        // every real chain (`X extends Y extends Z extends Future<A>`)
+        // while guaranteeing termination on cyclic spellings.
+        self.flatten_param(ty, 8)
+    }
+
+    fn flatten_param(&self, ty: Ty, depth: usize) -> Ty {
+        let Ty::Named {
+            name,
+            nullable,
+            args: list,
+        } = ty
+        else {
+            return ty;
+        };
+        // The `S?` arm mirrors `flatten_ty`'s own split — strip, flatten,
+        // re-apply — but the recursion must run through this method so a
+        // `X?` parameter keeps reading its bound's future type.
+        if nullable {
+            let flat = self.flatten_param(
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args: list,
+                },
+                depth,
+            );
+            return match flat {
+                Ty::Named { name, args, .. } => Ty::Named {
+                    name,
+                    nullable: true,
+                    args,
+                },
+                Ty::Record { shape, .. } => Ty::Record {
+                    shape,
+                    nullable: true,
+                },
+                Ty::Function { shape, .. } => Ty::Function {
+                    shape,
+                    nullable: true,
+                },
+                flat => flat,
+            };
+        }
+        // The parameter arm (type_system.dart:437-454 +
+        // `_futureTypeOfBounded`'s TypeParameterType recursion,
+        // :1856-1872): `X`'s future type is its bound's, chained through
+        // bound parameters (`X extends Y`, `Y extends Future<A>` → `A`).
+        // Only a bound that actually flattens to a future type rewrites
+        // `X`; every other bound leaves `X` spelled (the oracle's
+        // `otherwise flatten(X)` return — awaiting a non-future parameter
+        // yields the parameter itself, never the bound).
+        // The bound lookup rides the in-scope window when the scope is
+        // live (`param_bound` — authoritative), and the post-walk captures
+        // when the rows re-derive the operand's face after teardown
+        // (`param_bound_of` — the await-extent replays in row_resolution /
+        // invocation run with `type_params` already emptied; a name that
+        // no capture declares answers `None`, the concrete-head case).
+        if list == ArgListId::EMPTY && depth > 0 {
+            let bound = if self.is_scope_param(name) {
+                self.param_bound(name)
+            } else {
+                self.param_bound_of(name)
+            };
+            if let Some(bound) = bound
+                && bound != ty
+                && bound != Ty::UNKNOWN
+            {
+                let flat_bound = self.flatten_param(bound, depth - 1);
+                if flat_bound != bound {
+                    return flat_bound;
+                }
+                return ty;
+            }
+        }
         flatten_ty(self.strings, &self.boundary.pool(), ty)
     }
 
