@@ -4945,6 +4945,57 @@ impl ParserListener for DiagnoseListener<'_> {
         // `ThisExpression`/`SuperReference` (upstream `buildInitializer`'s
         // fold, ast_builder.dart:634-756).
         self.engine.init_item_head = Some(token.range.offset);
+        // The recovery arm that synthesizes a field name: an initializer item
+        // whose head is neither an identifier nor one of the three keyword
+        // arms (`assert`, `this`, `super`) makes the parser insert a whole
+        // synthetic assignment — a zero-length field name at the head token,
+        // then `=`, then a synthetic expression (upstream Dart SDK source,
+        // pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart,
+        // `parseInitializer`'s fallthrough:
+        // `insertSyntheticIdentifier(..., diag.expectedAnInitializer)`). The
+        // analyzer's `_checkForInvalidField` walks that empty spelling against
+        // the enclosing class's field set, finds no field named `''`, and
+        // reports `initializer_for_non_existent_field` at the zero-length node
+        // (`error_verifier.dart`). The shapes: `C() : var f;`, `C() : ;`,
+        // `C() : {} ...`, `C() :}` and the primary-constructor bodies
+        // `C() : new();` / `this:;` — all report `''` at the head token.
+        //
+        // A synthetic head carries no table entry and no stable offset
+        // (`text_of` answers `None` for parser-inserted tokens), so only real
+        // heads land here. The identifier arm (`f =`, and the `f var f`
+        // recovery that keeps the written name) and the keyword arms own
+        // their own rows.
+        // The head's own kind decides the arm: an identifier keeps the written
+        // name (and the `f var f` recovery keeps `f`), the three keyword arms
+        // own their rows, and a synthetic head carries no table entry — every
+        // other real head is the synthesized-assignment shape above.
+        let arm = self
+            .engine
+            .tokens
+            .get(token.id as usize)
+            .map(|scanned| scanned.kind.clone());
+        let owned_arm = matches!(
+            arm,
+            Some(
+                dartq_scanner::TokenKind::Identifier
+                    | dartq_scanner::TokenKind::Keyword(
+                        dartq_scanner::Keyword::Assert
+                            | dartq_scanner::Keyword::This
+                            | dartq_scanner::Keyword::Super
+                    )
+            )
+        );
+        if arm.is_some() && !owned_arm {
+            self.engine.emit(
+                SemanticCode::InitializerForNonExistentField,
+                SourceRange {
+                    offset: token.range.offset,
+                    length: 0,
+                },
+                "",
+                "",
+            );
+        }
     }
 
     fn end_initializer(&mut self, end: Token) {
@@ -7824,20 +7875,31 @@ impl ParserListener for DiagnoseListener<'_> {
         // — `l?[0][0]` reports `?.[0][0]` whole, `l?[0]?[1]` keeps one row
         // at the inner `?[` (the second `?` lands exactly at the inner
         // extent's end). The climb is kind-agnostic for the plain faces (a
-        // `?.`/`?[` root's climb covers every access parent); a cascade
-        // root grows too — `a?..[0][1]` keeps `first` an IndexExpression
-        // whose `period` is the `?..`, so the bare-body gate holds
-        // (`verifyCascadeExpression`'s index arm). The bracket's own close
-        // is the grown end; the operator offset is the containment key
-        // (`?` if present, `[` otherwise).
+        // `?.`/`?[` root's climb covers every access parent). A CASCADE
+        // root is the opposite: an index continuation chains the section's
+        // body (`?..[0][1]`, `?..sign[0]`), so `first.body` is no bare
+        // `CascadePropertyExtraction`/`CascadeMethodInvocation`/
+        // `CascadeIndexExpression` and `verifyCascadeExpression`'s gate
+        // fails — the root's row retires (oracle 3.13.7: `l?..[0][1];`
+        // reports nothing; the member-side `.` boundary rule's index twin).
+        // The bracket's own close is the grown end; the operator offset is
+        // the containment key (`?` if present, `[` otherwise).
         let index_op_offset = question_range.map_or(open.range.offset, |q| q.offset);
         if let Some(index) = engine
             .dead_null_chains
             .iter()
             .position(|(op, end, ..)| *op <= index_op_offset && index_op_offset <= *end)
         {
-            engine.dead_null_chains[index].1 =
-                engine.dead_null_chains[index].1.max(close.range.end());
+            match engine.dead_null_chains[index].3 {
+                crate::diagnose::types::DeadChainKind::CascadeMember
+                | crate::diagnose::types::DeadChainKind::CascadeIndex => {
+                    engine.dead_null_chains.remove(index);
+                }
+                _ => {
+                    engine.dead_null_chains[index].1 =
+                        engine.dead_null_chains[index].1.max(close.range.end());
+                }
+            }
         }
         if let Some(question_range) = question_range {
             // The same receiver typing `merge_member` runs (`f()?[i]`'s
@@ -7882,7 +7944,17 @@ impl ParserListener for DiagnoseListener<'_> {
                     .local_hits
                     .iter()
                     .find(|&(off, _)| recv.offset < *off && *off < recv.end())
-                    .and_then(|(&inner_offset, _)| {
+                    .map(|(&off, _)| off)
+                    // A paren group's own row can span only its closing
+                    // `)` (`(l)?[0]`) — the inner read then ends exactly at
+                    // the row's start. The shared helper admits the
+                    // one-identifier content alone, so `(c ? a : b)?[0]`
+                    // never unwraps.
+                    .or_else(|| {
+                        let inner = engine.paren_group_single_ident(recv.offset)?;
+                        engine.local_hits.contains_key(&inner).then_some(inner)
+                    })
+                    .and_then(|inner_offset| {
                         engine
                             .tokens
                             .as_slice()

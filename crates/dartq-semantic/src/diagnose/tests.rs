@@ -23525,6 +23525,10 @@ mod ticket_3765_tests;
 mod ticket_3779_tests;
 
 #[cfg(test)]
+#[path = "ticket_3799_tests.rs"]
+mod ticket_3799_tests;
+
+#[cfg(test)]
 #[path = "ticket_3780_tests.rs"]
 mod ticket_3780_tests;
 
@@ -23547,3 +23551,71 @@ mod ticket_3380_tests;
 #[cfg(test)]
 #[path = "ticket_3497_tests.rs"]
 mod ticket_3497_tests;
+
+#[cfg(test)]
+#[path = "ticket_3794_tests.rs"]
+mod ticket_3794_tests;
+
+#[cfg(test)]
+#[path = "ticket_3795_tests.rs"]
+mod ticket_3795_tests;
+
+#[cfg(test)]
+#[path = "ticket_3802_tests.rs"]
+mod ticket_3802_tests;
+
+#[cfg(test)]
+#[path = "ticket_3800_tests.rs"]
+mod ticket_3800_tests;
+
+#[cfg(test)]
+#[path = "ticket_3793_tests.rs"]
+mod ticket_3793_tests;
+
+#[cfg(test)]
+#[path = "ticket_3797_tests.rs"]
+mod ticket_3797_tests;
+
+#[cfg(test)]
+#[path = "ticket_3796_tests.rs"]
+mod ticket_3796_tests;
+
+#[cfg(test)]
+#[path = "ticket_3806_tests.rs"]
+mod ticket_3806_tests;
+
+#[cfg(test)]
+#[path = "ticket_3809_initializer_tests.rs"]
+mod ticket_3809_initializer_tests;
+
+// —— #3804 ——
+// Typedef-parameter bound-invariance: a parameter referenced inside its
+// aliased function type's own binder bounds is `invariant`
+// (variance_builder.dart:131-140), so its instantiate-to-bound default
+// reads `dynamic`, never the `Never` a `contravariant` occurrence alone
+// grounds. The pins cover the exact census fixture, a binder that names no
+// alias parameter (the regression guard), the non-function twin, and the
+// report-side `G<dynamic, A<dynamic>>` display.
+#[cfg(test)]
+#[path = "ticket_3804_tests.rs"]
+mod ticket_3804_tests;
+
+// —— #3809 ——
+// The raw-creation `could_not_infer` detail's `_` display (the detail
+// prints an unsolved sibling parameter as `_` while the twin spells it
+// out, so each reads its own `CreationInferenceRow` field) and the
+// named-constructor row's written extent (the oracle anchors the whole
+// `ConstructorName`, head first: `P._` spans 3, pinned against the
+// 3.13.7 oracle on the two census fixtures plus an unnamed-creation
+// control).
+#[cfg(test)]
+#[path = "ticket_3809_tests.rs"]
+mod ticket_3809_tests;
+
+// —— #3823 ——
+// The `unchecked_use_of_nullable_value` face's statement-operand rows
+// (for-in iterable, spread operand, unary void operand) and the
+// access-shape rules the census's 380-row miss/extra split localises.
+#[cfg(test)]
+#[path = "ticket_3823_tests.rs"]
+mod ticket_3823_tests;
