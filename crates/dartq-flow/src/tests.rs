@@ -8730,3 +8730,50 @@ fn return_switch_expression_scrutinee_latches_matched_types() {
         "matched rows carry the promoted non-null face: {matched:?}"
     );
 }
+
+/// A field promoted to `Null` by `is! Null` carries its real head on the
+/// read — `this._f == null` folds `true` and deads the else exactly like a
+/// local's promoted read (#4127's oracle behavior): the promoted `Null`
+/// face must reach the equality fold, not the opaque `UNKNOWN` marker.
+#[test]
+fn null_promoted_field_equality_deads_the_else() {
+    let source = "class C {\n\
+                  \x20 final Object? _f;\n\
+                  \x20 C(this._f);\n\
+                  \x20 void test() {\n\
+                  \x20   if (_f is! Null) return;\n\
+                  \x20   if (_f == null) { print(1); } else { print(2); }\n\
+                  \x20   if (_f != null) { print(3); } else { print(4); }\n\
+                  \x20 }\n\
+                  }";
+    let dead = dead_snippets(source);
+    assert_eq!(
+        dead,
+        vec![
+            "{ print(2); }".to_string(),
+            "{ print(3); }".to_string()
+        ],
+        "promoted-Null field reads fold both equality arms"
+    );
+}
+
+/// The widened read face keeps its class-head fold too: a field promoted
+/// to `int` reads `int` (not the opaque marker), so `_f == null` folds
+/// `false` under sound flow and deads the then arm.
+#[test]
+fn class_promoted_field_equality_deads_the_then() {
+    let source = "class C {\n\
+                  \x20 final Object? _f;\n\
+                  \x20 C(this._f);\n\
+                  \x20 void test() {\n\
+                  \x20   if (_f is! int) return;\n\
+                  \x20   if (_f == null) { print(1); } else { print(2); }\n\
+                  \x20 }\n\
+                  }";
+    let dead = dead_snippets(source);
+    assert_eq!(
+        dead,
+        vec!["{ print(1); }".to_string()],
+        "promoted-int field reads fold the equality's then arm"
+    );
+}

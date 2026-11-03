@@ -17,6 +17,7 @@ use dartq_types::{ExhaustivenessWorld, Key, Single, Space};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 
+
 /// The open-switch context stack: a `Vec` face for every caller (the
 /// `Deref` chain keeps `last`/`last_mut`/`len`/`is_empty` verbatim), with
 /// one twist — `pop` RETAINS the closed context into `completed` so the
@@ -2954,13 +2955,19 @@ impl<'a> NameWorld<'a> {
         // a map rest (`{...}`), and a provably non-list head makes
         // either spelling a never-match — the unknown space answers both
         // (under-report, never a false coverage claim).
+        // An extension type erases to its representation first
+        // (`extensionTypeErasure`): `ET1<int>` over `List<int>` IS a list
+        // at the pattern face, and its element column is the
+        // representation's (`list_pattern_resolver.dart:40-45` reads the
+        // matched value's element type through the erasure).
+        let erased = self.extension_erasure(&NameTy::from_semantic(scrutinee));
         let list = self.list_head();
-        let can_be_list = match scrutinee {
-            Ty::Named { name, .. } => {
-                name == list
-                    || self.named_sub(name, list)
-                    || self.named_sub(list, name)
-                    || !self.is_known_head(name)
+        let can_be_list = match &erased {
+            NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => {
+                *name == list
+                    || self.named_sub(*name, list)
+                    || self.named_sub(list, *name)
+                    || !self.is_known_head(*name)
             }
             // `dynamic`/unknown/record-or-function sentinels: a list is
             // always possible (under-report for the map-rest twin).
@@ -2969,9 +2976,9 @@ impl<'a> NameWorld<'a> {
         if !can_be_list {
             return None;
         }
-        let elem = match scrutinee {
-            Ty::Named { name, args, .. } if name == list => fold_engine()
-                .and_then(|engine| engine.boundary.pool().get(args).first().copied())
+        let elem = match &erased {
+            NameTy::NamedArgs(name, _, args) if *name == list => fold_engine()
+                .and_then(|engine| engine.boundary.pool().get(*args).first().copied())
                 .unwrap_or_else(|| self.nullable_form_obj()),
             _ => self.nullable_form_obj(),
         };

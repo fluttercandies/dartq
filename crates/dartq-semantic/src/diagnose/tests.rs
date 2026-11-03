@@ -23445,9 +23445,21 @@ mod ticket_3735_tests;
 mod ticket_3738_tests;
 
 #[cfg(test)]
+#[path = "ticket_3739_tests.rs"]
+mod ticket_3739_tests;
+
+#[cfg(test)]
 #[path = "ticket_3743_tests.rs"]
 mod ticket_3743_tests;
 
 #[cfg(test)]
 #[path = "ticket_3744_tests.rs"]
 mod ticket_3744_tests;
+
+#[cfg(test)]
+#[path = "ticket_3741_tests.rs"]
+mod ticket_3741_tests;
+
+#[cfg(test)]
+#[path = "ticket_3742_tests.rs"]
+mod ticket_3742_tests;

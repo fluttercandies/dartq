@@ -868,6 +868,23 @@ impl<'a> Engine<'a> {
         if faces.is_empty() {
             return;
         }
+        // The index-read pool (`[]` alone): upstream
+        // `IndexExpression.writeOrReadElement` (extensions.dart:244-246)
+        // resolves `[]=` for EVERY assignment form (`=`, `??=`, `+=`,
+        // `++`/`--`), so a write-only unit's `[]` declaration is still
+        // `unused_element` — but the resolve side's `extension_application`
+        // records the `[]` READ spelling beside `[]=` for every write row
+        // (`member` + `setter` pair at row_resolution's applied-face
+        // credit), crediting a member the oracle never used. The read-only
+        // set re-derives the `[]` verdict from the pass's own read-position
+        // credits: a `(face_file, face_index)` lands here only where a
+        // genuine `[]` READ applied — a pure `x[i]`/`L[i]` access, never a
+        // compound's write half. At the pass's end the pool is scrubbed:
+        // a `(file, index, "[]")` entry paired with `[]=` but missing here
+        // is the write-artifact.
+        let index_get = self.intern("[]");
+        let index_set = self.intern("[]=");
+        let mut index_read_used: FxHashSet<(FileId, u32)> = FxHashSet::default();
         // Self-use arm: the same-file faces keyed by the container spelling
         // the resolution rows record.
         let empty = self.intern("");
@@ -960,6 +977,11 @@ impl<'a> Engine<'a> {
                 && let Some(index) = unique_face(unit_ref.name)
                 && !in_extension_body(unit_ref.range.offset, index)
             {
+                // An Opaque `x[i]` row inside an extension body is the
+                // implicit-this `[]` READ — a genuine index read credit.
+                if unit_ref.name == index_get {
+                    index_read_used.insert((self.file, index));
+                }
                 derived.insert((self.file, index, unit_ref.name));
             }
         }
@@ -968,6 +990,9 @@ impl<'a> Engine<'a> {
                 && type_param_heads.contains(&type_name)
                 && let Some(index) = unique_face(read.name)
             {
+                if read.name == index_get {
+                    index_read_used.insert((self.file, index));
+                }
                 derived.insert((self.file, index, read.name));
             }
         }
@@ -1063,6 +1088,9 @@ impl<'a> Engine<'a> {
                         .filter_map(|(index, _)| u32::try_from(index).ok())
                         .collect();
                     for index in credits {
+                        if *name == index_get {
+                            index_read_used.insert((self.file, index));
+                        }
                         self.extension_member_used.insert((self.file, index, *name));
                     }
                 }
@@ -1140,6 +1168,12 @@ impl<'a> Engine<'a> {
                 })
                 .and_then(|index| u32::try_from(index).ok())
             {
+                // A `member_reads` `[]` row is the resolved `x[i]` read —
+                // a genuine read-position credit the write-artifact scrub
+                // below honors.
+                if read.name == index_get {
+                    index_read_used.insert((face_file, face_index));
+                }
                 self.extension_member_used
                     .insert((face_file, face_index, read.name));
                 self.credit_extension_import(face, face_file);
@@ -1223,11 +1257,11 @@ impl<'a> Engine<'a> {
                         } else {
                             self.intern("[]")
                         };
-                        self.credit_face_member(&faces, &declarers, member, head);
+                        self.credit_face_member(&faces, &declarers, member, head, &mut index_read_used);
                     }
                     // An implicit-`call` invocation (`0()`).
                     Some(b'(') => {
-                        self.credit_face_member(&faces, &declarers, call_spelling, head);
+                        self.credit_face_member(&faces, &declarers, call_spelling, head, &mut index_read_used);
                     }
                     _ => {}
                 }
@@ -1323,7 +1357,7 @@ impl<'a> Engine<'a> {
                     end += 1;
                 }
                 if let Some(op) = self.binary_operator_after(end.saturating_add(1)) {
-                    self.credit_face_member(&faces, &declarers, op, string_head);
+                    self.credit_face_member(&faces, &declarers, op, string_head, &mut index_read_used);
                 }
                 scan = end.saturating_add(1);
                 continue;
@@ -1356,7 +1390,7 @@ impl<'a> Engine<'a> {
                             None
                         };
                         if let Some(head) = head {
-                            self.credit_face_member(&faces, &declarers, op, head);
+                            self.credit_face_member(&faces, &declarers, op, head, &mut index_read_used);
                         }
                     }
                 }
@@ -1392,7 +1426,7 @@ impl<'a> Engine<'a> {
                         && self.source_member_access(self.strings.resolve(head), &member_text)
                 });
                 if applied {
-                    self.credit_face_member(&faces, &declarers, *member, self.intern("Function"));
+                    self.credit_face_member(&faces, &declarers, *member, self.intern("Function"), &mut index_read_used);
                 }
             }
         }
@@ -1433,9 +1467,9 @@ impl<'a> Engine<'a> {
             if let Some(member) = self.adjacent_write_member_at(read.offset, name_units)
                 && let Some(receiver) = receiver
             {
-                self.credit_face_member_ty(&faces, &declarers, member, receiver);
+                self.credit_face_member_ty(&faces, &declarers, member, receiver, &mut index_read_used);
                 let setter = self.setter_spelling(member);
-                self.credit_face_member_ty(&faces, &declarers, setter, receiver);
+                self.credit_face_member_ty(&faces, &declarers, setter, receiver, &mut index_read_used);
             }
             // The operator half (`x.f += 1`/`x.f++`): the application
             // resolves `operator<op>` on the member's DECLARED value type,
@@ -1445,7 +1479,7 @@ impl<'a> Engine<'a> {
                     .member_read_value_ty(&read)
                     .or(receiver)
                     .unwrap_or(Ty::UNKNOWN);
-                self.credit_face_member_ty(&faces, &declarers, op, operand);
+                self.credit_face_member_ty(&faces, &declarers, op, operand, &mut index_read_used);
             }
         }
         // The bare-record arm: `refs` carries every bare identifier the
@@ -1487,15 +1521,21 @@ impl<'a> Engine<'a> {
                     _ => None,
                 };
                 if let Some(receiver) = owner_ty {
-                    self.credit_face_member_ty(&faces, &declarers, member, receiver);
+                    self.credit_face_member_ty(&faces, &declarers, member, receiver, &mut index_read_used);
                     let setter = self.setter_spelling(member);
-                    self.credit_face_member_ty(&faces, &declarers, setter, receiver);
+                    self.credit_face_member_ty(&faces, &declarers, setter, receiver, &mut index_read_used);
                 }
             }
             if let Some(op) = self.adjacent_operator_at(unit_ref.range.offset, name_units)
                 && let Some(operand) = self.operand_ty_of_ref(&unit_ref)
             {
-                self.credit_face_member_ty(&faces, &declarers, op, operand);
+                self.credit_face_member_ty(
+                    &faces,
+                    &declarers,
+                    op,
+                    operand,
+                    &mut index_read_used,
+                );
             }
             // The implicit-`call` arm (`visitFunctionExpressionInvocation`,
             // unused_local_elements_verifier.dart:175-180): a bare callee
@@ -1505,7 +1545,13 @@ impl<'a> Engine<'a> {
                 && let Some(operand) = self.operand_ty_of_ref(&unit_ref)
                 && matches!(operand, Ty::Record { .. } | Ty::Function { .. })
             {
-                self.credit_face_member_ty(&faces, &declarers, call_spelling, operand);
+                self.credit_face_member_ty(
+                    &faces,
+                    &declarers,
+                    call_spelling,
+                    operand,
+                    &mut index_read_used,
+                );
             }
         }
         // The literal-prefix arm: a unary `~`/`-`/`++`/`--` ahead of a
@@ -1513,7 +1559,30 @@ impl<'a> Engine<'a> {
         // (`~"hello"` → `String`, `-1` → `int`). The bare-ref arm covers
         // only identifier operands — a literal carries no `refs` entry, so
         // the token stream re-derives this one family directly.
-        self.credit_prefix_literal_operators(&faces, &declarers);
+        self.credit_prefix_literal_operators(&faces, &declarers, &mut index_read_used);
+        // The write-artifact scrub (`writeOrReadElement` is `[]=` alone for
+        // every index write form): the resolve side credits the `[]` read
+        // spelling beside `[]=` on every applied write row, so a `(file,
+        // index, "[]")` entry that pairs with `[]=` but no read-position
+        // credit ever justified is the artifact — purge it before the
+        // verdict walks read the pool. A lone `[]` entry (no `[]=` pair) is
+        // a pure read the resolve side already settled — it stays.
+        let artifact_reads: Vec<(FileId, u32)> = self
+            .extension_member_used
+            .iter()
+            .filter(|&&(face_file, face_index, spelling)| {
+                spelling == index_get
+                    && !index_read_used.contains(&(face_file, face_index))
+                    && self
+                        .extension_member_used
+                        .contains(&(face_file, face_index, index_set))
+            })
+            .map(|&(face_file, face_index, _)| (face_file, face_index))
+            .collect();
+        for (face_file, face_index) in artifact_reads {
+            self.extension_member_used
+                .remove(&(face_file, face_index, index_get));
+        }
     }
 
     /// The member spelling a `??=`/compound/`++`/`--` write credits beside
@@ -1711,6 +1780,7 @@ impl<'a> Engine<'a> {
         declarers: &FxHashMap<StringId, u32>,
         member: StringId,
         receiver: Ty,
+        index_read_used: &mut FxHashSet<(FileId, u32)>,
     ) -> bool {
         if declarers.get(&member).copied() != Some(1) {
             return false;
@@ -1736,6 +1806,13 @@ impl<'a> Engine<'a> {
             })
             .and_then(|index| u32::try_from(index).ok())
         {
+            // A `[]` credit through this arm is always read-position — the
+            // caller's `adjacent_operator_at` already split the write
+            // verdict (`[]=`) out, so the read spelling here justifies the
+            // pool entry the write-artifact scrub honors.
+            if member == self.intern("[]") {
+                index_read_used.insert((face_file, face_index));
+            }
             self.extension_member_used
                 .insert((face_file, face_index, member));
             self.credit_extension_import(face, face_file);
@@ -2051,6 +2128,7 @@ impl<'a> Engine<'a> {
         &mut self,
         faces: &[(&ExtensionFace, FileId)],
         declarers: &FxHashMap<StringId, u32>,
+        index_read_used: &mut FxHashSet<(FileId, u32)>,
     ) {
         let tokens = self.tokens.as_slice();
         let mut index = 0usize;
@@ -2109,7 +2187,13 @@ impl<'a> Engine<'a> {
                 _ => None,
             };
             if let Some(head) = head {
-                self.credit_face_member_ty(faces, declarers, self.intern(op), Ty::named(head));
+                self.credit_face_member_ty(
+                    faces,
+                    declarers,
+                    self.intern(op),
+                    Ty::named(head),
+                    index_read_used,
+                );
             }
             index += 1;
         }
@@ -2569,6 +2653,7 @@ impl<'a> Engine<'a> {
         declarers: &FxHashMap<StringId, u32>,
         member: StringId,
         head: StringId,
+        index_read_used: &mut FxHashSet<(FileId, u32)>,
     ) -> bool {
         if declarers.get(&member).copied() != Some(1) {
             return false;
@@ -2593,6 +2678,11 @@ impl<'a> Engine<'a> {
             })
             .and_then(|index| u32::try_from(index).ok())
         {
+            // The literal-index byte arm calls this with `[]` for a read
+            // follower alone — a genuine read-position credit.
+            if member == self.intern("[]") {
+                index_read_used.insert((face_file, face_index));
+            }
             self.extension_member_used
                 .insert((face_file, face_index, member));
             self.credit_extension_import(face, face_file);

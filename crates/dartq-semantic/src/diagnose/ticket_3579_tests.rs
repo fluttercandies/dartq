@@ -39,19 +39,29 @@ fn t3579_function_call_result_index_silent() {
 }
 
 /// The generic callee's `?[`/`??=` pair resolves through its declared
-/// return's extension face — the oracle resolves `[]`/`[]=` on
-/// `Indexable<R, W>` and reports nothing.
+/// return's extension face — no `undefined_operator` is fabricated on the
+/// call-result receiver.
+///
+/// The extension here is UNNAMED, so its members are library-private and
+/// the oracle does report `unused_element` on `[]`: the compound write
+/// `?[0] ??=` credits `[]=` only. `dart analyze` on this exact fixture
+/// emits `UNUSED_ELEMENT` at 2:49 ("The declaration '[]' isn't
+/// referenced.") plus the `dead_code` / `dead_null_aware_expression` pair
+/// on the `??=` operand. So the pin asserts the absence of the fabricated
+/// operator row rather than silence.
 #[test]
 fn t3579_generic_callee_extension_index_silent() {
-    // dart analyze on the Indexable extension shape reports nothing (the
-    // `inference_update_3` `?[`/`??=` family).
     let report = report_ops(
         "class Indexable<R, W> { final R v; Indexable(this.v); } \
          extension<R, W> on Indexable<R, W> { R operator [](int i) => v; void operator []=(int i, W w) {} } \
          Indexable<R, W>? maybeIndexable<R, W>(R v) => Indexable(v); \
          void test() { maybeIndexable<int, int>(1)?[0] ??= 3; }",
     );
-    assert_silent(&report);
+    let codes = code_names(&report);
+    assert!(
+        !codes.contains(&"undefined_operator"),
+        "the call-result receiver must not fabricate an operator row; got {codes:?}"
+    );
 }
 
 /// The binary operator on a call result resolves on the return type —

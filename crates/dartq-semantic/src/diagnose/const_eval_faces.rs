@@ -80,6 +80,102 @@ fn skip_balanced(bytes: &[u8], i: usize, open: u8) -> usize {
     start
 }
 
+/// Skips whitespace and `//`/`/* */` comments; returns the first
+/// non-trivia byte index at/after `i`.
+fn ws_skip(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            _ => break,
+        }
+    }
+    i
+}
+
+/// The end index of one identifier lexeme starting at `i`
+/// (`[A-Za-z_$][A-Za-z0-9_$]*`); `i` unchanged when the byte is not an
+/// identifier start.
+fn ident_end(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i) {
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' || *b == b'$' => {
+            let mut j = i + 1;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'$')
+            {
+                j += 1;
+            }
+            j
+        }
+        _ => i,
+    }
+}
+
+/// Whether the identifier ending at `i` is `kw` — walks back over the
+/// lexeme and confirms a non-identifier boundary on its left (a `myFunction`
+/// or `xFunction` identifier never aliases the keyword).
+fn preceded_by_keyword(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    let mut j = i;
+    while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+        j -= 1;
+    }
+    &bytes[j..i] == kw
+}
+
+/// Collects the byte spans of every leaf identifier inside the
+/// `<...>` type-argument group `(open, close)` that spells an in-scope
+/// type parameter — the recursive-leaf face of the oracle's
+/// `_checkForConstWithTypeParameters` walk. A nested `<...>` group a
+/// `Function` keyword opens is that function type's OWN parameter list
+/// (its idents are exempt `allowedTypeParameters` upstream), so the scan
+/// steps over it; any other nested group's interior is recursed so a
+/// parameterized argument's inner `T` leaf reports at its own span.
+fn param_leaf_spans(
+    bytes: &[u8],
+    source: &str,
+    strings: &StringTable,
+    open: usize,
+    close: usize,
+    params: &[StringId],
+    spans: &mut Vec<(usize, usize)>,
+) {
+    let mut j = open + 1;
+    while j < close.saturating_sub(1) {
+        match bytes[j] {
+            b'<' => {
+                let inner_end = skip_balanced(bytes, j, b'<');
+                if inner_end == j {
+                    break;
+                }
+                if !preceded_by_keyword(bytes, j, b"Function") {
+                    param_leaf_spans(bytes, source, strings, j, inner_end, params, spans);
+                }
+                j = inner_end;
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => {
+                let end = ident_end(bytes, j);
+                let text = &source[j..end];
+                if params.iter().any(|p| strings.resolve(*p) == text) {
+                    spans.push((j, end));
+                }
+                j = end;
+            }
+            _ => j += 1,
+        }
+    }
+}
+
 impl ConstLookup for CtorScope<'_, '_> {
     fn ident(&self, name: StringId) -> IdentVerdict {
         match self.env.get(&name) {
@@ -942,6 +1038,15 @@ impl<'a> Engine<'a> {
     /// file declared arms the argument check (foreign and non-const
     /// targets defer — under-report).
     pub fn arm_const_ctor_gate(&mut self, head: Token) {
+        // An explicit `const C<T>`-shaped reference: the type-argument check
+        // runs for every const-context constructor reference the verifier
+        // visits (`visitInstanceCreationExpression.isConst` —
+        // `_checkForConstWithTypeParameters`), independent of whether the
+        // constructor resolves or is const, so it fires here before the
+        // gate below decides the argument check.
+        if let Some(name) = self.name_of(head) {
+            self.emit_const_type_param_args(name, self.byte_of(head.range.end()));
+        }
         let gate = self
             .name_of(head)
             .is_some_and(|name| self.const_ctor_target(name));
@@ -1123,6 +1228,131 @@ impl<'a> Engine<'a> {
         self.rows.get(callee.checked_sub(1)?)
     }
 
+    /// Reports `const_with_type_parameters` once per type-parameter type
+    /// argument a const creation's head carries — the oracle's
+    /// `_checkForConstWithTypeParameters` walks the written `NamedType`'s
+    /// `typeArguments` recursively and reports each `TypeParameterElement`
+    /// leaf at its own span (upstream Dart SDK source, pkg/analyzer/lib/src/
+    /// dart/constant/constant_verifier.dart:591-660), BEFORE the
+    /// constructor resolves, so an unresolved (`Missing<T>`) or non-const
+    /// (`A<T>()` with no const constructor) head still answers.
+    ///
+    /// The head face gates: a class container, an import prefix, or an
+    /// unresolved name reaches the check; a function or value head
+    /// (`f<T>()`, `x.C<T>()`) is the invocation/teardown face, never a
+    /// creation — `resolve_bare` reads that distinction directly. The args
+    /// are scanned from the WRITTEN `<...>` group's interior (not the row
+    /// stack — a resolved type-param leaf pushes no `TypeUse` row), so a
+    /// param-spelled leaf (`T`) and a nested param (`List<T>`'s inner `T`)
+    /// each report at their own byte span. A `Function<U>` group's OWN
+    /// `<U>` declares that function type's parameter (`allowedTypeParameters`
+    /// exempts it upstream), so the scan skips the parameter-list bracket
+    /// that follows the `Function` keyword and only visits the argument
+    /// leaves around it.
+    fn emit_const_type_param_args(&mut self, head_name: StringId, head_byte_end: usize) {
+        match self.resolve_bare(head_name).0 {
+            BareInfo::Container { .. } | BareInfo::Prefix { .. } | BareInfo::Missing { .. } => {}
+            BareInfo::Plain { .. } => return,
+        }
+        // Locate the `<...>` type-argument group: skip the optional `.C`
+        // qualified rest of a `prefix.C` head, then the group's `<`.
+        let bytes = self.source.as_bytes();
+        let mut i = ws_skip(bytes, head_byte_end);
+        if bytes.get(i) == Some(&b'.') {
+            i = ws_skip(bytes, i + 1);
+            i = ident_end(bytes, i);
+            i = ws_skip(bytes, i);
+        }
+        if bytes.get(i) != Some(&b'<') {
+            return;
+        }
+        let group_end = skip_balanced(bytes, i, b'<');
+        if group_end == i {
+            return;
+        }
+        let params: Vec<StringId> = self
+            .type_params
+            .iter()
+            .chain(self.pending_type_params.iter())
+            .copied()
+            .collect();
+        if params.is_empty() {
+            return;
+        }
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        param_leaf_spans(
+            bytes,
+            self.source,
+            self.strings,
+            i,
+            group_end,
+            &params,
+            &mut spans,
+        );
+        for (start, end) in spans {
+            self.emit(
+                SemanticCode::ConstWithTypeParameters,
+                SourceRange {
+                    offset: self.utf16_of(start),
+                    length: self.utf16_of(end) - self.utf16_of(start),
+                },
+                "",
+                "",
+            );
+        }
+    }
+
+    /// The implicit-creation face of [`Self::emit_const_type_param_args`]:
+    /// `const x = C<T>(...)` / `const x = C<T>.named(...)` carry no `const`
+    /// keyword before the head, so no `ConstructorReferenceContext::Const`
+    /// event fires — the argument group's close (this `classify_call`) is
+    /// the only hook that sees the whole reference. `name` is the callee
+    /// (`C` for the unnamed shape, `named` for the qualified one); the head
+    /// resolves from the callee row.
+    ///
+    /// A bare callee IS the head (`const x = C<T>(` — the send latched `C`
+    /// itself); a qualified callee's head sits behind the type-argument
+    /// rows (`C<T>.named(` — `invokes.last()` is `named`'s selector row,
+    /// `T`'s `TypeUse` row and `C`'s head row stack below it). The scan
+    /// stops at the first non-`TypeUse` row, which for the qualified shape
+    /// is the class head. `this`/`super`/`new` heads name no creation the
+    /// check accepts — the keyword guard excludes them before the
+    /// `resolve_bare` read (their `Missing`/`Receiver` faces would
+    /// otherwise reach the emit).
+    fn emit_const_type_param_call_args(&mut self) {
+        let Some(callee_index) = self.invokes.last().and_then(|slot| *slot) else {
+            return;
+        };
+        // Resolve the head row: the callee itself for a bare reference, or
+        // the last non-`TypeUse` row below a qualified selector.
+        let head = match self.rows.get(callee_index) {
+            Some(callee) if callee.qualified => {
+                let mut index = callee_index;
+                while index > 0
+                    && matches!(
+                        self.rows.get(index - 1).map(|r| &r.shape),
+                        Some(RowShape::TypeUse(..))
+                    )
+                {
+                    index -= 1;
+                }
+                index.checked_sub(1).and_then(|i| self.rows.get(i))
+            }
+            other => other,
+        };
+        let Some(head) = head else {
+            return;
+        };
+        let head_name = head.name;
+        let head_end = head.range.end();
+        // `this`/`super`/`new` heads carry no class the check accepts.
+        match self.strings.resolve(head_name) {
+            "this" | "super" | "new" => return,
+            _ => {}
+        }
+        self.emit_const_type_param_args(head_name, self.byte_of(head_end));
+    }
+
     /// The callee classification a closed bare-identifier call resolves
     /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`). The
     /// `&mut` receiver stages the `C.named(` implicit-const creation the
@@ -1165,6 +1395,18 @@ impl<'a> Engine<'a> {
         // shape). `const_kw_spans` being non-empty marks the explicit
         // prefix.
         let in_pattern_expression = self.const_capture.top_is_map_pattern_key();
+        // The implicit-creation type-argument check (`const x = C<T>(`) —
+        // the creation carries no `const` keyword so no
+        // `ConstructorReferenceContext::Const` event armed the explicit
+        // hook; the argument group's close is the only point that sees the
+        // whole reference. A map-pattern key's window is NOT a const
+        // context (the enclosing site reports `non_constant_map_pattern_key`
+        // at the creation, never the type-argument face), so the emit is
+        // gated on the same `in_pattern_expression` read the verdict below
+        // uses.
+        if !in_pattern_expression {
+            self.emit_const_type_param_call_args();
+        }
         if self.const_ctor_target(name) {
             return if in_pattern_expression {
                 CallClass::ValueCall

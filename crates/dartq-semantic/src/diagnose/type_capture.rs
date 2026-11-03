@@ -2532,6 +2532,15 @@ impl<'a> Engine<'a> {
         // only post-pass-2 resolution products); when a natural slot
         // frees, this call moves there verbatim.
         self.report_member_use_warnings();
+        // HELD-WIRING SEAM (#3744): the fabricated extension-member
+        // `type_argument_not_matching_bounds` prune runs here because every
+        // natural slot — the pass-1 emit seam (`check_call_type_arg_bounds`,
+        // invocation.rs) and the bounds table (`extension_member_bounds`,
+        // invocation.rs) — sits in a sibling lane's file this round. The
+        // pass is self-contained (it re-decides emitted rows against the
+        // post-pass-2 receiver re-derivation); when a natural slot frees,
+        // this call moves there verbatim.
+        self.prune_fabricated_bounds_rows();
         if self.var_containers.is_empty() {
             return;
         }
@@ -3058,6 +3067,471 @@ impl<'a> Engine<'a> {
             Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Never | Ty::Void => None,
         }
     }
+
+    /// #3744 — the fabricated `type_argument_not_matching_bounds` prune:
+    /// every emitted row anchored at a member send's written type argument
+    /// re-decides against the receiver's RE-DERIVED static face
+    /// ([`Self::promoted_receiver`]), the same question pass 1 answered on
+    /// the frozen push-time face. The oracle's extension-member bounds
+    /// face reads the member's instantiated type over the resolved
+    /// receiver (`type_arguments_verifier.dart`: the `node.function
+    /// .staticType` the resolver stamped — promoted where a promotion
+    /// stands), so a `n is int` local read's `expectStaticType` send
+    /// checks `Exactly<int>` where the frozen `num` face checked
+    /// `Exactly<num>` — a fabricated extra per emit.
+    ///
+    /// The re-verdict only DROPS: a row whose seam cannot be identified
+    /// (no member-read record, no written type-argument group, a
+    /// container-declared member, an ambiguous extension pool), whose
+    /// receiver re-decides to the same face, or whose substituted
+    /// verdict still fails keeps byte for byte — the under-report
+    /// direction, never a new fabrication.
+    fn prune_fabricated_bounds_rows(&mut self) {
+        use dartq_scanner::TokenKind as K;
+        if !self
+            .report
+            .diagnostics
+            .iter()
+            .any(|row| row.code.name == "type_argument_not_matching_bounds")
+        {
+            return;
+        }
+        self.accessible_extension_faces();
+        // Each member read whose token is followed by a `<...>` type
+        // argument group: `(group extent, member offset, member spelling,
+        // recv)`. Rows anchored inside the extent are the candidates.
+        let mut sends: Vec<(u32, u32, u32, StringId, Receiver)> = Vec::new();
+        for read in &self.member_reads {
+            let at = self
+                .tokens
+                .as_slice()
+                .partition_point(|t| t.utf16_offset <= read.offset);
+            let Some(member_token) = at.checked_sub(1) else {
+                continue;
+            };
+            let tokens = self.tokens.as_slice();
+            if tokens[member_token].utf16_offset != read.offset {
+                continue;
+            }
+            let Some(lt) = tokens
+                .get(member_token + 1)
+                .filter(|t| t.kind == K::Lt)
+                .map(|_| member_token + 1)
+            else {
+                continue;
+            };
+            let Some(gt) = self.tokens.matching_end(lt) else {
+                continue;
+            };
+            // The group's own `>` is the matched token's LAST angle: the
+            // scanner folds adjacent closers into one `GtGt`/`GtGtGt`
+            // (the parser's closer-split may or may not have separated
+            // them), so the inner `>` closes a nested group and the last
+            // byte closes this one. `byte_len` equals the UTF-16 length
+            // for an all-ASCII closer run.
+            sends.push((
+                tokens[lt].utf16_offset,
+                tokens[gt].utf16_offset + tokens[gt].byte_len - 1,
+                read.offset,
+                read.name,
+                read.recv,
+            ));
+        }
+        if sends.is_empty() {
+            return;
+        }
+        // Per send, the group's argument spellings parsed once — the
+        // `(arg utf16 start, Ty)` column the row's anchor keys on.
+        let mut parsed: Vec<Option<Vec<(u32, Ty)>>> = Vec::with_capacity(sends.len());
+        for &(lt, gt, _, _, _) in &sends {
+            parsed.push(self.written_group_args(lt, gt));
+        }
+        // The candidates: `(row offset, send index)` pairs whose anchor
+        // sits inside a member send's written group. Collected before the
+        // re-verdict pass — the verdict borrows `self` mutably (the
+        // extension-face lazy fill, the application latch).
+        let mut candidates: Vec<(u32, usize)> = Vec::new();
+        for row in &self.report.diagnostics {
+            if row.code.name != "type_argument_not_matching_bounds" {
+                continue;
+            }
+            for (index, &(lt, gt, _, _, _)) in sends.iter().enumerate() {
+                if lt < row.range.offset && row.range.offset < gt && parsed[index].is_some() {
+                    candidates.push((row.range.offset, index));
+                }
+            }
+        }
+        let mut drop_offsets: FxHashSet<u32> = FxHashSet::default();
+        for (offset, index) in candidates {
+            let (_, _, member_at, member, recv) = sends[index];
+            let args = parsed[index].as_deref().expect("gated above");
+            let Some(arg_at) = args
+                .iter()
+                .position(|&(start, _)| start == offset)
+                .or_else(|| {
+                    // `written_function_literal_span` grows a bare
+                    // `Function` head through its formals group — match
+                    // by containment inside the segment instead.
+                    args.iter()
+                        .position(|&(start, _)| {
+                            start <= offset
+                                && args.iter().all(|&(s, _)| !(start < s && s <= offset))
+                        })
+                })
+            else {
+                continue;
+            };
+            let arg = args[arg_at].1;
+            if self.bounds_row_conforms(member_at, member, recv, args, arg, arg_at) {
+                drop_offsets.insert(offset);
+            }
+        }
+        if drop_offsets.is_empty() {
+            return;
+        }
+        self.report.diagnostics.retain(|row| {
+            row.code.name != "type_argument_not_matching_bounds"
+                || !drop_offsets.contains(&row.range.offset)
+        });
+    }
+
+    /// The re-decided verdict of one emitted bounds row (#3744): `true`
+    /// when the member send re-resolves to a single extension member
+    /// whose bound — instantiated over the receiver's RE-DERIVED face and
+    /// the written group's arguments — the offending argument satisfies.
+    /// `false` keeps the row (the under-report direction).
+    fn bounds_row_conforms(
+        &mut self,
+        member_at: u32,
+        member: StringId,
+        recv: Receiver,
+        args: &[(u32, Ty)],
+        arg: Ty,
+        arg_at: usize,
+    ) -> bool {
+        // The receiver face pass 2 re-derives: a promotion, a chained
+        // link's settled result, or a narrowing reads here; the frozen
+        // face unchanged answers the same verdict pass 1 gave.
+        let recv = self.promoted_receiver(member_at, recv);
+        let (head, receiver_ty, receiver_nullable) = match recv {
+            Receiver::Typed { type_name, ty } => {
+                (type_name, ty, self.potentially_nullable(ty))
+            }
+            Receiver::This { container, kind } => {
+                let ty = self.this_static_ty(container, kind);
+                let Ty::Named { name, .. } = ty else {
+                    return false;
+                };
+                (name, ty, self.potentially_nullable(ty))
+            }
+            _ => return false,
+        };
+        // A member the receiver's own container declares never rode the
+        // extension seam — its param table is the container's, and its
+        // row keeps the frozen verdict.
+        if let Walk::Found(entry) = self.walk_members(head, member)
+            && entry.kind == MemberKind::Method
+        {
+            return false;
+        }
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
+        let declarers: Vec<(&crate::model::ExtensionFace, FileId)> = faces
+            .iter()
+            .filter(|(face, _)| {
+                face.members
+                    .get(&member)
+                    .is_some_and(|entry| entry.kind == MemberKind::Method)
+            })
+            .copied()
+            .collect();
+        if declarers.len() != 1 {
+            return false;
+        }
+        let (face, face_file) = declarers[0];
+        match self.extension_application(head, receiver_ty, member, false, receiver_nullable) {
+            ExtensionApp::Single | ExtensionApp::UnsafeSingle => {}
+            ExtensionApp::None | ExtensionApp::Ambiguous(_) => return false,
+        }
+        let Some(entry) = face.members.get(&member) else {
+            return false;
+        };
+        if entry.type_param_names.is_empty() || arg_at >= entry.type_param_names.len() {
+            return false;
+        }
+        // The extension's own parameters instantiate from the re-decided
+        // receiver — the same binding `extension_member_bounds` builds:
+        // a bare own-parameter `on` head binds `T := receiver` wholesale,
+        // a generic `on` head binds its argument positions through the
+        // receiver's written arguments.
+        let mut bindings: Vec<(StringId, Ty)> = Vec::new();
+        if let Some(on_head) = face.on_type
+            && face.type_param_names.contains(&on_head)
+        {
+            bindings.push((on_head, receiver_ty));
+        } else if let (
+            Ty::Named {
+                name: on_head,
+                args: on_args,
+                ..
+            },
+            Ty::Named {
+                name: recv_head,
+                args: recv_args,
+                ..
+            },
+        ) = (self.boundary.ty(face_file, face.on_ty), receiver_ty)
+            && on_head == recv_head
+        {
+            let on_args = self.boundary.pool().get(on_args).to_vec();
+            let recv_args = self.boundary.pool().get(recv_args).to_vec();
+            if on_args.len() == recv_args.len() {
+                for (param, arg) in on_args.iter().zip(recv_args) {
+                    if let Ty::Named {
+                        name,
+                        args: ArgListId::EMPTY,
+                        ..
+                    } = param
+                        && face.type_param_names.contains(name)
+                    {
+                        bindings.push((*name, arg));
+                    }
+                }
+            }
+        }
+        let Some(bound) = entry.type_param_bounds.get(arg_at).copied() else {
+            return false;
+        };
+        if matches!(bound, Ty::Dynamic | Ty::Unknown) {
+            return false;
+        }
+        let bound = self.boundary.ty(face_file, bound);
+        let Some(bound) = (if bindings.is_empty() {
+            Some(bound)
+        } else {
+            self.subst_params(bound, &bindings)
+        }) else {
+            return false;
+        };
+        // The member's own parameters substitute the written group's
+        // arguments (the `<TFrom, TTo extends Iterable<TFrom>>` shapes),
+        // truncated to the shared prefix exactly like the emit's map.
+        let len = entry.type_param_names.len().min(args.len());
+        let map: Vec<(StringId, Ty)> = entry.type_param_names[..len]
+            .iter()
+            .zip(args[..len].iter())
+            .map(|(name, (_, ty))| (*name, *ty))
+            .collect();
+        let Some(bound) = self.subst_params(bound, &map) else {
+            return false;
+        };
+        if !self.call_type_arg_decidable_at(arg) || !self.call_type_arg_decidable_at(bound) {
+            return false;
+        }
+        self.assignable(arg, bound, false) == Some(true)
+    }
+
+    /// The decidability gate of the bounds emit (`call_type_arg_decidable`
+    /// in invocation.rs): a bare named head must resolve as a type; every
+    /// compound shape decides. Kept beside the prune so the port stays
+    /// self-contained.
+    fn call_type_arg_decidable_at(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Named {
+                name,
+                args: ArgListId::EMPTY,
+                ..
+            } => self.named_type_is_type(name),
+            _ => true,
+        }
+    }
+
+    /// The written type-argument group's members as `(utf16 start, Ty)`
+    /// pairs, parsed from the source bytes between `lt` and `gt` (the
+    /// angle offsets). The head of each segment resolves through the
+    /// recorded `type_uses` (textual order); a segment that fails to
+    /// parse — a function-type spelling, an unresolved head, trailing
+    /// residue — drops the whole group to `None` (the keep direction).
+    fn written_group_args(&self, lt: u32, gt: u32) -> Option<Vec<(u32, Ty)>> {
+        let bytes = self.source.as_bytes();
+        let start = self.byte_of(lt) + 1;
+        let end = self.byte_of(gt);
+        if start > end {
+            return None;
+        }
+        let mut segments = Vec::new();
+        let mut seg_start = start;
+        let mut i = start;
+        let mut depth = 0usize;
+        while i < end {
+            match bytes[i] {
+                b'<' | b'(' | b'[' | b'{' => depth += 1,
+                b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    segments.push((seg_start, i));
+                    seg_start = i + 1;
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < end && bytes[i] != quote {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        segments.push((seg_start, end));
+        let mut args = Vec::with_capacity(segments.len());
+        for (s, e) in segments {
+            let s = {
+                let mut s = s;
+                while s < e && bytes[s].is_ascii_whitespace() {
+                    s += 1;
+                }
+                s
+            };
+            if s >= e {
+                return None;
+            }
+            let ty = self.written_arg_ty(s, e)?;
+            args.push((self.utf16_of(s), ty));
+        }
+        Some(args)
+    }
+
+    /// One written argument's [`Ty`] over its byte segment: the head
+    /// identifier tokenized from the bytes (invocation type-argument
+    /// spellings ride no `type_uses` publication — the head is simply the
+    /// first identifier, qualified spellings `p.C` keeping the leaf), its
+    /// optional nested `<...>` group, and a trailing `?`. `None` on any
+    /// residue (a function-form spelling, a non-type head, trailing
+    /// bytes the grammar would not admit) — the keep direction.
+    fn written_arg_ty(&self, start: usize, end: usize) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        // The head identifier, qualified spellings `p.C` keeping the leaf
+        // `C`: ident runs joined by single dots; a head that is not an
+        // identifier fails the parse.
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut leaf = start;
+        let head_end = loop {
+            let mut e = leaf;
+            while e < end && ident(bytes[e]) {
+                e += 1;
+            }
+            if e == leaf || bytes[leaf].is_ascii_digit() {
+                return None;
+            }
+            if e + 1 < end && bytes[e] == b'.' && bytes[e + 1] != b'.' {
+                leaf = e + 1;
+            } else {
+                break e;
+            }
+        };
+        let name = self
+            .strings
+            .intern(std::str::from_utf8(&bytes[leaf..head_end]).ok()?);
+        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+            return None;
+        }
+        match self.strings.resolve(name) {
+            "dynamic" => return Some(Ty::Dynamic),
+            "void" => return Some(Ty::Void),
+            "Null" => return Some(Ty::Null),
+            _ => {}
+        }
+        let nullable = self.written_nullable_suffix(self.utf16_of(head_end));
+        let mut cursor = head_end;
+        if nullable {
+            let mut c = cursor;
+            while c < end && bytes[c].is_ascii_whitespace() {
+                c += 1;
+            }
+            if c < end && bytes[c] == b'?' {
+                cursor = c + 1;
+            }
+        }
+        let mut c = cursor;
+        while c < end && bytes[c].is_ascii_whitespace() {
+            c += 1;
+        }
+        let args = if c < end && bytes[c] == b'<' {
+            let (close, after) = {
+                let mut depth = 0usize;
+                let mut i = c;
+                loop {
+                    if i >= end {
+                        return None;
+                    }
+                    match bytes[i] {
+                        b'<' => depth += 1,
+                        b'>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break (i, i + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            };
+            if bytes[after..end].iter().any(|b| !b.is_ascii_whitespace()) {
+                return None;
+            }
+            let mut nested = Vec::new();
+            let mut seg_start = c + 1;
+            let mut i = seg_start;
+            let mut depth = 0usize;
+            while i < close {
+                match bytes[i] {
+                    b'<' | b'(' | b'[' | b'{' => depth += 1,
+                    b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                    b',' if depth == 0 => {
+                        let s = {
+                            let mut s = seg_start;
+                            while s < i && bytes[s].is_ascii_whitespace() {
+                                s += 1;
+                            }
+                            s
+                        };
+                        if s >= i {
+                            return None;
+                        }
+                        nested.push(self.written_arg_ty(s, i)?);
+                        seg_start = i + 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let s = {
+                let mut s = seg_start;
+                while s < close && bytes[s].is_ascii_whitespace() {
+                    s += 1;
+                }
+                s
+            };
+            if s >= close {
+                return None;
+            }
+            nested.push(self.written_arg_ty(s, close)?);
+            self.boundary.intern_list(&nested)
+        } else {
+            if c != end {
+                return None;
+            }
+            ArgListId::EMPTY
+        };
+        Some(Ty::Named {
+            name,
+            nullable,
+            args,
+        })
+    }
 }
 
 // The #3464 pins (the `duplicate_constructor` head-shape pass). Registered
@@ -3069,7 +3543,7 @@ mod ticket_3464_tests;
 
 #[cfg(test)]
 mod exec_bounds_pairing_tests {
-    use super::super::test_rig::report_ops;
+    use super::super::test_rig::{report_ops, report_ops_bare};
 
     /// The bound-driven row a generic callee's captured `exec_bounds`
     /// window produces for a bound-violating argument: `T extends num`
@@ -3178,7 +3652,14 @@ mod exec_bounds_pairing_tests {
     fn leading_function_type_argument_anchors_at_its_return_head() {
         let source = "void f2<A extends int, B extends int>() {}\n\
                       void main() { f2<void Function(), String>(); }\n";
-        let rows = bounds_rows(source);
+        // The bare rig keeps the fixture's own offsets (`report_ops`
+        // prepends a prelude, which would shift every anchor).
+        let rows: Vec<(u32, String)> = report_ops_bare(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "type_argument_not_matching_bounds")
+            .map(|d| (d.range.offset, d.message.to_string()))
+            .collect();
         assert_eq!(rows.len(), 2, "both arguments check: {rows:?}");
         let expected = source.find("void Function()").expect("fixture") as u32;
         assert_eq!(

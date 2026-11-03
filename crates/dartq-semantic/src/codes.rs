@@ -443,6 +443,13 @@ pub enum SemanticCode {
     /// `const`-prefixed creation whose resolved constructor declares no
     /// `const` (`error_verifier.dart` `_checkForConstWithNonConst`).
     ConstWithNonConst,
+    /// `A constant creation can't use a type parameter as a type argument.` —
+    /// a type parameter spelled as a type argument of a constant creation
+    /// (`_checkForConstWithTypeParameters` over the named type's written
+    /// `typeArguments`, constant_verifier.dart:591-660 — one row per
+    /// type-parameter leaf, checked before the constructor's own
+    /// resolution).
+    ConstWithTypeParameters,
     /// `The values in a const list literal must be constants.`
     NonConstantListElement,
     /// `The values in a const set literal must be constants.`
@@ -2523,6 +2530,10 @@ impl SemanticCode {
                 "CONST_WITH_NON_CONSTANT_ARGUMENT",
             ),
             Self::ConstWithNonConst => ("const_with_non_const", "CONST_WITH_NON_CONST"),
+            Self::ConstWithTypeParameters => (
+                "const_with_type_parameters",
+                "CONST_WITH_TYPE_PARAMETERS",
+            ),
             Self::NonConstantListElement => {
                 ("non_constant_list_element", "NON_CONSTANT_LIST_ELEMENT")
             }
@@ -4049,6 +4060,10 @@ impl SemanticCode {
             }
             Self::ConstWithNonConst => {
                 "The constructor being called isn't a const constructor.".to_string()
+            }
+            Self::ConstWithTypeParameters => {
+                "A constant creation can't use a type parameter as a type argument."
+                    .to_string()
             }
             Self::NonConstantListElement => {
                 "The values in a const list literal must be constants.".to_string()
@@ -7084,6 +7099,7 @@ mod tests {
             | SemanticCode::ConstInitializedWithNonConstantValue
             | SemanticCode::ConstWithNonConst
             | SemanticCode::ConstWithNonConstantArgument
+            | SemanticCode::ConstWithTypeParameters
             | SemanticCode::ConstantPatternNeverMatchesValueType
             | SemanticCode::ConstantPatternWithNonConstantExpression
             | SemanticCode::EqualKeysInMapPattern
@@ -7502,6 +7518,7 @@ mod tests {
             SemanticCode::ConstInitializedWithNonConstantValue,
             SemanticCode::ConstWithNonConst,
             SemanticCode::ConstWithNonConstantArgument,
+            SemanticCode::ConstWithTypeParameters,
             SemanticCode::ConstantPatternNeverMatchesValueType,
             SemanticCode::ConstantPatternWithNonConstantExpression,
             SemanticCode::EqualKeysInMapPattern,

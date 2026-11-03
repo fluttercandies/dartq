@@ -2146,6 +2146,30 @@ impl<'o> Interp<'o> {
             && self.current.prop(slot).promoted != crate::model::NIL
     }
 
+    /// The flow type a promoted property read carries on the expression
+    /// stack. The marker pair the read wears by default (promoted =
+    /// `UNKNOWN`, unpromoted = `UNKNOWN_NULLABLE`) answers no nullability
+    /// question — but a slot promoted to a real head has a face the
+    /// equality/`is` folds must see: `_f == null` over a `Null`-promoted
+    /// field folds `true` and deads the else, `_f == null` over an
+    /// `int`-promoted field folds `false` and deads the then — exactly the
+    /// oracle's rows. `Null` and class heads surface verbatim; the opaque
+    /// bases (`Unknown`/`Dynamic`/`Void`) and the signature-less `Function`
+    /// head keep the marker (their fold semantics differ — a `Function`
+    /// face is deliberately excluded from the non-null read, and the
+    /// marker's under-report is safer than a fabricated face).
+    pub(crate) fn prop_read_ty(&self, slot: u32) -> Ty {
+        let model = self.current.prop(slot);
+        if model.promoted == crate::model::NIL {
+            return Ty::UNKNOWN;
+        }
+        let head = self.lists.head(model.promoted);
+        match head.base {
+            Base::Null | Base::Never | Base::Name(_) => head,
+            _ => Ty::UNKNOWN,
+        }
+    }
+
     // —— effect recording (collect mode) —————————————————————————————————
 
     pub(crate) fn record_write(&mut self, var: u32) {

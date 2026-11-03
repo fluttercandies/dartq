@@ -1163,11 +1163,19 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             .enumerate()
             .map(|(slot, bound)| {
                 bound.unwrap_or_else(|| {
-                    self.substitute(
-                        bounds.get(slot).copied().unwrap_or(Ty::Dynamic),
-                        params,
-                        &partial,
-                    )
+                    let raw = bounds.get(slot).copied().unwrap_or(Ty::Dynamic);
+                    // Only a named bound takes the substitution — a
+                    // function- or record-shaped bound mentions the
+                    // parameters inside a bracket shape `substitute`
+                    // cannot re-intern (it degrades to `Ty::Unknown`,
+                    // losing `Y extends void Function(X)` entirely); an
+                    // unbound param reads itself there anyway, so the
+                    // raw bound is already the honest answer.
+                    if matches!(raw, Ty::Named { .. }) {
+                        self.substitute(raw, params, &partial)
+                    } else {
+                        raw
+                    }
                 })
             })
             .collect();
@@ -1397,8 +1405,8 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
     /// unfolding walk (`class A implements B<List<T>>` / `class B
     /// implements A<List<T>>`) therefore reports nothing.
     fn hierarchy(&mut self, name: StringId, depth: u32) -> Option<Hierarchy> {
-        if let Some(hit) = self.hierarchy_map_get(name) {
-            return hit;
+        if let Some(hit) = self.hierarchy.get(&name) {
+            return hit.clone();
         }
         if !self.visiting.insert(name) {
             // The in-progress sentinel: no interfaces, never cached (the
@@ -1416,12 +1424,6 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
         self.visiting.remove(&name);
         self.hierarchy.insert(name, computed.clone());
         computed
-    }
-
-    /// The memo read (a separate helper so the `&mut` borrow of the walk
-    /// ends before the compute path takes it again).
-    fn hierarchy_map_get(&self, name: StringId) -> Option<Option<Hierarchy>> {
-        self.hierarchy.get(&name).cloned()
     }
 
     /// Merges one interface instantiation into its element's cell

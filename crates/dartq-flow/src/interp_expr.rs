@@ -310,7 +310,7 @@ impl Interp<'_> {
                                 }
                             }
                             expr.ty = if promoted {
-                                Ty::UNKNOWN
+                                self.prop_read_ty(slot)
                             } else {
                                 Ty::UNKNOWN_NULLABLE
                             };
@@ -2680,7 +2680,7 @@ impl Interp<'_> {
                     // own face, not the callee property's.
                     if !post_send_tile {
                         expr.ty = if promoted {
-                            Ty::UNKNOWN
+                            self.prop_read_ty(slot)
                         } else {
                             Ty::UNKNOWN_NULLABLE
                         };
@@ -3480,12 +3480,13 @@ impl Interp<'_> {
                     // (unpromoted = potentially-nullable unknown, promoted
                     // = its non-null face) — the same faces DotAccess's
                     // prop arm writes.
+                    let head_ty = if promoted {
+                        self.prop_read_ty(slot)
+                    } else {
+                        Ty::UNKNOWN_NULLABLE
+                    };
                     if let Some(head) = self.exprs.last_mut() {
-                        head.ty = if promoted {
-                            Ty::UNKNOWN
-                        } else {
-                            Ty::UNKNOWN_NULLABLE
-                        };
+                        head.ty = head_ty;
                         head.prop = Some(slot);
                     }
                 }

@@ -16,7 +16,9 @@
 //! Oracle provenance: `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze`
 //! over a package fixture — each pin names the oracle verdict it encodes.
 
-use super::test_rig::{assert_silent, code_names, report_ops, report_ops_experiments_with, rows};
+use super::test_rig::{
+    CORE_PRELUDE, assert_silent, code_names, report_ops, report_ops_experiments_with, rows,
+};
 
 /// The co19 `StaticType`/`Exactly<T>` extension the census cases use.
 const EXPECT_HELPER: &str = "typedef Exactly<T> = T Function(T);\n\
@@ -114,7 +116,7 @@ fn unpromoted_receiver_reports() {
 fn this_is_guard_keeps_the_declared_bound() {
     let report = report_ops_experiments_with(
         &format!(
-            "{EXPECT_HELPER}class A {{\n\
+            "{CORE_PRELUDE}{EXPECT_HELPER}class A {{\n\
              \x20 num get x => 1;\n\
              \x20 void t() {{\n\
              \x20   if (this is B) {{\n\
