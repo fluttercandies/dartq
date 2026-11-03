@@ -428,11 +428,7 @@ fn records_related(c: &Check<'_>, l: &RecordShape, r: &RecordShape) -> bool {
 /// list does not decompose through `Analysis` — `List<int>` under-
 /// reports the arg walk); `Record`/`Function` carry no readable shape
 /// and stay `Top` (the written face answers those shapes first).
-fn ty_face<'a>(
-    c: &'a Check<'a>,
-    analysis: &dartq_semantic::Analysis<'a>,
-    ty: Ty,
-) -> OpFace<'a> {
+fn ty_face<'a>(c: &'a Check<'a>, analysis: &dartq_semantic::Analysis<'a>, ty: Ty) -> OpFace<'a> {
     match ty {
         Ty::Named { name, .. } => {
             let spelled = analysis.strings().resolve(name);
@@ -843,9 +839,7 @@ fn direct_super(c: &Check<'_>, name: &str) -> String {
             .unwrap_or_else(|| "Object".to_owned()),
         None => match name {
             "int" | "double" => "num".to_owned(),
-            "num" | "bool" | "String" | "Record" | "Function" | "Null" => {
-                "Object".to_owned()
-            }
+            "num" | "bool" | "String" | "Record" | "Function" | "Null" => "Object".to_owned(),
             _ => "?".to_owned(),
         },
     }
@@ -937,7 +931,11 @@ mod tests {
                 "\nvoid m(int? a1, num a2) {\n  var b1 = a1 == a2;\n  var b2 = a2 == a1;\n}\n",
                 &[],
             ),
-            ("dynamic_andInt", "\nvoid f(dynamic x) {\n  if (x == 0) {}\n}\n", &[]),
+            (
+                "dynamic_andInt",
+                "\nvoid f(dynamic x) {\n  if (x == 0) {}\n}\n",
+                &[],
+            ),
             (
                 "extensionTypes_same",
                 "\nvoid m(A a, B b) {\n  if (a == b) {}\n}\nextension type A(String value) {}\nextension type B(String value) {}\n",

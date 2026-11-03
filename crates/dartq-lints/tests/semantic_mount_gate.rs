@@ -299,8 +299,7 @@ fn keyword_at(text: &[u8], pos: usize, kw: &str) -> bool {
 
 /// Parse one source file into its module/fn/spec index.
 fn parse_file(path: &Path, rel: &str) -> SourceFile {
-    let src = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
     let text = strip_noise(&src);
     let stem = path
         .file_stem()
@@ -413,11 +412,13 @@ fn parse_file(path: &Path, rel: &str) -> SourceFile {
             if j < text.len() && text[j] == b'(' {
                 let end = balanced(&text, j, b'(', b')');
                 let stop = end.saturating_sub(1).max(j + 1);
-                if let Some((name, check)) =
-                    spec_args(&src[j + 1..stop], &text[j + 1..stop])
-                {
+                if let Some((name, check)) = spec_args(&src[j + 1..stop], &text[j + 1..stop]) {
                     let module = innermost(&mod_ranges, &inner_mods, i);
-                    file.specs.push(SpecItem { module, name, check });
+                    file.specs.push(SpecItem {
+                        module,
+                        name,
+                        check,
+                    });
                 }
                 i = end;
                 continue;
@@ -434,11 +435,13 @@ fn parse_file(path: &Path, rel: &str) -> SourceFile {
             if j < text.len() && text[j] == b'{' {
                 let end = balanced(&text, j, b'{', b'}');
                 let stop = end.saturating_sub(1).max(j + 1);
-                if let Some((name, check)) =
-                    literal_fields(&src[j + 1..stop], &text[j + 1..stop])
-                {
+                if let Some((name, check)) = literal_fields(&src[j + 1..stop], &text[j + 1..stop]) {
                     let module = innermost(&mod_ranges, &inner_mods, i);
-                    file.specs.push(SpecItem { module, name, check });
+                    file.specs.push(SpecItem {
+                        module,
+                        name,
+                        check,
+                    });
                 }
                 i = end;
                 continue;
@@ -823,11 +826,7 @@ fn analyze(files: Vec<SourceFile>, texts: &[Vec<u8>]) -> Scan {
 /// The direct `.semantics()` witness reachable from `(fi, ni)` through
 /// `edges` — a BFS back-trace used only to name the propagation path in a
 /// failure/debug report, never in the pass decision.
-fn witness(
-    scan: &Scan,
-    texts: &[Vec<u8>],
-    from: (usize, usize),
-) -> Vec<String> {
+fn witness(scan: &Scan, texts: &[Vec<u8>], from: (usize, usize)) -> Vec<String> {
     let mut path = Vec::new();
     let mut seen = BTreeSet::new();
     let mut frontier = vec![from];
@@ -973,7 +972,11 @@ fn every_fold_consumer_is_registered() {
 /// left out of that table passes its own gate yet mounts an empty face
 /// (the same silent death behind one extra table away).
 const DRIVER_FACES: &[(&str, &[u8], bool)] = &[
-    ("Unit::async_context_uses", b".unit.async_context_uses", true),
+    (
+        "Unit::async_context_uses",
+        b".unit.async_context_uses",
+        true,
+    ),
     ("Unit::reachability", b".unit.reachability", false),
     ("Unit::library_type_uses", b".library_type_uses", false),
 ];
@@ -1040,9 +1043,7 @@ fn driver_gate_names(path: &Path) -> Vec<String> {
                 let end = balanced(&text, j, b'(', b')');
                 let stop = end.saturating_sub(1).max(j + 1);
                 let in_test = test_mods.iter().any(|&(s, e)| i >= s && i < e);
-                if !in_test
-                    && let Some(name) = first_string_literal(&src[j + 1..stop])
-                {
+                if !in_test && let Some(name) = first_string_literal(&src[j + 1..stop]) {
                     names.push(name);
                 }
                 i = end;

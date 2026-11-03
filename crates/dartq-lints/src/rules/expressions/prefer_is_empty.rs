@@ -270,8 +270,7 @@ fn in_const_constructor_initializer(c: &Check<'_>) -> bool {
             // The initializer's constructor is the enclosing declaration.
             for &outer in path {
                 if c.kind(outer) == NodeKind::Constructor {
-                    return dartq_ast::mod_flags(c.unit.ast, outer)
-                        & VAR_FINAL_OR_CONST_MEMBER_BIT
+                    return dartq_ast::mod_flags(c.unit.ast, outer) & VAR_FINAL_OR_CONST_MEMBER_BIT
                         != 0;
                 }
             }

@@ -260,7 +260,6 @@ fn remove_deprecations_is_structurally_silent() {
     assert!(SPEC.kinds.is_empty(), "{:?}", SPEC.kinds);
 }
 
-
 // —— deprecated_member_use_from_same_package: emission faces ————————————
 //
 // The corpus shapes the first wave left as residuals
@@ -327,12 +326,13 @@ fn dmfs_extension_override_reports_at_the_receiver() {
 /// payload word; `E.two` reports at `two`.
 #[test]
 fn dmfs_enum_constant_reports_at_the_selector() {
-    let f = Fixture::parse(
-        "enum E {\n  one, @deprecated two;\n}\nlate E e = E.two;\n",
-    );
+    let f = Fixture::parse("enum E {\n  one, @deprecated two;\n}\nlate E e = E.two;\n");
     let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
     assert_eq!(lints.len(), 1, "{lints:?}");
-    assert_eq!(lints[0].message, "'two' is deprecated and shouldn't be used.");
+    assert_eq!(
+        lints[0].message,
+        "'two' is deprecated and shouldn't be used."
+    );
     let start = utf16_at(&f, tok(&f.source, &f.tokens, "two", 1));
     assert_eq!(lints[0].range, start..start + 3);
 }
@@ -341,9 +341,7 @@ fn dmfs_enum_constant_reports_at_the_selector() {
 /// parameter; the label is the report span.
 #[test]
 fn dmfs_named_argument_reports_at_the_label() {
-    let f = Fixture::parse(
-        "void f({@deprecated int? p}) {}\nvoid g() => f(p: 1);\n",
-    );
+    let f = Fixture::parse("void f({@deprecated int? p}) {}\nvoid g() => f(p: 1);\n");
     let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(lints[0].message, "'p' is deprecated and shouldn't be used.");
@@ -355,9 +353,7 @@ fn dmfs_named_argument_reports_at_the_label() {
 /// reads the parameter at its index; the argument is the report span.
 #[test]
 fn dmfs_positional_argument_reports_at_the_argument() {
-    let f = Fixture::parse(
-        "void f([@deprecated int? p]) {}\nvoid g() => f(1);\n",
-    );
+    let f = Fixture::parse("void f([@deprecated int? p]) {}\nvoid g() => f(1);\n");
     let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(lints[0].message, "'p' is deprecated and shouldn't be used.");
@@ -428,7 +424,10 @@ fn dmfs_index_operator_reports_at_the_expression() {
     );
     let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
     assert_eq!(lints.len(), 1, "{lints:?}");
-    assert_eq!(lints[0].message, "'[]' is deprecated and shouldn't be used.");
+    assert_eq!(
+        lints[0].message,
+        "'[]' is deprecated and shouldn't be used."
+    );
     let start = utf16_at(&f, tok(&f.source, &f.tokens, "c", 1));
     assert_eq!(lints[0].range, start..start + 4);
 }
@@ -442,7 +441,10 @@ fn dmfs_pattern_field_label_reports_at_the_label() {
     );
     let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
     assert_eq!(lints.len(), 1, "{lints:?}");
-    assert_eq!(lints[0].message, "'foo' is deprecated and shouldn't be used.");
+    assert_eq!(
+        lints[0].message,
+        "'foo' is deprecated and shouldn't be used."
+    );
     let start = utf16_at(&f, tok(&f.source, &f.tokens, "foo", 1));
     assert_eq!(lints[0].range, start..start + 3);
 }
@@ -451,13 +453,11 @@ fn dmfs_pattern_field_label_reports_at_the_label() {
 /// whole operand `a.f`, not the bare selector.
 #[test]
 fn dmfs_postfix_reports_the_operand() {
-    let f = Fixture::parse(
-        "class A {\n  @deprecated\n  int f = 0;\n}\nvoid f(A a) {\n  a.f++;\n}\n",
-    );
+    let f =
+        Fixture::parse("class A {\n  @deprecated\n  int f = 0;\n}\nvoid f(A a) {\n  a.f++;\n}\n");
     let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(lints[0].message, "'f' is deprecated and shouldn't be used.");
     let start = utf16_at(&f, tok(&f.source, &f.tokens, "a", 1));
     assert_eq!(lints[0].range, start..start + 3);
 }
-

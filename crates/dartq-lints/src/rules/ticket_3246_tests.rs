@@ -98,7 +98,11 @@ fn uf3246_typed_for_each_variable_reports_with_type() {
 /// (`test_recordPattern_destructured_forEach`).
 #[test]
 fn uf3246_for_each_pattern_form_reports_without_type() {
-    assert_row("void f() { for (final (a, b) in [(1, 2)]) {} }", 0, WITHOUT_TYPE);
+    assert_row(
+        "void f() { for (final (a, b) in [(1, 2)]) {} }",
+        0,
+        WITHOUT_TYPE,
+    );
 }
 
 #[test]
@@ -145,7 +149,11 @@ fn uf3246_var_object_pattern_destructuring_stays_silent() {
 /// `PatternVariableDeclaration` inside an if-case.
 #[test]
 fn uf3246_record_pattern_if_case_reports_one_row() {
-    assert_row("void f(Object o) { if (o case (final int x, int y)) {} }", 0, WITH_TYPE);
+    assert_row(
+        "void f(Object o) { if (o case (final int x, int y)) {} }",
+        0,
+        WITH_TYPE,
+    );
 }
 
 #[test]

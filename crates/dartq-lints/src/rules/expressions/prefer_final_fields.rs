@@ -176,7 +176,10 @@ fn scan<'a>(
             // declaring formals of the owner's primary constructor —
             // the enum and extension-type owners are excluded
             // (:142-145).
-            if matches!(kind, NodeKind::ClassDeclaration | NodeKind::MixinDeclaration) {
+            if matches!(
+                kind,
+                NodeKind::ClassDeclaration | NodeKind::MixinDeclaration
+            ) {
                 declaring_formals(c, node, candidates);
             }
             return;
@@ -223,8 +226,7 @@ fn scan<'a>(
                         // name is the span head; hand-built tables keep the
                         // same head (see
                         // [`crate::rules::initialized_identifier_name`]).
-                        let Some(name_token) =
-                            crate::rules::initialized_identifier_name(c, var)
+                        let Some(name_token) = crate::rules::initialized_identifier_name(c, var)
                         else {
                             continue;
                         };
@@ -236,8 +238,7 @@ fn scan<'a>(
                         // initializer followed (`end_last` adopts the
                         // initializer's value end; a bare name ends at the
                         // name itself).
-                        let has_initializer =
-                            c.head_token(var) != crate::rules::tail_token(c, var);
+                        let has_initializer = c.head_token(var) != crate::rules::tail_token(c, var);
                         candidates.push(Candidate {
                             declaration: var,
                             name,
@@ -267,8 +268,13 @@ fn scan<'a>(
                 .and_then(|parent| {
                     let siblings = c.collect_direct(parent);
                     let pos = siblings.iter().position(|&sibling| sibling == node)?;
+                    // The section's own marker is the nearest one before the
+                    // assignment — a chained cascade (`o..toString().._x = 1`)
+                    // carries one marker per section, and the earlier ones
+                    // belong to their own sections.
                     siblings[..pos]
                         .iter()
+                        .rev()
                         .copied()
                         .find(|&row| c.kind(row) == NodeKind::CascadeAccess)
                 })
@@ -757,7 +763,11 @@ mod tests {
                 "\nenum A {\n  a,b,c;\n  int _x = 0;\n  int get x => _x;\n}\n",
                 &[],
             ),
-            ("final_multiple", "\nclass C {\n  final _x = 1, _y = 2;\n}\n", &[]),
+            (
+                "final_multiple",
+                "\nclass C {\n  final _x = 1, _y = 2;\n}\n",
+                &[],
+            ),
             (
                 "final_public_multiple",
                 "\nclass C {\n  final x = 1, y = 2;\n}\n",
@@ -855,11 +865,7 @@ mod tests {
                 &[(3, 15, 6)],
             ),
             ("unused_public", "\nclass C {\n  var x = 1;\n}\n", &[]),
-            (
-                "unused_uninitialized",
-                "\nclass C {\n  int? _x;\n}\n",
-                &[],
-            ),
+            ("unused_uninitialized", "\nclass C {\n  int? _x;\n}\n", &[]),
             (
                 "ext_field_instance",
                 "\nextension type E(Object o) {\n  int _i = 0;\n}\n",

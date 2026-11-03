@@ -346,7 +346,11 @@ pub(crate) fn unprefixed_import_uris(c: &Check<'_>) -> Vec<String> {
                 c.collect_direct(row)
                     .into_iter()
                     .filter(|&kid| c.kind(kid) == NodeKind::StringLiteral)
-                    .map(|kid| c.lexeme(c.head_token(kid)).trim_matches(['\'', '"']).to_owned()),
+                    .map(|kid| {
+                        c.lexeme(c.head_token(kid))
+                            .trim_matches(['\'', '"'])
+                            .to_owned()
+                    }),
             );
         }
     }
@@ -852,8 +856,8 @@ fn modifier_keyword(c: &Check<'_>, ctor: u32, needle: &str) -> Option<u32> {
 /// official's list node owns them; `late` is reserved, never a
 /// preceding identifier).
 pub(crate) fn variables_list_range(c: &Check<'_>, row: u32) -> Option<core::ops::Range<u32>> {
-    let mut first = crate::rules::variables_declaration_keyword(c, row)
-        .unwrap_or_else(|| c.head_token(row));
+    let mut first =
+        crate::rules::variables_declaration_keyword(c, row).unwrap_or_else(|| c.head_token(row));
     while let Some(prev) = first.checked_sub(1) {
         if c.lexeme(prev) == "late" {
             first = prev;

@@ -524,8 +524,7 @@ pub(crate) mod non_constant_identifier_names {
                 // there). The unnamed `new()` form anchors at the keyword
                 // itself, which the camel gate passes — the official
                 // `name = newToken` posture.
-                let cont =
-                    dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
+                let cont = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
                 let named = c.direct_children(node).iter().copied().find(|&ch| {
                     c.kind(ch) == NodeKind::Identifier
                         && c.field(ch, PayloadField::Context) == Some(cont)
@@ -3705,7 +3704,12 @@ pub(crate) mod sort_unnamed_constructors_first {
     /// (`_Visitor.check`: a named constructor arms the flag;
     /// non-constructor members neither arm nor clear it). Factories carry
     /// the same constructor element shape, so an unnamed factory
-    /// arms/reports identically. Message: `diagnostic.g.dart`
+    /// arms/reports identically. A primary constructor written in the
+    /// declaration header is no body member and joins neither side. The
+    /// report lands at `member.errorRange`
+    /// (`ConstructorDeclarationImpl.errorRange`, ast.dart:7066-7070 — the
+    /// type name, or the new-form `new` keyword head, through the
+    /// constructor name's end). Message: `diagnostic.g.dart`
     /// `sortUnnamedConstructorsFirst`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "sort_unnamed_constructors_first",
@@ -3735,14 +3739,14 @@ pub(crate) mod sort_unnamed_constructors_first {
             }
         }
         for member in hits {
-            let range = c.utf16_span(member);
+            let range = super::sort_constructors_first::constructor_error_range(c, member);
             c.report(range, &[]);
         }
     }
 
     #[cfg(test)]
     mod tests {
-        use crate::testsupport::{Fixture, one_rule};
+        use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
         /// `test/rules/sort_unnamed_constructors_first_test.dart`
         /// `test_unnamedConstructorAfterNamed`.
@@ -3799,6 +3803,76 @@ pub(crate) mod sort_unnamed_constructors_first {
         #[test]
         fn ignores_an_unnamed_constructor_after_a_non_constructor_member() {
             let f = Fixture::parse("class A { int x = 0; void m() {} A(); }");
+            assert!(
+                f.run(&one_rule("sort_unnamed_constructors_first"))
+                    .is_empty()
+            );
+        }
+
+        // —— the `errorRange` report spans (the oracle-verified census
+        // shapes) ————————————————————————————————————————————————
+
+        /// `C();` reports at the type name (len 1).
+        #[test]
+        fn span_of_a_plain_unnamed_constructor() {
+            let f = Fixture::parse("class C { C.named(); C(); }");
+            let lints = f.run(&one_rule("sort_unnamed_constructors_first"));
+            assert_eq!(lints.len(), 1);
+            let start = utf16_at(&f, tok(&f.source, &f.tokens, "C", 2));
+            assert_eq!(lints[0].range, start..start + 1);
+        }
+
+        /// `C.new();` reports at `C.new` (len 5) — the new-form's
+        /// startEntity head through the name's end.
+        #[test]
+        fn span_of_a_new_form_unnamed_constructor() {
+            let f = Fixture::parse("class C { C.named(); C.new(); }");
+            let lints = f.run(&one_rule("sort_unnamed_constructors_first"));
+            assert_eq!(lints.len(), 1);
+            let start = utf16_at(&f, tok(&f.source, &f.tokens, "C", 2));
+            assert_eq!(lints[0].range, start..start + 5);
+        }
+
+        /// `new();` reports at the `new` keyword head (len 3).
+        #[test]
+        fn span_of_a_new_keyword_constructor() {
+            let f = Fixture::parse("class C { C.named(); new(); }");
+            let lints = f.run(&one_rule("sort_unnamed_constructors_first"));
+            assert_eq!(lints.len(), 1);
+            let start = utf16_at(&f, tok(&f.source, &f.tokens, "new", 0));
+            assert_eq!(lints[0].range, start..start + 3);
+        }
+
+        /// `const A();` reports at the type name after the keyword.
+        #[test]
+        fn span_of_a_const_unnamed_constructor() {
+            let f = Fixture::parse("class A { A.named(); const A(); }");
+            let lints = f.run(&one_rule("sort_unnamed_constructors_first"));
+            assert_eq!(lints.len(), 1);
+            let start = utf16_at(&f, tok(&f.source, &f.tokens, "A", 2));
+            assert_eq!(lints[0].range, start..start + 1);
+        }
+
+        /// `factory _PriorityItem();` reports at the name (len 13) — the
+        /// factory element carries the same constructor shape, and the
+        /// unnamed factory's name is the class-name echo.
+        #[test]
+        fn span_of_an_unnamed_factory() {
+            let f = Fixture::parse(
+                "class _PriorityItem { _PriorityItem.named(); factory _PriorityItem() => _PriorityItem.named(); }",
+            );
+            let lints = f.run(&one_rule("sort_unnamed_constructors_first"));
+            assert_eq!(lints.len(), 1);
+            let start = utf16_at(&f, tok(&f.source, &f.tokens, "_PriorityItem", 2));
+            assert_eq!(lints[0].range, start..start + 13);
+        }
+
+        /// A primary constructor written in the declaration header is no
+        /// body member: it arms nothing and the header shape never arms the
+        /// flag (`test_primaryConstructor*` faces — silent).
+        #[test]
+        fn ignores_primary_constructor_headers() {
+            let f = Fixture::parse("class C.named { C(); }");
             assert!(
                 f.run(&one_rule("sort_unnamed_constructors_first"))
                     .is_empty()
@@ -3888,14 +3962,18 @@ pub(crate) mod sort_constructors_first {
     /// written — through the constructor name's end (the type name's own
     /// end for the unnamed form). The modifier run (`augment`, `external`,
     /// `const`, `factory`) sits before the anchor and drops out.
-    fn constructor_error_range(c: &Check<'_>, ctor: u32) -> core::ops::Range<u32> {
+    pub(super) fn constructor_error_range(c: &Check<'_>, ctor: u32) -> core::ops::Range<u32> {
         let tokens = c.unit.ast.token_range(ctor);
         // The new-form `new` keyword tiles BEFORE the row's token range
         // (`begin_constructor` anchors at the name — the parser never
-        // passes the constructor head); `errorRange` starts there.
-        let new_kw = c
-            .field(ctor, PayloadField::NewKeyword)
-            .filter(|&token| token != crate::rules::NONE_TOKEN);
+        // passes the constructor head); `errorRange` starts there. A
+        // `Factory` row carries no `NewKeyword` word.
+        let new_kw = if c.kind(ctor) == NodeKind::Constructor {
+            c.field(ctor, PayloadField::NewKeyword)
+                .filter(|&token| token != crate::rules::NONE_TOKEN)
+        } else {
+            None
+        };
         let mut cursor = tokens.start;
         while cursor < tokens.end
             && matches!(
@@ -3907,9 +3985,7 @@ pub(crate) mod sort_constructors_first {
         }
         let head = cursor.min(tokens.end.saturating_sub(1));
         let start_entity = new_kw.unwrap_or(head);
-        let start = c
-            .utf16_of_token(start_entity)
-            .unwrap_or_default();
+        let start = c.utf16_of_token(start_entity).unwrap_or_default();
         // `name ?? startEntity`: the `.named` part when written (the
         // type-name echo `A.named` shape); the new-form name when the
         // head is an identifier (`new named`); the start entity's own
@@ -3921,9 +3997,7 @@ pub(crate) mod sort_constructors_first {
         } else {
             start_entity
         };
-        let end = c
-            .utf16_end_of_token(end_token)
-            .unwrap_or_else(|| start);
+        let end = c.utf16_end_of_token(end_token).unwrap_or_else(|| start);
         start..end
     }
 
@@ -4495,11 +4569,7 @@ mod oracle_corpus_pins {
                 "\nclass $FooBar\n{}",
                 &[],
             ),
-            (
-                "test_class_lowerCamel#0",
-                "\nclass fooBar {}",
-                &[(2, 7, 6)],
-            ),
+            ("test_class_lowerCamel#0", "\nclass fooBar {}", &[(2, 7, 6)]),
             (
                 "test_class_primaryConstructor_test_class_lowerCamel#0",
                 "\nclass fooBar(var int x);",
@@ -4510,11 +4580,7 @@ mod oracle_corpus_pins {
                 "\nclass FooBar(var int x);",
                 &[],
             ),
-            (
-                "test_class_upperCamel#0",
-                "\nclass FooBar {}",
-                &[],
-            ),
+            ("test_class_upperCamel#0", "\nclass FooBar {}", &[]),
             (
                 "test_class_upperCamel_private#0",
                 "\nclass _Foo {} // ignore: unused_element",
@@ -4525,16 +4591,8 @@ mod oracle_corpus_pins {
                 "\nclass Foo$Bar {}",
                 &[],
             ),
-            (
-                "test_class_upperCase1#0",
-                "\nclass A {}",
-                &[],
-            ),
-            (
-                "test_class_upperCase2#0",
-                "\nclass AA {}",
-                &[],
-            ),
+            ("test_class_upperCase1#0", "\nclass A {}", &[]),
+            ("test_class_upperCase2#0", "\nclass AA {}", &[]),
             (
                 "test_class_upperSnake#0",
                 "\nclass Foo_Bar {}",
@@ -4555,11 +4613,7 @@ mod oracle_corpus_pins {
                 "\nenum FooBar(final String name) { a('') }",
                 &[],
             ),
-            (
-                "test_enum_upperCamel#0",
-                "\nenum FoooBar { a }",
-                &[],
-            ),
+            ("test_enum_upperCamel#0", "\nenum FoooBar { a }", &[]),
             (
                 "test_extensionType_lowerCase#0",
                 "\nextension type fooBar(int i) {}",
@@ -4575,11 +4629,7 @@ mod oracle_corpus_pins {
                 "\nmixin M {}\nclass c = Object with M;",
                 &[(3, 7, 1)],
             ),
-            (
-                "test_mixin_lowerCase#0",
-                "\nmixin m {}",
-                &[(2, 7, 1)],
-            ),
+            ("test_mixin_lowerCase#0", "\nmixin m {}", &[(2, 7, 1)]),
             (
                 "test_typedef_newFormat_lower#0",
                 "\ntypedef f = void Function();",
@@ -4605,16 +4655,8 @@ mod oracle_corpus_pins {
                 "\ntypedef bool Predicate();",
                 &[],
             ),
-            (
-                "doc_bad_0",
-                "class c {}",
-                &[(1, 7, 1)],
-            ),
-            (
-                "doc_good_0",
-                "class C {}",
-                &[],
-            ),
+            ("doc_bad_0", "class c {}", &[(1, 7, 1)]),
+            ("doc_good_0", "class C {}", &[]),
             (
                 "doc_good_1",
                 "class SliderMenu {\n  // ...\n}\n\nclass HttpRequest {\n  // ...\n}\n\ntypedef num Adder(num x, num y);",
@@ -4652,7 +4694,8 @@ mod oracle_corpus_pins {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    }    /// The whole upstream oracle corpus — `NonConstantIdentifierNamesTest` (80
+    }
+    /// The whole upstream oracle corpus — `NonConstantIdentifierNamesTest` (80
     /// cases, `pkg/linter/test/rules/non_constant_identifier_names_test.dart`)
     /// plus the one `messages.yaml` doc-bad and two doc-good cases: 83 total,
     /// `conformance/status.tsv` `lint non_constant_identifier_names 83 73 10`.
@@ -4885,11 +4928,7 @@ mod oracle_corpus_pins {
                 "\nclass C {\n  static const ZZZ = 3;\n}",
                 &[],
             ),
-            (
-                "test_field_upper#0",
-                "\nclass C {\n  int? X; //OK\n}",
-                &[],
-            ),
+            ("test_field_upper#0", "\nclass C {\n  int? X; //OK\n}", &[]),
             (
                 "test_forEachVariable#0",
                 "\nvoid f() {\n  for (var ZZZ in []) {}\n}",
@@ -4980,11 +5019,7 @@ mod oracle_corpus_pins {
                 "\nclass C.Named();",
                 &[(2, 9, 5)],
             ),
-            (
-                "test_topLevelFunction#0",
-                "\nvoid Main() {}",
-                &[(2, 6, 4)],
-            ),
+            ("test_topLevelFunction#0", "\nvoid Main() {}", &[(2, 6, 4)]),
             (
                 "test_topLevelFunction_private_camelCase#0",
                 "\nvoid _funBar() {}",
@@ -5015,16 +5050,8 @@ mod oracle_corpus_pins {
                 "\nString ZZZ = '';",
                 &[(2, 8, 3)],
             ),
-            (
-                "doc_bad_0",
-                "var Count = 0;",
-                &[(1, 5, 5)],
-            ),
-            (
-                "doc_good_0",
-                "var count = 0;",
-                &[],
-            ),
+            ("doc_bad_0", "var Count = 0;", &[(1, 5, 5)]),
+            ("doc_good_0", "var count = 0;", &[]),
             (
                 "doc_good_1",
                 "var item;\n\nHttpRequest httpRequest;\n\nalign(clearItems) {\n  // ...\n}",
@@ -5062,5 +5089,5 @@ mod oracle_corpus_pins {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    }}
-
+    }
+}

@@ -3159,7 +3159,11 @@ fn sort_constructors_first_oracle_corpus_pins() {
     // doc_bad_1/doc_good_1 oracle faces carry additional non-lint rows the
     // pin does not cover).
     let doc_cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
-        ("doc_bad_0", "class C {\n  void m() {}\n\n  C();\n}\n", &[(4, 3, 1)]),
+        (
+            "doc_bad_0",
+            "class C {\n  void m() {}\n\n  C();\n}\n",
+            &[(4, 3, 1)],
+        ),
         (
             "doc_bad_1",
             "abstract class Visitor {\n  double value;\n  visitSomething(Something s);\n  Visitor();\n}\n",

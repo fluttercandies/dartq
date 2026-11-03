@@ -20,6 +20,18 @@ fn run_semantic(source: &str, rule: &str) -> Vec<Lint> {
 /// [`run_semantic`] with a dependency file declared and imported
 /// unprefixed into the library — the cross-file closure faces.
 fn run_semantic_dep(source: &str, dependency: Option<&str>, rule: &str) -> Vec<Lint> {
+    run_semantic_dep_edge(source, dependency, None, false, rule)
+}
+
+/// [`run_semantic_dep`] with the import edge's `prefix`/`deferred`
+/// spelled — the `as b` and `deferred as b` faces.
+fn run_semantic_dep_edge(
+    source: &str,
+    dependency: Option<&str>,
+    prefix: Option<&str>,
+    deferred: bool,
+    rule: &str,
+) -> Vec<Lint> {
     let version = LanguageVersion::new(3, 15);
     let mut fixture = Fixture::parse(source);
     fixture.version = Some(version);
@@ -62,8 +74,8 @@ fn run_semantic_dep(source: &str, dependency: Option<&str>, rule: &str) -> Vec<L
             lib,
             ImportEdge {
                 target: Some(dep_lib),
-                prefix: None,
-                deferred: false,
+                prefix: prefix.map(|name| strings.intern(name)),
+                deferred,
                 combinators: Combinators::unfiltered(),
                 non_library: false,
             },
@@ -1165,6 +1177,131 @@ fn unnecessary_lambdas_silent_faces() {
             "{source}"
         );
     }
+}
+
+/// `unnecessary_lambdas`, the report anchor: the analyzer's
+/// `FunctionExpression` span runs through the body's last token —
+/// the arrow body's expression end or the block body's `}`. The
+/// production `FunctionExpression` seal stops at the body begin, so
+/// the end rides the body's own pieces.
+#[test]
+fn unnecessary_lambdas_report_spans_the_body() {
+    // `test_functionCall_matchingArg` — `2:20|15` upstream: the whole
+    // `(x) => print(x)`.
+    let source = "var x = [].forEach((x) => print(x));\n";
+    let lints = run_semantic(source, "unnecessary_lambdas");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let start = tok(source, &f.tokens, "(", 1);
+    let end = tok(source, &f.tokens, ")", 1);
+    assert_eq!(lints[0].range.start, utf16_at(&f, start));
+    assert_eq!(lints[0].range.end, utf16_at(&f, end) + 1);
+
+    // `test_noParameter_targetIsFinalField` — the block body anchors
+    // through `}`.
+    let source = "class C {\n  final f = 1;\n  Function m() {\n    return () {\n      f.toString();\n    };\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_lambdas");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let close = tok(source, &f.tokens, "}", 0);
+    assert_eq!(lints[0].range.end, utf16_at(&f, close) + 1);
+}
+
+/// `unnecessary_lambdas`, the receiver-finality faces
+/// (`isFinalNode(node.target)` :283 under `isFinal` :326-335): a
+/// `final` local's method fires, a `final` FIELD's method fires,
+/// and a `final` parameter of an ENCLOSING lambda fires (the
+/// VariableElement arm — `isFinal && !isLate`), while a plain
+/// parameter stays silent.
+#[test]
+fn unnecessary_lambdas_receiver_finality_faces() {
+    for source in [
+        // `test_methodCallOnFinalLocal_matchingArg`.
+        "void f() {\n  final l = [];\n  [].where((e) => l.contains(e));\n}\n",
+        // `test_noParameter_targetIsFinalField` (arrow form).
+        "class C {\n  final f = 1;\n  Function m() => () => f.toString();\n}\n",
+        // `test_targetIsFinalParameter` — the outer lambda's `final`
+        // parameter is not the linted lambda's own (:74), so the
+        // VariableElement arm reads it final.
+        "void f(List<String> list) {\n  list.where((final e) => ((a) => e.contains(a))(e));\n}\n",
+    ] {
+        let lints = run_semantic(source, "unnecessary_lambdas");
+        assert_eq!(lints.len(), 1, "{source}\n{lints:?}");
+    }
+    // `test_targetIsUntypedParameter` — a plain parameter is not
+    // final (`isFinal && !isLate`).
+    assert!(
+        run_semantic(
+            "void main(List<String> list) {\n  list.where((e) => ((a) => e.contains(a))(e));\n}\n",
+            "unnecessary_lambdas"
+        )
+        .is_empty()
+    );
+}
+
+/// `unnecessary_lambdas`, the prefix faces (`mightBeDeferred`
+/// :314-324 and the prefixed creation head :195-197): a non-deferred
+/// `b.isB(o)` receiver fires (`test_importedFunction`), a non-deferred
+/// `b.C()` creation fires (`test_constructorCall_imported`), and the
+/// deferred spellings bail (`test_importedFunction_deferred`,
+/// `test_constructorCall_importedDeferred`).
+#[test]
+fn unnecessary_lambdas_prefix_faces() {
+    let dep = "bool isB(Object o) => true;\nclass C {}\n";
+    for (source, deferred, expected) in [
+        (
+            "import 'kit.dart' as b;\nvoid f() {\n  [].where((o) => b.isB(o));\n}\n",
+            false,
+            1,
+        ),
+        (
+            "import 'kit.dart' deferred as b;\nvoid f() {\n  [].where((o) => b.isB(o));\n}\n",
+            true,
+            0,
+        ),
+        (
+            "import 'kit.dart' as b;\nvar x = [() => b.C()];\n",
+            false,
+            1,
+        ),
+        (
+            "import 'kit.dart' deferred as b;\nvar x = [() => b.C()];\n",
+            true,
+            0,
+        ),
+    ] {
+        let lints = run_semantic_dep_edge(
+            source,
+            Some(dep),
+            Some("b"),
+            deferred,
+            "unnecessary_lambdas",
+        );
+        assert_eq!(lints.len(), expected, "{source}\n{lints:?}");
+    }
+}
+
+/// `unnecessary_lambdas`, the context-gate face (:269-279): a
+/// named-argument lambda over a resolvable callee needs
+/// `isSubtypeOf(tearoffType, argType)` — a function type the `Ty`
+/// face cannot represent, so the check is unprovable and the posture
+/// stays silent (`test_matchingArg_dynamicParameterToOtherArg_named`).
+/// The positional sibling carries no such gate and reports through
+/// the `parametersMatch` fallback
+/// (`test_matchingArg_dynamicParameterToOtherArg_positional`).
+#[test]
+fn unnecessary_lambdas_named_argument_context_gate() {
+    let named = "var x = f(fn: (s) => count(s));\nint count(String s) => s.length;\nvoid f({int Function(dynamic)? fn}) {}\n";
+    assert!(
+        run_semantic(named, "unnecessary_lambdas").is_empty(),
+        "the named-argument context check is unprovable — silent"
+    );
+    let positional = "var x = f((s) => count(s));\nint count(String s) => s.length;\nvoid f(int Function(dynamic)? fn) {}\n";
+    assert_eq!(
+        run_semantic(positional, "unnecessary_lambdas").len(),
+        1,
+        "the positional forward reports"
+    );
 }
 
 /// The comma-init recovery faces (ticket #2418; oracle probe 14:8:6): the

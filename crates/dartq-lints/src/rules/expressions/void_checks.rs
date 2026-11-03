@@ -292,7 +292,8 @@ fn argument_face(c: &mut Check<'_>) {
             // variables ride along so a bare `T` formal substitutes through
             // the invocation's own `TypeArguments` (`A<void>.c(p)`) or the
             // receiver's written type arguments (`A<void> a; a.m(1)`).
-            let resolved = if let Some(found) = member_invocation(c, analysis, &kids[..head], selector)
+            let resolved = if let Some(found) =
+                member_invocation(c, analysis, &kids[..head], selector)
             {
                 found
             } else if let Some(sig) = analysis.function_signature_of(query_site(c, kids[head])) {
@@ -496,9 +497,7 @@ fn pattern_face(
     let Some(analysis) = analysis else {
         return;
     };
-    let is_list = left
-        .iter()
-        .any(|&row| c.kind(row) == NodeKind::ListPattern);
+    let is_list = left.iter().any(|&row| c.kind(row) == NodeKind::ListPattern);
     // The matched value type: a list pattern reads the right literal's
     // element type (`<int>[7]` → `int`); a record pattern the first
     // positional field's literal type. Anything undecidable bails.
@@ -728,9 +727,7 @@ fn type_arg_names(c: &Check<'_>, args: u32) -> Vec<Option<String>> {
     c.collect_direct(args)
         .into_iter()
         .map(|arg| match c.kind(arg) {
-            NodeKind::Type | NodeKind::VoidType => {
-                Some(c.lexeme(c.head_token(arg)).to_owned())
-            }
+            NodeKind::Type | NodeKind::VoidType => Some(c.lexeme(c.head_token(arg)).to_owned()),
             _ => None,
         })
         .collect()
@@ -822,10 +819,8 @@ fn member_invocation<'a>(
         .rev()
         .copied()
         .find(|&row| c.kind(row) == NodeKind::Identifier)?;
-    let binding = analysis.member_of(
-        query_site(c, receiver),
-        analysis.strings().intern(selector),
-    )?;
+    let binding =
+        analysis.member_of(query_site(c, receiver), analysis.strings().intern(selector))?;
     let sig = dartq_semantic::FnSig::of_member(binding.entry)?;
     Some((
         sig.formals,
@@ -863,7 +858,8 @@ fn constructor_invocation<'a>(
                 Some(analysis.strings().intern(selector)),
             )
         });
-    let binding = named.or_else(|| analysis.resolve_constructor(query_site(c, kids[head]), None))?;
+    let binding =
+        named.or_else(|| analysis.resolve_constructor(query_site(c, kids[head]), None))?;
     let formals = binding.formals?;
     Some((
         formals,

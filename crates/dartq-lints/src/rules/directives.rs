@@ -2233,12 +2233,7 @@ pub(crate) mod conditional_uri_does_not_exist {
     /// pubspec names stand in for the config: the own package's
     /// `packageUri` directory is known exactly, a declared dependency
     /// stands in for present, every other name is the no-source miss.
-    fn check_package(
-        c: &mut Check<'_>,
-        range: core::ops::Range<u32>,
-        candidate: &str,
-        rest: &str,
-    ) {
+    fn check_package(c: &mut Check<'_>, range: core::ops::Range<u32>, candidate: &str, rest: &str) {
         let Some(workspace) = c.unit.workspace else {
             return;
         };
@@ -2270,9 +2265,7 @@ pub(crate) mod conditional_uri_does_not_exist {
         // A declared dependency stands in for present: its root is not a
         // mounted fact, so the file face cannot be tested (the
         // documented under-report).
-        if workspace.dependencies.contains(name)
-            || workspace.dev_dependencies.contains(name)
-        {
+        if workspace.dependencies.contains(name) || workspace.dev_dependencies.contains(name) {
             return;
         }
         // No config entry: the oracle's source factory returns no source.
@@ -3796,10 +3789,16 @@ mod wave1_pins {
     fn conditional_uri_sdk_name_table_sentinels() {
         assert!(SDK_LIBRARY_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
         for present in ["async", "cli", "io", "html", "web_gl", "_internal", "_wasm"] {
-            assert!(SDK_LIBRARY_NAMES.binary_search(&present).is_ok(), "{present}");
+            assert!(
+                SDK_LIBRARY_NAMES.binary_search(&present).is_ok(),
+                "{present}"
+            );
         }
         for absent in ["web_sql", "missing_1", ""] {
-            assert!(SDK_LIBRARY_NAMES.binary_search(&absent).is_err(), "{absent}");
+            assert!(
+                SDK_LIBRARY_NAMES.binary_search(&absent).is_err(),
+                "{absent}"
+            );
         }
     }
 

@@ -688,10 +688,9 @@ fn block_binding(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Opt
     let mut written: Option<u32> = None;
     for kid in c.collect_direct(block) {
         match c.kind(kid) {
-            NodeKind::Type
-            | NodeKind::FunctionType
-            | NodeKind::VoidType
-            | NodeKind::RecordType => written = Some(kid),
+            NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType | NodeKind::RecordType => {
+                written = Some(kid)
+            }
             NodeKind::VariablesDeclaration => {
                 // The name identifier: a direct child (hand-built trees)
                 // or nested inside an `InitializedIdentifier` row (the
@@ -805,10 +804,9 @@ fn fields_binding(c: &Check<'_>, fields: u32, name: &str) -> Option<Option<u32>>
     let mut written: Option<u32> = None;
     for kid in c.collect_direct(fields) {
         match c.kind(kid) {
-            NodeKind::Type
-            | NodeKind::FunctionType
-            | NodeKind::VoidType
-            | NodeKind::RecordType => written = Some(kid),
+            NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType | NodeKind::RecordType => {
+                written = Some(kid)
+            }
             NodeKind::Identifier
                 if c.field(kid, PayloadField::Context) == Some(ctx)
                     && c.lexeme(c.head_token(kid)) == name =>

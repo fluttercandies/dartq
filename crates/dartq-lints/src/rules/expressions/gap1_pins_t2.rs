@@ -174,7 +174,7 @@ fn discarded_futures_sync_faces() {
     assert_eq!(
         lints[0].correction.as_deref(),
         Some(
-            "Try either making the enclosing function 'async' and awaiting the expression or wrapping the expression in 'unawaited'."
+            "Try converting the enclosing function to be 'async' and then 'await' the future, or wrap the expression in 'unawaited'."
         )
     );
 
@@ -188,6 +188,8 @@ fn discarded_futures_sync_faces() {
         1
     );
 
+    // The `FutureOr` static type lands on the same 3.13.7 code row —
+    // the paired `*FutureOr` texts are a later-SDK face, not this pin.
     let lints = run_semantic(
         "FutureOr<int> h() => 1;\nvoid g() {\n  h();\n}\n",
         "discarded_futures",
@@ -195,11 +197,7 @@ fn discarded_futures_sync_faces() {
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
-        "'FutureOr'-returning calls in a non-'async' function."
-    );
-    assert_eq!(
-        lints[0].correction.as_deref(),
-        Some("Try making the enclosing function 'async' and awaiting the expression.")
+        "'Future'-returning calls in a non-'async' function."
     );
 
     for source in [
@@ -257,11 +255,10 @@ fn unawaited_futures_async_faces() {
     );
     assert_eq!(
         lints[0].correction.as_deref(),
-        Some(
-            "Try adding an 'await' or wrapping the expression with 'unawaited' (if it is a 'Future')."
-        )
+        Some("Try adding an 'await' or wrapping the expression with 'unawaited'.")
     );
 
+    // The `FutureOr` static type lands on the same 3.13.7 code row.
     let lints = run_semantic(
         "FutureOr<int> h() => 1;\nvoid g() async {\n  h();\n}\n",
         "unawaited_futures",
@@ -269,11 +266,7 @@ fn unawaited_futures_async_faces() {
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
-        "Missing an 'await' for the 'FutureOr' computed by this expression."
-    );
-    assert_eq!(
-        lints[0].correction.as_deref(),
-        Some("Try adding an 'await'.")
+        "Missing an 'await' for the 'Future' computed by this expression."
     );
 
     for source in [

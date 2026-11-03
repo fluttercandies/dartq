@@ -428,8 +428,8 @@ pub(crate) mod prefer_spread_collections {
 
 pub(crate) mod prefer_collection_literals {
     use super::{Check, NodeKind, PayloadField, RuleSpec, slice};
-    use crate::rules::expressions::same_file;
     use crate::rules::NONE_TOKEN;
+    use crate::rules::expressions::same_file;
 
     const PROBLEM: &str = "Unnecessary constructor invocation.";
     const CORRECTION: &str = "Try using a collection literal.";
@@ -601,9 +601,7 @@ pub(crate) mod prefer_collection_literals {
         let selector = c.lexeme(c.head_token(kids[head]));
         let access = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
         match (access, args) {
-            (None, Some(args)) => {
-                unnamed_face(c, selector, args).then(|| c.utf16_span(node))
-            }
+            (None, Some(args)) => unnamed_face(c, selector, args).then(|| c.utf16_span(node)),
             (Some(_), Some(args)) if selector == "from" || selector == "of" => {
                 named_face(c, kids, head, args)
             }
@@ -845,8 +843,8 @@ pub(crate) mod prefer_collection_literals {
                                 | NodeKind::FunctionExpression
                         )
                     });
-                    let closure_return = boundary
-                        .is_some_and(|j| c.kind(c.path[j]) == NodeKind::FunctionExpression);
+                    let closure_return =
+                        boundary.is_some_and(|j| c.kind(c.path[j]) == NodeKind::FunctionExpression);
                     if !closure_return {
                         return match expected_return_head(c, &c.path[..i]) {
                             Some(t) => Context::Head(t),
@@ -977,9 +975,7 @@ pub(crate) mod prefer_collection_literals {
         let body = path[func_idx + 1..]
             .iter()
             .copied()
-            .find(|&row| {
-                matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody)
-            })?;
+            .find(|&row| matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody))?;
         let is_async = c
             .field(body, PayloadField::AsyncKeyword)
             .is_some_and(|kw| kw != NONE_TOKEN && c.lexeme(kw) == "async");
@@ -1004,9 +1000,7 @@ pub(crate) mod prefer_collection_literals {
         // kids), its `Type` children the arguments in order.
         let kids = c.collect_direct(path[func_idx]);
         if let Some(pos) = kids.iter().position(|&kid| kid == ty)
-            && let Some(&prev) = pos
-                .checked_sub(1)
-                .and_then(|prev| kids.get(prev))
+            && let Some(&prev) = pos.checked_sub(1).and_then(|prev| kids.get(prev))
             && c.kind(prev) == NodeKind::TypeArguments
             && let Some(arg) = c
                 .collect_direct(prev)
@@ -1081,7 +1075,9 @@ pub(crate) mod prefer_collection_literals {
             for row in std::iter::once(owner).chain(c.collect_direct(owner)) {
                 if !matches!(
                     c.kind(row),
-                    NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration
+                    NodeKind::TopLevelMethod
+                        | NodeKind::Method
+                        | NodeKind::LocalFunctionDeclaration
                 ) || !crate::rules::declarations::member_declaration_name(c, row)
                     .is_some_and(|name_row| c.lexeme(c.head_token(name_row)) == callee_name)
                 {
@@ -1096,7 +1092,10 @@ pub(crate) mod prefer_collection_literals {
                             let name = c.lexeme(c.head_token(*piece));
                             formals
                                 .iter()
-                                .find(|(p, _)| slice::parameter_assignments::parameter_name(c, *p) == Some(name))
+                                .find(|(p, _)| {
+                                    slice::parameter_assignments::parameter_name(c, *p)
+                                        == Some(name)
+                                })
                                 .map(|&(p, _)| p)
                         })
                 } else {
@@ -1845,7 +1844,10 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
 
 pub(crate) mod collection_methods_unrelated_type {
     use super::{Check, NodeKind, PayloadField, RuleSpec};
-    use crate::rules::{TypeFace, slice, type_face_of_field, written_type_face};
+    use crate::rules::{
+        SupertypeClause, TypeFace, class_declaration_name, slice, type_face_of_field,
+        written_type_face,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/collection_methods_unrelated_type.dart`
     /// — a single-argument invocation of a collection method whose argument
@@ -1884,15 +1886,21 @@ pub(crate) mod collection_methods_unrelated_type {
     /// on `String` (never on `Map` — `Map` is no `Iterable`), so the
     /// expected element is `String` itself.
     ///
-    /// The argument type is the scalar-literal face (`int`, `double`,
-    /// `String`, `bool`, `null`); unknown arguments stay silent. The
-    /// relation (`typesAreUnrelated`) ports as: equal names, `num` against
-    /// `int`/`double`, `Object`/`dynamic` against everything,
-    /// nullable-`?` against `Null`, a `Null` argument against a type
-    /// parameter whose bound does not pin it non-nullable
-    /// (`<T extends Object?>`), and `Comparable`/`Pattern` (the core
-    /// supertypes the scalars implement) are comparable — everything else
-    /// reports.
+    /// The argument face (`_checkMethod`'s `argument.staticType`) reads
+    /// the scalar literals, a declared name's flow-read type, a creation's
+    /// published type (`E2()`, `Object()`), an enum's static-member read
+    /// (`E2.c`), and a record literal field-wise (`(1, 2)`); faceless
+    /// arguments (`as` casts, untyped bindings, member chains) stay
+    /// silent. The relation (`typesAreUnrelated`) ports over resolved
+    /// slots: the promoted-nullability `Null` arms ahead of the subtype
+    /// walk, record-vs-record field-wise (a record against a named type
+    /// is always unrelated), the same-file supertype closure (subtype
+    /// either way stays related), and the direct-supertype pair — equal
+    /// heads relate only when the head is neither `Object` nor
+    /// `ProtobufEnum` and the sides are neither distinct enums nor
+    /// distinct mixins, everything else reports. Extension types erase to
+    /// their representation type for the relation only (`E(int)` against
+    /// `int` stays silent); the report keeps the written spellings.
     ///
     /// The index face (:180-200) dispatches on the `Indexed` handle: the
     /// receiver reads through the same resolution, the key argument is the
@@ -1904,17 +1912,16 @@ pub(crate) mod collection_methods_unrelated_type {
     /// Known silences (each the documented fallback of the same-file
     /// channel): a receiver whose written type leaves the file (a member
     /// chain, an import) — the official's unresolvable-or-imported faces;
-    /// an untyped binding decides only through its initializer
-    /// ([`inferred_binding_type_face`] — a user-container creation head or
-    /// any other shape keeps the silence); a prefixed collection
-    /// spelling (`collection.Queue`) — the `Type` row's head is the prefix,
-    /// no slot matches; a user-declared collection subtype (same-file
-    /// `class MyList extends List<int>` or a cross-file one) — the
-    /// official reads the resolved supertype's substituted type arguments,
-    /// a substitution the written type does not carry; a bare-`this` or
-    /// implicit receiver (the official `_getTargetType` member walk); and
-    /// the inferred element type of an untyped literal (the official's
-    /// inference, `[]`'s `dynamic` included). Message:
+    /// a cross-file user-declared collection subtype — the official reads
+    /// the resolved supertype's substituted type arguments, a clause the
+    /// file does not carry; an untyped binding decides only through its
+    /// initializer ([`inferred_binding_type_face`] — a user-container
+    /// creation head or any other shape keeps the silence); a prefixed
+    /// collection spelling (`collection.Queue`) — the `Type` row's head is
+    /// the prefix, no slot matches; the inferred element type of an
+    /// untyped literal (the official's inference, `[]`'s `dynamic`
+    /// included); and cross-file types that share a head spelling with a
+    /// different element (the official's element-identity read). Message:
     /// `diagnostic.g.dart` `collectionMethodsUnrelatedType`.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "collection_methods_unrelated_type",
@@ -1949,52 +1956,117 @@ pub(crate) mod collection_methods_unrelated_type {
             return;
         };
         let name = c.lexeme(c.head_token(kids[head]));
-        // The receiver run: the pieces before the selector, read through
-        // the access-run form (the markers and the bare-name send group
-        // tile beside the chain rows).
-        let mut end = head;
-        while end > 0
-            && matches!(
-                c.kind(kids[end - 1]),
-                NodeKind::NoTypeArguments | NodeKind::TypeArguments
-            )
-        {
-            end -= 1;
-        }
-        let trimmed = slice::access_run(c, &kids[..end]);
-        // The single scalar-literal argument (:203-205): the argument is the
-        // `Arguments` container's lone child row.
-        let args = c.collect_direct(arguments);
-        let [arg] = args.as_slice() else {
+        let selector = c.head_token(kids[head]);
+        // The single argument (:203-205): the argument list carries no
+        // top-level comma, and its non-marker pieces are the argument's
+        // rows — a complex argument (`E2.c`, a record literal) tiles
+        // several, and its whole extent is the report span.
+        let Some((arg_rows, arg_span)) = single_argument(c, arguments) else {
             return;
+        };
+        // The receiver run: the pieces before the selector. A cascade
+        // section's target tiles OUTSIDE the Cascade window — the run
+        // adopts the pieces before the Cascade row in its own owner
+        // window; a plain send reads its owner run before the selector.
+        let cascade_row = c
+            .ancestor(1)
+            .filter(|&parent| c.kind(parent) == NodeKind::Cascade);
+        let cascade = cascade_row.is_some();
+        let receiver_rows: Vec<u32> = if let Some(cascade_row) = cascade_row {
+            let Some(grand) = c.ancestor(2) else {
+                return;
+            };
+            let gkids = c.collect_direct(grand);
+            let Some(gpos) = gkids.iter().position(|&kid| kid == cascade_row) else {
+                return;
+            };
+            let mut run = gkids[..gpos].to_vec();
+            if let Some(i) = run
+                .iter()
+                .rposition(|&row| crate::rules::is_statement_row(c, row))
+            {
+                run.drain(..=i);
+            }
+            run
+        } else {
+            let mut end = head;
+            while end > 0
+                && matches!(
+                    c.kind(kids[end - 1]),
+                    NodeKind::NoTypeArguments | NodeKind::TypeArguments
+                )
+            {
+                end -= 1;
+            }
+            kids[..end].to_vec()
         };
         // The typed-literal receiver (`<num>[].contains('x')`): the
         // literal is its own static type, ahead of the written-type faces.
-        if let Some(literal) = literal_receiver_face(c, &kids[..end]) {
-            if let Some(pinned) = literal.name {
-                if let Some((arg_type, expected)) =
-                    verdict_on(c, name, pinned, &literal.type_arguments, *arg)
-                {
-                    let range = c.utf16_span(*arg);
-                    c.report(range, &[&arg_type, &expected]);
-                }
+        if let Some(expected) = literal_receiver_face(c, &receiver_rows) {
+            if let Some((arg_type, expected)) = verdict_on(c, name, &expected, &arg_rows) {
+                c.report(arg_span.clone(), &[&arg_type, &expected]);
             }
             return;
         }
-        let (face, inferred_user) = match receiver_face(c, &trimmed) {
+        let dotted = matches!(
+            selector.checked_sub(1).map(|token| c.lexeme(token)),
+            Some(".") | Some("?.")
+        );
+        if !dotted && !cascade {
+            // The implicit-this face (`_getTargetType`'s walk): the
+            // enclosing class-like's supertype clauses.
+            if let Some(expected) = enclosing_container(c)
+                .and_then(|container| substituted_expected(c, name, &container))
+                && let Some((arg_type, expected)) = expected_verdict(c, &expected, &arg_rows)
+            {
+                c.report(arg_span.clone(), &[&arg_type, &expected]);
+            }
+            return;
+        }
+        // The access-run receiver, cut to the dot-adjacent tail — an
+        // expression-body owner carries the declaration header's strays
+        // (`bool f(List<int> l) => l.contains('1')`), and only the
+        // token-adjacent tail is the receiver.
+        let access = slice::access_run(c, &receiver_rows);
+        let trimmed = slice::contiguous_tail(c, &access, selector.saturating_sub(1));
+        let (face, inferred_user) = match receiver_face(c, trimmed) {
             Some(face) => (face, false),
-            None => match inferred_receiver_face(c, &trimmed) {
+            None => match inferred_receiver_face(c, trimmed) {
                 Some((face, user)) => (face, user),
-                None => return,
+                // The bare `this` receiver: the enclosing class-like's
+                // supertype clauses (`this.contains('1')`).
+                None => {
+                    if let [only] = trimmed
+                        && c.kind(*only) == NodeKind::ThisExpression
+                        && let Some(expected) = enclosing_container(c)
+                            .and_then(|container| substituted_expected(c, name, &container))
+                        && let Some((arg_type, expected)) =
+                            expected_verdict(c, &expected, &arg_rows)
+                    {
+                        c.report(arg_span.clone(), &[&arg_type, &expected]);
+                    }
+                    return;
+                }
             },
         };
-        let bare = match trimmed.as_slice() {
+        let bare = match trimmed {
             [only] if c.kind(*only) == NodeKind::Identifier => Some(*only),
             _ => None,
         };
-        if !inferred_user && let Some((arg_type, expected)) = verdict(c, name, &face, bare, *arg) {
-            let range = c.utf16_span(*arg);
-            c.report(range, &[&arg_type, &expected]);
+        if !inferred_user
+            && let Some((arg_type, expected)) = verdict(c, name, &face, bare, &arg_rows)
+        {
+            c.report(arg_span.clone(), &[&arg_type, &expected]);
+            return;
+        }
+        // The written face named a same-file type: its supertype clauses
+        // carry the substituted core face (`C implements List<num>`).
+        if !inferred_user
+            && let Some(written) = face.name
+            && let Some(expected) = substituted_expected(c, name, written)
+            && let Some((arg_type, expected)) = expected_verdict(c, &expected, &arg_rows)
+        {
+            c.report(arg_span.clone(), &[&arg_type, &expected]);
         }
     }
 
@@ -2069,40 +2141,46 @@ pub(crate) mod collection_methods_unrelated_type {
         // The receiver: the access run before the key piece, matched on its
         // trailing `[ThisExpression, name]` / `[name]` face. The typed-
         // literal receiver (`<int, String>{}['k']`) reads first.
-        if let Some(literal) = literal_receiver_face(c, &kids[..key_pos]) {
-            if let Some(pinned) = literal.name {
-                if let Some((arg_type, expected)) = verdict_on(
-                    c,
-                    "[]",
-                    pinned,
-                    &literal.type_arguments,
-                    key.expect("counted above"),
-                ) {
-                    let range = c.utf16_span(key.expect("counted above"));
-                    c.report(range, &[&arg_type, &expected]);
-                }
+        let key = key.expect("counted above");
+        if let Some(expected) = literal_receiver_face(c, &kids[..key_pos]) {
+            if let Some((arg_type, expected)) =
+                verdict_on(c, "[]", &expected, std::slice::from_ref(&key))
+            {
+                let range = c.utf16_span(key);
+                c.report(range, &[&arg_type, &expected]);
             }
             return;
         }
-        let trimmed = slice::access_run(c, &kids[..key_pos]);
-        let tail = trimmed.len().saturating_sub(2);
-        let end = trimmed.len();
-        let (face, inferred_user) = match receiver_face(c, &trimmed[tail..]) {
+        let access = slice::access_run(c, &kids[..key_pos]);
+        let cut = slice::contiguous_tail(c, &access, c.unit.ast.token_range(node).start);
+        let tail = cut.len().saturating_sub(2);
+        let end = cut.len();
+        let (face, inferred_user) = match receiver_face(c, &cut[tail..]) {
             Some(face) => (face, false),
-            None => match inferred_receiver_face(c, &trimmed[tail..end]) {
+            None => match inferred_receiver_face(c, &cut[tail..end]) {
                 Some((face, user)) => (face, user),
                 None => return,
             },
         };
-        let bare = match &trimmed[tail..end] {
+        let bare = match &cut[tail..end] {
             [only] if c.kind(*only) == NodeKind::Identifier => Some(*only),
             _ => None,
         };
         if !inferred_user
             && let Some((arg_type, expected)) =
-                verdict(c, "[]", &face, bare, key.expect("counted above"))
+                verdict(c, "[]", &face, bare, std::slice::from_ref(&key))
         {
-            let range = c.utf16_span(key.expect("counted above"));
+            let range = c.utf16_span(key);
+            c.report(range, &[&arg_type, &expected]);
+            return;
+        }
+        if !inferred_user
+            && let Some(written) = face.name
+            && let Some(expected) = substituted_expected(c, "[]", written)
+            && let Some((arg_type, expected)) =
+                expected_verdict(c, &expected, std::slice::from_ref(&key))
+        {
+            let range = c.utf16_span(key);
             c.report(range, &[&arg_type, &expected]);
         }
     }
@@ -2168,17 +2246,52 @@ pub(crate) mod collection_methods_unrelated_type {
             .is_some()
     }
 
+    /// One resolved type slot: the display spelling, its nullability, and
+    /// the field-wise face of a record type.
+    #[derive(Clone)]
+    struct Slot {
+        display: String,
+        nullable: bool,
+        record: Option<Vec<Slot>>,
+    }
+
+    impl Slot {
+        /// The message display: the spelling plus the written `?`.
+        fn nullable_display(&self) -> String {
+            if self.nullable {
+                format!("{}?", self.display)
+            } else {
+                self.display.clone()
+            }
+        }
+    }
+
+    /// The resolved expected face: the core container spelling the method
+    /// table keys on, and the written type-argument slots.
+    struct Expected<'a> {
+        written: &'a str,
+        slots: Vec<Slot>,
+    }
+
+    fn named_slot(name: &str, nullable: bool) -> Slot {
+        Slot {
+            display: name.to_owned(),
+            nullable,
+            record: None,
+        }
+    }
+
     /// The verdict over a written-type receiver: the same-file shadow gate,
     /// the cross-file user-container gate, then the shared verdict body.
     /// `receiver` is the bare receiver row when the face came off a bare
     /// name (`None` for `this.<field>` and inferred-initializer faces — the
     /// latter gate their own creation heads).
-    fn verdict(
-        c: &Check<'_>,
+    fn verdict<'a>(
+        c: &Check<'a>,
         method: &str,
-        face: &TypeFace<'_>,
+        face: &TypeFace<'a>,
         receiver: Option<u32>,
-        argument: u32,
+        arg_rows: &[u32],
     ) -> Option<(String, String)> {
         let written = face.name?;
         // A same-file declaration owns the written name — the
@@ -2194,50 +2307,63 @@ pub(crate) mod collection_methods_unrelated_type {
         {
             return None;
         }
-        verdict_on(c, method, written, &face.type_arguments, argument)
+        let expected = Expected {
+            written,
+            slots: face
+                .type_arguments
+                .iter()
+                .map(|(name, nullable)| named_slot(name, *nullable))
+                .collect(),
+        };
+        verdict_on(c, method, &expected, arg_rows)
     }
 
-    /// The verdict body (:243-265) over an already-core written name — the
-    /// written-type face and the typed-literal face share it (a literal's
-    /// static type is the core collection whatever the file declares, so
-    /// the shadow gate does not apply). `(argument type, expected type)`
-    /// when the report fires, `None` otherwise.
-    fn verdict_on(
-        c: &Check<'_>,
+    /// The verdict body (:243-265) over a resolved expected face — the
+    /// written-type face, the typed-literal face and the substituted
+    /// clause face share it (a literal's static type is the core
+    /// collection whatever the file declares, so the shadow gate does not
+    /// apply). `(argument type, expected type)` when the report fires.
+    fn verdict_on<'a>(
+        c: &Check<'a>,
         method: &str,
-        written: &str,
-        type_arguments: &[(&str, bool)],
-        argument: u32,
+        expected: &Expected<'a>,
+        arg_rows: &[u32],
     ) -> Option<(String, String)> {
         // `String.contains` rides the `Iterable<String>` face —
         // `asInstanceOf(iterableElement)` resolves on the unparameterized
         // `String` (never on `Map`: `Map` is no `Iterable`, so a map
         // receiver's `contains` never reaches the table) — and the
         // expected element is `String` itself.
-        if method == "contains" && written == "String" {
-            let arg_type = literal_type_name(c, argument)?;
-            return if comparable("String", false, arg_type) {
+        if method == "contains" && expected.written == "String" {
+            let arg = argument_slot(c, arg_rows)?;
+            return if comparable("String", false, &arg.display) {
                 None
             } else {
-                Some((arg_type.to_owned(), "String".to_owned()))
+                Some((arg.nullable_display(), "String".to_owned()))
             };
         }
-        let (index, ()) = expected_slot(method, written)?;
-        if type_arguments.len() <= index {
-            return None; // raw or argument-less written type: no verdict
-        }
-        let arg_type = literal_type_name(c, argument)?;
-        let (element, element_nullable) = type_arguments[index];
-        if comparable(element, element_nullable, arg_type)
-            || (arg_type == "Null" && type_parameter_admits_null(c, element) == Some(true))
-        {
+        let (index, ()) = expected_slot(method, expected.written)?;
+        slot_verdict(c, expected.slots.get(index)?, arg_rows)
+    }
+
+    /// The substituted clause face resolved THE method's slot already —
+    /// it rides at index 0.
+    fn expected_verdict(
+        c: &Check<'_>,
+        expected: &Expected<'_>,
+        arg_rows: &[u32],
+    ) -> Option<(String, String)> {
+        slot_verdict(c, expected.slots.first()?, arg_rows)
+    }
+
+    /// The slot check + the argument face + the relation (:243-265). A
+    /// faceless argument (`dynamic`, an unresolved name) stays silent.
+    fn slot_verdict(c: &Check<'_>, element: &Slot, arg_rows: &[u32]) -> Option<(String, String)> {
+        let arg = argument_slot(c, arg_rows)?;
+        if !unrelated(c, element, &arg) {
             return None;
         }
-        let mut expected = element.to_owned();
-        if element_nullable {
-            expected.push('?');
-        }
-        Some((arg_type.to_owned(), expected))
+        Some((arg.nullable_display(), element.nullable_display()))
     }
 
     /// The method's expected slot: `(type-argument index, declaring
@@ -2282,7 +2408,7 @@ pub(crate) mod collection_methods_unrelated_type {
     /// to the statement, so earlier expressions' literals stay out unless
     /// they genuinely end after the receiver's, which only the receiver's
     /// own run can produce adjacent to the selector).
-    fn literal_receiver_face<'a>(c: &'a Check<'_>, run: &[u32]) -> Option<TypeFace<'a>> {
+    fn literal_receiver_face(c: &Check<'_>, run: &[u32]) -> Option<Expected<'static>> {
         let literal = run
             .iter()
             .copied()
@@ -2293,22 +2419,17 @@ pub(crate) mod collection_methods_unrelated_type {
                 )
             })
             .max_by_key(|&row| c.byte_span(row).end)?;
-        let mut type_arguments = Vec::new();
+        let mut slots: Vec<Slot> = Vec::new();
         for &piece in run {
             if c.kind(piece) != NodeKind::TypeArguments {
                 continue;
             }
             if c.byte_span(piece).end <= c.byte_span(literal).start {
-                type_arguments = c
+                slots = c
                     .collect_direct(piece)
                     .into_iter()
-                    .filter(|&arg| c.kind(arg) == NodeKind::Type)
-                    .map(|arg| {
-                        let head = c.head_token(arg);
-                        let nullable =
-                            c.byte_span(arg).end > crate::rules::byte_span_of_token(c, head).end;
-                        (c.lexeme(head), nullable)
-                    })
+                    .filter(|&arg| matches!(c.kind(arg), NodeKind::Type | NodeKind::RecordType))
+                    .map(|arg| type_row_slot(c, arg))
                     .collect();
             }
         }
@@ -2321,31 +2442,93 @@ pub(crate) mod collection_methods_unrelated_type {
                 // documented corner — the official resolves it through
                 // context); two written type arguments are the map's
                 // `K, V`, the context-free reading.
-                _ if type_arguments.len() == 2 => "Map",
+                _ if slots.len() == 2 => "Map",
                 _ => "Set",
             },
             _ => return None,
         };
-        Some(TypeFace {
-            name: Some(pinned),
-            nullable: false,
-            is_void: false,
-            is_future_or_void: false,
-            is_function_type: false,
-            type_arguments,
+        Some(Expected {
+            written: pinned,
+            slots,
         })
     }
 
-    /// The scalar-literal type face; `null` answers `"Null"`.
-    fn literal_type_name(c: &Check<'_>, row: u32) -> Option<&'static str> {
-        match c.kind(row) {
-            NodeKind::LiteralInt => Some("int"),
-            NodeKind::LiteralDouble => Some("double"),
-            NodeKind::StringLiteral => Some("String"),
-            NodeKind::LiteralBool => Some("bool"),
-            NodeKind::LiteralNull => Some("Null"),
-            _ => None,
+    /// One written type row as a verdict slot: a named type (head spelling
+    /// plus the `?` tail) or a record type (field-wise face).
+    fn type_row_slot(c: &Check<'_>, row: u32) -> Slot {
+        if c.kind(row) == NodeKind::RecordType {
+            return record_slot(c, row);
         }
+        let head = c.head_token(row);
+        let nullable = c.byte_span(row).end > crate::rules::byte_span_of_token(c, head).end;
+        named_slot(c.lexeme(head), nullable)
+    }
+
+    /// The record-type slot: positional entries then named entries, the
+    /// display `(f1, f2, {n1: t1})` — the upstream `RecordType` display
+    /// shape. The `?` suffix is the row's last token (`endRecordType`).
+    fn record_slot(c: &Check<'_>, row: u32) -> Slot {
+        let mut fields = Vec::new();
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        for kid in c.collect_direct(row) {
+            match c.kind(kid) {
+                NodeKind::RecordTypeEntry => {
+                    if let Some(field) = record_entry_slot(c, kid) {
+                        positional.push(field.nullable_display());
+                        fields.push(field);
+                    }
+                }
+                NodeKind::RecordTypeNamedFields => {
+                    for entry in c.collect_direct(kid) {
+                        if c.kind(entry) != NodeKind::RecordTypeEntry {
+                            continue;
+                        }
+                        if let (Some(name), Some(field)) =
+                            (record_entry_name(c, entry), record_entry_slot(c, entry))
+                        {
+                            named.push(format!("{}: {}", name, field.nullable_display()));
+                            fields.push(field);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let last = c.unit.ast.token_range(row).end.saturating_sub(1);
+        let nullable = c.lexeme(last) == "?";
+        let mut display = String::from("(");
+        display.push_str(&positional.join(", "));
+        if !named.is_empty() {
+            if !positional.is_empty() {
+                display.push_str(", ");
+            }
+            display.push('{');
+            display.push_str(&named.join(", "));
+            display.push('}');
+        }
+        display.push(')');
+        Slot {
+            display,
+            nullable,
+            record: Some(fields),
+        }
+    }
+
+    /// The written type of one record-type entry.
+    fn record_entry_slot(c: &Check<'_>, entry: u32) -> Option<Slot> {
+        c.collect_direct(entry)
+            .into_iter()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::RecordType))
+            .map(|kid| type_row_slot(c, kid))
+    }
+
+    /// The written field name of a named record-type entry.
+    fn record_entry_name<'a>(c: &'a Check<'_>, entry: u32) -> Option<&'a str> {
+        c.collect_direct(entry)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .map(|kid| c.lexeme(c.head_token(kid)))
     }
 
     /// `typesAreUnrelated`'s type-parameter arm: a `Null` argument is
@@ -2408,14 +2591,367 @@ pub(crate) mod collection_methods_unrelated_type {
         None
     }
 
-    /// `typesAreUnrelated` on the ported faces (documented on the SPEC).
+    /// The single argument's non-marker rows and utf-16 extent: the
+    /// argument list carries no top-level comma (the upstream
+    /// `arguments.length != 1` bail — a nested group's commas stay out of
+    /// the walk), and its non-marker pieces are the argument's rows. A
+    /// complex argument (`E2.c`, a record literal) tiles several rows,
+    /// and its whole extent is the report span (`reportAtNode`).
+    fn single_argument(c: &Check<'_>, arguments: u32) -> Option<(Vec<u32>, core::ops::Range<u32>)> {
+        let range = c.unit.ast.token_range(arguments);
+        let mut at = range.start;
+        while let Some(next) = c.unit.tokens.next(at as usize) {
+            let token = next as u32;
+            if token >= range.end {
+                break;
+            }
+            if let Some(close) = c.unit.tokens.matching_end(token as usize) {
+                at = close as u32; // the nested group's commas stay out
+                continue;
+            }
+            if c.lexeme(token) == "," {
+                return None;
+            }
+            at = token;
+        }
+        let rows: Vec<u32> = c
+            .collect_direct(arguments)
+            .into_iter()
+            .filter(|&row| !slice::is_send_group_piece(c, row))
+            .collect();
+        // The extent is the pieces' own spans over the non-marker rows
+        // (a trailing `DotAccess` seals past the expression — the
+        // `reportAtNode(argument)` extent is the argument itself).
+        let extent: Vec<u32> = rows
+            .iter()
+            .copied()
+            .filter(|&row| !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified))
+            .collect();
+        let first = *extent.first().or_else(|| rows.first())?;
+        let last = *extent.last().or_else(|| rows.last())?;
+        let start = c.utf16_span(first).start;
+        let end = c.utf16_span(last).end;
+        Some((rows, start..end))
+    }
+
+    /// The argument's type slot (`_checkMethod`'s `argument.staticType`):
+    /// the scalar-literal faces, a declared name's flow-read type, a
+    /// creation's published type (`E2()`, `Object()`), an enum's
+    /// static-member read (`E2.c`), and a record literal field-wise. The
+    /// upstream reads the resolved static type; the same-file channel
+    /// answers where the row carries the answer (`as` casts, untyped
+    /// bindings, member chains stay faceless and silent).
+    fn argument_slot(c: &Check<'_>, rows: &[u32]) -> Option<Slot> {
+        match rows {
+            [only] => single_row_slot(c, *only),
+            [head, rest @ ..]
+                if c.kind(*head) == NodeKind::Identifier
+                    && rest.iter().any(|&row| c.kind(row) == NodeKind::DotAccess) =>
+            {
+                // The static-member read (`E2.c`): the head names the
+                // target — an enum constant's type is its enum.
+                let name = c.lexeme(c.head_token(*head));
+                let row = crate::rules::same_file_declaration(c, name)?;
+                (c.kind(row) == NodeKind::EnumDeclaration).then(|| named_slot(name, false))
+            }
+            [callee, rest @ ..]
+                if c.kind(*callee) == NodeKind::Identifier
+                    && rest.iter().any(|&row| c.kind(row) == NodeKind::Arguments) =>
+            {
+                // The creation face (`E2()`): the published construction
+                // type.
+                let analysis = c.semantics()?;
+                match analysis.creation_type(crate::rules::expressions::query_site(c, *callee)) {
+                    Some(dartq_semantic::model::Ty::Named { name, nullable, .. }) => {
+                        let display = analysis.strings().resolve(name);
+                        Some(Slot {
+                            display: display.to_owned(),
+                            nullable,
+                            record: None,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The one-row argument faces: the scalar literals, a record literal,
+    /// a declared name (`type_of`).
+    fn single_row_slot(c: &Check<'_>, row: u32) -> Option<Slot> {
+        let scalar = match c.kind(row) {
+            NodeKind::LiteralInt => "int",
+            NodeKind::LiteralDouble => "double",
+            NodeKind::StringLiteral => "String",
+            NodeKind::LiteralBool => "bool",
+            NodeKind::LiteralNull => "Null",
+            _ => "",
+        };
+        if !scalar.is_empty() {
+            return Some(named_slot(scalar, false));
+        }
+        match c.kind(row) {
+            NodeKind::RecordLiteral => record_literal_slot(c, row),
+            NodeKind::Identifier => {
+                let analysis = c.semantics()?;
+                match analysis.type_of(crate::rules::expressions::query_site(c, row)) {
+                    Some(dartq_semantic::model::Ty::Named { name, nullable, .. }) => {
+                        let display = analysis.strings().resolve(name);
+                        Some(Slot {
+                            display: display.to_owned(),
+                            nullable,
+                            record: None,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The record-literal argument's field-wise slot (`(1, 2)`): the
+    /// value rows in order — the width-0 named-field markers and
+    /// send-group pieces stay out. A faceless element drops the whole
+    /// slot (the official reads the resolved inference; the
+    /// scalar-literal census shapes carry theirs).
+    fn record_literal_slot(c: &Check<'_>, row: u32) -> Option<Slot> {
+        let mut fields = Vec::new();
+        let mut display = String::from("(");
+        for kid in c.collect_direct(row) {
+            if c.byte_span(kid).is_empty() {
+                continue;
+            }
+            // A faceless element drops the whole slot: the field-wise
+            // relation needs every position.
+            let slot = single_row_slot(c, kid)?;
+            if !fields.is_empty() {
+                display.push_str(", ");
+            }
+            display.push_str(&slot.nullable_display());
+            fields.push(slot);
+        }
+        display.push(')');
+        Some(Slot {
+            display,
+            nullable: false,
+            record: Some(fields),
+        })
+    }
+
+    /// `typesAreUnrelated` (:163-296) over the ported slots, with the
+    /// extension-type erasure (`extensionTypeErasure`) on both sides —
+    /// the erasure decides the relation only, the report keeps the
+    /// written spellings.
+    fn unrelated(c: &Check<'_>, element: &Slot, arg: &Slot) -> bool {
+        let element = erased(c, element);
+        let arg = erased(c, arg);
+        if comparable(&element.display, element.nullable, &arg.display) {
+            return false;
+        }
+        // The type-variable face: a `Null` argument against a variable
+        // whose bound does not pin it non-nullable stays related (the
+        // promoted-`Never` subtype of a nullable-bound variable).
+        if arg.display == "Null" && type_parameter_admits_null(c, &element.display) == Some(true) {
+            return false;
+        }
+        // `Null` against a non-nullable non-`Null` type is unrelated —
+        // the upstream promoted-nullability arms, ahead of the subtype
+        // walk (`<T extends Object>` reports, `<T extends Object?>` and
+        // `<num?>` stay silent).
+        if (arg.display == "Null" && !element.nullable && element.display != "Null")
+            || (element.display == "Null" && !arg.nullable && arg.display != "Null")
+        {
+            return true;
+        }
+        // Record faces: same arity, every field pair related; a record
+        // against a named type is always unrelated (the assignability
+        // arms).
+        match (&element.record, &arg.record) {
+            (Some(ef), Some(af)) => {
+                return ef.len() != af.len() || ef.iter().zip(af).any(|(e, a)| unrelated(c, e, a));
+            }
+            (Some(_), None) | (None, Some(_)) => return true,
+            (None, None) => {}
+        }
+        if element.display == arg.display {
+            return false;
+        }
+        // A written supertype link either way stays related (the
+        // promoted-subtype arms, the same-file closure).
+        if subtype_either_way(c, &element.display, &arg.display) {
+            return false;
+        }
+        // The direct-supertype pair (`interfaceTypesAreUnrelated`): equal
+        // heads are unrelated when the head is `Object` or `ProtobufEnum`
+        // or the sides are distinct enums / mixins (the sentinel heads);
+        // any other shared head is the same-element face and stays
+        // related.
+        match (
+            extends_head(c, &element.display),
+            extends_head(c, &arg.display),
+        ) {
+            (Some(left), Some(right)) if left == right => {
+                matches!(left, "Object" | "ProtobufEnum" | "Enum" | "#mixin")
+            }
+            _ => true,
+        }
+    }
+
+    /// The same-file closure subtype face — the promoted-subtype arms
+    /// over written declarations. A cross-file spelling carries no
+    /// closure (the documented under-report).
+    fn subtype_either_way(c: &Check<'_>, left: &str, right: &str) -> bool {
+        for (from, to) in [(left, right), (right, left)] {
+            if let Some(closure) = crate::rules::expressions::same_file::supertype_closure(c, from)
+                && closure.iter().any(|name| name == to)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The extension-type erasure: a slot naming a same-file extension
+    /// type reads as its representation type; anything else is itself.
+    fn erased(c: &Check<'_>, slot: &Slot) -> Slot {
+        if slot.record.is_some() {
+            return slot.clone();
+        }
+        extension_representation(c, &slot.display).unwrap_or_else(|| slot.clone())
+    }
+
+    /// The representation type of the same-file extension type `name`:
+    /// the written type inside its primary-constructor header. `None`
+    /// when the name is not a same-file extension type (no erasure).
+    fn extension_representation(c: &Check<'_>, name: &str) -> Option<Slot> {
+        let root = c.unit.ast.root()?;
+        let none = crate::rules::NONE_TOKEN;
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            for row in c.collect_direct(top) {
+                if c.kind(row) != NodeKind::ExtensionTypeDeclaration {
+                    continue;
+                }
+                let declared = c.field(row, PayloadField::Name).unwrap_or(none);
+                if declared == none || c.lexeme(declared) != name {
+                    continue;
+                }
+                let ctor = c
+                    .collect_direct(row)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::PrimaryConstructor)?;
+                let representation = c
+                    .collect_direct(ctor)
+                    .into_iter()
+                    .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::RecordType))?;
+                return Some(type_row_slot(c, representation));
+            }
+        }
+        None
+    }
+
+    /// The enclosing class-like declaration's name — the implicit-`this`
+    /// target (`_getTargetType`'s class/mixin walk).
+    fn enclosing_container<'a>(c: &'a Check<'a>) -> Option<&'a str> {
+        let ancestor = c.path.iter().rev().copied().find(|&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration | NodeKind::MixinDeclaration | NodeKind::EnumDeclaration
+            )
+        })?;
+        class_declaration_name(c, ancestor)
+    }
+
+    /// The method's expected slot through the container's written
+    /// supertype clauses (`C implements List<num>` answers
+    /// `contains`/`remove` with `num`) — the official
+    /// `collectionTypeFor`'s `asInstanceOf` substitution, over the
+    /// same-file clauses. The first tabled clause type wins, its written
+    /// type arguments are the slots; `None` when no clause names a tabled
+    /// container.
+    fn substituted_expected<'a>(
+        c: &'a Check<'a>,
+        method: &str,
+        container: &str,
+    ) -> Option<Expected<'a>> {
+        let row = crate::rules::same_file_declaration(c, container)?;
+        let kids = c.collect_direct(row);
+        for (index, &kid) in kids.iter().enumerate() {
+            if c.kind(kid) != NodeKind::Type {
+                continue;
+            }
+            // The supertype clauses sit before the body; a member's
+            // written type never tiles at the declaration level. The
+            // clause's `TypeArguments` is the sibling row (the
+            // production tiling keeps it beside the `Type`).
+            let written = c.lexeme(c.head_token(kid));
+            if expected_slot(method, written).is_some() {
+                let arguments = kids[..index]
+                    .iter()
+                    .rev()
+                    .find(|&&sibling| c.kind(sibling) == NodeKind::TypeArguments)
+                    .or_else(|| {
+                        kids[index + 1..]
+                            .iter()
+                            .find(|&&sibling| c.kind(sibling) == NodeKind::TypeArguments)
+                    })
+                    .map(|&sibling| {
+                        c.collect_direct(sibling)
+                            .into_iter()
+                            .filter(|&arg| {
+                                matches!(c.kind(arg), NodeKind::Type | NodeKind::RecordType)
+                            })
+                            .map(|arg| type_row_slot(c, arg))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return Some(Expected {
+                    written,
+                    slots: arguments,
+                });
+            }
+        }
+        None
+    }
+
+    /// The direct-supertype head spelling of a same-file declaration —
+    /// the `extends` clause's name. Enums carry the implicit `Enum`
+    /// supertype and mixins none (the sentinel pair: distinct enums and
+    /// distinct mixins are unrelated, the upstream `EnumElement` and
+    /// null-supertype faces).
+    fn extends_head<'a>(c: &'a Check<'a>, name: &str) -> Option<&'a str> {
+        let row = crate::rules::same_file_declaration(c, name)?;
+        match c.kind(row) {
+            NodeKind::EnumDeclaration => return Some("Enum"),
+            NodeKind::MixinDeclaration => return Some("#mixin"),
+            _ => {}
+        }
+        crate::rules::supertypes(c, row)
+            .into_iter()
+            .find(|(_, clause)| *clause == SupertypeClause::Extends)
+            .map(|(name, _)| name)
+    }
+
+    /// `typesAreUnrelated`'s core-scalar face on the ported names: the
+    /// promoted equality/subtype arms over the SDK spellings (`num` vs
+    /// `int`/`double` either way — the shared `num` supertype face; the
+    /// `Comparable`/`Pattern` implementors; `Object`/`dynamic` against
+    /// everything).
     fn comparable(element: &str, element_nullable: bool, arg: &str) -> bool {
         element == arg
             || matches!(
                 element,
                 "Object" | "dynamic" | "void" | "Comparable" | "Pattern"
             )
+            || matches!(arg, "Object" | "dynamic")
+            || (matches!(element, "num" | "int" | "double" | "String")
+                && matches!(arg, "Comparable" | "Pattern"))
             || (element == "num" && matches!(arg, "int" | "double"))
+            || (matches!(element, "int" | "double") && matches!(arg, "num" | "int" | "double"))
             || (element_nullable && arg == "Null")
     }
 }
@@ -2574,7 +3110,19 @@ pub(crate) mod prefer_foreach {
         if references_in_target(c, &kids[..head], selector_head, loop_var, forin) {
             return;
         }
-        c.report(c.utf16_span(forin), &[]);
+        // `reportAtNode(forEachStatement)` (:70/:79): the whole for
+        // statement through the body's end. The production `ForIn`
+        // seal stops one token short (its exclusive `end_at` drops
+        // the body's last token — `}` or `;`), so the end reads the
+        // body row's own span: the last direct child statement row.
+        let span = c.utf16_span(forin);
+        let end = c
+            .collect_direct(forin)
+            .into_iter()
+            .rev()
+            .find(|&row| is_statement_row(c, row))
+            .map_or(span.end, |body| c.utf16_span(body).end);
+        c.report(span.start..end, &[]);
     }
 
     /// The statement rows of a block window (`node.statements.length`, :44).
@@ -3026,10 +3574,7 @@ mod tests {
         let f = Fixture::parse(
             "import 'dart:collection';\n\nvoid f() {\n  g(() {\n    return LinkedHashSet();\n  });\n}\n\nvoid g(LinkedHashSet<int> Function()) {}\n",
         );
-        assert!(
-            f.run(&one_rule("prefer_collection_literals"))
-                .is_empty()
-        );
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
     }
 
     /// `Set.from([1])` reports at the whole invocation (`Set` through the
@@ -3050,9 +3595,7 @@ mod tests {
         let f = Fixture::parse("void f() { Set.of([1]); LinkedHashSet.from([1]); }");
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
 
-        let f = Fixture::parse(
-            "import 'dart:collection';\nvoid f() { LinkedHashSet.from([1]); }",
-        );
+        let f = Fixture::parse("import 'dart:collection';\nvoid f() { LinkedHashSet.from([1]); }");
         assert_eq!(f.run(&one_rule("prefer_collection_literals")).len(), 1);
 
         let f = Fixture::parse("void f() { Set<int>.from([]); }");
@@ -3067,7 +3610,6 @@ mod tests {
         let f = Fixture::parse("void f() { Set.from(1); Set.of([1], 2); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
     }
-
 
     /// The same-file element gate (:44-46): a unit-local declaration of
     /// the name — a user class or a typedef — shadows the core type and
@@ -3716,9 +4258,8 @@ mod tests {
     /// Object>[]` pins `T` non-nullable and the same argument reports.
     #[test]
     fn collection_methods_null_against_a_type_parameter() {
-        let f = Fixture::parse(
-            "bool f<T extends Object?>() {\n  return <T>[].contains(null);\n}\n",
-        );
+        let f =
+            Fixture::parse("bool f<T extends Object?>() {\n  return <T>[].contains(null);\n}\n");
         assert!(
             f.run(&one_rule("collection_methods_unrelated_type"))
                 .is_empty(),
@@ -4074,6 +4615,249 @@ void f(x) {
                 .is_empty()
         );
     }
+
+    // —— collection_methods_unrelated_type census wave ———————————————————
+
+    /// The expression-body receiver run (`doc_bad_0`): the declaration
+    /// header's strays stay out of the receiver read — the bare `l`
+    /// parameter resolves and `'1'` reports at the argument; the related
+    /// `1` stays silent (`doc_good_0`).
+    #[test]
+    fn collection_methods_arrow_body_parameter_face() {
+        let source = "bool f(List<int> l) => l.contains('1');\n";
+        let lints = run_semantic(source, "collection_methods_unrelated_type", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'int'."
+        );
+        let probe = Fixture::parse(source);
+        let start = utf16_at(&probe, tok(source, &probe.tokens, "'1'", 0));
+        assert_eq!(lints[0].range, start..start + 3);
+
+        assert!(
+            run_semantic(
+                "bool f(List<int> l) => l.contains(1);\n",
+                "collection_methods_unrelated_type",
+                None
+            )
+            .is_empty()
+        );
+    }
+
+    /// The var-inferred local receivers (`doc_bad_1`/`doc_bad_2`): the
+    /// typed-literal initializer decides — `<int>[]` for `contains`,
+    /// `<int>{}` (the set reading) for `remove`. The inferred face rides
+    /// the semantic run ([`inferred_binding_type_face`]).
+    #[test]
+    fn collection_methods_var_inferred_receivers() {
+        let source = "void f() {\n  var list = <int>[];\n  if (list.contains('1')) print('x');\n  var set = <int>{};\n  set.remove('1');\n}\n";
+        let lints = run_semantic(source, "collection_methods_unrelated_type", None);
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        for lint in &lints {
+            assert_eq!(
+                lint.message,
+                "The argument type 'String' isn't related to 'int'."
+            );
+        }
+    }
+
+    /// The cascade section's receiver tiles outside the Cascade window —
+    /// the run adopts the pieces before the Cascade row
+    /// (`test_contains_unrelated_cascade`).
+    #[test]
+    fn collection_methods_cascade_section_receiver() {
+        let source = "void f() {\n  <num>[]..contains('1');\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'num'."
+        );
+        let probe = Fixture::parse(source);
+        let start = utf16_at(&probe, tok(source, &probe.tokens, "'1'", 0));
+        assert_eq!(lints[0].range, start..start + 3);
+    }
+
+    /// The enum faces: a same-enum constant is related
+    /// (`test_contains_related_sameEnum`), a distinct enum's constant is
+    /// unrelated and reports at the whole `E2.c` read
+    /// (`test_contains_unrelated_differentEnums`).
+    #[test]
+    fn collection_methods_enum_argument_faces() {
+        let source = "enum E1 { a }\nenum E2 { c }\nvoid f() {\n  <E1>[].contains(E2.c);\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'E2' isn't related to 'E1'."
+        );
+        let probe = Fixture::parse(source);
+        let start = utf16_at(&probe, tok(source, &probe.tokens, "E2", 1));
+        assert_eq!(lints[0].range, start..start + 4);
+
+        let f = Fixture::parse("enum E { a }\nvoid f() {\n  <E>[].contains(E.a);\n}\n");
+        assert!(
+            f.run(&one_rule("collection_methods_unrelated_type"))
+                .is_empty()
+        );
+    }
+
+    /// The shared-supertype-head faces (`interfaceTypesAreUnrelated`):
+    /// subclasses of a shared `ProtobufEnum` head are unrelated
+    /// (`test_contains_unrelated_differentProtobufEnums` — the creation
+    /// argument reports at `E2()`); subclasses of a shared plain head are
+    /// the same-element face and stay silent.
+    #[test]
+    fn collection_methods_shared_supertype_heads() {
+        let source = "class ProtobufEnum {}\nclass E1 extends ProtobufEnum {}\nclass E2 extends ProtobufEnum {}\nvoid f() {\n  <E1>[].contains(E2());\n}\n";
+        let lints = run_semantic(source, "collection_methods_unrelated_type", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'E2' isn't related to 'E1'."
+        );
+        let probe = Fixture::parse(source);
+        let start = utf16_at(&probe, tok(source, &probe.tokens, "E2", 1));
+        assert_eq!(lints[0].range, start..start + 4);
+
+        let source = "class P {}\nclass A extends P {}\nclass B extends P {}\nvoid f() {\n  <A>[].contains(B());\n}\n";
+        assert!(run_semantic(source, "collection_methods_unrelated_type", None).is_empty());
+    }
+
+    /// The substitution face (`collectionTypeFor`'s `asInstanceOf`): a
+    /// same-file `implements List<num>` answers `contains` with `num` —
+    /// `c.contains('1')` reports, `c.contains(1)` stays silent
+    /// (`test_contains_unrelated_subclassOfList`/`related`); the
+    /// `this` and implicit receivers read the same clauses
+    /// (`test_contains_unrelated_thisTarget`/`implicitTarget`).
+    #[test]
+    fn collection_methods_user_subtype_substitution() {
+        let source = "abstract class C implements List<num> {}\nvoid f(C c) {\n  c.contains('1');\n  c.contains(1);\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'num'."
+        );
+
+        let f = Fixture::parse(
+            "abstract class C implements List<int> {\n  bool g() => this.contains('1');\n}\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("collection_methods_unrelated_type")).len(),
+            1
+        );
+
+        let f = Fixture::parse(
+            "abstract class C implements List<int> {\n  bool g() => contains('1');\n}\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("collection_methods_unrelated_type")).len(),
+            1
+        );
+    }
+
+    /// The record faces: a record element against a matching record
+    /// literal stays related field-wise (`test_contains_related_records`),
+    /// a mismatching record reports at the whole literal with the
+    /// record-type display (`test_contains_unrelated_records`), and a
+    /// record against a named type reports
+    /// (`test_contains_unrelated_recordAndNonRecord`).
+    #[test]
+    fn collection_methods_record_faces() {
+        let f = Fixture::parse("void f() {\n  <(num, num)>[].contains((1, 2));\n}\n");
+        assert!(
+            f.run(&one_rule("collection_methods_unrelated_type"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("void f() {\n  <(int, int)>[].contains(('hi', 'hey'));\n}\n");
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type '(String, String)' isn't related to '(int, int)'."
+        );
+
+        let f = Fixture::parse("void f() {\n  <(int, int)>[].contains('hi');\n}\n");
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to '(int, int)'."
+        );
+    }
+
+    /// The extension-type erasure (`extensionTypeErasure`) over declared
+    /// variables: a representation match stays silent, distinct
+    /// representations report with the written spellings. (An extension-
+    /// type creation argument — `E2(1)` — carries no face: the semantic
+    /// lane's `resolve_constructor`/`creation_type` answers no extension-
+    /// type container, and the census carries no extension-type case for
+    /// this rule.)
+    #[test]
+    fn collection_methods_extension_type_erasure() {
+        let source = "extension type E1(int v) {}\nvoid f(E1 e) {\n  <E1>[].contains(e);\n}\n";
+        assert!(run_semantic(source, "collection_methods_unrelated_type", None).is_empty());
+
+        let source = "extension type E1(int v) {}\nextension type E2(String s) {}\nvoid f(E2 e) {\n  <E1>[].contains(e);\n}\n";
+        let lints = run_semantic(source, "collection_methods_unrelated_type", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'E2' isn't related to 'E1'."
+        );
+    }
+
+    /// The closure faces (the promoted-subtype arms): a mixed-in mixin and
+    /// its mixer are related either way (`test_contains_related_mixedInto`
+    /// /`mixesIn`); an `Object()` creation argument is related
+    /// (`test_contains_related_Object`); a `dynamic` cast argument stays
+    /// silent; the core scalars' shared `num` supertype relates
+    /// `int`/`double`; the unrelated scalar reports.
+    #[test]
+    fn collection_methods_subtype_closure_faces() {
+        let source = "mixin M {}\nclass C with M {}\nvoid f(C c, M m) {\n  <C>[].contains(m);\n  <M>[].contains(c);\n}\n";
+        assert!(run_semantic(source, "collection_methods_unrelated_type", None).is_empty());
+
+        let source = "void f() {\n  <num>[].contains(Object());\n  <num>[].contains('1' as dynamic);\n  <double>[].contains(1);\n  <num>[].contains('1');\n}\n";
+        let lints = run_semantic(source, "collection_methods_unrelated_type", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'num'."
+        );
+    }
+
+    /// The null faces: `<num?>` and the admits-null type variable stay
+    /// related, `<num>` and the non-nullable-bounded variable report
+    /// (`test_contains_related_null`, `*_null_genericNullable*`,
+    /// `*_unrelated_null`, `*_unrelated_null_generic`).
+    #[test]
+    fn collection_methods_null_and_type_parameter_faces() {
+        let source = "void f() {\n  <num?>[].contains(null);\n  <num>[].contains(null);\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'Null' isn't related to 'num'."
+        );
+
+        let source = "bool g<T extends Object>() => <T>[].contains(null);\nbool h<T extends Object?>() => <T>[].contains(null);\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'Null' isn't related to 'T'."
+        );
+    }
+
     // —— prefer_foreach ——————————————————————————————————————————————————
 
     /// A function-typed formal's inner parameter naming the loop variable
@@ -4113,6 +4897,33 @@ void f(x) {
         );
         let for_kw = tok(&f.source, &f.tokens, "for", 0);
         assert_eq!(lints[0].range.start, utf16_at(&f, for_kw));
+        // The oracle's `ForStatement` span runs through the body's `}`
+        // (`reportAtNode(forEachStatement)`; the production `ForIn`
+        // seal stops one token short, so the end rides the body row's
+        // own span).
+        let close = tok(&f.source, &f.tokens, "}", 0);
+        assert_eq!(
+            lints[0].range.end,
+            utf16_at(&f, close) + 1,
+            "report spans through the body's close brace"
+        );
+    }
+
+    /// `test_nonBlockBody_singleStatement` — the non-block body's
+    /// report also spans through the statement's `;`.
+    #[test]
+    fn foreach_non_block_body_span_covers_semicolon() {
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (final a in list) fn(a);\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_foreach"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let semi = tok(&f.source, &f.tokens, ";", 0);
+        assert_eq!(
+            lints[0].range.end,
+            utf16_at(&f, semi) + 1,
+            "report spans through the statement's semicolon"
+        );
     }
 
     /// `test_blockBody_multipleStatements` — a two-statement body passes.

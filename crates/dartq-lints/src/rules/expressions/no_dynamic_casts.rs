@@ -358,8 +358,7 @@ fn condition_run(c: &Check<'_>, node: u32) -> Vec<u32> {
         .copied()
         .take_while(|&kid| {
             c.byte_span(kid).start >= open
-                && (slice::is_send_group_piece(c, kid)
-                    || c.kind(kid) == NodeKind::Identifier)
+                && (slice::is_send_group_piece(c, kid) || c.kind(kid) == NodeKind::Identifier)
         })
         .collect();
     prefix.reverse();

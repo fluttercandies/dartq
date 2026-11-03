@@ -902,8 +902,10 @@ pub(crate) mod parameter_assignments {
     /// earlier-completed `??=` write in the binding body's completion
     /// window. The count is name-faced: a same-name `??=` write shadowed
     /// by a nested closure's own binder counts into it (the candidate
-    /// residual — no corpus shape today). The
-    /// primary-constructor face stays unported. A `_` formal binds nothing
+    /// residual — no corpus shape today). The primary-constructor face
+    /// (`visitPrimaryConstructorDeclaration`) reads the enclosing class's
+    /// `PrimaryConstructor` sibling over a `PrimaryConstructorBody`
+    /// ancestor. A `_` formal binds nothing
     /// under `wildcard_variables` (Dart 3.7) — writes to `_` stay silent;
     /// pre-3.7 the name binds and reports.
     ///
@@ -959,8 +961,43 @@ pub(crate) mod parameter_assignments {
         }
         // The official reports at the whole `AssignmentExpression` — the
         // adopted node's own span covers only the sealed tail, so the
-        // report range opens at the left operand's head.
-        c.report(c.utf16_span(lhs).start..c.utf16_span(node).end, &[name]);
+        // report opens at the left operand's head and closes at the
+        // expression tail: the first depth-0 statement/argument boundary
+        // after the operator (the spilled tiling's `AssignmentExpression.
+        // end` correspondence).
+        let start = c.utf16_span(lhs).start;
+        let end = write_end(c, op, c.utf16_span(node).end);
+        c.report(start..end, &[name]);
+    }
+
+    /// The expression tail after the operator token: the first depth-0
+    /// `;`/`,`/`)`/`]`/`}` boundary closes the expression and its end is
+    /// the token before the boundary. An unterminated run falls back to
+    /// `fallback` (the assignment row's own end).
+    fn write_end(c: &Check<'_>, op: u32, fallback: u32) -> u32 {
+        let mut depth: i32 = 0;
+        let mut previous = op;
+        let mut index = op + 1;
+        while c.token(index).is_some() {
+            match c.lexeme(index) {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => {
+                    if depth == 0 {
+                        return c.utf16_end_of_token(previous).unwrap_or(fallback);
+                    }
+                    depth -= 1;
+                }
+                ";" | "," => {
+                    if depth == 0 {
+                        return c.utf16_end_of_token(previous).unwrap_or(fallback);
+                    }
+                }
+                _ => {}
+            }
+            previous = index;
+            index += 1;
+        }
+        fallback
     }
 
     /// The arm-statement compensation face: the production tiling seals a
@@ -1039,14 +1076,50 @@ pub(crate) mod parameter_assignments {
     /// ([`super::binary_operands_at`]) peeled to its semantic rows
     /// ([`super::access_run`]); `Some` only for the single-identifier
     /// face the official's `SimpleIdentifier` gate covers.
+    ///
+    /// Spill exception: in an anonymous function's arrow body the write's
+    /// [`NodeKind::Assignment`] row seals on the RHS tail while the lhs
+    /// pieces spill inside the sealing [`NodeKind::FunctionExpression`]'s
+    /// slice — the peel then rides a foreign row (the formal parameters)
+    /// and misses the single-identifier arm. In that posture (the storage
+    /// parent is the sealed function) the lhs reads at the token level:
+    /// the bare identifier directly before the operator, first token of
+    /// the spilled body, backed by its [`NodeKind::Identifier`] row in the
+    /// peeled run.
     fn assignment_lhs<'a>(c: &Check<'a>, node: u32) -> Option<(u32, &'a str)> {
         let (left, _) = super::binary_operands_at(c, node)?;
-        match super::access_run(c, &left).as_slice() {
-            [name] if c.kind(*name) == NodeKind::Identifier => {
-                Some((*name, c.lexeme(c.head_token(*name))))
+        if let [name] = super::access_run(c, &left).as_slice() {
+            if c.kind(*name) == NodeKind::Identifier {
+                return Some((*name, c.lexeme(c.head_token(*name))));
             }
-            _ => None,
+            return None;
         }
+        let parent = c.unit.ast.parent(node)?;
+        if !matches!(
+            c.kind(parent),
+            NodeKind::FunctionExpression | NodeKind::NamedFunctionExpression
+        ) || c.byte_span(parent).end > c.byte_span(node).start
+        {
+            return None;
+        }
+        let op = c.field(node, PayloadField::Operator)?;
+        let prev = op.checked_sub(1)?;
+        let Some(id) = c.token(prev) else {
+            return None;
+        };
+        let Some(seal) = c.token(prev.checked_sub(1)?) else {
+            return None;
+        };
+        if id.kind != TokenKind::Identifier
+            || c.token_is_synthetic(prev)
+            || (seal.byte_offset as usize) >= c.byte_span(parent).end
+        {
+            return None;
+        }
+        let row = left
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Identifier && c.head_token(kid) == prev)?;
+        Some((row, c.lexeme(prev)))
     }
 
     /// Whether an earlier-completed `??=` write naming `name` sits in
@@ -1111,7 +1184,16 @@ pub(crate) mod parameter_assignments {
         }
         let name = c.lexeme(c.head_token(siblings[start]));
         if enclosing_parameter(c, name).is_some_and(|(_, null_default)| !null_default) {
-            c.report(c.utf16_span(node), &[name]);
+            // The official reports the whole `PostfixExpression` /
+            // `PrefixExpression` — the operator row seals over the
+            // operator token alone, so the span widens over the operand's
+            // identifier row (the group head).
+            let range = c.utf16_span(node);
+            let operand = c.utf16_span(siblings[start]);
+            c.report(
+                range.start.min(operand.start)..range.end.max(operand.end),
+                &[name],
+            );
         }
     }
 
@@ -1186,8 +1268,11 @@ pub(crate) mod parameter_assignments {
             return None;
         }
         let write_start = c.byte_span(c.node()).start;
+        let mut shadowed = false;
         for depth in 1..256 {
-            let row = c.ancestor(depth)?;
+            let Some(row) = c.ancestor(depth) else {
+                break;
+            };
             match c.kind(row) {
                 NodeKind::TopLevelMethod
                 | NodeKind::Method
@@ -1197,17 +1282,48 @@ pub(crate) mod parameter_assignments {
                 | NodeKind::LocalFunctionDeclaration
                 | NodeKind::NamedFunctionExpression => {
                     // The official walks the body only: initializer and
-                    // non-body arms fall through to the outer scopes.
-                    let in_body = c.collect_direct(row).into_iter().find(|&kid| {
-                        matches!(c.kind(kid), NodeKind::BlockBody | NodeKind::ExpressionBody) && {
-                            let span = c.byte_span(kid);
-                            span.start <= write_start && write_start < span.end
-                        }
-                    });
+                    // non-body arms fall through to the outer scopes. The
+                    // arrow body seals childless over the `=>` alone (the
+                    // body expression spills past it), so its in-body read
+                    // keys on the write lying after the arrow.
+                    let in_body =
+                        c.collect_direct(row)
+                            .into_iter()
+                            .find(|&kid| match c.kind(kid) {
+                                NodeKind::BlockBody => {
+                                    let span = c.byte_span(kid);
+                                    span.start <= write_start && write_start < span.end
+                                }
+                                NodeKind::ExpressionBody => c.byte_span(kid).end <= write_start,
+                                _ => false,
+                            });
                     if let Some(body) = in_body {
                         for (parameter, optional) in parameter_rows(c, row) {
                             if parameter_name(c, parameter) == Some(name) {
                                 return Some((body, optional && !has_default_clause(c, parameter)));
+                            }
+                        }
+                    }
+                }
+                NodeKind::PrimaryConstructorBody => {
+                    // The primary-constructor face
+                    // (`visitPrimaryConstructorDeclaration`): the formals
+                    // sit on the enclosing class's `PrimaryConstructor`
+                    // sibling, and the body row is the walk's body bound.
+                    let primary = c
+                        .path
+                        .iter()
+                        .rev()
+                        .find(|&&a| c.kind(a) == NodeKind::ClassDeclaration)
+                        .and_then(|&container| {
+                            c.collect_direct(container)
+                                .into_iter()
+                                .find(|&kid| c.kind(kid) == NodeKind::PrimaryConstructor)
+                        });
+                    if let Some(primary) = primary {
+                        for (parameter, optional) in parameter_rows(c, primary) {
+                            if parameter_name(c, parameter) == Some(name) {
+                                return Some((row, optional && !has_default_clause(c, parameter)));
                             }
                         }
                     }
@@ -1219,7 +1335,8 @@ pub(crate) mod parameter_assignments {
                         .into_iter()
                         .any(|stmt| statement_binds(c, stmt, name, write_start))
                     {
-                        return None;
+                        shadowed = true;
+                        break;
                     }
                 }
                 NodeKind::CatchClause => {
@@ -1229,7 +1346,8 @@ pub(crate) mod parameter_assignments {
                                 .into_iter()
                                 .any(|p| parameter_name(c, p) == Some(name))
                     }) {
-                        return None;
+                        shadowed = true;
+                        break;
                     }
                 }
                 NodeKind::ForStatement => {
@@ -1242,7 +1360,8 @@ pub(crate) mod parameter_assignments {
                                 .any(|stmt| statement_binds(c, stmt, name, write_start))
                         })
                     {
-                        return None;
+                        shadowed = true;
+                        break;
                     }
                 }
                 NodeKind::ForIn
@@ -1253,7 +1372,8 @@ pub(crate) mod parameter_assignments {
                         c.kind(kid) == NodeKind::DeclaredVariablePattern
                             && c.lexeme(c.head_token(kid)) == name
                     }) {
-                        return None;
+                        shadowed = true;
+                        break;
                     }
                 }
                 NodeKind::PatternVarDeclStatement
@@ -1262,12 +1382,78 @@ pub(crate) mod parameter_assignments {
                             && c.lexeme(c.head_token(kid)) == name
                     }) =>
                 {
-                    return None;
+                    shadowed = true;
+                    break;
                 }
                 _ => {}
             }
         }
+        if shadowed {
+            return None;
+        }
+        arrow_tail_binder(c, name)
+    }
+
+    /// The arrow-body spill fallback: a `FunctionExpression`'s arrow body
+    /// seals over the `=>` alone (the [`NodeKind::ExpressionBody`] row
+    /// covers the arrow) and the body expression lands as a spill tail
+    /// piece, so the function is never a dispatch ancestor of the write
+    /// and the scope walk above exhausts without reaching it. After the
+    /// walk exhausts without a binder or a shadowing declaration, the
+    /// write belongs to the innermost arrow function whose
+    /// `ExpressionBody` seals at/before the write with no statement
+    /// boundary (`;`) between the arrow and the write; the innermost-first
+    /// order mirrors the official's lexical shadowing (a nested arrow's
+    /// parameter hides the outer one).
+    fn arrow_tail_binder(c: &Check<'_>, name: &str) -> Option<(u32, bool)> {
+        let write_start = c.byte_span(c.node()).start;
+        let mut candidates: Vec<u32> = Vec::new();
+        let mut stack = vec![c.unit.ast.root()?];
+        while let Some(row) = stack.pop() {
+            if matches!(
+                c.kind(row),
+                NodeKind::FunctionExpression | NodeKind::NamedFunctionExpression
+            ) && c
+                .collect_direct(row)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::ExpressionBody)
+                .is_some_and(|arrow| {
+                    c.byte_span(arrow).end <= write_start
+                        && !arrow_tail_boundary(c, arrow, write_start)
+                })
+            {
+                candidates.push(row);
+            }
+            stack.extend(c.children(row));
+        }
+        candidates.sort_by_key(|&row| core::cmp::Reverse(c.byte_span(row).end));
+        candidates.dedup();
+        for row in candidates {
+            for (parameter, optional) in parameter_rows(c, row) {
+                if parameter_name(c, parameter) == Some(name) {
+                    return Some((row, optional && !has_default_clause(c, parameter)));
+                }
+            }
+        }
         None
+    }
+
+    /// Whether a statement-boundary token (`;`) lies between the arrow's
+    /// head and the write: inside that gap the write is the function's
+    /// spilled arrow tail; past a boundary it is a later statement the
+    /// arrow's parameters never bind.
+    fn arrow_tail_boundary(c: &Check<'_>, arrow: u32, write_start: usize) -> bool {
+        let mut token = c.head_token(arrow) + 1;
+        while let Some(t) = c.token(token) {
+            if t.byte_offset as usize >= write_start {
+                return false;
+            }
+            if c.lexeme(token) == ";" {
+                return true;
+            }
+            token += 1;
+        }
+        false
     }
 
     /// Whether a statement binds `name` before the write (the shadow
@@ -1603,6 +1789,78 @@ pub(crate) mod parameter_assignments {
 
             let f = Fixture::parse("class C { C(int c) { c = 1; } }");
             assert_eq!(f.run(&one_rule("parameter_assignments")).len(), 1);
+        }
+
+        /// `test_anonymousFunction_assignment_arrowBody#0` — `3:14|6` —
+        /// the arrow body seals childless over the `=>` alone; the write
+        /// after the arrow is in-body and reports over `i = 42`.
+        #[test]
+        fn arrow_body_write_reports() {
+            let f = Fixture::parse("void main() {\n  (int i) => i = 42;\n}\n");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("i = 42").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 6);
+        }
+
+        /// `test_assignment_inIfElseBranches#0` — `4:5|17` twice — the
+        /// report spans the whole `AssignmentExpression` (`value = '
+        /// $value'`): the row seals only its tail, so the end reads off
+        /// the expression tail boundary.
+        #[test]
+        fn if_else_branch_writes_span_the_whole_write() {
+            let source = "void foo({String? value}) {\n  if (1 == 1) {\n    value = ' $value';\n  } else {\n    value = ' $value';\n  }\n}\n";
+            let lints = Fixture::parse(source).run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 2, "{lints:?}");
+            let first = source.find("value =").unwrap();
+            let second = source[first + 1..].find("value =").unwrap() + first + 1;
+            let (first, second) = (first as u32, second as u32);
+            assert_eq!(lints[0].range, first..first + 17);
+            assert_eq!(lints[1].range, second..second + 17);
+        }
+
+        /// `test_constructor_primary_assignment#0` — `4:5|5` — the
+        /// primary constructor's formals bind inside the `this` body and
+        /// the write reports over `x = 4`.
+        #[test]
+        fn primary_constructor_body_write_reports() {
+            let f = Fixture::parse("class C(int x) {\n  this {\n    x = 4;\n  }\n}\n");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("x = 4").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 5);
+        }
+
+        /// `test_function_postfix#0` / `test_function_prefix#0` /
+        /// `test_postfixOperation#0` / `test_function_named_default#0` —
+        /// `p++`/`++p` report over the whole unary expression (the
+        /// operator row seals over the operator token alone, so the span
+        /// widens over the operand).
+        #[test]
+        fn unary_writes_span_the_operand() {
+            let f = Fixture::parse("void f(int p) {\n  p++;\n}\n");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("p++").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 3);
+
+            let f = Fixture::parse("void f(int p) {\n  ++p;\n}\n");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("++p").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 3);
+
+            let f = Fixture::parse("void f(int x) {\n  x++;\n}\n");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("x++").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 3);
+
+            let f = Fixture::parse("void f({int p = 5}) {\n  print(p++);\n}\n");
+            let lints = f.run(&one_rule("parameter_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let start = f.source.find("p++").unwrap() as u32;
+            assert_eq!(lints[0].range, start..start + 3);
         }
     }
 }

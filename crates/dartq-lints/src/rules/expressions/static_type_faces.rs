@@ -335,8 +335,7 @@ pub(crate) fn receiver_family(
         && c.kind(*only) == NodeKind::Identifier
     {
         let receiver_name = c.lexeme(c.head_token(*only));
-        let written =
-            crate::rules::expressions::same_file::written_type(c, *only, receiver_name);
+        let written = crate::rules::expressions::same_file::written_type(c, *only, receiver_name);
         if let Some(written) = written {
             if crate::rules::expressions::same_file::declares_type(c, written) {
                 return Some(false);

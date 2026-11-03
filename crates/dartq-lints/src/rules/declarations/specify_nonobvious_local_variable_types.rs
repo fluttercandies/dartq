@@ -105,12 +105,23 @@ fn specify_face(c: &mut Check<'_>, node: u32) {
 
 /// The initializer's expression row — the widest direct child (the
 /// outermost expression tiling; the send-group markers spike smaller
-/// windows beside it).
+/// windows beside it). The `<…>` argument marker is excluded: over a
+/// typed literal it tiles as a sibling wider than the literal itself
+/// (`<int>[1]` — five bytes of arguments over three of elements) and it
+/// is not an expression.
 fn initializer_value(c: &Check<'_>, initializer: u32) -> Option<u32> {
-    c.collect_direct(initializer).into_iter().max_by_key(|&row| {
-        let span = c.byte_span(row);
-        span.end - span.start
-    })
+    c.collect_direct(initializer)
+        .into_iter()
+        .filter(|&row| {
+            !matches!(
+                c.kind(row),
+                NodeKind::TypeArguments | NodeKind::NoTypeArguments
+            )
+        })
+        .max_by_key(|&row| {
+            let span = c.byte_span(row);
+            span.end - span.start
+        })
 }
 
 /// The for-each face (:74-86): no written type (or exactly `dynamic`,

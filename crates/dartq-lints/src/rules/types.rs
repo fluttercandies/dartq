@@ -303,8 +303,7 @@ fn raw_generic_name(c: &Check<'_>, name: &str) -> Option<bool> {
         // same-file class-like without type variables answers `None`
         // (the exclusive resolution, the core table never answers
         // behind it).
-        return declaration_type_variables(c, decl)
-            .map(|_| optional_type_args_annotation(c, decl));
+        return declaration_type_variables(c, decl).map(|_| optional_type_args_annotation(c, decl));
     }
     match same_file_alt_fills(c, name) {
         Some(Resolved::Generic(_, optional)) => Some(optional),
@@ -690,9 +689,11 @@ pub(crate) mod library_private_types_in_public_api {
         }
         // An enum's members ride an `EnumBody` row, the other class-likes a
         // `DeclarationBody` — both are the members window.
-        let body = c.direct_children(decl).iter().copied().find(|&kid| {
-            matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
-        });
+        let body = c
+            .direct_children(decl)
+            .iter()
+            .copied()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody));
         let body_start = body.map(|body| c.byte_span(body).start);
         walk_header_types(c, decl, wrapper, body_start);
         walk_primary_parameters(c, decl, body_start);
@@ -799,8 +800,7 @@ pub(crate) mod library_private_types_in_public_api {
         const INTERFACE: u16 = 1 << 5;
         const FINAL: u16 = 1 << 6;
         let flags = dartq_ast::mod_flags(c.unit.ast, decl);
-        flags & SEALED != 0
-            || (flags & ABSTRACT != 0 && flags & (FINAL | INTERFACE) != 0)
+        flags & SEALED != 0 || (flags & ABSTRACT != 0 && flags & (FINAL | INTERFACE) != 0)
     }
 
     /// A method face: a private name skips; otherwise return type,
@@ -1003,8 +1003,9 @@ pub(crate) mod library_private_types_in_public_api {
             // The super formal's element type is the inherited parameter's
             // — a field (`super_field_type`) or a plain super-constructor
             // parameter (`_A(_O o)` + `B(super.o)`).
-            "super" => super_field_type(c, decl, name)
-                .or_else(|| super_parameter_type(c, decl, name)),
+            "super" => {
+                super_field_type(c, decl, name).or_else(|| super_parameter_type(c, decl, name))
+            }
             _ => None,
         };
         if let Some(field_type) = field_type {
@@ -1076,11 +1077,7 @@ pub(crate) mod library_private_types_in_public_api {
             .collect_direct(super_decl)
             .into_iter()
             .find(|&kid| matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody))?;
-        let members = c
-            .direct_children(body)
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let members = c.direct_children(body).iter().copied().collect::<Vec<_>>();
         for member in members {
             if c.kind(member) != NodeKind::Constructor {
                 continue;
@@ -1770,7 +1767,10 @@ mod tests {
             ("class C<T> {\n  void m<T>() {}\n}\n", "class"),
             ("enum E<T> { a; void m<T>() {} }\n", "enum"),
             ("mixin M<T> { void m<T>() {} }\n", "mixin"),
-            ("extension X<T> on List<T> { void m<T>() {} }\n", "extension"),
+            (
+                "extension X<T> on List<T> { void m<T>() {} }\n",
+                "extension",
+            ),
             (
                 "extension type Y<T>(int i) { void m<T>() {} }\n",
                 "extension type",
@@ -4663,7 +4663,7 @@ pub(crate) mod type_annotate_public_apis {
 }
 
 pub(crate) mod prefer_void_to_null {
-    use super::{Check, NodeKind, RuleSpec, member_name_typed, prefixed_type};
+    use super::{Check, NodeKind, RuleSpec, member_name_typed};
     use crate::rules::{
         MemberQuery, body_members, member_matches, same_file_ancestors, type_before,
     };
@@ -4690,24 +4690,43 @@ pub(crate) mod prefer_void_to_null {
     /// the `TypeArguments` sibling interposed). The override face is the
     /// same-file ancestor chain, static methods and extension members never
     /// overriding — cross-file supertypes under-report. A prefixed `p.Null`
-    /// resolves through the prefix upstream and stays silent here (the
-    /// documented under-report face). Message: `diagnostic.g.dart`
+    /// reports like the bare spelling: the resolved `Null` face upstream is
+    /// the dart:core element whichever prefix path reaches it (a prefix
+    /// naming *another* library's `Null` class over-reports — the residue of
+    /// the name-level face). Message: `diagnostic.g.dart`
     /// `preferVoidToNull`.
-    pub(crate) static SPEC: RuleSpec =
-        crate::spec!("prefer_void_to_null", &[NodeKind::Type], check,);
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+        "prefer_void_to_null",
+        &[NodeKind::Type, NodeKind::Qualified],
+        check,
+    );
 
     fn check(c: &mut Check<'_>) {
         let row = c.node();
-        let head = c.head_token(row);
-        // `nodeType.isDartCoreNull` — the written `Null` face.
-        if c.lexeme(head) != "Null" || prefixed_type(c, head) {
+        let name = written_name_token(c, row);
+        // `nodeType.isDartCoreNull` — the written `Null` face, prefixed
+        // (`core.Null`) or bare.
+        if token_at(c, name) != Some("Null") {
             return;
         }
         if exemption(c, row) || in_augmentation(c) {
             return;
         }
-        let range = crate::rules::utf16_token_span(c, head);
+        let range = crate::rules::utf16_token_span(c, name);
         c.report(range, &[]);
+    }
+
+    /// The token spelling the type's name: the head token on the bare row, the
+    /// token after the period on the prefixed (`Qualified`) row — the
+    /// `node.name` anchor the report reads.
+    fn written_name_token(c: &Check<'_>, row: u32) -> u32 {
+        let head = c.head_token(row);
+        match c.kind(row) {
+            NodeKind::Qualified => c
+                .field(row, super::PayloadField::Period)
+                .map_or(head, |period| period + 1),
+            _ => head,
+        }
     }
 
     /// The parent-chain exemptions (:65-122), one arm per upstream parent.
@@ -4742,10 +4761,11 @@ pub(crate) mod prefer_void_to_null {
             | NodeKind::SwitchCase => true,
             // `<Null>[]` / `<Null, Null>{}` (:93-101): empty literals only.
             NodeKind::TypeArguments => type_argument_exemption(c, parent),
-            // The void-incompatible-override return face (:119-122) and the
-            // top-level function return face (:59-67).
+            // The void-incompatible-override return face (:119-122). A
+            // top-level function has no ancestor to override, so its `Null`
+            // return type reports (:59-67 — the doc's `Null f() {}`).
             NodeKind::Method => method_return_exemption(c, row, parent),
-            NodeKind::TopLevelMethod => true,
+            NodeKind::TopLevelMethod => false,
             _ => false,
         }
     }
@@ -4776,29 +4796,46 @@ pub(crate) mod prefer_void_to_null {
         }
     }
 
-    /// The empty-collection-literal exemption (:93-101): any non-type
-    /// element kills the exemption. The `TypeArguments` row, the literal's
-    /// element rows, and the `ListLiteral`/`SetOrMapLiteral` row are all
-    /// siblings under the initializer — an empty literal's sibling set is
-    /// just `[TypeArguments, ListLiteral]`.
+    /// The empty-collection-literal exemption (:93-101): `<Null>[]` and
+    /// `<Null, Null>{}` stay silent, an element after the bracket reports.
+    /// Upstream asks the resolved literal for `elements.isEmpty`; the written
+    /// shape decides here — the literal opening right after the type-argument
+    /// list's closing `>` is empty. That reading is tiling-independent (the
+    /// same shape holds in an initializer, an argument, and an expression
+    /// statement, where the literal's rows tile flat beside the arguments).
     fn type_argument_exemption(c: &Check<'_>, args: u32) -> bool {
-        let Some(parent) = c.unit.ast.parent(args) else {
+        let Some(close) = type_arguments_close(c, args) else {
             return false;
         };
-        let siblings = c.collect_direct(parent);
-        let has_literal = siblings.iter().any(|&kid| {
-            matches!(
-                c.kind(kid),
-                NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
-            )
-        });
-        has_literal
-            && siblings.iter().all(|&kid| {
-                matches!(
-                    c.kind(kid),
-                    NodeKind::TypeArguments | NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
-                )
-            })
+        match token_at(c, close + 1) {
+            // The scanner folds an empty list literal into a single `[]`
+            // token; a spaced `[ ]` keeps the brackets apart.
+            Some("[]") => true,
+            Some("[") => token_at(c, close + 2) == Some("]"),
+            Some("{") => token_at(c, close + 2) == Some("}"),
+            _ => false,
+        }
+    }
+
+    /// The `>` token closing the type-argument list at `args`: the row's own
+    /// last token when the row spans the brackets, else the token right after
+    /// it (a tiling that stops the row at its last argument).
+    fn type_arguments_close(c: &Check<'_>, args: u32) -> Option<u32> {
+        let range = c.unit.ast.token_range(args);
+        if range.end > range.start && token_at(c, range.end - 1) == Some(">") {
+            return Some(range.end - 1);
+        }
+        (token_at(c, range.end) == Some(">")).then_some(range.end)
+    }
+
+    /// The lexeme at `index`, `None` past the token table (a lookahead may
+    /// run off the end of a file, so the raw table is read rather than
+    /// [`Check::token`], whose out-of-range answer is the parser-bug assert).
+    fn token_at<'a>(c: &'a Check<'_>, index: u32) -> Option<&'a str> {
+        let tokens = c.unit.tokens;
+        tokens
+            .get(index as usize)
+            .map(|_| tokens.lexeme(c.unit.source, index as usize))
     }
 
     /// The `isVoidIncompatibleOverride` face (:44-56): only the return-type
@@ -4806,7 +4843,9 @@ pub(crate) mod prefer_void_to_null {
     /// overrides; the overridden return type is read off the same-file
     /// ancestor chain — `void` and `FutureOr<void>` stay report-worthy
     /// (:52-53), everything else (an untyped member's dynamic included)
-    /// silences.
+    /// silences. The ancestor answers in the member's own accessor kind — a
+    /// getter overrides a getter (`Object? get foo` under `Null get foo`),
+    /// which the plain method query does not see.
     fn method_return_exemption(c: &Check<'_>, row: u32, method: u32) -> bool {
         let Some(name) = member_name_typed(c, method) else {
             return false;
@@ -4838,7 +4877,14 @@ pub(crate) mod prefer_void_to_null {
         let name_lexeme = c.lexeme(c.head_token(name));
         for ancestor in same_file_ancestors(c, container, false) {
             for member in body_members(c, ancestor) {
-                if member_matches(c, member, MemberQuery::Method, name_lexeme).is_empty() {
+                let overridden = [
+                    MemberQuery::Method,
+                    MemberQuery::Getter,
+                    MemberQuery::Setter,
+                ]
+                .into_iter()
+                .any(|query| !member_matches(c, member, query, name_lexeme).is_empty());
+                if !overridden {
                     continue;
                 }
                 return !matches!(
@@ -5060,9 +5106,7 @@ pub(crate) mod always_specify_types {
         // already is. The run filters the access/send markers, leaving
         // the semantic pieces — its first row is the receiver-most.
         let callee = if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
-            slice::access_run(c, &kids[..head + 1])
-                .into_iter()
-                .next()
+            slice::access_run(c, &kids[..head + 1]).into_iter().next()
         } else {
             Some(kids[head])
         };
@@ -5140,8 +5184,7 @@ pub(crate) mod always_specify_types {
             };
             let head = c.head_token(current);
             if c.collect_direct(parent).into_iter().any(|kid| {
-                c.kind(kid) == NodeKind::TypeArguments
-                    && c.unit.ast.token_range(kid).end == head
+                c.kind(kid) == NodeKind::TypeArguments && c.unit.ast.token_range(kid).end == head
             }) {
                 return true;
             }
@@ -5158,7 +5201,9 @@ pub(crate) mod always_specify_types {
     fn creation(c: &mut Check<'_>) {
         let row = c.node();
         let kids = c.collect_direct(row);
-        let Some(args_at) = kids.iter().position(|&kid| c.kind(kid) == NodeKind::Arguments)
+        let Some(args_at) = kids
+            .iter()
+            .position(|&kid| c.kind(kid) == NodeKind::Arguments)
         else {
             return;
         };
@@ -5327,7 +5372,10 @@ pub(crate) mod always_specify_types {
         // analyzer AST (`CatchClause.exceptionParameter` is a bare
         // parameter of the clause), so the registered visitor never sees
         // them — `catch (e)` stays silent.
-        if c.path.iter().any(|&anc| c.kind(anc) == NodeKind::CatchClause) {
+        if c.path
+            .iter()
+            .any(|&anc| c.kind(anc) == NodeKind::CatchClause)
+        {
             return;
         }
         // Receiver formals are the Field/Super formal visitors upstream and
@@ -5396,7 +5444,7 @@ pub(crate) mod avoid_futureor_void {
         Check, NodeKind, PayloadField, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows,
         type_arguments_row, type_sibling_before,
     };
-    use crate::rules::{utf16_token_span, NONE_TOKEN};
+    use crate::rules::{NONE_TOKEN, utf16_token_span};
 
     /// The variance of a type position (the upstream `VarianceChecker`
     /// walk): `Out` result positions, `In` contravariant positions, `InOut`
@@ -5725,8 +5773,8 @@ pub(crate) mod avoid_futureor_void {
                     // type — the head plus the `<void>` argument run (the
                     // row's own span stops at the head name).
                     let start = c.utf16_span(row).start;
-                    let end = type_arguments_row(c, row)
-                        .map_or(start, |args| c.utf16_span(args).end);
+                    let end =
+                        type_arguments_row(c, row).map_or(start, |args| c.utf16_span(args).end);
                     c.report(start..end, &[]);
                 }
             }
@@ -5812,8 +5860,7 @@ pub(crate) mod avoid_futureor_void {
         let is_async_import = |c: &Check<'_>, row: u32| {
             c.kind(row) == NodeKind::Import
                 && c.field(row, PayloadField::AsKeyword).unwrap_or(NONE_TOKEN) == NONE_TOKEN
-                && c
-                    .unit
+                && c.unit
                     .ast
                     .token_range(row)
                     .any(|token| c.lexeme(token).contains("dart:async"))
@@ -5826,7 +5873,9 @@ pub(crate) mod avoid_futureor_void {
         // row.
         c.collect_direct(root).iter().any(|&row| {
             is_async_import(c, row)
-                || c.collect_direct(row).iter().any(|&kid| is_async_import(c, kid))
+                || c.collect_direct(row)
+                    .iter()
+                    .any(|&kid| is_async_import(c, kid))
         })
     }
 }
@@ -6949,6 +6998,33 @@ mod wave1_types_tests {
         assert!(f.run(&one_rule("prefer_void_to_null")).is_empty());
     }
 
+    /// `test_topLevelFunction_returnType_null` and the doc's `Null f() {}`
+    /// — a top-level function's `Null` return type has no ancestor to
+    /// override, so it reports.
+    #[test]
+    fn void_to_null_top_level_return_reports() {
+        let f = Fixture::parse("Null f() {}\n");
+        let lints = f.run(&one_rule("prefer_void_to_null"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let null = tok(&f.source, &f.tokens, "Null", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, null));
+
+        let f = Fixture::parse("Null g() => null;\n");
+        assert_eq!(f.run(&one_rule("prefer_void_to_null")).len(), 1);
+    }
+
+    /// `test_instanceField_null_prefixed` and the other prefixed forms —
+    /// `core.Null` resolves to the dart:core element, so the prefix does
+    /// not silence the report.
+    #[test]
+    fn void_to_null_prefixed_null_reports() {
+        let f = Fixture::parse("import 'dart:core' as core;\nclass C {\n  core.Null x;\n}\n");
+        let lints = f.run(&one_rule("prefer_void_to_null"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let null = tok(&f.source, &f.tokens, "Null", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, null));
+    }
+
     /// `test_castAsExpression` — `as` and cast-pattern positions stay
     /// silent; `is` reports.
     #[test]
@@ -6965,11 +7041,25 @@ mod wave1_types_tests {
 
     /// `test_listLiteralTypeArg_null_empty` /
     /// `test_listLiteralTypeArg_null_nonEmpty` — the empty literal's
-    /// argument stays silent, the non-empty literal's reports.
+    /// argument stays silent, the non-empty literal's reports. The same
+    /// shapes written as expression statements (`<Null>[];`) keep the
+    /// exemption: the literal is empty whatever its row tiles under.
     #[test]
     fn void_to_null_empty_literal_arguments() {
         let f = Fixture::parse("var l = <Null>[];\n");
         assert!(f.run(&one_rule("prefer_void_to_null")).is_empty());
+
+        let f = Fixture::parse("void f() {\n  <Null>[];\n}\n");
+        assert!(f.run(&one_rule("prefer_void_to_null")).is_empty());
+
+        let f = Fixture::parse("void f() {\n  <Null, String>{};\n}\n");
+        assert!(f.run(&one_rule("prefer_void_to_null")).is_empty());
+
+        let f = Fixture::parse("void f() {\n  <String, Null>{};\n}\n");
+        assert!(f.run(&one_rule("prefer_void_to_null")).is_empty());
+
+        let f = Fixture::parse("void f() {\n  <Null>[null];\n}\n");
+        assert_eq!(f.run(&one_rule("prefer_void_to_null")).len(), 1);
 
         let f = Fixture::parse("var l = <Null>[null];\n");
         assert_eq!(f.run(&one_rule("prefer_void_to_null")).len(), 1);
@@ -7029,6 +7119,22 @@ mod wave1_types_tests {
 
         let f = Fixture::parse(
             "class A {\n  void f() {}\n}\nclass B extends A {\n  Null f<T>() => throw 0;\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("prefer_void_to_null")).len(), 1);
+    }
+
+    /// `test_instanceGetter_overrideChangingType` — a getter overriding a
+    /// non-`void` getter stays exempt; the same getter over a `void` getter
+    /// keeps the report.
+    #[test]
+    fn void_to_null_getter_override_faces() {
+        let f = Fixture::parse(
+            "abstract class C {\n  Object? get foo;\n}\nclass D extends C {\n  @override\n  Null get foo => null;\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_void_to_null")).is_empty());
+
+        let f = Fixture::parse(
+            "abstract class C {\n  void get foo;\n}\nclass D extends C {\n  @override\n  Null get foo => null;\n}\n",
         );
         assert_eq!(f.run(&one_rule("prefer_void_to_null")).len(), 1);
     }
@@ -7470,7 +7576,10 @@ mod wave1_types_tests {
         let lints = f.run(&one_rule("always_specify_types"));
         assert_eq!(lints.len(), 1, "{lints:?}");
         let final_kw = tok(&f.source, &f.tokens, "final", 0);
-        assert_eq!(lints[0].range, utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5);
+        assert_eq!(
+            lints[0].range,
+            utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5
+        );
 
         let f = Fixture::parse("class C(x);\n");
         let lints = f.run(&one_rule("always_specify_types"));
@@ -7561,7 +7670,10 @@ mod wave1_types_tests {
 
     /// The generic-alias invocation callee (`test_instanceCreation_
     /// genericTypeAlias_implicitTypeArgument`) reports at the callee; a
-    /// non-generic alias callee stays silent (`test_0`).
+    /// non-generic alias callee stays silent (`test_0`). Oracle
+    /// (3.13.7): `INFO|LINT|ALWAYS_SPECIFY_TYPES|…|2|23|9` — the
+    /// implicit `StringMap()` creation, not the written `StringMap<…>`
+    /// annotation on the same line.
     #[test]
     fn specify_alias_creation_faces() {
         let f = Fixture::parse(
@@ -7569,7 +7681,7 @@ mod wave1_types_tests {
         );
         let lints = f.run(&one_rule("always_specify_types"));
         assert_eq!(lints.len(), 1, "{lints:?}");
-        let callee = tok(&f.source, &f.tokens, "StringMap", 1);
+        let callee = tok(&f.source, &f.tokens, "StringMap", 2);
         assert_eq!(lints[0].range.start, utf16_at(&f, callee));
         assert_eq!(lints[0].range.end - lints[0].range.start, 9);
 
@@ -7584,15 +7696,19 @@ mod wave1_types_tests {
     /// `test_mapPattern_destructured`).
     #[test]
     fn specify_pattern_group_faces() {
-        let f = Fixture::parse(
-            "f() {\n  switch ((1, 2)) {\n    case (final a, var b):\n  }\n}\n",
-        );
+        let f = Fixture::parse("f() {\n  switch ((1, 2)) {\n    case (final a, var b):\n  }\n}\n");
         let lints = f.run(&one_rule("always_specify_types"));
         assert_eq!(lints.len(), 2, "{lints:?}");
         let final_kw = tok(&f.source, &f.tokens, "final", 0);
-        assert_eq!(lints[0].range, utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5);
+        assert_eq!(
+            lints[0].range,
+            utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5
+        );
         let var_kw = tok(&f.source, &f.tokens, "var", 0);
-        assert_eq!(lints[1].range, utf16_at(&f, var_kw)..utf16_at(&f, var_kw) + 3);
+        assert_eq!(
+            lints[1].range,
+            utf16_at(&f, var_kw)..utf16_at(&f, var_kw) + 3
+        );
 
         let f = Fixture::parse(
             "class A {\n  int a;\n  A(this.a);\n}\n\nf() {\n  switch (A(1)) {\n    case A(a: >0 && final b):\n  }\n}\n",
@@ -7600,7 +7716,10 @@ mod wave1_types_tests {
         let lints = f.run(&one_rule("always_specify_types"));
         assert_eq!(lints.len(), 1, "{lints:?}");
         let final_kw = tok(&f.source, &f.tokens, "final", 0);
-        assert_eq!(lints[0].range, utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5);
+        assert_eq!(
+            lints[0].range,
+            utf16_at(&f, final_kw)..utf16_at(&f, final_kw) + 5
+        );
 
         let f = Fixture::parse("f() {\n  var [a] = <int>[1];\n}\n");
         let lints = f.run(&one_rule("always_specify_types"));
@@ -7636,7 +7755,9 @@ mod wave1_types_tests {
         let f = Fixture::parse("import 'dart:async';\n\nFutureOr<void> x = throw 0;\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f = Fixture::parse("import 'dart:async';\n\nclass C {\n  FutureOr<void> m() => throw 0;\n}\n");
+        let f = Fixture::parse(
+            "import 'dart:async';\n\nclass C {\n  FutureOr<void> m() => throw 0;\n}\n",
+        );
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
     }
 
@@ -7650,8 +7771,7 @@ mod wave1_types_tests {
         let f = Fixture::parse("import 'dart:async';\n\nvoid f(List<FutureOr<void>> x) {}\n");
         assert!(f.run(&one_rule("avoid_futureor_void")).is_empty());
 
-        let f =
-            Fixture::parse("import 'dart:async';\n\nvoid f(FutureOr<void> Function() g) {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nvoid f(FutureOr<void> Function() g) {}\n");
         assert!(f.run(&one_rule("avoid_futureor_void")).is_empty());
 
         let f = Fixture::parse("import 'dart:async';\n\nclass C {\n  C(FutureOr<void> x);\n}\n");
@@ -7680,8 +7800,7 @@ mod wave1_types_tests {
         let f = Fixture::parse("import 'dart:async';\n\nclass C implements FutureOr<void> {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f =
-            Fixture::parse("import 'dart:async';\n\nclass C<T extends FutureOr<void>> {}\n");
+        let f = Fixture::parse("import 'dart:async';\n\nclass C<T extends FutureOr<void>> {}\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
         let f = Fixture::parse("import 'dart:async';\n\nmixin M on FutureOr<void> {}\n");
@@ -7700,12 +7819,12 @@ mod wave1_types_tests {
         );
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f =
-            Fixture::parse("import 'dart:async';\n\nvoid f(Object o) {\n  o as FutureOr<void>;\n}\n");
+        let f = Fixture::parse(
+            "import 'dart:async';\n\nvoid f(Object o) {\n  o as FutureOr<void>;\n}\n",
+        );
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
 
-        let f =
-            Fixture::parse("import 'dart:async';\n\nFutureOr<void> Function() f = throw 0;\n");
+        let f = Fixture::parse("import 'dart:async';\n\nFutureOr<void> Function() f = throw 0;\n");
         assert_eq!(f.run(&one_rule("avoid_futureor_void")).len(), 1);
     }
 

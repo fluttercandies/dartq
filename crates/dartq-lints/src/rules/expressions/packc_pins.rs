@@ -133,9 +133,7 @@ fn void_checks_dynamic_argument_and_return() {
     }
     // A non-dynamic value returned under `void` stays silent
     // (:142-146).
-    assert!(
-        run_semantic("void f() {\n  return 1;\n}\n", "void_checks").is_empty()
-    );
+    assert!(run_semantic("void f() {\n  return 1;\n}\n", "void_checks").is_empty());
 }
 
 /// `void_checks`: a member write (`a.x = 1` over `FutureOr<void>`)

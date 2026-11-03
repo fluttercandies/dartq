@@ -226,7 +226,10 @@ fn check_pattern(c: &mut Check<'_>) {
     // The element-level `TypeParameterType` cut at the name level: any
     // in-scope type parameter (class-like and method-like ancestors)
     // — a same-named class is not a type parameter and stays silent.
-    if !in_scope_type_parameters(c).iter().any(|(n, _)| *n == matched) {
+    if !in_scope_type_parameters(c)
+        .iter()
+        .any(|(n, _)| *n == matched)
+    {
         return;
     }
     let range = utf16_token_span(c, c.head_token(c.node()));
@@ -382,9 +385,7 @@ fn parameter_potentially_nullable(
 fn bound_face<'a>(c: &'a Check<'_>, variable: u32) -> Option<(&'a str, bool)> {
     let bound = c
         .children(variable)
-        .filter(|&row| {
-            c.kind(row) == NodeKind::Type && c.unit.ast.parent(row) == Some(variable)
-        })
+        .filter(|&row| c.kind(row) == NodeKind::Type && c.unit.ast.parent(row) == Some(variable))
         .next()?;
     let token = c.head_token(bound);
     let nullable = c.byte_span(bound).end > crate::rules::byte_span_of_token(c, token).end;
@@ -546,11 +547,7 @@ fn collection_face<'a>(
 /// The expected type at a whole-body or `return` site: the written
 /// return type, flattened one level when the site awaits or the body is
 /// `async` (:50-53 — only the `Future`/`FutureOr` wrapper decides).
-fn return_expected<'a>(
-    c: &'a Check<'_>,
-    function: u32,
-    awaited: bool,
-) -> Option<(&'a str, bool)> {
+fn return_expected<'a>(c: &'a Check<'_>, function: u32, awaited: bool) -> Option<(&'a str, bool)> {
     let face = written_return_face(c, function)?;
     if awaited
         || c.unit

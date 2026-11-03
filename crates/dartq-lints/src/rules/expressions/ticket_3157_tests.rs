@@ -31,11 +31,7 @@ fn assert_row(source: &str, needle: &str, nth: usize, len: u32) {
         utf16_at(&f, tok(&f.source, &f.tokens, needle, nth)),
         "{source:?}"
     );
-    assert_eq!(
-        lints[0].range.end - lints[0].range.start,
-        len,
-        "{source:?}"
-    );
+    assert_eq!(lints[0].range.end - lints[0].range.start, len, "{source:?}");
 }
 
 /// No row for `source`.
@@ -62,12 +58,7 @@ fn us_empty_list_literal_in_block_body_reports_at_the_brackets() {
 /// braces alone.
 #[test]
 fn us_map_literal_statement_reports_the_whole_literal() {
-    assert_row(
-        "void f() {\n  <dynamic, dynamic>{};\n}\n",
-        "<",
-        0,
-        20,
-    );
+    assert_row("void f() {\n  <dynamic, dynamic>{};\n}\n", "<", 0, 20);
 }
 
 /// Oracle `test_inForLoopUpdaters` 3:18|2 — an updater's empty literal is

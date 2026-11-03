@@ -516,13 +516,11 @@ pub(crate) mod unnecessary_string_interpolations {
                 // type never stands in for the expression's. The written
                 // face decides before the read row (the same over-non-null
                 // read seam the `$id` arm guards).
-                let sole = matches!(run.as_slice(), [ident] if c.kind(*ident) == NodeKind::Identifier);
+                let sole =
+                    matches!(run.as_slice(), [ident] if c.kind(*ident) == NodeKind::Identifier);
                 let reports = if sole {
-                    match crate::rules::written_type_face(
-                        c,
-                        run[0],
-                        c.lexeme(c.head_token(run[0])),
-                    ) {
+                    match crate::rules::written_type_face(c, run[0], c.lexeme(c.head_token(run[0])))
+                    {
                         Some(face) => face.name == Some("String") && !face.nullable,
                         None => {
                             is_string(analysis, ty)

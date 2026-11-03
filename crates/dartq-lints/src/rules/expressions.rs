@@ -20,15 +20,17 @@ pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
 
 /// A row's own token span as the semantic query face's `SourceRange` —
 /// the analysis queries' span contract (a row and its fold row share the
-/// identifier token's own range). BYTE offsets — the fold rows' coordinate
-/// convention (`read_types`, `refs`, `type_uses` key `SourceRange.offset`
-/// from `byte_span`); the queries match on the start offset, the length
-/// rides along for construction.
+/// identifier token's own range). UTF-16 offsets, the fold rows'
+/// coordinate convention: the semantic engine keys every published range
+/// (`read_types`, `refs`, `type_uses`, …) off `Token::utf16_offset`, so a
+/// byte-span query overshoots every read behind a non-BMP glyph (U+1F600
+/// is four UTF-8 bytes but two UTF-16 units) and misses. Byte offsets are
+/// the report/`byte_span` convention, never the query one.
 pub(crate) fn query_site(c: &Check<'_>, row: u32) -> dartq_source::SourceRange {
-    let span = c.byte_span(row);
+    let span = c.utf16_span(row);
     dartq_source::SourceRange {
-        offset: span.start as u32,
-        length: (span.end - span.start) as u32,
+        offset: span.start,
+        length: span.end - span.start,
     }
 }
 
@@ -195,6 +197,11 @@ pub(crate) mod same_file;
 /// explicit-cast bail the official dynamic rules read. Every consumer
 /// keeps the wave posture: the face absent means the rule stays silent.
 pub(crate) mod static_type_faces;
+/// The #2970 cluster pins: `null_check_on_nullable_type_parameter`,
+/// `unnecessary_null_checks`, and `avoid_futureor_void` oracle shapes
+/// through the production bridge.
+#[cfg(test)]
+mod t2970_pins;
 #[cfg(test)]
 mod tests;
 pub(crate) mod unawaited_futures;
@@ -222,6 +229,13 @@ pub(crate) mod unrelated_type_equality_checks;
 /// is the context gate — `discarded_futures` wants sync bodies,
 /// `unawaited_futures` async ones.
 mod unused_futures;
+/// The #3776 shared-walk pins: `discarded_futures` and
+/// `unawaited_futures` oracle shapes through the production bridge —
+/// the property-access selector span, the `Future`-subtype relevance
+/// gate, and the `@awaitNotRequired` escapes (own member, implicit
+/// `this`, same-file ancestor).
+#[cfg(test)]
+mod unused_futures_pins;
 pub(crate) mod use_if_null_to_convert_nulls_to_bools;
 pub(crate) mod use_is_even_rather_than_modulo;
 pub(crate) mod use_named_constants;
@@ -242,8 +256,3 @@ mod w2_expr_pins;
 mod w3_pins;
 #[cfg(test)]
 mod w4_pins;
-/// The #2970 cluster pins: `null_check_on_nullable_type_parameter`,
-/// `unnecessary_null_checks`, and `avoid_futureor_void` oracle shapes
-/// through the production bridge.
-#[cfg(test)]
-mod t2970_pins;

@@ -68,15 +68,14 @@ fn check(c: &mut Check<'_>) {
         .and_then(|index| assignment_target(c, owner, statements[index]));
     // `!equal(second, third) && equal(last, second)` (:84-93); any
     // null side of the official comparison answers false.
-    if !equal(
-        c,
-        &second_last_expression.span,
-        third_last_expression.as_ref().map(|t| &t.span),
-    ) && equal(c, &last_expression, Some(&second_last_expression.span))
+    if !equal(c, &second_last_expression, third_last_expression.as_ref())
+        && equal(c, &last_expression, Some(&second_last_expression))
     {
-        // The official node is the assignment statement's expression
-        // (its material rows' combined span).
-        c.report(utf16_run_span(c, &second_last_expression.rows), &[]);
+        // `reportAtNode(secondLastStatement)` (:93): the whole
+        // expression statement — the production statement row seals
+        // over its `;` (`handle_expression_statement(begin, end)`),
+        // matching the analyzer's `ExpressionStatement` span.
+        c.report(c.utf16_span(second_last), &[]);
     }
 }
 
@@ -161,7 +160,7 @@ fn peel_parens(c: &Check<'_>, mut span: Range<usize>) -> Range<usize> {
 /// operand, :24-28). The target is the operand run's byte span over
 /// its rows: the assignment splits at the operator token, the
 /// prefix/postfix marker takes the run before it.
-fn assignment_target(c: &Check<'_>, owner: u32, statement: u32) -> Option<Target> {
+fn assignment_target(c: &Check<'_>, owner: u32, statement: u32) -> Option<Range<usize>> {
     if c.kind(statement) != NodeKind::ExpressionStatement {
         return None;
     }
@@ -187,18 +186,7 @@ fn assignment_target(c: &Check<'_>, owner: u32, statement: u32) -> Option<Target
     if operand_rows.is_empty() {
         return None;
     }
-    let span = expression_rows_span(c, &operand_rows)?;
-    Some(Target {
-        span,
-        rows: operand_rows,
-    })
-}
-
-struct Target {
-    /// The target's byte span over the source (the equality face).
-    span: Range<usize>,
-    /// The target's rows (the report span).
-    rows: Vec<u32>,
+    expression_rows_span(c, &operand_rows)
 }
 
 /// The written-spelling face of the official element identity: both
@@ -214,17 +202,6 @@ fn equal(c: &Check<'_>, left: &Range<usize>, right: Option<&Range<usize>>) -> bo
             .is_some_and(|spelling| is_identifier_chain(spelling))
     };
     is_chain(left) && is_chain(right) && c.unit.source[left.clone()] == c.unit.source[right.clone()]
-}
-
-/// UTF-16 min/max over a row run — the engine's external coordinates.
-fn utf16_run_span(c: &Check<'_>, rows: &[u32]) -> Range<u32> {
-    let mut span = c.utf16_span(rows[0]);
-    for &row in &rows[1..] {
-        let other = c.utf16_span(row);
-        span.start = span.start.min(other.start);
-        span.end = span.end.max(other.end);
-    }
-    span
 }
 
 /// `ident('.' ident)*` with optional `?.` separators and a
@@ -273,6 +250,13 @@ mod tests {
         assert_eq!(
             lints[0].range.start,
             utf16_at(&f, tok(source, &f.tokens, "a", 1))
+        );
+        // `reportAtNode(secondLastStatement)` pins the WHOLE
+        // expression statement — the analyzer's `ExpressionStatement`
+        // span carries the `;`.
+        assert_eq!(
+            lints[0].range.end,
+            utf16_at(&f, tok(source, &f.tokens, ";", 0)) + 1
         );
     }
 

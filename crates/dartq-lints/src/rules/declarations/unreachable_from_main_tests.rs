@@ -395,9 +395,7 @@ fn typedef_alias_invocation_reaches_target_but_bounds_do_not() {
     let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
     assert!(lints.is_empty(), "{lints:?}");
 
-    let f = Fixture::parse(
-        "void main() {\n  f();\n}\n\nclass C {}\n\nvoid f<T extends C>() {}\n",
-    );
+    let f = Fixture::parse("void main() {\n  f();\n}\n\nclass C {}\n\nvoid f<T extends C>() {}\n");
     let lints = run(&f, true, &[flag(&f, "main", 0, true)]);
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(

@@ -374,6 +374,13 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
     // condition tiled to its left, so it never covers the run that made
     // it; upstream's `visitConditionalExpression` walks the arms and the
     // conditional is the run's root (`t ? x : y` reports per arm).
+    //
+    // The binary is the same anchor shape when its left operand is an
+    // access chain: `a.b + y` seals the container over the operator with
+    // `a.b` tiled to its left, so nothing covers the run — upstream's
+    // `visitBinaryExpression` falls through to `visitNode(node)` and
+    // reports the whole expression (the report's start reads the run's
+    // earliest head, so it opens at `a`).
     matches!(
         c.kind(root),
         NodeKind::UnaryPrefix
@@ -383,6 +390,7 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
             | NodeKind::SetOrMapLiteral
             | NodeKind::RecordLiteral
             | NodeKind::Conditional
+            | NodeKind::BinaryExpression
     )
     .then_some(root)
 }
@@ -1020,11 +1028,10 @@ fn check_cascade(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
             // (the childless-handle contract), so the operator payload token
             // answers the report start and the section's member bounds the
             // end.
-            let start = c
-                .field(marker, PayloadField::Operator)
-                .map_or_else(|| c.utf16_span(marker).start, |op| {
-                    crate::rules::utf16_token_span(c, op).start
-                });
+            let start = c.field(marker, PayloadField::Operator).map_or_else(
+                || c.utf16_span(marker).start,
+                |op| crate::rules::utf16_token_span(c, op).start,
+            );
             let end = c
                 .utf16_span(marker)
                 .end
@@ -1254,5 +1261,3 @@ mod ticket_3157_tests;
 #[cfg(test)]
 #[path = "ticket_3194_tests.rs"]
 mod ticket_3194_tests;
-
-

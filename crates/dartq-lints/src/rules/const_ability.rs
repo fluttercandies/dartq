@@ -525,12 +525,7 @@ fn nested(unit: &Unit<'_>, candidate: u32, span: core::ops::Range<u32>) -> bool 
 /// scan stops at the head's own token count plus any continuation segments
 /// the interpolation opened. The escaped `\$` spelling bails too — the
 /// under-report.
-fn string_face(
-    unit: &Unit<'_>,
-    index: &ConstIndex<'_>,
-    scope: Scope<'_>,
-    row: u32,
-) -> bool {
+fn string_face(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u32) -> bool {
     if string_able(unit, row) {
         return true;
     }
@@ -540,15 +535,17 @@ fn string_face(
     if !scope.potentially() {
         return false;
     }
-    child_rows(unit, row).into_iter().all(|kid| match unit.ast.kind(kid) {
-        // `$id` shorthand: the identifier is a leaf, not a group piece —
-        // a bound parameter or a same-file const variable only.
-        NodeKind::Identifier => {
-            let name = lexeme(unit, head_token(unit, kid));
-            scope.binds(name) || index.consts.contains_key(name)
-        }
-        _ => able(unit, index, scope, kid),
-    })
+    child_rows(unit, row)
+        .into_iter()
+        .all(|kid| match unit.ast.kind(kid) {
+            // `$id` shorthand: the identifier is a leaf, not a group piece —
+            // a bound parameter or a same-file const variable only.
+            NodeKind::Identifier => {
+                let name = lexeme(unit, head_token(unit, kid));
+                scope.binds(name) || index.consts.contains_key(name)
+            }
+            _ => able(unit, index, scope, kid),
+        })
 }
 
 fn string_able(unit: &Unit<'_>, row: u32) -> bool {
@@ -632,8 +629,7 @@ fn binary_able(unit: &Unit<'_>, index: &ConstIndex<'_>, scope: Scope<'_>, row: u
     let op = unit.ast.field(row, PayloadField::Operator);
     let legal = op.is_some_and(|token| {
         let operator = lexeme(unit, token);
-        const_operator(operator)
-            || (scope.potentially() && matches!(operator, "??" | "!="))
+        const_operator(operator) || (scope.potentially() && matches!(operator, "??" | "!="))
     });
     if !legal {
         return false;
@@ -1010,8 +1006,7 @@ fn chain_segment_face(
         _ => {
             matches!(lexeme(unit, range.end - 1), ";" | ")" | "," | "]" | "}")
                 && kids.iter().any(|&kid| {
-                    unit.ast.kind(kid) == NodeKind::DotAccess
-                        && unit.ast.token_range(kid) == range
+                    unit.ast.kind(kid) == NodeKind::DotAccess && unit.ast.token_range(kid) == range
                 })
         }
     }
@@ -1808,7 +1803,6 @@ mod w3_const_pins {
             assert!(is_const_able(&unit, row), "C<int>.new(1) not const-able");
         }
     }
-
 
     /// The reject face: non-const constructors, runtime calls, non-const
     /// identifiers, interpolation, spreads and loop elements, `??`/`is`/

@@ -1238,13 +1238,21 @@ fn prefer_is_empty_oracle_corpus_pins() {
             &[(2, 9, 15)],
         ),
         ("listLength_eqEq_one", "\nvar x = [].length == 1;\n", &[]),
-        ("listLength_eqEq_zero", "\nvar x = [].length == 0;\n", &[(2, 9, 14)]),
+        (
+            "listLength_eqEq_zero",
+            "\nvar x = [].length == 0;\n",
+            &[(2, 9, 14)],
+        ),
         (
             "listLength_greaterThan_negativeOne",
             "\nvar x = [].length > -1;\n",
             &[(2, 9, 14)],
         ),
-        ("listLength_greaterThan_one", "\nvar x = [].length > 1;\n", &[]),
+        (
+            "listLength_greaterThan_one",
+            "\nvar x = [].length > 1;\n",
+            &[],
+        ),
         (
             "listLength_greaterThan_one_boolTarget",
             "\nbool x = [].length > 1;\n",
@@ -1285,27 +1293,47 @@ fn prefer_is_empty_oracle_corpus_pins() {
             "\nvar x = [].length < -1;\n",
             &[(2, 9, 14)],
         ),
-        ("listLength_lessThan_one", "\nvar x = [].length < 1;\n", &[(2, 9, 13)]),
+        (
+            "listLength_lessThan_one",
+            "\nvar x = [].length < 1;\n",
+            &[(2, 9, 13)],
+        ),
         (
             "listLength_lessThan_variable",
             "\nvar zero  = 0;\nvar x = [].length < zero;\n",
             &[],
         ),
-        ("listLength_lessThan_zero", "\nvar x = [].length < 0;\n", &[(2, 9, 13)]),
+        (
+            "listLength_lessThan_zero",
+            "\nvar x = [].length < 0;\n",
+            &[(2, 9, 13)],
+        ),
         (
             "listLength_lessThanEq_negativeOne",
             "\nvar x = [].length <= -1;\n",
             &[(2, 9, 15)],
         ),
-        ("listLength_lessThanEq_one", "\nvar x = [].length <= 1;\n", &[]),
-        ("listLength_lessThanEq_zero", "\nvar x = [].length <= 0;\n", &[(2, 9, 14)]),
+        (
+            "listLength_lessThanEq_one",
+            "\nvar x = [].length <= 1;\n",
+            &[],
+        ),
+        (
+            "listLength_lessThanEq_zero",
+            "\nvar x = [].length <= 0;\n",
+            &[(2, 9, 14)],
+        ),
         (
             "listLength_notEq_negativeOne",
             "\nvar x = [].length != -1;\n",
             &[(2, 9, 15)],
         ),
         ("listLength_notEq_one", "\nvar x = [].length != 1;\n", &[]),
-        ("listLength_notEq_zero", "\nvar x = [].length != 0;\n", &[(2, 9, 14)]),
+        (
+            "listLength_notEq_zero",
+            "\nvar x = [].length != 0;\n",
+            &[(2, 9, 14)],
+        ),
         (
             "listLength_plusExpression_greaterThan_zero",
             "\nvar x = [].length + 1 > 0;\n",
@@ -1352,7 +1380,11 @@ fn prefer_is_empty_oracle_corpus_pins() {
             "\nvar x = 1 > [].length;\n",
             &[(2, 9, 13)],
         ),
-        ("one_greaterThanEq_listLength", "\nvar x = 1 >= [].length;\n", &[]),
+        (
+            "one_greaterThanEq_listLength",
+            "\nvar x = 1 >= [].length;\n",
+            &[],
+        ),
         ("one_lessThan_listLength", "\nvar x = 1 < [].length;\n", &[]),
         (
             "one_lessThanEq_listLength",
@@ -1375,7 +1407,11 @@ fn prefer_is_empty_oracle_corpus_pins() {
             "\nvar zero = 0;\nvar x = zero < [].length;\n",
             &[],
         ),
-        ("zero_eqEq_listLength", "\nvar x = 0 == [].length;\n", &[(2, 9, 14)]),
+        (
+            "zero_eqEq_listLength",
+            "\nvar x = 0 == [].length;\n",
+            &[(2, 9, 14)],
+        ),
         (
             "zero_greaterThan_listLength",
             "\nvar x = 0 > [].length;\n",
@@ -1396,7 +1432,11 @@ fn prefer_is_empty_oracle_corpus_pins() {
             "\nvar x = 0 <= [].length;\n",
             &[(2, 9, 14)],
         ),
-        ("zero_notEq_listLength", "\nvar x = 0 != [].length;\n", &[(2, 9, 14)]),
+        (
+            "zero_notEq_listLength",
+            "\nvar x = 0 != [].length;\n",
+            &[(2, 9, 14)],
+        ),
         (
             "doc_bad_0",
             "int f(Iterable<int> p) => p.length == 0 ? 0 : p.first;\n",
@@ -3122,15 +3162,15 @@ fn js_rounded_ints_exact_literals_pass() {
 /// prefix's documented `None` silence alike), and the plain run stays
 /// silent (the wave posture). The remaining `unnecessary_lambdas`
 /// pins live in the semantic `b4_expr_pins` module.
-/// The oracle-of-record's initializer face (probed 2026-10-18 on
-/// 3.13.1): a block-body lambda in variable-initializer position
-/// stays silent — only arrow bodies report there — while argument
-/// positions report for both body forms (`locals_family.dart`'s
-/// rc2 divergence, the `handler` initializer). The arrow-initializer
-/// row fires through the `parametersMatch` fallback arm: `print`
-/// resolves to no model signature (the unindexed dart:core name), so
-/// the no-signature face reports — verified end to end against the
-/// 3.13.1 SDK (#2095).
+/// The oracle-of-record's initializer face (3.13.7 —
+/// `test_functionCall_singleStatement`'s `final l = () { f(); };`
+/// fires): a block-body lambda reports in variable-initializer
+/// position the same as anywhere else — the body forms are
+/// position-blind upstream (:160-186). The variable-declaration
+/// subtype gate (:273-279) is skipped: the callee is an unresolved
+/// `print` (the unindexed dart:core name), so the no-signature face
+/// reports and the FunctionExpressionInvocation arm carries no
+/// context gate at all.
 #[test]
 fn unnecessary_lambdas_initializer_faces() {
     let initializer =
@@ -3139,7 +3179,12 @@ fn unnecessary_lambdas_initializer_faces() {
         Fixture::parse(initializer)
             .run(&one_rule("unnecessary_lambdas"))
             .is_empty(),
-        "block body in initializer position stays silent"
+        "the plain run stays silent (the wave posture)"
+    );
+    assert_eq!(
+        run_semantic(initializer, "unnecessary_lambdas", None).len(),
+        1,
+        "block body in initializer position reports (3.13.7 oracle)"
     );
     // The arrow initializer reports in the semantic run; the plain
     // run stays silent (the wave posture). Both positions — the local
@@ -3612,8 +3657,12 @@ fn void_checks_void_formal_arguments() {
 /// return type decides where the scalar faces stay silent, and the
 /// acceptability cut splits on the target — `FutureOr` is not
 /// void-acceptable upstream (`isTypeAcceptableWhenExpectingVoid`
-/// recurses only through a `Future` head), `dynamic` passes both
-/// cuts.
+/// recurses only through a `Future` head), and `dynamic` is *not*
+/// acceptable either: the official assignment face calls the plain
+/// `isTypeAcceptableWhenExpectingVoid`, whose only exemptions are
+/// `void`, `Null`, `Never` and a `Future`-headed recursion (only the
+/// separate `isTypeAcceptableWhenExpectingFutureOrVoid` accepts
+/// `dynamic`; oracle row `INFO|LINT|VOID_CHECKS|…|5|5|12`).
 #[test]
 fn void_checks_assignment_bridge_value_face() {
     let source = "class C {\n  FutureOr<void> drained;\n  int piece() => 1;\n  void pour() {\n    drained = piece();\n  }\n}\n";
@@ -3621,7 +3670,7 @@ fn void_checks_assignment_bridge_value_face() {
     let source = "class C {\n  void v = null;\n  FutureOr<int> h() => 1;\n  void m() {\n    this.v = h();\n  }\n}\n";
     assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
     let source = "class C {\n  void v = null;\n  dynamic d() => null;\n  void m() {\n    this.v = d();\n  }\n}\n";
-    assert!(run_semantic(source, "void_checks", None).is_empty());
+    assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
 }
 
 /// The null_check_on_nullable_type_parameter operand face through the

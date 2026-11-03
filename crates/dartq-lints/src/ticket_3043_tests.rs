@@ -39,7 +39,11 @@ fn run(f: &Fixture, has_entry: bool, entries: &[(u32, bool)]) -> Vec<Lint> {
 #[test]
 fn ufm_ctor_verdict_fallback_reports() {
     let f = Fixture::parse("void main() {\n  C;\n}\n\nclass C {\n  C();\n}\n");
-    let lints = run(&f, true, &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)]);
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)],
+    );
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
@@ -48,7 +52,11 @@ fn ufm_ctor_verdict_fallback_reports() {
     assert_eq!(lints[0].range.start, flag(&f, "C", 2, false).0);
 
     let f = Fixture::parse("void main() {\n  C;\n}\n\nclass C {\n  C.named();\n}\n");
-    let lints = run(&f, true, &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)]);
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)],
+    );
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
@@ -56,7 +64,11 @@ fn ufm_ctor_verdict_fallback_reports() {
     );
 
     let f = Fixture::parse("void main() {}\n\nclass C {\n  C();\n}\n");
-    let lints = run(&f, true, &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)]);
+    let lints = run(
+        &f,
+        true,
+        &[flag(&f, "main", 0, true), flag(&f, "C", 0, true)],
+    );
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
         lints[0].message,
@@ -84,7 +96,9 @@ fn ufm_counted_invocation_suppresses_ctor() {
 /// unnamed constructor — `S()` stays silent.
 #[test]
 fn ufm_subclass_default_ctor_marks_super_unnamed() {
-    let f = Fixture::parse("void main() {\n  B();\n}\n\nclass S {\n  S();\n}\n\nclass B extends S {}\n");
+    let f = Fixture::parse(
+        "void main() {\n  B();\n}\n\nclass S {\n  S();\n}\n\nclass B extends S {}\n",
+    );
     let lints = run(
         &f,
         true,

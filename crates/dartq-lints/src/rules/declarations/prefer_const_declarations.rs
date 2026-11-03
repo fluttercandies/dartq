@@ -396,11 +396,7 @@ mod tests {
                 "\nconst x = const [];",
                 &[],
             ),
-            (
-                "doc_bad_0",
-                "final v = const <int>[];",
-                &[(1, 1, 23)],
-            ),
+            ("doc_bad_0", "final v = const <int>[];", &[(1, 1, 23)]),
             (
                 "doc_bad_1",
                 "class C {\n  static final f = const <int>[];\n}",
@@ -458,4 +454,5 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    }}
+    }
+}

@@ -454,7 +454,10 @@ mod tests {
     fn the_language_version_gate_is_the_units_own_enablement() {
         let source = "void f(Object o) {\n  switch (o) {\n    case 1 + 2:\n  }\n}\n";
         assert_eq!(legacy(source).len(), 1);
-        assert!(modern(source).is_empty(), "a 3.0+ unit registers the rule off");
+        assert!(
+            modern(source).is_empty(),
+            "a 3.0+ unit registers the rule off"
+        );
         // A modern head (a valid constant pattern) is silent either way —
         // the gate silences it, not the classification.
         let valid = "void f(Object o) {\n  switch (o) {\n    case 1:\n  }\n}\n";

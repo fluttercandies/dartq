@@ -21,19 +21,24 @@ use dartq_semantic::{Analysis, FnSig};
 /// type (:246, `isAssignableTo(invocationType, nodeType)`); a
 /// deferred-prefix callee or receiver bails (:255, :264,
 /// `mightBeDeferred` :314-324); the bare callee (:260) or the receiver
-/// (:283) is final (`isFinalNode` :50-79, `isFinal` :326-335 — a
-/// parameter of the lambda, a non-`final` or `late` variable, and a
-/// non-variable accessor are not); the receiver chain carries no
+/// (:283) is final (`isFinalNode` :50-79, `isFinal` :326-335 — the
+/// VariableElement arm reads `isFinal && !isLate`, so a `final`
+/// parameter is final, a plain parameter is not, and the lambda's OWN
+/// parameters are excluded by :74); the receiver chain carries no
 /// null-aware link (:282) and the invocation no explicit type
-/// arguments (:285). The named-argument and variable-initializer
+/// arguments (:285). The named-argument and variable-declaration
 /// positions add a pure-subtype check of the tear-off against the
-/// context type (:269-279): for a forwarding lambda that is the main
-/// relation read without the permissive fallback, which is exactly how
-/// the gate below reads it, so it adds no face. The constructor face
-/// (:189-226): a non-`const`, non-deferred creation (:195-197) whose
-/// constructor type is assignable to the lambda's (:208) and whose
-/// arguments are bare identifiers naming the lambda's parameters by
-/// index with equal counts (:212-223).
+/// context type (:269-279, MethodInvocation arm only — a bare-name
+/// callee IS a null-target MethodInvocation upstream; a variable-typed
+/// callee is FunctionExpressionInvocation and skips the gate): the
+/// context type is a function type the `Ty` face cannot represent, so
+/// the gate is unprovable and the no-face posture stays silent. The
+/// constructor face (:189-226): a non-`const`, non-deferred creation
+/// (:195-197 — a `p.C()` head resolves `C` through the prefix's import
+/// scope, deferred `p` bailing) whose constructor type is assignable
+/// to the lambda's (:208) and whose arguments are bare identifiers
+/// naming the lambda's parameters by index with equal counts
+/// (:212-223).
 ///
 /// dartq faces over the production tiling. The dispatch row is the
 /// [`NodeKind::FunctionExpression`] (a named function expression is a
@@ -99,18 +104,23 @@ use dartq_semantic::{Analysis, FnSig};
 /// the lambda lacks, a constructor formal the lambda lacks. The
 /// undecided `None` faces the fallback's gates fail: a
 /// required-positional count mismatch (an optional target formal
-/// against the untyped forward's required slot). The faces that never
-/// reach the gate: a getter, field, or prefix callee (the member
-/// face's accessor cut — no method signature composes); a
-/// `receiver.method` whose receiver type the model cannot name; a
-/// prefixed or unresolved creation head; a creation head published as
-/// a value reference (the bare `C(a)` send, no type-use row) — of
-/// which only the zero-argument shape is provable: a bare same-file
-/// class-like name invoked with no arguments by a parameterless lambda
-/// (`() => C()`, `test_constructorCall_noArgs`) is replaceable by
-/// construction, since a compiling zero-argument call means the
-/// constructor declares no required formal and optional leftovers on
-/// the replacement side are admissible (`subtype.dart:141-146`,
+/// against the untyped forward's required slot). The member face's
+/// resolved non-method member (a field, getter, or setter) reads
+/// `methodName.element.isFinal` (:284) rather than the signature gate
+/// — a final field fires, a declared accessor stays silent; a member
+/// the model cannot resolve at all reads the same leaf on a null
+/// element — the extension's `_ => true` arm (:335) fires it, which
+/// is how the non-deferred `p.m(e)` prefix receiver reports (the
+/// deferred spelling bails earlier on `mightBeDeferred`). The faces
+/// that never reach the gate: an unresolved creation head; a
+/// creation head published as a value reference (the bare `C(a)`
+/// send, no type-use row) — of which only the zero-argument shape is
+/// provable: a bare same-file class-like name invoked with no
+/// arguments by a parameterless lambda (`() => C()`,
+/// `test_constructorCall_noArgs`) is replaceable by construction,
+/// since a compiling zero-argument call means the constructor
+/// declares no required formal and optional leftovers on the
+/// replacement side are admissible (`subtype.dart:141-146`,
 /// :157-165). The undecided-but-plausible faces report through the
 /// fallback — an untyped, `dynamic`, `void`, parameterized,
 /// prefixed, function-typed, or record-typed written formal, a
@@ -146,19 +156,11 @@ fn check(c: &mut Check<'_>) {
     let Some((run, arrow)) = body_run(c, lambda) else {
         return;
     };
-    // The oracle-of-record's initializer face (probed 2026-10-18 on
-    // 3.13.1): a *block*-body lambda in variable-initializer position
-    // stays silent — only arrow bodies report there, while argument
-    // positions report for both body forms. Upstream main reads both
-    // bodies alike; the shipped 3.13.1 linter does not.
-    if !arrow
-        && (1..=2).any(|up| {
-            c.ancestor(up)
-                .is_some_and(|row| c.kind(row) == NodeKind::VariableInitializer)
-        })
-    {
-        return;
-    }
+    // The block-body face is position-blind upstream (:160-186): a
+    // block-body lambda in variable-initializer position reports like
+    // any other (the 3.13.7 oracle —
+    // `test_functionCall_singleStatement`'s `final l = () { f(); };`
+    // fires).
     // The invocation face first (:163, :169, :178); the constructor
     // face (:181-185) takes an arrow body whose root is a creation.
     if let Some(root) = expression_root(c, &run, NodeKind::Send) {
@@ -348,51 +350,204 @@ fn check_invocation(
         return;
     }
     let name = c.lexeme(c.head_token(probe));
-    if matches!(binding_finality(c, probe, name), Finality::NotFinal) {
+    if matches!(binding_finality(c, lambda, probe, name), Finality::NotFinal) {
+        return;
+    }
+    // `mightBeDeferred` (:255, :264, :314-324): a bare callee or a bare
+    // receiver spelling a deferred import prefix bails.
+    if deferred_prefix(c, name) {
         return;
     }
     // `invocationType` (:244-245, :266-267): the bare callee's own
     // declaration, or the receiver's method (a getter or field never
     // composes — the `methodName.element.isFinal` accessor cut, :284).
+    #[derive(Clone, Copy)]
+    enum Target<'a> {
+        Sig(FnSig<'a>),
+        /// A resolved non-method member (field/getter/setter): the
+        /// `methodName.element.isFinal` leaf decides.
+        NonMethod(&'a dartq_semantic::model::MemberEntry),
+        /// No callable face composes (unresolved or unmodelled).
+        None,
+    }
     let target = match marker {
-        None => analysis.function_signature_of(query_site(c, probe)),
+        None => analysis
+            .function_signature_of(query_site(c, probe))
+            .map_or(Target::None, Target::Sig),
         Some(_) => {
             let method = analysis
                 .strings()
                 .intern(c.lexeme(c.head_token(run[selector])));
-            analysis
-                .member_of(query_site(c, probe), method)
-                .and_then(|member| FnSig::of_member(member.entry))
+            match analysis.member_of(query_site(c, probe), method) {
+                Some(member) => match FnSig::of_member(member.entry) {
+                    Some(sig) => Target::Sig(sig),
+                    // A method without a captured formal table (the
+                    // synthesized core entries carry only the kind)
+                    // composes no model signature — the
+                    // non-`FunctionType` posture fires it like an
+                    // unresolved member. A getter/field/setter reads
+                    // the `methodName.element.isFinal` leaf (:284).
+                    None => {
+                        if member.entry.kind == dartq_semantic::model::MemberKind::Method {
+                            Target::None
+                        } else {
+                            Target::NonMethod(member.entry)
+                        }
+                    }
+                },
+                None => Target::None,
+            }
         }
     };
     let fires = match target {
         // The :246-249 gate — assignability, else the fallback on the
         // undecided face.
-        Some(target) => lambda_accepts(c, analysis, &formals, target, true),
-        // No callable face composes. A same-file class-like name is
-        // the creation head: only the zero-argument shape is provable
-        // (the constructor formals the model cannot name stay
-        // unprovable). Every other bare callee takes the
-        // `parametersMatch` non-`FunctionType` arm (:111-114, "We
-        // must assume is valid here"): an invocation type that
-        // composes no model function type cannot fail the
-        // assignability gate, and for a compiling forward the
-        // arguments-match, finality, type-argument, and null-aware
-        // gates above carry the verdict. A prefixed callee rides the
-        // member face and stays with the creation cut.
-        None => {
-            marker.is_none()
-                && if same_file_class(c, name) {
-                    formals.is_empty() && zero_arguments(c, arguments)
-                } else {
-                    true
-                }
+        Target::Sig(target) => lambda_accepts(c, analysis, &formals, target, true),
+        // `methodName.element.isFinal` (:284): the resolved member is a
+        // field/getter/setter — the PropertyAccessor/Variable arms of
+        // the `isFinal` extension (:326-335). A declared getter or
+        // setter's `isOriginVariable` is false (not final); a field's
+        // `isFinal` keyword bit decides (`late` is outside the member
+        // face — a `late final` field over-reports).
+        Target::NonMethod(entry) => {
+            matches!(entry.kind, dartq_semantic::model::MemberKind::Field)
+                && (entry.is_final || entry.is_const)
+        }
+        // No callable face composes. A bare callee takes the
+        // `parametersMatch` non-`FunctionType` arm (:111-114, "We must
+        // assume is valid here") — except the same-file class-like
+        // name, the creation head: only the zero-argument shape is
+        // provable. A method invocation whose member resolves nowhere
+        // reads `methodName.element.isFinal` on a null element — the
+        // extension's `_ => true` arm (:335) fires it.
+        Target::None => {
+            if marker.is_some() {
+                true
+            } else if same_file_class(c, name) {
+                formals.is_empty() && zero_arguments(c, arguments)
+            } else {
+                true
+            }
         }
     };
-    if fires {
-        let range = c.utf16_span(lambda);
-        c.report(range, &[]);
+    // The MethodInvocation arm's context gates (:269-279): a lambda in
+    // named-argument or variable-declaration position additionally
+    // requires `isSubtypeOf(tearoffType, contextType)` with no
+    // parametersMatch fallback. The arm boundary: a `receiver.m()`
+    // send and a bare callee that resolves to a function/method
+    // declaration are the upstream MethodInvocation (a bare name is a
+    // null-target method invocation); a bare callee resolving to a
+    // variable is the FunctionExpressionInvocation and skips the gate
+    // entirely.
+    let method_face = marker.is_some() || matches!(target, Target::Sig(_));
+    if fires && method_face && context_gated(c, lambda) {
+        return;
     }
+    if fires {
+        c.report(lambda_span(c, lambda), &[]);
+    }
+}
+
+/// The MethodInvocation context gates (:269-279): the lambda is the
+/// value of a named argument (its argument group ends in a
+/// `NamedArgument` row — the production tiling keeps the label a
+/// sibling of the value, not a parent), or sits in a variable
+/// declaration carrying a written type annotation. An unannotated
+/// declaration (`var`/`final`/`const`) infers the lambda's own type,
+/// which the tear-off trivially satisfies upstream; the written and
+/// matched-formal context types are function types the `Ty` face
+/// cannot represent, so their check is unprovable and the no-face
+/// posture stays silent.
+fn context_gated(c: &Check<'_>, lambda: u32) -> bool {
+    // The named-argument face: the lambda's `Arguments` parent groups
+    // its arguments — the group containing the lambda ends in a
+    // `NamedArgument` row.
+    if let Some(arguments) = c
+        .ancestor(1)
+        .filter(|&row| c.kind(row) == NodeKind::Arguments)
+    {
+        let raw = c.collect_direct(arguments);
+        let lambda_pos = raw.iter().position(|&row| row == lambda);
+        if lambda_pos.is_some_and(|pos| {
+            slice::arguments(c, &raw).into_iter().any(|range| {
+                pos >= range.start
+                    && pos < range.end
+                    && c.kind(raw[range.end - 1]) == NodeKind::NamedArgument
+            })
+        }) {
+            return true;
+        }
+    }
+    // The variable-declaration face: the nearest
+    // `VariablesDeclaration`/`TopLevelFields`/`Fields` ancestor of a
+    // `VariableInitializer` carrying the lambda.
+    if (1..=3).any(|up| {
+        c.ancestor(up)
+            .is_some_and(|row| c.kind(row) == NodeKind::VariableInitializer)
+    }) {
+        let mut cursor = c.unit.ast.parent(lambda);
+        while let Some(row) = cursor {
+            if matches!(
+                c.kind(row),
+                NodeKind::VariablesDeclaration | NodeKind::TopLevelFields | NodeKind::Fields
+            ) {
+                return has_written_type(c, row);
+            }
+            cursor = c.unit.ast.parent(row);
+        }
+    }
+    false
+}
+
+/// Whether a `VariablesDeclaration`/`TopLevelFields` row carries a
+/// written type annotation — a type row among its DIRECT children
+/// (`var`/`final`/`const` without an annotation carries none and
+/// infers the initializer's type; descendant type rows inside the
+/// initializer do not count).
+fn has_written_type(c: &Check<'_>, declaration: u32) -> bool {
+    c.collect_direct(declaration).into_iter().any(|row| {
+        matches!(
+            c.kind(row),
+            NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType | NodeKind::RecordType
+        )
+    })
+}
+
+/// The import row declaring `name` as its `as` prefix, `None` when no
+/// import of this unit prefixes that spelling.
+fn prefix_import(c: &Check<'_>, name: &str) -> Option<u32> {
+    let &unit = c
+        .path
+        .iter()
+        .find(|&&n| c.kind(n) == NodeKind::CompilationUnit)?;
+    c.collect_direct(unit).into_iter().find_map(|kid| {
+        let row = if c.kind(kid) == NodeKind::TopLevelDeclaration {
+            c.collect_direct(kid).first().copied().unwrap_or(kid)
+        } else {
+            kid
+        };
+        (c.kind(row) == NodeKind::Import
+            && c.collect_direct(row).into_iter().any(|piece| {
+                c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == name
+            }))
+        .then_some(row)
+    })
+}
+
+/// Whether `name` spells an import prefix of this unit (`import … as name`).
+fn is_import_prefix(c: &Check<'_>, name: &str) -> bool {
+    prefix_import(c, name).is_some()
+}
+
+/// Whether `name` spells a `deferred as name` import prefix of this
+/// unit — the `mightBeDeferred` face (:314-324: a `PrefixedIdentifier`'s
+/// or bare callee's prefix element whose import is deferred).
+fn deferred_prefix(c: &Check<'_>, name: &str) -> bool {
+    prefix_import(c, name).is_some_and(|row| {
+        c.field(row, PayloadField::DeferredKeyword)
+            .unwrap_or(NONE_TOKEN)
+            != NONE_TOKEN
+    })
 }
 
 /// The upstream zero-argument face: no argument list marker (the
@@ -441,13 +596,52 @@ fn check_constructor(c: &mut Check<'_>, analysis: &Analysis<'_>, lambda: u32, ro
     let Some(type_row) = names.next() else {
         return;
     };
-    let selector = names
+    let tail = names
         .next()
         .map(|row| analysis.strings().intern(c.lexeme(c.head_token(row))));
-    let Some(binding) = analysis.resolve_constructor(query_site(c, type_row), selector) else {
-        return;
+    // The constructor's signature: its declared formals, else the
+    // implicit default constructor's empty table.
+    let implicit = Formals {
+        positional: Box::new([]),
+        named: Box::new([]),
     };
-    if !binding.exists {
+    // The prefixed head `p.C()` (:195-197, `constructorName.type`
+    // resolves through the prefix's import scope — a deferred `p`
+    // bails): the tail name is the class, the constructor unnamed.
+    // Without the prefix the tail is the named-constructor selector
+    // over the head's own class.
+    let head = c.lexeme(c.head_token(type_row));
+    let (exists, container, ctor_formals) = match tail {
+        Some(class) if is_import_prefix(c, head) => {
+            if deferred_prefix(c, head) {
+                return;
+            }
+            let Some((resolved, _)) =
+                analysis.resolve_prefixed_container(analysis.strings().intern(head), class)
+            else {
+                return;
+            };
+            (
+                resolved.has_unnamed_constructor,
+                class,
+                resolved
+                    .ctor_formals
+                    .get(&class)
+                    .map_or(&implicit, |f| f.as_ref()),
+            )
+        }
+        _ => {
+            let Some(binding) = analysis.resolve_constructor(query_site(c, type_row), tail) else {
+                return;
+            };
+            (
+                binding.exists,
+                binding.container,
+                binding.formals.unwrap_or(&implicit),
+            )
+        }
+    };
+    if !exists {
         return;
     }
     let formals = lambda_formals(c, lambda);
@@ -458,22 +652,28 @@ fn check_constructor(c: &mut Check<'_>, analysis: &Analysis<'_>, lambda: u32, ro
     if !constructor_arguments_match(c, &formals, arguments) {
         return;
     }
-    // The constructor's signature: its declared formals, else the
-    // implicit default constructor's empty table.
-    let implicit = Formals {
-        positional: Box::new([]),
-        named: Box::new([]),
-    };
-    let target = FnSig::new(
-        0,
-        Ty::named(binding.container),
-        binding.formals.unwrap_or(&implicit),
-    );
+    let target = FnSig::new(0, Ty::named(container), ctor_formals);
     // :208 reads plain assignability — no fallback consultation.
     if lambda_accepts(c, analysis, &formals, target, false) {
-        let range = c.utf16_span(lambda);
-        c.report(range, &[]);
+        c.report(lambda_span(c, lambda), &[]);
     }
+}
+
+/// The lambda's report span (`reportAtNode(node)`, :155/:249): the
+/// analyzer's `FunctionExpression` runs through the body's last token.
+/// The production `FunctionExpression` seal stops at the `=>`/body
+/// begin, so the end reads the body's own pieces — the deepest utf16
+/// end over the lambda's children (the arrow expression's pieces or
+/// the `BlockBody` row covering `}`).
+fn lambda_span(c: &Check<'_>, lambda: u32) -> core::ops::Range<u32> {
+    let span = c.utf16_span(lambda);
+    let end = c
+        .collect_direct(lambda)
+        .into_iter()
+        .map(|kid| c.utf16_span(kid).end)
+        .max()
+        .unwrap_or(span.end);
+    span.start..end.max(span.end)
 }
 
 /// The constructor arguments face (:212-223): every argument is a bare
@@ -843,6 +1043,46 @@ fn resolves_to_lambda_parameter(
     }
 }
 
+/// The `isFinal` verdict of `name` bound as a parameter of `owner`
+/// (`None` when no formal of that name exists): the VariableElement
+/// arm (:329 — `isFinal && !isLate`) over the formal's written
+/// keywords — `final`/`const` final unless `late`, everything else
+/// (a plain or `var` formal) not final.
+fn parameter_finality(c: &Check<'_>, owner: u32, name: &str) -> Option<Finality> {
+    let row = c
+        .collect_direct(owner)
+        .into_iter()
+        .filter(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        .flat_map(|params| c.collect_direct(params))
+        .flat_map(|kid| {
+            if c.kind(kid) == NodeKind::OptionalFormalParameters {
+                c.collect_direct(kid)
+            } else {
+                vec![kid]
+            }
+        })
+        .find(|&row| {
+            c.kind(row) == NodeKind::FormalParameter && parameter_name(c, row) == Some(name)
+        })?;
+    let mut late = false;
+    let mut keyworded = false;
+    for token in c.unit.ast.token_range(row) {
+        match c.lexeme(token) {
+            "late" => late = true,
+            "final" | "const" => keyworded = true,
+            _ => {}
+        }
+        if keyworded {
+            break;
+        }
+    }
+    Some(if keyworded && !late {
+        Finality::Final
+    } else {
+        Finality::NotFinal
+    })
+}
+
 /// Whether a closure's parameter list binds `name`.
 fn params_binds(c: &Check<'_>, owner: u32, name: &str) -> bool {
     c.collect_direct(owner)
@@ -886,11 +1126,14 @@ fn block_binds(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Optio
 /// The finality verdict of the binding `name` at the use site (the
 /// upstream `isFinal` extension, :326-335, under `isFinalNode`'s
 /// SimpleIdentifier arm, :70-76): a `final`/`const` variable, field,
-/// or any function is final; a parameter, getter, `late` variable, or
-/// mutable variable is not; the walk's terminal — the enclosing class's
-/// own name (a constructor), cross-file and unresolved names — leaves
-/// the verdict to the signature gate (`Unknown`).
-fn binding_finality(c: &Check<'_>, use_row: u32, name: &str) -> Finality {
+/// or any function is final; a getter, `late` variable, or mutable
+/// variable is not; a parameter is final UNLESS it is one of the
+/// linted lambda's own (:74 — `parameters.contains(element)`, then the
+/// `_ => true` arm reads every other parameter element as final); the
+/// walk's terminal — the enclosing class's own name (a constructor),
+/// cross-file and unresolved names — leaves the verdict to the
+/// signature gate (`Unknown`).
+fn binding_finality(c: &Check<'_>, lambda: u32, use_row: u32, name: &str) -> Finality {
     let use_start = c.byte_span(use_row).start;
     let mut current = use_row;
     loop {
@@ -907,8 +1150,17 @@ fn binding_finality(c: &Check<'_>, use_row: u32, name: &str) -> Finality {
             NodeKind::FunctionExpression
             | NodeKind::NamedFunctionExpression
             | NodeKind::LocalFunctionDeclaration => {
-                if params_binds(c, current, name) {
-                    return Finality::NotFinal;
+                if let Some(finality) = parameter_finality(c, current, name) {
+                    // The linted lambda's own parameter is not final
+                    // (:74); every other closure's parameter reads the
+                    // `isFinal` extension's VariableElement arm
+                    // (:329 — `isFinal && !isLate`, so a `final`
+                    // parameter is final and a plain one is not).
+                    return if current == lambda {
+                        Finality::NotFinal
+                    } else {
+                        finality
+                    };
                 }
             }
             NodeKind::CatchClause => {
@@ -925,9 +1177,11 @@ fn binding_finality(c: &Check<'_>, use_row: u32, name: &str) -> Finality {
             | NodeKind::Constructor
             | NodeKind::Factory
             | NodeKind::TopLevelMethod => {
-                // The enclosing member's own parameters bind first.
-                if params_binds(c, current, name) {
-                    return Finality::NotFinal;
+                // The enclosing member's parameters read the same
+                // VariableElement arm (:329 — `isFinal && !isLate`):
+                // `final`/`const` is final, a plain parameter is not.
+                if let Some(finality) = parameter_finality(c, current, name) {
+                    return finality;
                 }
                 // The unit-level member of that name: a getter is the
                 // accessor face (not final); a function takes the

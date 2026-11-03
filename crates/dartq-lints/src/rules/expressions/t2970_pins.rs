@@ -412,4 +412,3 @@ fn afov_unresolved_head_stays_silent() {
     let lints = f.run_semantic(&one_rule("avoid_futureor_void"));
     assert!(lints.is_empty(), "{lints:?}");
 }
-

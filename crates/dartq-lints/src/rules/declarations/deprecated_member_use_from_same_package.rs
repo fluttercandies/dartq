@@ -26,8 +26,11 @@ use std::path::{Path, PathBuf};
 /// `C.named`, the invocation handlers the argument-to-parameter mapping
 /// (`_visitParametersAndArguments`: a named argument at its label, a
 /// positional one at the argument), the operator handlers the whole
-/// expression (`c + 1`, `c[1]`, `c += 1`), and the prefix/postfix
-/// handlers the operand.
+/// expression (`c + 1`, `c[1]`, `c += 1`), the constructor-invocation
+/// handlers the whole `super(…)`/`this(…)` initializer and the implicit
+/// super-constructor call at the declaration itself
+/// (`constructorDeclaration`), and the prefix/postfix handlers the
+/// operand.
 ///
 /// This implementation reads the same faces off the single-unit arena,
 /// with the same-file declaration table standing in for element
@@ -35,12 +38,14 @@ use std::path::{Path, PathBuf};
 /// name *and the same shape*. A bare name reaches top-level declarations
 /// and the enclosing container's own members; a selector name reaches
 /// members and enum constants; a constructor name reaches constructor
-/// declarations; a call-site argument reaches the matching parameter.
-/// The faces the arena cannot resolve stay silent (documented
-/// residuals): cross-file same-package uses through other names, the
-/// implicit-super and `super()`/`this()` constructor faces (no arena
-/// node), the implicit `call` method of a function-typed receiver, and
-/// the inferred-name object-pattern shorthand.
+/// declarations (including the `super(…)`/`this(…)` initializer targets
+/// and the implicit super-constructor call); a call-site argument reaches
+/// the matching parameter; an inferred-name object-pattern field reaches
+/// its bound variable's name. The faces the arena cannot resolve stay
+/// silent (documented residuals): cross-file same-package uses through
+/// other names, the implicit `call` method of a receiver that is not a
+/// formally typed parameter, and the inferred-name object-pattern field
+/// whose pattern is not a plain variable declaration.
 ///
 /// Messages: `diagnostic.g.dart`
 /// `deprecatedMemberUseFromSamePackageWithMessage` and
@@ -150,6 +155,9 @@ fn check(c: &mut Check<'_>) {
     }
     operator_faces(c, &decls, &mut hits);
     argument_faces(c, &decls, &mut hits);
+    implicit_call_faces(c, &decls, &mut hits);
+    initializer_faces(c, &decls, &mut hits);
+    pattern_shorthand_faces(c, &decls, &mut hits);
     for hit in hits {
         if suppressed
             .iter()
@@ -187,7 +195,12 @@ fn report(c: &mut Check<'_>, hit: &Hit, decl: &DeprecatedDecl<'_>) {
     let name: &str = hit.display.as_deref().unwrap_or(decl.name);
     match &decl.message {
         Some(message) => {
-            c.report_texts(hit.range.clone(), WITH_MESSAGE, CORRECTION, &[name, message]);
+            c.report_texts(
+                hit.range.clone(),
+                WITH_MESSAGE,
+                CORRECTION,
+                &[name, message],
+            );
         }
         None => c.report_texts(hit.range.clone(), WITHOUT_MESSAGE, CORRECTION, &[name]),
     }
@@ -197,12 +210,7 @@ fn report(c: &mut Check<'_>, hit: &Hit, decl: &DeprecatedDecl<'_>) {
 
 /// The identifier faces: a reference-context identifier, a named-argument
 /// label, and an object-pattern field label.
-fn identifier_face(
-    c: &Check<'_>,
-    row: u32,
-    decls: &[DeprecatedDecl<'_>],
-    hits: &mut Vec<Hit>,
-) {
+fn identifier_face(c: &Check<'_>, row: u32, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hit>) {
     let Some(context) = c.field(row, PayloadField::Context) else {
         return;
     };
@@ -310,7 +318,11 @@ fn argument_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hi
                 continue;
             };
             let lexeme = c.lexeme(label);
-            let Some(offset) = c.unit.tokens.get(label as usize).map(|token| token.byte_offset)
+            let Some(offset) = c
+                .unit
+                .tokens
+                .get(label as usize)
+                .map(|token| token.byte_offset)
             else {
                 continue;
             };
@@ -338,14 +350,12 @@ fn argument_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hi
                 c.kind(kid) != NodeKind::NamedArgument
                     && !(c.kind(kid) == NodeKind::Identifier
                         && c.field(kid, PayloadField::Context)
-                            == Some(
-                                dartq_parser::IdentifierContext::NamedArgumentReference as u32,
-                            ))
+                            == Some(dartq_parser::IdentifierContext::NamedArgumentReference as u32))
             })
             .collect();
-        let owner = decls.iter().find(|decl| {
-            decl.kind == Kind::Parameter && !decl.named && decl.owner_name == callee
-        });
+        let owner = decls
+            .iter()
+            .find(|decl| decl.kind == Kind::Parameter && !decl.named && decl.owner_name == callee);
         let Some(owner) = owner else {
             continue;
         };
@@ -370,6 +380,288 @@ fn argument_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hi
     }
 }
 
+/// The implicit `call` face: a `Send` whose callee is a value
+/// (`functionExpressionInvocation` → the receiver's `call` method) reports
+/// the whole `receiver(…)`. The receiver's static type is not resolvable
+/// here, so the face answers only the declared shape — a formally typed
+/// parameter naming the container that declares the deprecated `call`
+/// member.
+fn implicit_call_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hit>) {
+    if !decls
+        .iter()
+        .any(|decl| decl.kind == Kind::Member && decl.name == "call")
+    {
+        return;
+    }
+    for send in 0..narrow_u32(c.unit.ast.len()) {
+        if c.kind(send) != NodeKind::Send {
+            continue;
+        }
+        let Some(parent) = c.unit.ast.parent(send) else {
+            continue;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == send) else {
+            continue;
+        };
+        // The callee expression is the nearest preceding sibling that is
+        // not part of the send's own argument-list detritus.
+        let callee = kids[..pos].iter().rev().copied().find(|&kid| {
+            !matches!(
+                c.kind(kid),
+                NodeKind::NoTypeArguments
+                    | NodeKind::TypeApplication
+                    | NodeKind::Arguments
+                    | NodeKind::NoArguments
+            )
+        });
+        let Some(callee) = callee else {
+            continue;
+        };
+        if c.kind(callee) != NodeKind::Identifier
+            || !c
+                .field(callee, PayloadField::Context)
+                .is_some_and(is_reference_context)
+        {
+            continue;
+        }
+        // A selector (`x.m()`) is a plain method invocation, never the
+        // implicit `call`.
+        if selector_left(c, callee).is_some() {
+            continue;
+        }
+        let name = c.lexeme(c.head_token(callee));
+        for (index, decl) in decls.iter().enumerate() {
+            if decl.kind != Kind::Member || decl.name != "call" || decl.owner == 0 {
+                continue;
+            }
+            let Some(owner) = crate::rules::class_declaration_name(c, decl.owner) else {
+                continue;
+            };
+            if !parameter_typed_as(c, parent, name, owner) {
+                continue;
+            }
+            hits.push(Hit::new(c.byte_span(send).start, c.utf16_span(send), index));
+        }
+    }
+}
+
+/// Whether `name` is a formal parameter, in an executable enclosing
+/// `use_row`, written with the type `class` (`void f(C c) => c();`).
+fn parameter_typed_as(c: &Check<'_>, use_row: u32, name: &str, class: &str) -> bool {
+    let mut node = Some(use_row);
+    for _ in 0..16 {
+        let Some(row) = node else {
+            return false;
+        };
+        if matches!(
+            c.kind(row),
+            NodeKind::Method
+                | NodeKind::TopLevelMethod
+                | NodeKind::Constructor
+                | NodeKind::FunctionExpression
+                | NodeKind::LocalFunctionDeclaration
+        ) && parameter_group(c, row).is_some_and(|group| {
+            super::parameter_rows(c, group).iter().any(|&param| {
+                c.kind(param) == NodeKind::FormalParameter
+                    && payload_name(c, param) == Some(name)
+                    && c.collect_direct(param).iter().any(|&kid| {
+                        c.kind(kid) == NodeKind::Type && c.lexeme(c.head_token(kid)) == class
+                    })
+            })
+        }) {
+            return true;
+        }
+        node = c.unit.ast.parent(row);
+    }
+    false
+}
+
+/// The executable's parameter-list row (`FormalParameters`,
+/// `OptionalFormalParameters` or `NoFormalParameters`).
+fn parameter_group(c: &Check<'_>, row: u32) -> Option<u32> {
+    c.collect_direct(row).into_iter().find(|&kid| {
+        matches!(
+            c.kind(kid),
+            NodeKind::FormalParameters
+                | NodeKind::OptionalFormalParameters
+                | NodeKind::NoFormalParameters
+        )
+    })
+}
+
+/// The constructor-invocation faces: an initializer list's `super(…)` reads
+/// the superclass constructor and `this(…)` the own constructor
+/// (`superConstructorInvocation`/`redirectingConstructorInvocation` report
+/// the whole invocation), and a constructor with neither reads the
+/// superclass's unnamed constructor implicitly (`constructorDeclaration`
+/// reports the declaration).
+fn initializer_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hit>) {
+    for row in 0..narrow_u32(c.unit.ast.len()) {
+        match c.kind(row) {
+            NodeKind::Initializer => {
+                let head = c.head_token(row);
+                let head_lexeme = c.lexeme(head);
+                if !matches!(head_lexeme, "super" | "this") {
+                    continue;
+                }
+                let Some(selector) = invocation_selector(c, head) else {
+                    continue;
+                };
+                let Some(class_row) = enclosing_class(c, row) else {
+                    continue;
+                };
+                let class = match head_lexeme {
+                    "super" => extends_name(c, class_row),
+                    _ => crate::rules::class_declaration_name(c, class_row),
+                };
+                let Some(class) = class else {
+                    continue;
+                };
+                for (index, decl) in decls.iter().enumerate() {
+                    if decl.kind != Kind::Constructor
+                        || decl.name != class
+                        || decl.selector != selector
+                    {
+                        continue;
+                    }
+                    let mut hit = Hit::new(c.byte_span(row).start, c.utf16_span(row), index);
+                    if let Some(selector) = selector {
+                        hit.display = Some(format!("{class}.{selector}"));
+                    }
+                    hits.push(hit);
+                }
+            }
+            NodeKind::Constructor => {
+                let Some(class_row) = enclosing_class(c, row) else {
+                    continue;
+                };
+                let Some(super_name) = extends_name(c, class_row) else {
+                    continue;
+                };
+                if has_constructor_invocation(c, row) {
+                    continue;
+                }
+                for (index, decl) in decls.iter().enumerate() {
+                    if decl.kind == Kind::Constructor
+                        && decl.name == super_name
+                        && decl.selector.is_none()
+                    {
+                        hits.push(Hit::new(c.byte_span(row).start, c.utf16_span(row), index));
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The object-pattern inferred-name face: a field pattern written without a
+/// name reads the field into the variable pattern's own name
+/// (`patternField`: `errorEntity = variablePattern.name`).
+fn pattern_shorthand_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hit>) {
+    for row in 0..narrow_u32(c.unit.ast.len()) {
+        if c.kind(row) != NodeKind::DeclaredVariablePattern {
+            continue;
+        }
+        let Some(token) = c.field(row, PayloadField::Variable) else {
+            continue;
+        };
+        let Some(parent) = c.unit.ast.parent(row) else {
+            continue;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == row) else {
+            continue;
+        };
+        // The field's `PatternField` row seals right after its pattern; an
+        // explicit field name rides the identifier just before the pattern.
+        if kids.get(pos + 1).map(|&kid| c.kind(kid)) != Some(NodeKind::PatternField) {
+            continue;
+        }
+        if kids[..pos].last().is_some_and(|&kid| {
+            c.kind(kid) == NodeKind::Identifier
+                && c.field(kid, PayloadField::Context)
+                    == Some(dartq_parser::IdentifierContext::PatternFieldName as u32)
+        }) {
+            continue;
+        }
+        let lexeme = c.lexeme(token);
+        for (index, decl) in decls.iter().enumerate() {
+            if decl.kind == Kind::Member && decl.name == lexeme && decl.access.readable() {
+                hits.push(Hit::new(
+                    crate::rules::byte_span_of_token(c, token).start,
+                    crate::rules::utf16_token_span(c, token),
+                    index,
+                ));
+            }
+        }
+    }
+}
+
+/// The enclosing class-like row of `row`, `None` outside any container.
+fn enclosing_class(c: &Check<'_>, row: u32) -> Option<u32> {
+    let mut node = row;
+    for _ in 0..8 {
+        node = c.unit.ast.parent(node)?;
+        if matches!(
+            c.kind(node),
+            NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::EnumDeclaration
+                | NodeKind::ExtensionDeclaration
+                | NodeKind::ExtensionTypeDeclaration
+                | NodeKind::NamedMixinApplication
+        ) {
+            return Some(node);
+        }
+    }
+    None
+}
+
+/// The class-like row's written `extends` supertype name.
+fn extends_name<'a>(c: &'a Check<'_>, class_row: u32) -> Option<&'a str> {
+    crate::rules::supertypes(c, class_row)
+        .into_iter()
+        .find(|&(_, clause)| clause == crate::rules::SupertypeClause::Extends)
+        .map(|(name, _)| name)
+}
+
+/// The `super`/`this` invocation's selector: `Some(None)` for the unnamed
+/// `super(…)`, `Some(Some(name))` for `super.name(…)`, `None` when the head
+/// is neither invocation (`this.field = …`).
+fn invocation_selector<'a>(c: &'a Check<'_>, head: u32) -> Option<Option<&'a str>> {
+    c.unit.tokens.get(head as usize + 1)?;
+    match c.lexeme(head + 1) {
+        "(" => Some(None),
+        "." => {
+            c.unit.tokens.get(head as usize + 2)?;
+            c.unit.tokens.get(head as usize + 3)?;
+            (c.lexeme(head + 3) == "(").then(|| Some(c.lexeme(head + 2)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the constructor's initializer list names a `super(…)` or
+/// `this(…)` invocation (anything else — field initializers, asserts —
+/// leaves the implicit super-constructor call in place).
+fn has_constructor_invocation(c: &Check<'_>, ctor: u32) -> bool {
+    let Some(initializers) = c
+        .collect_direct(ctor)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::Initializers)
+    else {
+        return false;
+    };
+    c.collect_direct(initializers).into_iter().any(|row| {
+        c.kind(row) == NodeKind::Initializer
+            && matches!(c.lexeme(c.head_token(row)), "super" | "this")
+            && invocation_selector(c, c.head_token(row)).is_some()
+    })
+}
+
 /// The operator faces: a binary expression reads its operator
 /// (`binaryExpression` → the method element at the whole expression), a
 /// compound assignment reads the stripped operator at the whole
@@ -386,6 +678,7 @@ fn operator_faces(c: &Check<'_>, decls: &[DeprecatedDecl<'_>], hits: &mut Vec<Hi
         }
         let range = match kind {
             NodeKind::Indexed => indexed_span(c, row),
+            NodeKind::Assignment => assignment_span(c, row),
             _ => c.utf16_span(row),
         };
         let operator: String = if kind == NodeKind::Indexed {
@@ -457,7 +750,18 @@ fn collect_deprecated<'a>(c: &Check<'a>) -> Vec<DeprecatedDecl<'a>> {
                 let metas = top_level_annotations(c, row);
                 let name = container_name(c, row, top);
                 if let Some(name) = name {
-                    push(&metas, name, None, Kind::Type, Access::Variable, 0, "", false, c, &mut out);
+                    push(
+                        &metas,
+                        name,
+                        None,
+                        Kind::Type,
+                        Access::Variable,
+                        0,
+                        "",
+                        false,
+                        c,
+                        &mut out,
+                    );
                 }
                 let (_, members) = container_members(c, row);
                 collect_members(c, row, name, &members, &mut out);
@@ -465,20 +769,53 @@ fn collect_deprecated<'a>(c: &Check<'a>) -> Vec<DeprecatedDecl<'a>> {
             NodeKind::NamedMixinApplication => {
                 let metas = top_level_annotations(c, row);
                 if let Some(name) = mixin_application_name(c, row) {
-                    push(&metas, name, None, Kind::Type, Access::Variable, 0, "", false, c, &mut out);
+                    push(
+                        &metas,
+                        name,
+                        None,
+                        Kind::Type,
+                        Access::Variable,
+                        0,
+                        "",
+                        false,
+                        c,
+                        &mut out,
+                    );
                 }
             }
             NodeKind::Typedef => {
                 let metas = top_level_annotations(c, row);
                 if let Some(name) = typedef_name(c, row) {
-                    push(&metas, name, None, Kind::Type, Access::Variable, 0, "", false, c, &mut out);
+                    push(
+                        &metas,
+                        name,
+                        None,
+                        Kind::Type,
+                        Access::Variable,
+                        0,
+                        "",
+                        false,
+                        c,
+                        &mut out,
+                    );
                 }
             }
             NodeKind::TopLevelMethod | NodeKind::TopLevelFields => {
                 let metas = top_level_annotations(c, row);
                 let (name, access) = top_level_entry(c, row);
                 if let Some(name) = name {
-                    push(&metas, name, None, Kind::TopLevel, access, 0, "", false, c, &mut out);
+                    push(
+                        &metas,
+                        name,
+                        None,
+                        Kind::TopLevel,
+                        access,
+                        0,
+                        "",
+                        false,
+                        c,
+                        &mut out,
+                    );
                     if c.kind(row) == NodeKind::TopLevelMethod {
                         collect_parameters(c, row, name, &mut out);
                     }
@@ -495,9 +832,7 @@ fn collect_deprecated<'a>(c: &Check<'a>) -> Vec<DeprecatedDecl<'a>> {
 /// for the class-likes and the enum.
 fn container_name<'a>(c: &Check<'a>, row: u32, top: u32) -> Option<&'a str> {
     match c.kind(row) {
-        NodeKind::ExtensionDeclaration | NodeKind::ExtensionTypeDeclaration => {
-            payload_name(c, row)
-        }
+        NodeKind::ExtensionDeclaration | NodeKind::ExtensionTypeDeclaration => payload_name(c, row),
         _ => {
             let name_row = if c.kind(top) == NodeKind::TopLevelDeclaration {
                 top
@@ -525,8 +860,7 @@ fn typedef_name<'a>(c: &Check<'a>, row: u32) -> Option<&'a str> {
     c.collect_direct(row)
         .into_iter()
         .find(|&kid| {
-            c.kind(kid) == NodeKind::Identifier
-                && c.field(kid, PayloadField::Context) == Some(ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         })
         .map(|kid| c.lexeme(c.head_token(kid)))
 }
@@ -543,8 +877,7 @@ fn mixin_application_name<'a>(c: &Check<'a>, row: u32) -> Option<&'a str> {
         .rev()
         .copied()
         .find(|&kid| {
-            c.kind(kid) == NodeKind::Identifier
-                && c.field(kid, PayloadField::Context) == Some(ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         })
         .map(|kid| c.lexeme(c.head_token(kid)))
 }
@@ -596,9 +929,9 @@ fn collect_members<'a>(
         };
         let metas = member_metas(c, members, index);
         index += 1 + usize::from(operator.is_some());
-        if metas.is_empty() {
-            continue;
-        }
+        // No member-level metadata early-out: a parameter's own `@deprecated`
+        // rides the parameter list, not the member's star, so the parameter
+        // walk runs for every executable.
         match c.kind(decl_row) {
             NodeKind::Method => {
                 let Some(name) = method_name(c, decl_row, operator) else {
@@ -624,8 +957,7 @@ fn collect_members<'a>(
                 collect_parameters(c, decl_row, name, out);
             }
             NodeKind::Constructor | NodeKind::Factory => {
-                let Some((type_name, selector)) = constructor_names(c, decl_row, class_name)
-                else {
+                let Some((type_name, selector)) = constructor_names(c, decl_row, class_name) else {
                     continue;
                 };
                 push(
@@ -641,6 +973,25 @@ fn collect_members<'a>(
                     out,
                 );
                 collect_parameters(c, decl_row, type_name, out);
+            }
+            // A decorated primary-constructor body declaration
+            // (`@deprecated this;`) denotes the class's unnamed constructor
+            // element, so an invocation (`A(1)`) reports the class name.
+            NodeKind::PrimaryConstructorBody => {
+                if let Some(name) = class_name {
+                    push(
+                        &metas,
+                        name,
+                        None,
+                        Kind::Constructor,
+                        Access::Variable,
+                        0,
+                        "",
+                        false,
+                        c,
+                        out,
+                    );
+                }
             }
             NodeKind::Fields => {
                 for var in field_rows(c, decl_row) {
@@ -713,8 +1064,7 @@ fn method_name<'a>(c: &Check<'a>, row: u32, operator: Option<u32>) -> Option<&'a
     c.collect_direct(row)
         .into_iter()
         .find(|&kid| {
-            c.kind(kid) == NodeKind::Identifier
-                && c.field(kid, PayloadField::Context) == Some(ctx)
+            c.kind(kid) == NodeKind::Identifier && c.field(kid, PayloadField::Context) == Some(ctx)
         })
         .map(|kid| c.lexeme(c.head_token(kid)))
 }
@@ -741,8 +1091,7 @@ fn constructor_names<'a>(
     class_name: Option<&'a str>,
 ) -> Option<(&'a str, Option<&'a str>)> {
     let type_ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
-    let continuation_ctx =
-        dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
+    let continuation_ctx = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
     let mut type_name = None;
     let mut selector = None;
     for kid in c.collect_direct(row) {
@@ -773,14 +1122,7 @@ fn collect_parameters<'a>(
     owner_name: &'a str,
     out: &mut Vec<DeprecatedDecl<'a>>,
 ) {
-    let Some(outer) = c.collect_direct(row).into_iter().find(|&kid| {
-        matches!(
-            c.kind(kid),
-            NodeKind::FormalParameters
-                | NodeKind::OptionalFormalParameters
-                | NodeKind::NoFormalParameters
-        )
-    }) else {
+    let Some(outer) = parameter_group(c, row) else {
         return;
     };
     // The optional group (`{…}`/`[…]`) nests inside the required list; its
@@ -931,15 +1273,13 @@ fn selector_left(c: &Check<'_>, row: u32) -> Option<Option<u32>> {
     let span = c.byte_span(row);
     // The dot chain is a `DotAccess` row beginning at this name (the row is
     // sealed after its operands; its span starts at the selector name).
-    kids.iter().copied().find(|&kid| {
-        c.kind(kid) == NodeKind::DotAccess && c.byte_span(kid).start == span.start
-    })?;
+    kids.iter()
+        .copied()
+        .find(|&kid| c.kind(kid) == NodeKind::DotAccess && c.byte_span(kid).start == span.start)?;
     let receiver = kids
         .iter()
         .copied()
-        .filter(|&kid| {
-            c.kind(kid) == NodeKind::Identifier && c.byte_span(kid).end <= span.start
-        })
+        .filter(|&kid| c.kind(kid) == NodeKind::Identifier && c.byte_span(kid).end <= span.start)
         .max_by_key(|&kid| c.utf16_span(kid).start);
     Some(receiver)
 }
@@ -989,7 +1329,9 @@ fn followed_by_arguments(c: &Check<'_>, row: u32) -> bool {
     let Some(pos) = kids.iter().position(|&kid| kid == row) else {
         return false;
     };
-    kids[pos + 1..].iter().any(|&kid| c.kind(kid) == NodeKind::Arguments)
+    kids[pos + 1..]
+        .iter()
+        .any(|&kid| c.kind(kid) == NodeKind::Arguments)
 }
 
 /// The callee name of an argument list: the last identifier before the
@@ -1035,6 +1377,26 @@ fn increment_operand_span(c: &Check<'_>, row: u32) -> Option<core::ops::Range<u3
         node = parent;
     }
     None
+}
+
+/// The assignment expression's report span: the `Assignment` row anchors at
+/// its right operand, so the span starts at the preceding sibling — the
+/// target expression the row did not adopt — and runs to the row's own end
+/// (the upstream `checkUsage(node.element, node)` over the whole
+/// `AssignmentExpression`).
+fn assignment_span(c: &Check<'_>, row: u32) -> core::ops::Range<u32> {
+    let own = c.utf16_span(row);
+    let Some(parent) = c.unit.ast.parent(row) else {
+        return own;
+    };
+    let kids = c.collect_direct(parent);
+    let Some(pos) = kids.iter().position(|&kid| kid == row) else {
+        return own;
+    };
+    let Some(&target) = pos.checked_sub(1).and_then(|index| kids.get(index)) else {
+        return own;
+    };
+    c.utf16_span(target).start..own.end
 }
 
 /// The index expression's report span: the receiver start through the
@@ -1495,26 +1857,15 @@ mod oracle_corpus_pins {
     use crate::testsupport::{Fixture, one_rule};
 
     /// The whole upstream oracle corpus for `deprecated_member_use_from_same_package`: `DeprecatedMemberUseFromSamePackageTest` (75 cases) plus two `messages.yaml` doc entries,
-    /// `conformance/status.tsv` `lint deprecated_member_use_from_same_package 77 45 32`. Each entry is the exact
+    /// `conformance/status.tsv` `lint deprecated_member_use_from_same_package 77 66 11`. Each entry is the exact
     /// materialized case source and the oracle's `(line, column, length)` for
     /// every `deprecated_member_use_from_same_package` row; only the rule's own rows are pinned.
     ///
-    /// 63 single-file cases pinned (37 oracle rows).
+    /// 74 single-file cases pinned (50 oracle rows).
     /// Not representable in a single-source fixture (aux files or packages):
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedCallMethod#0` (known deviation: the `call` tear-off face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInShowCombinator#0` (known deviation: the combinator name face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInRedirectingConstructorInitializer#0` (known deviation: the redirecting-constructor initializer face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInSuperConstructorCall#0` (known deviation: the super-constructor call face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInSuperConstructorCall_implicit#0` (known deviation: the implicit super-constructor call face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_inObjectPattern_inferredName#0` (known deviation: the object-pattern inferred name face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedLibrary_export#0` (known deviation: the deprecated-library export face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedLibrary_import#0` (known deviation: the deprecated-library import face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedConstructor_usedInSuperConstructorCall#0` (known deviation: the named super-constructor call face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedParameterOfMethod#0` (known deviation: the named-parameter declaration face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedOperator_usedInCompoundAssignment#0` (known deviation: the compound-assignment operator span starts late).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedParameterOfConstructor_usedInRedirectingConstructor#0` (known deviation: the redirecting-constructor parameter face is not matched).
-    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedPrimaryConstructor_bodyPart#0` (known deviation: the primary-constructor body part face is not matched).
-    /// `doc_bad_0` (known deviation: one row of the doc snippet is not reported).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedClass_usedInShowCombinator#0` (the `show` combinator name needs the target file's declaration table).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedLibrary_export#0` (the deprecated-library face needs a resolved `export` URI).
+    /// `DeprecatedMemberUseFromSamePackageTest/test_deprecatedLibrary_import#0` (the deprecated-library face needs a resolved `import` URI).
     #[test]
     fn deprecated_member_use_from_same_package_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).
@@ -2258,6 +2609,156 @@ var x = C();
                 &[(7, 9, 1)],
             ),
             (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedCallMethod#0"#,
+                r#"
+class C {
+  @deprecated
+  void call() {}
+}
+
+void f(C c) => c();
+"#,
+                &[(7, 16, 3)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInRedirectingConstructorInitializer#0"#,
+                r#"
+class A {
+  @deprecated
+  A();
+  A.two() : this();
+}
+"#,
+                &[(5, 13, 6)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInSuperConstructorCall#0"#,
+                r#"
+class A {
+  @deprecated
+  A();
+}
+class B extends A {
+  B() : super();
+}
+"#,
+                &[(7, 9, 7)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedConstructor_usedInSuperConstructorCall_implicit#0"#,
+                r#"
+class A {
+  @deprecated
+  A();
+}
+class B extends A {
+  B();
+}
+"#,
+                &[(7, 3, 4)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedField_inObjectPattern_inferredName#0"#,
+                r#"
+class A {
+  @Deprecated('')
+  final int foo = 0;
+}
+
+int f(Object x) =>
+  switch (x) {
+    A(:var foo) => foo,
+    _ => 0,
+  };
+"#,
+                &[(9, 12, 3)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedConstructor_usedInSuperConstructorCall#0"#,
+                r#"
+class A {
+  @deprecated
+  A.named();
+}
+class B extends A {
+  B() : super.named();
+}
+"#,
+                &[(7, 9, 13)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedNamedParameterOfMethod#0"#,
+                r#"
+class C {
+  void f({@deprecated int? p}) {}
+
+  void g() => f(p: 1);
+}
+"#,
+                &[(5, 17, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedOperator_usedInCompoundAssignment#0"#,
+                r#"
+class C {
+  @deprecated
+  C operator+(int other) => C();
+}
+void f(C c) {
+  c += 1;
+}
+"#,
+                &[(7, 3, 6)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedParameterOfConstructor_usedInRedirectingConstructor#0"#,
+                r#"
+class C {
+  C({@deprecated int? p});
+  C.two() : this(p: 0);
+}
+"#,
+                &[(4, 18, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/DeprecatedMemberUseFromSamePackageTest/test_deprecatedPrimaryConstructor_bodyPart#0"#,
+                r#"
+class A(var int x) {
+  @deprecated
+  this;
+}
+
+void f() {
+  var a = A(1);
+}
+"#,
+                &[(8, 11, 1)],
+            ),
+            (
+                r#"lints/deprecated_member_use_from_same_package/doc_bad_0"#,
+                r#"// Declared in one library:
+class Foo {
+  @Deprecated("Use 'm2' instead")
+  void m1() {}
+
+  void m2({
+      @Deprecated('This is an old parameter') int? p,
+  })
+}
+
+@Deprecated('Do not use')
+int x = 0;
+
+// In the same or another library, but within the same package:
+void m(Foo foo) {
+  foo.m1();
+  foo.m2(p: 7);
+  x = 1;
+}
+"#,
+                &[(16, 7, 2), (17, 10, 1), (18, 3, 1)],
+            ),
+            (
                 r#"lints/deprecated_member_use_from_same_package/doc_good_0"#,
                 r#"// Declared in one library:
 class Foo {
@@ -2315,5 +2816,182 @@ void m(Foo foo) {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod wave_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    fn run(f: &Fixture) -> Vec<crate::Lint> {
+        f.run(&one_rule("deprecated_member_use_from_same_package"))
+    }
+
+    /// `test_deprecatedCallMethod`: the implicit `call` of a formally typed
+    /// receiver reports the whole `c()` and displays the bare `call`
+    /// (`functionExpressionInvocation` leaves `displayName` alone).
+    #[test]
+    fn dmfs_call_reports_the_receiver_invocation() {
+        let f =
+            Fixture::parse("class C {\n  @deprecated\n  void call() {}\n}\nvoid f(C c) => c();\n");
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'call' is deprecated and shouldn't be used."
+        );
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "c", 1));
+        assert_eq!(lints[0].range, start..start + 3);
+    }
+
+    /// A receiver with no written type never reports the implicit `call`
+    /// (the element face needs the static type).
+    #[test]
+    fn dmfs_call_needs_a_typed_receiver() {
+        let f = Fixture::parse(
+            "class C {\n  @deprecated\n  void call() {}\n}\nvoid f(dynamic d) => d();\n",
+        );
+        assert!(run(&f).is_empty());
+    }
+
+    /// `test_deprecatedConstructor_usedInSuperConstructorCall`: the whole
+    /// `super()` initializer reports the superclass's unnamed constructor.
+    #[test]
+    fn dmfs_super_constructor_call_reports_the_initializer() {
+        let f = Fixture::parse(
+            "class A {\n  @deprecated\n  A();\n}\nclass B extends A {\n  B() : super();\n}\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'A' is deprecated and shouldn't be used.");
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "super", 0));
+        assert_eq!(lints[0].range, start..start + 7);
+    }
+
+    /// `test_deprecatedNamedConstructor_usedInSuperConstructorCall`: the
+    /// named selector rides the display name.
+    #[test]
+    fn dmfs_named_super_constructor_call_displays_the_selector() {
+        let f = Fixture::parse(
+            "class A {\n  @deprecated\n  A.named();\n}\nclass B extends A {\n  B() : super.named();\n}\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'A.named' is deprecated and shouldn't be used."
+        );
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "super", 0));
+        assert_eq!(lints[0].range, start..start + 13);
+    }
+
+    /// `test_deprecatedConstructor_usedInRedirectingConstructorInitializer`:
+    /// the redirecting `this()` reports the own unnamed constructor.
+    #[test]
+    fn dmfs_redirecting_constructor_invocation_reports_the_initializer() {
+        let f = Fixture::parse("class A {\n  @deprecated\n  A();\n  A.two() : this();\n}\n");
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'A' is deprecated and shouldn't be used.");
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "this", 0));
+        assert_eq!(lints[0].range, start..start + 6);
+    }
+
+    /// `test_deprecatedConstructor_usedInSuperConstructorCall_implicit`: a
+    /// constructor with no `super(…)`/`this(…)` reads the superclass's
+    /// unnamed constructor at the declaration itself.
+    #[test]
+    fn dmfs_implicit_super_constructor_call_reports_the_declaration() {
+        let f =
+            Fixture::parse("class A {\n  @deprecated\n  A();\n}\nclass B extends A {\n  B();\n}\n");
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'A' is deprecated and shouldn't be used.");
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "B", 1));
+        assert_eq!(lints[0].range, start..start + 4);
+    }
+
+    /// A constructor whose initializer list names `super(…)` never takes the
+    /// implicit face as well.
+    #[test]
+    fn dmfs_explicit_super_call_suppresses_the_implicit_face() {
+        let f = Fixture::parse(
+            "class A {\n  @deprecated\n  A();\n}\nclass B extends A {\n  B() : super();\n}\n",
+        );
+        assert_eq!(run(&f).len(), 1);
+    }
+
+    /// A field initializer (`this.x = …`) is not a constructor invocation:
+    /// the implicit super call still reports.
+    #[test]
+    fn dmfs_field_initializer_keeps_the_implicit_super_call() {
+        let f = Fixture::parse(
+            "class A {\n  @deprecated\n  A();\n}\nclass B extends A {\n  int x;\n  B() : x = 0;\n}\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'A' is deprecated and shouldn't be used.");
+    }
+
+    /// `test_deprecatedPrimaryConstructor_bodyPart`: a decorated `this;`
+    /// body part denotes the unnamed constructor, so `A(1)` reports the
+    /// class name.
+    #[test]
+    fn dmfs_primary_constructor_body_part_is_the_unnamed_constructor() {
+        let f = Fixture::parse(
+            "class A(var int x) {\n  @deprecated\n  this;\n}\nvoid f() {\n  var a = A(1);\n}\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'A' is deprecated and shouldn't be used.");
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "A", 1));
+        assert_eq!(lints[0].range, start..start + 1);
+    }
+
+    /// `test_deprecatedField_inObjectPattern_inferredName`: the inferred-name
+    /// field reports at the bound variable's name.
+    #[test]
+    fn dmfs_inferred_object_pattern_field_reports_the_variable() {
+        let f = Fixture::parse(
+            "class A {\n  @Deprecated('')\n  final int foo = 0;\n}\nint f(Object x) =>\n  switch (x) {\n    A(:var foo) => foo,\n    _ => 0,\n  };\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'foo' is deprecated and shouldn't be used."
+        );
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "foo", 1));
+        assert_eq!(lints[0].range, start..start + 3);
+    }
+
+    /// `test_deprecatedOperator_usedInCompoundAssignment`: the compound
+    /// assignment reports the stripped operator over the whole
+    /// `c += 1` (not just the right operand the arena row anchors at).
+    #[test]
+    fn dmfs_compound_assignment_reports_the_whole_expression() {
+        let f = Fixture::parse(
+            "class C {\n  @deprecated\n  C operator+(int other) => C();\n}\nvoid f(C c) {\n  c += 1;\n}\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'+' is deprecated and shouldn't be used.");
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "c", 1));
+        assert_eq!(lints[0].range, start..start + 6);
+    }
+
+    /// `test_deprecatedNamedParameterOfMethod`: a member's decorated
+    /// parameter reports at the named-argument label even when the member
+    /// itself carries no metadata.
+    #[test]
+    fn dmfs_member_parameter_reports_without_member_metadata() {
+        let f = Fixture::parse(
+            "class C {\n  void f({@deprecated int? p}) {}\n\n  void g() => f(p: 1);\n}\n",
+        );
+        let lints = run(&f);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'p' is deprecated and shouldn't be used.");
+        let start = utf16_at(&f, tok(&f.source, &f.tokens, "p", 1));
+        assert_eq!(lints[0].range, start..start + 1);
     }
 }

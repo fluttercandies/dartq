@@ -232,11 +232,7 @@ mod tests {
                 "\nconst r = const (a: 1);\n",
                 &[(2, 11, 5)],
             ),
-            (
-                "records/recordLiteral_ok",
-                "\nconst r = (a: 1);\n",
-                &[],
-            ),
+            ("records/recordLiteral_ok", "\nconst r = (a: 1);\n", &[]),
             (
                 "records/variable_constCall_constListArgument",
                 "\nvar x = const A(const []);\nclass A {\n  const A(Object o);\n}\n",
@@ -277,21 +273,13 @@ mod tests {
                 "\nvar x = A.new(const []);\nclass A {\n  const A(Object o);\n}\n",
                 &[],
             ),
-            (
-                "doc_bad_0",
-                "const l = const <int>[];\n",
-                &[(1, 11, 5)],
-            ),
+            ("doc_bad_0", "const l = const <int>[];\n", &[(1, 11, 5)]),
             (
                 "doc_bad_1",
                 "class A { const A(); }\nm(){\n  const a = const A();\n  final b = const [const A()];\n}\n",
                 &[(3, 13, 5), (4, 20, 5)],
             ),
-            (
-                "doc_good_0",
-                "const l = <int>[];\n",
-                &[],
-            ),
+            ("doc_good_0", "const l = <int>[];\n", &[]),
             (
                 "doc_good_1",
                 "class A { const A(); }\nm(){\n  const a = A();\n  final b = const [A()];\n}\n",

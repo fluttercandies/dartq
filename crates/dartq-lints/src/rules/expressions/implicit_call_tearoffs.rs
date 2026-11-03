@@ -515,8 +515,7 @@ fn collection_face(c: &mut Check<'_>) {
         .or_else(|| {
             c.unit.ast.parent(node).and_then(|parent| {
                 c.collect_direct(parent).into_iter().find(|&kid| {
-                    c.kind(kid) == NodeKind::TypeArguments
-                        && c.byte_span(kid).end == span.start
+                    c.kind(kid) == NodeKind::TypeArguments && c.byte_span(kid).end == span.start
                 })
             })
         });
@@ -634,9 +633,8 @@ fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
     // just past the operand slice, so the owner's rows one step past
     // `rows` count too.
     let call_marked = |rows: &[u32]| {
-        rows.iter().any(|&row| {
-            c.kind(row) == NodeKind::DotAccess && c.lexeme(c.head_token(row)) == "call"
-        })
+        rows.iter()
+            .any(|&row| c.kind(row) == NodeKind::DotAccess && c.lexeme(c.head_token(row)) == "call")
     };
     if call_marked(rows) {
         return false;
@@ -712,7 +710,11 @@ fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
                     | NodeKind::Send
             )
         });
-        if tail_is_markers && !rows[1..].iter().any(|&row| c.kind(row) == NodeKind::Arguments) {
+        if tail_is_markers
+            && !rows[1..]
+                .iter()
+                .any(|&row| c.kind(row) == NodeKind::Arguments)
+        {
             let name = c.lexeme(c.head_token(first));
             return operand_type_has_call(c, use_node, &[first], name);
         }

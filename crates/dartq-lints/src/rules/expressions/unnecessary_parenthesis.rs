@@ -106,12 +106,19 @@ fn interpolation_token_before(c: &Check<'_>, node: u32) -> bool {
 }
 
 /// Whether a `!` postfix directly follows the paren's `)` — the
-/// `(a?[0])!` null-check face.
+/// `(a?[0])!` null-check face. The row's token range may spill past the
+/// closer (the delta-tile anchor convention), so the pair reads off the
+/// range walk rather than the range tail.
 fn postfix_bang_after(c: &Check<'_>, node: u32) -> bool {
-    let Some(rparen) = c.unit.ast.token_range(node).next_back() else {
-        return false;
-    };
-    matches!(c.lexeme(rparen + 1), "!")
+    let mut previous_close = false;
+    for token in c.unit.ast.token_range(node) {
+        let lexeme = c.lexeme(token);
+        if lexeme == "!" && previous_close {
+            return true;
+        }
+        previous_close = lexeme == ")";
+    }
+    false
 }
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_parenthesis.dart`
@@ -170,7 +177,13 @@ fn postfix_bang_after(c: &Check<'_>, node: u32) -> bool {
 /// the parens (the import-through keep — the under-report family);
 /// extension applicability reads at written-name level, so a
 /// subclass receiver misses a superclass-on-type extension. The
-/// null-aware-index-in-then-arm bail (:144-157) is not read.
+/// null-aware-index-in-then-arm bail (:144-157) reads off the tiling:
+/// the paren as a conditional piece with both arms populated is the
+/// then expression, and a set-or-map key position answers on the
+/// `{`/`,` token before the `(` (the entry value pieces trail the
+/// `:`). The invoked constructor-tear-off inner tiles flat (a send
+/// group, no `ConstructorReference` row), so the :207-216 block also
+/// answers through the token face ([`constructor_reference_inner`]).
 /// Message: `diagnostic.g.dart` `unnecessaryParenthesis`.
 pub(crate) static SPEC: RuleSpec = crate::spec!(
     "unnecessary_parenthesis",
@@ -293,25 +306,34 @@ fn check(c: &mut Check<'_>) {
         if postfix_bang_after(c, node) {
             return;
         }
-        // `a ? (b?[c]) : d` / `{(a?[b]): c}` (:148-157): the null-aware
-        // index keeps the parens in the conditional-then and map-key
-        // positions (the second `?` would open a nested conditional).
-        if has_token_lexeme(c, node, "?[")
-            && matches!(
-                container_parent(c, node, &owner_kids, pos),
-                Some(NodeKind::Conditional) | Some(NodeKind::MapEntry)
-            )
-        {
+        // The null-aware-index inner keeps the parens in every oracle
+        // corpus shape (`a ? (b?[c]) : d` and `{(a?[b]): c}` stop a
+        // nested conditional `?`, `(a?[0])!` and `(a?[0]).x` stop the
+        // null-aware shorting — upstream :82-157); the paren's own tiling
+        // carries the `?[` pair, so the bail is parent-shape-free.
+        if has_null_aware_index_inner(c, node) {
             return;
         }
         report(c, node);
         return;
     }
     // `(C.new)` / `(List<int>.filled)` (:210-216) — the
-    // invocation-with-type-arguments exemption is the documented corner.
-    if inner_has_kind(c, node, NodeKind::ConstructorReference) {
-        report(c, node);
-        return;
+    // ConstructorReference block reports unless the invocation carries
+    // explicit type arguments (the upstream `parent is
+    // FunctionExpressionInvocation && parent.typeArguments != null`
+    // exemption; the FEI keep below covers that shape). The flat
+    // send-group tiling of the invoked tear-off answers through the
+    // token face ([`constructor_reference_inner`]).
+    if inner_has_kind(c, node, NodeKind::ConstructorReference)
+        || constructor_reference_inner(c, node)
+    {
+        if !owner_kids
+            .get(pos + 1)
+            .is_some_and(|&piece| c.kind(piece) == NodeKind::TypeArguments)
+        {
+            report(c, node);
+            return;
+        }
     }
     // `a..b = (c..d)` (:218-222): any cascade position keeps the parens
     // (a cascade inner row, a `..`/`?..` link token, or a cascade
@@ -355,23 +377,29 @@ fn check(c: &mut Check<'_>) {
         return;
     }
     // The whitespace-readability family (:259-272): keep the parens
-    // unless an exemption parent answers.
+    // unless an exemption parent answers. The unary-operator operand
+    // face: the production tiling seals the prefix/postfix operator
+    // childless beside the paren, so the tiled parent kind reads the
+    // enclosing statement/initializer — the upstream direct parent is
+    // the `PrefixExpression`/`PostfixExpression`, which is never in the
+    // exemption set, and the keep stands.
     if whitespace_inner(c, node) {
-        let exempt = matches!(
-            parent_kind,
-            NodeKind::Assignment
-                | NodeKind::RecordLiteral
-                | NodeKind::ReturnStatement
-                | NodeKind::YieldStatement
-                | NodeKind::InitializedIdentifier
-                | NodeKind::VariableInitializer
-                | NodeKind::Arguments
-                | NodeKind::NamedArgument
-        ) || c
-            .path
-            .iter()
-            .rev()
-            .any(|&a| c.kind(a) == NodeKind::Initializer)
+        let exempt = !operand_of_unary(c, node, &owner_kids, pos)
+            && matches!(
+                parent_kind,
+                NodeKind::Assignment
+                    | NodeKind::RecordLiteral
+                    | NodeKind::ReturnStatement
+                    | NodeKind::YieldStatement
+                    | NodeKind::InitializedIdentifier
+                    | NodeKind::VariableInitializer
+                    | NodeKind::Arguments
+                    | NodeKind::NamedArgument
+            )
+            || c.path
+                .iter()
+                .rev()
+                .any(|&a| c.kind(a) == NodeKind::Initializer)
             || has_arrow_body(c, parent);
         if !exempt {
             return;
@@ -603,12 +631,96 @@ fn type_literal_inner(c: &Check<'_>, node: u32) -> bool {
 /// the upstream `containsNullAwareInvocationInChain` walk,
 /// extensions.dart:130-143). `?..` is deliberately excluded: it opens
 /// a cascade section, which the walk answers `false` for and the
-/// cascade bail owns.
+/// cascade bail owns. The index link spells as two tokens (`?` `[`) —
+/// the scanner emits no `?[` punctuation.
 fn has_null_aware_token(c: &Check<'_>, node: u32) -> bool {
-    c.unit
-        .ast
-        .token_range(node)
-        .any(|token| matches!(c.lexeme(token), "?." | "?["))
+    let mut previous = "";
+    c.unit.ast.token_range(node).any(|token| {
+        let lexeme = c.lexeme(token);
+        let hit = lexeme == "?." || (lexeme == "[" && previous == "?");
+        previous = lexeme;
+        hit
+    })
+}
+
+/// Whether the paren's inner is a null-aware index — the `?` immediately
+/// followed by `[` inside the token range (the scanner's two-token
+/// spelling of `?[`).
+fn has_null_aware_index_inner(c: &Check<'_>, node: u32) -> bool {
+    let mut previous = "";
+    c.unit.ast.token_range(node).any(|token| {
+        let lexeme = c.lexeme(token);
+        let hit = lexeme == "[" && previous == "?";
+        previous = lexeme;
+        hit
+    })
+}
+
+/// Whether the paren is the operand of a prefix/postfix operator: the
+/// childless operator row hugs the paren's span (a [`NodeKind::
+/// UnaryPrefix`] ending at the paren's start, a [`NodeKind::UnaryPostfix`]
+/// / [`NodeKind::NonNullAssert`] starting at its end). The row's position
+/// in the owner slice is completion order — the operator seals last —
+/// so the read is a span-adjacency scan, not a sibling offset.
+fn operand_of_unary(c: &Check<'_>, node: u32, owner_kids: &[u32], pos: usize) -> bool {
+    let span = c.utf16_span(node);
+    owner_kids.iter().any(|&row| match c.kind(row) {
+        NodeKind::UnaryPrefix => c.utf16_span(row).end == span.start,
+        NodeKind::UnaryPostfix | NodeKind::NonNullAssert => c.utf16_span(row).start == span.end,
+        _ => false,
+    })
+}
+
+/// Whether the paren's inner is a constructor tear-off by token face —
+/// `(C.new)` (the `.new` spelling) or `(name<...>.name)` (the
+/// instantiated spelling): an identifier, optionally angle-nested type
+/// arguments, a `.`, and a member name before `)`. The head name must
+/// bind to no same-file value ([`super::same_file::declares_value`]) —
+/// a same-file value spells a property access, which the official
+/// keeps reading as a `PrefixedIdentifier` (the FEI keep's documented
+/// corner).
+fn constructor_reference_inner(c: &Check<'_>, node: u32) -> bool {
+    let extent = c.unit.ast.token_range(node);
+    if extent.len() < 5 {
+        return false; // `( name . name )` minimum
+    }
+    let lparen = extent.start;
+    if c.lexeme(lparen) != "(" {
+        return false;
+    }
+    let name = lparen + 1;
+    let rparen = extent.end - 1;
+    if c.lexeme(rparen) != ")" {
+        return false;
+    }
+    let member = rparen - 1;
+    if c.lexeme(member - 1) != "." {
+        return false;
+    }
+    if extent.len() == 5 {
+        return c.lexeme(name + 1) == "." && c.lexeme(name + 2) == "new";
+    }
+    // `(name<...>.name)`: angle-nested type arguments between the head
+    // identifier and the `.` (`>>`/`<<` step the depth by two).
+    if c.lexeme(name + 1) != "<" {
+        return false;
+    }
+    let mut depth: isize = 0;
+    let mut i = name + 1;
+    while i < member - 1 {
+        match c.lexeme(i) {
+            "<" => depth += 1,
+            "<<" => depth += 2,
+            ">" => depth -= 1,
+            ">>" => depth -= 2,
+            _ => {}
+        }
+        if depth <= 0 {
+            break;
+        }
+        i += 1;
+    }
+    i + 1 == member - 1 && !super::same_file::declares_value(c, node, c.lexeme(name))
 }
 
 /// The name of the selector that follows the paren in the owner slice,
@@ -655,14 +767,6 @@ fn bare_in_initializer(c: &Check<'_>) -> bool {
     false
 }
 
-/// Whether the node's token range carries `lexeme`.
-fn has_token_lexeme(c: &Check<'_>, node: u32, lexeme: &str) -> bool {
-    c.unit
-        .ast
-        .token_range(node)
-        .any(|token| c.lexeme(token) == lexeme)
-}
-
 /// The `directlyContainsWhitespace` faces (:321-343): the container
 /// inners — `as`, assignment, await, binary, `is`, switch, function
 /// expression, `new`-creation — plus the `const`-literal shape and the
@@ -671,8 +775,9 @@ fn has_token_lexeme(c: &Check<'_>, node: u32, lexeme: &str) -> bool {
 /// container shapes; a `const` head word or an explicit `new`/`const`
 /// keyword token inside covers the literal/creation arms.
 fn whitespace_inner(c: &Check<'_>, node: u32) -> bool {
-    for kid in c.collect_direct(node) {
-        match c.kind(kid) {
+    let inner = c.collect_direct(node);
+    for kid in &inner {
+        match c.kind(*kid) {
             NodeKind::AsExpression
             | NodeKind::Assignment
             | NodeKind::AwaitExpression
@@ -683,10 +788,26 @@ fn whitespace_inner(c: &Check<'_>, node: u32) -> bool {
             | NodeKind::SwitchExpression
             | NodeKind::NewExpression => return true,
             _ => {
-                if crate::rules::const_keyword(c, kid).is_some() {
+                if crate::rules::const_keyword(c, *kid).is_some() {
                     return true;
                 }
             }
+        }
+    }
+    // The const-literal head (the upstream `TypedLiteral.constKeyword`
+    // / `InstanceCreationExpression.keyword` arms): the production
+    // bridge seals the `const`-headed literal as a childless
+    // [`NodeKind::ConstLiteral`] row. The head child only — a `const`
+    // literal deeper in the inner (an argument) is not the chain
+    // target, which the upstream target-chain recursion also answers
+    // `false` for.
+    if let Some(head) = inner
+        .iter()
+        .copied()
+        .min_by_key(|&kid| c.utf16_span(kid).start)
+    {
+        if c.kind(head) == NodeKind::ConstLiteral {
+            return true;
         }
     }
     // The `new`-keyword creation arm (`(new Foo())` tiles the creation
@@ -703,4 +824,98 @@ fn has_arrow_body(c: &Check<'_>, declaration: u32) -> bool {
     c.collect_direct(declaration)
         .into_iter()
         .any(|kid| c.kind(kid) == NodeKind::ExpressionBody)
+}
+
+#[cfg(test)]
+mod p3769_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    /// `test_binaryExpressionInside_prefixExpression#0` —
+    /// `var x = ~(1 | 2);` — the paren is the prefix `~`'s operand and
+    /// the inner binary carries whitespace, so the official keeps the
+    /// parens (the upstream parent is the `PrefixExpression`, never in
+    /// the whitespace-exemption set). The production tiling seals the
+    /// operator childless beside the paren under the initializer, and
+    /// the operand-of-unary face reads the same keep.
+    #[test]
+    fn binary_inside_prefix_keeps() {
+        let f = Fixture::parse("var x = ~(1 | 2);\n");
+        assert!(
+            f.run(&one_rule("unnecessary_parenthesis")).is_empty(),
+            "{:?}",
+            f.run(&one_rule("unnecessary_parenthesis"))
+        );
+    }
+
+    /// `test_startsWithConstInside_prefixExpression#0` /
+    /// `test_startsWithConstInside_targetOfMethodCall_prefixExpression#0`
+    /// — the `const`-headed literal head makes the inner carry
+    /// whitespace (`TypedLiteral.constKeyword`), so both `!(const
+    /// [7]…)` shapes keep the parens.
+    #[test]
+    fn const_headed_inner_keeps() {
+        let f = Fixture::parse("void f() {\n  !(const [7].contains(42));\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse("void f() {\n  !(const [7]).contains(42);\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+    }
+
+    /// `test_nullAwareIndexExpressionInside_conditionExpression#0` and
+    /// `test_nullAwareIndexExpressionInside_mapLiteralKey#0` — the
+    /// `?[` inner keeps the parens in the conditional-then and entry-key
+    /// positions (:144-157, the second `?` would open a nested
+    /// conditional).
+    #[test]
+    fn null_aware_index_in_then_and_key_keeps() {
+        let f = Fixture::parse("void f(List<int>? a, bool b) {\n  var x = b ? (a?[7]) : 7;\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse("void f(List<int>? a) {\n  var x = {(a?[7]): 7};\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+    }
+
+    /// `test_nullAwareIndexExpressionInside_postfixExpression#0` —
+    /// `(a?[0])!` — the `!` postfix parent keeps the parens (they stop
+    /// the null-aware shorting). `test_nullAwareIndexExpressionInside_
+    /// propertyAccess#0` — `(a?[0]).hashCode` — the `hashCode` accessor
+    /// keeps them (:82-88).
+    #[test]
+    fn null_aware_index_under_bang_and_hash_code_keeps() {
+        let f = Fixture::parse("void f(List<int?>? a) {\n  (a?[0])!;\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse("void f(List<int>? a) {\n  (a?[0]).hashCode;\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+    }
+
+    /// `test_constructorTearoffInside#0` — `INFO|…|4:3|7` — `(C.new)`
+    /// reports (the flat send-group tiling answers through the token
+    /// face); `test_constructorTearoffInstantiatedInside#0` —
+    /// `INFO|…|3:3|18` — `(List<int>.filled)` reports. The
+    /// explicit-type-arguments invocation keeps instead
+    /// (`test_constructorTearoffInside_instantiatedThenCalled#0`).
+    #[test]
+    fn constructor_tearoff_inner_reports() {
+        let f = Fixture::parse("class C {}\nvoid f() {\n  (C.new)();\n}\n");
+        let lints = f.run(&one_rule("unnecessary_parenthesis"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let lparen = tok(&f.source, &f.tokens, "(", 1);
+        assert_eq!(
+            lints[0].range,
+            utf16_at(&f, lparen)..utf16_at(&f, lparen) + 7
+        );
+
+        let f = Fixture::parse("void f() {\n  (List<int>.filled)(3, 0);\n}\n");
+        let lints = f.run(&one_rule("unnecessary_parenthesis"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let lparen = tok(&f.source, &f.tokens, "(", 1);
+        assert_eq!(
+            lints[0].range,
+            utf16_at(&f, lparen)..utf16_at(&f, lparen) + 18
+        );
+
+        let f = Fixture::parse("void f() {\n  (List.filled)<int>(3, 0);\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+    }
 }

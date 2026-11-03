@@ -135,9 +135,7 @@ fn check_parameter(c: &mut Check<'_>) {
     let start = c
         .utf16_of_token(c.unit.ast.token_range(node).start)
         .unwrap_or_default();
-    let end = c
-        .utf16_end_of_token(end.saturating_sub(1))
-        .unwrap_or(start);
+    let end = c.utf16_end_of_token(end.saturating_sub(1)).unwrap_or(start);
     c.report(start..end, &[]);
 }
 
@@ -238,7 +236,9 @@ fn super_formal_default_is_null(c: &Check<'_>, param: u32) -> Option<bool> {
             found = Some(match clause {
                 None => true,
                 Some(start) => {
-                    let end = c.field(formal, PayloadField::InitializerEnd).unwrap_or(start);
+                    let end = c
+                        .field(formal, PayloadField::InitializerEnd)
+                        .unwrap_or(start);
                     c.lexeme(start) == "null" && end.saturating_sub(start) <= 1
                 }
             });

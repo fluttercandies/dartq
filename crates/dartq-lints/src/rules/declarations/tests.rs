@@ -1167,7 +1167,11 @@ fn init_to_null_parameter_default() {
     );
     let lints = f.run(&one_rule("avoid_init_to_null"));
     assert_eq!(lints.len(), 1);
-    assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    // Oracle (3.13.7): `INFO|LINT|AVOID_INIT_TO_NULL|…|1|4|13` — the
+    // report spans the whole formal, opening at the written type and
+    // closing after the `null` default.
+    let param_start = utf16_at(&f, 3);
+    assert_eq!(lints[0].range, param_start..param_start + 13);
 
     let int_default = "f({int x = null}) {}";
     // f0 (1 {2 int3 x4 =5 null6 }7 )8 {9 }10
@@ -5960,9 +5964,8 @@ fn omit_obvious_property_types_gate() {
 /// carries no element).
 #[test]
 fn prefer_const_constructors_in_immutables_gate() {
-    let f = Fixture::parse(
-        "import 'package:meta/meta.dart';\n\n@immutable\nclass A {\n  A();\n}\n",
-    );
+    let f =
+        Fixture::parse("import 'package:meta/meta.dart';\n\n@immutable\nclass A {\n  A();\n}\n");
     let lints = f.run(&one_rule("prefer_const_constructors_in_immutables"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(
@@ -6316,9 +6319,11 @@ fn specify_nonobvious_bare_element_comma_boundary() {
     let lints = f.run(&one_rule("specify_nonobvious_local_variable_types"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     let var = tok(&f.source, &f.tokens, "var", 0);
+    // Oracle (3.13.7): `2|3|14` — `var x = [j, 1]`, the whole
+    // declaration clause from the modifier through the initializer.
     assert_eq!(
         lints[0].range,
-        utf16_at(&f, var)..utf16_at(&f, var),
+        utf16_at(&f, var)..utf16_at(&f, var) + 14,
         "{lints:?}"
     );
 }
@@ -6328,23 +6333,31 @@ fn specify_nonobvious_bare_element_comma_boundary() {
 /// `test_genericInvocation_typeNeededForInference` /
 /// `test_genericInvocation_typeParamProvided`): a `bar(...)` initializer
 /// whose parameter is a type — with or without an explicit type argument —
-/// is non-obvious and reports at the keyword anchor (the list head, a
-/// zero-width range); the typed `_ok` shapes stay silent. The invocation
-/// face also gates the for-each iterable (`for (var i in bar())`).
+/// is non-obvious and reports over the whole declaration clause, from the
+/// modifier keyword through the initializer (the oracle's `(3, 3, 17)`
+/// row for `final h = bar('')`); the typed `_ok` shapes stay silent. The
+/// invocation face also gates the for-each iterable
+/// (`for (var i in bar())`).
 #[test]
 fn specify_nonobvious_generic_invocation_faces() {
-    for (source, keyword) in [
+    // The widths are the oracle's own element counts: 17 for
+    // `final h = bar('')`, 15 for `var h = bar('')`, 23 for
+    // `var h = bar<String>('')`.
+    for (source, keyword, width) in [
         (
             "String f() {\n  final h = bar('');\n  return h;\n}\n\nT bar<T>(T d) => d;\n",
             "final",
+            17,
         ),
         (
             "f() {\n  var h = bar('');\n  return h;\n}\n\nT bar<T>(dynamic d) => d;\n",
             "var",
+            15,
         ),
         (
             "String f() {\n  var h = bar<String>('');\n  return h;\n}\n\nT bar<T>(dynamic d) => d;\n",
             "var",
+            23,
         ),
     ] {
         let f = Fixture::parse(source);
@@ -6353,7 +6366,7 @@ fn specify_nonobvious_generic_invocation_faces() {
         let kw = tok(&f.source, &f.tokens, keyword, 0);
         assert_eq!(
             lints[0].range,
-            utf16_at(&f, kw)..utf16_at(&f, kw),
+            utf16_at(&f, kw)..utf16_at(&f, kw) + width,
             "{source} {lints:?}"
         );
     }
@@ -6849,26 +6862,46 @@ fn prefer_const_declarations_upstream_corpus_pins() {
             "\nconst record = (number: 123, name: \"Main\", type: \"Street\");\n",
             &[],
         ),
-        ("topLevelVariable_final_doubleLiteral", "\nfinal x = 1.3;\n", &[(2, 1, 13)]),
-        ("topLevelVariable_final_listLiteral", "\nfinal x = [];\n", &[]),
+        (
+            "topLevelVariable_final_doubleLiteral",
+            "\nfinal x = 1.3;\n",
+            &[(2, 1, 13)],
+        ),
+        (
+            "topLevelVariable_final_listLiteral",
+            "\nfinal x = [];\n",
+            &[],
+        ),
         (
             "topLevelVariable_final_listLiteral_const",
             "\nfinal x = const [];\n",
             &[(2, 1, 18)],
         ),
-        ("topLevelVariable_final_mapOrSetLiteral", "\nfinal o9 = {};\n", &[]),
+        (
+            "topLevelVariable_final_mapOrSetLiteral",
+            "\nfinal o9 = {};\n",
+            &[],
+        ),
         (
             "topLevelVariable_final_mapOrSetLiteral_const",
             "\nfinal x = const {};\n",
             &[(2, 1, 18)],
         ),
-        ("topLevelVariable_final_nullLiteral", "\nfinal a = null;\n", &[(2, 1, 14)]),
+        (
+            "topLevelVariable_final_nullLiteral",
+            "\nfinal a = null;\n",
+            &[(2, 1, 14)],
+        ),
         (
             "topLevelVariable_final_topLevelVariable_const",
             "\nconst x = const [];\nfinal y = x;\n",
             &[(3, 1, 11)],
         ),
-        ("topLevelVariable_listLiteral_const", "\nconst x = const [];\n", &[]),
+        (
+            "topLevelVariable_listLiteral_const",
+            "\nconst x = const [];\n",
+            &[],
+        ),
         ("doc_bad_0", "final v = const <int>[];\n", &[(1, 1, 23)]),
         (
             "doc_bad_1",
@@ -6885,7 +6918,11 @@ fn prefer_const_declarations_upstream_corpus_pins() {
             "final o = const <int>[];\n\nclass A {\n  static final o = const <int>[];\n}\n",
             &[(1, 1, 23), (4, 10, 23)],
         ),
-        ("doc_good_0", "class C {\n  static const f = <int>[];\n}\n", &[]),
+        (
+            "doc_good_0",
+            "class C {\n  static const f = <int>[];\n}\n",
+            &[],
+        ),
         (
             "doc_good_1",
             "const o = <int>[];\n\nclass A {\n  static const o = <int>[];\n}\n",

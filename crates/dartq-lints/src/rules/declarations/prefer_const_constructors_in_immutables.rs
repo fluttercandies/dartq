@@ -91,7 +91,10 @@ fn face_constructor(c: &mut Check<'_>, container: u32, node: u32) {
     // `node.firstTokenAfterCommentAndMetadata` (:58/:65) — the member's
     // first token: the modifiers (`const`, `factory`, the new-syntax
     // `new`) sit in the window before the row's name anchor.
-    c.report(utf16_token_span(c, super::constructor_first_token(c, node)), &[]);
+    c.report(
+        utf16_token_span(c, super::constructor_first_token(c, node)),
+        &[],
+    );
 }
 
 /// The redirecting-factory face (:53-58): a non-const factory whose
@@ -148,7 +151,10 @@ fn face_factory(c: &mut Check<'_>, container: u32, node: u32) {
         _ => return,
     };
     if const_ctor_named(c, target.0, target.1) {
-        c.report(utf16_token_span(c, super::constructor_first_token(c, node)), &[]);
+        c.report(
+            utf16_token_span(c, super::constructor_first_token(c, node)),
+            &[],
+        );
     }
 }
 
@@ -226,9 +232,8 @@ fn primary_header_const(c: &Check<'_>, container: u32, primary: u32) -> bool {
     if c.kind(primary) == NodeKind::PrimaryConstructor && ctor_header_has_const(c, primary) {
         return true;
     }
-    container_name_token(c, container).is_some_and(|name_head| {
-        range_has_const(c, c.head_token(container)..name_head)
-    })
+    container_name_token(c, container)
+        .is_some_and(|name_head| range_has_const(c, c.head_token(container)..name_head))
 }
 
 /// `hasImmutableAnnotation` (:136-147): the container's own
@@ -243,15 +248,12 @@ fn has_immutable(c: &Check<'_>, container: u32) -> bool {
     std::iter::once(container)
         .chain(same_file_ancestors(c, container, true))
         .any(|row| {
-            top_level_annotations(c, row)
-                .iter()
-                .any(|&meta| {
-                    // `metadata.hasImmutable` resolves the element —
-                    // meta ships both spellings (`immutable` the const,
-                    // `Immutable` the class).
-                    annotation_names(c, meta, "immutable")
-                        || annotation_names(c, meta, "Immutable")
-                })
+            top_level_annotations(c, row).iter().any(|&meta| {
+                // `metadata.hasImmutable` resolves the element —
+                // meta ships both spellings (`immutable` the const,
+                // `Immutable` the class).
+                annotation_names(c, meta, "immutable") || annotation_names(c, meta, "Immutable")
+            })
         })
 }
 
@@ -330,12 +332,11 @@ fn initializer_entries_able(c: &Check<'_>, container: u32, node: u32) -> bool {
         })
         .collect();
     let initializers = if c.kind(node) == NodeKind::PrimaryConstructor {
-        primary_body_row(c, container)
-            .and_then(|body| {
-                c.collect_direct(body)
-                    .into_iter()
-                    .find(|&kid| c.kind(kid) == NodeKind::Initializers)
-            })
+        primary_body_row(c, container).and_then(|body| {
+            c.collect_direct(body)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Initializers)
+        })
     } else {
         c.collect_direct(node)
             .into_iter()
@@ -351,7 +352,10 @@ fn initializer_entries_able(c: &Check<'_>, container: u32, node: u32) -> bool {
         }
         let kids = c.collect_direct(entry);
         // The invocation entries belong to `const_invocation_face`.
-        if kids.iter().any(|&kid| c.kind(kid) == NodeKind::SuperExpression) {
+        if kids
+            .iter()
+            .any(|&kid| c.kind(kid) == NodeKind::SuperExpression)
+        {
             continue;
         }
         let Some(name_send) = kids
@@ -413,8 +417,6 @@ fn is_field_name_send(c: &Check<'_>, send: u32) -> bool {
     let tokens = c.unit.ast.token_range(send);
     tokens.start + 1 < tokens.end && c.lexeme(tokens.start + 1) == "="
 }
-
-
 
 /// Whether every instance field of the row is spelled
 /// `final`/`const` without `late`, with an initializer that is an
@@ -491,11 +493,7 @@ fn const_literal(c: &Check<'_>, value: u32) -> bool {
 /// member row (which starts at the token after the leading `this`: the
 /// `:` of its initializers or its `{`); no body at all is the empty
 /// region.
-fn initializer_region(
-    c: &Check<'_>,
-    container: u32,
-    node: u32,
-) -> Option<core::ops::Range<u32>> {
+fn initializer_region(c: &Check<'_>, container: u32, node: u32) -> Option<core::ops::Range<u32>> {
     let params_end = c
         .collect_direct(node)
         .into_iter()
@@ -614,251 +612,251 @@ mod tests {
     fn prefer_const_constructors_in_immutables_oracle_corpus_pins() {
         // (case, source, oracle rows as (line, column, length)).
         let cases: &[(&str, &str, &[(u32, u32, u32)])] = &[
-        (
-            "doc_bad_0",
-            "import 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  final f;\n\n  C(this.f);\n}\n",
-            &[(7, 3, 1)],
-        ),
-        (
-            "doc_bad_1",
-            "@immutable\nclass A {\n  final a;\n  A(this.a);\n}\n",
-            &[],
-        ),
-        (
-            "doc_good_0",
-            "import 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  final f;\n\n  const C(this.f);\n}\n",
-            &[],
-        ),
-        (
-            "doc_good_1",
-            "class C {\n  final f;\n\n  C(this.f);\n}\n",
-            &[],
-        ),
-        (
-            "doc_good_2",
-            "@immutable\nclass A {\n  final a;\n  const A(this.a);\n}\n",
-            &[],
-        ),
-        (
-            "test_assertInitializer_canBeConst#0",
-            "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  C.named(a) : assert(a != null);\n}\n",
-            &[(6, 3, 1)],
-        ),
-        (
-            "test_assertInitializer_canBeConst_enumComparison#0",
-            "\nimport 'package:meta/meta.dart';\n\nenum E { a, b }\n\n@immutable\nclass C {\n  final E e;\n  C(this.e) : assert(e == E.a);\n}\n",
-            &[(9, 3, 1)],
-        ),
-        (
-            "test_assertInitializer_cannotBeConst#0",
-            "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  C.named(a) : assert(a.toString() == 'string');\n}\n",
-            &[],
-        ),
-        (
-            "test_extendsImmutable_constConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B extends A {\n  const B();\n}\n",
-            &[],
-        ),
-        (
-            "test_extendsImmutable_nonConstConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B extends A {\n  B();\n}\n",
-            &[(8, 3, 1)],
-        ),
-        (
-            "test_extendsImmutable_nonConstSuperCall#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {}\nclass B extends A {\n  B() : super();\n}\n",
-            &[],
-        ),
-        (
-            "test_extensionType_constConstructor_named#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) {\n  const E.e(this.i);\n}\n",
-            &[],
-        ),
-        (
-            "test_extensionType_constConstructor_primary#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) { }\n",
-            &[],
-        ),
-        (
-            "test_extensionType_nonConstConstructor_named#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) {\n  E.e(this.i);\n}\n",
-            &[(5, 3, 1)],
-        ),
-        (
-            "test_extensionType_nonConstConstructor_primary#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nextension type E(int i) { }\n",
-            &[(4, 16, 1)],
-        ),
-        (
-            "test_immutableInstantiation_nonConstConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@Immutable('')\nclass A {\n  A();\n}\n",
-            &[(5, 3, 1)],
-        ),
-        (
-            "test_immutable_constConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_constConstructor_named#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A.named();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_constConstructor_primary#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass const C(final int i);\n",
-            &[],
-        ),
-        (
-            "test_immutable_constFactory#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const factory C() = C.named;\n  const C.named();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_constRedirectingConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C();\n  const C.named() : this();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_constSuperCall_primary#0",
-            "\nimport 'package:meta/meta.dart';\nclass C {\n  const C();\n}\n@immutable\nclass D(final int i) extends C {\n  this : super();\n}\n",
-            &[(7, 7, 1)],
-        ),
-        (
-            "test_immutable_constructorHasBody#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  A.named() {}\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_constructorHasBody_primary#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C(final int i) {\n  this {\n    print(1);\n  }\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_enumComparisonInInitializerList#0",
-            "\nimport 'package:meta/meta.dart';\n\nenum E { a, b }\n\n@immutable\nclass C {\n  final bool isA;\n  C(E e) : isA = e == E.a;\n}\n",
-            &[(9, 3, 1)],
-        ),
-        (
-            "test_immutable_factoryConstructor_toConstConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C();\n  factory C.named() = C;\n}\n",
-            &[(6, 3, 7)],
-        ),
-        (
-            "test_immutable_factoryConstructor_toNonConst#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  C() {}\n  factory C.named() = C;\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_fieldWithInitializer#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final f = Object();\n  C();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_hasMixin#0",
-            "\nimport 'package:meta/meta.dart';\nmixin M {}\n\n@immutable\nclass C with M {\n  C();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_implicitConstSuperCall_primary#0",
-            "\nimport 'package:meta/meta.dart';\nclass C {\n  const C();\n}\n@immutable\nclass D(final int i) extends C;\n",
-            &[(7, 7, 1)],
-        ),
-        (
-            "test_immutable_implicitNonConstSuperCall_primary#0",
-            "\nimport 'package:meta/meta.dart';\nclass C {}\n@immutable\nclass D(final int i) extends C;\n",
-            &[],
-        ),
-        (
-            "test_immutable_nonConstConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  A();\n}\n",
-            &[(5, 3, 1)],
-        ),
-        (
-            "test_immutable_nonConstConstructor_newSyntax#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  new();\n}\n",
-            &[(5, 3, 3)],
-        ),
-        (
-            "test_immutable_nonConstConstructor_primary#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C(final int i);\n",
-            &[(4, 7, 1)],
-        ),
-        (
-            "test_immutable_nonConstFactory#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  factory C() = C.named;\n  const C.named();\n}\n",
-            &[(5, 3, 7)],
-        ),
-        (
-            "test_immutable_nonConstInInitializerList#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final String _a; // ignore: unused_field\n  C(int a) : _a = a.toString();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_nonConstInInitializerList2#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final int _a; // ignore: unused_field\n  C(int a) : _a = a;\n}\n",
-            &[(6, 3, 1)],
-        ),
-        (
-            "test_immutable_nonConstInInitializerList3#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final bool _a; // ignore: unused_field\n  C(bool a) : _a = a && a;\n}\n",
-            &[(6, 3, 1)],
-        ),
-        (
-            "test_immutable_nonConstInInitializerList4#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final String _a; // ignore: unused_field\n  C(bool a) : _a = '${a ? a : ''}';\n}\n",
-            &[(6, 3, 1)],
-        ),
-        (
-            "test_immutable_nonConstInInitializerList5#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final bool f;\n  C(bool? f) : f = f ?? f == null;\n}\n",
-            &[(6, 3, 1)],
-        ),
-        (
-            "test_immutable_nonConstInInitializerList6#0",
-            "\nimport 'package:meta/meta.dart';\nint notConst = 0;\n@immutable\nclass C {\n  final int f;\n  C(Object f) : f = notConst;\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_nonConstSuperCall_primary#0",
-            "\nimport 'package:meta/meta.dart';\nclass C {}\n@immutable\nclass D(final int i) extends C {\n  this : super();\n}\n",
-            &[],
-        ),
-        (
-            "test_immutable_redirectingConstructor#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  C.a();\n  C.b() : this.a();\n}\n",
-            &[(5, 3, 1)],
-        ),
-        (
-            "test_immutable_redirectingConstructor_toConst#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C();\n  C.named(): this();\n}\n",
-            &[(6, 3, 1)],
-        ),
-        (
-            "test_implementsImmutable#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B implements A {\n  B();\n}\n",
-            &[],
-        ),
-        (
-            "test_implementsImmutable_named#0",
-            "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B implements A {\n  const B.named();\n}\n",
-            &[],
-        ),
-        (
-            "test_implicitSuperConstructorInvocation_undefined#0",
-            "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass A {\n  const A.named();\n}\n\nclass B extends A {\n  B();\n}\n",
-            &[],
-        ),
-        (
-            "test_parameterizedType#0",
-            "\nimport 'package:meta/meta.dart';\n\nclass A<T> {}\n\n@immutable\nclass C<U> extends A<U> {\n  C();\n}\n",
-            &[],
-        ),
-        (
-            "test_returnOfInvalidType#0",
-            "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass F {\n  factory F.fc() => null;\n}\n",
-            &[],
-        ),
+            (
+                "doc_bad_0",
+                "import 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  final f;\n\n  C(this.f);\n}\n",
+                &[(7, 3, 1)],
+            ),
+            (
+                "doc_bad_1",
+                "@immutable\nclass A {\n  final a;\n  A(this.a);\n}\n",
+                &[],
+            ),
+            (
+                "doc_good_0",
+                "import 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  final f;\n\n  const C(this.f);\n}\n",
+                &[],
+            ),
+            (
+                "doc_good_1",
+                "class C {\n  final f;\n\n  C(this.f);\n}\n",
+                &[],
+            ),
+            (
+                "doc_good_2",
+                "@immutable\nclass A {\n  final a;\n  const A(this.a);\n}\n",
+                &[],
+            ),
+            (
+                "test_assertInitializer_canBeConst#0",
+                "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  C.named(a) : assert(a != null);\n}\n",
+                &[(6, 3, 1)],
+            ),
+            (
+                "test_assertInitializer_canBeConst_enumComparison#0",
+                "\nimport 'package:meta/meta.dart';\n\nenum E { a, b }\n\n@immutable\nclass C {\n  final E e;\n  C(this.e) : assert(e == E.a);\n}\n",
+                &[(9, 3, 1)],
+            ),
+            (
+                "test_assertInitializer_cannotBeConst#0",
+                "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass C {\n  C.named(a) : assert(a.toString() == 'string');\n}\n",
+                &[],
+            ),
+            (
+                "test_extendsImmutable_constConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B extends A {\n  const B();\n}\n",
+                &[],
+            ),
+            (
+                "test_extendsImmutable_nonConstConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B extends A {\n  B();\n}\n",
+                &[(8, 3, 1)],
+            ),
+            (
+                "test_extendsImmutable_nonConstSuperCall#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {}\nclass B extends A {\n  B() : super();\n}\n",
+                &[],
+            ),
+            (
+                "test_extensionType_constConstructor_named#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) {\n  const E.e(this.i);\n}\n",
+                &[],
+            ),
+            (
+                "test_extensionType_constConstructor_primary#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) { }\n",
+                &[],
+            ),
+            (
+                "test_extensionType_nonConstConstructor_named#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nextension type const E(int i) {\n  E.e(this.i);\n}\n",
+                &[(5, 3, 1)],
+            ),
+            (
+                "test_extensionType_nonConstConstructor_primary#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nextension type E(int i) { }\n",
+                &[(4, 16, 1)],
+            ),
+            (
+                "test_immutableInstantiation_nonConstConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@Immutable('')\nclass A {\n  A();\n}\n",
+                &[(5, 3, 1)],
+            ),
+            (
+                "test_immutable_constConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_constConstructor_named#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A.named();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_constConstructor_primary#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass const C(final int i);\n",
+                &[],
+            ),
+            (
+                "test_immutable_constFactory#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const factory C() = C.named;\n  const C.named();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_constRedirectingConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C();\n  const C.named() : this();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_constSuperCall_primary#0",
+                "\nimport 'package:meta/meta.dart';\nclass C {\n  const C();\n}\n@immutable\nclass D(final int i) extends C {\n  this : super();\n}\n",
+                &[(7, 7, 1)],
+            ),
+            (
+                "test_immutable_constructorHasBody#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  A.named() {}\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_constructorHasBody_primary#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C(final int i) {\n  this {\n    print(1);\n  }\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_enumComparisonInInitializerList#0",
+                "\nimport 'package:meta/meta.dart';\n\nenum E { a, b }\n\n@immutable\nclass C {\n  final bool isA;\n  C(E e) : isA = e == E.a;\n}\n",
+                &[(9, 3, 1)],
+            ),
+            (
+                "test_immutable_factoryConstructor_toConstConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C();\n  factory C.named() = C;\n}\n",
+                &[(6, 3, 7)],
+            ),
+            (
+                "test_immutable_factoryConstructor_toNonConst#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  C() {}\n  factory C.named() = C;\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_fieldWithInitializer#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final f = Object();\n  C();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_hasMixin#0",
+                "\nimport 'package:meta/meta.dart';\nmixin M {}\n\n@immutable\nclass C with M {\n  C();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_implicitConstSuperCall_primary#0",
+                "\nimport 'package:meta/meta.dart';\nclass C {\n  const C();\n}\n@immutable\nclass D(final int i) extends C;\n",
+                &[(7, 7, 1)],
+            ),
+            (
+                "test_immutable_implicitNonConstSuperCall_primary#0",
+                "\nimport 'package:meta/meta.dart';\nclass C {}\n@immutable\nclass D(final int i) extends C;\n",
+                &[],
+            ),
+            (
+                "test_immutable_nonConstConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  A();\n}\n",
+                &[(5, 3, 1)],
+            ),
+            (
+                "test_immutable_nonConstConstructor_newSyntax#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  new();\n}\n",
+                &[(5, 3, 3)],
+            ),
+            (
+                "test_immutable_nonConstConstructor_primary#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C(final int i);\n",
+                &[(4, 7, 1)],
+            ),
+            (
+                "test_immutable_nonConstFactory#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  factory C() = C.named;\n  const C.named();\n}\n",
+                &[(5, 3, 7)],
+            ),
+            (
+                "test_immutable_nonConstInInitializerList#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final String _a; // ignore: unused_field\n  C(int a) : _a = a.toString();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_nonConstInInitializerList2#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final int _a; // ignore: unused_field\n  C(int a) : _a = a;\n}\n",
+                &[(6, 3, 1)],
+            ),
+            (
+                "test_immutable_nonConstInInitializerList3#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final bool _a; // ignore: unused_field\n  C(bool a) : _a = a && a;\n}\n",
+                &[(6, 3, 1)],
+            ),
+            (
+                "test_immutable_nonConstInInitializerList4#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final String _a; // ignore: unused_field\n  C(bool a) : _a = '${a ? a : ''}';\n}\n",
+                &[(6, 3, 1)],
+            ),
+            (
+                "test_immutable_nonConstInInitializerList5#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  final bool f;\n  C(bool? f) : f = f ?? f == null;\n}\n",
+                &[(6, 3, 1)],
+            ),
+            (
+                "test_immutable_nonConstInInitializerList6#0",
+                "\nimport 'package:meta/meta.dart';\nint notConst = 0;\n@immutable\nclass C {\n  final int f;\n  C(Object f) : f = notConst;\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_nonConstSuperCall_primary#0",
+                "\nimport 'package:meta/meta.dart';\nclass C {}\n@immutable\nclass D(final int i) extends C {\n  this : super();\n}\n",
+                &[],
+            ),
+            (
+                "test_immutable_redirectingConstructor#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  C.a();\n  C.b() : this.a();\n}\n",
+                &[(5, 3, 1)],
+            ),
+            (
+                "test_immutable_redirectingConstructor_toConst#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass C {\n  const C();\n  C.named(): this();\n}\n",
+                &[(6, 3, 1)],
+            ),
+            (
+                "test_implementsImmutable#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B implements A {\n  B();\n}\n",
+                &[],
+            ),
+            (
+                "test_implementsImmutable_named#0",
+                "\nimport 'package:meta/meta.dart';\n@immutable\nclass A {\n  const A();\n}\nclass B implements A {\n  const B.named();\n}\n",
+                &[],
+            ),
+            (
+                "test_implicitSuperConstructorInvocation_undefined#0",
+                "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass A {\n  const A.named();\n}\n\nclass B extends A {\n  B();\n}\n",
+                &[],
+            ),
+            (
+                "test_parameterizedType#0",
+                "\nimport 'package:meta/meta.dart';\n\nclass A<T> {}\n\n@immutable\nclass C<U> extends A<U> {\n  C();\n}\n",
+                &[],
+            ),
+            (
+                "test_returnOfInvalidType#0",
+                "\nimport 'package:meta/meta.dart';\n\n@immutable\nclass F {\n  factory F.fc() => null;\n}\n",
+                &[],
+            ),
         ];
         // The UTF-16 offset of a 1-based `(line, column)` in an ASCII source.
         fn offset(source: &str, line: u32, column: u32) -> u32 {

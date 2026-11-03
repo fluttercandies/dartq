@@ -172,24 +172,29 @@ fn collection_display(
     // The literal's explicit type arguments (`<int>[…]`, `<K, V>{…}`):
     // hand-built trees carry the `TypeArguments` row as a child; the
     // production tiling leaves it an owner-sibling sealing at the
-    // literal head (the literal span opens at `[`/`{`).
+    // literal head (the literal span opens at `[`/`{`). The row is the
+    // one whose token range ends where the literal's head begins, or —
+    // for a literal anchored on a synthetic bracket pair whose index
+    // carries no ordering relation to the real stream — whose `>` ends
+    // exactly at the literal's head byte (byte adjacency: an earlier
+    // typed literal's arguments always have a separator between).
     let typed: Vec<String> = c
         .collect_direct(root)
         .into_iter()
         .find(|&kid| c.kind(kid) == NodeKind::TypeArguments)
         .or_else(|| {
             let tokens = c.unit.ast.token_range(root);
-            let synthetic_head = c.token_is_synthetic(tokens.start);
+            let head_byte = c
+                .unit
+                .tokens
+                .get(tokens.start as usize)
+                .map(|token| token.byte_offset as usize);
             let window = c.children(c.unit.ast.parent(root)?);
             (window.start..window.end)
                 .filter(|&row| c.kind(row) == NodeKind::TypeArguments)
                 .filter(|&row| {
-                    let end = c.unit.ast.token_range(row).end;
-                    // The `[]` index-token literal anchors at synthetic
-                    // brackets past the `>` — its `TypeArguments`
-                    // sibling only satisfies the looser before-head
-                    // bound.
-                    end == tokens.start || (synthetic_head && end <= tokens.start)
+                    c.unit.ast.token_range(row).end == tokens.start
+                        || head_byte.is_some_and(|head| c.byte_span(row).end == head)
                 })
                 .max_by_key(|&row| c.unit.ast.token_range(row).end)
         })

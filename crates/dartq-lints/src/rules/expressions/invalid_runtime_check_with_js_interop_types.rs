@@ -510,12 +510,10 @@ fn extension_type_representation(c: &Check<'_>, name: &str) -> Option<u32> {
                 continue;
             }
             let (open, close) = representation_parens(c, name_token)?;
-            return c
-                .children(declaration)
-                .find(|&row| {
-                    let span = c.unit.ast.token_range(row);
-                    is_type_row(c.kind(row)) && span.start >= open && span.end <= close
-                });
+            return c.children(declaration).find(|&row| {
+                let span = c.unit.ast.token_range(row);
+                is_type_row(c.kind(row)) && span.start >= open && span.end <= close
+            });
         }
     }
     None
@@ -733,7 +731,8 @@ mod tests {
         );
         assert_eq!(reported(source, &lints[0]), "b is JSBoolean");
 
-        let source = "import 'dart:js_interop';\n\nbool f(List<Object> l) => l is List<JSString>;\n";
+        let source =
+            "import 'dart:js_interop';\n\nbool f(List<Object> l) => l is List<JSString>;\n";
         let lints = run(source);
         assert_eq!(lints.len(), 1, "{lints:?}");
         assert_eq!(

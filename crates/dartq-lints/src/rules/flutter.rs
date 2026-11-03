@@ -296,9 +296,12 @@ fn value_is_creation(c: &Check<'_>, pieces: &[u32], range: core::ops::Range<usiz
 /// supertype passing `keep` spells one of `roots`. A same-file declaration
 /// of the name shadows the framework spelling (the walk descends into the
 /// user class instead); an undeclared root spelling matches unless its
-/// written type-use position resolves to an indexed container — the
-/// negative-identity refutation (a cross-file user class carrying the
-/// root spelling is user code; an unindexed spelling keeps the verdict,
+/// written type-use position resolves to an indexed container OR resolves
+/// to nothing — the negative-identity refutation (a cross-file user class
+/// carrying the root spelling is user code; a looked-up-and-missed
+/// spelling is no framework class either, upstream's element check
+/// failing the same way on `undefined` — the semantic face's unresolved
+/// names carry that verdict; an unindexed spelling keeps the verdict,
 /// the plain-run posture included; the terminal decides, not each link —
 /// a same-file link is still descended). One resolvable supertype is
 /// followed per step, the walk stops past 8 links (the bounded-chain
@@ -322,8 +325,9 @@ fn chain_spells_root(
             if let Some(declared) = same_file_declaration(c, name) {
                 next = next.or(Some(declared));
             } else if roots.contains(&name)
-                && !supertype_head(c, row, name)
-                    .is_some_and(|head| resolves_user_container(c, head))
+                && !supertype_head(c, row, name).is_some_and(|head| {
+                    resolves_user_container(c, head) || resolves_to_missing(c, head)
+                })
             {
                 return true;
             }
@@ -331,6 +335,24 @@ fn chain_spells_root(
         current = next;
     }
     false
+}
+
+/// Whether the written position of `row` is a name the mounted semantic
+/// face looked up and missed — positive evidence the spelling is no
+/// framework container at all (the official element check's `undefined`
+/// face: `isStatefulWidget` on a missing class is `false`, never a
+/// shadow). `false` when the semantic face is unmounted (the plain run)
+/// or the position carries no miss row — the documented unindexed fallback
+/// keeps the framework verdict there.
+fn resolves_to_missing(c: &Check<'_>, row: u32) -> bool {
+    let Some(analysis) = c.semantics() else {
+        return false;
+    };
+    let start = c.utf16_span(row).start;
+    analysis
+        .names()
+        .iter()
+        .any(|miss| miss.use_kind == dartq_semantic::NameUse::Type && miss.range.offset == start)
 }
 
 /// The head row of the supertype clause spelling `name` on `class` — the
@@ -840,12 +862,12 @@ pub(crate) mod use_colored_box {
     /// with same-file declarations and resolution-resolved workspace
     /// containers refuting; a user class inside an unindexed dependency
     /// still matches (what dependency indexing would close). The `color`
-    /// argument's non-nullable static-type gate reads the flow type at
-    /// the value's identifier read (the official `isPotentiallyNull`
-    /// inverse): a nullable color value passes when its read row answers,
-    /// and a shape without a read row (a literal, a member chain, a
-    /// creation) keeps the counting posture. A prefixed `p.Container(...)`
-    /// under-reports.
+    /// argument's `?`-suffix static-type gate reads the flow type at
+    /// the value's identifier read (the official
+    /// `nullabilitySuffix != question` test): a nullable color value
+    /// passes when its read row answers, and a shape without a read row
+    /// (a literal, a member chain, a creation) keeps the counting
+    /// posture. A prefixed `p.Container(...)` under-reports.
     pub(crate) static SPEC: RuleSpec = crate::spec!(
         "use_colored_box",
         &[
@@ -874,8 +896,8 @@ pub(crate) mod use_colored_box {
                 "child" => child = true,
                 "color" => {
                     // The nullability gate (:61): a color value whose
-                    // static type is potentially null never counts.
-                    if color_argument_potentially_null(c, &pieces, range.clone()) {
+                    // static type carries the `?` suffix never counts.
+                    if color_argument_is_nullable(c, &pieces, range.clone()) {
                         continue;
                     }
                     color = true;
@@ -891,17 +913,20 @@ pub(crate) mod use_colored_box {
         }
     }
 
-    /// The upstream color gate (`use_colored_box.dart` :61): a color
-    /// value whose static type is potentially null
-    /// (`nullabilitySuffix != question` inverse) never counts. Reads the
-    /// flow type at the value's bare-read face — the value root is an
+    /// The upstream color gate (`use_colored_box.dart` :61): the value's
+    /// static type must not carry the `?` nullability suffix
+    /// (`nullabilitySuffix != NullabilitySuffix.question`) for the
+    /// argument to count. The gate reads the *written* nullability, not
+    /// `isPotentiallyNull`: `dynamic` and `Null` declare
+    /// `NullabilitySuffix.none` upstream, so both count. Reads the flow
+    /// type at the value's bare-read face — the value root is an
     /// identifier, or the production tiling's argument-position `Send`
     /// wrapper over one (no `Arguments` row; the read row shares the
     /// wrapper's start offset). Any other shape (a literal, a member
     /// chain, an invocation, a creation) answers unknown and keeps the
     /// counting posture (the documented residual — what the full
     /// static-type face would close).
-    fn color_argument_potentially_null(
+    fn color_argument_is_nullable(
         c: &Check<'_>,
         pieces: &[u32],
         range: core::ops::Range<usize>,
@@ -920,7 +945,15 @@ pub(crate) mod use_colored_box {
                 .any(|&kid| c.kind(kid) == NodeKind::Arguments),
             _ => false,
         };
-        bare_read && analysis.is_potentially_null(query_span(c, root))
+        bare_read
+            && matches!(
+                analysis.type_of(query_span(c, root)),
+                Some(
+                    dartq_semantic::model::Ty::Named { nullable: true, .. }
+                        | dartq_semantic::model::Ty::Record { nullable: true, .. }
+                        | dartq_semantic::model::Ty::Function { nullable: true, .. }
+                )
+            )
     }
 
     #[cfg(test)]
@@ -2147,7 +2180,9 @@ pub(crate) mod use_key_in_widget_constructors {
 }
 
 pub(crate) mod no_logic_in_create_state {
-    use super::{Check, NodeKind, RuleSpec, chain_spells_root, extends_only, member_name_row};
+    use super::{
+        Check, NodeKind, PayloadField, RuleSpec, chain_spells_root, extends_only, member_name_row,
+    };
     use crate::rules::{is_statement_row, slice};
 
     /// Official: `upstream Dart SDK source,
@@ -2163,11 +2198,14 @@ pub(crate) mod no_logic_in_create_state {
     /// Approximation register (R4): widget identity by spelling with the
     /// negative-identity refutation — the `StatefulWidget` gate reads the
     /// written `extends` chain against the spelling (same-file
-    /// declarations descend; resolution-resolved workspace classes
-    /// refute; a user class inside an unindexed dependency with the name
-    /// still matches — what dependency indexing would close). The
-    /// instance-creation face reads the creation shapes (a dot-shorthand
-    /// constructor invocation under-reports its silent face).
+    /// declarations descend; resolution-resolved workspace classes and
+    /// looked-up-and-missed spellings alike refute; a user class inside an
+    /// unindexed dependency with the name still matches — what dependency
+    /// indexing would close). The instance-creation face reads the
+    /// creation shapes, the argument-less dot-shorthand invocation
+    /// included; the report span is the written expression's token run
+    /// (`reportAtNode(expressionToTest)` — a cascade's whole
+    /// `target..section` extent, not its sealing marker).
     pub(crate) static SPEC: RuleSpec =
         crate::spec!("no_logic_in_create_state", &[NodeKind::Method], check,);
 
@@ -2224,13 +2262,30 @@ pub(crate) mod no_logic_in_create_state {
                 } else {
                     (window.start..window.end).collect()
                 };
-                let Some(&root) = rows.last() else {
+                if rows.is_empty() {
                     return;
-                };
+                }
                 if is_bare_creation(c, &rows, rows.len() - 1) {
                     return;
                 }
-                c.report(c.utf16_span(root), &[]);
+                // `reportAtNode(expressionToTest)` covers the whole written
+                // expression — the run's last row is just the sealing piece
+                // (a `Cascade`/`CascadeAccess` marker or the shorthand's
+                // `DotShorthandHead`), so the span is the token run from
+                // the body's `=>` successor through the `;` (upstream's
+                // `body.expression`: the `;` never belongs to it).
+                let body_tokens = c.unit.ast.token_range(body);
+                let end = c
+                    .field_token(body, PayloadField::Semicolon)
+                    .unwrap_or(body_tokens.end - 1);
+                if end > body_tokens.start + 1
+                    && let Some(range) = crate::rules::declarations::utf16_token_run_span(
+                        c,
+                        body_tokens.start + 1..end,
+                    )
+                {
+                    c.report(range, &[]);
+                }
             }
             NodeKind::BlockBody => {
                 // Hand-built trees nest a `Block` row inside the body; the
@@ -2258,12 +2313,22 @@ pub(crate) mod no_logic_in_create_state {
                         let returned: Vec<u32> = (ret_window.start..ret_window.end)
                             .filter(|&row| c.unit.ast.token_range(row as u32).start > arrow)
                             .collect();
-                        match returned.last() {
-                            Some(&root) if !is_bare_creation(c, &returned, returned.len() - 1) => {
-                                c.report(c.utf16_span(root), &[]);
+                        if returned.is_empty() {
+                            // A bare `return;` reports at the body.
+                            c.report(c.utf16_span(body), &[]);
+                        } else if !is_bare_creation(c, &returned, returned.len() - 1) {
+                            // The `statement.expression` span: from the
+                            // `return` keyword's successor through the `;`.
+                            let ret_tokens = c.unit.ast.token_range(ret);
+                            if ret_tokens.end > ret_tokens.start + 2
+                                && let Some(range) =
+                                    crate::rules::declarations::utf16_token_run_span(
+                                        c,
+                                        ret_tokens.start + 1..ret_tokens.end - 1,
+                                    )
+                            {
+                                c.report(range, &[]);
                             }
-                            Some(_) => {}
-                            None => c.report(c.utf16_span(body), &[]), // bare `return;`
                         }
                     }
                     _ => c.report(c.utf16_span(body), &[]),
@@ -2275,10 +2340,19 @@ pub(crate) mod no_logic_in_create_state {
 
     /// The silent face: the returned expression is an argument-less
     /// instance creation (`expressionToTest is InstanceCreationExpression
-    /// && arguments.isEmpty`, :70-78) — an invocation send (not the
-    /// bare-name tear-off group), a `new`/implicit creation, or a const
-    /// wrapper carrying one.
+    /// && arguments.isEmpty`, :70-78 — the same empty-arguments verdict
+    /// for a `DotShorthandConstructorInvocation`, :74-76) — an invocation
+    /// send (not the bare-name tear-off group), a `new`/implicit
+    /// creation, or a const wrapper carrying one.
     fn is_bare_creation(c: &Check<'_>, run: &[u32], index: usize) -> bool {
+        // The shorthand's `.` anchor leaf seals immediately after its
+        // `Send` (`prefer_const_constructors`'s shorthand face: the leaf
+        // owns the `.`, the send owns `new (…)`), so a run sealing on the
+        // head steps back to the invocation.
+        let index = match c.kind(run[index]) {
+            NodeKind::DotShorthandHead if index > 0 => index - 1,
+            _ => index,
+        };
         let root = run[index];
         match c.kind(root) {
             NodeKind::Send => {
@@ -2333,7 +2407,7 @@ pub(crate) mod no_logic_in_create_state {
 
     #[cfg(test)]
     mod tests {
-        use crate::testsupport::{Fixture, one_rule};
+        use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
 
         /// `test/rules/no_logic_in_create_state_test.dart`
         /// `test_logicInCreateState` — a creation with arguments reports
@@ -2403,6 +2477,75 @@ pub(crate) mod no_logic_in_create_state {
                 "class StatefulWidget {}\nclass W extends StatefulWidget {\n  S createState() => S(x);\n}\n",
             );
             assert!(f.run(&one_rule("no_logic_in_create_state")).is_empty());
+        }
+
+        /// `test_arrowBody_returnsState_dotShorthand#0` — an argument-less
+        /// `.new()` invocation is the upstream
+        /// `DotShorthandConstructorInvocation` silent face; the
+        /// with-arguments shape reports the whole `.new(1)` run (the `.`
+        /// anchor's own span, not the head leaf's).
+        #[test]
+        fn dot_shorthand_creation_faces() {
+            let f = Fixture::parse(
+                "class W extends StatefulWidget {\n  S createState() => .new();\n}\n",
+            );
+            assert!(f.run(&one_rule("no_logic_in_create_state")).is_empty());
+
+            let f = Fixture::parse(
+                "class W extends StatefulWidget {\n  S createState() => .new(1);\n}\n",
+            );
+            let lints = f.run(&one_rule("no_logic_in_create_state"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let dot = tok(&f.source, &f.tokens, ".", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, dot));
+            assert_eq!(lints[0].range.end - lints[0].range.start, 7);
+        }
+
+        /// `test_arrowBody_returnsState_withCascade#0` — the cascade's
+        /// `target..section` whole-expression span (`S()..f = 0`, 10
+        /// units; `MyState()..field = 0` on the pinned oracle row), not
+        /// the sealing `CascadeAccess` marker's.
+        #[test]
+        fn cascade_return_reports_the_whole_expression() {
+            let f = Fixture::parse(
+                "class W extends StatefulWidget {\n  S createState() => S()..f = 0;\n}\n",
+            );
+            let lints = f.run(&one_rule("no_logic_in_create_state"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let s = tok(&f.source, &f.tokens, "S", 1);
+            assert_eq!(lints[0].range.start, utf16_at(&f, s));
+            assert_eq!(lints[0].range.end - lints[0].range.start, 10);
+        }
+
+        /// `test_blockBodyWithSingleStatement_returnsInstanceField#0` —
+        /// `return instance;` reports at the returned expression only
+        /// (`instance`, 8 units — the `;` rides the statement, never the
+        /// expression span).
+        #[test]
+        fn block_body_return_reports_the_expression_not_the_statement() {
+            let f = Fixture::parse(
+                "class W extends StatefulWidget {\n  S createState() {\n    return instance;\n  }\n}\n",
+            );
+            let lints = f.run(&one_rule("no_logic_in_create_state"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let instance = tok(&f.source, &f.tokens, "instance", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, instance));
+            assert_eq!(lints[0].range.end - lints[0].range.start, 8);
+        }
+
+        /// `doc_bad_1`-face — an `extends StatefulWidget` spelling whose
+        /// semantic look-up missed is negative identity too (the official
+        /// element check's `undefined` face: no `isStatefulWidget` on a
+        /// missing class). The plain run keeps the framework verdict.
+        #[test]
+        fn unresolved_stateful_widget_refutes() {
+            let f =
+                Fixture::parse("class W extends StatefulWidget {\n  S createState() => S(x);\n}\n");
+            assert!(
+                f.run_semantic(&one_rule("no_logic_in_create_state"))
+                    .is_empty()
+            );
+            assert_eq!(f.run(&one_rule("no_logic_in_create_state")).len(), 1);
         }
     }
 }

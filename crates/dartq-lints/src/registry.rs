@@ -617,6 +617,17 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
     if !late_join.is_empty() {
         drift.push(format!("LATE_JOIN_RULES unregistered names {late_join:?}"));
     }
+    let umbrella_members = unresolved(
+        rules,
+        UMBRELLA_RULES
+            .iter()
+            .flat_map(|(_, members)| members.iter().copied()),
+    );
+    if !umbrella_members.is_empty() {
+        drift.push(format!(
+            "UMBRELLA_RULES unregistered member names {umbrella_members:?}"
+        ));
+    }
     // The generated-metadata arm (#2676): every registered name resolves
     // in the table (the mirrors exempt) and — for the rules whose spec
     // resolves through it — the spec's group agrees with the row's. A
@@ -762,6 +773,52 @@ pub fn incompatible_rules(name: &str) -> &'static [&'static str] {
         .map_or(&[], |(_, peers)| peers)
 }
 
+/// The `MultiAnalysisRule` umbrella names and the member codes they fan out
+/// to. Upstream registers one rule under the umbrella name whose
+/// `diagnosticCodes` list every code it can emit
+/// (`pkg/linter/lib/src/rules/analyzer_public_api.dart:32-38`,
+/// `analyzer_element_model_tracking.dart:30-35`); `Registry.lintRules` is
+/// keyed by rule name only, so the umbrella is the sole `linter.rules`
+/// enable switch and the member code names are not enableable upstream
+/// (`undefined_lint` there — `lint_names::NAMES` mirrors that by carrying
+/// only the umbrella spellings). dartq splits the codes into one spec each
+/// (conformance enables them by name through [`EnableSet::resolve`]
+/// directly), so the umbrella resolves to its member set here — the
+/// `name: false` arm never reaches resolution (the options merge drops
+/// disabled entries before `lint_rules` is built), matching the upstream
+/// posture where a member-named entry has no enable effect.
+static UMBRELLA_RULES: &[(&str, &[&str])] = &[
+    (
+        "analyzer_element_model_tracking",
+        &[
+            "analyzer_element_model_tracking_bad",
+            "analyzer_element_model_tracking_more_than_one",
+            "analyzer_element_model_tracking_zero",
+        ],
+    ),
+    (
+        "analyzer_public_api",
+        &[
+            "analyzer_public_api_bad_part_directive",
+            "analyzer_public_api_bad_type",
+            "analyzer_public_api_experimental_inconsistency",
+            "analyzer_public_api_exports_non_public_name",
+            "analyzer_public_api_impl_in_public_api",
+        ],
+    ),
+];
+
+/// The member code names of umbrella rule `name`, `None` when `name` is not
+/// a [`UMBRELLA_RULES`] key. Case-insensitive like [`rule_by_name`]; a
+/// once-per-run lookup, not a hot path.
+#[must_use]
+fn umbrella_members(name: &str) -> Option<&'static [&'static str]> {
+    UMBRELLA_RULES
+        .iter()
+        .find(|(umbrella, _)| umbrella.eq_ignore_ascii_case(name))
+        .map(|(_, members)| *members)
+}
+
 /// The `kinds: &[]` set rules that still emit — through the dartq-commands
 /// pubspec pass at the #434 mounting face, not through AST dispatch (the
 /// crate docs' pubspec seam). The only legitimate empty-`kinds` members
@@ -855,7 +912,11 @@ impl EnableSet {
 
     /// Resolves machine names into the set. Unknown names are reported back
     /// verbatim (the caller decides whether that is an error — the oracle
-    /// reports an undefined lint as a warning and keeps analyzing).
+    /// reports an undefined lint as a warning and keeps analyzing). An
+    /// umbrella name fans out to its member codes ([`UMBRELLA_RULES`]): the
+    /// upstream `MultiAnalysisRule` registers once under the umbrella, so
+    /// `linter.rules: {analyzer_public_api: true}` mounts every code the
+    /// rule emits — here, every member spec.
     #[must_use]
     pub fn resolve<'a, I>(names: I) -> (Self, Vec<&'a str>)
     where
@@ -864,9 +925,16 @@ impl EnableSet {
         let mut set = Self { words: [0; WORDS] };
         let mut unknown = Vec::new();
         for name in names {
-            match rule_by_name(name) {
-                Some(id) => set.set(id),
-                None => unknown.push(name),
+            if let Some(id) = rule_by_name(name) {
+                set.set(id);
+            } else if let Some(members) = umbrella_members(name) {
+                for member in members {
+                    if let Some(id) = rule_by_name(member) {
+                        set.set(id);
+                    }
+                }
+            } else {
+                unknown.push(name);
             }
         }
         (set, unknown)

@@ -483,8 +483,7 @@ fn member_is_override(
     }) {
         return true;
     }
-    bridge_mounted_container
-        && bridge_is_override(c, container_row, name, query)
+    bridge_mounted_container && bridge_is_override(c, container_row, name, query)
 }
 
 /// The cross-file half of the override read: the semantic bridge's
@@ -608,8 +607,15 @@ fn judge(
         } else {
             graph.uses.get(public).copied().unwrap_or(0)
         };
-    let verdict =
-        effective_verdict(c, face, graph, single_file, annotation_row, name_token, offset);
+    let verdict = effective_verdict(
+        c,
+        face,
+        graph,
+        single_file,
+        annotation_row,
+        name_token,
+        offset,
+    );
     match verdict {
         Some(false) if !single_file => {
             if counted_count > 0 {
@@ -721,9 +727,15 @@ fn locally_used(
         NodeKind::Constructor | NodeKind::Factory | NodeKind::Method | NodeKind::Fields
     ) && let Some(container) = enclosing_container_name(c, declaration_row)
     {
-        let member = if name == container.as_str() { "new" } else { name };
+        let member = if name == container.as_str() {
+            "new"
+        } else {
+            name
+        };
         return graph.used.contains(member)
-            || graph.used.contains(format!("{container}.{member}").as_str());
+            || graph
+                .used
+                .contains(format!("{container}.{member}").as_str());
     }
     false
 }
@@ -971,7 +983,10 @@ fn subclass_walks_super(
 /// The counted positions of one constructor: the qualified
 /// `{container}.{member}` key and the bare member key.
 fn ctor_counted(uses: &rustc_hash::FxHashMap<String, u32>, container: &str, member: &str) -> bool {
-    uses.get(&format!("{container}.{member}")).copied().unwrap_or(0) > 0
+    uses.get(&format!("{container}.{member}"))
+        .copied()
+        .unwrap_or(0)
+        > 0
         || uses.get(member).copied().unwrap_or(0) > 0
 }
 
@@ -1053,15 +1068,17 @@ fn name_token_of(c: &Check<'_>, wrapper: u32, row: u32) -> Option<u32> {
         // generic `Expression` word (the `member_name` posture).
         Ctx::Expression as u32,
     ];
-    if let Some(name) = c.collect_direct(row).into_iter().find(|&kid| {
-        match c.kind(kid) {
+    if let Some(name) = c
+        .collect_direct(row)
+        .into_iter()
+        .find(|&kid| match c.kind(kid) {
             NodeKind::OperatorName => true,
             NodeKind::Identifier => c
                 .field(kid, PayloadField::Context)
                 .is_some_and(|ctx| NAME_CONTEXTS.contains(&ctx)),
             _ => false,
-        }
-    }) {
+        })
+    {
         return Some(if c.kind(name) == NodeKind::OperatorName {
             c.field(name, PayloadField::Name)
                 .unwrap_or_else(|| c.head_token(name))
@@ -1091,20 +1108,22 @@ fn constructor_name_node(c: &Check<'_>, row: u32) -> Option<u32> {
     let cont = dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32;
     let decl = dartq_parser::IdentifierContext::MethodDeclaration as u32;
     let mut fallback = None;
-    c.collect_direct(row).into_iter().find(|&kid| {
-        if c.kind(kid) != NodeKind::Identifier {
-            return false;
-        }
-        match c.field(kid, PayloadField::Context) {
-            Some(ctx) if ctx == cont => true,
-            Some(ctx) if ctx == decl && fallback.is_none() => {
-                fallback = Some(kid);
-                false
+    c.collect_direct(row)
+        .into_iter()
+        .find(|&kid| {
+            if c.kind(kid) != NodeKind::Identifier {
+                return false;
             }
-            _ => false,
-        }
-    })
-    .or(fallback)
+            match c.field(kid, PayloadField::Context) {
+                Some(ctx) if ctx == cont => true,
+                Some(ctx) if ctx == decl && fallback.is_none() => {
+                    fallback = Some(kid);
+                    false
+                }
+                _ => false,
+            }
+        })
+        .or(fallback)
 }
 
 /// The test-harness method names (`isTestMethod`).
@@ -1195,8 +1214,7 @@ impl ReferenceGraph {
         const EXPRESSION_CONT: u32 = Ctx::ExpressionContinuation as u32;
         const CTOR: u32 = Ctx::ConstructorReference as u32;
         const CTOR_CONT: u32 = Ctx::ConstructorReferenceContinuation as u32;
-        const CTOR_CONT_ARGS: u32 =
-            Ctx::ConstructorReferenceContinuationAfterTypeArguments as u32;
+        const CTOR_CONT_ARGS: u32 = Ctx::ConstructorReferenceContinuationAfterTypeArguments as u32;
         const PATTERN_FIELD: u32 = Ctx::PatternFieldName as u32;
         const TYPE_REF: u32 = Ctx::TypeReference as u32;
         const META_REF: u32 = Ctx::MetadataReference as u32;
@@ -1293,8 +1311,10 @@ impl ReferenceGraph {
                 }
             }
         }
-        let preview_resolves =
-            import_uris.iter().any(|uri| uri.contains("widget_previews")) && !declares_preview;
+        let preview_resolves = import_uris
+            .iter()
+            .any(|uri| uri.contains("widget_previews"))
+            && !declares_preview;
         // The const aliases (`const entryPoint = pragma('vm:entry-point')`,
         // `const preview = Preview()`): `_isExemptingAnnotation` follows
         // them through `computeConstantValue`, so `@entryPoint` reads
@@ -1318,9 +1338,11 @@ impl ReferenceGraph {
                         else {
                             continue;
                         };
-                        let Some(init) = c.collect_direct(var).into_iter().find(|&kid| {
-                            c.kind(kid) == NodeKind::VariableInitializer
-                        }) else {
+                        let Some(init) = c
+                            .collect_direct(var)
+                            .into_iter()
+                            .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer)
+                        else {
                             continue;
                         };
                         let kids = c.collect_direct(init);
@@ -1396,7 +1418,11 @@ impl ReferenceGraph {
                     if lexeme == "=" || lexeme == "new" || lexeme == "const" {
                         continue;
                     }
-                    if lexeme.chars().next().is_none_or(|ch| !(ch.is_alphabetic() || ch == '_')) {
+                    if lexeme
+                        .chars()
+                        .next()
+                        .is_none_or(|ch| !(ch.is_alphabetic() || ch == '_'))
+                    {
                         break;
                     }
                     let next = (token + 1).min(last);
@@ -1436,7 +1462,9 @@ impl ReferenceGraph {
                 }
             }
             for source in &attribution {
-                deps.entry(source.clone()).or_default().extend_from_slice(keys);
+                deps.entry(source.clone())
+                    .or_default()
+                    .extend_from_slice(keys);
             }
         };
         let constant_patterns: Vec<core::ops::Range<u32>> = c
@@ -1590,8 +1618,8 @@ impl ReferenceGraph {
                         c.field(row, field)
                             .filter(|&token| token != dartq_ast::TOKEN_NONE)
                     };
-                    let type_token = named(PayloadField::SecondName)
-                        .or_else(|| named(PayloadField::FirstName));
+                    let type_token =
+                        named(PayloadField::SecondName).or_else(|| named(PayloadField::FirstName));
                     if let Some(token) = type_token {
                         let lexeme = c.lexeme(token);
                         if alias_like.contains(lexeme) {
@@ -1690,7 +1718,9 @@ impl ReferenceGraph {
                 let container = c.lexeme(name).to_owned();
                 for (super_name, _) in supertypes(c, row) {
                     count_keys(&mut uses, &[super_name.to_owned()]);
-                    deps.entry(container.clone()).or_default().push(super_name.to_owned());
+                    deps.entry(container.clone())
+                        .or_default()
+                        .push(super_name.to_owned());
                 }
             }
         }
@@ -1780,7 +1810,8 @@ fn credit_member_names(
             NodeKind::Method => {
                 if let Some(name) = member_name(c, member) {
                     let token = if c.kind(name) == NodeKind::OperatorName {
-                        c.field(name, PayloadField::Name).unwrap_or_else(|| c.head_token(name))
+                        c.field(name, PayloadField::Name)
+                            .unwrap_or_else(|| c.head_token(name))
                     } else {
                         c.head_token(name)
                     };
@@ -1853,12 +1884,14 @@ fn attribution_keys(c: &Check<'_>, row: u32) -> Vec<String> {
             NodeKind::Constructor | NodeKind::Factory => {
                 if let Some(container) = enclosing_container_name(c, node) {
                     let written = constructor_name_node(c, node);
-                    let head = written.map_or_else(
-                        || c.head_token(node),
-                        |name| c.head_token(name),
-                    );
+                    let head =
+                        written.map_or_else(|| c.head_token(node), |name| c.head_token(name));
                     let head_lexeme = c.lexeme(head);
-                    let member = if head_lexeme == container { "new" } else { head_lexeme };
+                    let member = if head_lexeme == container {
+                        "new"
+                    } else {
+                        head_lexeme
+                    };
                     keys.push(format!("{container}.{member}"));
                     if member != "new" {
                         keys.push(member.to_owned());
@@ -1868,7 +1901,8 @@ fn attribution_keys(c: &Check<'_>, row: u32) -> Vec<String> {
             NodeKind::Method | NodeKind::TopLevelMethod => {
                 if let Some(name) = member_name(c, node) {
                     let token = if c.kind(name) == NodeKind::OperatorName {
-                        c.field(name, PayloadField::Name).unwrap_or_else(|| c.head_token(name))
+                        c.field(name, PayloadField::Name)
+                            .unwrap_or_else(|| c.head_token(name))
                     } else {
                         c.head_token(name)
                     };
@@ -1935,9 +1969,11 @@ fn attribution_keys(c: &Check<'_>, row: u32) -> Vec<String> {
 /// credits the member, not its container).
 fn doc_owner(c: &Check<'_>, candidates: &[u32], token: u32) -> Option<u32> {
     candidates.iter().copied().find_map(|row| {
-        c.unit.ast.token_range(row).contains(&token).then(|| {
-            doc_owner(c, &member_rows(c, row), token).unwrap_or(row)
-        })
+        c.unit
+            .ast
+            .token_range(row)
+            .contains(&token)
+            .then(|| doc_owner(c, &member_rows(c, row), token).unwrap_or(row))
     })
 }
 
@@ -2016,13 +2052,11 @@ fn external_type_position(c: &Check<'_>, row: u32) -> bool {
         // child before the parameter group; parameter types sit inside it.
         NodeKind::Method => {
             mod_flags(c.unit.ast, owner) & EXTERNAL_MEMBER_BIT != 0
-                && c
-                    .collect_direct(owner)
+                && c.collect_direct(owner)
                     .into_iter()
                     .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
                     .is_some_and(|params| {
-                        c.unit.ast.token_range(top).start
-                            < c.unit.ast.token_range(params).start
+                        c.unit.ast.token_range(top).start < c.unit.ast.token_range(params).start
                     })
         }
         // `external C? c;` — the written type of an external field /
@@ -2078,9 +2112,7 @@ fn carries_pragma_entry(c: &Check<'_>, wrapper: u32, row: u32) -> bool {
         else {
             continue;
         };
-        if c.lexeme(head) == "pragma"
-            && first_string_argument(c, &kids) == Some("vm:entry-point")
-        {
+        if c.lexeme(head) == "pragma" && first_string_argument(c, &kids) == Some("vm:entry-point") {
             return true;
         }
     }

@@ -87,8 +87,7 @@ fn same_type_elements_still_spell() {
 /// unchanged `int` face.
 #[test]
 fn spread_operand_comma_still_separates() {
-    let f =
-        Fixture::parse("void f() async {\n  List<String> z = [];\n  await [...z, 1];\n}\n");
+    let f = Fixture::parse("void f() async {\n  List<String> z = [];\n  await [...z, 1];\n}\n");
     let lints = f.run_semantic(&one_rule("await_only_futures"));
     assert_eq!(lints.len(), 1, "{lints:?}");
     assert_eq!(

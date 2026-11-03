@@ -383,21 +383,13 @@ mod tests {
                 "\ntypedef T = Function(bool p);",
                 &[(2, 22, 6)],
             ),
-            (
-                "doc_bad_0",
-                "void f(bool b) {}",
-                &[(1, 8, 6)],
-            ),
+            ("doc_bad_0", "void f(bool b) {}", &[(1, 8, 6)]),
             (
                 "doc_bad_1",
                 "Task(true);\nTask(false);\nListBox(false, true, true);\nButton(false);",
                 &[],
             ),
-            (
-                "doc_good_0",
-                "void f({bool b = false}) {}",
-                &[],
-            ),
+            ("doc_good_0", "void f({bool b = false}) {}", &[]),
             (
                 "doc_good_1",
                 "Task.oneShot();\nTask.repeating();\nListBox(scroll: true, showScrollbars: true);\nButton(ButtonState.enabled);",
@@ -435,4 +427,5 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    }}
+    }
+}

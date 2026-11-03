@@ -151,17 +151,12 @@ fn arrow_admits(c: &Check<'_>, declaration: u32, real: u32, node: u32, awaited: 
         return false;
     }
     let body = &kids[..kids.len() - 1];
-    if let Some(literal) = body
-        .iter()
-        .rev()
-        .copied()
-        .find(|&row| {
-            matches!(
-                c.kind(row),
-                NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
-            ) && belongs_to(c, row, node)
-        })
-    {
+    if let Some(literal) = body.iter().rev().copied().find(|&row| {
+        matches!(
+            c.kind(row),
+            NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
+        ) && belongs_to(c, row, node)
+    }) {
         let index = if c.kind(literal) == NodeKind::SetOrMapLiteral {
             map_index(c, literal, node)
         } else {
@@ -202,12 +197,14 @@ pub(super) fn entry_containing(c: &Check<'_>, literal: u32, inner: u32) -> Optio
     let mut pending: Vec<u32> = Vec::new();
     pending.extend(c.children(literal).start..c.children(literal).end);
     if let Some(owner) = c.unit.ast.parent(literal) {
-        pending.extend((c.children(owner).start..c.children(owner).end).filter(|&row| {
-            row != literal && {
-                let span = c.byte_span(row);
-                span.start >= extent.start && span.start <= extent.end
-            }
-        }));
+        pending.extend(
+            (c.children(owner).start..c.children(owner).end).filter(|&row| {
+                row != literal && {
+                    let span = c.byte_span(row);
+                    span.start >= extent.start && span.start <= extent.end
+                }
+            }),
+        );
     }
     let mut before: Option<(usize, u32)> = None;
     let mut after: Option<(usize, u32)> = None;
@@ -227,7 +224,9 @@ pub(super) fn entry_containing(c: &Check<'_>, literal: u32, inner: u32) -> Optio
             | NodeKind::ThenControlFlow
             | NodeKind::ElseControlFlow
             | NodeKind::ForControlFlow
-            | NodeKind::SetOrMapLiteral => pending.extend(c.children(row).start..c.children(row).end),
+            | NodeKind::SetOrMapLiteral => {
+                pending.extend(c.children(row).start..c.children(row).end)
+            }
             _ => {}
         }
     }
@@ -257,11 +256,7 @@ pub(super) fn entry_side(c: &Check<'_>, entry: u32, real: u32) -> usize {
     let key_side = c
         .field(entry, PayloadField::Colon)
         .is_some_and(|colon| c.unit.ast.token_range(real).end <= colon + 1);
-    if key_side {
-        0
-    } else {
-        1
-    }
+    if key_side { 0 } else { 1 }
 }
 
 /// The written type row of the declaration an initializer belongs to:
@@ -469,9 +464,8 @@ fn member_admits(c: &Check<'_>, index: usize, awaited: bool) -> bool {
 /// port of their own: both are SDK callees, and the resolution faces
 /// answer `None` for every unindexed target.
 fn argument_admits(c: &Check<'_>, arguments: u32, real: u32) -> bool {
-    argument_formal_ty(c, arguments, real).is_some_and(|ty| {
-        matches!(ty, Ty::Dynamic | Ty::Named { nullable: true, .. })
-    })
+    argument_formal_ty(c, arguments, real)
+        .is_some_and(|ty| matches!(ty, Ty::Dynamic | Ty::Named { nullable: true, .. }))
 }
 
 /// The callee's formal type at the dispatch node's own argument slot
