@@ -6423,7 +6423,11 @@ impl ParserListener for DiagnoseListener<'_> {
             Some("~") => UnOp::BitNot,
             _ => UnOp::Inc, // `++`/`--` prefixes
         };
-        engine.const_capture.unary_prefix(op);
+        // The operator's own token range rides along: the capture anchors a
+        // failing prefix application at the whole `PrefixExpression`
+        // (operator start through operand end), which it cannot derive from
+        // the operand alone (`-  D` puts whitespace in between).
+        engine.const_capture.unary_prefix(op, operator.range);
         // The unary-operator junction (`unary_operator_invocation_resolver.
         // dart:49`): the operand's row is complete — the parser fires this
         // event after the operand parses.

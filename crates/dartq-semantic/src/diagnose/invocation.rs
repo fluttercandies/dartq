@@ -599,16 +599,21 @@ impl<'a> Engine<'a> {
                     .find(|read| self.cascade_sections.contains(&read.offset))
             })
             .flatten()
-            .filter(|_| {
-                // A chained access ON a section (`..headers.addAll(x)`) pops the
-                // section's own selector row — that send must resolve against
-                // the section's member type, never the latched target. An RHS
-                // leftover never sits at a section offset, so the popped row's
-                // own offset answers which shape this merge is.
-                popped_receiver
-                    .as_ref()
-                    .is_none_or(|row| !self.cascade_sections.contains(&row.range.offset))
-            })
+            // No popped-row disarm. A chained access ON a section
+            // (`..headers.addAll(x)`) merges behind a plain `.`/`?.`, so
+            // `is_section` is false and this latch never runs at all — that
+            // send keeps resolving against the section's member type through
+            // the ordinary merge. A popped row sitting AT a section offset is
+            // therefore always the PREVIOUS section's merged row (the
+            // listener registers every section's row in `cascade_sections`),
+            // and a section never chains on another section's value: upstream
+            // analyzes one target per cascade and every section is a member
+            // access on it (`resolver.dart`'s `visitCascadeExpression`, whose
+            // sections resolve with a null access target — "the property
+            // access target is the target of a cascade";
+            // `static_type_analyzer.dart` types the whole cascade as the
+            // target). The old disarm dropped the latch on exactly that row,
+            // so `A()..x..x..x` folded sections 2+ against section 1's `int`.
             .filter(|last| {
                 // A `;` inside the popped RHS's own span (a `"a;b"` literal) is
                 // part of the expression, not a boundary — the separator probe
@@ -18131,3 +18136,12 @@ mod ticket_3723_tests;
 #[cfg(test)]
 #[path = "ticket_3834_tests.rs"]
 mod ticket_3834_tests;
+
+/// The #3854 pins (every cascade section resolves against the cascade
+/// target: `A()..x..x..x` is silent, the chained-send twin
+/// `..headers.addAll(x)` still resolves against the section's member type,
+/// and a later section's real miss still names the target).
+/// Registered here, not in `tests.rs` (other lanes' file), via `#[path]`.
+#[cfg(test)]
+#[path = "ticket_3854_tests.rs"]
+mod ticket_3854_tests;

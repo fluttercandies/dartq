@@ -2069,8 +2069,12 @@ pub struct ConstCapture {
     stack: Vec<Node>,
     /// Paren/argument/string nesting (the prefix-application depth).
     depth: u32,
-    /// Prefix operators awaiting their operand, with latch depth.
-    pending_unary: Vec<(UnOp, u32)>,
+    /// Prefix operators awaiting their operand: the operator kind, its latch
+    /// depth, and the operator token's own range — the oracle anchors a
+    /// failing prefix application at the whole `PrefixExpression`
+    /// (operator start through operand end), so the range must survive to
+    /// the wrapping site.
+    pending_unary: Vec<(UnOp, u32, SourceRange)>,
     /// `(op, stack len at begin, depth)` per open binary operator.
     bin_latches: Vec<(BinOp, usize, u32)>,
     /// `(stack len at begin, depth)` per open conditional.
@@ -2202,6 +2206,23 @@ fn split_set_or_map(staged: Vec<Node>, has_set_entry: bool, map: bool) -> SetOrM
         // No colon entry and the literal resolved set (a `Set` context or
         // a list/set-typed spread): the bare operands are set elements.
         SetOrMap::Set(staged)
+    }
+}
+
+/// The extent of a prefix application: the operator token's start through
+/// the operand's end.
+///
+/// The oracle anchors a failing prefix expression at the whole
+/// `PrefixExpression` node (`InvalidConstant.forEntity(entity: node)`), so
+/// the span starts at the operator, never at the operand — `!D` spans both
+/// characters and `-  D` spans the whitespace between them too. Deriving it
+/// from the operator token's own range is the invariant; computing it as
+/// `operand.offset - 1` would land inside the operator at best and in the
+/// whitespace at worst.
+fn unary_span(op: SourceRange, operand: SourceRange) -> SourceRange {
+    SourceRange {
+        offset: op.offset,
+        length: operand.end().saturating_sub(op.offset),
     }
 }
 
@@ -2993,9 +3014,13 @@ impl ConstCapture {
 
     // —— operators ———————————————————————————————————————————————————
 
-    pub fn unary_prefix(&mut self, op: UnOp) {
+    /// A prefix `-`/`!`/`~`/`++`/`--`. `span` is the operator token's own
+    /// range: the wrapped node's extent runs from it to the operand's end,
+    /// so whitespace between the two stays inside the anchored span rather
+    /// than being guessed from the operand's offset.
+    pub fn unary_prefix(&mut self, op: UnOp, span: SourceRange) {
         if self.open() {
-            self.pending_unary.push((op, self.depth));
+            self.pending_unary.push((op, self.depth, span));
         }
     }
 
@@ -3185,13 +3210,17 @@ impl ConstCapture {
     /// Wraps the top operand with every prefix operator whose operand
     /// just completed (latched at the current depth).
     fn apply_unaries_at(&mut self, depth: u32) {
-        while self.pending_unary.last().is_some_and(|&(_, d)| d == depth) {
+        while self
+            .pending_unary
+            .last()
+            .is_some_and(|&(_, d, _)| d == depth)
+        {
             let Some(mut node) = self.pop_clamped(self.base()) else {
                 self.pending_unary.pop();
                 continue;
             };
-            let (op, _) = self.pending_unary.pop().expect("checked above");
-            let span = node.span;
+            let (op, _, op_span) = self.pending_unary.pop().expect("checked above");
+            let span = unary_span(op_span, node.span);
             node = Node {
                 expr: Expr::Unary {
                     op,
@@ -3206,9 +3235,9 @@ impl ConstCapture {
     /// Window teardown: applies every surviving prefix (recovery debris
     /// has no completing event).
     fn apply_unaries(&mut self) {
-        while let Some((op, _)) = self.pending_unary.pop() {
+        while let Some((op, _, op_span)) = self.pending_unary.pop() {
             if let Some(mut node) = self.pop_clamped(self.base()) {
-                let span = node.span;
+                let span = unary_span(op_span, node.span);
                 node = Node {
                     expr: Expr::Unary {
                         op,
@@ -6120,3 +6149,9 @@ mod null_aware_access_3825 {
 #[cfg(test)]
 #[path = "ticket_3852_tests.rs"]
 mod ticket_3852_tests;
+
+/// The #3860 pins: a prefix application's fault span covers the operator
+/// token through the operand, not the operand alone.
+#[cfg(test)]
+#[path = "ticket_3860_tests.rs"]
+mod ticket_3860_tests;

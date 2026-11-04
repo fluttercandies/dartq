@@ -24,8 +24,18 @@
 //! Both directions are pinned: every reporting shape has a keep-honest twin
 //! that must stay silent, so the exclusion cannot widen into a blanket
 //! "declarations are never credited".
+//!
+//! Rig: [`crate::diagnose::test_rig::report_ops`], the single-file rig that
+//! mounts the implicit `dart:core` library every real Dart unit has. The
+//! import-free `pins::report` rig cannot express the sibling-member shape:
+//! without the core library the bare `_g` read inside `m()` resolves
+//! `RefTarget::Missing` (the engine reports `undefined_identifier` beside
+//! the `unused_element`), so the sibling-twin assertion was unreachable
+//! there for a reason that has nothing to do with the exclusion under test.
+//! Probed both ways: the same source analyzed through `report_ops` is
+//! silent, exactly as the oracle is.
 
-use super::pins::report;
+use crate::diagnose::test_rig::report_ops as report;
 
 /// The `unused_element` rows of `report`, as (offset, message) pairs — the
 /// message carries the `{0}` displayName the assertions key on.
