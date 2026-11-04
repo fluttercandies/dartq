@@ -729,7 +729,7 @@ impl<'a> Engine<'a> {
     /// through the same unresolvable head). Each face suppresses here:
     /// `None` keeps the under-report posture for everything that is not
     /// decidable as InvalidType.
-    fn checked_operand_ty(&self, tail: usize) -> Option<(Ty, SourceRange)> {
+    pub(crate) fn checked_operand_ty(&self, tail: usize) -> Option<(Ty, SourceRange)> {
         let (ty, probe) = self.unary_operand_ty(tail)?;
         // The operand token's own `refs` miss: a bare read (`x`), a
         // callee (`x()` — an InvalidType invocation's result is
@@ -846,7 +846,7 @@ impl<'a> Engine<'a> {
     /// folds into the answered face, and the hop count caps the
     /// recovered cycle (`T extends T`). A non-parameter head or a bound
     /// the captures never staged returns the operand verbatim.
-    fn operand_extension_receiver(
+    pub(crate) fn operand_extension_receiver(
         &self,
         head: StringId,
         ty: Ty,

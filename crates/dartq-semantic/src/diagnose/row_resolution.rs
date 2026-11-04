@@ -2110,6 +2110,7 @@ impl<'a> Engine<'a> {
             Receiver::Unknown => {
                 if let Some(ty) = self.recv_expression_ty(row.range) {
                     if self.potentially_nullable(ty)
+                        && !self.operand_row_invalid_bounded(row.range)
                         && !self.null_aware_members.contains(&row.range.offset)
                         && !self.operator_face_extension_resolved(ty, row)
                     {
@@ -2752,6 +2753,12 @@ impl<'a> Engine<'a> {
                         // verdict — the same suppression the member sites
                         // take); `UnsafeSingle` keeps the report.
                         if self.potentially_nullable(ty)
+                            // An invalid-bounded operand short-circuits the
+                            // `isNullable` tail upstream (see
+                            // [`Self::operand_row_invalid_bounded`]): the
+                            // `Missing?`/`T extends X?` faces report their
+                            // own `undefined_class` row only.
+                            && !self.operand_row_invalid_bounded(row.range)
                             && !self.null_aware_members.contains(&row.range.offset)
                             // A `?[` index shorts the same way a `?.` member
                             // access does: the bracket's null-aware merge
@@ -2891,6 +2898,12 @@ impl<'a> Engine<'a> {
                             // family owns the row (probed 3.13.7: `x++` on
                             // `Never` is silent).
                         } else if self.potentially_nullable(ty)
+                            // The compound/unary twin takes the same
+                            // invalid-bounded short-circuit the direct
+                            // operator arm above does (`x += 1` on a
+                            // `T extends X?` names only the bound's
+                            // `undefined_class`).
+                            && !self.operand_row_invalid_bounded(row.range)
                             && !self.null_aware_members.contains(&row.range.offset)
                             && !self.operator_face_extension_resolved(ty, row)
                         {
@@ -4261,6 +4274,38 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the row's operand is invalid-bounded — upstream's
+    /// `isInvalidBounded` short-circuit (type_property_resolver.dart:87-94)
+    /// runs BEFORE the `isNullable` tail, so an operand whose static face
+    /// involves an unresolvable name reports its own
+    /// `undefined_class`/`undefined_identifier` row alone and never the
+    /// shared unchecked code (`void f() { Missing? x; x + 1; }` is the
+    /// `UNDEFINED_CLASS` row upstream, and `T extends X?`'s `t + t` the
+    /// same — the bound chain is what makes the parameter head invalid).
+    /// The question is the operand staging pass's own
+    /// [`Engine::checked_operand_ty`] verdict: `None` there IS that pass's
+    /// InvalidType read (an unresolvable head on the operand's own type or
+    /// on a bound hop, a `refs` miss on the operand or on a selector
+    /// tail's receiver), so the two passes share one implementation of the
+    /// rule. The operand's tail token comes from the row's own span; a
+    /// span that recovers no token of its own keeps the report.
+    fn operand_row_invalid_bounded(&self, span: SourceRange) -> bool {
+        let tokens = self.tokens.as_slice();
+        let mut tail = tokens.partition_point(|token| token.utf16_offset < span.end());
+        while tail > 0 {
+            tail -= 1;
+            let token = &tokens[tail];
+            if token.is_synthetic() {
+                continue;
+            }
+            if token.utf16_offset < span.offset {
+                return false;
+            }
+            return self.checked_operand_ty(tail).is_none();
+        }
+        false
+    }
+
     /// Whether an extension application resolves the operator face a row
     /// spells against the NULLABLE receiver `ty` (the #2815 R2 gate's
     /// suppression): only the `Single` verdict — a face whose `on` type
@@ -4274,6 +4319,14 @@ impl<'a> Engine<'a> {
     /// `x` still resolves `operator +` through the same extension
     /// application (`assignment_expression_resolver.dart`'s compound
     /// consult).
+    ///
+    /// The receiver is the SUBSTITUTED one: upstream `applicableTo`
+    /// subtypes a type parameter through its declared bound (`T extends
+    /// C?` satisfies `on C?`, so `t + t` inside `A<T extends C?>`
+    /// resolves the extension and reports nothing), which the name-level
+    /// [`Self::extension_application`] cannot order on the parameter head
+    /// alone — [`Engine::operand_extension_receiver`] answers the same
+    /// substitution the operand staging pass consults.
     fn operator_face_extension_resolved(&mut self, ty: Ty, row: &Row) -> bool {
         let (read, write) = self.operator_spellings(row);
         let adjacent = if read.is_none() && write.is_none() {
@@ -4285,6 +4338,7 @@ impl<'a> Engine<'a> {
         let Ty::Named { name, .. } = ty else {
             return false;
         };
+        let (name, ty) = self.operand_extension_receiver(name, ty, row.range.offset);
         // `operator -()` declares the `unary-` face but registers under
         // `-` in the member table (the `-` token is the written spelling);
         // the lookup spelling pair covers both forms.
