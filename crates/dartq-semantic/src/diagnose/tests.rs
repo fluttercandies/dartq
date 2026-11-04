@@ -23667,3 +23667,18 @@ mod ticket_3837_nested_fn_tests;
 #[cfg(test)]
 #[path = "ticket_3839_tests.rs"]
 mod ticket_3839_tests;
+
+// —— #3861 (invalid-source gate over keyword type arguments) ——
+
+// —— #41983 (a cascade section's discarded value is never a void use) ——
+#[cfg(test)]
+#[path = "ticket_41983_tests.rs"]
+mod ticket_41983_tests;
+
+
+// —— #3856 (the duplicate_field_formal_parameter row swap) ——
+// The formal-parameter scope reports the pair code when BOTH colliding
+// claims are `this.x` formals; the capture bit rides `DuplicateDecl`.
+#[cfg(test)]
+#[path = "ticket_3856_tests.rs"]
+mod ticket_3856_tests;

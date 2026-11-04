@@ -5548,12 +5548,11 @@ impl ParserListener for DiagnoseListener<'_> {
             });
         // The `void`-receiver face (#3249): a cascade section's target is
         // consumed exactly like a plain member access's receiver
-        // (`a..m()` reports at the target, `a..m` at the member). Resolved
-        // before the merge folds the target row away.
-        if let Some(pos) = engine.access_receiver_index(operator.range.offset)
-            && let Some(selector) = engine.access_selector_span(operator)
-        {
-            engine.emit_void_member_receiver(pos, selector);
+        // (`a..m()` reports at the target, `a..m` at the member). The
+        // section's target is the CASCADE TARGET, never the row the merge
+        // is about to fold — see [`Self::emit_cascade_section_void_target`].
+        if let Some(selector) = engine.access_selector_span(operator) {
+            engine.emit_cascade_section_void_target(selector);
         }
         engine.merge_member(is_null_aware, operator.range, chain_end, member_ident);
         // The merged row is the section's selector: its discarded value
@@ -15679,6 +15678,48 @@ impl Engine<'_> {
             self.invocation_span(range)
                 .or_else(|| self.property_access_span(range))
                 .unwrap_or(range)
+        } else {
+            selector
+        };
+        if !self.void_result_reported_at(anchor) {
+            self.emit(SemanticCode::UseOfVoidResult, anchor, "", "");
+        }
+    }
+
+    /// The `void`-receiver face of a cascade section: every section's access
+    /// target is the CASCADE TARGET, never the previous section's value
+    /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+    /// resolver.dart's `visitCascadeExpression` resolves each section with a
+    /// null access target — "the property access target is the target of a
+    /// cascade" — and `static_type_analyzer.dart` types the whole cascade as
+    /// that target). [`Self::access_receiver_index`] answers the closest row
+    /// wholly before the `..`, which from the SECOND section on is the
+    /// previous section's merged row: a cascade whose sections return `void`
+    /// (`<int>[]..add(0)..add(1)…`) then hands this face a `void` receiver
+    /// for every section and reports one row per section, while the oracle
+    /// answers none (the target types `List<int>`).
+    ///
+    /// The `begin_cascade` frame carries both halves of the real target: the
+    /// type it resolved (`cascade_target_tys`) and its span
+    /// (`cascade_target_spans`) — the `reopened` continuation case already
+    /// stashes the cascade's own target type there. The anchor split is
+    /// [`Self::emit_void_member_receiver`]'s: a section send consumes the
+    /// target node (oracle: `v()..m()..m()` reports once at `v()`), a
+    /// read/write section its own member name (`v()..x` reports at `x`).
+    fn emit_cascade_section_void_target(&mut self, selector: SourceRange) {
+        let Some((ty, _)) = self.cascade_target_tys.last().copied() else {
+            return;
+        };
+        if ty != Ty::Void {
+            return;
+        }
+        let Some(target) = self.cascade_target_spans.last().copied() else {
+            return;
+        };
+        let anchor = if self.call_opens_at(selector.end()) {
+            self.invocation_span(target)
+                .or_else(|| self.property_access_span(target))
+                .unwrap_or(target)
         } else {
             selector
         };
