@@ -143,6 +143,17 @@ mod exit {
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
+    // `flutter` PATH shim: when argv0 names this binary `flutter` (the
+    // symlink `dartq init` puts on PATH) or DARTQ_SHIM is set, the
+    // process IS the shim — config discovery, cache logic, and the
+    // child spawn replace the usual CLI entirely, before any argument
+    // parsing (the child gets the original OsString argv, never a
+    // lossy copy).
+    if dartq_commands::bcache::is_shim_invocation(std::env::args_os().next().as_deref()) {
+        let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let code = dartq_commands::bcache::run_flutter_shim(&raw);
+        return ExitCode::from(u8::try_from(code).unwrap_or(exit::INTERNAL_ERROR));
+    }
     // Lossy argv decode: `env::args` panics (exit 101) on a non-UTF-8
     // argument, ahead of any parse; the lossy spelling keeps the process in
     // control — an invalid path fails downstream resolution as the ordinary
@@ -179,6 +190,9 @@ fn run(args: &[String]) -> u8 {
             command: Some(Command::Compatibility(compat_args)),
         }) => compat::run_entry(&compat_args),
         Ok(Cli {
+            command: Some(Command::Bcache(bcache_args)),
+        }) => bcache(&bcache_args),
+        Ok(Cli {
             command: Some(Command::Daemon(daemon_args)),
         }) => daemon(&daemon_args),
         Ok(Cli {
@@ -202,6 +216,7 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Events(events_args)),
         }) => events::run_entry(&events_args),
+        Ok(Cli { command: Some(Command::Init) }) => init(),
         Ok(Cli {
             command: Some(Command::Mcp(mcp_args)),
         }) => mcp::run_entry(&mcp_args),
@@ -259,6 +274,10 @@ enum Command {
     /// compatibility matrix. `compatibility` stays as a hidden alias.
     #[command(name = "compat", alias = "compatibility")]
     Compatibility(compat::CompatArgs),
+    /// Manage the Flutter build cache — the `flutter` PATH shim's
+    /// content-addressed store: `stats` prints a one-line JSON summary,
+    /// `gc` runs the budget/LRU pass and prints its report.
+    Bcache(BcacheArgs),
     /// Serve the RPC daemon over stdin/stdout (one client; overlay edits +
     /// full diagnostic pushes). Hidden — a protocol face; the resident
     /// session layer supersedes it for interactive use.
@@ -301,6 +320,10 @@ enum Command {
     /// (`session` handle) or the cold-analysis progress snapshot
     /// (`progress` handle — files scanned, current package).
     Events(events::EventsArgs),
+    /// Set up this Flutter project for dartq: write a documented
+    /// `dartq.yaml` (only when none exists) and install the `flutter`
+    /// PATH shim into `~/.dartq/bin`.
+    Init,
     /// Serve the MCP stdio face: every tool mirrors a CLI verb and
     /// converges on the worktree's resident session — one engine for
     /// CLI, events, and MCP clients alike.
@@ -2537,6 +2560,101 @@ fn max_rss_bytes() -> Option<u64> {
 #[cfg(not(unix))]
 fn max_rss_bytes() -> Option<u64> {
     None
+}
+
+/// The `bcache` maintenance face.
+#[derive(Args)]
+struct BcacheArgs {
+    #[command(subcommand)]
+    cmd: BcacheFace,
+}
+
+#[derive(Subcommand)]
+enum BcacheFace {
+    /// Print the store's one-line JSON stats.
+    Stats,
+    /// Run the budget/LRU garbage-collection pass.
+    Gc,
+}
+
+/// `dartq init`: project scaffolding plus the shim install. The report
+/// is human-facing prose on stdout — the command is interactive setup,
+/// not a machine face.
+fn init() -> u8 {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    match dartq_commands::bcache::init(&cwd) {
+        Ok(report) => {
+            if report.config_written {
+                println!("wrote {}", report.config_path.display());
+            } else {
+                println!("{} already present", report.config_path.display());
+            }
+            if report.shim_installed {
+                println!("shim: {}", report.shim_path.display());
+            } else {
+                println!(
+                    "shim: {} (not installed: occupied by a non-symlink)",
+                    report.shim_path.display()
+                );
+            }
+            if let Some(export) = report.path_missing {
+                println!("{export}");
+            }
+            exit::CLEAN
+        }
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// `dartq bcache stats|gc`: the build cache's maintenance faces, one
+/// JSON line on stdout each (the machine-channel convention). A missing
+/// `build_cache` section maintains the default store.
+fn bcache(args: &BcacheArgs) -> u8 {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    let config = match dartq_commands::bcache::discover_shim_config(&cwd) {
+        Ok(Some(config)) => config,
+        Ok(None) => dartq_commands::bcache::default_shim_config(),
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            return exit::USAGE;
+        }
+    };
+    let value = match args.cmd {
+        BcacheFace::Stats => dartq_commands::bcache::bcache_stats(&config)
+            .map(|stats| serde_json::to_value(stats)),
+        BcacheFace::Gc => dartq_commands::bcache::bcache_gc(&config)
+            .map(|report| serde_json::to_value(report)),
+    };
+    let value = match value {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    if write_json_value(&mut io::stdout().lock(), &value).is_err() {
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
 }
 
 #[cfg(test)]

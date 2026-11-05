@@ -44,6 +44,7 @@
 pub use pkg_label::locate;
 
 pub mod analyze;
+pub mod bcache;
 pub mod check;
 pub mod compat;
 pub mod config;

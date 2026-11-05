@@ -1,0 +1,30 @@
+[package]
+name = "dartq-bcache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Content-addressed Flutter build cache: cross-worktree artifact sharing with content-keyed entries and deduplicated blobs."
+repository.workspace = true
+categories = ["development-tools::build-utils", "caching"]
+keywords = ["dart", "flutter", "cache", "build"]
+
+[dependencies]
+# The `DartDefines` build-system define the predicted build-dir name
+# recomputes: each `k=v` pair rides as padded standard base64.
+base64 = { workspace = true }
+blake3 = { workspace = true }
+md-5 = { workspace = true }
+memchr = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

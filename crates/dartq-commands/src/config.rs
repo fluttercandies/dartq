@@ -56,6 +56,35 @@ pub struct DartqConfig {
     pub cache: Option<CacheDefaults>,
     /// The package-discovery policy (the `packages` face).
     pub packages: Option<PackagesConfig>,
+    /// The `flutter` shim's build-cache opt-in.
+    pub build_cache: Option<BuildCacheConfig>,
+}
+
+/// The `build_cache:` section — the `flutter` PATH shim's build cache.
+/// Every key is optional; an absent (or all-commented, i.e. null)
+/// section leaves the shim a pure passthrough, which is the
+/// zero-config contract: existing dartq behavior stays byte-identical.
+///
+/// Unlike the top level (unknown keys ignored for forward
+/// compatibility), unknown keys inside this section are a structured
+/// [`ConfigError::Invalid`]: the section gates shell-visible behavior,
+/// so a typo must fail loud rather than silently disable the cache.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildCacheConfig {
+    /// The CAS store root; `~` expands at consumption and the store
+    /// layer appends its layout version. Default
+    /// `$XDG_CACHE_HOME/dartq/cas`, falling back to
+    /// `~/.cache/dartq/cas`.
+    pub root: Option<PathBuf>,
+    /// The store size budget in GiB. Default 20.
+    pub budget_gb: Option<u64>,
+    /// Seconds after a hit during which an entry is unevictable.
+    /// Default 3600.
+    pub grace_secs: Option<u64>,
+    /// An explicit flutter binary (default: `$DARTQ_FLUTTER`, then a
+    /// PATH search that skips the shim's own directory).
+    pub flutter: Option<PathBuf>,
 }
 
 /// The `packages:` section — how `dartq packages` (and every
@@ -340,6 +369,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         memory: raw.memory,
         cache: raw.cache,
         packages: raw.packages,
+        build_cache: raw.build_cache,
     })
 }
 
@@ -352,6 +382,7 @@ struct RawConfig {
     memory: Option<MemoryDefaults>,
     cache: Option<CacheDefaults>,
     packages: Option<PackagesConfig>,
+    build_cache: Option<BuildCacheConfig>,
 }
 
 #[derive(Deserialize)]
@@ -567,5 +598,57 @@ mod tests {
         assert!(matches!(load(&bare), Err(ConfigError::Invalid(_))));
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&bare).ok();
+    }
+
+    /// The `build_cache` section parses through with its typed fields.
+    #[test]
+    fn build_cache_section_parses_with_typed_fields() {
+        let root = fixture("bcache");
+        write_config(
+            &root,
+            "build_cache:\n  root: ~/cas-root\n  budget_gb: 5\n  grace_secs: 60\n  flutter: /opt/flutter/bin/flutter\n",
+        );
+        let config = load(&root).expect("config").expect("some");
+        let section = config.build_cache.expect("build_cache");
+        assert_eq!(section.root, Some(PathBuf::from("~/cas-root")));
+        assert_eq!(section.budget_gb, Some(5));
+        assert_eq!(section.grace_secs, Some(60));
+        assert_eq!(
+            section.flutter,
+            Some(PathBuf::from("/opt/flutter/bin/flutter"))
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Absent file, absent section, and an all-commented (null) section
+    /// all read as `None`: the zero-config passthrough contract.
+    #[test]
+    fn build_cache_absent_or_null_section_is_none() {
+        let root = fixture("babsent");
+        assert!(load(&root).expect("absent file").is_none());
+        write_config(&root, "version: 1\ncache:\n  size_limit_gib: 10\n");
+        let config = load(&root).expect("config").expect("some");
+        assert!(config.build_cache.is_none());
+        write_config(&root, "build_cache:\n  # root: ~/.cache/dartq/cas\n");
+        let config = load(&root).expect("config").expect("some");
+        assert!(
+            config.build_cache.is_none(),
+            "a null (all-commented) section is absent"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An unknown key inside the section is a structured error, never a
+    /// silent skip.
+    #[test]
+    fn build_cache_unknown_key_is_invalid() {
+        let root = fixture("binvalid");
+        write_config(&root, "build_cache:\n  budget_gib: 5\n");
+        let error = load(&root).expect_err("unknown key must be Invalid");
+        assert!(
+            matches!(error, ConfigError::Invalid(ref message) if message.contains("budget_gib")),
+            "structured: {error}"
+        );
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -13,6 +13,7 @@ categories = ["development-tools"]
 [dependencies]
 dartq-ai = { workspace = true }
 dartq-ast = { workspace = true }
+dartq-bcache = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-engine = { workspace = true }
 dartq-flow = { workspace = true }
