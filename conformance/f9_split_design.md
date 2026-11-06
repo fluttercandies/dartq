@@ -12,11 +12,11 @@ Decisions taken autonomously in this recon (no user questions, per brief):
   "版本钉死链" requires the reference source and the oracle to be the same pin;
   the analyzer sources below are line-cited against `dart-sdk-3.13.7`.
 - Classified the F9 rows against a **stale** snapshot rather than re-running
-  the sweep (the brief forbids oracle runs). §1 states exactly how stale and
+  the sweep (the brief forbids oracle runs). section 1 states exactly how stale and
   what that does to the yield estimate.
 - Treated `base_transitivity` extras as "already closed by #3161" only after
   reconstructing the pre-#3161 code path from `git show 7ff55168`; the proof is
-  in §4.A, not assumed.
+  in section 4.A, not assumed.
 
 ---
 
@@ -39,7 +39,7 @@ What is actually left is three narrow, independent sub-seams, none of which is
 
 S1 and S2 are pure *suppression* work (delete rows). S3 is the only place that
 could still be a real logic gap, and it needs one cheap probe before dispatch
-(§6).
+(section 6).
 
 ---
 
@@ -66,7 +66,7 @@ Two consequences:
    drive split (A4), the `with`-entry span defect (A5) and the Pass-5
    mis-shaped base row (A6) — all five fixed.
 2. The extra side is **not** `~200` uniform rows: it splits cleanly into
-   "already fixed by A6" and "still live" (§4).
+   "already fixed by A6" and "still live" (section 4).
 
 **Re-census cost:** one `conformance sweep` + the F9 code filter (the same
 one-liner used here). Must run before the ticket is sized. Everything below is
@@ -179,7 +179,7 @@ Enum rides the class drive with a null superclass
 `BaseOrFinalTypeVerifier` is a **separate verifier**, driven from the resolver
 (`resolver.dart:2370` class, `:2384` class type alias / named mixin
 application, `:3665` mixin) — **not** inside `_checkClassInheritance`, therefore
-**not** subject to the §3.1 gates. That asymmetry is a hard constraint on the
+**not** subject to the section 3.1 gates. That asymmetry is a hard constraint on the
 fix: the gate must suppress passes 1–4 and must leave pass 5 alone.
 
 `base_or_final_type_verifier.dart` decision order:
@@ -232,7 +232,7 @@ port.
 | `class` (none) | extends/implements/with/on all legal | all legal |
 | `base class` / `base mixin` | extends/implements/with legal **iff** the subtype is `base`/`final`/`sealed`; `on` legal | **implements** illegal (`base_class_implemented_outside_of_library` / `base_mixin_...`); extends/with legal (a `base` super may be extended from anywhere — no type-family rule) |
 | `interface class` | nothing special | `extends` illegal (`interface_class_extended_outside_of_library`); implements/with legal |
-| `final class` | subtype must be `base`/`final`/`sealed` | `extends` illegal, `implements` illegal (with the indirect-final skip, §3.1 pass 3), `on` illegal; subtype row suppressed (carve-out, §3.2 step 6) |
+| `final class` | subtype must be `base`/`final`/`sealed` | `extends` illegal, `implements` illegal (with the indirect-final skip, section 3.1 pass 3), `on` illegal; subtype row suppressed (carve-out, section 3.2 step 6) |
 | `sealed class` | subtype legal (subclassable only here) | extends/with/implements/on **all** illegal (`sealed_class_subtype_outside_of_library`), no `_mayIgnoreClassModifiers` gate |
 | pre-feature library's declaration with a modifier | modifier is an `experiment_not_enabled` error — the element is **not** base/final/sealed | same (see S2) |
 | SDK platform supertype | `_mayIgnoreClassModifiers` may exempt | `dart:ffi` never exempt; other `dart:` exempt only if the use site is SDK or pre-feature |
@@ -278,7 +278,7 @@ confirms the ancestor-naming rule.
 
 ### 4.B — S1: the clause-error drive gate (LIVE, extra-side, ~138 rows)
 
-Upstream §3.1 suppresses the entire outside-library block when the clause has a
+Upstream section 3.1 suppresses the entire outside-library block when the clause has a
 hard error. dartq has no such gate: `plan_modifier_use_sites` runs passes 1–4
 unconditionally.
 
@@ -302,7 +302,7 @@ diagnostics/extends_disallowed_class/ExtendsDisallowedClassTest/test_class_int
 
 **Rule to implement:** before passes 1–4, compute the four clause-error verdicts
 for this container and return no findings if any is true. Pass 5 stays
-unconditional (§3.2).
+unconditional (section 3.2).
 
 **Where the verdicts already exist:** `crates/dartq-semantic/src/diagnose/engine_core.rs:9190`
 `finalize_disallowed_subtypes` already walks *exactly* the four upstream clause
@@ -436,7 +436,7 @@ S3 collapses to the re-census and the ticket is S1+S2 only.
   verdicts from `finalize_disallowed_subtypes`, :9190),
   `crates/dartq-semantic/src/diagnose/overrides.rs`
   (`plan_modifier_use_sites`, :3195; `check_modifier_use_sites`, :3009).
-- **Rule:** §3.1. Class drive = four probes; mixin drive = two probes. Gate
+- **Rule:** section 3.1. Class drive = four probes; mixin drive = two probes. Gate
   passes 1–4 only.
 - **Pin shapes:** the *absence* of
   `ERROR|invalid_use_of_type_outside_library|<file>|<offset>|<len>|"The class 'int' can't be extended outside of its library because it's a final class."`
@@ -455,7 +455,7 @@ S3 collapses to the re-census and the ticket is S1+S2 only.
   `&LibraryClassModifiers`, which `overrides.rs` already holds as
   `self.class_modifiers`), `crates/dartq-semantic/src/diagnose/overrides.rs`
   (constructor sites only).
-- **Rule:** §4.C. Mask to the empty flag set (keep `kind`) when
+- **Rule:** section 4.C. Mask to the empty flag set (keep `kind`) when
   `!class_modifiers.is_enabled(declaring_lib)`.
 - **Pin shapes:** `versioning_A02_t03` — `class_modifiers_lib.dart` at 2.19 must
   yield **zero** `invalid_use_of_type_outside_library` and zero
@@ -471,7 +471,7 @@ S3 collapses to the re-census and the ticket is S1+S2 only.
 
 ### F9-C — S3 probe + residual closure
 
-- **Files:** probe only, then whatever §4.D names.
+- **Files:** probe only, then whatever section 4.D names.
 - **Gate:** if the probe shows current HEAD already emits the A04_t01/t02/t05
   rows, close as "absorbed by #3161" and spend the slot on the re-census.
 
@@ -523,7 +523,7 @@ can run any time (read-only).
 2. **`syntax_base_mixin_A02_t0{1,2}` (8 extras)** are placed under S1 by shape,
    not by proof — classify them during the S1 fix.
 3. **S3's whole-file suppression anomaly** is unexplained by reading; the probe
-   in §4.D is the cheapest resolution and may collapse the entire S3 sub-seam.
+   in section 4.D is the cheapest resolution and may collapse the entire S3 sub-seam.
 4. **`#3161`'s own residual note** ("clause-error gate not modeled", "~40
    non-alias MISSING projected") is the prior art for this design: S1 is the
    item it deferred, S3 is the item it projected. Nothing here contradicts it.
