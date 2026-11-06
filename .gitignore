@@ -54,3 +54,4 @@ tests/plugin-validation/expectations/
 # pub build artifacts under tool packages — regenerated per run
 # (same posture as tests/plugin-validation/parity/*/.dart_tool/)
 tools/*/.dart_tool/
+conformance/mocks/.dart_tool/
