@@ -343,7 +343,7 @@ directory per face:
 | --- | --- |
 | `snapshots/` | L2 facts snapshots — one generation directory per save, evicted whole |
 | `store/` | L3 content store — source blobs sharded by content digest, LRU under a byte cap |
-| `cas/v1/` | the `flutter` shim's build cache — flutter tool outputs, content-addressed |
+| `cas/v2/` | the `flutter` shim's build cache — flutter tool outputs, content-addressed |
 | `sessions/` | resident-session registry — runtime state, reported but never collected |
 
 `dartq cache stats` prints one JSON line per face plus a total (read-only).
@@ -362,7 +362,7 @@ dartq binary. With that bin directory ahead of the real flutter on `PATH`,
 
 Caps live in `dartq.yaml`: `cache.size_limit_gib` bounds both analysis
 stores (snapshots and content store; each defaults to 10 GiB), and
-`build_cache.budget_gb` bounds the build cache (default 20 GiB). The
+`build_cache.budget_gb` bounds the build cache (default 40 GiB). The
 analyze and daemon `--cache-size-limit` flag overrides the content cap for
 the run that arms it.
 

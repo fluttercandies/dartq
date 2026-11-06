@@ -21,7 +21,7 @@ use dartq_bcache::{BcacheError, CasStore, GcReport, StoreStats, STORE_LAYOUT_VER
 use crate::config::{BuildCacheConfig, ConfigError, load as load_config};
 
 /// The default store size budget, in GiB.
-const DEFAULT_BUDGET_GB: u64 = 20;
+const DEFAULT_BUDGET_GB: u64 = 40;
 /// The default grace window, in seconds.
 const DEFAULT_GRACE_SECS: u64 = 3600;
 
@@ -35,9 +35,9 @@ const CONFIG_TEMPLATE: &str = "\
 # passthrough until at least one key below is set.
 build_cache:
   # root: ~/.cache/dartq/cas  # CAS store root (~ expands; default honors $XDG_CACHE_HOME)
-  # budget_gb: 20             # store size budget in GiB
+  # budget_gb: 40             # store size budget in GiB
   # grace_secs: 3600          # seconds a recently-hit entry is unevictable
-  # flutter: /path/to/flutter # explicit flutter binary (default: PATH)
+  # flutter: /path/to/flutter # explicit flutter binary (~ expands; default: PATH)
 ";
 
 /// Expands a leading `~` to the home directory — the one tilde form the
@@ -62,7 +62,9 @@ pub fn expand_home(path: &Path) -> PathBuf {
 }
 
 /// The orchestrator config a `build_cache` section (or its defaults)
-/// maps to. `root` gains the store layer's layout version; the budget
+/// maps to. `root` gains the store layer's layout version; `root` and
+/// `flutter` both expand a leading `~` (a literal tilde would hand the
+/// spawn a path the kernel cannot resolve — exit 127); the budget
 /// saturates rather than overflow.
 #[must_use]
 pub fn shim_config(section: &BuildCacheConfig) -> ShimConfig {
@@ -77,7 +79,7 @@ pub fn shim_config(section: &BuildCacheConfig) -> ShimConfig {
             .unwrap_or(DEFAULT_BUDGET_GB)
             .saturating_mul(1024 * 1024 * 1024),
         grace_secs: section.grace_secs.unwrap_or(DEFAULT_GRACE_SECS),
-        flutter_bin: section.flutter.clone(),
+        flutter_bin: section.flutter.as_ref().map(|bin| expand_home(bin)),
     }
 }
 
@@ -131,8 +133,9 @@ pub fn discover_shim_config(dir: &Path) -> Result<Option<ShimConfig>, ConfigErro
 }
 
 /// Whether this process was invoked as the `flutter` shim: argv0's
-/// basename is `flutter` (the PATH symlink's name), or `DARTQ_SHIM` is
-/// set (the explicit spelling for wrappers that rename argv0).
+/// basename is `flutter` (the PATH symlink's name) or `flutter.exe`
+/// (the Windows spelling), or `DARTQ_SHIM` is set (the explicit
+/// spelling for wrappers that rename argv0).
 #[must_use]
 pub fn is_shim_invocation(argv0: Option<&OsStr>) -> bool {
     if std::env::var_os("DARTQ_SHIM").is_some_and(|value| !value.is_empty()) {
@@ -140,7 +143,9 @@ pub fn is_shim_invocation(argv0: Option<&OsStr>) -> bool {
     }
     argv0
         .and_then(|argv0| Path::new(argv0).file_name())
-        .is_some_and(|basename| basename == OsStr::new("flutter"))
+        .is_some_and(|basename| {
+            basename == OsStr::new("flutter") || basename == OsStr::new("flutter.exe")
+        })
 }
 
 /// The shim entry the CLI's argv0 dispatch calls: resolves the config
@@ -365,6 +370,25 @@ mod tests {
         assert_eq!(defaults.grace_secs, DEFAULT_GRACE_SECS);
     }
 
+    /// The `flutter:` key expands `~` exactly like `root:` — the audit's
+    /// 127 case was a literal `~/…` path handed to the spawn.
+    #[test]
+    fn flutter_bin_expands_tilde_like_the_root() {
+        let home = std::env::home_dir().expect("home");
+        let section = BuildCacheConfig {
+            root: Some(PathBuf::from("~/cas")),
+            budget_gb: None,
+            grace_secs: None,
+            flutter: Some(PathBuf::from("~/sdks/flutter")),
+        };
+        let config = shim_config(&section);
+        assert_eq!(
+            config.store_root,
+            home.join("cas").join(STORE_LAYOUT_VERSION)
+        );
+        assert_eq!(config.flutter_bin, Some(home.join("sdks/flutter")));
+    }
+
     #[test]
     fn expand_home_leaves_non_tilde_paths_literal() {
         assert_eq!(
@@ -429,8 +453,14 @@ mod tests {
         assert!(is_shim_invocation(Some(
             OsStr::new("/opt/dartq-shims/flutter")
         )));
+        // The Windows spelling of the shim name, as a pure name check.
+        assert!(is_shim_invocation(Some(OsStr::new("flutter.exe"))));
+        assert!(is_shim_invocation(Some(
+            OsStr::new("/opt/dartq-shims/flutter.exe")
+        )));
         assert!(!is_shim_invocation(Some(OsStr::new("dartq"))));
         assert!(!is_shim_invocation(Some(OsStr::new("/usr/local/bin/dart"))));
+        assert!(!is_shim_invocation(Some(OsStr::new("flutter.exe.bak"))));
         assert!(!is_shim_invocation(None));
     }
 
@@ -449,7 +479,7 @@ mod tests {
         assert!(report.config_written);
         let config = fs::read_to_string(&report.config_path).expect("config");
         assert!(config.contains("build_cache:"));
-        assert!(config.contains("# budget_gb: 20"));
+        assert!(config.contains("# budget_gb: 40"));
         assert!(report.shim_installed);
         assert_eq!(
             fs::read_link(&report.shim_path).expect("symlink"),
