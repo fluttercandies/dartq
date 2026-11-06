@@ -36,8 +36,8 @@
 //! * **Store** ([`store`]): the two-layer CAS — entries addressed by key,
 //!   payload blobs deduplicated by content — with verified atomic ingest
 //!   and refcounted LRU garbage collection. The store root is injected by
-//!   callers (default `$XDG_CACHE_HOME/dartq/cas/{STORE_LAYOUT_VERSION}`,
-//!   falling back to `~/.cache/dartq/cas/{STORE_LAYOUT_VERSION}`).
+//!   callers (default `$XDG_CACHE_HOME/dartq/cas`, falling back to
+//!   `~/.cache/dartq/cas`).
 //! * **Materializer** ([`materialize`], [`fsutil`], [`dill_rewrite`]):
 //!   copy-on-write placement of an entry's directories into a project
 //!   tree, filling only missing files and rewriting the worktree-root
@@ -68,7 +68,7 @@ pub mod store;
 pub mod types;
 
 pub use error::BcacheError;
-pub use store::{CasStore, GcReport, STORE_LAYOUT_VERSION};
+pub use store::{CasStore, GcReport};
 pub use types::{
     BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, FileStamp, KeyInputs, ManifestFile,
     NameRule, PathAnchors, PlacedFile, RewriteKind, StoreStats, TargetSpec, ToolchainFingerprint,

@@ -3,8 +3,7 @@
 //!
 //! # Layout
 //!
-//! Under the root the caller injects (default
-//! `~/.cache/dartq/cas/{STORE_LAYOUT_VERSION}`):
+//! Under the root the caller injects (default `~/.cache/dartq/cas`):
 //!
 //! * `blobs/<hex[0:2]>/<hex>` — immutable payload named by the blake3 of
 //!   its bytes, 256-way sharded. Entries that differ only in their key
@@ -17,6 +16,15 @@
 //!   its content; it exists so a hit never rewrites the manifest.
 //! * `tmp/` — scratch space: every file is written here and renamed into
 //!   place, never written in place.
+//!
+//! # Regenerability
+//!
+//! The store is fully regenerable derived data: deleting it is always
+//! safe (worst case one cold rebuild). Format generations live in the
+//! key preimage (key.rs `FORMAT_LINE`), so a generation change makes old
+//! entries unreachable — equivalent to deletion-without-the-rm — and gc
+//! reclaims their space. A manifest that fails to decode is a miss and
+//! a rebuild, never an error.
 //!
 //! # Write protocol
 //!
@@ -34,8 +42,8 @@
 //!
 //! # Concurrency
 //!
-//! Several dartq processes (one per worktree) may share a store; v2 takes
-//! no locks. Content addressing makes blob publication idempotent — two
+//! Several dartq processes (one per worktree) may share a store; the
+//! store takes no locks. Content addressing makes blob publication idempotent — two
 //! writers of one blob rename identical bytes onto the same name.
 //! Manifests are last-writer-wins per key, and every writer of a key wrote
 //! a valid entry for it. `tmp/` lives under the root, so every rename stays
@@ -97,17 +105,6 @@ use crate::error::{BcacheError, Result};
 use crate::fsutil::{clone_file_hashed, mtime_ns, touch};
 use crate::types::{BlobId, EntryManifest, StoreStats, blob_id_hex, is_hex_digest};
 
-/// The store layout version: the final path component of the default
-/// root (`~/.cache/dartq/cas/v2`), appended by the config glue. Cut
-/// from v1 with no migration and no cross-version reads: 0.1.x is an
-/// alpha under an explicit no-compatibility ruling, and schema drift
-/// inside one version (new manifest enum variants filed under the same
-/// directory) made released binaries treat newer manifests as corrupt —
-/// and their gc delete them. A clean cut removes that class outright:
-/// an old binary never sees a v2 path. v1 is left in place, never read
-/// and never written again; an old binary keeps working on it untouched.
-pub const STORE_LAYOUT_VERSION: &str = "v2";
-
 const BLOBS: &str = "blobs";
 const ENTRIES: &str = "entries";
 const TMP: &str = "tmp";
@@ -149,6 +146,14 @@ pub struct GcReport {
     /// counted so a damaged or drifting store stays visible in every
     /// report instead of failing the pass.
     pub corrupt_manifests: u64,
+    /// Empty entry directories removed: the leftovers of an ingest that
+    /// created its directory but never published a manifest.
+    pub empty_dirs_removed: u64,
+    /// Non-zero only when this pass skipped the walk entirely: a prior
+    /// pass that evicted nothing stopped at a grace-protected entry and
+    /// remembered when its window closes; until this moment a walk is
+    /// provably a no-op. The value is that remembered deadline.
+    pub grace_skipped_until_unix: u64,
 }
 
 impl CasStore {
@@ -290,7 +295,13 @@ impl CasStore {
             let path = self.blob_path(id);
             touch(&path).map_err(io_at(&path))?;
         }
-        self.publish(&self.entry_path(&draft.key), &manifest)
+        self.publish(&self.entry_path(&draft.key), &manifest)?;
+        // The store changed: any gc walk-stability memo is now stale
+        // (this ingest may hold the youngest grace window, or have
+        // freed evictable state). Best-effort — a missed clear only
+        // costs the next gc a walk.
+        let _ = fs::remove_file(self.grace_path());
+        Ok(())
     }
 
     /// Brings the blobs under `budget_bytes` if it can, then deletes every
@@ -309,6 +320,19 @@ impl CasStore {
     /// and the running usage counter is rewritten to the truth this pass
     /// observed (see [`Self::used_bytes`]).
     pub fn gc(&self, budget_bytes: u64, grace_secs: u64, now_unix: u64) -> Result<GcReport> {
+        // The walk-stability memo: a prior pass that evicted nothing and
+        // stopped at a grace-protected entry remembered when that window
+        // closes. Until then a walk is provably a no-op — nothing moves
+        // without an ingest, and ingest clears the memo — so the full
+        // walk (hundreds of milliseconds at store scale) is skipped.
+        if let Some(deadline) = self.grace_deadline()
+            && now_unix < deadline
+        {
+            return Ok(GcReport {
+                grace_skipped_until_unix: deadline,
+                ..GcReport::default()
+            });
+        }
         let entries = self.scan_entries()?;
         let blobs = self.scan_blobs()?;
         let mut report = GcReport {
@@ -352,11 +376,20 @@ impl CasStore {
 
         // Least recently hit first; the directory breaks ties, keeping the
         // order deterministic. Hit times only grow along this order, so the
-        // first grace-protected entry ends the eviction run.
+        // first grace-protected entry ends the eviction run. `grace_edge`
+        // remembers the hit of the entry that ended it for its grace
+        // window (not for the budget): everything older was already
+        // evictable, so no later pass can evict anything until that
+        // entry's window closes.
         live.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         let mut evicted = 0;
+        let mut grace_edge: Option<u64> = None;
         for (last_hit, _, ids) in &live {
-            if kept <= budget_bytes || now_unix.saturating_sub(*last_hit) < grace_secs {
+            if kept <= budget_bytes {
+                break;
+            }
+            if now_unix.saturating_sub(*last_hit) < grace_secs {
+                grace_edge = Some(*last_hit);
                 break;
             }
             for id in ids {
@@ -374,10 +407,16 @@ impl CasStore {
         evict.extend(live.into_iter().take(evicted).map(|(_, dir, _)| dir));
 
         // Manifests go before blobs: at every step of the pass, no
-        // surviving manifest names a deleted blob.
+        // surviving manifest names a deleted blob. A removal that finds
+        // the directory non-empty lost a race against an ingest
+        // re-publishing this very key mid-pass — the eviction simply did
+        // not happen (the entry is live again) and the pass keeps going.
         for dir in &evict {
-            if removed(dir, fs::remove_dir_all(dir))? {
-                report.entries_evicted += 1;
+            match fs::remove_dir_all(dir) {
+                Ok(()) => report.entries_evicted += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if entry_removal_raced(&e) => {}
+                Err(e) => return Err(io_at(dir)(e)),
             }
         }
         let scanned_bytes: u64 = blobs.iter().map(|blob| blob.len).sum();
@@ -416,6 +455,17 @@ impl CasStore {
         // counter to what it observed, healing any drift from lost
         // read-modify-write races between concurrent writers.
         self.set_used(scanned_bytes - blob_bytes_freed)?;
+        // Hygiene: entry directories whose manifest never landed (an
+        // ingest that crashed inside its create-before-publish window)
+        // go once empty, and shards emptied by the pass go with them.
+        report.empty_dirs_removed = self.sweep_empty_entry_dirs();
+        // Re-arm or drop the walk-stability memo: a pass that evicted
+        // nothing and stopped at a grace-protected entry would find
+        // exactly this state again until that window closes.
+        self.remember_grace(match (report.entries_evicted, grace_edge) {
+            (0, Some(last_hit)) => Some(last_hit.saturating_add(grace_secs)),
+            _ => None,
+        });
         Ok(report)
     }
 
@@ -461,6 +511,64 @@ impl CasStore {
 
     fn used_path(&self) -> PathBuf {
         self.root.join("meta").join("used")
+    }
+
+    /// The gc walk-stability memo's path (see [`Self::gc`]).
+    fn grace_path(&self) -> PathBuf {
+        self.root.join("meta").join("gc-grace")
+    }
+
+    /// The remembered earliest moment a gc pass could evict again, when
+    /// a memo applies. Unparsable or absent reads as none.
+    fn grace_deadline(&self) -> Option<u64> {
+        fs::read_to_string(self.grace_path())
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Records (or clears) the gc walk-stability memo. Best-effort: a
+    /// failed write or clear only costs the next gc a full walk.
+    fn remember_grace(&self, deadline: Option<u64>) {
+        let result = match deadline {
+            Some(deadline) => self.publish(&self.grace_path(), format!("{deadline}\n").as_bytes()),
+            None => fs::remove_file(self.grace_path()).map_err(io_at(&self.grace_path())),
+        };
+        let _ = result;
+    }
+
+    /// Removes entry directories whose manifest is gone — the residue
+    /// of an ingest that crashed inside its create-before-publish
+    /// window, or of an eviction that lost its race. Only a truly EMPTY
+    /// directory is taken (`remove_dir`, never the recursive form): a
+    /// directory holding anything belongs to an ingest in flight and is
+    /// left entirely alone. Every failure here is this sweep's own race
+    /// (a concurrent taker or publisher) and is ignored — the next pass
+    /// tries again, idempotently. Shards the sweep empties go too.
+    fn sweep_empty_entry_dirs(&self) -> u64 {
+        let mut taken = 0;
+        let Ok(shards) = list(&self.root.join(ENTRIES)) else {
+            return 0;
+        };
+        for (shard, meta) in shards {
+            if !meta.is_dir() {
+                continue;
+            }
+            let Ok(dirs) = list(&shard) else {
+                continue;
+            };
+            for (dir, meta) in dirs {
+                if !meta.is_dir() || dir.join(MANIFEST).is_file() {
+                    continue;
+                }
+                if fs::remove_dir(&dir).is_ok() {
+                    taken += 1;
+                }
+            }
+            let _ = fs::remove_dir(&shard);
+        }
+        taken
     }
 
     /// Entry and blob counts, total blob bytes, the oldest effective hit,
@@ -922,6 +1030,22 @@ fn removed(path: &Path, result: io::Result<()>) -> Result<bool> {
     }
 }
 
+/// Whether an entry-directory removal hit the re-publish race: the pass
+/// emptied the directory and an ingest re-created its manifest before
+/// the directory itself was taken — the eviction did not happen, the
+/// entry is live again, and the pass keeps going.
+#[cfg(unix)]
+fn entry_removal_raced(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOTEMPTY)
+}
+
+/// The race has no distinct portable error kind on this platform;
+/// unknown errors from a removal keep failing the pass as usual.
+#[cfg(not(unix))]
+fn entry_removal_raced(_e: &io::Error) -> bool {
+    false
+}
+
 /// Whether the error is the filesystem's "no such file" — the publish
 /// retry's signal that a concurrent gc removed the destination's
 /// directory between the mkdir and the rename.
@@ -1296,6 +1420,8 @@ mod tests {
                 blobs_removed: 2,
                 bytes_freed: 17_000,
                 corrupt_manifests: 0,
+                empty_dirs_removed: 0,
+                grace_skipped_until_unix: 0,
             }
         );
         assert_eq!(f.store.lookup(&key(1)).unwrap(), None);
@@ -1317,6 +1443,8 @@ mod tests {
                 blobs_removed: 2,
                 bytes_freed: 6_000,
                 corrupt_manifests: 0,
+                empty_dirs_removed: 0,
+                grace_skipped_until_unix: 0,
             }
         );
         assert_eq!(f.store.lookup(&key(2)).unwrap(), None);
@@ -1437,6 +1565,8 @@ mod tests {
                 blobs_removed: 0,
                 bytes_freed: 0,
                 corrupt_manifests: 3,
+                empty_dirs_removed: 0,
+                grace_skipped_until_unix: 0,
             }
         );
         for n in [1, 2, 4] {
@@ -1509,10 +1639,146 @@ mod tests {
                 blobs_removed: 1,
                 bytes_freed: 64 + 16,
                 corrupt_manifests: 0,
+                empty_dirs_removed: 0,
+                grace_skipped_until_unix: 0,
             }
         );
         assert!(blob_files(&f.root).is_empty());
         assert!(scratch_is_empty(&f.root));
+    }
+
+    /// Store hygiene: an entry directory whose manifest never landed
+    /// (an ingest that crashed inside its create-before-publish window)
+    /// is removed once empty — a manifest-less directory holding a file
+    /// belongs to an ingest in flight and stays — and a shard the pass
+    /// empties goes with it. The sweep is idempotent and never touches
+    /// manifest-bearing directories.
+    #[test]
+    fn store_gc_sweeps_empty_entry_dirs_and_empty_shards() {
+        let f = fixture();
+        let a = source(&f.build, "a", &[b'a'; 32]);
+        put(&f, 1, &[a], 100);
+
+        // The crashed-ingest leftover, alone in a shard of its own.
+        let stray_shard = f.root.join(ENTRIES).join("ef");
+        let stray = stray_shard.join(key(9));
+        fs::create_dir_all(&stray).unwrap();
+        // A manifest-less directory holding a file: an ingest in
+        // flight, never swept.
+        let busy = f.store.entry_path(&key(2)).parent().unwrap().to_path_buf();
+        fs::create_dir_all(&busy).unwrap();
+        fs::write(busy.join("hold"), b"in flight").unwrap();
+
+        let report = f.store.gc(u64::MAX, 0, later()).unwrap();
+        assert_eq!(report.entries_evicted, 0);
+        assert_eq!(report.empty_dirs_removed, 1, "the one empty stray");
+        assert!(!stray.exists(), "the empty stray directory is gone");
+        assert!(!stray_shard.exists(), "the emptied shard is gone");
+        assert!(busy.exists(), "a directory holding anything stays");
+        assert!(
+            f.store.lookup(&key(1)).unwrap().is_some(),
+            "live entries are untouched"
+        );
+
+        // Idempotent: nothing left to sweep.
+        let again = f.store.gc(u64::MAX, 0, later()).unwrap();
+        assert_eq!(again.empty_dirs_removed, 0);
+
+        // And a shard emptied by EVICTION is collected by the same
+        // sweep: drop the last entry of a shard through the budget
+        // path, and the shard does not linger.
+        let b = source(&f.build, "b", &[b'b'; 16]);
+        put(&f, 2, &[b.clone()], 100);
+        fs::remove_file(busy.join("hold")).unwrap();
+        let report = f.store.gc(0, 0, later()).unwrap();
+        assert_eq!(report.entries_evicted, 2);
+        assert!(
+            !f.store.entry_path(&key(1)).parent().unwrap().exists(),
+            "key 1 evicted"
+        );
+        assert!(
+            !f.store.entry_path(&key(2)).parent().unwrap().exists(),
+            "key 2 evicted"
+        );
+        let shards: Vec<String> = fs::read_dir(f.root.join(ENTRIES))
+            .unwrap()
+            .map(|item| item.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            shards.is_empty(),
+            "the emptied shards are collected: {shards:?}"
+        );
+    }
+
+    /// The walk-stability memo: a pass that evicted nothing but stopped
+    /// at a grace-protected entry remembers when its window closes; gc
+    /// calls before that skip the walk entirely (proved by a corrupt
+    /// manifest planted after the memo — a walked pass reports it, a
+    /// skipped one cannot see it), an ingest invalidates the memo, and
+    /// a call at or past the deadline walks again.
+    #[test]
+    fn store_gc_skips_the_walk_within_the_remembered_grace_window() {
+        let f = fixture();
+        let a = source(&f.build, "a", &[b'a'; 40]);
+        put(&f, 1, &[a], 1_000);
+
+        let now = 2_000;
+        let grace = 3_600;
+        let deadline = 1_000 + grace;
+        let first = f.store.gc(0, grace, now).unwrap();
+        assert_eq!(first.entries_before, 1);
+        assert_eq!(first.entries_evicted, 0, "the hit is grace-young");
+        assert_eq!(first.grace_skipped_until_unix, 0, "the pass itself walked");
+        assert_eq!(f.store.grace_deadline(), Some(deadline), "the memo is armed");
+
+        // Within the window the walk is skipped: a corruption planted
+        // after the memo goes unseen.
+        let garbage = f.store.entry_path(&key(5));
+        fs::create_dir_all(garbage.parent().unwrap()).unwrap();
+        fs::write(&garbage, b"\x00\xffnot json").unwrap();
+        let skipped = f.store.gc(0, grace, now + 1).unwrap();
+        assert_eq!(skipped.grace_skipped_until_unix, deadline);
+        assert_eq!(skipped.entries_before, 0, "nothing was walked");
+        assert_eq!(skipped.corrupt_manifests, 0, "the planted corruption is unseen");
+
+        // An ingest invalidates the memo: the next pass walks, finds
+        // the corruption, and evicts it (the pass that did work does
+        // not re-arm).
+        let b = source(&f.build, "b", &[b'b'; 40]);
+        put(&f, 2, &[b], 1_500);
+        assert_eq!(f.store.grace_deadline(), None, "ingest cleared the memo");
+        let walked = f.store.gc(0, grace, now + 1).unwrap();
+        assert_eq!(walked.entries_before, 3, "the walk sees every entry");
+        assert_eq!(walked.corrupt_manifests, 1);
+        assert_eq!(walked.entries_evicted, 1, "the corrupt entry goes");
+        assert_eq!(f.store.grace_deadline(), None, "working passes do not re-arm");
+
+        // A quiet pass re-arms; at the deadline — no longer before it —
+        // the walk happens again.
+        let rearm = f.store.gc(0, grace, now + 1).unwrap();
+        assert_eq!(rearm.entries_evicted, 0);
+        assert_eq!(f.store.grace_deadline(), Some(deadline), "re-armed");
+        let after = f.store.gc(0, grace, deadline).unwrap();
+        assert_eq!(
+            after.grace_skipped_until_unix, 0,
+            "at the deadline the walk happens"
+        );
+        assert_eq!(after.entries_before, 2);
+    }
+
+    /// The eviction race predicate: only the directory-not-empty error
+    /// is the re-publish race; other errors stay errors.
+    #[cfg(unix)]
+    #[test]
+    fn entry_removal_race_is_only_the_not_empty_error() {
+        assert!(entry_removal_raced(&io::Error::from_raw_os_error(
+            libc::ENOTEMPTY
+        )));
+        assert!(!entry_removal_raced(&io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!entry_removal_raced(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "gone"
+        )));
     }
 
     #[test]
@@ -1632,6 +1898,8 @@ mod tests {
                 blobs_removed: 1,
                 bytes_freed: 40,
                 corrupt_manifests: 1,
+                empty_dirs_removed: 0,
+                grace_skipped_until_unix: 0,
             }
         );
         assert_eq!(f.store.lookup(&key(1)).unwrap(), None);
@@ -1688,38 +1956,55 @@ mod tests {
         assert_eq!(f.store.stats().unwrap().corrupt_manifests, 0);
     }
 
-    /// The v2 cut in action: an old v1 root sits beside the v2 root,
-    /// never read and never written again, while v2 works — an old
-    /// binary keeps its own store and can neither judge nor delete v2
-    /// entries.
+    /// The layout sits DIRECTLY under the injected root — no version
+    /// segment between the root and `blobs/`/`entries/`/`tmp/`. The
+    /// versioned-root coexistence machinery is gone by the zero-user
+    /// ruling; key-preimage isolation lives in the key format line
+    /// instead.
     #[test]
-    fn store_v2_open_leaves_a_v1_root_untouched() {
-        assert_eq!(STORE_LAYOUT_VERSION, "v2");
+    fn store_layout_sits_directly_under_the_root() {
         let dir = tempfile::tempdir().unwrap();
         let cas = dir.path().join("cas");
 
-        let v1 = CasStore::open(&cas.join("v1")).unwrap();
-        let old = source(dir.path(), "old.dill", b"v1 kernel bytes");
-        v1.ingest(draft(&key(1), &[old.clone()], 100), &[old])
-            .unwrap();
-        let garbage = v1.entry_path(&key(2));
-        fs::create_dir_all(garbage.parent().unwrap()).unwrap();
-        fs::write(&garbage, b"\x00\xffnot json").unwrap();
-        let before = tree(&cas.join("v1"));
+        let store = CasStore::open(&cas).unwrap();
+        let src = source(dir.path(), "k.dill", b"kernel bytes");
+        store.ingest(draft(&key(1), &[src.clone()], 100), &[src]).unwrap();
+        store.record_hit(&key(1)).unwrap();
 
-        let v2 = CasStore::open(&cas.join(STORE_LAYOUT_VERSION)).unwrap();
-        let fresh = source(dir.path(), "fresh.dill", b"v2 kernel bytes");
-        v2.ingest(draft(&key(1), &[fresh.clone()], 100), &[fresh.clone()])
-            .unwrap();
-        v2.record_hit(&key(1)).unwrap();
-        v2.gc(u64::MAX, 0, later()).unwrap();
-
-        assert_eq!(tree(&cas.join("v1")), before, "v1 is never touched again");
+        assert!(cas.join("blobs").is_dir());
+        assert!(cas.join("entries").is_dir());
+        assert!(cas.join("tmp").is_dir());
+        // First component after the root is the layout dir itself — no
+        // version layer in between.
         assert_eq!(
-            v2.lookup(&key(1)).unwrap().unwrap().dirs[0].files[0].blob,
-            fresh.1
+            store
+                .entry_path(&key(1))
+                .strip_prefix(&cas)
+                .unwrap()
+                .components()
+                .next()
+                .map(|component| component.as_os_str()),
+            Some(std::ffi::OsStr::new("entries")),
+            "the entry dir hangs straight off the root"
         );
-        assert_eq!(v2.lookup(&key(2)).unwrap(), None);
+        let blob = store
+            .lookup(&key(1))
+            .unwrap()
+            .unwrap()
+            .dirs[0]
+            .files[0]
+            .blob;
+        assert_eq!(
+            store
+                .blob_path(&blob)
+                .strip_prefix(&cas)
+                .unwrap()
+                .components()
+                .next()
+                .map(|component| component.as_os_str()),
+            Some(std::ffi::OsStr::new("blobs")),
+            "the blob path hangs straight off the root"
+        );
     }
 
     /// The A12 race as a live drill: ingesters re-referencing blobs on

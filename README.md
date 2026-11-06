@@ -343,7 +343,7 @@ directory per face:
 | --- | --- |
 | `snapshots/` | L2 facts snapshots — one generation directory per save, evicted whole |
 | `store/` | L3 content store — source blobs sharded by content digest, LRU under a byte cap |
-| `cas/v2/` | the `flutter` shim's build cache — flutter tool outputs, content-addressed |
+| `cas/` | the `flutter` shim's build cache — flutter tool outputs, content-addressed |
 | `sessions/` | resident-session registry — runtime state, reported but never collected |
 
 `dartq cache stats` prints one JSON line per face plus a total (read-only).

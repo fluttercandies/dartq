@@ -977,7 +977,7 @@ mod tests {
 
         let config = CacheConfig::discover(&scratch.0).expect("discover");
 
-        assert_eq!(config.bcache.store_root, PathBuf::from("/fixture/cas/v2"));
+        assert_eq!(config.bcache.store_root, PathBuf::from("/fixture/cas"));
         assert_eq!(config.snapshot.root, None);
 
         fs::write(&yaml, "build_cache:\n  typo: 1\n").expect("config");
@@ -1233,7 +1233,7 @@ mod tests {
         assert_eq!(
             lines(vec![
                 StatsRow::Bcache {
-                    root: PathBuf::from("/fixture/cas/v2"),
+                    root: PathBuf::from("/fixture/cas"),
                     cap_bytes: 7,
                     stats: StoreStats {
                         entries: 1,
@@ -1274,7 +1274,7 @@ mod tests {
                 },
             ]),
             concat!(
-                r#"{"face":"bcache","root":"/fixture/cas/v2","cap_bytes":7,"entries":1,"blobs":2,"blob_bytes":3,"oldest_hit_unix":4,"corrupt_manifests":0}"#,
+                r#"{"face":"bcache","root":"/fixture/cas","cap_bytes":7,"entries":1,"blobs":2,"blob_bytes":3,"oldest_hit_unix":4,"corrupt_manifests":0}"#,
                 "\n",
                 r#"{"face":"snapshot","root":"/fixture/snapshots","cap_bytes":8,"generations":1,"entries":2,"bytes":3}"#,
                 "\n",
@@ -1291,13 +1291,15 @@ mod tests {
         assert_eq!(
             lines(vec![
                 GcRow::Bcache {
-                    root: PathBuf::from("/fixture/cas/v2"),
+                    root: PathBuf::from("/fixture/cas"),
                     report: GcReport {
                         entries_before: 1,
                         entries_evicted: 2,
                         blobs_removed: 3,
                         bytes_freed: 4,
                         corrupt_manifests: 0,
+                        empty_dirs_removed: 0,
+                        grace_skipped_until_unix: 0,
                     },
                 },
                 GcRow::Snapshot {
@@ -1327,7 +1329,7 @@ mod tests {
                 },
             ]),
             concat!(
-                r#"{"face":"bcache","root":"/fixture/cas/v2","entries_before":1,"entries_evicted":2,"blobs_removed":3,"bytes_freed":4,"corrupt_manifests":0}"#,
+                r#"{"face":"bcache","root":"/fixture/cas","entries_before":1,"entries_evicted":2,"blobs_removed":3,"bytes_freed":4,"corrupt_manifests":0,"empty_dirs_removed":0,"grace_skipped_until_unix":0}"#,
                 "\n",
                 r#"{"face":"snapshot","root":"/fixture/snapshots","generations_before":1,"generations_evicted":2,"bytes_freed":3}"#,
                 "\n",

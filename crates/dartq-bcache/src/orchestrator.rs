@@ -106,7 +106,9 @@ use crate::error::Result;
 #[cfg(unix)]
 use crate::fsutil::TreeLock;
 use crate::fsutil::{file_blake3, stamp_of};
-use crate::ingest_scan::{DirScan, find_touched_hash_dirs, scan_entry_files, scan_test_cache};
+use crate::ingest_scan::{
+    DirScan, ScanSkips, find_touched_hash_dirs, scan_entry_files, scan_test_cache,
+};
 use crate::key;
 use crate::materialize::{self, DirPlan, MaterializePlan, MaterializeReport};
 use crate::observer::CaptureObserver;
@@ -124,11 +126,10 @@ pub const SUPPORTED_FLUTTER_VERSION: &str = "3.47.1";
 /// Everything the shim needs beyond the invocation itself.
 #[derive(Debug, Clone)]
 pub struct ShimConfig {
-    /// CAS store root (default `$XDG_CACHE_HOME/dartq/cas/<STORE_LAYOUT_VERSION>`
-    /// — currently `v2` — falling back to `~/.cache/dartq/cas/...`;
-    /// assembled by the config glue, which appends the layout version).
+    /// CAS store root (default `$XDG_CACHE_HOME/dartq/cas`, falling
+    /// back to `~/.cache/dartq/cas`; assembled by the config glue).
     pub store_root: PathBuf,
-    /// Store size budget (default 20 GiB); gc runs when exceeded.
+    /// Store size budget (default 40 GiB); gc runs when exceeded.
     pub budget_bytes: u64,
     /// Seconds after a hit during which an entry is unevictable.
     pub grace_secs: u64,
@@ -444,10 +445,13 @@ pub fn run_shim(
         Ok(toolchain) => toolchain,
         Err(_) => return run_passthrough(argv, cwd, runner, "toolchain_unreadable"),
     };
+    // The record lands before the gate refuses, so an unsupported SDK
+    // pays its one rehash and never another: the negative record serves
+    // every later invocation of the same SDK state.
+    store_fingerprint_cache(&config.store_root, &root, &toolchain);
     if toolchain.flutter_version != SUPPORTED_FLUTTER_VERSION {
         return run_passthrough(argv, cwd, runner, "unsupported_flutter_version");
     }
-    store_fingerprint_cache(&config.store_root, &root, &toolchain);
 
     let Some(cwd) = fs::canonicalize(cwd).ok() else {
         return run_passthrough(argv, cwd, runner, "cwd_unreadable");
@@ -780,7 +784,7 @@ pub fn run_shim(
                     Ok(count)
                 });
                 match ingested {
-                    Ok(count) => {
+                    Ok((count, skips)) => {
                         if report.action != Action::PreHitMaterialized {
                             report.action = Action::Ingested;
                         }
@@ -789,6 +793,12 @@ pub fn run_shim(
                             report.key = Some(post_key.clone());
                         }
                         note(&format!("ingested {} ({count} files)", &post_key[..8]));
+                        if skips.total() > 0 {
+                            note(&format!(
+                                "ingest scan skipped {} files: {skips}",
+                                skips.total()
+                            ));
+                        }
                     }
                     Err(err) => note(&err),
                 }
@@ -1276,10 +1286,11 @@ fn ingest_observed(
     key: String,
     placed: &[(String, Vec<PlacedFile>)],
     test_cache: Option<&TestCacheScan>,
-) -> Result<u64> {
+) -> Result<(u64, ScanSkips)> {
     let bundle_face = parsed.target.command == "build bundle";
     // Decision-time prior: the entry stored under the ingest key.
     let prior = store.lookup(&key)?;
+    let mut skips = ScanSkips::default();
     let mut dirs = Vec::with_capacity(observed.len() + usize::from(test_cache.is_some()));
     let mut sources: Vec<(PathBuf, BlobId)> = Vec::new();
     // `observed` is name-sorted, so the DirRecords come out name-sorted.
@@ -1344,6 +1355,7 @@ fn ingest_observed(
             files: scan.files,
         });
         sources.extend(scan.sources);
+        skips.add(&scan.skipped);
     }
     if let Some(scan) = test_cache {
         dirs.push(DirRecord {
@@ -1354,6 +1366,7 @@ fn ingest_observed(
             files: scan.scan.files.clone(),
         });
         sources.extend(scan.scan.sources.iter().cloned());
+        skips.add(&scan.scan.skipped);
     }
     let now = unix_now();
     let draft = EntryManifest {
@@ -1366,11 +1379,14 @@ fn ingest_observed(
         defines: key_defines.clone(),
         target: parsed.target.clone(),
         toolchain: toolchain.clone(),
-        created_at_unix: now,
+        // `created_at` is the entry's birth time, not this ingest's: a
+        // rewrite of the same key carries the prior record's creation
+        // forward so LRU aging reflects the entry's true age.
+        created_at_unix: prior.as_ref().map_or(now, |manifest| manifest.created_at_unix),
         last_hit_unix: now,
     };
     store.ingest(draft, &sources)?;
-    Ok(sources.len() as u64)
+    Ok((sources.len() as u64, skips))
 }
 
 /// GC when the store is over budget (the O(1) running usage counter
@@ -1389,34 +1405,43 @@ fn maybe_gc(store: &CasStore, config: &ShimConfig) {
     }
 }
 
-/// The toolchain fingerprint through the
-/// `<store_root>/meta/toolchain.json` cache, so the ~40 MB of hashed
-/// artifacts is hashed once per SDK state instead of once per
-/// invocation. A cached fingerprint is used only when the flutter root
-/// and both hashed artifacts' mtime+size still match.
+/// The toolchain fingerprint through the `<store_root>/meta/` cache, so
+/// the ~40 MB of hashed artifacts is hashed once per SDK state instead
+/// of once per invocation. A cached fingerprint is used only when the
+/// flutter root and both hashed artifacts' mtime+size still match. Two
+/// records exist: `toolchain.json` for supported SDKs and
+/// `toolchain-unsupported.json` — the NEGATIVE record — for versions
+/// the gate refuses; both use the same staleness rule, and a root only
+/// ever consults one of them (a given root+stamps state is either
+/// supported or it is not).
 ///
 /// Safety: a stale cache yields a wrong fingerprint, hence a wrong
 /// key, hence a lookup miss — entries live under their true keys, so a
 /// stale cache can never serve a wrong hit. The same argument covers
 /// the version gate: a gate that passes on a stale `3.47.1` only
-/// produces misses.
+/// produces misses, and the negative record only skips a rehash whose
+/// result the gate would discard anyway.
 fn cached_fingerprint(root: &Path, store_root: &Path) -> Result<ToolchainFingerprint> {
     let Some((dill_stamp, frontend_stamp)) = hashed_artifact_stamps(root) else {
         return key::fingerprint_toolchain(root);
     };
-    let cache_path = store_root.join("meta").join("toolchain.json");
-    if let Ok(bytes) = fs::read(&cache_path)
-        && let Ok(cache) = serde_json::from_slice::<ToolchainCache>(&bytes)
-        && cache.flutter_root == root
-        && (cache.dill, cache.frontend) == (dill_stamp, frontend_stamp)
-    {
-        return Ok(cache.fingerprint);
+    for name in ["toolchain.json", "toolchain-unsupported.json"] {
+        let cache_path = store_root.join("meta").join(name);
+        if let Ok(bytes) = fs::read(&cache_path)
+            && let Ok(cache) = serde_json::from_slice::<ToolchainCache>(&bytes)
+            && cache.flutter_root == root
+            && (&cache.dill, &cache.frontend) == (&dill_stamp, &frontend_stamp)
+        {
+            return Ok(cache.fingerprint);
+        }
     }
     key::fingerprint_toolchain(root)
 }
 
 /// Writes the fingerprint cache (tmp + rename, best-effort: a failed
-/// write only costs the next call a rehash).
+/// write only costs the next call a rehash). A record whose bytes
+/// already sit on disk — the common warm-invocation case — skips the
+/// rewrite (and its fsync) entirely.
 fn store_fingerprint_cache(store_root: &Path, root: &Path, fingerprint: &ToolchainFingerprint) {
     let write = || -> io::Result<()> {
         let Some((dill, frontend)) = hashed_artifact_stamps(root) else {
@@ -1432,9 +1457,18 @@ fn store_fingerprint_cache(store_root: &Path, root: &Path, fingerprint: &Toolcha
         fs::create_dir_all(&dir)?;
         let bytes = serde_json::to_vec(&cache)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let name = if fingerprint.flutter_version == SUPPORTED_FLUTTER_VERSION {
+            "toolchain.json"
+        } else {
+            "toolchain-unsupported.json"
+        };
+        let path = dir.join(name);
+        if fs::read(&path).is_ok_and(|prior| prior == bytes) {
+            return Ok(());
+        }
         let tmp = dir.join(format!(".toolchain.{}.dartq-tmp", std::process::id()));
         fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, dir.join("toolchain.json"))
+        fs::rename(&tmp, &path)
     };
     let _ = write();
 }
@@ -1662,7 +1696,7 @@ mod tests {
     /// The as-tokenized (base) capture of one argv — the first of the
     /// enumerated join-variants.
     fn base_capture(argv: &[String], cwd: &Path, engine_revision: &str) -> AssembleCapture {
-        let mut all = capture_templates(argv, cwd, engine_revision).expect("variants");
+        let mut all = capture_templates(argv, cwd, engine_revision, true).expect("variants");
         assert!(!all.is_empty(), "an Ok capture always has the base parse");
         all.remove(0)
     }
@@ -1818,7 +1852,7 @@ mod tests {
     fn fresh_tree_pre_hit_materializes_recorded_dirs() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // Tree A builds: pre-miss on an empty store, POST ingests the
@@ -1887,7 +1921,7 @@ mod tests {
     fn stale_source_change_keeps_coarse_key_and_delegates_validation() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // Tree A seeds the entry.
@@ -1933,7 +1967,7 @@ mod tests {
     fn foreign_path_dir_refused_cross_tree_replays_in_tree() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // Tree A seeds an entry whose depfile also names an input
@@ -2013,7 +2047,7 @@ mod tests {
     fn fresh_worktree_without_dart_tool_hits_the_ingest_key() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         let tree_a = synthetic_project(&tmp, "a");
@@ -2063,7 +2097,7 @@ mod tests {
     fn hit_rerun_that_rewrites_outputs_refreshes_the_entry() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         let tree = synthetic_project(&tmp, "a");
@@ -2238,7 +2272,7 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
         // Tree A: the fake run's "build" spawns the assemble lookalike
@@ -2310,11 +2344,12 @@ mod tests {
         );
     }
 
-    /// The real gradle defect shape, end to end: the decoy's argv carries
-    /// a spaced multi-arch define, so the observer reads it space-split;
-    /// the template that lands must be the FULL-value join variant,
-    /// selected by the POST name verification against the dir the "build"
-    /// materialized, and it replays across trees.
+    /// The real gradle defect shape, end to end: the multi-arch define
+    /// VALUE carries spaces, and the kernel argv spells it as ONE
+    /// element — the observer's exact parse lands the full value (the
+    /// ps whitespace split that once made it ambiguous is obsolete), the
+    /// POST verifies it against the dir the "build" materialized, and it
+    /// replays across trees.
     #[cfg(unix)]
     #[test]
     fn spaced_define_value_lands_through_name_arbitration() {
@@ -2324,12 +2359,12 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
-        // The multi-arch tail of the default apk build, as a `ps` poll
-        // splits it: `-dAndroidArchs=android-arm android-arm64
-        // android-x64` arrives as three tokens.
+        // The multi-arch tail of the default apk build, as the kernel
+        // spells it: `-dAndroidArchs=android-arm android-arm64
+        // android-x64` is ONE argv element.
         let tree_a = synthetic_project(&tmp, "a");
         let output_a = tree_a.join("build/app/intermediates/flutter/debug");
         let mut argv_a = assemble_argv(&flutter_bin, &output_a.to_string_lossy());
@@ -2337,28 +2372,17 @@ mod tests {
             .iter()
             .position(|token| token == "-dAndroidArchs=android-arm64")
             .expect("the archs define token");
-        argv_a.splice(
-            archs_at..archs_at + 1,
-            [
-                "-dAndroidArchs=android-arm".to_owned(),
-                "android-arm64".to_owned(),
-                "android-x64".to_owned(),
-            ],
+        argv_a[archs_at] = "-dAndroidArchs=android-arm android-arm64 android-x64".to_owned();
+        let exact = capture_templates(&argv_a, &tree_a, &engine_revision, false).expect("parse");
+        assert_eq!(exact.len(), 1, "an exact argv yields the one true parse");
+        let full = exact.into_iter().next().expect("the full-value capture");
+        assert_eq!(
+            full.defines.get("AndroidArchs").map(String::as_str),
+            Some("android-arm android-arm64 android-x64")
         );
-        let variants =
-            capture_templates(&argv_a, &tree_a, &engine_revision).expect("variants");
-        let full = variants
-            .iter()
-            .find(|capture| {
-                capture.defines.get("AndroidArchs").map(String::as_str)
-                    == Some("android-arm android-arm64 android-x64")
-            })
-            .expect("the full-value variant");
-        let base = base_capture(&argv_a, &tree_a, &engine_revision);
-        assert_ne!(base.name, full.name, "the split parse and the true parse disagree");
 
-        // Real flutter_tools parsed the UNSPLIT argv: the dir lands under
-        // the full-value name, never the base variant's.
+        // Real flutter_tools parsed the same element: the dir lands under
+        // the full-value name.
         let effect_name = full.name.clone();
         let effect_argv = argv_a.clone();
         let mut runner = FakeRunner {
@@ -2413,7 +2437,7 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
         let tree = synthetic_project(&tmp, "a");
@@ -2469,7 +2493,7 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
         let tree_a = synthetic_project(&tmp, "a");
@@ -2535,7 +2559,7 @@ mod tests {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
         let tree = synthetic_project(&tmp, "a");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         let raw = raw_argv(&["assemble", "-o", "/opt/out", "-dBuildMode=release"]);
@@ -2554,7 +2578,7 @@ mod tests {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.50.0");
         let tree = synthetic_project(&tmp, "app");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
         let mut runner = FakeRunner::exits(7);
         let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
@@ -2563,7 +2587,111 @@ mod tests {
         assert_eq!(report.reason, "unsupported_flutter_version");
         assert_eq!(report.exit_code, Some(7), "the child's exit code wins");
         assert!(report.key.is_none());
-        assert!(!store_root.exists(), "no store directory is created");
+        // The negative fingerprint record is the ONLY store side effect:
+        // no blobs, no entries — the cache stays untouched as a cache.
+        let meta = store_root.join("meta");
+        assert!(meta.join("toolchain-unsupported.json").is_file());
+        assert!(!meta.join("toolchain.json").exists());
+        assert!(!store_root.join("blobs").exists());
+        assert!(!store_root.join("entries").exists());
+    }
+
+    /// The negative record's purpose: a second invocation of the same
+    /// unsupported SDK state serves the fingerprint from the record
+    /// without rehashing — proven by rewriting the hashed artifact's
+    /// CONTENTS at the same size and mtime (the identity the staleness
+    /// rule trusts): a rehash would produce a different fingerprint, a
+    /// cache hit returns the recorded one. A real artifact change
+    /// (different size) invalidates the record and rehashes.
+    #[test]
+    fn unsupported_version_negative_cache_skips_the_rehash() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.50.0");
+        let store_root = tmp.join("cas");
+        let tree = synthetic_project(&tmp, "app");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let mut runner = FakeRunner::exits(0);
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.reason, "unsupported_flutter_version");
+
+        let record = store_root
+            .join("meta")
+            .join("toolchain-unsupported.json");
+        let recorded: ToolchainCache =
+            serde_json::from_slice(&fs::read(&record).expect("record")).expect("parse record");
+
+        // Same bytes length, same mtime: identity-identical, content
+        // different — only a cache hit can return the old fingerprint.
+        let dill = sdk
+            .join("bin")
+            .join("cache")
+            .join("dart-sdk")
+            .join("lib")
+            .join("_internal")
+            .join("vm_platform_strong.dill");
+        let metadata = fs::metadata(&dill).expect("stat dill");
+        let mtime = metadata.modified().expect("mtime");
+        let changed = vec![b'X'; metadata.len() as usize];
+        assert_ne!(changed, fs::read(&dill).expect("read dill"));
+        fs::write(&dill, &changed).expect("rewrite dill");
+        let file = fs::File::options().write(true).open(&dill).expect("open dill");
+        file.set_times(fs::FileTimes::new().set_modified(mtime))
+            .expect("restore mtime");
+        drop(file);
+
+        let cached = cached_fingerprint(&sdk, &store_root).expect("fingerprint");
+        assert_eq!(
+            cached, recorded.fingerprint,
+            "the identity-matching negative record serves without a rehash"
+        );
+
+        // A real change (the size moves) invalidates the record.
+        fs::write(&dill, b"platform dill bytes, changed").expect("grow dill");
+        let fresh = cached_fingerprint(&sdk, &store_root).expect("fingerprint");
+        assert_ne!(fresh.platform_strong_dill, recorded.fingerprint.platform_strong_dill);
+    }
+
+    /// A byte-identical fingerprint record is not rewritten: the file's
+    /// mtime survives a second store call (a rewrite would bump it past
+    /// the sleep), a changed record is.
+    #[test]
+    fn fingerprint_cache_skips_rewrite_of_identical_record() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let first = key::fingerprint_toolchain(&sdk).expect("fingerprint");
+
+        store_fingerprint_cache(&store_root, &sdk, &first);
+        let path = store_root.join("meta").join("toolchain.json");
+        let mtime = fs::metadata(&path).expect("stat record").modified().expect("mtime");
+        std::thread::sleep(Duration::from_millis(25));
+        store_fingerprint_cache(&store_root, &sdk, &first);
+        assert_eq!(
+            fs::metadata(&path).expect("stat record").modified().expect("mtime"),
+            mtime,
+            "an identical record must not be rewritten"
+        );
+
+        // A changed SDK state rewrites: the artifact's size moves, so
+        // the stamps — and the record — change.
+        write(
+            &sdk.join("bin")
+                .join("cache")
+                .join("dart-sdk")
+                .join("lib")
+                .join("_internal")
+                .join("vm_platform_strong.dill"),
+            b"platform dill bytes, changed",
+        );
+        let second = key::fingerprint_toolchain(&sdk).expect("fingerprint");
+        store_fingerprint_cache(&store_root, &sdk, &second);
+        let record: ToolchainCache =
+            serde_json::from_slice(&fs::read(&path).expect("record")).expect("parse record");
+        assert_eq!(record.fingerprint, second);
+        assert_ne!(
+            fs::metadata(&path).expect("stat record").modified().expect("mtime"),
+            mtime
+        );
     }
 
     #[test]
@@ -2571,7 +2699,7 @@ mod tests {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
         let tree = synthetic_project(&tmp, "app");
-        let config = config_for(&tmp.join("cas").join("v1"), &sdk.join("bin").join("flutter"));
+        let config = config_for(&tmp.join("cas"), &sdk.join("bin").join("flutter"));
 
         // A non-zero exit isolates the PRE key (POST never runs), and the
         // coarse key computes with no build dir in the tree at all.
@@ -2591,7 +2719,7 @@ mod tests {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
         let tree = synthetic_project(&tmp, "app");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
         let mut runner = FakeRunner {
             code: 1,
@@ -2625,7 +2753,7 @@ mod tests {
     fn red_suite_ingests_kernel_cache_only_and_propagates_exit() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // The red suite: the harness compiled the closure (the dill is
@@ -2687,7 +2815,7 @@ mod tests {
     fn compile_failed_test_run_ingests_nothing() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // The dill an earlier run left, parked before this run's start.
@@ -2725,7 +2853,7 @@ mod tests {
     fn signal_death_test_run_still_ingests_kernel_cache() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         let tree = synthetic_project(&tmp, "a");
@@ -2793,7 +2921,7 @@ mod tests {
 
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // Tree A: the "compile" leaves a kernel dill embedding tree A's
@@ -2902,7 +3030,7 @@ mod tests {
     fn test_kernel_cache_cold_ingest_and_wiped_hit_replay() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // Cold run: the child compiles, leaving the kernel cache behind;
@@ -2974,7 +3102,7 @@ mod tests {
     fn post_reuses_recorded_dill_when_file_unchanged() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
         let tree = synthetic_project(&tmp, "a");
         // The provenance state the entry is keyed on.
@@ -3048,7 +3176,7 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
         // Run 1 seeds the entry: the "build" runs the assemble lookalike
@@ -3131,7 +3259,7 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
         let tree = synthetic_project(&tmp, "a");
@@ -3222,7 +3350,7 @@ mod tests {
     fn miss_run_reuses_prior_entry_stamps_for_build_dirs() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // The provenance state the entry is keyed on; run 1 seeds it.
@@ -3296,6 +3424,59 @@ mod tests {
         assert_eq!(store.stats().expect("stats").blobs, seed_blobs + 1);
     }
 
+    /// `created_at` survives a re-ingest of the same key: the rewritten
+    /// manifest carries the prior record's birth time forward, so LRU
+    /// aging reflects the entry's age, not the latest run's.
+    #[test]
+    fn reingest_preserves_the_entry_creation_time() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.expect("key");
+
+        // Age the entry: a creation time far in the past, everything
+        // else recorded as-is.
+        let store = CasStore::open(&store_root).expect("open store");
+        let mut manifest = store.lookup(&key).expect("lookup").expect("entry");
+        manifest.created_at_unix = 1_000;
+        store.ingest(manifest, &[]).expect("age entry");
+
+        // A warm rerun re-ingests under the same key (the run rewrites
+        // one bookkeeping file).
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write(
+                    &cwd.join(".dart_tool").join("flutter_build").join(DIR_MAIN)
+                        .join("flutter_build.dill.stamp"),
+                    br#"{"inputs":["x"],"outputs":["y"]}"#,
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.created_at_unix, 1_000, "the birth time is kept");
+        assert!(
+            manifest.last_hit_unix > 1_000,
+            "the hit clock still advances"
+        );
+    }
+
     /// An older test entry that predates the kernel-cache face (no
     /// test dir in its manifest) passes through sanely: the hit has
     /// nothing to materialize, the child runs, and POST re-ingests the
@@ -3304,7 +3485,7 @@ mod tests {
     fn older_test_entry_without_cache_dir_runs_and_reingests() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         let tree = synthetic_project(&tmp, "a");
@@ -3354,6 +3535,23 @@ mod tests {
             PathBuf::from("out/debug")
         );
         assert_eq!(flutter_build_dir(Some(OsString::new())), PathBuf::from("build"));
+    }
+
+    /// The define-value/output-dir reroot replaces the ingest root only
+    /// at a whole-path boundary: a value that merely STARTS with the
+    /// root (`/old/root-lookalike`, a sibling directory) keeps its
+    /// bytes — the recomputed name must hash this tree's true value.
+    #[test]
+    fn rerooted_replaces_only_whole_path_boundaries() {
+        let target = Path::new("/new/root");
+        assert_eq!(rerooted("/old/root/lib", "/old/root", target), "/new/root/lib");
+        assert_eq!(rerooted("/old/root", "/old/root", target), "/new/root");
+        assert_eq!(
+            rerooted("/old/root-lookalike", "/old/root", target),
+            "/old/root-lookalike",
+            "a sibling prefix is not rewritten"
+        );
+        assert_eq!(rerooted("/elsewhere/x", "/old/root", target), "/elsewhere/x");
     }
 
     /// A10's narrowing: the PATH search skips only the shim BINARY —
@@ -3435,7 +3633,7 @@ mod tests {
     fn fingerprint_cache_roundtrips_and_invalidates_on_change() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
 
         let first = cached_fingerprint(&sdk, &store_root).expect("fingerprint");
         store_fingerprint_cache(&store_root, &sdk, &first);
@@ -3665,7 +3863,7 @@ mod tests {
     fn maybe_gc_probes_the_running_counter_and_collects_over_budget() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let mut config = config_for(&store_root, &sdk.join("bin").join("flutter"));
         config.budget_bytes = u64::MAX;
         config.grace_secs = 0;
@@ -3708,7 +3906,7 @@ mod tests {
     fn tree_lock_contention_degrades_pre_and_post_to_clean_misses() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // Seed the entry from tree A with two recorded dirs.
@@ -3784,7 +3982,7 @@ mod tests {
     fn pre_run_write_in_the_same_second_is_not_touched() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
 
         // The dill an earlier moment left, with a completely fresh
@@ -3818,7 +4016,7 @@ mod tests {
         let engine_revision = key::fingerprint_toolchain(&sdk)
             .expect("fingerprint")
             .engine_revision;
-        let store_root = tmp.join("cas").join("v1");
+        let store_root = tmp.join("cas");
         let config = config_for(&store_root, &flutter_bin);
 
         // Seed with a REAL observation (the lookalike), as gradle would.

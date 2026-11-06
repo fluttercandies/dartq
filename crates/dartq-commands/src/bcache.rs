@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dartq_bcache::orchestrator::{CommandRunner, FlutterRunner, ShimConfig, discover_flutter, run_shim};
-use dartq_bcache::{BcacheError, CasStore, GcReport, StoreStats, STORE_LAYOUT_VERSION};
+use dartq_bcache::{BcacheError, CasStore, GcReport, StoreStats};
 
 use crate::config::{BuildCacheConfig, ConfigError, load as load_config};
 
@@ -62,10 +62,9 @@ pub fn expand_home(path: &Path) -> PathBuf {
 }
 
 /// The orchestrator config a `build_cache` section (or its defaults)
-/// maps to. `root` gains the store layer's layout version; `root` and
-/// `flutter` both expand a leading `~` (a literal tilde would hand the
-/// spawn a path the kernel cannot resolve — exit 127); the budget
-/// saturates rather than overflow.
+/// maps to. `root` and `flutter` both expand a leading `~` (a literal
+/// tilde would hand the spawn a path the kernel cannot resolve — exit
+/// 127); the budget saturates rather than overflow.
 #[must_use]
 pub fn shim_config(section: &BuildCacheConfig) -> ShimConfig {
     let root = match &section.root {
@@ -73,7 +72,7 @@ pub fn shim_config(section: &BuildCacheConfig) -> ShimConfig {
         None => default_cache_root(),
     };
     ShimConfig {
-        store_root: root.join(STORE_LAYOUT_VERSION),
+        store_root: root,
         budget_bytes: section
             .budget_gb
             .unwrap_or(DEFAULT_BUDGET_GB)
@@ -343,8 +342,9 @@ mod tests {
         fs::write(dir.join("dartq.yaml"), yaml).expect("config");
     }
 
-    /// A section maps to a full orchestrator config: the root gains the
-    /// store's layout version, GiB → bytes, defaults apply.
+    /// A section maps to a full orchestrator config: the root is the
+    /// store root verbatim (no version segment), GiB → bytes, defaults
+    /// apply.
     #[test]
     fn shim_config_maps_the_section_to_store_paths() {
         let section = BuildCacheConfig {
@@ -354,15 +354,12 @@ mod tests {
             flutter: Some(PathBuf::from("/opt/flutter/bin/flutter")),
         };
         let config = shim_config(&section);
-        assert_eq!(
-            config.store_root,
-            PathBuf::from("/store/cas").join(STORE_LAYOUT_VERSION)
-        );
+        assert_eq!(config.store_root, PathBuf::from("/store/cas"));
         assert_eq!(config.budget_bytes, 3 * 1024 * 1024 * 1024);
         assert_eq!(config.grace_secs, DEFAULT_GRACE_SECS);
         assert_eq!(config.flutter_bin, section.flutter);
         let defaults = default_shim_config();
-        assert!(defaults.store_root.ends_with(STORE_LAYOUT_VERSION));
+        assert!(defaults.store_root.ends_with("cas"));
         assert_eq!(
             defaults.budget_bytes,
             DEFAULT_BUDGET_GB * 1024 * 1024 * 1024
@@ -382,10 +379,7 @@ mod tests {
             flutter: Some(PathBuf::from("~/sdks/flutter")),
         };
         let config = shim_config(&section);
-        assert_eq!(
-            config.store_root,
-            home.join("cas").join(STORE_LAYOUT_VERSION)
-        );
+        assert_eq!(config.store_root, home.join("cas"));
         assert_eq!(config.flutter_bin, Some(home.join("sdks/flutter")));
     }
 
@@ -432,10 +426,7 @@ mod tests {
         let config = discover_shim_config(&project)
             .expect("discover")
             .expect("some");
-        assert_eq!(
-            config.store_root,
-            PathBuf::from("/store/cas").join(STORE_LAYOUT_VERSION)
-        );
+        assert_eq!(config.store_root, PathBuf::from("/store/cas"));
         assert_eq!(config.budget_bytes, 3 * 1024 * 1024 * 1024);
 
         // No section anywhere: None, with no side effects.
@@ -523,7 +514,7 @@ mod tests {
     fn stats_and_gc_faces_drive_the_store() {
         let root = scratch("stats");
         let config = ShimConfig {
-            store_root: root.join("cas").join(STORE_LAYOUT_VERSION),
+            store_root: root.join("cas"),
             budget_bytes: 0,
             grace_secs: 0,
             flutter_bin: None,
