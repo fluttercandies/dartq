@@ -109,8 +109,12 @@ fn command_slot(name: &str) -> Option<Slot> {
         // base64 list exactly as gradle passes it.
         "dart-define" | "DartDefines" => Some(Slot::DartDefine),
         "dart-define-from-file" => Some(Slot::DefineFile),
-        "input" | "depfile" | "build-inputs" | "build-outputs"
-        | "performance-measurement-file" | "resource-pool-size" => Some(Slot::IgnoredValue),
+        "input"
+        | "depfile"
+        | "build-inputs"
+        | "build-outputs"
+        | "performance-measurement-file"
+        | "resource-pool-size" => Some(Slot::IgnoredValue),
         "output" => Some(Slot::Output),
         "ExtraFrontEndOptions" | "extra-front-end-options" => Some(Slot::ExtraFrontEnd),
         "ExtraGenSnapshotOptions" | "extra-gen-snapshot-options" => Some(Slot::ExtraGenSnapshot),
@@ -262,9 +266,7 @@ impl AssembleArgs {
                 match shorts_of(token.as_bytes()[1]) {
                     Some(slot) if token.len() == 2 => {
                         let value = tokens.get(i + 1).ok_or_else(|| {
-                            ArgModelError::Invalid(format!(
-                                "option `{token}` is missing its value"
-                            ))
+                            ArgModelError::Invalid(format!("option `{token}` is missing its value"))
                         })?;
                         self.record_tagged(slot, value)?;
                         i += 1;
@@ -382,9 +384,8 @@ pub fn capture_templates(
     toolchain_engine_revision: &str,
     enumerate_joins: bool,
 ) -> Result<Vec<AssembleCapture>, ArgModelError> {
-    let at = locate_command(argv).ok_or_else(|| {
-        ArgModelError::Unsupported("no `assemble` command token in argv".into())
-    })?;
+    let at = locate_command(argv)
+        .ok_or_else(|| ArgModelError::Unsupported("no `assemble` command token in argv".into()))?;
     let mut args = AssembleArgs::default();
     args.walk(&argv[..at], global_slot, global_short, false)?;
     args.walk(&argv[at + 1..], command_slot, short_slot, true)?;
@@ -464,10 +465,7 @@ fn finish_args(
         deferred_components(&args.targets, cwd).to_string(),
     );
     if !args.front_end.is_empty() {
-        defines.insert(
-            "ExtraFrontEndOptions".to_owned(),
-            args.front_end.join(","),
-        );
+        defines.insert("ExtraFrontEndOptions".to_owned(), args.front_end.join(","));
     }
 
     let output = args
@@ -526,13 +524,13 @@ fn decode_dart_defines(raw: &[String]) -> Result<Vec<String>, ArgModelError> {
             if part.is_empty() {
                 continue;
             }
-            let bytes = base64::engine::general_purpose::STANDARD.decode(part).map_err(
-                |_| ArgModelError::Invalid(format!("dart define is not base64 encoded: {part}")),
-            )?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(part)
+                .map_err(|_| {
+                    ArgModelError::Invalid(format!("dart define is not base64 encoded: {part}"))
+                })?;
             decoded.push(String::from_utf8(bytes).map_err(|_| {
-                ArgModelError::Invalid(format!(
-                    "dart define does not decode to UTF-8: {part}"
-                ))
+                ArgModelError::Invalid(format!("dart define does not decode to UTF-8: {part}"))
             })?);
         }
     }
@@ -552,7 +550,9 @@ fn deferred_components(targets: &[String], cwd: &Path) -> bool {
         "android_aot_deferred_components_bundle_release_android-arm64",
         "android_aot_deferred_components_bundle_release_android-x64",
     ];
-    targets.iter().any(|target| DEFERRED_TARGETS.contains(&target.as_str()))
+    targets
+        .iter()
+        .any(|target| DEFERRED_TARGETS.contains(&target.as_str()))
         && !targets.iter().any(|target| target.contains("debug"))
         && pubspec_declares_deferred_components(cwd)
 }
@@ -628,15 +628,27 @@ mod tests {
         // Real producer shapes: gradle (`--quiet assemble …`), Xcode
         // (`$FLUTTER_ROOT/bin/flutter assemble --no-version-check …`),
         // tool_backend. And the shapes that are NOT assemble.
-        assert!(is_assemble_argv(&strings(&["assemble", "-dBuildMode=release"])));
         assert!(is_assemble_argv(&strings(&[
-            "--quiet", "assemble", "--no-version-check", "--output", "/out"
+            "assemble",
+            "-dBuildMode=release"
         ])));
         assert!(is_assemble_argv(&strings(&[
-            "--local-engine", "android_release", "assemble", "-o", "/out"
+            "--quiet",
+            "assemble",
+            "--no-version-check",
+            "--output",
+            "/out"
         ])));
         assert!(is_assemble_argv(&strings(&[
-            "assemble", "android_aot_bundle_release_arm64"
+            "--local-engine",
+            "android_release",
+            "assemble",
+            "-o",
+            "/out"
+        ])));
+        assert!(is_assemble_argv(&strings(&[
+            "assemble",
+            "android_aot_bundle_release_arm64"
         ])));
         assert!(!is_assemble_argv(&strings(&["build", "apk"])));
         assert!(!is_assemble_argv(&strings(&["run"])));
@@ -684,7 +696,10 @@ mod tests {
                 ("TrackWidgetCreation", "true"),
             ])
         );
-        assert_eq!(got.output_dir, "/work/app/build/app/intermediates/flutter/paidRelease");
+        assert_eq!(
+            got.output_dir,
+            "/work/app/build/app/intermediates/flutter/paidRelease"
+        );
         assert_eq!(
             got.name,
             flutter_build_dir_name(
@@ -752,14 +767,11 @@ mod tests {
             Some("RkxVVFRFUl9BUFBfRkxBVk9SPXBhaWQ=,QVBJPXByb2Q=")
         );
         // A separate `--dart-define` spelling lands the same way.
-        let separated = capture(&[
-            "assemble",
-            "-o",
-            "/out",
-            "--dart-define",
-            "QVBJPXByb2Q=",
-        ]);
-        assert_eq!(separated.defines.get("API").map(String::as_str), Some("prod"));
+        let separated = capture(&["assemble", "-o", "/out", "--dart-define", "QVBJPXByb2Q="]);
+        assert_eq!(
+            separated.defines.get("API").map(String::as_str),
+            Some("prod")
+        );
         assert_eq!(
             separated.defines.get("DartDefines").map(String::as_str),
             Some("QVBJPXByb2Q=")
@@ -891,9 +903,11 @@ mod tests {
                     && capture.defines.get("B").map(String::as_str) == Some("1")
             })
             .expect("the true parse is a candidate");
-        assert!(variants
-            .iter()
-            .any(|capture| capture.defines.get("B").map(String::as_str) == Some("1 t")));
+        assert!(
+            variants
+                .iter()
+                .any(|capture| capture.defines.get("B").map(String::as_str) == Some("1 t"))
+        );
         assert_ne!(true_parse.name, variants[0].name);
     }
 
@@ -950,7 +964,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let argv = strings(&["assemble", "--output", "build/inner", "-dBuildMode=debug"]);
         let got = capture_argv(&argv, tmp.path(), "enginerev0000000000000000");
-        let joined = tmp.path().join("build/inner").to_string_lossy().into_owned();
+        let joined = tmp
+            .path()
+            .join("build/inner")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(got.output_dir, joined);
 
         // A local-engine invocation hashes a null engine revision, so the
@@ -996,12 +1014,7 @@ mod tests {
         );
 
         // A debug target, or a pubspec without the section, keeps false.
-        let debug = strings(&[
-            "assemble",
-            "-o",
-            "/out",
-            "debug_android_application",
-        ]);
+        let debug = strings(&["assemble", "-o", "/out", "debug_android_application"]);
         assert_eq!(
             capture_argv(&debug, tmp.path(), "e")
                 .defines
@@ -1144,23 +1157,30 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let bad: [(&[&str], &str); 5] = [
             (&["assemble", "-dBuildMode=release"], "missing --output"),
-            (&["assemble", "-o", "/out", "-dNOSEPARATOR"], "define without ="),
+            (
+                &["assemble", "-o", "/out", "-dNOSEPARATOR"],
+                "define without =",
+            ),
             (&["assemble", "-o"], "option missing its value"),
-            (&["assemble", "-o", "/out", "--DartDefines=%not%base64%"], "non-base64"),
+            (
+                &["assemble", "-o", "/out", "--DartDefines=%not%base64%"],
+                "non-base64",
+            ),
             (
                 &["assemble", "-o", "/out", "--dart-define-from-file=env.json"],
                 "dart-define-from-file",
             ),
         ];
         for (argv, why) in bad {
-            let err = capture_templates(&strings(argv), tmp.path(), "e", true)
-                .expect_err(why);
+            let err = capture_templates(&strings(argv), tmp.path(), "e", true).expect_err(why);
             let kind = match err {
                 ArgModelError::Unsupported(_) => "unsupported",
                 ArgModelError::Invalid(_) => "invalid",
             };
-            assert!(kind == "invalid" || why == "dart-define-from-file", "{why}: {err}");
+            assert!(
+                kind == "invalid" || why == "dart-define-from-file",
+                "{why}: {err}"
+            );
         }
     }
-
 }

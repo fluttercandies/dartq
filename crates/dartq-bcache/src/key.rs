@@ -573,7 +573,9 @@ T:packages/characters/lib/src/characters.dart bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let key = config_key(&inputs);
         assert_eq!(
             key,
-            blake3::hash(GOLDEN_PREIMAGE.as_bytes()).to_hex().to_string()
+            blake3::hash(GOLDEN_PREIMAGE.as_bytes())
+                .to_hex()
+                .to_string()
         );
         assert_eq!(key.len(), 64);
         assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -584,32 +586,23 @@ T:packages/characters/lib/src/characters.dart bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let inputs = sample_inputs();
         // Provenance contents are in the key: an edited provenance file
         // is a different configuration.
-        assert_ne!(
-            config_key(&inputs),
-            {
-                let mut edited = sample_inputs();
-                edited.closure[0].content = blob(0xad);
-                config_key(&edited)
-            }
-        );
+        assert_ne!(config_key(&inputs), {
+            let mut edited = sample_inputs();
+            edited.closure[0].content = blob(0xad);
+            config_key(&edited)
+        });
         // A dropped provenance file is a different configuration too.
-        assert_ne!(
-            config_key(&inputs),
-            {
-                let mut edited = sample_inputs();
-                edited.closure.pop();
-                config_key(&edited)
-            }
-        );
+        assert_ne!(config_key(&inputs), {
+            let mut edited = sample_inputs();
+            edited.closure.pop();
+            config_key(&edited)
+        });
         // ...as is any other coarse-key input.
-        assert_ne!(
-            config_key(&sample_inputs()),
-            {
-                let mut edited = sample_inputs();
-                edited.defines.insert("EXTRA".to_owned(), "1".to_owned());
-                config_key(&edited)
-            }
-        );
+        assert_ne!(config_key(&sample_inputs()), {
+            let mut edited = sample_inputs();
+            edited.defines.insert("EXTRA".to_owned(), "1".to_owned());
+            config_key(&edited)
+        });
     }
 
     #[test]

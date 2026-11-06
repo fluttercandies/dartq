@@ -64,9 +64,9 @@
 //! not-replayable.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::thread::JoinHandle;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -251,10 +251,7 @@ fn sweep(
 /// nothing (an unmodeled shape, a misread token) still counts as seen —
 /// retrying it every poll would only burn the same parse, and skipping
 /// it can cost that dir its template, never misplace one.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn collect(
     argvs: Vec<Vec<String>>,
     cwd: &Path,
@@ -312,10 +309,7 @@ const WATCHED_COMM: &[&str] = &["sh", "bash", "zsh", "dash", "dart", "flutter"];
 /// poll.
 #[cfg(target_os = "macos")]
 fn process_argv() -> Vec<Vec<String>> {
-    candidate_pids()
-        .into_iter()
-        .filter_map(read_argv)
-        .collect()
+    candidate_pids().into_iter().filter_map(read_argv).collect()
 }
 
 /// The watched-name pids: one `proc_listallpids` listing plus one
@@ -474,10 +468,7 @@ fn parse_procargs2(blob: &[u8]) -> Option<Vec<String>> {
 /// A failed read yields an empty table for that poll.
 #[cfg(target_os = "linux")]
 fn process_argv() -> Vec<Vec<String>> {
-    candidate_pids()
-        .into_iter()
-        .filter_map(read_argv)
-        .collect()
+    candidate_pids().into_iter().filter_map(read_argv).collect()
 }
 
 /// The watched-name pids: the numeric `/proc` entries whose comm
@@ -608,10 +599,7 @@ mod tests {
         let capture = found[0].clone();
         // The interpreter tokens are positional junk the parser skips:
         // the base template is exactly what the clean argv yields.
-        let clean = gradle_assemble(
-            &flutter.to_string_lossy(),
-            &output.to_string_lossy(),
-        );
+        let clean = gradle_assemble(&flutter.to_string_lossy(), &output.to_string_lossy());
         let mut seen = FxHashSet::default();
         assert_eq!(poll(&[clean], tmp.path(), &mut seen)[0], capture);
         assert_eq!(
@@ -970,15 +958,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let flutter = tmp.path().join("sdk").join("bin").join("flutter");
         let output = tmp.path().join("build/app/intermediates/flutter/release");
-        let mut tokens: Vec<String> = [
-            "--quiet",
-            "assemble",
-            "--no-version-check",
-            "--output",
-        ]
-        .iter()
-        .map(|token| (*token).to_owned())
-        .collect();
+        let mut tokens: Vec<String> = ["--quiet", "assemble", "--no-version-check", "--output"]
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect();
         tokens.push(output.to_string_lossy().into_owned());
         tokens.push("-dTargetFile=lib/main.dart".to_owned());
         tokens.push("kernel_snapshot".to_owned());
@@ -1026,9 +1009,7 @@ mod tests {
         assert_eq!(direct.len(), 1, "the clean kernel argv: the exact parse");
         let base = &direct[0];
         assert!(
-            captures
-                .iter()
-                .any(|capture| capture == base),
+            captures.iter().any(|capture| capture == base),
             "the thread landed the direct-seam base capture: {captures:?}"
         );
     }

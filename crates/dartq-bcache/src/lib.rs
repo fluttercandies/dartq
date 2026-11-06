@@ -72,7 +72,7 @@ pub mod types;
 pub use error::BcacheError;
 pub use store::{CasStore, GcReport};
 pub use types::{
-    BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, FileStamp, KeyInputs, ManifestFile,
-    NameRule, PathAnchors, PlacedFile, RewriteKind, StoreStats, TargetSpec, ToolchainFingerprint,
-    blob_id_hex,
+    BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, FileStamp, KeyInputs,
+    ManifestFile, NameRule, PathAnchors, PlacedFile, RewriteKind, StoreStats, TargetSpec,
+    ToolchainFingerprint, blob_id_hex,
 };

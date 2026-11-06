@@ -41,7 +41,9 @@ use rayon::prelude::*;
 
 use crate::error::{BcacheError, Result};
 use crate::fsutil::{file_blake3, stamp_of};
-use crate::types::{BlobId, DirRecord, FileStamp, ManifestFile, PathAnchors, PlacedFile, RewriteKind};
+use crate::types::{
+    BlobId, DirRecord, FileStamp, ManifestFile, PathAnchors, PlacedFile, RewriteKind,
+};
 
 /// Files up to this size are read whole, one buffer serving both the hash
 /// and the root search; larger bookkeeping files stream through windows of
@@ -252,11 +254,7 @@ impl<'a> ForeignUriScan<'a> {
         self.buf.extend_from_slice(window);
         loop {
             if self.in_uri {
-                match self
-                    .buf
-                    .iter()
-                    .position(|&byte| is_token_delimiter(byte))
-                {
+                match self.buf.iter().position(|&byte| is_token_delimiter(byte)) {
                     // Delimiter inside the head window: the head ends.
                     Some(at) if at < URI_HEAD_CAP => {
                         let head: Vec<u8> = self.buf.drain(..at).collect();
@@ -364,9 +362,9 @@ impl ByteScan<'_> {
                 .map(|needle| needle.needle().len())
                 .max()
                 .unwrap_or(1),
-            ByteScan::DillUris { root_uri, .. } => root_uri
-                .as_ref()
-                .map_or(1, |finder| finder.needle().len()),
+            ByteScan::DillUris { root_uri, .. } => {
+                root_uri.as_ref().map_or(1, |finder| finder.needle().len())
+            }
         }
     }
 
@@ -496,12 +494,10 @@ fn reused_identity(
     placed: Option<&[PlacedFile]>,
     blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
 ) -> Option<(BlobId, RewriteKind, bool)> {
-    if let Some(placed) = placed
-        .and_then(|files| files.iter().find(|f| f.path == Path::new(&file.relative)))
+    if let Some(placed) =
+        placed.and_then(|files| files.iter().find(|f| f.path == Path::new(&file.relative)))
     {
-        return (placed.verbatim
-            && placed.stamp == file.stamp
-            && blob_exists(&placed.blob))
+        return (placed.verbatim && placed.stamp == file.stamp && blob_exists(&placed.blob))
             .then_some((placed.blob, placed.rewrite, placed.foreign_paths));
     }
     prior
@@ -684,7 +680,13 @@ pub fn scan_entry_files(
     // another tree) — each in its escaped spellings (depfiles escape
     // spaces, JSON backslashes). Owned, so per-file `Finder`s can
     // borrow them.
-    let mut needle_bytes = vec![anchors.worktree_root.as_os_str().as_encoded_bytes().to_vec()];
+    let mut needle_bytes = vec![
+        anchors
+            .worktree_root
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec(),
+    ];
     if let Some(name) = hash_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -850,7 +852,11 @@ struct ScannedFile {
 /// non-UTF-8 name — are skipped and counted in `skips` (a named
 /// reason, never a failed scan: one odd file must not cost the run its
 /// whole ingest).
-fn collect_files(hash_dir: &Path, files: &mut Vec<ScannedFile>, skips: &mut ScanSkips) -> Result<()> {
+fn collect_files(
+    hash_dir: &Path,
+    files: &mut Vec<ScannedFile>,
+    skips: &mut ScanSkips,
+) -> Result<()> {
     let mut pending = vec![(hash_dir.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = pending.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -908,11 +914,7 @@ fn is_executable(_: &Metadata) -> bool {
 /// [`WHOLE_READ_LIMIT`] and streamed in windows beyond it — the needle
 /// search carries its tail between windows, the foreign scanners keep
 /// their own sequential state, and each byte feeds them exactly once.
-fn digest(
-    path: &Path,
-    size: u64,
-    scan: Option<&mut ByteScan<'_>>,
-) -> Result<(BlobId, bool, bool)> {
+fn digest(path: &Path, size: u64, scan: Option<&mut ByteScan<'_>>) -> Result<(BlobId, bool, bool)> {
     if size <= WHOLE_READ_LIMIT as u64 {
         let data = fs::read(path)?;
         let blob = BlobId(*blake3::hash(&data).as_bytes());
@@ -948,7 +950,11 @@ fn digest(
         carried = carry.min(filled);
         buf.copy_within(filled - carried..filled, 0);
     }
-    Ok((BlobId(*hasher.finalize().as_bytes()), mentions, scan.foreign()))
+    Ok((
+        BlobId(*hasher.finalize().as_bytes()),
+        mentions,
+        scan.foreign(),
+    ))
 }
 
 #[cfg(test)]
@@ -1032,7 +1038,8 @@ mod tests {
             fs::set_permissions(app, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned =
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         let summary: Vec<(&str, RewriteKind, bool)> = scanned
             .files
             .iter()
@@ -1092,7 +1099,8 @@ mod tests {
         write(&hash_dir.join("straddle.stamp"), &straddle);
         write(&hash_dir.join("plain.d"), &plain);
 
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned =
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         let summary: Vec<(&str, RewriteKind, BlobId)> = scanned
             .files
             .iter()
@@ -1131,8 +1139,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cache = tmp.path().join("test_cache");
         assert!(!dir_touched_since(&cache, at(0)).expect("missing dir"));
-        write(&cache.join("build").join("ab.cache.dill.track.dill"), b"dill");
-        set_mtime(&cache.join("build").join("ab.cache.dill.track.dill"), at(100));
+        write(
+            &cache.join("build").join("ab.cache.dill.track.dill"),
+            b"dill",
+        );
+        set_mtime(
+            &cache.join("build").join("ab.cache.dill.track.dill"),
+            at(100),
+        );
         set_mtime(&cache.join("build"), at(50));
         set_mtime(&cache, at(50));
         assert!(dir_touched_since(&cache, at(0)).expect("touched"));
@@ -1157,22 +1171,15 @@ mod tests {
 
         // The live layout: build/test_cache/build/<md5>.cache.dill.track.dill
         // plus foreign files that must not ride along.
+        write(&cache.join("build").join("ab.cache.dill"), b"kernel bytes");
         write(
-            &cache.join("build").join("ab.cache.dill"),
-            b"kernel bytes",
-        );
-        write(
-            &cache
-                .join("build")
-                .join("cd.cache.dill.track.dill"),
+            &cache.join("build").join("cd.cache.dill.track.dill"),
             b"tracked kernel bytes",
         );
         write(&cache.join("build").join("lock"), b"transient");
         set_mtime(&cache.join("build").join("ab.cache.dill"), at(100));
         set_mtime(
-            &cache
-                .join("build")
-                .join("cd.cache.dill.track.dill"),
+            &cache.join("build").join("cd.cache.dill.track.dill"),
             at(120),
         );
         set_mtime(&cache.join("build").join("lock"), at(110));
@@ -1192,8 +1199,15 @@ mod tests {
             ["build/ab.cache.dill", "build/cd.cache.dill.track.dill"]
         );
         for file in &scanned.files {
-            assert_eq!(file.rewrite, RewriteKind::DillUris, "a dill rewrites URIs cross-tree");
-            assert_eq!(file.blob, blob(&fs::read(cache.join(&file.path)).expect("read")));
+            assert_eq!(
+                file.rewrite,
+                RewriteKind::DillUris,
+                "a dill rewrites URIs cross-tree"
+            );
+            assert_eq!(
+                file.blob,
+                blob(&fs::read(cache.join(&file.path)).expect("read"))
+            );
             assert!(file.stamp.is_some(), "every dill records its stamp");
         }
         assert_eq!(scanned.sources.len(), 2, "no prior: both dills hashed");
@@ -1242,9 +1256,16 @@ mod tests {
         // The next post-run scan over the unchanged file: the recorded
         // blob rides along and the file is never a source.
         let prior = prior_dir(first.files.clone());
-        let second = scan_test_cache(&cache, at(0), &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan")
-            .expect("files");
+        let second = scan_test_cache(
+            &cache,
+            at(0),
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            &|_| true,
+        )
+        .expect("scan")
+        .expect("files");
         assert!(second.sources.is_empty(), "no re-hash, no re-read");
         assert_eq!(second.files, first.files, "blob and stamp reused verbatim");
     }
@@ -1281,9 +1302,16 @@ mod tests {
         }
 
         let prior = prior_dir(first.files.clone());
-        let second = scan_test_cache(&cache, at(0), &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan")
-            .expect("files");
+        let second = scan_test_cache(
+            &cache,
+            at(0),
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            &|_| true,
+        )
+        .expect("scan")
+        .expect("files");
         assert_eq!(second.sources.len(), 1, "a replaced file always re-hashes");
         assert_eq!(second.files[0].blob, blob(b"kernel v2"));
         assert_ne!(second.files[0].blob, first.files[0].blob);
@@ -1295,9 +1323,16 @@ mod tests {
         let mut files = second.files.clone();
         files[0].stamp = Some(colliding);
         let prior = prior_dir(files);
-        let third = scan_test_cache(&cache, at(0), &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan")
-            .expect("files");
+        let third = scan_test_cache(
+            &cache,
+            at(0),
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            &|_| true,
+        )
+        .expect("scan")
+        .expect("files");
         assert_eq!(third.sources.len(), 1, "an inode mismatch alone re-hashes");
     }
 
@@ -1321,27 +1356,51 @@ mod tests {
         // mtime.
         set_mtime(&dill, at(999));
         let prior = prior_dir(first.files.clone());
-        let second = scan_test_cache(&cache, at(0), &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan")
-            .expect("files");
+        let second = scan_test_cache(
+            &cache,
+            at(0),
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            &|_| true,
+        )
+        .expect("scan")
+        .expect("files");
         assert_eq!(second.sources.len(), 1, "a moved mtime re-hashes");
-        assert_eq!(second.files[0].blob, first.files[0].blob, "same content, same blob");
+        assert_eq!(
+            second.files[0].blob, first.files[0].blob,
+            "same content, same blob"
+        );
 
         // A legacy manifest (no stamp) never matches.
         set_mtime(&dill, at(100));
         let mut legacy = first.files.clone();
         legacy[0].stamp = None;
         let prior = prior_dir(legacy);
-        let third = scan_test_cache(&cache, at(0), &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan")
-            .expect("files");
+        let third = scan_test_cache(
+            &cache,
+            at(0),
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            &|_| true,
+        )
+        .expect("scan")
+        .expect("files");
         assert_eq!(third.sources.len(), 1, "a stampless prior record re-hashes");
 
         // A stamp match whose blob gc has removed must not be reused.
         let prior = prior_dir(first.files.clone());
-        let fourth = scan_test_cache(&cache, at(0), &anchors_for(root), Some(&prior), None, &|_| false)
-            .expect("scan")
-            .expect("files");
+        let fourth = scan_test_cache(
+            &cache,
+            at(0),
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            &|_| false,
+        )
+        .expect("scan")
+        .expect("files");
         assert_eq!(fourth.sources.len(), 1, "a missing recorded blob re-hashes");
     }
 
@@ -1380,26 +1439,33 @@ mod tests {
         write(&hash_dir.join("a.stamp"), b"{}");
         write(&hash_dir.join("app.dill"), b"payload");
 
-        let first = scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let first =
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         assert_eq!(first.sources.len(), 2, "no prior: both files hashed");
         assert!(first.files.iter().all(|file| file.stamp.is_some()));
 
         // The warm re-scan over unchanged files: prior stamps match, no
         // bytes read, manifest references carried verbatim.
         let prior = prior_dir(first.files.clone());
-        let second =
-            scan_entry_files(&hash_dir, &anchors_for(root), Some(&prior), None, &|_| true).expect("scan");
+        let second = scan_entry_files(&hash_dir, &anchors_for(root), Some(&prior), None, &|_| true)
+            .expect("scan");
         assert!(second.sources.is_empty(), "no re-hash, no re-read");
-        assert_eq!(second.files, first.files, "blobs and stamps reused verbatim");
+        assert_eq!(
+            second.files, first.files,
+            "blobs and stamps reused verbatim"
+        );
 
         // A legacy manifest (no stamp) never matches for that file.
         let mut legacy = first.files.clone();
         legacy[0].stamp = None; // "a.stamp", the first of the sorted pair
         let prior = prior_dir(legacy);
-        let third =
-            scan_entry_files(&hash_dir, &anchors_for(root), Some(&prior), None, &|_| true).expect("scan");
+        let third = scan_entry_files(&hash_dir, &anchors_for(root), Some(&prior), None, &|_| true)
+            .expect("scan");
         assert_eq!(third.sources.len(), 1, "only the stamped record can reuse");
-        assert_eq!(third.files[0].blob, first.files[0].blob, "still hashed to the same content");
+        assert_eq!(
+            third.files[0].blob, first.files[0].blob,
+            "still hashed to the same content"
+        );
     }
 
     /// The placed fast path and its honesty rule: a verbatim placement
@@ -1417,12 +1483,23 @@ mod tests {
 
         // The placement was verbatim and the run left the file alone:
         // the placed blob rides along, nothing is read.
-        let placed = vec![placed_file("app.dill", on_disk, blob(b"placed bytes"), true)];
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| true)
-            .expect("scan");
+        let placed = vec![placed_file(
+            "app.dill",
+            on_disk,
+            blob(b"placed bytes"),
+            true,
+        )];
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| {
+            true
+        })
+        .expect("scan");
         assert!(scanned.sources.is_empty());
         assert_eq!(scanned.files[0].blob, blob(b"placed bytes"));
-        assert_eq!(scanned.files[0].stamp, Some(on_disk), "the fresh stamp is recorded");
+        assert_eq!(
+            scanned.files[0].stamp,
+            Some(on_disk),
+            "the fresh stamp is recorded"
+        );
 
         // The run rewrote the file after placement: the placed stamp no
         // longer matches. A prior record claiming the CURRENT identity
@@ -1472,9 +1549,16 @@ mod tests {
         write(&dill, b"payload");
         let on_disk = stamp_of(&fs::metadata(&dill).expect("metadata"));
 
-        let placed = vec![placed_file("app.dill", on_disk, blob(b"rewritten bytes"), false)];
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| true)
-            .expect("scan");
+        let placed = vec![placed_file(
+            "app.dill",
+            on_disk,
+            blob(b"rewritten bytes"),
+            false,
+        )];
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| {
+            true
+        })
+        .expect("scan");
         assert_eq!(
             scanned.sources.len(),
             1,
@@ -1483,9 +1567,15 @@ mod tests {
         assert_eq!(scanned.files[0].blob, blob(b"payload"));
 
         let placed = vec![placed_file("app.dill", on_disk, blob(b"gc'd bytes"), true)];
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| false)
-            .expect("scan");
-        assert_eq!(scanned.sources.len(), 1, "a missing recorded blob re-hashes");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| {
+            false
+        })
+        .expect("scan");
+        assert_eq!(
+            scanned.sources.len(),
+            1,
+            "a missing recorded blob re-hashes"
+        );
     }
 
     /// Files a manifest cannot represent are skipped with named
@@ -1506,14 +1596,18 @@ mod tests {
             non_regular: 1,
             ..ScanSkips::default()
         };
-        if fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"\xff\xfe.stamp")), b"{}").is_ok()
+        if fs::write(
+            dir.path()
+                .join(std::ffi::OsStr::from_bytes(b"\xff\xfe.stamp")),
+            b"{}",
+        )
+        .is_ok()
         {
             expected.non_utf8_names = 1;
         }
 
-        let scanned =
-            scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
-                .expect("the scan keeps going");
+        let scanned = scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
+            .expect("the scan keeps going");
         assert_eq!(scanned.skipped, expected);
         let names: Vec<&str> = scanned
             .files
@@ -1535,9 +1629,8 @@ mod tests {
         huge.resize(crate::materialize::REWRITE_LIMIT + 1, b' ');
         fs::write(dir.path().join("kernel_snapshot_program.d"), &huge).expect("write huge");
 
-        let scanned =
-            scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
-                .expect("scan");
+        let scanned = scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
+            .expect("scan");
         assert_eq!(scanned.skipped.oversize_rewrite, 1);
         assert_eq!(scanned.skipped.total(), 1);
         let names: Vec<&str> = scanned
@@ -1565,15 +1658,18 @@ mod tests {
         let escaped = root_text.replace(' ', "\\ ");
         let hash_dir = root.join(HASH_A);
         let depfile = format!("{escaped}/build/app.dill: {escaped}/lib/main.dart\n");
-        write(&hash_dir.join("kernel_snapshot_program.d"), depfile.as_bytes());
+        write(
+            &hash_dir.join("kernel_snapshot_program.d"),
+            depfile.as_bytes(),
+        );
         // The plain spelling in the same dir still classifies too.
         write(
             &hash_dir.join("outputs.json"),
             format!(r#"{{"out":["{root_text}/build/app.dill"]}}"#).as_bytes(),
         );
 
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(&root), None, None, &|_| true)
-            .expect("scan");
+        let scanned =
+            scan_entry_files(&hash_dir, &anchors_for(&root), None, None, &|_| true).expect("scan");
         let by_name = |name: &str| {
             scanned
                 .files
@@ -1635,8 +1731,8 @@ mod tests {
             b"file:///elsewhere/lib/main.dart file:///path/to/foo",
         );
 
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true)
-            .expect("scan");
+        let scanned =
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         let kind_of = |path: &str| {
             scanned
                 .files
@@ -1697,10 +1793,7 @@ mod tests {
         let picked = |since| find_touched_hash_dirs(&root, since).expect("scan");
         // HASH_A < HASH_B as strings ('0' < 'f'), so the name sort lists
         // A first; touch times do not order the result.
-        assert_eq!(
-            picked(at(150)),
-            vec![(HASH_B.to_owned(), at(300))]
-        );
+        assert_eq!(picked(at(150)), vec![(HASH_B.to_owned(), at(300))]);
         assert_eq!(
             picked(at(0)),
             vec![(HASH_A.to_owned(), at(100)), (HASH_B.to_owned(), at(300))]
@@ -1727,10 +1820,7 @@ mod tests {
         set_mtime(&root.join(by_file), at(50));
         assert_eq!(
             find_touched_hash_dirs(root, at(0)).expect("scan"),
-            vec![
-                (by_file.to_owned(), at(250)),
-                (by_dir.to_owned(), at(300)),
-            ]
+            vec![(by_file.to_owned(), at(250)), (by_dir.to_owned(), at(300)),]
         );
         // Only the dir touched at 300 — through its own mtime — survives
         // a `since` past the other's file-carried 250.
@@ -1789,8 +1879,7 @@ mod tests {
             write(&hash_dir.join(name), text.as_bytes());
         }
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors, None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors, None, None, &|_| true).expect("scan");
         let flag = |name: &str| {
             scanned
                 .files
@@ -1812,8 +1901,7 @@ mod tests {
         // root's bytes is not under it.
         let sibling_root = format!("{root_text}X/lib/main.dart");
         write(&hash_dir.join("prefix-trap.stamp"), sibling_root.as_bytes());
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors, None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors, None, None, &|_| true).expect("scan");
         assert!(
             scanned
                 .files
@@ -1841,8 +1929,7 @@ mod tests {
         write(&hash_dir.join("payload.bin"), b"payload");
 
         let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true)
-                .expect("scan");
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         let kind = |name: &str| {
             scanned
                 .files
@@ -1875,15 +1962,13 @@ mod tests {
         write(&hash_dir.join(".filecache"), &data);
 
         let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true)
-                .expect("scan");
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         let file = &scanned.files[0];
         assert!(file.foreign_paths, "the straddling foreign path is found");
         assert_eq!(file.rewrite, RewriteKind::PathText, "the late anchor too");
         // Deterministic: a second pass classifies identically.
         let again =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true)
-                .expect("scan");
+            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
         assert_eq!(again.files, scanned.files);
     }
 
@@ -1940,7 +2025,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {name}"))
                 .rewrite
         };
-        assert_eq!(kind("anchored.cache.dill.track.dill"), RewriteKind::DillUris);
+        assert_eq!(
+            kind("anchored.cache.dill.track.dill"),
+            RewriteKind::DillUris
+        );
         assert_eq!(kind("foreign.cache.dill.track.dill"), RewriteKind::None);
         assert!(
             scanned.files.iter().all(|file| !file.foreign_paths),

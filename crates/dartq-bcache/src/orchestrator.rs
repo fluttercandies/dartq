@@ -106,7 +106,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::args_model::{ArgModelError, ParsedFlutterCmd, flutter_build_dir_name, parse_flutter_args};
+use crate::args_model::{
+    ArgModelError, ParsedFlutterCmd, flutter_build_dir_name, parse_flutter_args,
+};
 use crate::assemble::AssembleCapture;
 use crate::error::Result;
 #[cfg(unix)]
@@ -651,7 +653,11 @@ pub fn run_shim(
                             "hit {} materialized {} dirs, {skipped} skipped{}",
                             &key[..8],
                             replayable,
-                            if outcome.report.intact { " (tree intact)" } else { "" }
+                            if outcome.report.intact {
+                                " (tree intact)"
+                            } else {
+                                ""
+                            }
                         ));
                         if outcome.report.dill_rewrites > 0
                             || outcome.report.dill_rewrite_refused > 0
@@ -678,7 +684,9 @@ pub fn run_shim(
                 }
             } else {
                 report.reason = "tree_lock_busy";
-                note("another shim holds this tree's cache lock; skipping the pre-run materialization");
+                note(
+                    "another shim holds this tree's cache lock; skipping the pre-run materialization",
+                );
             }
         }
     }
@@ -695,7 +703,9 @@ pub fn run_shim(
     let marker = RunMarker::create(&cwd);
     let run = runner.run(argv, &cwd);
     let observed = observer.finish();
-    let run_started = marker.as_ref().map_or_else(now_floored_to_secs, RunMarker::touch_time);
+    let run_started = marker
+        .as_ref()
+        .map_or_else(now_floored_to_secs, RunMarker::touch_time);
     drop(marker);
     match run {
         Ok(code) => report.exit_code = Some(code),
@@ -795,9 +805,7 @@ pub fn run_shim(
             // assemble) are dead observations.
             let captures: Vec<AssembleCapture> = observed
                 .into_iter()
-                .filter(|capture| {
-                    touched.iter().any(|(name, _)| name == &capture.name)
-                })
+                .filter(|capture| touched.iter().any(|(name, _)| name == &capture.name))
                 .collect();
             // A hit may skip the re-ingest ONLY when the run changed
             // nothing beyond the hit's own placement: every touched dir
@@ -839,7 +847,9 @@ pub fn run_shim(
                         engine_for_names,
                         post_key.clone(),
                         &placed,
-                        asset_dir.as_ref().map(|(name, dir)| (name.as_str(), dir.as_path())),
+                        asset_dir
+                            .as_ref()
+                            .map(|(name, dir)| (name.as_str(), dir.as_path())),
                         test_scan.as_ref(),
                     )?;
                     maybe_gc(&store, config);
@@ -1392,11 +1402,7 @@ fn ingest_observed(
                     capture.defines.clone(),
                     capture.output_dir.clone(),
                 ),
-                None if bundle_face => (
-                    NameRule::VerbatimRelative,
-                    BTreeMap::new(),
-                    String::new(),
-                ),
+                None if bundle_face => (NameRule::VerbatimRelative, BTreeMap::new(), String::new()),
                 // A missed capture for a dir the prior entry already
                 // recorded keeps the prior record's naming (audit A22):
                 // the absence of an observation this run says nothing
@@ -1436,13 +1442,9 @@ fn ingest_observed(
             .iter()
             .find(|(placed_name, _)| placed_name == name)
             .map(|(_, files)| files.as_slice());
-        let scan = scan_entry_files(
-            dir,
-            anchors,
-            prior_dir,
-            placed_dir,
-            &|id| store.blob_path(id).is_file(),
-        )?;
+        let scan = scan_entry_files(dir, anchors, prior_dir, placed_dir, &|id| {
+            store.blob_path(id).is_file()
+        })?;
         if !scan.files.is_empty() {
             dirs.push(DirRecord {
                 name_observed: name.to_owned(),
@@ -1480,7 +1482,9 @@ fn ingest_observed(
         // `created_at` is the entry's birth time, not this ingest's: a
         // rewrite of the same key carries the prior record's creation
         // forward so LRU aging reflects the entry's true age.
-        created_at_unix: prior.as_ref().map_or(now, |manifest| manifest.created_at_unix),
+        created_at_unix: prior
+            .as_ref()
+            .map_or(now, |manifest| manifest.created_at_unix),
         last_hit_unix: now,
     };
     // A rerun that reproduced the stored snapshot byte for byte has
@@ -1494,7 +1498,9 @@ fn ingest_observed(
     // re-hashing it is cheaper than a publish; a larger one is published
     // once so its fresh stamp spares every later run the re-read. A
     // vanished entry (gc between lookup and here) is published afresh.
-    let unchanged = prior.as_ref().is_some_and(|prior| same_snapshot(prior, &draft))
+    let unchanged = prior
+        .as_ref()
+        .is_some_and(|prior| same_snapshot(prior, &draft))
         && sources.iter().all(|(path, blob)| {
             store.blob_path(blob).is_file()
                 && fs::metadata(path).is_ok_and(|metadata| metadata.len() <= STALE_STAMP_LIMIT)
@@ -1519,7 +1525,11 @@ fn same_snapshot(prior: &EntryManifest, draft: &EntryManifest) -> bool {
         let mut manifest = manifest.clone();
         manifest.created_at_unix = 0;
         manifest.last_hit_unix = 0;
-        for file in manifest.dirs.iter_mut().flat_map(|dir| dir.files.iter_mut()) {
+        for file in manifest
+            .dirs
+            .iter_mut()
+            .flat_map(|dir| dir.files.iter_mut())
+        {
             file.stamp = None;
         }
         manifest
@@ -1674,8 +1684,8 @@ pub fn discover_flutter(explicit: Option<&Path>, own_exe: Option<&Path>) -> Opti
     if let Some(path) = std::env::var_os("DARTQ_FLUTTER").filter(|value| !value.is_empty()) {
         return non_recursing(&PathBuf::from(path), own.as_deref());
     }
-    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .collect();
+    let dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
     first_flutter_on_path(&dirs, own.as_deref())
 }
 
@@ -1762,7 +1772,9 @@ fn acquire_tree_lock(cwd: &Path) -> Option<TreeLock> {
         match TreeLock::acquire(cwd, TREE_LOCK_WAIT) {
             Ok(lock) => lock,
             Err(err) => {
-                note(&format!("tree lock unavailable ({err}); proceeding unsynchronized"));
+                note(&format!(
+                    "tree lock unavailable ({err}); proceeding unsynchronized"
+                ));
                 None
             }
         }
@@ -1894,7 +1906,10 @@ mod tests {
     /// source file.
     fn synthetic_project(tmp: &Path, tag: &str) -> PathBuf {
         let project = tmp.join(format!("app-{tag}"));
-        write(&project.join("pubspec.yaml"), b"name: app\nversion: 1.0.0\n");
+        write(
+            &project.join("pubspec.yaml"),
+            b"name: app\nversion: 1.0.0\n",
+        );
         write(&project.join("pubspec.lock"), b"packages: {}\n");
         write(
             &project.join(".dart_tool").join("package_config.json"),
@@ -1905,7 +1920,10 @@ mod tests {
     }
 
     fn escape_path(path: &Path) -> String {
-        path.display().to_string().replace('\\', "\\\\").replace(' ', "\\ ")
+        path.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace(' ', "\\ ")
     }
 
     /// Fabricates the `.dart_tool/flutter_build/<name>` dir a flutter run
@@ -1915,10 +1933,7 @@ mod tests {
     /// capture-not-predict the name is whatever the run observed, so
     /// callers pick it.
     fn build_fixture(project: &Path, name: &str) -> PathBuf {
-        let dir = project
-            .join(".dart_tool")
-            .join("flutter_build")
-            .join(name);
+        let dir = project.join(".dart_tool").join("flutter_build").join(name);
         write(&dir.join("app.dill"), b"kernel payload bytes");
         let depfile = format!(
             "{}: {} {}\n",
@@ -2034,7 +2049,10 @@ mod tests {
         assert_eq!(report.skipped_dirs, 0);
         assert_eq!(runner.argv, raw, "the child gets the original argv");
 
-        let dir_b = tree_b.join(".dart_tool").join("flutter_build").join(DIR_MAIN);
+        let dir_b = tree_b
+            .join(".dart_tool")
+            .join("flutter_build")
+            .join(DIR_MAIN);
         let stamp = fs::read_to_string(dir_b.join("flutter_build.dill.stamp")).expect("stamp");
         assert!(
             stamp.contains(tree_b.to_str().expect("UTF-8 root")),
@@ -2082,17 +2100,22 @@ mod tests {
         // its content validation rebuilds what diverged; the cost of the
         // stale hit is one materialization, never a wrong artifact.
         let tree_b = synthetic_project(&tmp, "b");
-        write(&tree_b.join("lib").join("main.dart"), b"void main() { edited(); }\n");
+        write(
+            &tree_b.join("lib").join("main.dart"),
+            b"void main() { edited(); }\n",
+        );
         let mut runner = FakeRunner::exits(0);
         let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.key.as_deref(), Some(key.as_str()));
-        assert!(tree_b
-            .join(".dart_tool")
-            .join("flutter_build")
-            .join(DIR_MAIN)
-            .join("app.dill")
-            .is_file());
+        assert!(
+            tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(DIR_MAIN)
+                .join("app.dill")
+                .is_file()
+        );
     }
 
     /// Audit finding A1, end to end: a recorded dir whose bookkeeping
@@ -2133,10 +2156,7 @@ mod tests {
         let store = CasStore::open(&store_root).expect("open store");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
         assert!(
-            manifest.dirs[0]
-                .files
-                .iter()
-                .any(|file| file.foreign_paths),
+            manifest.dirs[0].files.iter().any(|file| file.foreign_paths),
             "the ingest classifies the foreign input"
         );
 
@@ -2314,7 +2334,10 @@ mod tests {
             &defines("/new/wt/ios"),
             Path::new("/new/wt/build/app/intermediates"),
         );
-        assert_eq!(replayed_hash_name(&record, "/old/wt", target, "engine"), expected);
+        assert_eq!(
+            replayed_hash_name(&record, "/old/wt", target, "engine"),
+            expected
+        );
 
         // Lookalike prefixes and foreign values stay verbatim.
         let record = dir("/old/wt-lookalike/ios", "/old/wt/build");
@@ -2323,14 +2346,20 @@ mod tests {
             &defines("/old/wt-lookalike/ios"),
             Path::new("/new/wt/build"),
         );
-        assert_eq!(replayed_hash_name(&record, "/old/wt", target, "engine"), expected);
+        assert_eq!(
+            replayed_hash_name(&record, "/old/wt", target, "engine"),
+            expected
+        );
         let record = dir("/fake/pub-cache/x", "/old/wt/build");
         let expected = flutter_build_dir_name(
             "engine",
             &defines("/fake/pub-cache/x"),
             Path::new("/new/wt/build"),
         );
-        assert_eq!(replayed_hash_name(&record, "/old/wt", target, "engine"), expected);
+        assert_eq!(
+            replayed_hash_name(&record, "/old/wt", target, "engine"),
+            expected
+        );
     }
 
     /// The anchor itself: the worktree root is the nearest `.git`
@@ -2451,17 +2480,39 @@ mod tests {
         let mut runner = FakeRunner::exits(0);
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
-        let output_b = rerooted(&template.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
-        let name_b = flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
-        assert_ne!(name_b, template.name, "the name embeds the absolute output dir");
-        let dir_b = tree_b.join(".dart_tool").join("flutter_build").join(&name_b);
-        assert!(dir_b.join("app.dill").is_file(), "materialized under {}", dir_b.display());
+        let output_b = rerooted(
+            &template.output_dir,
+            &manifest.worktree_root_at_ingest,
+            &tree_b,
+        );
+        let name_b =
+            flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
+        assert_ne!(
+            name_b, template.name,
+            "the name embeds the absolute output dir"
+        );
+        let dir_b = tree_b
+            .join(".dart_tool")
+            .join("flutter_build")
+            .join(&name_b);
         assert!(
-            !tree_b.join(".dart_tool").join("flutter_build").join(&template.name).exists(),
+            dir_b.join("app.dill").is_file(),
+            "materialized under {}",
+            dir_b.display()
+        );
+        assert!(
+            !tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(&template.name)
+                .exists(),
             "the ingest-tree name never replays"
         );
         let stamp = fs::read_to_string(dir_b.join("flutter_build.dill.stamp")).expect("stamp");
-        assert!(stamp.contains(tree_b.to_str().expect("UTF-8 root")), "{stamp}");
+        assert!(
+            stamp.contains(tree_b.to_str().expect("UTF-8 root")),
+            "{stamp}"
+        );
         // A4 roundtrip: the recorded `flutter_build/<tree-A name>`
         // segment inside the stamp followed the dir to tree B's
         // recomputed name, root and segment together.
@@ -2552,16 +2603,16 @@ mod tests {
         let mut rerun = FakeRunner::exits(0);
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut rerun);
         assert_eq!(report.action, Action::PreHitMaterialized);
-        let output_b =
-            rerooted(&full.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
-        let name_b =
-            flutter_build_dir_name(&engine_revision, &full.defines, Path::new(&output_b));
-        assert!(tree_b
-            .join(".dart_tool")
-            .join("flutter_build")
-            .join(&name_b)
-            .join("app.dill")
-            .is_file());
+        let output_b = rerooted(&full.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
+        let name_b = flutter_build_dir_name(&engine_revision, &full.defines, Path::new(&output_b));
+        assert!(
+            tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(&name_b)
+                .join("app.dill")
+                .is_file()
+        );
     }
 
     /// An observed assemble whose dir never materialized (a failed
@@ -2580,8 +2631,7 @@ mod tests {
         let config = config_for(&store_root, &flutter_bin);
 
         let tree = synthetic_project(&tmp, "a");
-        let orphan_argv =
-            assemble_argv(&flutter_bin, "/opt/nowhere/failed");
+        let orphan_argv = assemble_argv(&flutter_bin, "/opt/nowhere/failed");
         let orphan = base_capture(&orphan_argv, &tree, &engine_revision);
         let observed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut runner = FakeRunner {
@@ -2664,7 +2714,10 @@ mod tests {
                 .find(|dir| dir.name_rule == rule)
                 .expect("dir of that rule")
         };
-        assert_eq!(by_rule(NameRule::RecomputeFromTemplate).name_observed, template.name);
+        assert_eq!(
+            by_rule(NameRule::RecomputeFromTemplate).name_observed,
+            template.name
+        );
         assert_eq!(by_rule(NameRule::NotReplayable).name_observed, internal);
 
         // The fresh tree's hit materializes the replayable dir and skips
@@ -2674,19 +2727,28 @@ mod tests {
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.skipped_dirs, 1);
-        let output_b = rerooted(&template.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
-        let name_b = flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
-        assert!(tree_b
-            .join(".dart_tool")
-            .join("flutter_build")
-            .join(&name_b)
-            .join("app.dill")
-            .is_file());
-        assert!(!tree_b
-            .join(".dart_tool")
-            .join("flutter_build")
-            .join(internal)
-            .exists());
+        let output_b = rerooted(
+            &template.output_dir,
+            &manifest.worktree_root_at_ingest,
+            &tree_b,
+        );
+        let name_b =
+            flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
+        assert!(
+            tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(&name_b)
+                .join("app.dill")
+                .is_file()
+        );
+        assert!(
+            !tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(internal)
+                .exists()
+        );
     }
 
     /// A user-run `flutter assemble` is an unmodeled command: a plain
@@ -2753,9 +2815,7 @@ mod tests {
         let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.reason, "unsupported_flutter_version");
 
-        let record = store_root
-            .join("meta")
-            .join("toolchain-unsupported.json");
+        let record = store_root.join("meta").join("toolchain-unsupported.json");
         let recorded: ToolchainCache =
             serde_json::from_slice(&fs::read(&record).expect("record")).expect("parse record");
 
@@ -2773,7 +2833,10 @@ mod tests {
         let changed = vec![b'X'; metadata.len() as usize];
         assert_ne!(changed, fs::read(&dill).expect("read dill"));
         fs::write(&dill, &changed).expect("rewrite dill");
-        let file = fs::File::options().write(true).open(&dill).expect("open dill");
+        let file = fs::File::options()
+            .write(true)
+            .open(&dill)
+            .expect("open dill");
         file.set_times(fs::FileTimes::new().set_modified(mtime))
             .expect("restore mtime");
         drop(file);
@@ -2787,7 +2850,10 @@ mod tests {
         // A real change (the size moves) invalidates the record.
         fs::write(&dill, b"platform dill bytes, changed").expect("grow dill");
         let fresh = cached_fingerprint(&sdk, &store_root).expect("fingerprint");
-        assert_ne!(fresh.platform_strong_dill, recorded.fingerprint.platform_strong_dill);
+        assert_ne!(
+            fresh.platform_strong_dill,
+            recorded.fingerprint.platform_strong_dill
+        );
     }
 
     /// A byte-identical fingerprint record is not rewritten: the file's
@@ -2802,11 +2868,17 @@ mod tests {
 
         store_fingerprint_cache(&store_root, &sdk, &first);
         let path = store_root.join("meta").join("toolchain.json");
-        let mtime = fs::metadata(&path).expect("stat record").modified().expect("mtime");
+        let mtime = fs::metadata(&path)
+            .expect("stat record")
+            .modified()
+            .expect("mtime");
         std::thread::sleep(Duration::from_millis(25));
         store_fingerprint_cache(&store_root, &sdk, &first);
         assert_eq!(
-            fs::metadata(&path).expect("stat record").modified().expect("mtime"),
+            fs::metadata(&path)
+                .expect("stat record")
+                .modified()
+                .expect("mtime"),
             mtime,
             "an identical record must not be rewritten"
         );
@@ -2828,7 +2900,10 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).expect("record")).expect("parse record");
         assert_eq!(record.fingerprint, second);
         assert_ne!(
-            fs::metadata(&path).expect("stat record").modified().expect("mtime"),
+            fs::metadata(&path)
+                .expect("stat record")
+                .modified()
+                .expect("mtime"),
             mtime
         );
     }
@@ -2918,7 +2993,10 @@ mod tests {
         assert_eq!(manifest.dirs[0].name_rule, NameRule::TestKernelCache);
         assert_eq!(manifest.dirs[0].name_observed, "build/test_cache");
         assert!(
-            !manifest.dirs.iter().any(|dir| dir.name_observed == DIR_MAIN),
+            !manifest
+                .dirs
+                .iter()
+                .any(|dir| dir.name_observed == DIR_MAIN),
             "hash dirs stay exit-0-gated"
         );
         assert_eq!(
@@ -3072,7 +3150,10 @@ mod tests {
                 format!("file://{root_a}/test/cache_smoke_test.dart").as_str(),
                 "package:app/main.dart",
             )],
-            &[format!("file://{root_a}/lib/main.dart").as_str(), "dart:core"],
+            &[
+                format!("file://{root_a}/lib/main.dart").as_str(),
+                "dart:core",
+            ],
             1,
         );
         let effect_a = dill_a.clone();
@@ -3090,7 +3171,10 @@ mod tests {
         let key = seeded.key.clone().expect("post key");
         let store = CasStore::open(&store_root).expect("open store");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
-        let dir = manifest.dirs.iter().find(|d| d.name_rule == NameRule::TestKernelCache)
+        let dir = manifest
+            .dirs
+            .iter()
+            .find(|d| d.name_rule == NameRule::TestKernelCache)
             .expect("test cache dir");
         assert_eq!(dir.files[0].rewrite, crate::types::RewriteKind::DillUris);
 
@@ -3105,7 +3189,10 @@ mod tests {
                 format!("file://{root_b}/test/cache_smoke_test.dart").as_str(),
                 "package:app/main.dart",
             )],
-            &[format!("file://{root_b}/lib/main.dart").as_str(), "dart:core"],
+            &[
+                format!("file://{root_b}/lib/main.dart").as_str(),
+                "dart:core",
+            ],
             1,
         );
         let effect_b = dill_b.clone();
@@ -3116,13 +3203,19 @@ mod tests {
                 // What the child initializes from: the hit's placement.
                 let placed = fs::read(test_dill_path(cwd)).expect("hit placed the dill");
                 assert!(
-                    memchr::memmem::find(&placed, format!("file://{root_b}/lib/main.dart").as_bytes())
-                        .is_some(),
+                    memchr::memmem::find(
+                        &placed,
+                        format!("file://{root_b}/lib/main.dart").as_bytes()
+                    )
+                    .is_some(),
                     "the placed dill carries this tree's URIs"
                 );
                 assert!(
-                    memchr::memmem::find(&placed, format!("file://{root_a}/lib/main.dart").as_bytes())
-                        .is_none(),
+                    memchr::memmem::find(
+                        &placed,
+                        format!("file://{root_a}/lib/main.dart").as_bytes()
+                    )
+                    .is_none(),
                     "no ingest-tree URI survives the rewrite"
                 );
                 assert_ne!(placed, dill_a, "the placement is a rewrite, not a clone");
@@ -3152,7 +3245,10 @@ mod tests {
 
         // POST converged the entry onto the consuming tree's dill.
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
-        let dir = manifest.dirs.iter().find(|d| d.name_rule == NameRule::TestKernelCache)
+        let dir = manifest
+            .dirs
+            .iter()
+            .find(|d| d.name_rule == NameRule::TestKernelCache)
             .expect("test cache dir");
         assert_eq!(
             dir.files[0].blob,
@@ -3273,7 +3369,10 @@ mod tests {
                 .expect("test cache dir")
         };
         assert_eq!(recorded().files[0].blob, dill_blob);
-        assert!(recorded().files[0].stamp.is_some(), "the ingest records the stamp");
+        assert!(
+            recorded().files[0].stamp.is_some(),
+            "the ingest records the stamp"
+        );
         assert_eq!(store.stats().expect("stats").blobs, 1);
 
         // A foreign pre-run state moves the key (so PRE misses and the
@@ -3286,14 +3385,20 @@ mod tests {
             effect: Some(Box::new(|cwd| {
                 write(&cwd.join("pubspec.yaml"), b"name: app\nversion: 2.0.0\n");
                 write(
-                    &cwd.join("build").join("test_cache").join("build").join("lock"),
+                    &cwd.join("build")
+                        .join("test_cache")
+                        .join("build")
+                        .join("lock"),
                     b"transient",
                 );
             })),
         };
         let report = run_shim(&raw, &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested, "pre-miss, post re-ingest");
-        assert_eq!(report.ingest_files, 0, "the unchanged dill is not re-hashed");
+        assert_eq!(
+            report.ingest_files, 0,
+            "the unchanged dill is not re-hashed"
+        );
         let stats = store.stats().expect("stats");
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.blobs, 1, "no new blob version");
@@ -3336,7 +3441,10 @@ mod tests {
         };
         let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
-        assert!(seeded.ingest_files >= 3, "the cold run stores the whole dir");
+        assert!(
+            seeded.ingest_files >= 3,
+            "the cold run stores the whole dir"
+        );
         let key = seeded.key.clone().expect("post key");
         let store = CasStore::open(&store_root).expect("open store");
         let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
@@ -3381,8 +3489,16 @@ mod tests {
                 .map(|file| (file.path.clone(), file.blob))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(refs(&manifest), refs(&seed_manifest), "references reused verbatim");
-        assert_eq!(store.stats().expect("stats").blobs, seed_blobs, "no new blob versions");
+        assert_eq!(
+            refs(&manifest),
+            refs(&seed_manifest),
+            "references reused verbatim"
+        );
+        assert_eq!(
+            store.stats().expect("stats").blobs,
+            seed_blobs,
+            "no new blob versions"
+        );
     }
 
     /// The warm apk shape with one rewritten payload: only that file is
@@ -3433,7 +3549,9 @@ mod tests {
             effect: Some(Box::new(move |cwd| {
                 run_assemble_lookalike(&warm_argv);
                 write(
-                    &cwd.join(".dart_tool").join("flutter_build").join(&warm_name)
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(&warm_name)
                         .join("app.dill"),
                     b"kernel payload bytes v2",
                 );
@@ -3471,7 +3589,10 @@ mod tests {
         // The superseded payload is unreferenced and gc-able; the entry
         // and its current blobs survive.
         let superseded = BlobId(*blake3::hash(b"kernel payload bytes").as_bytes());
-        assert!(store.blob_path(&superseded).exists(), "unreferenced until gc");
+        assert!(
+            store.blob_path(&superseded).exists(),
+            "unreferenced until gc"
+        );
         let report = store.gc(u64::MAX, 0, unix_now() + 2 * 3600).expect("gc");
         assert_eq!(report.entries_evicted, 0, "the entry survives");
         assert_eq!(report.blobs_removed, 1, "only the superseded payload goes");
@@ -3526,7 +3647,9 @@ mod tests {
             effect: Some(Box::new(|cwd| {
                 write(&cwd.join("pubspec.yaml"), b"name: app\nversion: 2.0.0\n");
                 write(
-                    &cwd.join(".dart_tool").join("flutter_build").join(DIR_MAIN)
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
                         .join("flutter_build.dill.stamp"),
                     br#"{"inputs":[],"outputs":[]}"#,
                 );
@@ -3599,7 +3722,9 @@ mod tests {
             argv: Vec::new(),
             effect: Some(Box::new(|cwd| {
                 write(
-                    &cwd.join(".dart_tool").join("flutter_build").join(DIR_MAIN)
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
                         .join("flutter_build.dill.stamp"),
                     br#"{"inputs":["x"],"outputs":["y"]}"#,
                 );
@@ -3673,7 +3798,10 @@ mod tests {
             flutter_build_dir(Some(OsString::from("out/debug"))),
             PathBuf::from("out/debug")
         );
-        assert_eq!(flutter_build_dir(Some(OsString::new())), PathBuf::from("build"));
+        assert_eq!(
+            flutter_build_dir(Some(OsString::new())),
+            PathBuf::from("build")
+        );
     }
 
     /// The define-value/output-dir reroot replaces the ingest root only
@@ -3683,14 +3811,20 @@ mod tests {
     #[test]
     fn rerooted_replaces_only_whole_path_boundaries() {
         let target = Path::new("/new/root");
-        assert_eq!(rerooted("/old/root/lib", "/old/root", target), "/new/root/lib");
+        assert_eq!(
+            rerooted("/old/root/lib", "/old/root", target),
+            "/new/root/lib"
+        );
         assert_eq!(rerooted("/old/root", "/old/root", target), "/new/root");
         assert_eq!(
             rerooted("/old/root-lookalike", "/old/root", target),
             "/old/root-lookalike",
             "a sibling prefix is not rewritten"
         );
-        assert_eq!(rerooted("/elsewhere/x", "/old/root", target), "/elsewhere/x");
+        assert_eq!(
+            rerooted("/elsewhere/x", "/old/root", target),
+            "/elsewhere/x"
+        );
     }
 
     /// A10's narrowing: the PATH search skips only the shim BINARY —
@@ -3711,11 +3845,17 @@ mod tests {
         // file identity may exclude.
         let bin_dir = tmp.join("dartq-bin");
         write(&bin_dir.join("dartq"), b"the dartq executable\n");
-        write(&bin_dir.join("flutter"), b"#!/bin/sh\n# a real flutter beside dartq\n");
+        write(
+            &bin_dir.join("flutter"),
+            b"#!/bin/sh\n# a real flutter beside dartq\n",
+        );
         let own = fs::canonicalize(bin_dir.join("dartq")).expect("canonicalize own");
         let beside =
             first_flutter_on_path(&[bin_dir.clone()], Some(&own)).expect("found beside the shim");
-        assert_eq!(beside, fs::canonicalize(bin_dir.join("flutter")).expect("canonicalize"));
+        assert_eq!(
+            beside,
+            fs::canonicalize(bin_dir.join("flutter")).expect("canonicalize")
+        );
 
         // A symlink to the shim binary in another directory is skipped
         // by file identity, and the search moves on to the real one.
@@ -3728,7 +3868,10 @@ mod tests {
         assert_eq!(found, real);
 
         // Nothing but the shim on PATH: no resolution at all.
-        assert_eq!(first_flutter_on_path(&[bin_dir.join("nowhere")], Some(&own)), None);
+        assert_eq!(
+            first_flutter_on_path(&[bin_dir.join("nowhere")], Some(&own)),
+            None
+        );
     }
 
     /// A10: a configured flutter (config key, DARTQ_FLUTTER, or a PATH
@@ -3812,8 +3955,13 @@ mod tests {
             "--dart-define",
             "API=prod",
         ];
-        let parsed = parse_flutter_args(&raw_argv(&argv).iter().map(|t| t.to_string_lossy().into_owned()).collect::<Vec<_>>())
-            .expect("parse");
+        let parsed = parse_flutter_args(
+            &raw_argv(&argv)
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .expect("parse");
         let toolchain = key::fingerprint_toolchain(&sdk).expect("fingerprint");
         let ordered = dart_define_vector(&parsed, &sdk, &toolchain);
         let rendered: Vec<(&str, &str)> = ordered
@@ -3836,14 +3984,21 @@ mod tests {
         );
         // A user define replaces the injected value in place.
         let over = parse_flutter_args(
-            &["build", "bundle", "--dart-define", "FLUTTER_BUILD_NAME=9.9.9"]
-                .iter()
-                .map(|token| (*token).to_owned())
-                .collect::<Vec<_>>(),
+            &[
+                "build",
+                "bundle",
+                "--dart-define",
+                "FLUTTER_BUILD_NAME=9.9.9",
+            ]
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect::<Vec<_>>(),
         )
         .expect("parse");
-        assert!(dart_define_vector(&over, &sdk, &toolchain)
-            .contains(&("FLUTTER_BUILD_NAME".to_owned(), "9.9.9".to_owned())));
+        assert!(
+            dart_define_vector(&over, &sdk, &toolchain)
+                .contains(&("FLUTTER_BUILD_NAME".to_owned(), "9.9.9".to_owned()))
+        );
     }
 
     /// A fake flutter as an executable script. The production runner
@@ -3870,7 +4025,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_runner_strips_the_shim_tag_from_the_child_env() {
-        let _serial = RUNNER_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = RUNNER_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (_guard, tmp) = tempdir();
         let probe = tmp.join("env-probe");
         let flutter = script(
@@ -3963,7 +4120,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn forwarded_sigterm_reaches_the_child_and_reports_its_status() {
-        let _serial = RUNNER_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = RUNNER_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (_guard, tmp) = tempdir();
         let ready = tmp.join("child-pid");
         let flutter = script(
@@ -3989,7 +4148,11 @@ mod tests {
         // SIGTERM this process — the shim's position in production.
         unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) };
         let code = runner.join().expect("runner thread").expect("run");
-        assert_eq!(code, 128 + libc::SIGTERM, "the child's signal death is reported");
+        assert_eq!(
+            code,
+            128 + libc::SIGTERM,
+            "the child's signal death is reported"
+        );
         // The child is reaped and gone.
         // SAFETY: signal 0 only probes for the pid's existence.
         assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1, "the child is gone");
@@ -4029,7 +4192,11 @@ mod tests {
         // stay; the counter heals to exactly the bytes that remain.
         config.budget_bytes = 0;
         maybe_gc(&store, &config);
-        assert_eq!(store.stats().expect("stats").entries, 0, "grace 0 + no budget evicts");
+        assert_eq!(
+            store.stats().expect("stats").entries,
+            0,
+            "grace 0 + no budget evicts"
+        );
         assert_eq!(
             store.used_bytes().expect("used after gc"),
             store.stats().expect("stats").blob_bytes,
@@ -4213,15 +4380,20 @@ mod tests {
         let mut runner = FakeRunner::exits(0);
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
-        let output_b =
-            rerooted(&template.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
+        let output_b = rerooted(
+            &template.output_dir,
+            &manifest.worktree_root_at_ingest,
+            &tree_b,
+        );
         let name_b =
             flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
-        assert!(tree_b
-            .join(".dart_tool")
-            .join("flutter_build")
-            .join(&name_b)
-            .join("app.dill")
-            .is_file());
+        assert!(
+            tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(&name_b)
+                .join("app.dill")
+                .is_file()
+        );
     }
 }

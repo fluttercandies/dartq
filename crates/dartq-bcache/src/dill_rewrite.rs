@@ -251,7 +251,12 @@ fn map_window(file: &fs::File, start: usize, len: usize) -> Result<Mmap> {
 
 /// Streams `input[start..end]` verbatim in window-sized chunks: the
 /// copy holds one window, never the region.
-fn copy_span<W: Write>(out: &mut Out<W>, input: &mut Reader, start: usize, end: usize) -> Result<()> {
+fn copy_span<W: Write>(
+    out: &mut Out<W>,
+    input: &mut Reader,
+    start: usize,
+    end: usize,
+) -> Result<()> {
     let mut pos = start;
     while pos < end {
         let stop = (pos + WINDOW).min(end);
@@ -327,7 +332,10 @@ fn component_ranges(
 /// The per-component header gate: magic, format version, ASCII sdkHash.
 fn check_header(input: &mut Reader, comp_start: usize, comp_len: usize) -> Result<()> {
     if comp_len < 8 + SDK_HASH_LEN {
-        return Err(malformed(comp_len as isize, "component shorter than its header"));
+        return Err(malformed(
+            comp_len as isize,
+            "component shorter than its header",
+        ));
     }
     let magic = input.slice_u32(comp_start)?;
     if magic != MAGIC {
@@ -378,7 +386,10 @@ impl Footer {
 fn parse_footer(input: &mut Reader, comp_start: usize, comp_len: usize) -> Result<Footer> {
     let comp_end = comp_start + comp_len;
     if comp_len < 12 {
-        return Err(malformed(comp_len as isize, "component shorter than a footer"));
+        return Err(malformed(
+            comp_len as isize,
+            "component shorter than a footer",
+        ));
     }
     let mut cursor = Cursor::new(input, comp_end - 8, comp_end);
     let library_count = cursor.u32()?;
@@ -392,9 +403,12 @@ fn parse_footer(input: &mut Reader, comp_start: usize, comp_len: usize) -> Resul
     // The trailing libraryCount + totalSize are part of the fixed
     // fields; the reader re-reads them at the end of the sequence.
     let fixed = Footer::len(library_count);
-    let start = comp_len
-        .checked_sub(fixed)
-        .ok_or_else(|| malformed(comp_len as isize, "component shorter than its footer claims"))?;
+    let start = comp_len.checked_sub(fixed).ok_or_else(|| {
+        malformed(
+            comp_len as isize,
+            "component shorter than its footer claims",
+        )
+    })?;
     let mut cursor = Cursor::new(input, comp_start + start, comp_end);
     let footer = Footer {
         src_tbl: cursor.u32()? as usize,
@@ -407,10 +421,15 @@ fn parse_footer(input: &mut Reader, comp_start: usize, comp_len: usize) -> Resul
         comp_idx_start: cursor.u32()? as usize,
         main_ref: cursor.u32()?,
         library_count,
-        library_offsets: (0..=library_count).map(|_| cursor.u32()).collect::<Result<_>>()?,
+        library_offsets: (0..=library_count)
+            .map(|_| cursor.u32())
+            .collect::<Result<_>>()?,
     };
     if cursor.u32()? != library_count {
-        return Err(malformed(comp_len as isize, "libraryCount re-read mismatch"));
+        return Err(malformed(
+            comp_len as isize,
+            "libraryCount re-read mismatch",
+        ));
     }
     if cursor.u32()? as usize != comp_len {
         return Err(malformed(comp_len as isize, "totalSize re-read mismatch"));
@@ -426,7 +445,10 @@ fn parse_footer(input: &mut Reader, comp_start: usize, comp_len: usize) -> Resul
         && footer.str_tbl <= footer.comp_idx_start
         && footer.comp_idx_start + fixed <= comp_len;
     if !ordered {
-        return Err(malformed(comp_len as isize, "footer table offsets are not ordered"));
+        return Err(malformed(
+            comp_len as isize,
+            "footer table offsets are not ordered",
+        ));
     }
     Ok(footer)
 }
@@ -554,7 +576,10 @@ fn rewrite_component<W: Write>(
     let mut prev = 0usize;
     for &end in &ends {
         if end < prev {
-            return Err(malformed(end as isize, "string table ends are not monotonic"));
+            return Err(malformed(
+                end as isize,
+                "string table ends are not monotonic",
+            ));
         }
         if end > blob_len {
             return Err(malformed(end as isize, "string table end beyond the blob"));
@@ -776,9 +801,10 @@ impl Cursor<'_> {
     }
 
     fn take(&mut self, len: usize) -> Result<&[u8]> {
-        let end = self.pos.checked_add(len).ok_or_else(|| {
-            malformed(self.pos as isize, "length overflows")
-        })?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| malformed(self.pos as isize, "length overflows"))?;
         if end > self.limit {
             return Err(malformed(self.pos as isize, "slice past the component end"));
         }
@@ -1078,7 +1104,9 @@ mod tests {
         let mut prev = 0usize;
         let mut strings = Vec::new();
         for end in ends {
-            let entry = input.slice(blob_start + prev, blob_start + end).expect("entry");
+            let entry = input
+                .slice(blob_start + prev, blob_start + end)
+                .expect("entry");
             strings.push(String::from_utf8(entry.to_vec()).expect("utf8"));
             prev = end;
         }
@@ -1115,7 +1143,11 @@ mod tests {
             &["file:///tree/a/lib/main.dart", "dart:core"],
             1,
         );
-        let b = synthetic_component(&[("file:///tree/b/t.dart", "")], &["file:///tree/b/t.dart"], 0);
+        let b = synthetic_component(
+            &[("file:///tree/b/t.dart", "")],
+            &["file:///tree/b/t.dart"],
+            0,
+        );
         let mut file = a.clone();
         file.extend_from_slice(&b);
         let src = write_fixture(dirs.path(), "multi.dill", &file);
@@ -1271,13 +1303,15 @@ mod tests {
         let dirs = tempfile::tempdir().expect("tempdir");
         let dst = dirs.path().join("o.dill");
 
-        let mut wrong_version = synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
+        let mut wrong_version =
+            synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
         wrong_version[4..8].copy_from_slice(&139_u32.to_be_bytes());
         let src = write_fixture(dirs.path(), "wrong-version.dill", &wrong_version);
         let err = rewrite_file(&src, &dst, b"file:///a/", b"file:///b/").expect_err("version gate");
         assert!(err.to_string().contains("version"), "{err}");
 
-        let mut wrong_magic = synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
+        let mut wrong_magic =
+            synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
         wrong_magic[0..4].copy_from_slice(&0xDEAD_BEEF_u32.to_be_bytes());
         let src = write_fixture(dirs.path(), "wrong-magic.dill", &wrong_magic);
         let err = rewrite_file(&src, &dst, b"file:///a/", b"file:///b/").expect_err("magic gate");
@@ -1339,12 +1373,20 @@ mod tests {
         let src = write_fixture(dirs.path(), "det.dill", &input);
         let first = dirs.path().join("det-1.dill");
         let second = dirs.path().join("det-2.dill");
-        let stats_a =
-            rewrite_file(&src, &first, b"file:///tree/a/", b"file:///private/tmp/tree-b/")
-                .expect("first");
-        let stats_b =
-            rewrite_file(&src, &second, b"file:///tree/a/", b"file:///private/tmp/tree-b/")
-                .expect("second");
+        let stats_a = rewrite_file(
+            &src,
+            &first,
+            b"file:///tree/a/",
+            b"file:///private/tmp/tree-b/",
+        )
+        .expect("first");
+        let stats_b = rewrite_file(
+            &src,
+            &second,
+            b"file:///tree/a/",
+            b"file:///private/tmp/tree-b/",
+        )
+        .expect("second");
         assert_eq!(stats_a, stats_b);
         assert_eq!(
             fs::read(&first).expect("first"),
@@ -1390,8 +1432,7 @@ mod tests {
         let dst = dirs.path().join("o");
         let err = rewrite_file(&src, &dst, b"", b"/b/").expect_err("empty from");
         assert!(matches!(err, BcacheError::Invalid(_)), "{err}");
-        let err =
-            rewrite_file(&src, &dst, b"/a/", "ü".as_bytes()).expect_err("non-ASCII to");
+        let err = rewrite_file(&src, &dst, b"/a/", "ü".as_bytes()).expect_err("non-ASCII to");
         assert!(matches!(err, BcacheError::Invalid(_)), "{err}");
     }
 
@@ -1404,9 +1445,8 @@ mod tests {
         let last = input.len();
         input[last - 4..].copy_from_slice(&patched.to_be_bytes());
         let src = write_fixture(dirs.path(), "bad-size.dill", &input);
-        let err =
-            rewrite_file(&src, &dirs.path().join("o"), b"file:///a/", b"file:///b/")
-                .expect_err("size mismatch");
+        let err = rewrite_file(&src, &dirs.path().join("o"), b"file:///a/", b"file:///b/")
+            .expect_err("size mismatch");
         assert!(matches!(err, BcacheError::Unsupported(_)), "{err}");
     }
 
@@ -1539,8 +1579,11 @@ mod tests {
 
         // A string-table end larger than the blob it indexes into (the
         // classic early-end-vs-late-end slice panic shape).
-        let mut ends_hostile =
-            synthetic_component(&[("file:///tree/a/x.dart", "")], &["aaaaaaaaaaaaaaaa", "b"], 0);
+        let mut ends_hostile = synthetic_component(
+            &[("file:///tree/a/x.dart", "")],
+            &["aaaaaaaaaaaaaaaa", "b"],
+            0,
+        );
         let hostile_footer = {
             let path = write_fixture(dirs.path(), "ends-hostile-base.dill", &ends_hostile);
             let mut reader = Reader::open(&path).expect("reader");
@@ -1555,8 +1598,7 @@ mod tests {
         // so each of these is a bounded walk to an end-of-bytes
         // refusal, never a multi-gigabyte allocation.
         let mut source_count = valid.clone();
-        source_count[footer.src_tbl..footer.src_tbl + 4]
-            .copy_from_slice(&u32::MAX.to_be_bytes());
+        source_count[footer.src_tbl..footer.src_tbl + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         refuse("source-count-u32-max", &source_count);
 
         let mut string_count = valid.clone();
@@ -1598,7 +1640,11 @@ mod tests {
                 strings: 0,
             }
         );
-        assert_eq!(fs::read(&dst).expect("output"), empty, "no-op stays byte-identical");
+        assert_eq!(
+            fs::read(&dst).expect("output"),
+            empty,
+            "no-op stays byte-identical"
+        );
     }
 
     /// Panic containment (A17): even a panic on a poisoned path must
@@ -1610,7 +1656,11 @@ mod tests {
         let src = write_fixture(
             dirs.path(),
             "valid.dill",
-            &synthetic_component(&[("file:///tree/a/m.dart", "")], &["file:///tree/a/m.dart"], 0),
+            &synthetic_component(
+                &[("file:///tree/a/m.dart", "")],
+                &["file:///tree/a/m.dart"],
+                0,
+            ),
         );
         let dst = dirs.path().join("out.dill");
         POISON_REWRITE.store(true, Ordering::SeqCst);
@@ -1632,12 +1682,10 @@ mod tests {
         if std::env::var_os("DQ_BCACHE_RSS_CHILD").is_some() {
             // Child payload: rewrite only; the parent measures this
             // process's peak.
-            let src = PathBuf::from(
-                std::env::var_os("DQ_BCACHE_RSS_SRC").expect("DQ_BCACHE_RSS_SRC"),
-            );
-            let dst = PathBuf::from(
-                std::env::var_os("DQ_BCACHE_RSS_DST").expect("DQ_BCACHE_RSS_DST"),
-            );
+            let src =
+                PathBuf::from(std::env::var_os("DQ_BCACHE_RSS_SRC").expect("DQ_BCACHE_RSS_SRC"));
+            let dst =
+                PathBuf::from(std::env::var_os("DQ_BCACHE_RSS_DST").expect("DQ_BCACHE_RSS_DST"));
             rewrite_file(&src, &dst, b"file:///tree/a/", b"file:///tree/b/")
                 .expect("child rewrite");
             return;
@@ -1688,11 +1736,15 @@ mod tests {
     fn build_large_dill(path: &Path) {
         let count = 260_000;
         let strings: Vec<String> = (0..count)
-            .map(|i| format!("file:///tree/a/lib/src/gen/module{i:06}.dart{}", " ".repeat(213)))
+            .map(|i| {
+                format!(
+                    "file:///tree/a/lib/src/gen/module{i:06}.dart{}",
+                    " ".repeat(213)
+                )
+            })
             .collect();
         let entries: Vec<&str> = strings.iter().map(String::as_str).collect();
-        let mut file =
-            synthetic_component(&[("file:///tree/a/lib/main.dart", "")], &entries, 1);
+        let mut file = synthetic_component(&[("file:///tree/a/lib/main.dart", "")], &entries, 1);
         // A second, small component keeps the framing walk real.
         file.extend_from_slice(&synthetic_component(
             &[("file:///tree/a/t.dart", "")],
@@ -1711,7 +1763,11 @@ mod tests {
         let mut expected = Vec::new();
         for i in 0..17u32 {
             let uri = format!("file:///tree/a/lib/src/module{i}.dart");
-            file.extend_from_slice(&synthetic_component(&[(uri.as_str(), "")], &[uri.as_str(), "dart:core"], i % 3));
+            file.extend_from_slice(&synthetic_component(
+                &[(uri.as_str(), "")],
+                &[uri.as_str(), "dart:core"],
+                i % 3,
+            ));
             expected.push(uri.replace("file:///tree/a/", "file:///tree/b/"));
         }
         let src = write_fixture(dirs.path(), "many.dill", &file);

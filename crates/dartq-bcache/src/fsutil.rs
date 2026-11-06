@@ -13,11 +13,11 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 #[cfg(unix)]
 use std::sync::mpsc;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::types::BlobId;
@@ -112,8 +112,7 @@ fn ficlone_or_copy_linux(src: &Path, dst: &Path) -> io::Result<bool> {
     // SAFETY: ioctl(2) with FICLONE takes the source descriptor by
     // value as its third argument; both descriptors are owned by this
     // function and outlive the call. The return value decides the rung.
-    let cloned =
-        unsafe { libc::ioctl(writer.as_raw_fd(), libc::FICLONE, reader.as_raw_fd()) } == 0;
+    let cloned = unsafe { libc::ioctl(writer.as_raw_fd(), libc::FICLONE, reader.as_raw_fd()) } == 0;
     if cloned {
         return Ok(true);
     }
@@ -280,14 +279,16 @@ pub(crate) fn hash_files_parallel(paths: &[PathBuf]) -> Vec<io::Result<BlobId>> 
         let next = &next;
         for _ in 0..HASH_WORKERS.min(paths.len()) {
             let tx = tx.clone();
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, AtomicOrdering::Relaxed);
-                if index >= paths.len() {
-                    break;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if index >= paths.len() {
+                        break;
+                    }
+                    // A send failure means the receiver is gone (a sibling
+                    // worker poisoned nothing — results are independent).
+                    let _ = tx.send((index, file_blake3(&paths[index])));
                 }
-                // A send failure means the receiver is gone (a sibling
-                // worker poisoned nothing — results are independent).
-                let _ = tx.send((index, file_blake3(&paths[index])));
             });
         }
         drop(tx);
@@ -511,7 +512,9 @@ pub(crate) fn mtime_ns(metadata: &fs::Metadata) -> u64 {
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(test)]
@@ -532,14 +535,21 @@ mod tests {
         let dst = tmp.path().join("dst.bin");
         let status = clone_file(&src, &dst).expect("clone_file");
         assert!(matches!(status, CloneStatus::Cloned | CloneStatus::Copied));
-        assert_eq!(file_blake3(&src).expect("hash src"), file_blake3(&dst).expect("hash dst"));
+        assert_eq!(
+            file_blake3(&src).expect("hash src"),
+            file_blake3(&dst).expect("hash dst")
+        );
     }
 
     #[test]
     fn clone_file_replaces_existing_destination() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let src = write_file(tmp.path(), "src.bin", b"fresh clone bytes");
-        let dst = write_file(tmp.path(), "dst.bin", b"stale destination bytes that differ");
+        let dst = write_file(
+            tmp.path(),
+            "dst.bin",
+            b"stale destination bytes that differ",
+        );
         let status = clone_file(&src, &dst).expect("clone_file over existing dst");
         assert!(matches!(status, CloneStatus::Cloned | CloneStatus::Copied));
         assert_eq!(std::fs::read(&dst).expect("read dst"), b"fresh clone bytes");
@@ -640,7 +650,10 @@ mod tests {
         }
 
         let started = Instant::now();
-        let sequential: Vec<_> = paths.iter().map(|path| file_blake3(path).expect("hash")).collect();
+        let sequential: Vec<_> = paths
+            .iter()
+            .map(|path| file_blake3(path).expect("hash"))
+            .collect();
         let sequential_elapsed = started.elapsed();
 
         let started = Instant::now();
