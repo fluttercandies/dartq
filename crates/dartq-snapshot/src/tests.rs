@@ -11,9 +11,9 @@ use filetime::{FileTime, set_file_atime, set_file_mtime};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DEFAULT_CAPACITY_BYTES, Entry, EntryKey, GenerationHeader, RemapTables,
-    SNAPSHOT_FORMAT_VERSION, SaveError, SnapshotConfig, SnapshotFileId, SnapshotStore,
-    SnapshotStringId,
+    DEFAULT_CAPACITY_BYTES, Entry, EntryKey, EvictionReport, GenerationHeader, RemapTables,
+    SNAPSHOT_FORMAT_VERSION, SaveError, SnapshotConfig, SnapshotFileId, SnapshotStats,
+    SnapshotStore, SnapshotStringId,
 };
 
 fn test_header() -> GenerationHeader {
@@ -955,6 +955,141 @@ fn enforce_sweeps_leaked_temp_files() {
         1,
         "one entry left"
     );
+}
+
+/// Saves a second generation beside `test_header()`'s, carrying one entry.
+fn save_sibling_generation(cache: &TempCache) -> GenerationHeader {
+    let mut header = test_header();
+    header.package_graph_fingerprint = [8; 16];
+    cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .save(
+            &header,
+            &tables(),
+            &[Entry {
+                key: key(3, 10),
+                payload: payload("sibling"),
+            }],
+        )
+        .expect("save sibling generation");
+    header
+}
+
+/// The usage face counts what the capacity scan measures — every
+/// generation, every entry file, the same byte total — and an unwritten
+/// store stays unwritten.
+#[test]
+fn stats_counts_generations_entries_and_bytes() {
+    let cache = TempCache::new("stats");
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    assert_eq!(store.stats(), SnapshotStats::default());
+    assert!(!store.generations_dir().exists(), "stats creates nothing");
+
+    let header_a = save_two_entries(&cache);
+    let header_b = save_sibling_generation(&cache);
+
+    assert_eq!(
+        store.stats(),
+        SnapshotStats {
+            generations: 2,
+            entries: 3,
+            bytes: dir_size(&gen_dir(&cache.path, &header_a))
+                + dir_size(&gen_dir(&cache.path, &header_b)),
+        }
+    );
+}
+
+/// A stats call changes nothing on disk: the temp residue the capacity
+/// scan would sweep stays in place and uncounted, and no file's times
+/// move — they are the LRU order.
+#[test]
+fn stats_is_read_only() {
+    let cache = TempCache::new("stats-read-only");
+    let header = save_one_entry(&cache);
+    let generation = gen_dir(&cache.path, &header);
+    let clean = cache.store(DEFAULT_CAPACITY_BYTES).stats();
+    fs::write(generation.join("header.json.tmp-7-3"), b"torn").expect("plant temp");
+    let listing = || {
+        let mut files: Vec<(PathBuf, u64, SystemTime, SystemTime)> = files_under(&generation)
+            .into_iter()
+            .map(|path| {
+                let meta = fs::metadata(&path).expect("metadata");
+                let (mtime, atime) = (
+                    meta.modified().expect("mtime"),
+                    meta.accessed().expect("atime"),
+                );
+                (path, meta.len(), mtime, atime)
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = listing();
+
+    let stats = cache.store(DEFAULT_CAPACITY_BYTES).stats();
+
+    assert_eq!(stats, clean, "residue is not counted");
+    assert_eq!(listing(), before, "nothing moved");
+}
+
+/// The read-only walk keeps the capacity scan's termination rule: a
+/// symlinked cycle ends, and a generation-level link is no generation.
+#[cfg(unix)]
+#[test]
+fn stats_never_follows_symlinks() {
+    let cache = TempCache::new("stats-symlink");
+    let header = save_one_entry(&cache);
+    let clean = cache.store(DEFAULT_CAPACITY_BYTES).stats();
+    let entries = entries_dir(&cache.path, &header);
+    std::os::unix::fs::symlink(&entries, entries.join("cycle")).expect("plant cycle");
+    std::os::unix::fs::symlink(
+        gen_dir(&cache.path, &header),
+        cache.path.join("snapshots").join("linked"),
+    )
+    .expect("plant generation-level link");
+
+    let stats = cache.store(DEFAULT_CAPACITY_BYTES).stats();
+
+    assert_eq!(stats.generations, clean.generations);
+    assert_eq!(stats.entries, clean.entries);
+}
+
+/// A pass reports exactly what it removed: nothing under capacity, the
+/// least recent generation and its bytes over it.
+#[test]
+fn enforce_reports_what_it_evicted() {
+    let cache = TempCache::new("evict-report");
+    let header_a = save_one_entry(&cache);
+    let header_b = save_sibling_generation(&cache);
+    let (dir_a, dir_b) = (
+        gen_dir(&cache.path, &header_a),
+        gen_dir(&cache.path, &header_b),
+    );
+    let newer = FileTime::from_system_time(SystemTime::now() + Duration::from_mins(10));
+    for file in files_under(&dir_b) {
+        let _ = set_file_atime(&file, newer);
+        let _ = set_file_mtime(&file, newer);
+    }
+
+    assert_eq!(
+        cache.store(DEFAULT_CAPACITY_BYTES).enforce_capacity(),
+        EvictionReport {
+            generations_before: 2,
+            generations_evicted: 0,
+            bytes_freed: 0,
+        }
+    );
+
+    let freed = dir_size(&dir_a);
+    assert_eq!(
+        cache.store(dir_size(&dir_b)).enforce_capacity(),
+        EvictionReport {
+            generations_before: 2,
+            generations_evicted: 1,
+            bytes_freed: freed,
+        }
+    );
+    assert!(!dir_a.exists() && dir_b.exists());
 }
 
 /// One load touches one marker: the generation gains a `recency` file —

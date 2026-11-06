@@ -49,6 +49,23 @@
 //! ([`ContentStore::read`], [`ContentStore::total_bytes`]) stays truthful
 //! about what actually landed.
 //!
+//! # Debris sweep (#4053)
+//!
+//! Two crash classes leave files eviction can never see back: a blob whose
+//! rename landed but whose journal row never did (the writer died between
+//! the flush's blob write and its append — the manifest loads healthy, so
+//! the mtime rebuild never runs, and [`ContentStore::evict`] walks only
+//! booked rows), and `<id>.tmp` debris from a write torn before its
+//! rename. [`ContentStore::sweep_debris`] reclaims both, each file only
+//! past [`SWEEP_GRACE`] of mtime age — the timestamp class the books
+//! already use (the rebuild reads the same field as `last_touch`). The
+//! grace covers the write-completion horizon: a blob renamed but not yet
+//! journaled becomes booked within one apply batch (the daemon's flush
+//! cadence), so a concurrent writer's in-flight files are orders of
+//! magnitude inside the grace and never swept. The sweep is a `dartq
+//! cache gc` pass, never an open-time one — the read path pays nothing
+//! for the write path's crash hygiene.
+//!
 //! # Reference counting (the daemon's surface)
 //!
 //! [`ContentStore::retain`] / [`ContentStore::release`] move an entry's
@@ -134,6 +151,15 @@ const LOCK_WAIT: Duration = Duration::from_millis(200);
 
 /// The bounded wait's poll tick.
 const LOCK_TICK: Duration = Duration::from_millis(5);
+
+/// How old a file must be before [`ContentStore::sweep_debris`] removes
+/// it: an off-books blob or `<id>.tmp` debris with a younger mtime may be
+/// an in-flight write (blob renamed, journal row pending — a window that
+/// closes within one apply batch) and stays. One hour is three orders of
+/// magnitude past that window and matches the build cache's grace window
+/// (`grace_secs`, the cache family's "well past in-flight" constant). A
+/// future mtime (a clock wound backwards) reads as young — never swept.
+const SWEEP_GRACE: Duration = Duration::from_secs(3600);
 
 /// One journal line: the absolute book state of one moved id (`set`
 /// carries the full row, `del` retires it). Absolute values make rows
@@ -241,6 +267,20 @@ pub struct StoreConfig {
 pub enum StoreError {
     #[error("creating content-store directory {0}: {1}")]
     CreateDir(PathBuf, #[source] std::io::Error),
+}
+
+/// What one [`ContentStore::sweep_debris`] pass reclaimed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Off-books blobs removed: present on disk, absent from the books,
+    /// older than [`SWEEP_GRACE`].
+    pub blobs_swept: u64,
+    /// Bytes those blobs occupied.
+    pub blob_bytes_freed: u64,
+    /// `<id>.tmp` write-debris files removed, past the same grace.
+    pub tmp_swept: u64,
+    /// Bytes that debris occupied.
+    pub tmp_bytes_freed: u64,
 }
 
 /// One manifest row: the lifecycle metadata a booked blob carries.
@@ -481,6 +521,69 @@ impl ContentStore {
                 self.delta.insert(id);
             }
         }
+    }
+
+    /// The gc-only integrity pass: reclaims what eviction can never see
+    /// back — blobs on disk the books do not carry (a writer that died
+    /// between its blob's rename and the journal append) and stale
+    /// `<id>.tmp` write debris. Both classes go only past [`SWEEP_GRACE`]
+    /// of mtime age, so a concurrent writer's in-flight files are never
+    /// touched; booked blobs are not candidates at any age (eviction owns
+    /// those, pin-gated). The books are neither read from nor written to
+    /// disk here — everything removed is by definition off them — so no
+    /// manifest bytes move and the books lock stays untaken. Never called
+    /// on the read path ([`Self::open`] stays free of it); `dartq cache
+    /// gc` is the caller.
+    pub fn sweep_debris(&self) -> SweepReport {
+        let mut report = SweepReport::default();
+        let Ok(shards) = fs::read_dir(&self.dir) else {
+            return report;
+        };
+        for shard in shards.flatten() {
+            if !shard.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let Ok(meta) = file.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                // The grace check first: it skips every young file without
+                // a name parse, and `elapsed` failing (a future mtime)
+                // reads as young — never swept.
+                let aged = meta
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age >= SWEEP_GRACE);
+                if !aged {
+                    continue;
+                }
+                let file_name = file.file_name();
+                let Some(name) = file_name.to_str() else {
+                    continue;
+                };
+                let size = meta.len();
+                if let Ok(id) = ContentId::parse_hex(name) {
+                    if !self.entries.contains_key(&id) && fs::remove_file(file.path()).is_ok() {
+                        report.blobs_swept += 1;
+                        report.blob_bytes_freed += size;
+                    }
+                } else if let Some(stem) = name.strip_suffix(".tmp")
+                    && ContentId::parse_hex(stem).is_ok()
+                    && fs::remove_file(file.path()).is_ok()
+                {
+                    report.tmp_swept += 1;
+                    report.tmp_bytes_freed += size;
+                }
+            }
+        }
+        report
     }
 
     /// Appends one journal row per moved id (ascending id — the `BTreeSet`
@@ -880,6 +983,7 @@ mod hex_id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::{FileTime, set_file_mtime};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A throwaway cache root, self-cleaning on drop (the persist tests'
@@ -1168,6 +1272,79 @@ mod tests {
             rebuilt.contains(&id),
             "a foreign version is torn, not fatal"
         );
+    }
+
+    /// The gc-only integrity sweep (#4053): a blob whose rename landed but
+    /// whose journal row never did, and a torn write's `.tmp`, are
+    /// reclaimed — each only past [`SWEEP_GRACE`]; young debris (a possible
+    /// in-flight write) and booked blobs at any age are never candidates,
+    /// and the books move not one row.
+    #[test]
+    fn sweep_reclaims_aged_debris_and_spares_the_rest() {
+        let scratch = Scratch::new("sweep");
+        let payload = b"booked payload";
+        let mut store = ContentStore::open(&scratch.config(u64::MAX)).expect("open");
+        let booked = store.put(payload);
+        store.flush();
+        let store_dir = scratch.0.join("store");
+        let epoch = FileTime::from_unix_time(0, 0);
+
+        // A booked blob aged to the epoch: eviction's territory, never
+        // the sweep's.
+        let booked_hex = booked.to_string();
+        let booked_path = store_dir.join(&booked_hex[..2]).join(&booked_hex);
+        set_file_mtime(&booked_path, epoch).expect("age booked blob");
+
+        // Aged off-books debris: the blob a dead writer renamed but never
+        // journaled.
+        let orphan = content_hash(b"orphan payload");
+        let orphan_hex = orphan.to_string();
+        let orphan_path = store_dir.join(&orphan_hex[..2]).join(&orphan_hex);
+        fs::create_dir_all(orphan_path.parent().expect("shard")).expect("orphan shard");
+        fs::write(&orphan_path, b"orphan payload").expect("orphan blob");
+        set_file_mtime(&orphan_path, epoch).expect("age orphan");
+        let tmp_old = store_dir.join(&orphan_hex[..2]).join(format!("{orphan_hex}.tmp"));
+        fs::write(&tmp_old, b"half-written").expect("aged tmp");
+        set_file_mtime(&tmp_old, epoch).expect("age tmp");
+
+        // Young debris: a possible in-flight write, untouchable.
+        let fresh = content_hash(b"fresh orphan");
+        let fresh_hex = fresh.to_string();
+        let fresh_path = store_dir.join(&fresh_hex[..2]).join(&fresh_hex);
+        fs::create_dir_all(fresh_path.parent().expect("shard")).expect("fresh shard");
+        fs::write(&fresh_path, b"fresh orphan").expect("young blob");
+        let tmp_young = store_dir.join(&fresh_hex[..2]).join(format!("{fresh_hex}.tmp"));
+        fs::write(&tmp_young, b"half-written").expect("young tmp");
+
+        let report = store.sweep_debris();
+
+        assert_eq!(
+            report,
+            SweepReport {
+                blobs_swept: 1,
+                blob_bytes_freed: bytes(b"orphan payload"),
+                tmp_swept: 1,
+                tmp_bytes_freed: bytes(b"half-written"),
+            },
+            "one aged blob and one aged tmp reclaimed, both counted with bytes"
+        );
+        assert!(!orphan_path.exists() && !tmp_old.exists(), "aged debris gone");
+        assert!(
+            fresh_path.is_file() && tmp_young.is_file(),
+            "young debris survives the grace guard"
+        );
+        assert!(
+            booked_path.is_file() && store.contains(&booked),
+            "a booked blob at any age is eviction's, never the sweep's"
+        );
+
+        // The books never moved: reopen loads them unchanged, and the
+        // young debris still on disk stays off them.
+        drop(store);
+        let reopened = ContentStore::open(&scratch.config(u64::MAX)).expect("reopen");
+        assert!(reopened.contains(&booked));
+        assert_eq!(reopened.total_bytes(), bytes(payload));
+        assert!(!reopened.contains(&fresh), "young debris stays off the books");
     }
 
     /// The manifest bytes are a pure function of the books (ascending-id

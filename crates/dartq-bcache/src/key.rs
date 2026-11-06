@@ -25,7 +25,15 @@ use crate::types::{
 
 /// First line of every key preimage. Any change to the canonical format
 /// must change this line, which changes every key with it.
-const FORMAT_LINE: &[u8] = b"format: bcache-key-v2\n";
+///
+/// v3: `.dart_tool/package_config.json` left the closure — it exists
+/// only after flutter's implicit `pub get`, so keying it split the
+/// pre-build key of a fresh worktree from the key the entry is stored
+/// under, and the headline use case never hit. The bump also retires
+/// every v2 entry: v2 manifests predate the worktree-anchor replay
+/// semantics, and a fresh key space guarantees no entry recorded under
+/// the old classification rules is ever replayed under the new ones.
+const FORMAT_LINE: &[u8] = b"format: bcache-key-v3\n";
 
 /// Read buffer for streamed hashing: 1 MiB, the crate-wide streaming size.
 const HASH_BUF: usize = 1 << 20;
@@ -121,17 +129,24 @@ pub fn filter_defines(raw: &BTreeMap<String, String>) -> BTreeMap<String, String
 /// The key covers exactly what a tree carries before any build —
 /// toolchain, filtered define vector, target, and the contents of the
 /// provenance files the caller puts in `inputs.closure` (pubspec,
-/// package config, define files) — so a fresh worktree keys identically
-/// to the tree an entry was ingested from. A depfile-sourced closure
-/// exists only after a build has run in that tree and can never hit on a
-/// fresh worktree; `inputs.closure` must therefore never receive one.
+/// define files) — so a fresh worktree keys identically to the tree an
+/// entry was ingested from. Two file families must never enter the
+/// closure: a depfile-sourced closure exists only after a build has
+/// run in that tree, and `.dart_tool/package_config.json` exists only
+/// after flutter's implicit `pub get` — either one splits the
+/// pre-build key from the stored key and the fresh-tree hit dies.
 ///
-/// Safety of the coarseness: whatever the config key cannot see — a
-/// source edit under identical provenance — is caught where flutter
-/// itself catches it: every build re-validates the recorded input hashes
-/// of a build dir (stamps, `.filecache`) and rebuilds on mismatch, so a
-/// hit with diverged sources costs one wasted materialization, never a
-/// wrong artifact.
+/// Safety of the coarseness: whatever the config key cannot see is
+/// caught where flutter itself catches it — every build re-validates
+/// the recorded input hashes of a build dir (stamps, `.filecache`) and
+/// rebuilds on mismatch, and frontend_server invalidates a stale
+/// initialize-from-dill kernel. That delegation is sound for a
+/// replayed dir because the replay rules guarantee the recorded paths
+/// resolve identically in the target tree: worktree-root paths are
+/// rewritten to it, cache-root paths are machine-constant, and a dir
+/// mentioning anything else is refused cross-tree (see
+/// [`crate::types::PathAnchors`]). A stale hit therefore costs one
+/// wasted materialization, never a wrong artifact.
 #[must_use]
 pub fn config_key(inputs: &KeyInputs) -> String {
     blake3::hash(&preimage(inputs)).to_hex().to_string()
@@ -141,7 +156,7 @@ pub fn config_key(inputs: &KeyInputs) -> String {
 /// a human can audit and diff (paths contribute their raw bytes).
 ///
 /// ```text
-/// format: bcache-key-v2
+/// format: bcache-key-v3
 /// toolchain.engine_revision <engine revision>
 /// toolchain.flutter_version <flutter version>
 /// toolchain.platform_strong_dill <hex>
@@ -330,7 +345,7 @@ mod tests {
 
     /// The canonical preimage of [`sample_inputs`], spelled out by hand.
     const GOLDEN_PREIMAGE: &str = "\
-format: bcache-key-v2
+format: bcache-key-v3
 toolchain.engine_revision 5d531788691ec3404cac0cee66ead4007b177363
 toolchain.flutter_version 3.47.1
 toolchain.platform_strong_dill 1111111111111111111111111111111111111111111111111111111111111111

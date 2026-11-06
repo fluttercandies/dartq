@@ -4,7 +4,7 @@
 //!
 //! The zero-config contract lives here: with no `dartq.yaml` in the
 //! cwd's upward chain, or one without an active `build_cache` section,
-//! [`run_flutter_shim`] spawns flutter with no store access at all —
+//! [`run_flutter_shim`] execs flutter with no store access at all —
 //! existing behavior stays byte-identical. A malformed config on the
 //! shim path is fail-open (one stderr note, then the passthrough
 //! spawn): the shim must never block a build.
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dartq_bcache::orchestrator::{CommandRunner, FlutterRunner, ShimConfig, discover_flutter, run_shim};
-use dartq_bcache::{BcacheError, CasStore, GcReport, StoreStats};
+use dartq_bcache::{BcacheError, CasStore, GcReport, StoreStats, STORE_LAYOUT_VERSION};
 
 use crate::config::{BuildCacheConfig, ConfigError, load as load_config};
 
@@ -71,7 +71,7 @@ pub fn shim_config(section: &BuildCacheConfig) -> ShimConfig {
         None => default_cache_root(),
     };
     ShimConfig {
-        store_root: root.join("v1"),
+        store_root: root.join(STORE_LAYOUT_VERSION),
         budget_bytes: section
             .budget_gb
             .unwrap_or(DEFAULT_BUDGET_GB)
@@ -174,10 +174,16 @@ pub fn run_flutter_shim(argv: &[OsString]) -> i32 {
         .unwrap_or(127)
 }
 
-/// The zero-config spawn: flutter with the original argv, nothing else.
+/// The zero-config passthrough: flutter with the original argv, nothing
+/// else — and no second process around it. `exec` replaces this shim
+/// with flutter outright, so signals reach flutter directly and the
+/// shim's memory goes away; the DARTQ_SHIM strip keeps a nested dartq
+/// from mistaking the child for a shim. A runner that cannot replace
+/// itself falls back to spawn-and-wait inside `exec`; a failed exec
+/// reports and exits 127.
 fn spawn_passthrough(flutter: &Path, argv: &[OsString], cwd: &Path) -> i32 {
     let mut runner = CommandRunner::new(flutter.to_path_buf());
-    runner.run(argv, cwd).unwrap_or_else(|err| {
+    runner.exec(argv, cwd).unwrap_or_else(|err| {
         eprintln!("dartq-bcache: {err}");
         127
     })
@@ -290,8 +296,9 @@ fn path_advice(bin_dir: &Path, path_env: Option<OsString>) -> Option<String> {
 ///
 /// # Errors
 ///
-/// [`BcacheError`] as the store reports it (a corrupt manifest fails
-/// the call; `gc` is the face that purges those).
+/// [`BcacheError`] as the store reports it. Corrupt manifests are
+/// counted in [`StoreStats::corrupt_manifests`], never fatal — one bad
+/// file must not blind the budget; `gc` purges them.
 pub fn bcache_stats(config: &ShimConfig) -> Result<StoreStats, BcacheError> {
     CasStore::open(&config.store_root)?.stats()
 }
@@ -342,12 +349,15 @@ mod tests {
             flutter: Some(PathBuf::from("/opt/flutter/bin/flutter")),
         };
         let config = shim_config(&section);
-        assert_eq!(config.store_root, PathBuf::from("/store/cas/v1"));
+        assert_eq!(
+            config.store_root,
+            PathBuf::from("/store/cas").join(STORE_LAYOUT_VERSION)
+        );
         assert_eq!(config.budget_bytes, 3 * 1024 * 1024 * 1024);
         assert_eq!(config.grace_secs, DEFAULT_GRACE_SECS);
         assert_eq!(config.flutter_bin, section.flutter);
         let defaults = default_shim_config();
-        assert!(defaults.store_root.ends_with("v1"));
+        assert!(defaults.store_root.ends_with(STORE_LAYOUT_VERSION));
         assert_eq!(
             defaults.budget_bytes,
             DEFAULT_BUDGET_GB * 1024 * 1024 * 1024
@@ -398,7 +408,10 @@ mod tests {
         let config = discover_shim_config(&project)
             .expect("discover")
             .expect("some");
-        assert_eq!(config.store_root, PathBuf::from("/store/cas/v1"));
+        assert_eq!(
+            config.store_root,
+            PathBuf::from("/store/cas").join(STORE_LAYOUT_VERSION)
+        );
         assert_eq!(config.budget_bytes, 3 * 1024 * 1024 * 1024);
 
         // No section anywhere: None, with no side effects.
@@ -480,7 +493,7 @@ mod tests {
     fn stats_and_gc_faces_drive_the_store() {
         let root = scratch("stats");
         let config = ShimConfig {
-            store_root: root.join("cas").join("v1"),
+            store_root: root.join("cas").join(STORE_LAYOUT_VERSION),
             budget_bytes: 0,
             grace_secs: 0,
             flutter_bin: None,

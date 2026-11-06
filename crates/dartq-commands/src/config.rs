@@ -179,6 +179,29 @@ pub fn load(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
     parse(&text).map(Some)
 }
 
+/// Finds the `dartq.yaml` governing `dir`: the nearest file up the chain
+/// from `dir` to the filesystem root that loads. `Ok(None)`: none exists.
+/// The faces that key off workspace config (the cache maintenance faces,
+/// the build cache) resolve every section from this one governing file, so
+/// one walk answers them all.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
+/// a file exists but cannot be read.
+pub fn discover(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
+    let mut current = dir;
+    loop {
+        if let Some(config) = load(current)? {
+            return Ok(Some(config));
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return Ok(None),
+        }
+    }
+}
+
 /// The compat face's axis roots for one invocation: the explicit
 /// `--sdk-root` roots in CLI order, then the selected contexts' resolved
 /// locators in file order, deduplicated by root. `contexts` non-empty

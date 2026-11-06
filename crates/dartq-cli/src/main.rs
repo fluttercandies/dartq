@@ -193,6 +193,9 @@ fn run(args: &[String]) -> u8 {
             command: Some(Command::Bcache(bcache_args)),
         }) => bcache(&bcache_args),
         Ok(Cli {
+            command: Some(Command::Cache(cache_args)),
+        }) => cache(&cache_args),
+        Ok(Cli {
             command: Some(Command::Daemon(daemon_args)),
         }) => daemon(&daemon_args),
         Ok(Cli {
@@ -278,6 +281,12 @@ enum Command {
     /// content-addressed store: `stats` prints a one-line JSON summary,
     /// `gc` runs the budget/LRU pass and prints its report.
     Bcache(BcacheArgs),
+    /// Manage every on-disk cache at once — the build cache, the facts
+    /// snapshot store, and the content store: `stats` prints one JSON
+    /// line per face plus a total (read-only), `gc` runs each store's own
+    /// eviction pass and reports what it freed. A face that fails prints
+    /// its own `error` line, the others still report, and the exit is 4.
+    Cache(CacheArgs),
     /// Serve the RPC daemon over stdin/stdout (one client; overlay edits +
     /// full diagnostic pushes). Hidden — a protocol face; the resident
     /// session layer supersedes it for interactive use.
@@ -2577,6 +2586,21 @@ enum BcacheFace {
     Gc,
 }
 
+/// The `cache` aggregate face.
+#[derive(Args)]
+struct CacheArgs {
+    #[command(subcommand)]
+    cmd: CacheFace,
+}
+
+#[derive(Subcommand)]
+enum CacheFace {
+    /// Print one JSON line per cache face, then the total.
+    Stats,
+    /// Run every store's own eviction pass and report what it freed.
+    Gc,
+}
+
 /// `dartq init`: project scaffolding plus the shim install. The report
 /// is human-facing prose on stdout — the command is interactive setup,
 /// not a machine face.
@@ -2655,6 +2679,52 @@ fn bcache(args: &BcacheArgs) -> u8 {
         return exit::INTERNAL_ERROR;
     }
     exit::CLEAN
+}
+
+/// `dartq cache stats|gc`: the aggregate over every cache face, JSON lines
+/// on stdout (the machine-channel convention). A failed face rides its own
+/// `error` line and turns the exit internal once the others have answered;
+/// a malformed `dartq.yaml` stops the run before any face, as it does for
+/// `bcache`.
+fn cache(args: &CacheArgs) -> u8 {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    let config = match dartq_commands::cache::CacheConfig::discover(&cwd) {
+        Ok(config) => config,
+        Err(ConfigError::Invalid(message)) => {
+            eprintln!("error: {message}");
+            return exit::USAGE;
+        }
+        Err(ConfigError::Io(err)) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+    let mut out = io::stdout().lock();
+    let (written, failed) = match args.cmd {
+        CacheFace::Stats => {
+            let report = dartq_commands::cache::stats(&config);
+            (report.write_lines(&mut out), report.failed)
+        }
+        CacheFace::Gc => {
+            let report = dartq_commands::cache::gc(&config);
+            (report.write_lines(&mut out), report.failed)
+        }
+    };
+    if let Err(err) = written {
+        eprintln!("dartq: {err}");
+        return exit::INTERNAL_ERROR;
+    }
+    if failed == 0 {
+        exit::CLEAN
+    } else {
+        exit::INTERNAL_ERROR
+    }
 }
 
 #[cfg(test)]
@@ -3640,6 +3710,29 @@ mod tests {
             args.use_aot_snapshot && args.no_use_aot_snapshot,
             "both --[no-]use-aot-snapshot spellings parse"
         );
+    }
+
+    /// `cache` carries the two maintenance faces and needs one of them;
+    /// `bcache` stays the per-face spelling beside it.
+    #[test]
+    fn cache_parses_its_stats_and_gc_faces() {
+        assert!(matches!(
+            parse_args_of(&["cache", "stats"]),
+            Ok(Some(Command::Cache(CacheArgs {
+                cmd: CacheFace::Stats
+            })))
+        ));
+        assert!(matches!(
+            parse_args_of(&["cache", "gc"]),
+            Ok(Some(Command::Cache(CacheArgs { cmd: CacheFace::Gc })))
+        ));
+        assert!(parse_args_of(&["cache"]).is_err());
+        assert!(matches!(
+            parse_args_of(&["bcache", "stats"]),
+            Ok(Some(Command::Bcache(BcacheArgs {
+                cmd: BcacheFace::Stats
+            })))
+        ));
     }
 
     /// The `--cache-size-limit` grammar rides the engine's

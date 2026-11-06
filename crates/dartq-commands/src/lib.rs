@@ -28,6 +28,8 @@
 //! * [`impact`] — the impact report.
 //! * [`compat`] — the per-SDK compatibility matrix.
 //! * [`fix`] — the anchored patch substrate.
+//! * [`cache`] — the `cache stats|gc` aggregate over every on-disk cache:
+//!   the build cache, the facts snapshot store, and the content store.
 //! * [`lints`] — the lint face's mount: enable-set resolution
 //!   from the merged analysis options and lint rows as engine diagnostics.
 //! * [`plugins`] — the analyze face's plugin cycle (launch, feed, drain,
@@ -45,6 +47,7 @@ pub use pkg_label::locate;
 
 pub mod analyze;
 pub mod bcache;
+pub mod cache;
 pub mod check;
 pub mod compat;
 pub mod config;

@@ -16,6 +16,9 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 md-5 = { workspace = true }
 memchr = { workspace = true }
+# The kernel-dill rewriter streams its input through a read-only map,
+# releasing consumed pages so RSS tracks a window, not the dill.
+memmap2 = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }

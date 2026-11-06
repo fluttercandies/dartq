@@ -95,6 +95,29 @@ pub struct Snapshot<T> {
     pub entries: Vec<Entry<T>>,
 }
 
+/// What a store holds on disk ([`SnapshotStore::stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SnapshotStats {
+    /// Generation directories, loadable or not.
+    pub generations: u64,
+    /// Entry files across every generation.
+    pub entries: u64,
+    /// Total file size: the figure [`SnapshotStore::enforce_capacity`]
+    /// holds to the capacity.
+    pub bytes: u64,
+}
+
+/// What one [`SnapshotStore::enforce_capacity`] pass evicted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EvictionReport {
+    /// Generations present when the pass started.
+    pub generations_before: u64,
+    /// Generations removed.
+    pub generations_evicted: u64,
+    /// Bytes the removed generations held.
+    pub bytes_freed: u64,
+}
+
 /// The write half of `tables.json`: the remap slices and the entry-id
 /// manifest in one atomic unit, so the pairing between a save's tables and
 /// its entry files cannot be torn apart by a crash — a manifest from one
@@ -159,6 +182,12 @@ impl SnapshotStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The directory holding one subdirectory per generation.
+    #[must_use]
+    pub fn generations_dir(&self) -> PathBuf {
+        self.root.join("snapshots")
     }
 
     /// Loads the generation matching `expected`, or `None` on any
@@ -475,23 +504,16 @@ impl SnapshotStore {
     /// Best-effort: unreadable files are skipped, never reported. Evicted
     /// directories leave the written-keys bookkeeping with them — a stale
     /// record over a removed generation would make a later re-save skip
-    /// files that no longer exist.
-    pub fn enforce_capacity(&self) {
+    /// files that no longer exist. The returned report counts the evicted
+    /// generations; swept temp files are residue, not part of it.
+    pub fn enforce_capacity(&self) -> EvictionReport {
         self.saves_since_enforce.store(0, Ordering::Relaxed);
-        let mut total = 0u64;
-        let mut generations: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-        if let Ok(dirs) = fs::read_dir(self.root.join("snapshots")) {
-            for path in dirs.flatten().map(|d| d.path()) {
-                // A generation is a real directory; symlinks are never
-                // followed (the same rule that keeps the scan terminating).
-                if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-                    continue;
-                }
-                let (bytes, recency) = dir_stats(&path);
-                total += bytes;
-                generations.push((path, bytes, recency));
-            }
-        }
+        let mut generations = self.scan_generations(true);
+        let mut total: u64 = generations.iter().map(|(_, bytes, _)| bytes).sum();
+        let mut report = EvictionReport {
+            generations_before: generations.len() as u64,
+            ..EvictionReport::default()
+        };
         if total > self.capacity_bytes {
             generations.sort_by_key(|(_, _, recency)| *recency);
             let evictable = generations.len().saturating_sub(1);
@@ -502,6 +524,8 @@ impl SnapshotStore {
                 }
                 if fs::remove_dir_all(path).is_ok() {
                     total -= bytes;
+                    report.generations_evicted += 1;
+                    report.bytes_freed += bytes;
                     if let Some(dir) = decode_dir_id(path) {
                         evicted.push(dir);
                     }
@@ -513,6 +537,46 @@ impl SnapshotStore {
             }
         }
         self.estimated_bytes.store(total, Ordering::Relaxed);
+        report
+    }
+
+    /// What the store holds on disk, with no side effect: where the
+    /// capacity scan sweeps leaked temp files, this leaves them in place
+    /// (uncounted, so `bytes` stays the figure that scan measures), and
+    /// reading sizes moves no recency. Best-effort like every read here:
+    /// what cannot be read counts as absent.
+    #[must_use]
+    pub fn stats(&self) -> SnapshotStats {
+        let mut stats = SnapshotStats::default();
+        for (path, bytes, _) in self.scan_generations(false) {
+            stats.generations += 1;
+            stats.bytes += bytes;
+            if let Ok(files) = fs::read_dir(path.join("entries")) {
+                stats.entries += files
+                    .flatten()
+                    .filter(|file| entry_file_id(&file.path()).is_some())
+                    .count() as u64;
+            }
+        }
+        stats
+    }
+
+    /// Every generation directory with its size and recency.
+    /// `sweep_temps` is [`dir_stats`]' choice to remove crash residue.
+    fn scan_generations(&self, sweep_temps: bool) -> Vec<(PathBuf, u64, SystemTime)> {
+        let mut generations = Vec::new();
+        if let Ok(dirs) = fs::read_dir(self.generations_dir()) {
+            for path in dirs.flatten().map(|d| d.path()) {
+                // A generation is a real directory; symlinks are never
+                // followed (the same rule that keeps the scan terminating).
+                if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                    continue;
+                }
+                let (bytes, recency) = dir_stats(&path, sweep_temps);
+                generations.push((path, bytes, recency));
+            }
+        }
+        generations
     }
 
     /// Locks the bookkeeping map. Poison is recovered rather than
@@ -524,9 +588,7 @@ impl SnapshotStore {
     }
 
     fn generation_dir(&self, header: &GenerationHeader) -> PathBuf {
-        self.root
-            .join("snapshots")
-            .join(hex::encode(header.dir_id()))
+        self.generations_dir().join(hex::encode(header.dir_id()))
     }
 }
 
@@ -618,13 +680,14 @@ fn default_cache_root() -> io::Result<PathBuf> {
     Ok(base.join("dartq"))
 }
 
-/// Total file size and newest file timestamp under `dir`, recursively,
-/// removing leaked temp files (crash residue) as a side pass. Directory
-/// recursion keys on the entry's own file type — symlinks are never
-/// resolved — so a symlinked cycle terminates instead of recursing to a
-/// stack overflow. Unreadable entries are skipped; an empty or unreadable
-/// directory stats as epoch-old, making it the first eviction candidate.
-fn dir_stats(dir: &Path) -> (u64, SystemTime) {
+/// Total file size and newest file timestamp under `dir`, recursively.
+/// Leaked temp files (crash residue) never count, and `sweep_temps`
+/// removes them as a side pass. Directory recursion keys on the entry's
+/// own file type — symlinks are never resolved — so a symlinked cycle
+/// terminates instead of recursing to a stack overflow. Unreadable entries
+/// are skipped; an empty or unreadable directory stats as epoch-old,
+/// making it the first eviction candidate.
+fn dir_stats(dir: &Path, sweep_temps: bool) -> (u64, SystemTime) {
     let mut total = 0u64;
     let mut newest = SystemTime::UNIX_EPOCH;
     let Ok(entries) = fs::read_dir(dir) else {
@@ -636,13 +699,15 @@ fn dir_stats(dir: &Path) -> (u64, SystemTime) {
             continue;
         };
         if file_type.is_dir() {
-            let (bytes, recency) = dir_stats(&path);
+            let (bytes, recency) = dir_stats(&path, sweep_temps);
             total += bytes;
             newest = newest.max(recency);
             continue;
         }
         if file_type.is_file() && entry.file_name().to_string_lossy().contains(".tmp-") {
-            let _ = fs::remove_file(&path);
+            if sweep_temps {
+                let _ = fs::remove_file(&path);
+            }
             continue;
         }
         // Symlinks (to files or directories) stat as themselves.

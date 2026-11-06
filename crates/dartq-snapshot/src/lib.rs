@@ -118,7 +118,10 @@ mod tests;
 pub use entry::{Entry, EntryKey};
 pub use header::{GenerationHeader, SNAPSHOT_FORMAT_VERSION};
 pub use remap::{RemapTables, SnapshotFileId, SnapshotStringId};
-pub use store::{DEFAULT_CAPACITY_BYTES, SaveError, Snapshot, SnapshotConfig, SnapshotStore};
+pub use store::{
+    DEFAULT_CAPACITY_BYTES, EvictionReport, SaveError, Snapshot, SnapshotConfig, SnapshotStats,
+    SnapshotStore,
+};
 
 /// blake3 truncated to 128 bits — the house content-id width.
 pub(crate) fn blake3_128(bytes: &[u8]) -> [u8; 16] {

@@ -13,28 +13,78 @@
 //!    build-dir name formula are pinned to it. Anything else passes
 //!    through before the store is ever touched.
 //! 2. **PRE**: compute the coarse config key (toolchain, filtered define
-//!    vector, target, provenance file contents — no depfile closure, so
-//!    a fresh worktree keys identically to the tree the entry was
-//!    ingested from), look it up in the CAS, and on a hit materialize
-//!    every replayable [`DirRecord`] of the entry into this tree —
-//!    verbatim for tree-relative names, recomputed from the recorded
-//!    template and the root-rewritten output dir otherwise. Content
-//!    divergence the coarse key cannot see is delegated to
-//!    flutter_tools: every build re-validates a dir's recorded input
-//!    hashes and rebuilds on mismatch, so a wasted materialization is
-//!    the entire cost of a stale hit. Any pre-phase failure degrades to
-//!    a miss: the shim never blocks a build.
+//!    vector, target, provenance file contents — no depfile closure and
+//!    no file that exists only after a build, so a fresh worktree keys
+//!    identically to the tree the entry was ingested from), look it up
+//!    in the CAS, and on a hit materialize every replayable
+//!    [`DirRecord`] of the entry into this tree — verbatim for
+//!    tree-relative names, recomputed from the recorded template with
+//!    the output dir AND define values re-aimed at this tree otherwise
+//!    (a define carrying an absolute path under the worktree — Xcode's
+//!    `-dSrcRoot`, an absolute `-dTargetFile` — hashes differently
+//!    here, so the recomputed name must follow it), and the
+//!    `flutter test` kernel cache into the build dir's `test_cache` —
+//!    where a cross-tree hit rewrites the dill's embedded `file://` URI
+//!    prefixes to this tree (see [`crate::dill_rewrite`]) so
+//!    frontend_server's initialize-from-dill validation keeps the
+//!    kernel.
+//!
+//!    The rewrite anchor is the WORKTREE root of each tree (git
+//!    toplevel), not the project root: a melos/pub-workspace sibling
+//!    `path:` package lives inside the worktree but outside the
+//!    project, and an un-rewritten reference to the ingest tree's copy
+//!    would let flutter's input validation skip on a file the target
+//!    tree never built — tree B running tree A's compiled code. Dirs
+//!    whose recorded bytes mention paths under NEITHER tree's
+//!    worktree root NOR the machine-local cache roots (pub cache,
+//!    flutter root) are refused by cross-tree replays
+//!    ([`crate::types::PathAnchors`]); within-tree replay is unaffected.
+//!    Placement itself is fill-only-missing with blobs verified present
+//!    up front (see [`crate::materialize`]).
+//!
+//!    Content divergence the coarse key cannot see is delegated to
+//!    flutter_tools — and that delegation is only sound for paths that
+//!    resolve identically in both trees, which is exactly what the
+//!    anchor rule guarantees: every build re-validates a dir's recorded
+//!    input hashes and rebuilds on mismatch, and frontend_server
+//!    invalidates a stale initialize-from-dill dill, so a wasted
+//!    materialization is the entire cost of a stale hit. Any pre-phase
+//!    failure degrades to a miss: the shim never blocks a build.
 //! 3. **RUN**: spawn flutter with the ORIGINAL argv (never a lossy
 //!    copy) while an assemble [`CaptureObserver`] polls the process
 //!    table for the `flutter assemble` invocations the platform build
 //!    systems spawn behind the shim (they invoke the SDK's absolute
 //!    binary path, so no PATH interception can see them). A non-zero
-//!    exit skips POST entirely.
-//! 4. **POST**: ingest EVERY hash dir the run touched, each as one
-//!    [`DirRecord`] — name and template from an observed assemble
-//!    invocation, or verbatim-replayable on the `build bundle` face, or
-//!    not-replayable provenance otherwise — under the same coarse key;
-//!    then run gc opportunistically when the store is over budget.
+//!    exit skips the build faces' POST; the test face still advances
+//!    its kernel cache (see 4).
+//! 4. **POST**: ingest EVERY dir the run touched, each as one
+//!    [`DirRecord`] — hash dirs with name and template from an observed
+//!    assemble invocation, or verbatim-replayable on the `build bundle`
+//!    face, or not-replayable provenance otherwise — under the same
+//!    coarse key; a `flutter test` run additionally ingests the
+//!    fixed-path kernel-cache dir (`<buildDir>/test_cache`; after a
+//!    rewritten cross-tree hit, flutter rewrites the dill with this
+//!    tree's URIs, and the re-ingest converges the entry onto it — no
+//!    special-casing needed). The test face ingests that dir even on a
+//!    non-zero exit: `flutter test` exits non-zero both when
+//!    compilation fails and when a compiled suite is red, and the
+//!    scan's touch gate separates the two — the cache dill is only
+//!    written after a successful compile, so a touched dill is valid
+//!    kernel however red the suite, while a compile failure writes
+//!    nothing. Every other face stays exit-0-gated (a failed build may
+//!    leave partially-written flutter_build state); signal deaths
+//!    arrive as 128 + signal and take the test-face path, where at
+//!    worst a torn in-place dill copy is bounded by frontend_server's
+//!    fall-back to a full compile when the initialize-from-dill file
+//!    will not read. A file whose identity this invocation's
+//!    materialization placed, or the prior entry under the key stamped,
+//!    is re-referenced without reading (see
+//!    [`crate::ingest_scan::scan_entry_files`]) — a warm run stores only
+//!    what flutter actually changed. A hit whose rerun reproduced the
+//!    key AND touched nothing needs no re-ingest; a rerun that rewrote
+//!    outputs always re-ingests, so a hit can never freeze a stale
+//!    entry. Then run gc opportunistically when the store is over
+//!    budget.
 //!
 //! Zero-config lives above this module: with no `build_cache` section
 //! the caller never reaches [`run_shim`] at all.
@@ -53,15 +103,17 @@ use serde::{Deserialize, Serialize};
 use crate::args_model::{ArgModelError, ParsedFlutterCmd, flutter_build_dir_name, parse_flutter_args};
 use crate::assemble::AssembleCapture;
 use crate::error::Result;
-use crate::fsutil::file_blake3;
-use crate::ingest_scan::{find_touched_hash_dirs, scan_entry_files};
+#[cfg(unix)]
+use crate::fsutil::TreeLock;
+use crate::fsutil::{file_blake3, stamp_of};
+use crate::ingest_scan::{DirScan, find_touched_hash_dirs, scan_entry_files, scan_test_cache};
 use crate::key;
 use crate::materialize::{self, DirPlan, MaterializePlan, MaterializeReport};
 use crate::observer::CaptureObserver;
 use crate::store::CasStore;
 use crate::types::{
-    BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, KeyInputs, NameRule,
-    ToolchainFingerprint,
+    BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, KeyInputs, ManifestFile, NameRule,
+    PathAnchors, PlacedFile, ToolchainFingerprint,
 };
 
 /// The one flutter version whose option tables and build-dir name
@@ -72,8 +124,9 @@ pub const SUPPORTED_FLUTTER_VERSION: &str = "3.47.1";
 /// Everything the shim needs beyond the invocation itself.
 #[derive(Debug, Clone)]
 pub struct ShimConfig {
-    /// CAS store root (default `$XDG_CACHE_HOME/dartq/cas/v1`, falling
-    /// back to `~/.cache/dartq/cas/v1`; assembled by the config glue).
+    /// CAS store root (default `$XDG_CACHE_HOME/dartq/cas/<STORE_LAYOUT_VERSION>`
+    /// — currently `v2` — falling back to `~/.cache/dartq/cas/...`;
+    /// assembled by the config glue, which appends the layout version).
     pub store_root: PathBuf,
     /// Store size budget (default 20 GiB); gc runs when exceeded.
     pub budget_bytes: u64,
@@ -93,7 +146,9 @@ pub enum Action {
     PreHitMaterialized,
     /// PRE computed a key but the store had no entry.
     PreMiss,
-    /// A modeled run exited 0 and its build dirs were ingested.
+    /// A modeled run ingested its dirs — every face on a zero exit,
+    /// the test kernel cache alone on a non-zero one (the exit-code
+    /// field carries the run's own outcome untouched).
     Ingested,
 }
 
@@ -107,7 +162,11 @@ pub struct ShimReport {
     /// The coarse config key (PRE's, which POST reuses when it ingests).
     pub key: Option<String>,
     pub materialize: Option<MaterializeReport>,
-    /// Files stored by the post-run ingest.
+    /// Files the post-run ingest read (hashed or verified) into the
+    /// store — the `ingested <key> (<n> files)` line's `n`. A file
+    /// re-referenced through a placed or prior identity is not counted;
+    /// the count is deterministic: zero means the run changed nothing
+    /// the store did not already hold.
     pub ingest_files: u64,
     /// Entry dirs a hit skipped because their names are not replayable
     /// in this tree.
@@ -120,17 +179,42 @@ pub struct ShimReport {
 pub trait FlutterRunner {
     /// Runs flutter with `argv` (the original arguments after the
     /// `flutter` token) in `cwd`, inheriting stdio, and returns the
-    /// child's exit code.
+    /// child's exit code. On the production runner the terminal signals
+    /// are forwarded to the child while it runs (see [`CommandRunner`]).
     fn run(&mut self, argv: &[OsString], cwd: &Path) -> io::Result<i32>;
+
+    /// The passthrough face: run flutter with NOTHING around it. The
+    /// production runner replaces this process with the child
+    /// (`exec(2)` — audit A11: no second process, signals reach flutter
+    /// directly, 6–9 ms and 9–11 MiB RSS saved); a runner that cannot
+    /// replace itself falls back to [`FlutterRunner::run`]. `Ok` never
+    /// returns on an exec-ing runner — the process IS the child by then.
+    fn exec(&mut self, argv: &[OsString], cwd: &Path) -> io::Result<i32> {
+        self.run(argv, cwd)
+    }
 }
 
-/// The production [`FlutterRunner`]: `Command::status` with inherited
-/// stdio, so an interactive `flutter run` streams exactly as a direct
-/// invocation would. The child stays in the shim's (foreground)
-/// process group — creating a separate group would sever Ctrl-C from
-/// it — and spawns with no environment tagging: the nested assemble
-/// invocations it triggers are captured from the process table, not by
-/// the child's cooperation.
+/// The tag [`crate::orchestrator`]'s CLI glue uses to recognize a shim
+/// invocation. It must never ride into a child environment: a nested
+/// `dartq` that inherits it would mistake itself for a shim (audit
+/// A10), so every spawn here strips it.
+const SHIM_ENV: &str = "DARTQ_SHIM";
+
+/// The production [`FlutterRunner`]. The child stays in the shim's
+/// (foreground) process group — creating a separate group would sever
+/// Ctrl-C from it — and spawns with no environment tagging beyond
+/// stripping [`SHIM_ENV`]: the nested assemble invocations it triggers
+/// are captured from the process table, not by the child's cooperation.
+///
+/// While the child runs, SIGTERM/SIGHUP/SIGINT are forwarded to it
+/// (audit A11: without forwarding, a signal to the shim killed only the
+/// shim and orphaned flutter_tools under PPID 1). The mechanism is a
+/// minimal sigaction forwarder, not the signal-hook crate: three
+/// signals need no pipe machinery, and the block-spawn-unblock sequence
+/// below closes the fork race that a handler-only approach leaves open.
+/// The shim then reports the child's own exit status (128 + signal for
+/// a signal death), so a `kill` of the shim tears down the build and
+/// the exit code still tells the truth.
 pub struct CommandRunner {
     flutter: PathBuf,
 }
@@ -143,8 +227,168 @@ impl CommandRunner {
 
 impl FlutterRunner for CommandRunner {
     fn run(&mut self, argv: &[OsString], cwd: &Path) -> io::Result<i32> {
-        let status = Command::new(&self.flutter).args(argv).current_dir(cwd).status()?;
-        Ok(exit_code(status))
+        #[cfg(unix)]
+        {
+            let forwarders = forward::install();
+            let mut command = Command::new(&self.flutter);
+            command.args(argv).current_dir(cwd).env_remove(SHIM_ENV);
+            let result = (|| -> io::Result<i32> {
+                let mut child = forward::spawn_blocked(&mut command)?;
+                let status = child.wait()?;
+                forward::child_gone();
+                Ok(exit_code(status))
+            })();
+            drop(forwarders);
+            result
+        }
+        #[cfg(not(unix))]
+        {
+            let status = Command::new(&self.flutter)
+                .args(argv)
+                .current_dir(cwd)
+                .env_remove(SHIM_ENV)
+                .status()?;
+            Ok(exit_code(status))
+        }
+    }
+
+    fn exec(&mut self, argv: &[OsString], cwd: &Path) -> io::Result<i32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // A successful exec never returns; the Err it returns IS
+            // the exec failure.
+            Err(Command::new(&self.flutter)
+                .args(argv)
+                .current_dir(cwd)
+                .env_remove(SHIM_ENV)
+                .exec())
+        }
+        #[cfg(not(unix))]
+        {
+            self.run(argv, cwd)
+        }
+    }
+}
+
+/// The SIGTERM/SIGHUP/SIGINT forwarder for the cacheable face (audit
+/// A11). Small by design: one static pid, one async-signal-safe
+/// handler, sigaction install/restore, and a block-spawn-unblock spawn
+/// that makes a signal arriving anywhere between fork and pid-publish
+/// stay pending until the pid is live (the handler would otherwise
+/// race the spawn and silently drop the signal). Residual risk,
+/// documented: a signal landing in the two-instruction window after
+/// `wait` reaps the child but before the pid is cleared forwards to a
+/// dead pid — `kill` returns ESRCH and nothing else happens unless the
+/// kernel recycled the pid in that window, which requires a full pid
+/// wrap between two adjacent instructions.
+#[cfg(unix)]
+mod forward {
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// The signals a terminal or supervisor sends to stop the shim.
+    const FORWARDED: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+
+    /// The child the forwarder targets; 0 = no child in flight.
+    static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn handler(signal: libc::c_int) {
+        let pid = CHILD_PID.load(Ordering::SeqCst);
+        if pid != 0 {
+            // kill(2) is async-signal-safe; the child shares the shim's
+            // process group, so a Ctrl-C from the terminal reaches it
+            // directly and this forward is the second, redundant
+            // delivery — flutter_tools' documented response to a
+            // repeated SIGINT is the forced shutdown a repeated Ctrl-C
+            // asks for.
+            unsafe { libc::kill(pid, signal) };
+        }
+    }
+
+    /// The installed forwarders. Dropping restores the previous
+    /// dispositions (normally the defaults), so nothing the shim does
+    /// outlives the child it spawned.
+    pub(super) struct Forwarders {
+        saved: [libc::sigaction; FORWARDED.len()],
+    }
+
+    pub(super) fn install() -> Forwarders {
+        let mut saved = unsafe { std::mem::zeroed::<[libc::sigaction; 3]>() };
+        for (slot, signal) in saved.iter_mut().zip(FORWARDED) {
+            // SAFETY: sigaction(2) reads the new action and writes the
+            // previous one; both live in this stack frame and outlive
+            // the call. A failure leaves the default disposition in
+            // place — the process then dies on the signal as it would
+            // without this module, never worse.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                libc::sigemptyset(&mut action.sa_mask);
+                action.sa_sigaction = handler as *const () as usize;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigaction(signal, &action, slot);
+            }
+        }
+        Forwarders { saved }
+    }
+
+    impl Drop for Forwarders {
+        fn drop(&mut self) {
+            for (saved, signal) in self.saved.iter().zip(FORWARDED) {
+                // SAFETY: as install(), restoring the saved action.
+                unsafe { libc::sigaction(signal, saved, std::ptr::null_mut()) };
+            }
+        }
+    }
+
+    /// Spawns `command` with [`FORWARDED`] blocked in the parent,
+    /// publishes the child's pid, then restores the previous mask: a
+    /// pending signal is delivered exactly then, with the pid live.
+    /// The child unblocks before exec — an inherited blocked mask would
+    /// swallow flutter's own Ctrl-C.
+    pub(super) fn spawn_blocked(command: &mut Command) -> io::Result<Child> {
+        // SAFETY: the sigset_t dance below only touches stack values;
+        // pre_exec's closure runs in the forked child before exec, where
+        // pthread_sigmask is one of the async-signal-safe calls.
+        let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut blocked);
+            for signal in FORWARDED {
+                libc::sigaddset(&mut blocked, signal);
+            }
+        }
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) };
+        // SAFETY: pre_exec runs its closure in the forked child before
+        // exec, where pthread_sigmask and the sigset_t initializers are
+        // async-signal-safe; the closure only touches its moved-in
+        // stack values. The outer block also covers the closure body's
+        // calls, which execute under fork's suspended-thread semantics.
+        let spawn = unsafe {
+            command
+                .pre_exec(move || {
+                    let mut unblock: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut unblock);
+                    for signal in FORWARDED {
+                        libc::sigaddset(&mut unblock, signal);
+                    }
+                    libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+                    Ok(())
+                })
+                .spawn()
+        };
+        if let Ok(child) = &spawn {
+            CHILD_PID.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
+        }
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
+        spawn
+    }
+
+    /// Clears the forwarded pid after the child was reaped.
+    pub(super) fn child_gone() {
+        CHILD_PID.store(0, Ordering::SeqCst);
     }
 }
 
@@ -209,9 +453,32 @@ pub fn run_shim(
         return run_passthrough(argv, cwd, runner, "cwd_unreadable");
     };
 
+    // The replay anchors of THIS tree: the worktree root (git toplevel
+    // enclosing the project) is the rewrite target for a cross-tree
+    // hit; the two cache roots classify machine-local paths. Shared by
+    // PRE's name recomputation and POST's classification scans.
+    let worktree = worktree_root(&cwd);
+    let anchors = PathAnchors {
+        worktree_root: worktree.clone(),
+        pub_cache: pub_cache_root(),
+        flutter_root: root.clone(),
+    };
+
     let dart_defines = dart_define_vector(&parsed, &root, &toolchain);
     let key_defines = key::filter_defines(&dart_defines.iter().cloned().collect());
     let build_root = cwd.join(".dart_tool").join("flutter_build");
+    // Debris sweep (independent of any hit): past versions of this
+    // cache moved superseded dirs aside as `.bcache-stale-<ms>`
+    // siblings and never removed them; placement is fill-only-missing
+    // now, so all that is left is cleaning the leftovers by age.
+    sweep_stale_aside_dirs(&build_root);
+    // The `flutter test` kernel cache: a fixed-path dir under the build
+    // dir, whose name flutter_tools honors `$FLUTTER_BUILD_DIR` for.
+    let build_dir = flutter_build_dir(std::env::var_os("FLUTTER_BUILD_DIR"));
+    let test_cache_dir = cwd.join(&build_dir).join("test_cache");
+    let test_cache_rel = test_cache_dir
+        .strip_prefix(&cwd)
+        .map_or_else(|_| test_cache_dir.clone(), Path::to_path_buf);
 
     let mut report = ShimReport {
         action: Action::PreMiss,
@@ -237,34 +504,72 @@ pub fn run_shim(
         }
     }
 
+    // The engine revision every build-dir name hashes: null under
+    // `--local-engine` (the recorded templates were captured the same
+    // way). Shared by the PRE plan names and the POST prior lookup.
+    let engine_for_names = if local_engine(&parsed) {
+        ""
+    } else {
+        toolchain.engine_revision.as_str()
+    };
+    // What PRE's materialization placed, by the name POST knows each dir
+    // under — the hash-dir name for build faces, the project-relative
+    // test-cache path for the test face. Empty unless a hit materialized.
+    let mut placed: Vec<(String, Vec<PlacedFile>)> = Vec::new();
+
     if let Some(manifest) = hit {
-        let engine_for_names = if local_engine(&parsed) {
-            ""
-        } else {
-            toolchain.engine_revision.as_str()
-        };
+        // Cross-tree means different worktree roots: only then do the
+        // recorded absolute paths need rewriting, and only then is a
+        // foreign-paths dir refused (within-tree, its paths are valid
+        // as recorded).
+        let cross_tree =
+            manifest.worktree_root_at_ingest.as_bytes() != worktree.as_os_str().as_encoded_bytes();
         let mut dirs = Vec::with_capacity(manifest.dirs.len());
+        let mut plan_names = Vec::with_capacity(manifest.dirs.len());
         let mut skipped = 0u64;
         for dir in &manifest.dirs {
             match dir.name_rule {
-                NameRule::VerbatimRelative => dirs.push(DirPlan {
-                    name: dir.name_observed.clone(),
-                    files: dir.files.clone(),
-                }),
-                NameRule::RecomputeFromTemplate => {
-                    let output_dir = rewrite_output_dir(
-                        &dir.name_output_dir,
-                        &manifest.project_root_at_ingest,
-                        &cwd,
+                NameRule::VerbatimRelative | NameRule::RecomputeFromTemplate => {
+                    if cross_tree && dir.files.iter().any(|file| file.foreign_paths) {
+                        // Bookkeeping that names a path outside the
+                        // ingest anchors would let flutter's input
+                        // validation skip on a file this tree cannot
+                        // re-derive — refuse the replay of this dir.
+                        skipped += 1;
+                        note(&format!(
+                            "dir {} records paths outside the ingest anchors; cross-tree replay refused",
+                            dir.name_observed
+                        ));
+                        continue;
+                    }
+                    let name = replayed_hash_name(
+                        dir,
+                        &manifest.worktree_root_at_ingest,
+                        &worktree,
+                        engine_for_names,
                     );
+                    // A recomputed name differs from the recorded one
+                    // whenever it embeds the ingest tree (absolute
+                    // output dirs, path-carrying defines): recorded
+                    // mentions of the old segment must follow the dir.
+                    let name_rewrite = (name != dir.name_observed)
+                        .then(|| (dir.name_observed.clone(), name.clone()));
+                    dirs.push(hash_dir_plan(&name, dir.files.clone(), name_rewrite));
+                    plan_names.push(name);
+                }
+                // The recorded name is provenance only: the replay path
+                // is re-derived from THIS invocation's build dir, so a
+                // changed `$FLUTTER_BUILD_DIR` still lands where flutter
+                // looks. A dill with foreign URIs ingested as
+                // `RewriteKind::None` already replays as the verbatim
+                // clone the design calls for — correct, just slower.
+                NameRule::TestKernelCache => {
                     dirs.push(DirPlan {
-                        name: flutter_build_dir_name(
-                            engine_for_names,
-                            &dir.name_defines,
-                            Path::new(&output_dir),
-                        ),
+                        path: test_cache_rel.clone(),
+                        name_rewrite: None,
                         files: dir.files.clone(),
                     });
+                    plan_names.push(test_cache_rel.to_string_lossy().into_owned());
                 }
                 NameRule::NotReplayable => skipped += 1,
             }
@@ -277,28 +582,46 @@ pub fn run_shim(
             let replayable = dirs.len();
             let plan = MaterializePlan {
                 dirs,
-                old_root: manifest.project_root_at_ingest.clone(),
-                new_root: cwd.clone(),
+                old_root: manifest.worktree_root_at_ingest.clone(),
+                new_root: worktree.clone(),
             };
-            let placed = CasStore::open(&config.store_root).and_then(|store| {
-                let placed = materialize::materialize(&store, &plan, &cwd)?;
-                store.record_hit(&key).map(|()| placed)
-            });
-            match placed {
-                Ok(placed) => {
-                    report.action = Action::PreHitMaterialized;
-                    report.materialize = Some(placed);
-                    report.reason = "pre_hit";
-                    note(&format!(
-                        "hit {} materialized {} dirs, {skipped} skipped",
-                        &key[..8],
-                        replayable
-                    ));
+            // A14: the placement writes into this tree — hold the
+            // per-tree lock so a second shim's scan or placement cannot
+            // interleave. Contention past the cap degrades to a clean
+            // miss: the build runs, nothing is placed.
+            if let Some(_tree_lock) = acquire_tree_lock(&cwd) {
+                let materialized = CasStore::open(&config.store_root).and_then(|store| {
+                    let outcome = materialize::materialize(&store, &plan, &cwd)?;
+                    store.record_hit(&key).map(|()| outcome)
+                });
+                match materialized {
+                    Ok(outcome) => {
+                        report.action = Action::PreHitMaterialized;
+                        note(&format!(
+                            "hit {} materialized {} dirs, {skipped} skipped",
+                            &key[..8],
+                            replayable
+                        ));
+                        if outcome.report.dill_rewrites > 0
+                            || outcome.report.dill_rewrite_refused > 0
+                        {
+                            note(&format!(
+                                "dill: {} rewritten, {} verbatim (rewrite refused)",
+                                outcome.report.dill_rewrites, outcome.report.dill_rewrite_refused
+                            ));
+                        }
+                        report.materialize = Some(outcome.report);
+                        report.reason = "pre_hit";
+                        placed = plan_names.into_iter().zip(outcome.placed).collect();
+                    }
+                    Err(err) => {
+                        report.reason = "materialize_failed";
+                        note(&err);
+                    }
                 }
-                Err(err) => {
-                    report.reason = "materialize_failed";
-                    note(&err);
-                }
+            } else {
+                report.reason = "tree_lock_busy";
+                note("another shim holds this tree's cache lock; skipping the pre-run materialization");
             }
         }
     }
@@ -306,11 +629,17 @@ pub fn run_shim(
     // RUN: the original argv, the canonical cwd (flutter's bookkeeping
     // paths then match the POST scan's root), the child's exit code —
     // observed throughout for the assemble invocations the platform
-    // build systems spawn behind the child.
-    let run_started = now_floored_to_secs();
+    // build systems spawn behind the child. The run marker (audit A22)
+    // is created immediately before the spawn: its mtime — full clock
+    // resolution, later than anything written before the run — is the
+    // touch gate the POST scans use. The old floored-to-whole-seconds
+    // start misclassified pre-run writes in the same second as touches.
     let observer = CaptureObserver::start(cwd.clone(), toolchain.engine_revision.clone());
+    let marker = RunMarker::create(&cwd);
     let run = runner.run(argv, &cwd);
     let observed = observer.finish();
+    let run_started = marker.as_ref().map_or_else(now_floored_to_secs, RunMarker::touch_time);
+    drop(marker);
     match run {
         Ok(code) => report.exit_code = Some(code),
         Err(err) => {
@@ -320,16 +649,90 @@ pub fn run_shim(
     }
 
     // POST: ingest every dir the run touched; a hit whose key the rebuild
-    // reproduced needs no re-ingest (the entry is already stored).
-    if report.exit_code == Some(0) {
-        let touched = match find_touched_hash_dirs(&build_root, run_started) {
-            Ok(touched) => touched,
-            Err(err) => {
-                note(&err);
-                Vec::new()
+    // reproduced needs no re-ingest (the entry is already stored). A
+    // non-zero exit narrows POST to the test face's kernel cache:
+    // `flutter test` exits non-zero both when compilation fails and when
+    // a compiled suite is red, and the scan itself tells the two apart —
+    // frontend_server writes the cache dill only after a successful
+    // compile, so a touched dill is valid kernel for the current sources
+    // however red the suite (the harness compiles the closure before
+    // running any test), while a compile failure leaves the cache
+    // untouched and the scan yields nothing. The hash dirs stay
+    // exit-0-gated: a failed build may leave partially-written
+    // flutter_build state, and flutter's own content validation is the
+    // replay safety net — ingesting known-partial state would only
+    // waste materialization. A signal death arrives as 128 + signal
+    // (the runner's shell-convention mapping) and takes the same path;
+    // at worst it tears the in-place dill copy (dart:io File.copy
+    // writes the destination directly, not through a rename), and a
+    // torn dill costs one wasted materialization — frontend_server
+    // falls back to a full compile whenever the initialize-from-dill
+    // file will not read.
+    let test_face = parsed.target.command == "test";
+    let zero_exit = report.exit_code == Some(0);
+    // A14: POST scans the very dirs another shim's placement writes and
+    // republishes the shared entry — it runs under the same per-tree
+    // lock as the placement. Contention past the cap skips the ingest:
+    // the run's outputs stay in the tree and the next run re-ingests.
+    if (zero_exit || test_face)
+        && let Some(_tree_lock) = acquire_tree_lock(&cwd)
+    {
+        let touched = if zero_exit {
+            match find_touched_hash_dirs(&build_root, run_started) {
+                Ok(touched) => touched,
+                Err(err) => {
+                    note(&err);
+                    Vec::new()
+                }
             }
+        } else {
+            // A red test run ingests the kernel cache exclusively; the
+            // hash-dir scan never runs, touched or not.
+            Vec::new()
         };
-        if !touched.is_empty() {
+        let post_key = coarse_key(&cwd, &parsed, &key_defines, &toolchain);
+        // The test face: the kernel cache the run compiled into, when it
+        // wrote one. Unlike the assemble faces nothing observes whether a
+        // hit's rerun really recompiled — and frontend_server rewrites
+        // the dill on every run — so a touched cache always goes back to
+        // the store, keeping the entry converged on the tree's sources.
+        // The entry currently stored under the post key supplies the
+        // prior stamps, and a hit's placement supplies the placed ones: a
+        // dill whose identity either record proves reuses its blob
+        // without re-reading tens of MB; a rewritten dill re-hashes and
+        // replaces the reference, leaving the superseded blob to gc.
+        let test_cache = if test_face {
+            match CasStore::open(&config.store_root).and_then(|store| {
+                let prior = store.lookup(&post_key)?;
+                let prior_dir = prior.as_ref().and_then(|manifest| {
+                    manifest
+                        .dirs
+                        .iter()
+                        .find(|dir| dir.name_rule == NameRule::TestKernelCache)
+                });
+                let placed_dir = placed
+                    .iter()
+                    .find(|(name, _)| Path::new(name) == test_cache_rel)
+                    .map(|(_, files)| files.as_slice());
+                scan_test_cache(
+                    &test_cache_dir,
+                    run_started,
+                    &anchors,
+                    prior_dir,
+                    placed_dir,
+                    &|id| store.blob_path(id).is_file(),
+                )
+            }) {
+                Ok(scanned) => scanned,
+                Err(err) => {
+                    note(&err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !touched.is_empty() || test_cache.is_some() {
             // Only templates whose dir this run materialized carry
             // information; the rest (a foreign process, a failed
             // assemble) are dead observations.
@@ -339,11 +742,24 @@ pub fn run_shim(
                     touched.iter().any(|(name, _)| name == &capture.name)
                 })
                 .collect();
-            let post_key = coarse_key(&cwd, &parsed, &key_defines, &toolchain);
+            // A hit may skip the re-ingest ONLY when the run changed
+            // nothing beyond the hit's own placement: every touched dir
+            // is still byte-for-byte what PRE materialized. The touched
+            // set alone cannot tell flutter's rewrites from the
+            // placement's own writes; a stamp mismatch (or a file
+            // beside the placement) means a rerun rewrote outputs, and
+            // re-ingesting is what keeps the first tree to hit from
+            // freezing the entry on its own outputs forever.
             let already_stored = report.action == Action::PreHitMaterialized
                 && report.key.as_deref() == Some(post_key.as_str())
-                && captures.is_empty();
+                && captures.is_empty()
+                && test_cache.is_none()
+                && placements_intact(&touched, &build_root, &placed);
             if !already_stored {
+                let test_scan = test_cache.map(|scan| TestCacheScan {
+                    name: test_cache_rel.to_string_lossy().into_owned(),
+                    scan,
+                });
                 let ingested = CasStore::open(&config.store_root).and_then(|store| {
                     let count = ingest_observed(
                         &store,
@@ -351,10 +767,14 @@ pub fn run_shim(
                         &touched,
                         &captures,
                         &cwd,
+                        &anchors,
                         &parsed,
                         &key_defines,
                         &toolchain,
+                        engine_for_names,
                         post_key.clone(),
+                        &placed,
+                        test_scan.as_ref(),
                     )?;
                     maybe_gc(&store, config);
                     Ok(count)
@@ -374,12 +794,166 @@ pub fn run_shim(
                 }
             }
         }
+    } else if zero_exit || test_face {
+        note("another shim holds this tree's cache lock; skipping the post-run ingest");
     }
 
     report
 }
 
-/// Passthrough: spawn the child untouched and report.
+/// A hash-dir materialization plan: `.dart_tool/flutter_build/<name>`,
+/// filling only missing files (see [`crate::materialize`]).
+fn hash_dir_plan(
+    name: &str,
+    files: Vec<ManifestFile>,
+    name_rewrite: Option<(String, String)>,
+) -> DirPlan {
+    DirPlan {
+        path: Path::new(".dart_tool").join("flutter_build").join(name),
+        name_rewrite,
+        files,
+    }
+}
+
+/// Whether every touched dir is still exactly what PRE's materialization
+/// placed: each placed file keeps the stamp the placement recorded and
+/// the dir holds nothing beside the placement. This is the "flutter
+/// changed nothing" signal for a hit — every write moves the ns mtime
+/// (the shared identity semantics), so a flutter rewrite, delete, or new
+/// file breaks the match and the rerun re-ingests.
+fn placements_intact(
+    touched: &[(String, SystemTime)],
+    build_root: &Path,
+    placed: &[(String, Vec<PlacedFile>)],
+) -> bool {
+    for (name, _) in touched {
+        let Some(files) = placed.iter().find(|(n, _)| n == name).map(|(_, f)| f) else {
+            // A dir this run fabricated or re-aimed, not the placement.
+            return false;
+        };
+        let dir = build_root.join(name);
+        for file in files {
+            let Ok(meta) = fs::metadata(dir.join(&file.path)) else {
+                return false;
+            };
+            if stamp_of(&meta) != file.stamp {
+                return false;
+            }
+        }
+        // Nothing beyond the placement: an extra entry is a file flutter
+        // fabricated beside the placed ones.
+        match fs::read_dir(&dir) {
+            Ok(entries) => {
+                if entries.count() != files.len() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// The rewrite anchor of a tree: the nearest ancestor of the project
+/// root holding `.git` — a directory for a main checkout, a file for a
+/// linked worktree — or the project root itself when no repo encloses
+/// it (then workspace siblings outside the project classify as
+/// foreign, so they are refused cross-tree rather than mis-rewritten).
+/// `project_root` must be canonical (its ancestors then are too).
+fn worktree_root(project_root: &Path) -> PathBuf {
+    let mut current = Some(project_root);
+    while let Some(dir) = current {
+        if fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+    project_root.to_path_buf()
+}
+
+/// The pub cache root pub itself resolves: `$PUB_CACHE` when set to an
+/// absolute path, else the per-user default. Unresolvable → empty: an
+/// empty anchor matches nothing, so pub-cache paths then classify
+/// foreign and affected dirs lose cross-tree replay — a safe, slower
+/// degradation, never a wrong one.
+fn pub_cache_root() -> PathBuf {
+    if let Some(value) = std::env::var_os("PUB_CACHE").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return fs::canonicalize(&path).unwrap_or(path);
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty());
+    let Some(home) = home else {
+        return PathBuf::new();
+    };
+    let path = if cfg!(windows) {
+        PathBuf::from(home)
+            .join("AppData")
+            .join("Local")
+            .join("Pub")
+            .join("Cache")
+    } else {
+        PathBuf::from(home).join(".pub-cache")
+    };
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Sweeps `.bcache-stale-<unix_millis>` dirs older versions of this
+/// cache moved aside next to the hash dirs. Fill-only-missing placement
+/// creates none; this is the cleanup of historical leftovers, by the
+/// same one-hour grace the store's debris sweeps use — a dir's own
+/// mtime survives the rename, so the age measured is that of the
+/// dir's last content change, which only makes the sweep later, never
+/// earlier. Best-effort: failures are ignored.
+fn sweep_stale_aside_dirs(build_root: &Path) {
+    const STALE_GRACE: u64 = 60 * 60;
+    let now = unix_now();
+    let Ok(entries) = fs::read_dir(build_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .contains(".bcache-stale-")
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        if let Ok(modified) = metadata.modified()
+            && now.saturating_sub(modified_unix(&modified)) >= STALE_GRACE
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn modified_unix(time: &SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// The flutter build dir of this invocation: `$FLUTTER_BUILD_DIR` when
+/// set (flutter_tools routes every output path through it, the test
+/// kernel cache included), else `build`. An empty value counts as
+/// unset, as flutter_tools treats it.
+fn flutter_build_dir(env: Option<OsString>) -> PathBuf {
+    env.filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("build"), PathBuf::from)
+}
+
+/// Passthrough: become (or spawn) the child untouched and report. On
+/// the production runner this never returns — the shim process IS
+/// flutter from the exec on (audit A11), so the report only exists for
+/// the exec-failure path and for test runners.
 fn run_passthrough(
     argv: &[OsString],
     cwd: &Path,
@@ -395,7 +969,7 @@ fn run_passthrough(
         skipped_dirs: 0,
         reason,
     };
-    match runner.run(argv, cwd) {
+    match runner.exec(argv, cwd) {
         Ok(code) => report.exit_code = Some(code),
         Err(err) => note(&format!("flutter spawn failed: {err}")),
     }
@@ -421,14 +995,20 @@ fn coarse_key(
 }
 
 /// The provenance files hashed into every key: `pubspec.yaml`,
-/// `pubspec.lock`, `.dart_tool/package_config.json`, and every
-/// `--dart-define-from-file` (flutter_tools folds their contents into
-/// the define list and no depfile records them). Files that do not
-/// exist (or cannot be read) are skipped — a fresh tree keys on what
-/// is there.
+/// `pubspec.lock`, and every `--dart-define-from-file` (flutter_tools
+/// folds their contents into the define list and no depfile records
+/// them). `.dart_tool/package_config.json` is deliberately NOT keyed:
+/// it exists only after flutter's implicit `pub get`, so keying it
+/// would give a fresh worktree a pre-build key that never matches the
+/// key the entry was stored under — the headline use case, dead on
+/// arrival. Divergence is caught anyway: flutter treats package_config
+/// as a build input, so its hash rides in every stamp/.filecache and
+/// a replay over a diverged config rebuilds natively. Files that do
+/// not exist (or cannot be read) are skipped — a fresh tree keys on
+/// what is there.
 fn provenance_closure(cwd: &Path, define_files: &[PathBuf]) -> Vec<ClosureFile> {
     let mut files = Vec::new();
-    for relative in ["pubspec.yaml", "pubspec.lock", ".dart_tool/package_config.json"] {
+    for relative in ["pubspec.yaml", "pubspec.lock"] {
         push_provenance(&cwd.join(relative), Some(Path::new(relative)), &mut files);
     }
     for define_file in define_files {
@@ -608,15 +1188,56 @@ fn local_engine(parsed: &ParsedFlutterCmd) -> bool {
     })
 }
 
-/// The recorded output-dir string re-aimed at the target tree: the
-/// ingest-root prefix replaced with the target root; a relative or
-/// foreign string replays verbatim (a tree-relative output dir is
-/// tree-independent by construction).
-fn rewrite_output_dir(recorded: &str, ingest_root: &str, target_root: &Path) -> String {
-    recorded.strip_prefix(ingest_root).map_or_else(
-        || recorded.to_owned(),
-        |rest| format!("{}{}", target_root.display(), rest),
-    )
+/// Re-aims `text` at the target tree when it is an absolute path under
+/// the ingest worktree root; a relative, foreign, or lookalike-prefixed
+/// string replays verbatim. The boundary check (`/` or end of string
+/// right after the root) keeps `/wt` from re-rooting `/wt-lookalike`.
+fn rerooted(text: &str, ingest_root: &str, target_root: &Path) -> String {
+    match text.strip_prefix(ingest_root) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{}{}", target_root.display(), rest)
+        }
+        _ => text.to_owned(),
+    }
+}
+
+/// The `.dart_tool/flutter_build` dir name a recorded hash dir replays
+/// to in the target tree: verbatim for tree-relative names (the `build
+/// bundle` face), recomputed from the recorded template otherwise —
+/// with the output dir AND every define value re-aimed at the target
+/// worktree root, because a define carrying an absolute path (Xcode's
+/// `-dSrcRoot`, an absolute `-dTargetFile`, gradle's `flutter run`
+/// stamp) hashes the tree into the name and the recomputation must
+/// hash this tree the same way flutter here will. Shared by the PRE
+/// plan (where the dir materializes under this name) and the POST
+/// prior lookup (which must find the record whose replay lands at a
+/// touched dir's name — the ingest-tree `name_observed` of a template
+/// dir never names a dir in this tree).
+fn replayed_hash_name(
+    dir: &DirRecord,
+    ingest_root: &str,
+    target_root: &Path,
+    engine_for_names: &str,
+) -> String {
+    if dir.name_rule == NameRule::RecomputeFromTemplate {
+        let output_dir = rerooted(&dir.name_output_dir, ingest_root, target_root);
+        let defines = dir
+            .name_defines
+            .iter()
+            .map(|(name, value)| (name.clone(), rerooted(value, ingest_root, target_root)))
+            .collect::<BTreeMap<String, String>>();
+        flutter_build_dir_name(engine_for_names, &defines, Path::new(&output_dir))
+    } else {
+        dir.name_observed.clone()
+    }
+}
+
+/// The scanned test kernel cache of a post-run ingest: the dir's
+/// project-relative spelling (provenance for
+/// [`NameRule::TestKernelCache`]) and the scan itself.
+struct TestCacheScan {
+    name: String,
+    scan: DirScan,
 }
 
 /// Scans and ingests every observed build dir under `key`. Each dir
@@ -626,8 +1247,17 @@ fn rewrite_output_dir(recorded: &str, ingest_root: &str, target_root: &Path) -> 
 /// the dir is tree-relative and replays verbatim
 /// ([`NameRule::VerbatimRelative`]); anything else is recorded as
 /// [`NameRule::NotReplayable`] provenance. Templates whose dir never
-/// materialized are dropped (a failed or partial assemble). Returns the
-/// file count stored.
+/// materialized are dropped (a failed or partial assemble). The test
+/// kernel-cache scan, when the run produced one, joins as the entry's
+/// fixed-path dir.
+///
+/// Each dir's scan consults two identities (see
+/// [`crate::ingest_scan`]): the files `placed` by this invocation's own
+/// materialization, and the stamps of the entry currently stored under
+/// `key` whose [`replayed_hash_name`] is the dir — a file either record
+/// proves is re-referenced, so a warm run stores only what flutter
+/// actually changed. Returns the count of files streamed into the
+/// store this run (reused references excluded).
 ///
 /// # Errors
 ///
@@ -638,17 +1268,46 @@ fn ingest_observed(
     observed: &[(String, SystemTime)],
     captures: &[AssembleCapture],
     cwd: &Path,
+    anchors: &PathAnchors,
     parsed: &ParsedFlutterCmd,
     key_defines: &BTreeMap<String, String>,
     toolchain: &ToolchainFingerprint,
+    engine_for_names: &str,
     key: String,
+    placed: &[(String, Vec<PlacedFile>)],
+    test_cache: Option<&TestCacheScan>,
 ) -> Result<u64> {
     let bundle_face = parsed.target.command == "build bundle";
-    let mut dirs = Vec::with_capacity(observed.len());
+    // Decision-time prior: the entry stored under the ingest key.
+    let prior = store.lookup(&key)?;
+    let mut dirs = Vec::with_capacity(observed.len() + usize::from(test_cache.is_some()));
     let mut sources: Vec<(PathBuf, BlobId)> = Vec::new();
     // `observed` is name-sorted, so the DirRecords come out name-sorted.
     for (name, _) in observed {
-        let scanned = scan_entry_files(&build_root.join(name), cwd)?;
+        let prior_dir = prior.as_ref().and_then(|manifest| {
+            manifest.dirs.iter().find(|dir| {
+                matches!(
+                    dir.name_rule,
+                    NameRule::VerbatimRelative | NameRule::RecomputeFromTemplate
+                ) && replayed_hash_name(
+                    dir,
+                    &manifest.worktree_root_at_ingest,
+                    &anchors.worktree_root,
+                    engine_for_names,
+                ) == *name
+            })
+        });
+        let placed_dir = placed
+            .iter()
+            .find(|(placed_name, _)| placed_name == name)
+            .map(|(_, files)| files.as_slice());
+        let scan = scan_entry_files(
+            &build_root.join(name),
+            anchors,
+            prior_dir,
+            placed_dir,
+            &|id| store.blob_path(id).is_file(),
+        )?;
         let (name_rule, name_defines, name_output_dir) =
             match captures.iter().find(|capture| &capture.name == name) {
                 Some(capture) => (
@@ -661,21 +1320,48 @@ fn ingest_observed(
                     BTreeMap::new(),
                     String::new(),
                 ),
-                None => (NameRule::NotReplayable, BTreeMap::new(), String::new()),
+                // A missed capture for a dir the prior entry already
+                // recorded keeps the prior record's naming (audit A22):
+                // the absence of an observation this run says nothing
+                // about replayability — without this arm one missed
+                // assemble capture silently demoted the dir to
+                // not-replayable provenance and the entry stopped
+                // serving fresh trees.
+                None => match prior_dir {
+                    Some(previous) => (
+                        previous.name_rule.clone(),
+                        previous.name_defines.clone(),
+                        previous.name_output_dir.clone(),
+                    ),
+                    None => (NameRule::NotReplayable, BTreeMap::new(), String::new()),
+                },
             };
         dirs.push(DirRecord {
             name_observed: name.clone(),
             name_rule,
             name_defines,
             name_output_dir,
-            files: scanned.iter().map(|(_, file)| file.clone()).collect(),
+            files: scan.files,
         });
-        sources.extend(scanned.iter().map(|(path, file)| (path.clone(), file.blob)));
+        sources.extend(scan.sources);
+    }
+    if let Some(scan) = test_cache {
+        dirs.push(DirRecord {
+            name_observed: scan.name.clone(),
+            name_rule: NameRule::TestKernelCache,
+            name_defines: BTreeMap::new(),
+            name_output_dir: String::new(),
+            files: scan.scan.files.clone(),
+        });
+        sources.extend(scan.scan.sources.iter().cloned());
     }
     let now = unix_now();
     let draft = EntryManifest {
         key,
         project_root_at_ingest: cwd.to_string_lossy().into_owned(),
+        worktree_root_at_ingest: anchors.worktree_root.to_string_lossy().into_owned(),
+        pub_cache_root: anchors.pub_cache.to_string_lossy().into_owned(),
+        flutter_root_at_ingest: anchors.flutter_root.to_string_lossy().into_owned(),
         dirs,
         defines: key_defines.clone(),
         target: parsed.target.clone(),
@@ -687,11 +1373,13 @@ fn ingest_observed(
     Ok(sources.len() as u64)
 }
 
-/// GC when the store is over budget (cheap stats check first; failures
-/// surface as one stderr line and never affect the build).
+/// GC when the store is over budget (the O(1) running usage counter
+/// decides; the full walk only runs once gc actually collects — see
+/// [`CasStore::used_bytes`]). Failures surface as one stderr line and
+/// never affect the build.
 fn maybe_gc(store: &CasStore, config: &ShimConfig) {
-    match store.stats() {
-        Ok(stats) if stats.blob_bytes > config.budget_bytes => {
+    match store.used_bytes() {
+        Ok(used) if used > config.budget_bytes => {
             if let Err(err) = store.gc(config.budget_bytes, config.grace_secs, unix_now()) {
                 note(&err);
             }
@@ -798,38 +1486,58 @@ fn artifact_stamp(path: &Path) -> Option<ArtifactStamp> {
 }
 
 /// Resolves the flutter binary the shim spawns: the config override,
-/// then `$DARTQ_FLUTTER`, then a PATH search that skips the shim's own
-/// directory and the shim binary itself (either would recurse into the
-/// shim). Symlinks resolve to the real SDK binary.
+/// then `$DARTQ_FLUTTER`, then a PATH search that skips the shim
+/// binary itself (either an explicit override or a PATH hit resolving
+/// to this executable would recurse — each shim spawning another at
+/// ~210 processes/second, audit A10; the refusal below fires first).
+/// Symlinks resolve to the real SDK binary. Returns `None` — after one
+/// explanatory stderr line naming both paths — when the resolution IS
+/// this executable; the caller's not-found exit (127) then applies.
 pub fn discover_flutter(explicit: Option<&Path>, own_exe: Option<&Path>) -> Option<PathBuf> {
+    let own = own_exe.and_then(|exe| fs::canonicalize(exe).ok());
     if let Some(path) = explicit {
-        return Some(path.to_path_buf());
+        return non_recursing(path, own.as_deref());
     }
     if let Some(path) = std::env::var_os("DARTQ_FLUTTER").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(path));
+        return non_recursing(&PathBuf::from(path), own.as_deref());
     }
     let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .collect();
-    let exclude_dir = own_exe
-        .and_then(|exe| exe.parent())
-        .and_then(|dir| fs::canonicalize(dir).ok());
-    let exclude_file = own_exe.and_then(|exe| fs::canonicalize(exe).ok());
-    first_flutter_on_path(&dirs, exclude_dir.as_deref(), exclude_file.as_deref())
+    first_flutter_on_path(&dirs, own.as_deref())
 }
 
-/// The PATH-search core of [`discover_flutter`]: the first `flutter`
-/// on `dirs` that is neither in `exclude_dir` nor `exclude_file`
-/// (compared after symlink resolution).
-fn first_flutter_on_path(
-    dirs: &[PathBuf],
-    exclude_dir: Option<&Path>,
-    exclude_file: Option<&Path>,
-) -> Option<PathBuf> {
+/// A resolved-by-configuration flutter path, canonicalized when
+/// possible and refused when it names this executable: spawning it
+/// would fork-bomb the shim into itself (audit A10). The message names
+/// both the requested and the current path so the misconfiguration is
+/// visible in one line.
+fn non_recursing(path: &Path, own: Option<&Path>) -> Option<PathBuf> {
+    let resolved = match fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        // Unresolvable (absent, dangling symlink): hand the path on
+        // verbatim — the spawn fails with its own diagnostic later.
+        Err(_) => return Some(path.to_path_buf()),
+    };
+    if let Some(own_path) = own
+        && own_path == resolved.as_path()
+    {
+        note(&format!(
+            "refusing to run flutter at {}: it is this shim itself ({}) — point the build_cache `flutter` setting or DARTQ_FLUTTER at the real SDK binary",
+            resolved.display(),
+            own_path.display()
+        ));
+        return None;
+    }
+    Some(resolved)
+}
+
+/// The PATH-search core of [`discover_flutter`]: the first `flutter` on
+/// `dirs` that is not the shim executable itself (compared after
+/// symlink resolution). Only the shim BINARY is excluded — audit A10:
+/// excluding the shim's entire directory also hid a real SDK flutter
+/// installed beside it.
+fn first_flutter_on_path(dirs: &[PathBuf], exclude_file: Option<&Path>) -> Option<PathBuf> {
     for dir in dirs {
-        let canonical_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-        if exclude_dir == Some(canonical_dir.as_path()) {
-            continue;
-        }
         let candidate = dir.join("flutter");
         if !candidate.is_file() {
             continue;
@@ -847,14 +1555,92 @@ fn first_flutter_on_path(
     None
 }
 
-/// `now`, floored to whole seconds: the run-start marker for the
-/// touched-dir scan (whole-second-mtime file systems).
+/// `now`, floored to whole seconds: the conservative fallback touch
+/// gate for the touched-dir scan when no run marker could be written
+/// (whole-second-mtime file systems lose nothing by it).
 fn now_floored_to_secs() -> SystemTime {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(UNIX_EPOCH, |since| {
             UNIX_EPOCH + Duration::from_secs(since.as_secs())
         })
+}
+
+/// A no-op stand-in for [`TreeLock`] on platforms without `flock`:
+/// acquiring always succeeds and guards nothing.
+#[cfg(not(unix))]
+struct TreeLock;
+
+/// Takes this tree's cache lock (audit A14), waiting up to the cap for
+/// a concurrent shim. `None` on contention or when the lock itself is
+/// unavailable (a lock failure degrades to the old unsynchronized
+/// behavior — the pid-unique temp names keep concurrent placements
+/// from corrupting anything; only the cache efficiency is lost).
+fn acquire_tree_lock(cwd: &Path) -> Option<TreeLock> {
+    #[cfg(unix)]
+    {
+        /// How long a shim waits for a concurrent shim's tree lock
+        /// before running cache-less (test builds shorten it so the
+        /// contention path is reachable without sleeping past a cap).
+        #[cfg(not(test))]
+        const TREE_LOCK_WAIT: Duration = Duration::from_secs(600);
+        #[cfg(test)]
+        const TREE_LOCK_WAIT: Duration = Duration::from_millis(300);
+        match TreeLock::acquire(cwd, TREE_LOCK_WAIT) {
+            Ok(lock) => lock,
+            Err(err) => {
+                note(&format!("tree lock unavailable ({err}); proceeding unsynchronized"));
+                None
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cwd;
+        Some(TreeLock)
+    }
+}
+
+/// `.dart_tool/dartq-bcache-run-<pid>`: created immediately before the
+/// flutter spawn and removed right after, the touch gate of the
+/// post-run scans (audit A22). Its mtime carries full clock resolution
+/// and postdates every write the shim or the user made before the run,
+/// so a record rewritten in the same whole second as the run start —
+/// which the old floored-to-seconds gate misread as a touch — stays
+/// untouched. The pid suffix keeps two shims in one tree from sharing a
+/// marker.
+struct RunMarker {
+    path: PathBuf,
+}
+
+impl RunMarker {
+    /// Writes the marker under `cwd`'s `.dart_tool`; `None` (and the
+    /// floored-clock fallback in the caller) when it cannot be written
+    /// — a read-only tree must not fail the build over a cache gate.
+    fn create(cwd: &Path) -> Option<RunMarker> {
+        let path = cwd
+            .join(".dart_tool")
+            .join(format!("dartq-bcache-run-{}", std::process::id()));
+        let dir = path.parent()?;
+        fs::create_dir_all(dir).ok()?;
+        fs::write(&path, b"").ok()?;
+        Some(RunMarker { path })
+    }
+
+    /// The gate mtime. Statting our own just-written file cannot race
+    /// anything meaningful, but a missing stat falls back to the
+    /// floored clock rather than guessing.
+    fn touch_time(&self) -> SystemTime {
+        fs::metadata(&self.path)
+            .and_then(|meta| meta.modified())
+            .unwrap_or_else(|_| now_floored_to_secs())
+    }
+}
+
+impl Drop for RunMarker {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn unix_now() -> u64 {
@@ -951,9 +1737,10 @@ mod tests {
 
     /// Fabricates the `.dart_tool/flutter_build/<name>` dir a flutter run
     /// leaves behind: a payload dill, a depfile recording the tree's
-    /// sources, and a stamp embedding the project root (the rewrite
-    /// probe). Under capture-not-predict the name is whatever the run
-    /// observed, so callers pick it.
+    /// sources, and a stamp embedding the project root and the dir's own
+    /// flutter_build path (the rewrite probes). Under
+    /// capture-not-predict the name is whatever the run observed, so
+    /// callers pick it.
     fn build_fixture(project: &Path, name: &str) -> PathBuf {
         let dir = project
             .join(".dart_tool")
@@ -967,7 +1754,11 @@ mod tests {
             escape_path(&project.join(".dart_tool").join("package_config.json")),
         );
         write(&dir.join("kernel_snapshot.d"), depfile.as_bytes());
-        let stamp = format!(r#"{{"inputs":["{}/lib/main.dart"]}}"#, project.display());
+        let stamp = format!(
+            r#"{{"inputs":["{}/lib/main.dart"],"outputs":["{}/app.dill"]}}"#,
+            project.display(),
+            dir.display()
+        );
         write(&dir.join("flutter_build.dill.stamp"), stamp.as_bytes());
         dir
     }
@@ -1019,6 +1810,9 @@ mod tests {
     /// An arbitrary config-hash dir name: under capture-not-predict the
     /// tests never need to derive it, only to reuse what a run observed.
     const DIR_MAIN: &str = "2fe6e51a1c0b3d4e5f60718293a4b5c6";
+    /// A second arbitrary name: the contention test's dir that only a
+    /// PRE materialization could ever place.
+    const DIR_ALT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn fresh_tree_pre_hit_materializes_recorded_dirs() {
@@ -1128,6 +1922,269 @@ mod tests {
             .is_file());
     }
 
+    /// Audit finding A1, end to end: a recorded dir whose bookkeeping
+    /// names an absolute path under NONE of the ingest anchors (here, a
+    /// path dependency inside another checkout) is refused by a
+    /// cross-tree replay — flutter's input validation would resolve the
+    /// recorded path, see it unchanged, and skip, running the ingest
+    /// tree's compiled code — while a within-tree hit replays fine
+    /// (the recorded paths are valid where they were recorded).
+    #[test]
+    fn foreign_path_dir_refused_cross_tree_replays_in_tree() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // Tree A seeds an entry whose depfile also names an input
+        // outside every anchor.
+        let tree_a = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                let dir = build_fixture(cwd, DIR_MAIN);
+                let depfile = format!(
+                    "{}: {}\n",
+                    escape_path(&dir.join("app.dill")),
+                    // Fictional absolute path of another checkout: the
+                    // classification only needs it outside the anchors.
+                    "/opt/other-checkout/packages/tools/lib/a.dart"
+                );
+                write(&dir.join("foreign_input.d"), depfile.as_bytes());
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.expect("seed key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert!(
+            manifest.dirs[0]
+                .files
+                .iter()
+                .any(|file| file.foreign_paths),
+            "the ingest classifies the foreign input"
+        );
+
+        // A different tree (no enclosing repo: each project dir is its
+        // own worktree root, so the roots differ): the hit refuses the
+        // dir instead of replaying bookkeeping this tree cannot honor.
+        let tree_b = synthetic_project(&tmp, "b");
+        let mut runner = FakeRunner::exits(0);
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        assert_eq!(report.reason, "entry_not_replayable");
+        assert_eq!(report.skipped_dirs, 1);
+        assert!(
+            !tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(DIR_MAIN)
+                .exists(),
+            "the foreign dir never materializes cross-tree"
+        );
+
+        // Within tree A the hit replays: fill-only-missing finds every
+        // file present and leaves the valid dir alone.
+        let mut runner = FakeRunner::exits(0);
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.skipped_dirs, 0);
+        assert_eq!(
+            fs::read_to_string(
+                tree_a
+                    .join(".dart_tool")
+                    .join("flutter_build")
+                    .join(DIR_MAIN)
+                    .join("app.dill")
+            )
+            .expect("the tree's own dir survives"),
+            "kernel payload bytes"
+        );
+    }
+
+    /// Audit finding A5, end to end: a fresh worktree has no
+    /// `.dart_tool` at all (flutter's implicit `pub get` has not run),
+    /// so its pre-build key must equal the ingest key — the hit fires
+    /// before the child runs. `.dart_tool/package_config.json` is not
+    /// in the key preimage for exactly this reason; flutter's own
+    /// input validation catches a diverged config after a hit.
+    #[test]
+    fn fresh_worktree_without_dart_tool_hits_the_ingest_key() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        let tree_a = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.expect("seed key");
+
+        // The fresh worktree: checked-out files only.
+        let tree_b = tmp.join("app-b");
+        write(&tree_b.join("pubspec.yaml"), b"name: app\nversion: 1.0.0\n");
+        write(&tree_b.join("pubspec.lock"), b"packages: {}\n");
+        write(&tree_b.join("lib").join("main.dart"), b"void main() {}\n");
+        assert!(!tree_b.join(".dart_tool").exists());
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                assert!(
+                    cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
+                        .join("app.dill")
+                        .is_file(),
+                    "the hit materializes before the child runs"
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.key.as_deref(), Some(key.as_str()));
+    }
+
+    /// Audit finding A3's refresh leg, end to end: a hit whose rerun
+    /// rewrote an output must re-ingest it — on the bundle face no
+    /// assemble child is ever observed, so the old `already_stored`
+    /// shortcut (hit + same key + no captures) froze the entry on the
+    /// seeding tree's outputs and every later rebuild was replayed
+    /// stale forever.
+    #[test]
+    fn hit_rerun_that_rewrites_outputs_refreshes_the_entry() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.expect("seed key");
+        let store = CasStore::open(&store_root).expect("open store");
+
+        // The hit rerun rewrites ONLY the payload (the stale-hit shape:
+        // flutter's validation rebuilt the kernel over diverged
+        // sources). The entry must follow.
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write(
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
+                        .join("app.dill"),
+                    b"kernel payload bytes v2",
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.ingest_files, 1, "the rewritten payload re-stores");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let dill = manifest.dirs[0]
+            .files
+            .iter()
+            .find(|file| file.path == Path::new("app.dill"))
+            .expect("payload record");
+        assert_eq!(
+            dill.blob,
+            BlobId(*blake3::hash(b"kernel payload bytes v2").as_bytes()),
+            "the entry no longer freezes on the seed outputs"
+        );
+    }
+
+    /// A6 at the name-recompute seam: define values that are absolute
+    /// paths under the ingest worktree root re-aim at the target tree
+    /// (Xcode's `-dSrcRoot` shape), everything else replays verbatim —
+    /// with a boundary guard against byte-prefix lookalikes.
+    #[test]
+    fn replayed_hash_name_reroots_define_values_and_output_dir() {
+        let defines = |src_root: &str| {
+            BTreeMap::from([
+                ("SrcRoot".to_owned(), src_root.to_owned()),
+                ("BuildMode".to_owned(), "release".to_owned()),
+            ])
+        };
+        let dir = |src_root: &str, output_dir: &str| DirRecord {
+            name_observed: String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            name_rule: NameRule::RecomputeFromTemplate,
+            name_defines: defines(src_root),
+            name_output_dir: output_dir.to_owned(),
+            files: Vec::new(),
+        };
+        let target = Path::new("/new/wt");
+
+        // The plain case: both the define value and the output dir
+        // re-root, and the name is exactly what flutter in the target
+        // tree computes for itself.
+        let record = dir("/old/wt/ios", "/old/wt/build/app/intermediates");
+        let expected = flutter_build_dir_name(
+            "engine",
+            &defines("/new/wt/ios"),
+            Path::new("/new/wt/build/app/intermediates"),
+        );
+        assert_eq!(replayed_hash_name(&record, "/old/wt", target, "engine"), expected);
+
+        // Lookalike prefixes and foreign values stay verbatim.
+        let record = dir("/old/wt-lookalike/ios", "/old/wt/build");
+        let expected = flutter_build_dir_name(
+            "engine",
+            &defines("/old/wt-lookalike/ios"),
+            Path::new("/new/wt/build"),
+        );
+        assert_eq!(replayed_hash_name(&record, "/old/wt", target, "engine"), expected);
+        let record = dir("/fake/pub-cache/x", "/old/wt/build");
+        let expected = flutter_build_dir_name(
+            "engine",
+            &defines("/fake/pub-cache/x"),
+            Path::new("/new/wt/build"),
+        );
+        assert_eq!(replayed_hash_name(&record, "/old/wt", target, "engine"), expected);
+    }
+
+    /// The anchor itself: the worktree root is the nearest `.git`
+    /// ancestor (directory or linked-worktree file), falling back to
+    /// the project root when no repo encloses it.
+    #[test]
+    fn worktree_root_finds_nearest_git_ancestor() {
+        let (_guard, tmp) = tempdir();
+        let repo = tmp.join("repo");
+        write(&repo.join(".git").join("HEAD"), b"ref: refs/heads/main\n");
+        let project = repo.join("apps").join("my_app");
+        write(&project.join("pubspec.yaml"), b"name: app\n");
+        assert_eq!(worktree_root(&project), repo);
+
+        // A linked worktree's `.git` is a file.
+        let linked = tmp.join("linked-wt");
+        write(&linked.join(".git"), b"gitdir: /nowhere/.git/worktrees/x\n");
+        let nested = linked.join("packages").join("tools");
+        write(&nested.join("pubspec.yaml"), b"name: tools\n");
+        assert_eq!(worktree_root(&nested), linked);
+
+        // No repo anywhere above: the project root is its own anchor.
+        let alone = tmp.join("standalone");
+        write(&alone.join("pubspec.yaml"), b"name: alone\n");
+        assert_eq!(worktree_root(&alone), alone);
+    }
+
     /// Spawns a short-lived REAL process whose argv IS an assemble
     /// invocation: a shell (two commands, so it never exec-optimizes
     /// itself away) that sleeps past several observer polls with the
@@ -1221,7 +2278,7 @@ mod tests {
         let mut runner = FakeRunner::exits(0);
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
-        let output_b = rewrite_output_dir(&template.output_dir, &manifest.project_root_at_ingest, &tree_b);
+        let output_b = rerooted(&template.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
         let name_b = flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
         assert_ne!(name_b, template.name, "the name embeds the absolute output dir");
         let dir_b = tree_b.join(".dart_tool").join("flutter_build").join(&name_b);
@@ -1232,6 +2289,25 @@ mod tests {
         );
         let stamp = fs::read_to_string(dir_b.join("flutter_build.dill.stamp")).expect("stamp");
         assert!(stamp.contains(tree_b.to_str().expect("UTF-8 root")), "{stamp}");
+        // A4 roundtrip: the recorded `flutter_build/<tree-A name>`
+        // segment inside the stamp followed the dir to tree B's
+        // recomputed name, root and segment together.
+        assert!(
+            stamp.contains(
+                tree_b
+                    .join(".dart_tool")
+                    .join("flutter_build")
+                    .join(&name_b)
+                    .join("app.dill")
+                    .to_str()
+                    .expect("UTF-8 path")
+            ),
+            "the recorded output mention re-roots AND renames: {stamp}"
+        );
+        assert!(
+            !stamp.contains(&format!("flutter_build/{}", template.name)),
+            "no ingest-tree name segment survives: {stamp}"
+        );
     }
 
     /// The real gradle defect shape, end to end: the decoy's argv carries
@@ -1314,7 +2390,7 @@ mod tests {
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut rerun);
         assert_eq!(report.action, Action::PreHitMaterialized);
         let output_b =
-            rewrite_output_dir(&full.output_dir, &manifest.project_root_at_ingest, &tree_b);
+            rerooted(&full.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
         let name_b =
             flutter_build_dir_name(&engine_revision, &full.defines, Path::new(&output_b));
         assert!(tree_b
@@ -1435,7 +2511,7 @@ mod tests {
         let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.skipped_dirs, 1);
-        let output_b = rewrite_output_dir(&template.output_dir, &manifest.project_root_at_ingest, &tree_b);
+        let output_b = rerooted(&template.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
         let name_b = flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
         assert!(tree_b
             .join(".dart_tool")
@@ -1539,42 +2615,819 @@ mod tests {
         assert_eq!(stats.blobs, 0, "a failed build never stores a blob");
     }
 
+    /// A red suite still advances the kernel cache: `flutter test` exits
+    /// non-zero both on a compile failure and on a compiled-but-failed
+    /// suite, and the scan's touch gate tells them apart (a touched dill
+    /// means the compile succeeded). The ingest is the kernel cache
+    /// alone — a hash dir the run also touched never rides along — and
+    /// the child's exit code propagates unchanged.
+    #[test]
+    fn red_suite_ingests_kernel_cache_only_and_propagates_exit() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // The red suite: the harness compiled the closure (the dill is
+        // fresh) and left a hash dir behind as well.
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 1,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write_test_cache(cwd);
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        assert_eq!(report.exit_code, Some(1), "the child's exit code wins");
+        assert_eq!(report.action, Action::Ingested);
+        assert_eq!(report.ingest_files, 1);
+        let key = report.key.clone().expect("post key");
+
+        let store = CasStore::open(&store_root).expect("open store");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs.len(), 1, "the kernel cache alone");
+        assert_eq!(manifest.dirs[0].name_rule, NameRule::TestKernelCache);
+        assert_eq!(manifest.dirs[0].name_observed, "build/test_cache");
+        assert!(
+            !manifest.dirs.iter().any(|dir| dir.name_observed == DIR_MAIN),
+            "hash dirs stay exit-0-gated"
+        );
+        assert_eq!(
+            manifest.dirs[0].files[0].blob,
+            BlobId(*blake3::hash(TEST_DILL_BYTES).as_bytes())
+        );
+
+        // The red-suite cache serves exactly the tree that iterates on
+        // tests: the next run PRE-hits and materializes the dill before
+        // the child runs.
+        fs::remove_dir_all(tree.join("build").join("test_cache")).expect("wipe cache dir");
+        let mut rerun = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                assert_eq!(
+                    fs::read(test_dill_path(cwd)).unwrap_or_default(),
+                    TEST_DILL_BYTES,
+                    "the red-suite dill materializes before the child runs"
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut rerun);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(store.stats().expect("stats").entries, 1);
+    }
+
+    /// A compile failure ingests nothing: frontend_server writes the
+    /// cache dill only after a successful compile, so a failed compile
+    /// leaves the cache untouched — and the stale dill of an earlier
+    /// run must not ride along on its old mtime.
+    #[test]
+    fn compile_failed_test_run_ingests_nothing() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // The dill an earlier run left, parked before this run's start.
+        let tree = synthetic_project(&tmp, "a");
+        let stale = write_test_cache(&tree);
+        let cache = tree.join("build").join("test_cache");
+        let past = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for path in [stale, cache.join("build"), cache] {
+            std::fs::File::open(&path)
+                .and_then(|file| file.set_modified(past))
+                .expect("park mtime");
+        }
+
+        let mut runner = FakeRunner::exits(1);
+        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        assert_eq!(report.exit_code, Some(1));
+        assert_eq!(report.action, Action::PreMiss);
+        assert_eq!(report.ingest_files, 0);
+        let stats = CasStore::open(&store_root)
+            .expect("open store")
+            .stats()
+            .expect("stats");
+        assert_eq!(stats.entries, 0, "a failed compile never stores an entry");
+        assert_eq!(stats.blobs, 0);
+    }
+
+    /// A signal death takes the same test-face path: the runner maps it
+    /// to 128 + signal (the shell convention), the kernel cache a
+    /// killed run already compiled is still fresh, and the worst a kill
+    /// can do mid-copy — dart:io File.copy writes the destination in
+    /// place — is a torn dill whose replay cost is one wasted
+    /// materialization (frontend_server falls back to a full compile
+    /// when the initialize-from-dill file will not read).
+    #[test]
+    fn signal_death_test_run_still_ingests_kernel_cache() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 128 + 9,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write_test_cache(cwd);
+            })),
+        };
+        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        assert_eq!(report.exit_code, Some(137), "128 + SIGKILL propagates");
+        assert_eq!(report.action, Action::Ingested);
+        assert_eq!(report.ingest_files, 1);
+        let key = report.key.expect("post key");
+        let manifest = CasStore::open(&store_root)
+            .expect("open store")
+            .lookup(&key)
+            .expect("lookup")
+            .expect("entry");
+        assert_eq!(manifest.dirs.len(), 1);
+        assert_eq!(manifest.dirs[0].name_rule, NameRule::TestKernelCache);
+    }
+
+    /// The runner's exit-code mapping that funnels signal deaths into
+    /// the non-zero path: the shell convention 128 + signal.
     #[cfg(unix)]
     #[test]
-    fn path_resolution_skips_the_shim_directory() {
-        let (_guard, tmp) = tempdir();
-        let shim_dir = tmp.join("shims");
-        let real_dir = tmp.join("sdk").join("bin");
-        write(&shim_dir.join("flutter"), b"#!/bin/sh\n# the shim\n");
-        write(&real_dir.join("flutter"), b"#!/bin/sh\n# the real one\n");
-        let exclude_dir = fs::canonicalize(&shim_dir).expect("canonicalize");
+    fn signal_death_maps_to_shell_convention() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_code(ExitStatus::from_raw(0)), 0);
+        assert_eq!(exit_code(ExitStatus::from_raw(0x0100)), 1);
+        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
+    }
 
-        let found = first_flutter_on_path(
-            &[shim_dir.clone(), tmp.join("empty"), real_dir.clone()],
-            Some(&exclude_dir),
-            None,
-        )
-        .expect("the real binary is found");
-        assert_eq!(found, fs::canonicalize(real_dir.join("flutter")).expect("canonicalize"));
+    /// The live test kernel-cache layout flutter_tools writes: the double
+    /// `build` nesting of `join(buildDir, 'test_cache', <cached kernel
+    /// path>)>`.
+    const TEST_DILL_REL: &str = "build/ab.cache.dill.track.dill";
+    const TEST_DILL_BYTES: &[u8] = b"test kernel bytes";
+
+    fn write_test_cache(cwd: &Path) -> PathBuf {
+        let dill = cwd.join("build").join("test_cache").join(TEST_DILL_REL);
+        write(&dill, TEST_DILL_BYTES);
+        dill
+    }
+
+    fn write_test_cache_bytes(cwd: &Path, bytes: &[u8]) -> PathBuf {
+        let dill = cwd.join("build").join("test_cache").join(TEST_DILL_REL);
+        write(&dill, bytes);
+        dill
+    }
+
+    fn test_dill_path(cwd: &Path) -> PathBuf {
+        cwd.join("build").join("test_cache").join(TEST_DILL_REL)
+    }
+
+    /// Cross-tree test-face replay: tree A seeds a kernel-shaped dill
+    /// embedding its own canonical URIs; tree B's PRE hit rewrites the
+    /// `file://` URIs to tree B before the child runs, and POST
+    /// converges the entry onto tree B's re-rewritten dill.
+    #[test]
+    fn test_kernel_cache_cross_tree_hit_rewrites_uris_and_converges() {
+        use crate::dill_rewrite::synthetic_component;
+
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // Tree A: the "compile" leaves a kernel dill embedding tree A's
+        // canonical URIs; POST ingests it as the entry's test dir.
+        let tree_a = synthetic_project(&tmp, "a");
+        let root_a = tree_a.to_str().expect("UTF-8 root").to_string();
+        let dill_a = synthetic_component(
+            &[(
+                format!("file://{root_a}/test/cache_smoke_test.dart").as_str(),
+                "package:app/main.dart",
+            )],
+            &[format!("file://{root_a}/lib/main.dart").as_str(), "dart:core"],
+            1,
+        );
+        let effect_a = dill_a.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                write_test_cache_bytes(cwd, &effect_a);
+            })),
+        };
+        let raw = raw_argv(&["test"]);
+        let seeded = run_shim(&raw, &tree_a, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        assert_eq!(seeded.ingest_files, 1);
+        let key = seeded.key.clone().expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let dir = manifest.dirs.iter().find(|d| d.name_rule == NameRule::TestKernelCache)
+            .expect("test cache dir");
+        assert_eq!(dir.files[0].rewrite, crate::types::RewriteKind::DillUris);
+
+        // Tree B (a different canonical root, no build dir): PRE hits
+        // and materializes the dill with tree B's URIs BEFORE the child
+        // runs; the child ("frontend_server") rewrites it with its own
+        // tree-B dill; POST re-ingests, converging the entry.
+        let tree_b = synthetic_project(&tmp, "b");
+        let root_b = tree_b.to_str().expect("UTF-8 root").to_string();
+        let dill_b = synthetic_component(
+            &[(
+                format!("file://{root_b}/test/cache_smoke_test.dart").as_str(),
+                "package:app/main.dart",
+            )],
+            &[format!("file://{root_b}/lib/main.dart").as_str(), "dart:core"],
+            1,
+        );
+        let effect_b = dill_b.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                // What the child initializes from: the hit's placement.
+                let placed = fs::read(test_dill_path(cwd)).expect("hit placed the dill");
+                assert!(
+                    memchr::memmem::find(&placed, format!("file://{root_b}/lib/main.dart").as_bytes())
+                        .is_some(),
+                    "the placed dill carries this tree's URIs"
+                );
+                assert!(
+                    memchr::memmem::find(&placed, format!("file://{root_a}/lib/main.dart").as_bytes())
+                        .is_none(),
+                    "no ingest-tree URI survives the rewrite"
+                );
+                assert_ne!(placed, dill_a, "the placement is a rewrite, not a clone");
+                // frontend_server rewrites the dill with current-tree
+                // URIs on every run.
+                write_test_cache_bytes(cwd, &effect_b);
+            })),
+        };
+        let report = run_shim(&raw, &tree_b, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.reason, "pre_hit");
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.key.as_deref(), Some(key.as_str()));
+        assert_eq!(
+            report
+                .materialize
+                .as_ref()
+                .expect("materialize report")
+                .dill_rewrites,
+            1
+        );
+        assert_eq!(
+            fs::read(test_dill_path(&tree_b)).expect("final dill"),
+            dill_b,
+            "the run leaves its own dill behind"
+        );
+
+        // POST converged the entry onto the consuming tree's dill.
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let dir = manifest.dirs.iter().find(|d| d.name_rule == NameRule::TestKernelCache)
+            .expect("test cache dir");
+        assert_eq!(
+            dir.files[0].blob,
+            BlobId(*blake3::hash(&dill_b).as_bytes()),
+            "entry converges onto tree B's dill"
+        );
+    }
+
+    /// The test face end to end: a cold `flutter test` ingests the
+    /// kernel-cache dir as the entry's fixed-path dir; after the dir is
+    /// wiped, the next run PRE-hits and materializes the dill back
+    /// byte-identical BEFORE the child runs.
+    #[test]
+    fn test_kernel_cache_cold_ingest_and_wiped_hit_replay() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // Cold run: the child compiles, leaving the kernel cache behind;
+        // POST ingests it as the entry's one dir.
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write_test_cache(cwd);
+            })),
+        };
+        let raw = raw_argv(&["test"]);
+        let report = run_shim(&raw, &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::Ingested);
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.ingest_files, 1);
+        let key = report.key.clone().expect("post key");
+
+        let store = CasStore::open(&store_root).expect("open store");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs.len(), 1);
+        let dir = &manifest.dirs[0];
+        assert_eq!(dir.name_observed, "build/test_cache");
+        assert_eq!(dir.name_rule, NameRule::TestKernelCache);
+        assert!(dir.name_defines.is_empty());
+        assert!(dir.name_output_dir.is_empty());
+        assert_eq!(dir.files.len(), 1);
+        assert_eq!(dir.files[0].path, Path::new(TEST_DILL_REL));
+
+        // The wiped tree: `rm -rf build`. The next run PRE-hits and
+        // materializes the dill before the child starts — the effect
+        // asserts the bytes the child would initialize from.
+        fs::remove_dir_all(tree.join("build")).expect("wipe build dir");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                let dill = cwd.join("build").join("test_cache").join(TEST_DILL_REL);
+                assert_eq!(
+                    fs::read(&dill).unwrap_or_default(),
+                    TEST_DILL_BYTES,
+                    "the hit must materialize the dill before the child runs"
+                );
+            })),
+        };
+        let report = run_shim(&raw, &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.reason, "pre_hit");
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.key.as_deref(), Some(key.as_str()));
+        assert_eq!(report.skipped_dirs, 0);
+        // Whether POST re-stores the just-materialized dill is timing
+        // (whole-second mtimes); either way the entry count holds.
+        assert_eq!(
+            fs::read(tree.join("build").join("test_cache").join(TEST_DILL_REL))
+                .expect("materialized dill"),
+            TEST_DILL_BYTES
+        );
+        assert_eq!(store.stats().expect("stats").entries, 1);
+    }
+
+    /// The warm-run fast path end to end: when the dill on disk is the
+    /// literal same file the stored entry recorded — the dir touched
+    /// through another file, and PRE not a hit, so nothing re-placed
+    /// it — POST reuses the recorded blob: no re-hash (the run stores
+    /// zero files), no new blob version, the reference unchanged.
+    #[test]
+    fn post_reuses_recorded_dill_when_file_unchanged() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "a");
+        // The provenance state the entry is keyed on.
+        write(&tree.join("pubspec.yaml"), b"name: app\nversion: 2.0.0\n");
+
+        // Run 1 compiles the dill; the entry lands under this state's key.
+        let raw = raw_argv(&["test"]);
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write_test_cache(cwd);
+            })),
+        };
+        let seeded = run_shim(&raw, &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        assert_eq!(seeded.ingest_files, 1);
+        let key = seeded.key.clone().expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let dill_blob = BlobId(*blake3::hash(TEST_DILL_BYTES).as_bytes());
+        let recorded = || {
+            store
+                .lookup(&key)
+                .expect("lookup")
+                .expect("entry")
+                .dirs
+                .into_iter()
+                .find(|dir| dir.name_rule == NameRule::TestKernelCache)
+                .expect("test cache dir")
+        };
+        assert_eq!(recorded().files[0].blob, dill_blob);
+        assert!(recorded().files[0].stamp.is_some(), "the ingest records the stamp");
+        assert_eq!(store.stats().expect("stats").blobs, 1);
+
+        // A foreign pre-run state moves the key (so PRE misses and the
+        // dill is never re-placed); the run restores the recorded state
+        // and touches the dir only through a non-dill file.
+        write(&tree.join("pubspec.yaml"), b"name: app\nversion: 3.0.0\n");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write(&cwd.join("pubspec.yaml"), b"name: app\nversion: 2.0.0\n");
+                write(
+                    &cwd.join("build").join("test_cache").join("build").join("lock"),
+                    b"transient",
+                );
+            })),
+        };
+        let report = run_shim(&raw, &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::Ingested, "pre-miss, post re-ingest");
+        assert_eq!(report.ingest_files, 0, "the unchanged dill is not re-hashed");
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.blobs, 1, "no new blob version");
+        assert_eq!(recorded().files[0].blob, dill_blob, "the reference is kept");
+        assert!(recorded().files[0].stamp.is_some());
+    }
+
+    /// The flagship warm apk shape: a same-tree hit whose rerun only
+    /// validates (an assemble child observed, the dir touched, no
+    /// output rewritten) stores ZERO new files — every placed file is
+    /// re-referenced through its placed identity, and the references
+    /// and blob set are exactly the seeded entry's.
+    #[cfg(unix)]
+    #[test]
+    fn warm_hit_run_stores_nothing_when_flutter_only_validates() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let flutter_bin = sdk.join("bin").join("flutter");
+        let engine_revision = key::fingerprint_toolchain(&sdk)
+            .expect("fingerprint")
+            .engine_revision;
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &flutter_bin);
+
+        // Run 1 seeds the entry: the "build" runs the assemble lookalike
+        // and leaves the observed hash dir.
+        let tree = synthetic_project(&tmp, "a");
+        let output = tree.join("build/app/intermediates/flutter/release");
+        let argv = assemble_argv(&flutter_bin, &output.to_string_lossy());
+        let template = base_capture(&argv, &tree, &engine_revision);
+        let seed_argv = argv.clone();
+        let seed_name = template.name.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                run_assemble_lookalike(&seed_argv);
+                build_fixture(cwd, &seed_name);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        assert!(seeded.ingest_files >= 3, "the cold run stores the whole dir");
+        let key = seeded.key.clone().expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let seed_blobs = store.stats().expect("stats").blobs;
+
+        // The warm rerun: PRE hits (same tree, same provenance) and
+        // re-places the dir — fresh inodes, so only the placed
+        // identities can vouch for the files. A real assemble child is
+        // observed exactly as gradle spawns one every run — without an
+        // observation the reproduced key would spare the re-ingest. The
+        // "validation" touches the dir without rewriting an output: a
+        // transient file appears and is gone again.
+        let warm_argv = argv.clone();
+        let warm_name = template.name.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                run_assemble_lookalike(&warm_argv);
+                let transient = cwd
+                    .join(".dart_tool")
+                    .join("flutter_build")
+                    .join(&warm_name)
+                    .join(".transient");
+                write(&transient, b"x");
+                fs::remove_file(&transient).expect("remove transient");
+            })),
+        };
+        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.reason, "pre_hit");
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.ingest_files, 0, "validation alone re-hashes nothing");
+
+        // Every reference and the blob set are exactly the seeded ones.
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs.len(), 1);
+        let refs = |manifest: &EntryManifest| {
+            manifest.dirs[0]
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.blob))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(refs(&manifest), refs(&seed_manifest), "references reused verbatim");
+        assert_eq!(store.stats().expect("stats").blobs, seed_blobs, "no new blob versions");
+    }
+
+    /// The warm apk shape with one rewritten payload: only that file is
+    /// re-hashed and stored, the bookkeeping references stay put — and
+    /// the superseded payload blob stays gc-able while the entry
+    /// survives.
+    #[cfg(unix)]
+    #[test]
+    fn warm_hit_run_rehashes_only_the_file_flutter_rewrote() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let flutter_bin = sdk.join("bin").join("flutter");
+        let engine_revision = key::fingerprint_toolchain(&sdk)
+            .expect("fingerprint")
+            .engine_revision;
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &flutter_bin);
+
+        let tree = synthetic_project(&tmp, "a");
+        let output = tree.join("build/app/intermediates/flutter/release");
+        let argv = assemble_argv(&flutter_bin, &output.to_string_lossy());
+        let template = base_capture(&argv, &tree, &engine_revision);
+        let seed_argv = argv.clone();
+        let seed_name = template.name.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                run_assemble_lookalike(&seed_argv);
+                build_fixture(cwd, &seed_name);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.clone().expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+
+        // The warm rerun rewrites ONLY the payload dill (the stale-hit
+        // shape: a source the coarse key cannot see changed, gradle
+        // rebuilt the kernel; sizes differ, so the identity cannot
+        // collide).
+        let warm_argv = argv.clone();
+        let warm_name = template.name.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                run_assemble_lookalike(&warm_argv);
+                write(
+                    &cwd.join(".dart_tool").join("flutter_build").join(&warm_name)
+                        .join("app.dill"),
+                    b"kernel payload bytes v2",
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.ingest_files, 1, "only the rewritten dill is stored");
+
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let by_path = |manifest: &EntryManifest, path: &str| {
+            manifest.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path} in the manifest"))
+                .blob
+        };
+        assert_eq!(
+            by_path(&manifest, "app.dill"),
+            BlobId(*blake3::hash(b"kernel payload bytes v2").as_bytes()),
+            "the rewritten payload got a fresh blob"
+        );
+        assert_eq!(
+            by_path(&manifest, "kernel_snapshot.d"),
+            by_path(&seed_manifest, "kernel_snapshot.d"),
+            "the untouched depfile reference is kept"
+        );
+        assert_eq!(
+            by_path(&manifest, "flutter_build.dill.stamp"),
+            by_path(&seed_manifest, "flutter_build.dill.stamp"),
+            "the untouched stamp reference is kept"
+        );
+
+        // The superseded payload is unreferenced and gc-able; the entry
+        // and its current blobs survive.
+        let superseded = BlobId(*blake3::hash(b"kernel payload bytes").as_bytes());
+        assert!(store.blob_path(&superseded).exists(), "unreferenced until gc");
+        let report = store.gc(u64::MAX, 0, unix_now() + 2 * 3600).expect("gc");
+        assert_eq!(report.entries_evicted, 0, "the entry survives");
+        assert_eq!(report.blobs_removed, 1, "only the superseded payload goes");
+        assert!(!store.blob_path(&superseded).exists());
+        assert!(store.lookup(&key).expect("lookup").is_some());
+    }
+
+    /// A miss run (the key moved between PRE and POST — provenance
+    /// edited before the run, restored during it) re-ingests under the
+    /// prior entry's key, and the prior stamps cover everything the run
+    /// did not rewrite: only the touched file stores, the payload and
+    /// depfile references are kept. The build-face twin of the test
+    /// face's warm fast path.
+    #[test]
+    fn miss_run_reuses_prior_entry_stamps_for_build_dirs() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // The provenance state the entry is keyed on; run 1 seeds it.
+        let tree = synthetic_project(&tmp, "a");
+        write(&tree.join("pubspec.yaml"), b"name: app\nversion: 2.0.0\n");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.clone().expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert!(
+            seed_manifest.dirs[0]
+                .files
+                .iter()
+                .all(|file| file.stamp.is_some()),
+            "build-face ingests record stamps"
+        );
+        let seed_blobs = store.stats().expect("stats").blobs;
+
+        // A foreign pre-run state moves the key (PRE misses, nothing is
+        // re-placed); the run restores the recorded state and rewrites
+        // only one bookkeeping file — flutter's content-validation shape.
+        write(&tree.join("pubspec.yaml"), b"name: app\nversion: 3.0.0\n");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write(&cwd.join("pubspec.yaml"), b"name: app\nversion: 2.0.0\n");
+                write(
+                    &cwd.join(".dart_tool").join("flutter_build").join(DIR_MAIN)
+                        .join("flutter_build.dill.stamp"),
+                    br#"{"inputs":[],"outputs":[]}"#,
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::Ingested, "pre-miss, post re-ingest");
+        assert_eq!(report.ingest_files, 1, "only the rewritten stamp stores");
+
+        // The other files ride along on their prior stamps.
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let by_path = |manifest: &EntryManifest, path: &str| {
+            manifest.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path} in the manifest"))
+                .blob
+        };
+        assert_eq!(
+            by_path(&manifest, "app.dill"),
+            by_path(&seed_manifest, "app.dill"),
+            "the payload is reused without reading"
+        );
+        assert_eq!(
+            by_path(&manifest, "kernel_snapshot.d"),
+            by_path(&seed_manifest, "kernel_snapshot.d")
+        );
+        assert_ne!(
+            by_path(&manifest, "flutter_build.dill.stamp"),
+            by_path(&seed_manifest, "flutter_build.dill.stamp"),
+            "the rewritten file got a fresh blob"
+        );
+        assert_eq!(store.stats().expect("stats").blobs, seed_blobs + 1);
+    }
+
+    /// An older test entry that predates the kernel-cache face (no
+    /// test dir in its manifest) passes through sanely: the hit has
+    /// nothing to materialize, the child runs, and POST re-ingests the
+    /// entry with the dir restored.
+    #[test]
+    fn older_test_entry_without_cache_dir_runs_and_reingests() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write_test_cache(cwd);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.expect("key");
+
+        // Surgically age the entry: drop its dir, keep the key.
+        let store = CasStore::open(&store_root).expect("open store");
+        let mut manifest = store.lookup(&key).expect("lookup").expect("entry");
+        manifest.dirs.clear();
+        store.ingest(manifest, &[]).expect("rewrite older entry");
+
+        // The hit materializes nothing (no replayable dir) and the child
+        // still runs to exit 0; POST restores the entry in full.
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write_test_cache(cwd);
+            })),
+        };
+        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        assert_eq!(report.reason, "entry_not_replayable");
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.key.as_deref(), Some(key.as_str()));
+        assert_eq!(report.action, Action::Ingested);
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs.len(), 1);
+        assert_eq!(manifest.dirs[0].name_rule, NameRule::TestKernelCache);
+    }
+
+    /// The build-dir seam: the env wins when set and non-empty, `build`
+    /// otherwise.
+    #[test]
+    fn flutter_build_dir_env_wins_over_default() {
+        assert_eq!(flutter_build_dir(None), PathBuf::from("build"));
+        assert_eq!(
+            flutter_build_dir(Some(OsString::from("out/debug"))),
+            PathBuf::from("out/debug")
+        );
+        assert_eq!(flutter_build_dir(Some(OsString::new())), PathBuf::from("build"));
+    }
+
+    /// A10's narrowing: the PATH search skips only the shim BINARY —
+    /// a real flutter living in the shim executable's own directory is
+    /// found (the old code excluded that entire directory) — while a
+    /// symlink to the shim in any other directory is still skipped by
+    /// file identity.
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_skips_only_the_shim_binary() {
+        let (_guard, tmp) = tempdir();
+        let real_dir = tmp.join("sdk").join("bin");
+        write(&real_dir.join("flutter"), b"#!/bin/sh\n# the real one\n");
+        let real = fs::canonicalize(real_dir.join("flutter")).expect("canonicalize real");
+
+        // A dartq executable and an unrelated real flutter side by
+        // side: the old directory exclusion hid the flutter; only the
+        // file identity may exclude.
+        let bin_dir = tmp.join("dartq-bin");
+        write(&bin_dir.join("dartq"), b"the dartq executable\n");
+        write(&bin_dir.join("flutter"), b"#!/bin/sh\n# a real flutter beside dartq\n");
+        let own = fs::canonicalize(bin_dir.join("dartq")).expect("canonicalize own");
+        let beside =
+            first_flutter_on_path(&[bin_dir.clone()], Some(&own)).expect("found beside the shim");
+        assert_eq!(beside, fs::canonicalize(bin_dir.join("flutter")).expect("canonicalize"));
 
         // A symlink to the shim binary in another directory is skipped
-        // by file identity, not just by directory.
+        // by file identity, and the search moves on to the real one.
         let alias_dir = tmp.join("alias");
         fs::create_dir_all(&alias_dir).expect("mkdir alias");
-        std::os::unix::fs::symlink(shim_dir.join("flutter"), alias_dir.join("flutter"))
+        std::os::unix::fs::symlink(bin_dir.join("dartq"), alias_dir.join("flutter"))
             .expect("symlink alias");
-        let shim_exe = fs::canonicalize(shim_dir.join("flutter")).expect("canonicalize");
-        let found = first_flutter_on_path(
-            &[alias_dir, real_dir.clone()],
-            None,
-            Some(&shim_exe),
-        )
-        .expect("the alias is skipped, the real one found");
-        assert_eq!(found, fs::canonicalize(real_dir.join("flutter")).expect("canonicalize"));
+        let found = first_flutter_on_path(&[alias_dir, real_dir], Some(&own))
+            .expect("the alias is skipped, the real one found");
+        assert_eq!(found, real);
 
+        // Nothing but the shim on PATH: no resolution at all.
+        assert_eq!(first_flutter_on_path(&[bin_dir.join("nowhere")], Some(&own)), None);
+    }
+
+    /// A10: a configured flutter (config key, DARTQ_FLUTTER, or a PATH
+    /// hit) that resolves to this executable is refused — spawning it
+    /// would recurse the shim into itself. The refusal yields None
+    /// (the caller's not-found exit applies) after one line naming
+    /// both paths; no child is ever spawned.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_refuses_a_flutter_that_is_this_shim() {
+        let (_guard, tmp) = tempdir();
+        let shim = tmp.join("dartq");
+        write(&shim, b"the shim executable\n");
+        let canonical = fs::canonicalize(&shim).expect("canonicalize");
+
+        // The explicit config path pointing straight at the shim.
+        assert_eq!(discover_flutter(Some(&shim), Some(&shim)), None);
+        // ... and through a symlink to it (the ~/.dartq/bin/flutter
+        // shape `dartq init` installs).
+        let alias = tmp.join("flutter");
+        std::os::unix::fs::symlink(&shim, &alias).expect("symlink alias");
+        assert_eq!(discover_flutter(Some(&alias), Some(&shim)), None);
+
+        // A PATH whose only `flutter` is the shim resolves to nothing.
+        let bindir = tmp.join("pathdir");
+        write(&bindir.join("unrelated"), b"keep dir non-empty\n");
+        std::os::unix::fs::symlink(&shim, bindir.join("flutter")).expect("symlink shim");
+        assert_eq!(first_flutter_on_path(&[bindir], Some(&canonical)), None);
+
+        // A DIFFERENT binary still resolves — the refusal is identity,
+        // not existence.
+        let other = tmp.join("flutter-real");
+        write(&other, b"#!/bin/sh\nexit 0\n");
         assert_eq!(
-            first_flutter_on_path(&[shim_dir], Some(&exclude_dir), None),
-            None
+            discover_flutter(Some(&other), Some(&shim)),
+            Some(fs::canonicalize(&other).expect("canonicalize other"))
         );
     }
 
@@ -1654,5 +3507,384 @@ mod tests {
         .expect("parse");
         assert!(dart_define_vector(&over, &sdk, &toolchain)
             .contains(&("FLUTTER_BUILD_NAME".to_owned(), "9.9.9".to_owned())));
+    }
+
+    /// A fake flutter as an executable script. The production runner
+    /// spawns it for real; the body is inline so each test records
+    /// exactly what it wants observed.
+    #[cfg(unix)]
+    fn script(path: &Path, body: &str) -> PathBuf {
+        write(path, format!("#!/bin/sh\n{body}\n").as_bytes());
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        path.to_path_buf()
+    }
+
+    /// Serializes the tests that drive the production runner: the
+    /// forwarder's static child pid and its install/restore sigaction
+    /// cycle are single-instance by design (one flutter per shim
+    /// process), so overlapping runner tests clobber each other's
+    /// process-wide signal state.
+    #[cfg(unix)]
+    static RUNNER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A10's env glue: the shim tag never rides into a child — a
+    /// nested dartq that inherited it would mistake itself for a shim.
+    #[cfg(unix)]
+    #[test]
+    fn command_runner_strips_the_shim_tag_from_the_child_env() {
+        let _serial = RUNNER_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_guard, tmp) = tempdir();
+        let probe = tmp.join("env-probe");
+        let flutter = script(
+            &tmp.join("fake-flutter"),
+            &format!(
+                "if [ -n \"$DARTQ_SHIM\" ]; then echo present > {probe}; else echo stripped > {probe}; fi",
+                probe = probe.display()
+            ),
+        );
+        // SAFETY: a process-wide environment mutation while the test
+        // binary's other threads may run: no other test in this binary
+        // reads or writes DARTQ_SHIM, and the runner copies the
+        // environment at spawn time, inside this test's thread.
+        unsafe { std::env::set_var("DARTQ_SHIM", "1") };
+        let mut runner = CommandRunner::new(flutter);
+        let code = runner.run(&[], &tmp).expect("run");
+        unsafe { std::env::remove_var("DARTQ_SHIM") };
+        assert_eq!(code, 0);
+        assert_eq!(
+            fs::read_to_string(&probe).expect("probe written").trim(),
+            "stripped",
+            "the child environment must not carry the shim tag"
+        );
+    }
+
+    /// The child half of [`exec_replaces_the_shim_process`]: invoked by
+    /// the parent test with the fixture env set, it execs into the fake
+    /// flutter binary. In a plain suite run (no env) it is a no-op, so
+    /// the helper costs one passing test.
+    #[cfg(unix)]
+    #[test]
+    fn exec_child_becomes_flutter() {
+        let (Some(flutter), Some(out)) = (
+            std::env::var_os("DARTQ_EXEC_FIXTURE"),
+            std::env::var_os("DARTQ_EXEC_OUT"),
+        ) else {
+            return;
+        };
+        let mut runner = CommandRunner::new(PathBuf::from(flutter));
+        match runner.exec(&[], Path::new("/")) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                let _ = fs::write(out, format!("exec failed: {err}"));
+                std::process::exit(70);
+            }
+        }
+    }
+
+    /// A11's passthrough face: `CommandRunner::exec` REPLACES the
+    /// calling process with flutter — the fake flutter records the pid
+    /// it runs as, and that pid is the child process's own. A spawn
+    /// (the old behavior) would record a grandchild's pid.
+    #[cfg(unix)]
+    #[test]
+    fn exec_replaces_the_shim_process() {
+        let (_guard, tmp) = tempdir();
+        let out = tmp.join("exec-pid");
+        let flutter = script(
+            &tmp.join("fake-flutter"),
+            &format!("echo $$ > {}", out.display()),
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "orchestrator::tests::exec_child_becomes_flutter",
+                "--nocapture",
+            ])
+            .env("DARTQ_EXEC_FIXTURE", &flutter)
+            .env("DARTQ_EXEC_OUT", &out)
+            .spawn()
+            .expect("spawn helper test");
+        let pid = child.id();
+        let status = child.wait().expect("wait helper");
+        assert!(status.success(), "the exec'd flutter exits 0: {status}");
+        let recorded = fs::read_to_string(&out)
+            .expect("fake flutter ran")
+            .trim()
+            .parse::<u32>()
+            .expect("pid");
+        assert_eq!(
+            recorded, pid,
+            "the child process BECAME flutter via exec — same pid, not a grandchild"
+        );
+    }
+
+    /// A11's cacheable face: SIGTERM to the shim is forwarded to the
+    /// child, the child dies by that signal, and the shim reports the
+    /// child's status (128 + signal) after reaping it — no orphaned
+    /// flutter_tools under PPID 1.
+    #[cfg(unix)]
+    #[test]
+    fn forwarded_sigterm_reaches_the_child_and_reports_its_status() {
+        let _serial = RUNNER_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_guard, tmp) = tempdir();
+        let ready = tmp.join("child-pid");
+        let flutter = script(
+            &tmp.join("fake-flutter"),
+            &format!("echo $$ > {}\nsleep 15", ready.display()),
+        );
+        let cwd = tmp.clone();
+        let runner = std::thread::spawn(move || {
+            let mut runner = CommandRunner::new(flutter);
+            runner.run(&[], &cwd)
+        });
+        let mut child_pid = 0;
+        for _ in 0..200 {
+            if let Ok(text) = fs::read_to_string(&ready)
+                && let Ok(parsed) = text.trim().parse::<i32>()
+            {
+                child_pid = parsed;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_ne!(child_pid, 0, "the fake flutter must start");
+        // SIGTERM this process — the shim's position in production.
+        unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) };
+        let code = runner.join().expect("runner thread").expect("run");
+        assert_eq!(code, 128 + libc::SIGTERM, "the child's signal death is reported");
+        // The child is reaped and gone.
+        // SAFETY: signal 0 only probes for the pid's existence.
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1, "the child is gone");
+    }
+
+    /// The #4057 carry-over: the budget probe is the O(1) running
+    /// counter (`used_bytes`), and crossing it runs gc (grace 0, tiny
+    /// budget → the entry is evicted and its blobs removed).
+    #[test]
+    fn maybe_gc_probes_the_running_counter_and_collects_over_budget() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let mut config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        config.budget_bytes = u64::MAX;
+        config.grace_secs = 0;
+
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::Ingested);
+        let key = report.key.expect("key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let blob = manifest.dirs[0].files[0].blob;
+        assert!(store.blob_path(&blob).is_file());
+        assert!(store.used_bytes().expect("used") > 0, "ingest books bytes");
+
+        // Over budget by the counter alone: gc evicts (grace 0). The
+        // blobs themselves are younger than the in-flight window and
+        // stay; the counter heals to exactly the bytes that remain.
+        config.budget_bytes = 0;
+        maybe_gc(&store, &config);
+        assert_eq!(store.stats().expect("stats").entries, 0, "grace 0 + no budget evicts");
+        assert_eq!(
+            store.used_bytes().expect("used after gc"),
+            store.stats().expect("stats").blob_bytes,
+            "the counter heals to the bytes the pass observed"
+        );
+    }
+
+    /// A14 end to end: with the tree lock held by another shim, PRE
+    /// degrades to a clean miss (nothing materialized, reason recorded)
+    /// and POST skips the ingest — the build itself runs either way.
+    #[cfg(unix)]
+    #[test]
+    fn tree_lock_contention_degrades_pre_and_post_to_clean_misses() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // Seed the entry from tree A with two recorded dirs.
+        let tree_a = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+                build_fixture(cwd, DIR_ALT);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+
+        // A second shim in tree B while tree B's lock is held: the run
+        // proceeds (and fabricates ONE of the two dirs itself), both
+        // cache sections degrade.
+        let tree_b = synthetic_project(&tmp, "b");
+        let _held = crate::fsutil::TreeLock::acquire(&tree_b, Duration::from_millis(50))
+            .expect("acquire")
+            .expect("lock");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        assert_eq!(report.reason, "tree_lock_busy", "PRE degraded to a miss");
+        assert_eq!(report.action, Action::PreMiss);
+        assert!(report.materialize.is_none(), "no materialization ran");
+        assert!(
+            tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(DIR_MAIN)
+                .join("app.dill")
+                .is_file(),
+            "the run's own output is untouched by the degradation"
+        );
+        assert!(
+            !tree_b
+                .join(".dart_tool")
+                .join("flutter_build")
+                .join(DIR_ALT)
+                .exists(),
+            "the dir only PRE could place never appears under contention"
+        );
+        assert_eq!(report.exit_code, Some(0), "the build itself ran");
+        // POST skipped too: the entry population is unchanged.
+        let entries = CasStore::open(&store_root)
+            .expect("open")
+            .stats()
+            .expect("stats")
+            .entries;
+        assert_eq!(entries, 1, "no ingest happened under contention");
+        // And the run left no marker behind.
+        assert!(
+            !tree_b
+                .join(".dart_tool")
+                .join(format!("dartq-bcache-run-{}", std::process::id()))
+                .exists(),
+            "the run marker is removed after the run"
+        );
+    }
+
+    /// A22's gate: a file written immediately before the run — fresh
+    /// mtime, same whole second as the old floored start — is NOT
+    /// touched. The marker file's full-resolution mtime is the gate.
+    #[test]
+    fn pre_run_write_in_the_same_second_is_not_touched() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+
+        // The dill an earlier moment left, with a completely fresh
+        // mtime (the floored gate would see at >= floor(now) and call
+        // it touched); the run itself writes nothing.
+        let tree = synthetic_project(&tmp, "a");
+        write_test_cache(&tree);
+        std::thread::sleep(Duration::from_millis(20));
+        let mut runner = FakeRunner::exits(1);
+        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        assert_eq!(report.exit_code, Some(1));
+        assert_eq!(report.action, Action::PreMiss);
+        assert_eq!(report.ingest_files, 0, "a pre-run write is not a touch");
+        let stats = CasStore::open(&store_root)
+            .expect("open store")
+            .stats()
+            .expect("stats");
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.blobs, 0);
+    }
+
+    /// A22's record half: a touched dir whose assemble capture was
+    /// missed keeps the prior entry's naming instead of being demoted
+    /// to not-replayable — the entry keeps serving fresh trees.
+    #[cfg(unix)]
+    #[test]
+    fn missed_capture_keeps_the_prior_dir_record_replayable() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let flutter_bin = sdk.join("bin").join("flutter");
+        let engine_revision = key::fingerprint_toolchain(&sdk)
+            .expect("fingerprint")
+            .engine_revision;
+        let store_root = tmp.join("cas").join("v1");
+        let config = config_for(&store_root, &flutter_bin);
+
+        // Seed with a REAL observation (the lookalike), as gradle would.
+        let tree = synthetic_project(&tmp, "a");
+        let output = tree.join("build/app/intermediates/flutter/release");
+        let argv = assemble_argv(&flutter_bin, &output.to_string_lossy());
+        let template = base_capture(&argv, &tree, &engine_revision);
+        let seed_argv = argv.clone();
+        let seed_name = template.name.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                run_assemble_lookalike(&seed_argv);
+                build_fixture(cwd, &seed_name);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        let key = seeded.key.clone().expect("key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs[0].name_rule, NameRule::RecomputeFromTemplate);
+        let seed_defines = manifest.dirs[0].name_defines.clone();
+
+        // The rerun touches the dir (flutter rewrote the payload) but
+        // the observer captures NOTHING — a missed capture.
+        let warm_name = template.name.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |cwd| {
+                write(
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(&warm_name)
+                        .join("app.dill"),
+                    b"kernel payload bytes v2",
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.ingest_files, 1, "the rewrite re-stores");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(
+            manifest.dirs[0].name_rule,
+            NameRule::RecomputeFromTemplate,
+            "the missed capture must not demote the dir to provenance"
+        );
+        assert_eq!(manifest.dirs[0].name_defines, seed_defines);
+
+        // The entry still serves a fresh tree under the template.
+        let tree_b = synthetic_project(&tmp, "b");
+        let mut runner = FakeRunner::exits(0);
+        let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        let output_b =
+            rerooted(&template.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
+        let name_b =
+            flutter_build_dir_name(&engine_revision, &template.defines, Path::new(&output_b));
+        assert!(tree_b
+            .join(".dart_tool")
+            .join("flutter_build")
+            .join(&name_b)
+            .join("app.dill")
+            .is_file());
     }
 }

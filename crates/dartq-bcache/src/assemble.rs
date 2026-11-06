@@ -754,31 +754,36 @@ mod tests {
         );
     }
 
-    /// The live gradle-nested assemble argv exactly as a macOS `ps` poll
-    /// delivered it (verbatim tokens, whitespace-split): the multi-arch
-    /// `-dAndroidArchs` value arrives truncated with its remainder as
-    /// positional orphans. The dir the build materialized was
-    /// 84ab3229adadc72224e634b8b9c2f856 — the full-value join must be
-    /// among the enumerated variants, and the as-split parse (whose name
-    /// never materialized — the e2e red this regresses) must be the
-    /// base. The absolute paths are fixture INPUTS captured from a real
-    /// build, not references into any checkout-local tree.
+    /// A gradle-nested assemble argv as a macOS `ps` poll delivers it
+    /// (verbatim token shapes and order, whitespace-split): the
+    /// multi-arch `-dAndroidArchs` value arrives truncated with its
+    /// remainder as positional orphans. Captured from a real build,
+    /// then path-fictionalized (SDK root, project root) with every
+    /// token shape preserved — the paths are fixture inputs, not
+    /// references into any checkout-local tree. The pinned names are
+    /// precomputed offline with the flutter_tools 3.47.1 dir-name hash
+    /// (exactly the crate's `flutter_build_dir_name`) over THIS argv,
+    /// so the goldens stay non-circular: the full-value join is the
+    /// name the real build materialized (its dir-name hash is how the
+    /// fixture was first validated), and the as-split parse (whose
+    /// name never materialized — the e2e red this regresses) is the
+    /// base.
     #[test]
     fn the_space_split_gradle_argv_reaches_the_observed_dir_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
         const ENGINE: &str = "5d531788691ec3404cac0cee66ead4007b177363";
-        let output = "/Users/iota9star/Development/workspace/flutter/mikan-cas-exp/build/app/intermediates/flutter/debug";
+        let output = "/work/myapp/build/app/intermediates/flutter/debug";
         let argv = strings(&[
-            "/Users/iota9star/fvm/versions/3.47.1/bin/cache/dart-sdk/bin/dartvm",
-            "--resolved_executable_name=/Users/iota9star/fvm/versions/3.47.1/bin/cache/dart-sdk/bin/dart",
-            "--executable_name=/Users/iota9star/fvm/versions/3.47.1/bin/cache/dart-sdk/bin/dart",
-            "--packages=/Users/iota9star/fvm/versions/3.47.1/packages/flutter_tools/.dart_tool/package_config.json",
-            "/Users/iota9star/fvm/versions/3.47.1/bin/cache/flutter_tools.snapshot",
+            "/opt/flutter471/bin/cache/dart-sdk/bin/dartvm",
+            "--resolved_executable_name=/opt/flutter471/bin/cache/dart-sdk/bin/dart",
+            "--executable_name=/opt/flutter471/bin/cache/dart-sdk/bin/dart",
+            "--packages=/opt/flutter471/packages/flutter_tools/.dart_tool/package_config.json",
+            "/opt/flutter471/bin/cache/flutter_tools.snapshot",
             "--quiet",
             "assemble",
             "--no-version-check",
             "--depfile",
-            "/Users/iota9star/Development/workspace/flutter/mikan-cas-exp/build/app/intermediates/flutter/debug/flutter_build.d",
+            "/work/myapp/build/app/intermediates/flutter/debug/flutter_build.d",
             "--output",
             output,
             "-dTargetFile=lib/main.dart",
@@ -803,7 +808,7 @@ mod tests {
             variants[0].defines.get("AndroidArchs").map(String::as_str),
             Some("android-arm")
         );
-        assert_eq!(variants[0].name, "264948424c0cf083e6eebf2baf3a923d");
+        assert_eq!(variants[0].name, "50aa28fa2bca19ee5f692df6c44725dd");
 
         let full = variants
             .iter()
@@ -812,7 +817,7 @@ mod tests {
                     == Some("android-arm android-arm64 android-x64")
             })
             .expect("the full-value join variant");
-        assert_eq!(full.name, "84ab3229adadc72224e634b8b9c2f856");
+        assert_eq!(full.name, "faea472ffd84b691840e8506221fea8e");
         assert_eq!(full.output_dir, output);
         assert_eq!(
             full.defines.get("MinSdkVersion").map(String::as_str),

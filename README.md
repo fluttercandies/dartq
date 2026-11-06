@@ -303,7 +303,8 @@ the session.
 An optional `dartq.yaml` at the workspace root configures the faces. It is
 all-optional — an absent file is the zero-config default — unknown keys are
 ignored, and an optional `version` key (currently `1`) guards the shape.
-Today `contexts` feeds `dartq compatibility`; the other sections are parsed
+Today `contexts` feeds `dartq compatibility`, and `cache` / `build_cache`
+feed the cache faces (see [Caches](#caches)); the other sections are parsed
 and validated ahead of their consumers.
 
 ```yaml
@@ -332,6 +333,38 @@ memory:
 cache:
   size_limit_gib: 8
 ```
+
+## Caches
+
+dartq keeps its on-disk state under `~/.cache/dartq/` (XDG-respecting), one
+directory per face:
+
+| Directory | Face |
+| --- | --- |
+| `snapshots/` | L2 facts snapshots — one generation directory per save, evicted whole |
+| `store/` | L3 content store — source blobs sharded by content digest, LRU under a byte cap |
+| `cas/v1/` | the `flutter` shim's build cache — flutter tool outputs, content-addressed |
+| `sessions/` | resident-session registry — runtime state, reported but never collected |
+
+`dartq cache stats` prints one JSON line per face plus a total (read-only).
+`dartq cache gc` runs each store's own eviction pass at its resolved cap and,
+on the content face, additionally sweeps debris eviction cannot see back —
+blobs no manifest row references and torn `.tmp` writes, both only past an
+age guard that spares any in-flight write. `dartq bcache stats|gc` manage
+the build cache alone; a face that fails prints its own `error` line and
+the others still report.
+
+The `flutter` build-cache shim: `dartq init` scaffolds a `dartq.yaml` (only
+when none exists) and installs `~/.dartq/bin/flutter` as a symlink to the
+dartq binary. With that bin directory ahead of the real flutter on `PATH`,
+`flutter` runs cache their tool outputs in the CAS store; until a
+`build_cache:` key is set in `dartq.yaml`, the shim is a pure passthrough.
+
+Caps live in `dartq.yaml`: `cache.size_limit_gib` bounds both analysis
+stores (snapshots and content store; each defaults to 10 GiB), and
+`build_cache.budget_gb` bounds the build cache (default 20 GiB). The
+analyze and daemon `--cache-size-limit` flag overrides the content cap for
+the run that arms it.
 
 ## Performance
 
