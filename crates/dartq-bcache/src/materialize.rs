@@ -70,9 +70,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::dill_rewrite;
 use crate::error::{BcacheError, Result};
-use crate::fsutil::{clone_file, stamp_of, CloneStatus};
+use crate::fsutil::{CloneStatus, clone_file, stamp_of};
 use crate::store::CasStore;
-use crate::types::{BlobId, PlacedFile, RewriteKind, blob_id_hex, ManifestFile};
+use crate::types::{BlobId, ManifestFile, PlacedFile, RewriteKind, blob_id_hex};
 
 /// Hard per-file bound for rewrite (`PathText`) files: 16 MiB.
 /// Bookkeeping files are KBs; payload files (dills, kernels) are
@@ -244,14 +244,15 @@ pub fn rewrite_bytes(data: &mut Vec<u8>, old: &[u8], new: &[u8]) -> usize {
 /// scoped readers — audit A15: the check was ~96% of a restore's wall
 /// time as one serialized read chain), and a mismatch aborts with
 /// [`BcacheError::Corrupt`] naming the blob — a wrong artifact is worse
-/// than a cache miss. Because verification now completes before the
-/// first placement, a corrupt store blob costs a fully clean miss, not
-/// a half-filled dir. Bookkeeping files get their embedded ingest-tree
-/// paths rewritten to target-tree paths (root segments, then
-/// `flutter_build/<name>` segments) before the run reports success;
-/// without that rewrite the skip would not survive the tree move. A
-/// `.filecache` the run places lands last, carrying the md5 of every
-/// file the run rewrote (see [`patch_file_store`]).
+/// than a cache miss — after removing it from the store, so the
+/// rebuild's ingest re-stores the true bytes. Because verification
+/// completes before the first placement, a corrupt store blob costs a
+/// fully clean miss, not a half-filled dir. Bookkeeping files get their
+/// embedded ingest-tree paths rewritten to target-tree paths (root
+/// segments, then `flutter_build/<name>` segments) before the run
+/// reports success; without that rewrite the skip would not survive the
+/// tree move. A `.filecache` the run places lands last, carrying the
+/// md5 of every file the run rewrote (see [`patch_file_store`]).
 pub fn materialize(
     store: &CasStore,
     plan: &MaterializePlan,
@@ -363,7 +364,8 @@ pub fn materialize(
         if patched > 0 {
             let metadata = fs::metadata(&path)?;
             run.report.filecache_patched += patched;
-            run.report.total_bytes = run.report.total_bytes - placed_file.stamp.size + metadata.len();
+            run.report.total_bytes =
+                run.report.total_bytes - placed_file.stamp.size + metadata.len();
             placed_file.stamp = stamp_of(&metadata);
             placed_file.verbatim = false;
         }
@@ -442,7 +444,10 @@ fn missing_files(plan: &MaterializePlan, project_root: &Path) -> Vec<(usize, usi
 /// the recorded one. A mismatch quarantines the blob by deletion
 /// (ingest leaves a same-size stored blob alone — removing it is what
 /// lets the next ingest re-store the true bytes) and aborts the
-/// materialization with [`BcacheError::Corrupt`].
+/// materialization with [`BcacheError::Corrupt`], whose message says
+/// whether the removal took: one that fails leaves every hit of the
+/// entry a miss until the blob is deleted. The running usage counter
+/// keeps the removed bytes until the next gc pass rewrites it.
 fn verify_missing_blobs(
     store: &CasStore,
     plan: &MaterializePlan,
@@ -467,12 +472,23 @@ fn verify_missing_blobs(
             _ => BcacheError::Io(e),
         })?;
         if digest != file.blob {
-            let _ = fs::remove_file(store.blob_path(&file.blob));
-            return Err(BcacheError::Corrupt(format!(
+            let what = format!(
                 "blob {} for {} failed its content check",
                 blob_id_hex(&file.blob),
                 file.path.display()
-            )));
+            );
+            // Already gone (a concurrent heal or gc) is as good as removed.
+            return Err(BcacheError::Corrupt(
+                match fs::remove_file(store.blob_path(&file.blob)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => format!(
+                        "{what}, and removing it from the store failed ({e}): every hit of \
+                         this entry misses until it is deleted"
+                    ),
+                    _ => format!(
+                        "{what} and was removed from the store; the next build re-stores it"
+                    ),
+                },
+            ));
         }
     }
     Ok(())
@@ -819,9 +835,7 @@ fn rewrite_name_segments(path: &Path, old_name: &str, new_name: &str) -> Result<
         let at = cursor + pos;
         let end = at + needle.len();
         // The byte after the match must not extend the hex name.
-        let boundary = data
-            .get(end)
-            .is_none_or(|&byte| !byte.is_ascii_hexdigit());
+        let boundary = data.get(end).is_none_or(|&byte| !byte.is_ascii_hexdigit());
         out.extend_from_slice(&data[cursor..at]);
         if boundary {
             out.extend_from_slice(&replacement);
@@ -923,13 +937,7 @@ fn set_executable(path: &Path) -> Result<()> {
 fn tmp_sibling(path: &Path) -> PathBuf {
     let name = path
         .file_name()
-        .map(|n| {
-            format!(
-                ".{}.{}.dartq-tmp",
-                n.to_string_lossy(),
-                std::process::id()
-            )
-        })
+        .map(|n| format!(".{}.{}.dartq-tmp", n.to_string_lossy(), std::process::id()))
         .unwrap_or_else(|| format!(".{}.dartq-tmp", std::process::id()));
     path.with_file_name(name)
 }
@@ -937,7 +945,9 @@ fn tmp_sibling(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{BlobId, DirRecord, EntryManifest, NameRule, TargetSpec, ToolchainFingerprint};
+    use crate::types::{
+        BlobId, DirRecord, EntryManifest, NameRule, TargetSpec, ToolchainFingerprint,
+    };
     use std::collections::BTreeMap;
 
     /// A valid entry key for draft manifests: 64 lowercase hex digits.
@@ -1056,7 +1066,10 @@ mod tests {
     #[test]
     fn rewrite_bytes_length_changes_shorter_and_longer() {
         let mut data = b"root=/old/root end".to_vec();
-        assert_eq!(rewrite_bytes(&mut data, b"/old/root", b"/much/longer/root"), 1);
+        assert_eq!(
+            rewrite_bytes(&mut data, b"/old/root", b"/much/longer/root"),
+            1
+        );
         assert_eq!(data, b"root=/much/longer/root end".to_vec());
 
         let mut data = b"root=/old/root end".to_vec();
@@ -1091,7 +1104,12 @@ mod tests {
                 "abc123",
                 vec![
                     manifest("app.dill", payload_id, false, RewriteKind::None),
-                    manifest("flutter_build.dill.stamp", stamp_id, false, RewriteKind::PathText),
+                    manifest(
+                        "flutter_build.dill.stamp",
+                        stamp_id,
+                        false,
+                        RewriteKind::PathText,
+                    ),
                     manifest("sub/dir/tool.out", payload_id, true, RewriteKind::None),
                 ],
             )],
@@ -1101,10 +1119,13 @@ mod tests {
 
         let project = tempfile::tempdir().expect("project dir");
         let MaterializeOutcome { report, .. } =
-        materialize(&store, &plan, project.path()).expect("materialize");
+            materialize(&store, &plan, project.path()).expect("materialize");
 
         let hash_dir = project.path().join(".dart_tool/flutter_build/abc123");
-        assert_eq!(fs::read(hash_dir.join("app.dill")).expect("read dill"), payload);
+        assert_eq!(
+            fs::read(hash_dir.join("app.dill")).expect("read dill"),
+            payload
+        );
 
         let rewritten = fs::read(hash_dir.join("flutter_build.dill.stamp")).expect("read stamp");
         let expected_stamp = format!("[\"{}/lib/main.dart\"]", new_root.display());
@@ -1211,12 +1232,7 @@ mod tests {
         let aside: Vec<_> = fs::read_dir(&build_root)
             .expect("read build root")
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("bcache-stale")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains("bcache-stale"))
             .collect();
         assert!(aside.is_empty(), "fill-only-missing renames nothing aside");
     }
@@ -1250,7 +1266,12 @@ mod tests {
             &store,
             &plan(vec![
                 manifest("app.dill", payload_id, false, RewriteKind::None),
-                manifest("flutter_build.dill.stamp", stamp_id, false, RewriteKind::None),
+                manifest(
+                    "flutter_build.dill.stamp",
+                    stamp_id,
+                    false,
+                    RewriteKind::None,
+                ),
             ]),
             project.path(),
         )
@@ -1292,7 +1313,12 @@ mod tests {
         .expect("stamp");
         let err = materialize(
             &store,
-            &plan(vec![manifest("gone.bin", missing_id, false, RewriteKind::None)]),
+            &plan(vec![manifest(
+                "gone.bin",
+                missing_id,
+                false,
+                RewriteKind::None,
+            )]),
             project.path(),
         )
         .expect_err("a missing blob aborts");
@@ -1323,7 +1349,12 @@ mod tests {
 
         let mut dir = hash_dir(
             new_name,
-            vec![manifest("flutter_build.dill.stamp", stamp_id, false, RewriteKind::PathText)],
+            vec![manifest(
+                "flutter_build.dill.stamp",
+                stamp_id,
+                false,
+                RewriteKind::PathText,
+            )],
         );
         dir.name_rewrite = Some((old_name.to_owned(), new_name.to_owned()));
         let new_root_dir = tempfile::tempdir().expect("new root dir");
@@ -1361,7 +1392,9 @@ mod tests {
             "no old-name segment survives: {placed}"
         );
         assert!(
-            placed.contains("flutter_build/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadeadbeefdeadbeefdeadbeef00"),
+            placed.contains(
+                "flutter_build/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadeadbeefdeadbeefdeadbeef00"
+            ),
             "the longer hex run keeps the old bytes: {placed}"
         );
         // Two segment hits (absolute + relative) plus the root hit.
@@ -1419,6 +1452,101 @@ mod tests {
         assert!(!hash_dir.exists(), "the tree is never touched");
     }
 
+    /// The self-heal loop: a stored blob damaged in place at its own size
+    /// (the case ingest's reuse rule never rereads) fails the content
+    /// check and is removed, so the hit is a clean miss and a retry before
+    /// the rebuild misses exactly like a missing blob; the rebuild's
+    /// re-ingest of the same source then takes the fresh path and lands
+    /// the true bytes, and the next hit materializes them.
+    #[test]
+    fn materialize_quarantines_a_corrupt_blob_and_reingest_heals_it() {
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = CasStore::open(store_dir.path()).expect("open store");
+        let original: &[u8] = b"original payload bytes";
+        let payload_id = place_blob(&store, store_dir.path(), "src-payload.bin", original);
+        let plan = MaterializePlan {
+            dirs: vec![hash_dir(
+                "abc123",
+                vec![manifest("app.dill", payload_id, false, RewriteKind::None)],
+            )],
+            old_root: "/old/root".to_string(),
+            new_root: PathBuf::from("/new/root"),
+        };
+        fs::write(store.blob_path(&payload_id), b"corrupted payload byte").expect("tamper blob");
+
+        let project = tempfile::tempdir().expect("project dir");
+        let err = materialize(&store, &plan, project.path()).expect_err("corrupt blob must abort");
+        assert!(
+            matches!(&err, BcacheError::Corrupt(message) if message.contains("removed from the store")),
+            "the shim's note reports the removal: {err}"
+        );
+        assert!(
+            !store.blob_path(&payload_id).exists(),
+            "the corrupt blob is quarantined"
+        );
+        assert!(
+            !project.path().join(".dart_tool").exists(),
+            "the miss never touches the tree"
+        );
+        assert!(
+            matches!(
+                materialize(&store, &plan, project.path()),
+                Err(BcacheError::NotFound(_))
+            ),
+            "until the rebuild, the hit misses like any missing blob"
+        );
+
+        // The rebuild's ingest re-stores the source: with the blob absent
+        // the fresh path runs, and the true bytes land under the same id.
+        assert_eq!(
+            place_blob(&store, store_dir.path(), "src-payload.bin", original),
+            payload_id
+        );
+        assert_eq!(
+            crate::fsutil::file_blake3(&store.blob_path(&payload_id)).expect("hash healed blob"),
+            payload_id
+        );
+
+        let outcome = materialize(&store, &plan, project.path()).expect("the healed entry hits");
+        assert_eq!(outcome.report.cloned + outcome.report.copied, 1);
+        let placed = project
+            .path()
+            .join(".dart_tool/flutter_build/abc123/app.dill");
+        assert_eq!(fs::read(&placed).expect("read placed file"), original);
+    }
+
+    /// Intact blobs pass the content check and stay in the store: only a
+    /// failed check removes anything.
+    #[test]
+    fn materialize_keeps_intact_blobs_in_the_store() {
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = CasStore::open(store_dir.path()).expect("open store");
+        let payload = place_blob(&store, store_dir.path(), "payload.bin", b"payload bytes");
+        let stamp = place_blob(&store, store_dir.path(), "stamp.json", b"{\"stamp\":1}");
+        let plan = MaterializePlan {
+            dirs: vec![hash_dir(
+                "abc123",
+                vec![
+                    manifest("app.dill", payload, false, RewriteKind::None),
+                    manifest("stamp.json", stamp, false, RewriteKind::None),
+                ],
+            )],
+            old_root: "/old/root".to_string(),
+            new_root: PathBuf::from("/new/root"),
+        };
+
+        let project = tempfile::tempdir().expect("project dir");
+        let outcome = materialize(&store, &plan, project.path()).expect("intact blobs hit");
+        assert_eq!(outcome.report.cloned + outcome.report.copied, 2);
+        for id in [payload, stamp] {
+            assert!(
+                store.blob_path(&id).is_file(),
+                "blob {} stays stored",
+                blob_id_hex(&id)
+            );
+        }
+    }
+
     #[test]
     fn plan_validation_rejects_before_any_io() {
         let store_dir = tempfile::tempdir().expect("store dir");
@@ -1431,7 +1559,12 @@ mod tests {
         let mut plan = MaterializePlan {
             dirs: vec![hash_dir(
                 "abc123",
-                vec![manifest("app.dill", BlobId([9; 32]), false, RewriteKind::None)],
+                vec![manifest(
+                    "app.dill",
+                    BlobId([9; 32]),
+                    false,
+                    RewriteKind::None,
+                )],
             )],
             old_root: "/old/root".to_string(),
             new_root: PathBuf::from("/new/root"),
@@ -1443,17 +1576,18 @@ mod tests {
         assert!(matches!(err, BcacheError::Invalid(_)), "got {err:?}");
 
         plan.old_root = String::new();
-        let err = materialize(&store, &plan, project.path()).expect_err("empty root must be Invalid");
+        let err =
+            materialize(&store, &plan, project.path()).expect_err("empty root must be Invalid");
         assert!(matches!(err, BcacheError::Invalid(_)), "got {err:?}");
 
         plan.old_root = "/old/root".to_string();
         plan.dirs[0].path = PathBuf::from("../escape");
-        let err = materialize(&store, &plan, project.path()).expect_err("traversal must be Invalid");
+        let err =
+            materialize(&store, &plan, project.path()).expect_err("traversal must be Invalid");
         assert!(matches!(err, BcacheError::Invalid(_)), "got {err:?}");
 
         plan.dirs[0].path = PathBuf::from("/absolute/dir");
-        let err =
-            materialize(&store, &plan, project.path()).expect_err("absolute must be Invalid");
+        let err = materialize(&store, &plan, project.path()).expect_err("absolute must be Invalid");
         assert!(matches!(err, BcacheError::Invalid(_)), "got {err:?}");
 
         assert!(
@@ -1493,9 +1627,12 @@ mod tests {
         fs::write(cache.join("build").join("lock"), b"transient").expect("lock");
 
         let MaterializeOutcome { report, .. } =
-        materialize(&store, &plan, project.path()).expect("materialize");
+            materialize(&store, &plan, project.path()).expect("materialize");
 
-        assert_eq!(report.skipped_existing, 0, "the pre-existing foreign files are not recorded files");
+        assert_eq!(
+            report.skipped_existing, 0,
+            "the pre-existing foreign files are not recorded files"
+        );
         assert_eq!(
             fs::read(cache.join("build").join("ab.cache.dill")).expect("dill"),
             b"kernel bytes".to_vec()
@@ -1516,12 +1653,7 @@ mod tests {
         let aside: Vec<_> = fs::read_dir(project.path().join("build"))
             .expect("read build")
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("bcache-stale")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains("bcache-stale"))
             .collect();
         assert!(aside.is_empty(), "in-place placement renames nothing aside");
     }
@@ -1555,7 +1687,12 @@ mod tests {
             name_rewrite: None,
             files: vec![
                 manifest("build/ab.cache.dill", dill_id, false, RewriteKind::DillUris),
-                manifest("build/cd.cache.dill", garbage_id, false, RewriteKind::DillUris),
+                manifest(
+                    "build/cd.cache.dill",
+                    garbage_id,
+                    false,
+                    RewriteKind::DillUris,
+                ),
             ],
         };
 
@@ -1567,15 +1704,22 @@ mod tests {
             new_root: new_root.clone(),
         };
         let MaterializeOutcome { report, .. } =
-        materialize(&store, &plan, project.path()).expect("materialize");
+            materialize(&store, &plan, project.path()).expect("materialize");
         assert_eq!(report.dill_rewrites, 1);
         assert_eq!(report.dill_rewrite_refused, 1);
-        assert_eq!(report.cloned + report.copied, 1, "only the refused dill clones");
+        assert_eq!(
+            report.cloned + report.copied,
+            1,
+            "only the refused dill clones"
+        );
 
         let placed = fs::read(project.path().join("build/test_cache/build/ab.cache.dill"))
             .expect("placed dill");
         let new_uri = format!("file://{}/lib/main.dart", new_root.display());
-        assert!(memmem::find(&placed, new_uri.as_bytes()).is_some(), "URI rewritten");
+        assert!(
+            memmem::find(&placed, new_uri.as_bytes()).is_some(),
+            "URI rewritten"
+        );
         // The old URI survives exactly once: the embedded source TEXT
         // (diagnostics-only, left verbatim by design); its source-table
         // and string-table occurrences are rewritten away.
@@ -1600,7 +1744,12 @@ mod tests {
                 name_rewrite: None,
                 files: vec![
                     manifest("build/ab.cache.dill", dill_id, false, RewriteKind::DillUris),
-                    manifest("build/cd.cache.dill", garbage_id, false, RewriteKind::DillUris),
+                    manifest(
+                        "build/cd.cache.dill",
+                        garbage_id,
+                        false,
+                        RewriteKind::DillUris,
+                    ),
                 ],
             }],
             old_root: old_root.to_string(),
@@ -1612,8 +1761,12 @@ mod tests {
         assert_eq!(report.dill_rewrite_refused, 0);
         assert_eq!(report.cloned + report.copied, 2, "same-tree clones both");
         assert_eq!(
-            fs::read(same_project.path().join("build/test_cache/build/ab.cache.dill"))
-                .expect("verbatim dill"),
+            fs::read(
+                same_project
+                    .path()
+                    .join("build/test_cache/build/ab.cache.dill")
+            )
+            .expect("verbatim dill"),
             dill,
             "same-root replay is byte-identical"
         );
@@ -1636,7 +1789,12 @@ mod tests {
         let stamp_id = place_blob(&store, store_dir.path(), "stamp", stamp.as_bytes());
         let files = vec![
             manifest("app.dill", payload_id, false, RewriteKind::None),
-            manifest("flutter_build.dill.stamp", stamp_id, false, RewriteKind::PathText),
+            manifest(
+                "flutter_build.dill.stamp",
+                stamp_id,
+                false,
+                RewriteKind::PathText,
+            ),
         ];
 
         // Cross-tree: the PathText stamp lands with the new root inside,
@@ -1662,8 +1820,12 @@ mod tests {
         assert_eq!(
             dill.stamp,
             crate::fsutil::stamp_of(
-                &fs::metadata(project.path().join(".dart_tool/flutter_build/abc123/app.dill"))
-                    .expect("metadata")
+                &fs::metadata(
+                    project
+                        .path()
+                        .join(".dart_tool/flutter_build/abc123/app.dill")
+                )
+                .expect("metadata")
             ),
             "the fresh identity of the placed file"
         );
@@ -1672,7 +1834,10 @@ mod tests {
             .iter()
             .find(|f| f.path == Path::new("flutter_build.dill.stamp"))
             .expect("placed stamp");
-        assert!(!stamp_file.verbatim, "a cross-tree rewrite changed the bytes");
+        assert!(
+            !stamp_file.verbatim,
+            "a cross-tree rewrite changed the bytes"
+        );
         assert_eq!(stamp_file.rewrite, RewriteKind::PathText);
 
         // Same-root: the rewrite replaces the root onto itself — bytes
@@ -1712,7 +1877,10 @@ mod tests {
 
         let app = synthetic_component(
             &[
-                (&format!("file://{a}/lib/main.dart"), "package:app/main.dart"),
+                (
+                    &format!("file://{a}/lib/main.dart"),
+                    "package:app/main.dart",
+                ),
                 (
                     &format!("file://{a}/examples/demo_app/lib/src/panel.dart"),
                     "package:demo/src/panel.dart",
@@ -1725,7 +1893,10 @@ mod tests {
         );
         let app_id = place_blob(&store, store_dir.path(), "app-dill", &app);
         let blob = synthetic_component(
-            &[(&format!("file://{a}/lib/main.dart"), "package:app/main.dart")],
+            &[(
+                &format!("file://{a}/lib/main.dart"),
+                "package:app/main.dart",
+            )],
             &[literal_a],
             1,
         );
@@ -1754,7 +1925,13 @@ mod tests {
             .path()
             .join(".dart_tool/flutter_build/dir0000000000000000000000000000009");
         let placed_app = fs::read(dir.join("app.dill")).expect("placed app.dill");
-        assert!(memmem::find(placed_app.as_slice(), format!("file://{b}/lib/main.dart").as_bytes()).is_some());
+        assert!(
+            memmem::find(
+                placed_app.as_slice(),
+                format!("file://{b}/lib/main.dart").as_bytes()
+            )
+            .is_some()
+        );
         assert!(
             memmem::find(
                 placed_app.as_slice(),
@@ -1778,7 +1955,9 @@ mod tests {
         );
 
         let placed_blob = fs::read(dir.join("kernel_blob.bin")).expect("placed kernel_blob");
-        assert!(memmem::find(&placed_blob, format!("file://{b}/lib/main.dart").as_bytes()).is_some());
+        assert!(
+            memmem::find(&placed_blob, format!("file://{b}/lib/main.dart").as_bytes()).is_some()
+        );
         assert!(memmem::find(&placed_blob, literal_a.as_bytes()).is_some());
     }
 
@@ -1788,7 +1967,9 @@ mod tests {
     #[test]
     fn tmp_sibling_carries_the_writer_pid() {
         let a = tmp_sibling(Path::new("/tree/.dart_tool/flutter_build/x/app.dill"));
-        let b = tmp_sibling(Path::new("/tree/.dart_tool/flutter_build/x/kernel_snapshot.d"));
+        let b = tmp_sibling(Path::new(
+            "/tree/.dart_tool/flutter_build/x/kernel_snapshot.d",
+        ));
         let expected = format!(".app.dill.{}.dartq-tmp", std::process::id());
         assert_eq!(
             a.file_name().expect("name"),
@@ -1857,7 +2038,12 @@ mod tests {
             dirs: vec![hash_dir(
                 "abc123",
                 vec![
-                    manifest("kernel_snapshot.d", depfile_id, false, RewriteKind::PathText),
+                    manifest(
+                        "kernel_snapshot.d",
+                        depfile_id,
+                        false,
+                        RewriteKind::PathText,
+                    ),
                     manifest("outputs.json", json_id, false, RewriteKind::PathText),
                 ],
             )],
@@ -1869,8 +2055,7 @@ mod tests {
             materialize(&store, &plan, project.path()).expect("materialize");
 
         let dir = project.path().join(".dart_tool/flutter_build/abc123");
-        let rewritten_depfile =
-            fs::read_to_string(dir.join("kernel_snapshot.d")).expect("depfile");
+        let rewritten_depfile = fs::read_to_string(dir.join("kernel_snapshot.d")).expect("depfile");
         assert_eq!(
             rewritten_depfile,
             format!("{escaped_new}/build/app.dill: {escaped_new}/lib/main.dart\n"),
@@ -1957,7 +2142,12 @@ mod tests {
                 "abc123",
                 vec![
                     manifest("app.dill", payload_id, false, RewriteKind::None),
-                    manifest("flutter_build.dill.stamp", stamp_id, false, RewriteKind::None),
+                    manifest(
+                        "flutter_build.dill.stamp",
+                        stamp_id,
+                        false,
+                        RewriteKind::None,
+                    ),
                 ],
             )],
             old_root: "/old/root".to_string(),
@@ -2016,17 +2206,33 @@ mod tests {
         let rewritten = b"flutter's own rewrite, longer than the blob";
         fs::write(dir.join("flutter_build.dill.stamp"), rewritten).expect("flutter rewrite");
         let held = materialize(&store, &plan, project.path()).expect("no-op");
-        assert!(held.report.intact, "a held file with a moved stamp is still held");
-        assert_eq!(fs::read(dir.join("flutter_build.dill.stamp")).expect("read"), rewritten);
+        assert!(
+            held.report.intact,
+            "a held file with a moved stamp is still held"
+        );
+        assert_eq!(
+            fs::read(dir.join("flutter_build.dill.stamp")).expect("read"),
+            rewritten
+        );
 
         fs::remove_file(dir.join("app.dill")).expect("delete one output");
         let filled = materialize(&store, &plan, project.path()).expect("full path");
         assert!(!filled.report.intact);
-        assert_eq!(filled.report.cloned + filled.report.copied, 1, "only the gap is filled");
+        assert_eq!(
+            filled.report.cloned + filled.report.copied,
+            1,
+            "only the gap is filled"
+        );
         assert_eq!(filled.report.skipped_existing, 1);
         assert_eq!(filled.placed[0].len(), 1);
-        assert_eq!(fs::read(dir.join("app.dill")).expect("filled"), b"payload bytes");
-        assert_eq!(fs::read(dir.join("flutter_build.dill.stamp")).expect("read"), rewritten);
+        assert_eq!(
+            fs::read(dir.join("app.dill")).expect("filled"),
+            b"payload bytes"
+        );
+        assert_eq!(
+            fs::read(dir.join("flutter_build.dill.stamp")).expect("read"),
+            rewritten
+        );
 
         fs::remove_file(dir.join("app.dill")).expect("delete again");
         fs::remove_file(store.blob_path(&payload_id)).expect("gc drops the blob");
@@ -2035,7 +2241,10 @@ mod tests {
             matches!(&err, BcacheError::NotFound(msg) if msg.contains(&blob_id_hex(&payload_id))),
             "the full path checks the store before the tree: {err:?}"
         );
-        assert_eq!(fs::read(dir.join("flutter_build.dill.stamp")).expect("read"), rewritten);
+        assert_eq!(
+            fs::read(dir.join("flutter_build.dill.stamp")).expect("read"),
+            rewritten
+        );
     }
 
     /// flutter_tools' FileStore check, as `Node.computeChanges` runs it
@@ -2057,7 +2266,9 @@ mod tests {
             .iter()
             .filter(|file| {
                 let path = project.join(&file.path);
-                fs::read(&path).map_or(true, |bytes| format!("{:x}", Md5::digest(&bytes)) != file.hash)
+                fs::read(&path).map_or(true, |bytes| {
+                    format!("{:x}", Md5::digest(&bytes)) != file.hash
+                })
             })
             .map(|file| file.path.clone())
             .collect()
@@ -2090,7 +2301,10 @@ mod tests {
 
         let source = b"import 'package:core/core.dart';\nvoid main() {}\n";
         let dill_a = synthetic_component(
-            &[(&format!("file://{a}/app/lib/main.dart"), "package:app/main.dart")],
+            &[(
+                &format!("file://{a}/app/lib/main.dart"),
+                "package:app/main.dart",
+            )],
             &[&format!("file://{a}/packages/core/lib/core.dart")],
             1,
         );
@@ -2128,7 +2342,12 @@ mod tests {
                     vec![
                         manifest(".filecache", store_id, false, RewriteKind::PathText),
                         manifest("app.dill", dill_id, false, RewriteKind::DillUris),
-                        manifest("kernel_snapshot_program.stamp", stamp_id, false, RewriteKind::PathText),
+                        manifest(
+                            "kernel_snapshot_program.stamp",
+                            stamp_id,
+                            false,
+                            RewriteKind::PathText,
+                        ),
                         manifest("native_assets.json", native_id, false, RewriteKind::None),
                     ],
                 ),
@@ -2137,7 +2356,12 @@ mod tests {
                     name_rewrite: None,
                     files: vec![
                         manifest("kernel_blob.bin", dill_id, false, RewriteKind::DillUris),
-                        manifest("fonts/MaterialIcons-Regular.otf", font_id, false, RewriteKind::None),
+                        manifest(
+                            "fonts/MaterialIcons-Regular.otf",
+                            font_id,
+                            false,
+                            RewriteKind::None,
+                        ),
                     ],
                 },
             ],
@@ -2150,9 +2374,15 @@ mod tests {
         fs::create_dir_all(project_b.join("lib")).expect("mkdir lib");
         fs::write(project_b.join("lib/main.dart"), source).expect("source");
         let outcome = materialize(&store, &plan, &project_b).expect("materialize");
-        assert_eq!(outcome.report.dill_rewrites, 2, "one rewrite, one clone of it");
+        assert_eq!(
+            outcome.report.dill_rewrites, 2,
+            "one rewrite, one clone of it"
+        );
         assert_eq!(outcome.report.dill_rewrite_refused, 0);
-        assert_eq!(outcome.report.filecache_patched, 2, "app.dill and kernel_blob.bin");
+        assert_eq!(
+            outcome.report.filecache_patched, 2,
+            "app.dill and kernel_blob.bin"
+        );
 
         let placed_dir = project_b.join(".dart_tool/flutter_build").join(hash);
         let dill_b = fs::read(placed_dir.join("app.dill")).expect("placed dill");
@@ -2162,10 +2392,20 @@ mod tests {
             dill_b,
             "the second placement of the blob is the same rewrite"
         );
-        assert_eq!(flutter_dirty_records(&project_b), Vec::<String>::new(), "every target skips");
+        assert_eq!(
+            flutter_dirty_records(&project_b),
+            Vec::<String>::new(),
+            "every target skips"
+        );
         let record = fs::read_to_string(placed_dir.join(FILE_STORE)).expect("record");
-        assert!(!record.contains(&a), "no record names the ingest tree: {record}");
-        assert!(record.contains(&md5_hex(source)), "the input keeps its recorded md5");
+        assert!(
+            !record.contains(&a),
+            "no record names the ingest tree: {record}"
+        );
+        assert!(
+            record.contains(&md5_hex(source)),
+            "the input keeps its recorded md5"
+        );
 
         // The placed identity of the patched record is its final one.
         let filecache = outcome.placed[0]
@@ -2182,7 +2422,9 @@ mod tests {
         // rewritten, the tree's record is never patched — its md5s
         // describe this tree's own last build, not the entry's.
         let tree_c = tempfile::tempdir().expect("tree c");
-        let project_c = fs::canonicalize(tree_c.path()).expect("canonical c").join("app");
+        let project_c = fs::canonicalize(tree_c.path())
+            .expect("canonical c")
+            .join("app");
         let own_dir = project_c.join(".dart_tool/flutter_build").join(hash);
         fs::create_dir_all(&own_dir).expect("mkdir own dir");
         fs::write(own_dir.join(FILE_STORE), b"this tree's own record").expect("own record");

@@ -640,7 +640,10 @@ impl CasStore {
     /// damaged outside the store), which is then replaced. Returns the
     /// bytes added to the store (0 on reuse) for the running usage
     /// counter; the rare damaged-blob replacement may overcount by the
-    /// old size, which the next gc pass heals.
+    /// old size, which the next gc pass heals. A blob damaged in place
+    /// at its own size is not reread here (one read per reuse): the
+    /// materializer's content check rejects it on the next hit and
+    /// removes it, so the ingest after that rebuild takes the fresh path.
     fn put_blob(&self, src: &Path, id: &BlobId, buf: &mut [u8]) -> Result<u64> {
         let dest = self.blob_path(id);
         if let Ok(stored) = fs::metadata(&dest) {
@@ -1131,7 +1134,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::types::{DirRecord, ManifestFile, NameRule, RewriteKind, TargetSpec, ToolchainFingerprint};
+    use crate::types::{
+        DirRecord, ManifestFile, NameRule, RewriteKind, TargetSpec, ToolchainFingerprint,
+    };
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -1167,19 +1172,14 @@ mod tests {
     }
 
     /// One DirRecord over `sources`, named `name`, replayable per `rule`.
-    fn record(
-        name: &str,
-        rule: NameRule,
-        sources: &[(PathBuf, BlobId)],
-    ) -> DirRecord {
+    fn record(name: &str, rule: NameRule, sources: &[(PathBuf, BlobId)]) -> DirRecord {
         DirRecord {
             name_observed: name.to_owned(),
             name_rule: rule,
             name_defines: match rule {
-                NameRule::RecomputeFromTemplate => BTreeMap::from([(
-                    "BuildMode".to_owned(),
-                    "debug".to_owned(),
-                )]),
+                NameRule::RecomputeFromTemplate => {
+                    BTreeMap::from([("BuildMode".to_owned(), "debug".to_owned())])
+                }
                 _ => BTreeMap::new(),
             },
             name_output_dir: match rule {
@@ -1271,7 +1271,11 @@ mod tests {
         let f = fixture();
         let sources = [
             source(&f.build, "app.dill", b"kernel bytes"),
-            source(&f.build, "kernel_snapshot_program.d", b"app.dill: lib/main.dart"),
+            source(
+                &f.build,
+                "kernel_snapshot_program.d",
+                b"app.dill: lib/main.dart",
+            ),
         ];
         let entry = draft(&key(1), &sources, 100);
         f.store.ingest(entry.clone(), &sources).unwrap();
@@ -1314,7 +1318,10 @@ mod tests {
             ..draft(&key(1), &kernel, 100)
         };
         f.store
-            .ingest(entry.clone(), &kernel.iter().chain(&assets).cloned().collect::<Vec<_>>())
+            .ingest(
+                entry.clone(),
+                &kernel.iter().chain(&assets).cloned().collect::<Vec<_>>(),
+            )
             .unwrap();
 
         assert_eq!(f.store.lookup(&key(1)).unwrap(), Some(entry));
@@ -1519,7 +1526,10 @@ mod tests {
 
         let manifest = f.store.lookup(&key(1)).unwrap().unwrap();
         assert_eq!(manifest.dirs[0].files.len(), 1, "no append-only blob list");
-        assert_eq!(manifest.dirs[0].files[0].blob, v2.1, "the reference is replaced");
+        assert_eq!(
+            manifest.dirs[0].files[0].blob, v2.1,
+            "the reference is replaced"
+        );
         assert!(f.store.blob_path(&v1.1).exists(), "unreferenced until gc");
 
         // Fresh blobs may belong to an ingest in flight: v1 is spared.
@@ -1631,7 +1641,11 @@ mod tests {
         drop_entry(&f, 3);
         // Neither foreign files nor an entry still being ingested count.
         fs::write(f.root.join(BLOBS).join(".DS_Store"), b"finder").unwrap();
-        fs::write(f.store.blob_path(&a.1).with_file_name(".DS_Store"), b"finder").unwrap();
+        fs::write(
+            f.store.blob_path(&a.1).with_file_name(".DS_Store"),
+            b"finder",
+        )
+        .unwrap();
         fs::create_dir_all(f.store.entry_path(&key(9)).parent().unwrap()).unwrap();
 
         // The shared blob counts once; the unreferenced one occupies the
@@ -1654,7 +1668,10 @@ mod tests {
         let garbage = f.store.entry_path(&key(1));
         fs::create_dir_all(garbage.parent().unwrap()).unwrap();
         fs::write(&garbage, b"\x00\xffnot json").unwrap();
-        assert!(matches!(f.store.lookup(&key(1)), Err(BcacheError::Corrupt(_))));
+        assert!(matches!(
+            f.store.lookup(&key(1)),
+            Err(BcacheError::Corrupt(_))
+        ));
         // record_hit only checks that a manifest file is there: the hit
         // sidecar is meaningless for an entry lookup already rejected,
         // and gc evicts it below either way.
@@ -1666,14 +1683,20 @@ mod tests {
         let truncated = f.store.entry_path(&key(2));
         let bytes = fs::read(&truncated).unwrap();
         fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
-        assert!(matches!(f.store.lookup(&key(2)), Err(BcacheError::Corrupt(_))));
+        assert!(matches!(
+            f.store.lookup(&key(2)),
+            Err(BcacheError::Corrupt(_))
+        ));
 
         // A well-formed manifest filed under another key.
         put(&f, 3, &sources, 100);
         let misfiled = f.store.entry_path(&key(4));
         fs::create_dir_all(misfiled.parent().unwrap()).unwrap();
         fs::copy(f.store.entry_path(&key(3)), &misfiled).unwrap();
-        assert!(matches!(f.store.lookup(&key(4)), Err(BcacheError::Corrupt(_))));
+        assert!(matches!(
+            f.store.lookup(&key(4)),
+            Err(BcacheError::Corrupt(_))
+        ));
 
         // stats summarizes around them and counts them; gc purges exactly
         // them. Neither face lets one bad manifest fail the store.
@@ -1731,7 +1754,10 @@ mod tests {
         // goes first under a budget that keeps one entry's worth.
         let cold = source(&f.build, "cold", b"cold entry bytes");
         put(&f, 2, &[cold.clone()], 100);
-        let report = f.store.gc(b"cold entry bytes".len() as u64, 0, later()).unwrap();
+        let report = f
+            .store
+            .gc(b"cold entry bytes".len() as u64, 0, later())
+            .unwrap();
         assert_eq!(report.entries_evicted, 1);
         assert!(f.store.lookup(&key(1)).unwrap().is_some());
         assert_eq!(f.store.lookup(&key(2)).unwrap(), None);
@@ -1860,7 +1886,11 @@ mod tests {
         assert_eq!(first.entries_before, 1);
         assert_eq!(first.entries_evicted, 0, "the hit is grace-young");
         assert_eq!(first.grace_skipped_until_unix, 0, "the pass itself walked");
-        assert_eq!(f.store.grace_deadline(), Some(deadline), "the memo is armed");
+        assert_eq!(
+            f.store.grace_deadline(),
+            Some(deadline),
+            "the memo is armed"
+        );
 
         // Within the window the walk is skipped: a corruption planted
         // after the memo goes unseen.
@@ -1870,7 +1900,10 @@ mod tests {
         let skipped = f.store.gc(0, grace, now + 1).unwrap();
         assert_eq!(skipped.grace_skipped_until_unix, deadline);
         assert_eq!(skipped.entries_before, 0, "nothing was walked");
-        assert_eq!(skipped.corrupt_manifests, 0, "the planted corruption is unseen");
+        assert_eq!(
+            skipped.corrupt_manifests, 0,
+            "the planted corruption is unseen"
+        );
 
         // An ingest invalidates the memo: the next pass walks, finds
         // the corruption, and evicts it (the pass that did work does
@@ -1882,7 +1915,11 @@ mod tests {
         assert_eq!(walked.entries_before, 3, "the walk sees every entry");
         assert_eq!(walked.corrupt_manifests, 1);
         assert_eq!(walked.entries_evicted, 1, "the corrupt entry goes");
-        assert_eq!(f.store.grace_deadline(), None, "working passes do not re-arm");
+        assert_eq!(
+            f.store.grace_deadline(),
+            None,
+            "working passes do not re-arm"
+        );
 
         // A quiet pass re-arms; at the deadline — no longer before it —
         // the walk happens again.
@@ -1905,7 +1942,9 @@ mod tests {
         assert!(entry_removal_raced(&io::Error::from_raw_os_error(
             libc::ENOTEMPTY
         )));
-        assert!(!entry_removal_raced(&io::Error::from_raw_os_error(libc::EIO)));
+        assert!(!entry_removal_raced(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
         assert!(!entry_removal_raced(&io::Error::new(
             io::ErrorKind::NotFound,
             "gone"
@@ -2099,7 +2138,9 @@ mod tests {
 
         let store = CasStore::open(&cas).unwrap();
         let src = source(dir.path(), "k.dill", b"kernel bytes");
-        store.ingest(draft(&key(1), &[src.clone()], 100), &[src]).unwrap();
+        store
+            .ingest(draft(&key(1), &[src.clone()], 100), &[src])
+            .unwrap();
         store.record_hit(&key(1)).unwrap();
 
         assert!(cas.join("blobs").is_dir());
@@ -2118,13 +2159,7 @@ mod tests {
             Some(std::ffi::OsStr::new("entries")),
             "the entry dir hangs straight off the root"
         );
-        let blob = store
-            .lookup(&key(1))
-            .unwrap()
-            .unwrap()
-            .dirs[0]
-            .files[0]
-            .blob;
+        let blob = store.lookup(&key(1)).unwrap().unwrap().dirs[0].files[0].blob;
         assert_eq!(
             store
                 .blob_path(&blob)
@@ -2328,7 +2363,11 @@ mod tests {
 
         // Reuse-only ingests book no new bytes.
         for i in 0..10u8 {
-            let reuse = draft(&key(200 + i), std::slice::from_ref(&originals[i as usize]), 100);
+            let reuse = draft(
+                &key(200 + i),
+                std::slice::from_ref(&originals[i as usize]),
+                100,
+            );
             f.store.ingest(reuse, &[]).unwrap();
         }
         check(&f);
@@ -2380,7 +2419,10 @@ mod tests {
             let sources: Vec<(PathBuf, BlobId)> = (0..3u64)
                 .map(|j| {
                     let hex = format!("{:064x}", u64::from(n) * 3 + j);
-                    (PathBuf::from(format!("f{j}")), hex.parse::<BlobId>().unwrap())
+                    (
+                        PathBuf::from(format!("f{j}")),
+                        hex.parse::<BlobId>().unwrap(),
+                    )
                 })
                 .collect();
             store.ingest(draft(&key(n), &sources, 100), &[]).unwrap();
