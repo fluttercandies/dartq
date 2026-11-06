@@ -362,7 +362,7 @@ dartq binary. With that bin directory ahead of the real flutter on `PATH`,
 
 Caps live in `dartq.yaml`: `cache.size_limit_gib` bounds both analysis
 stores (snapshots and content store; each defaults to 10 GiB), and
-`build_cache.budget_gb` bounds the build cache (default 40 GiB). The
+`build_cache.budget_gb` bounds the build cache (default 96 GiB). The
 analyze and daemon `--cache-size-limit` flag overrides the content cap for
 the run that arms it.
 

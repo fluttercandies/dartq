@@ -26,14 +26,13 @@ use crate::types::{
 /// First line of every key preimage. Any change to the canonical format
 /// must change this line, which changes every key with it.
 ///
-/// v3: `.dart_tool/package_config.json` left the closure — it exists
-/// only after flutter's implicit `pub get`, so keying it split the
-/// pre-build key of a fresh worktree from the key the entry is stored
-/// under, and the headline use case never hit. The bump also retires
-/// every v2 entry: v2 manifests predate the worktree-anchor replay
-/// semantics, and a fresh key space guarantees no entry recorded under
-/// the old classification rules is ever replayed under the new ones.
-const FORMAT_LINE: &[u8] = b"format: bcache-key-v3\n";
+/// v1 is the stable baseline; increment on any breaking change to the
+/// preimage composition or replay semantics. (The pre-1.0 counter sat
+/// at v3 from three in-development changes no user ever saw; with zero
+/// users throughout, it was reset to the clean external baseline —
+/// local caches invalidate once, exactly what the store's
+/// regenerability contract covers.)
+const FORMAT_LINE: &[u8] = b"format: bcache-key-v1\n";
 
 /// Read buffer for streamed hashing: 1 MiB, the crate-wide streaming size.
 const HASH_BUF: usize = 1 << 20;
@@ -156,7 +155,7 @@ pub fn config_key(inputs: &KeyInputs) -> String {
 /// a human can audit and diff (paths contribute their raw bytes).
 ///
 /// ```text
-/// format: bcache-key-v3
+/// format: bcache-key-v1
 /// toolchain.engine_revision <engine revision>
 /// toolchain.flutter_version <flutter version>
 /// toolchain.platform_strong_dill <hex>
@@ -345,7 +344,7 @@ mod tests {
 
     /// The canonical preimage of [`sample_inputs`], spelled out by hand.
     const GOLDEN_PREIMAGE: &str = "\
-format: bcache-key-v3
+format: bcache-key-v1
 toolchain.engine_revision 5d531788691ec3404cac0cee66ead4007b177363
 toolchain.flutter_version 3.47.1
 toolchain.platform_strong_dill 1111111111111111111111111111111111111111111111111111111111111111

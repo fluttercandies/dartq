@@ -72,12 +72,12 @@ pub struct DartqConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildCacheConfig {
-    /// The CAS store root; `~` expands at consumption and the store
-    /// layer appends its layout version. Default
+    /// The CAS store root; `~` expands at consumption, and the store's
+    /// directories sit directly under it (no version segment). Default
     /// `$XDG_CACHE_HOME/dartq/cas`, falling back to
     /// `~/.cache/dartq/cas`.
     pub root: Option<PathBuf>,
-    /// The store size budget in GiB. Default 20.
+    /// The store size budget in GiB. Default 96.
     pub budget_gb: Option<u64>,
     /// Seconds after a hit during which an entry is unevictable.
     /// Default 3600.

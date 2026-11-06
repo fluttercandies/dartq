@@ -208,10 +208,11 @@ pub enum RewriteKind {
     /// Rewrite absolute ingest-worktree-root path bytes to the target
     /// tree's worktree root.
     PathText,
-    /// A `flutter test` kernel-cache dill: same-tree replay stays a
-    /// byte-identical clone, while a replay into a different tree
-    /// rewrites the `file://<ingest-root>/` URI prefixes inside the
-    /// kernel tables to the target tree's root (see
+    /// A kernel dill — a `flutter test` kernel-cache dill or a build
+    /// payload dill (`app.dill`, `kernel_blob.bin`): same-tree replay
+    /// stays a byte-identical clone, while a replay into a different
+    /// tree rewrites the `file://<ingest-root>/` URI prefixes inside
+    /// the kernel tables to the target tree's root (see
     /// [`crate::dill_rewrite`]); a refused rewrite degrades to the
     /// verbatim clone.
     DillUris,
@@ -304,6 +305,16 @@ pub enum NameRule {
     /// dir already holds — frontend_server's initialize-from-dill
     /// validation is the correctness net for a stale payload.
     TestKernelCache,
+    /// The `build bundle` face's asset output dir (flutter_tools 3.47.1
+    /// `build bundle --asset-dir`, default `<buildDir>/flutter_assets`):
+    /// `copy_flutter_bundle`'s outputs — the kernel blob, assets, engine
+    /// snapshots — a fixed project-relative dir, not a hash dir. Its
+    /// files are tracked by the hash dir's `.filecache`, so a fresh tree
+    /// that lacks them reruns the copy target however faithfully the
+    /// hash dir replays. `name_observed` is the project-relative path at
+    /// ingest, provenance only: the replay path is this invocation's
+    /// asset dir, and files land fill-only-missing like everywhere else.
+    AssetDir,
     /// Touched at ingest with no captured template and no verbatim-safe
     /// producer: the name embeds strings this crate cannot recompute, so
     /// materialization skips this dir.
@@ -311,12 +322,14 @@ pub enum NameRule {
 }
 
 /// One recorded directory of a cache entry: a
-/// `.dart_tool/flutter_build/<name>` hash dir, or — for the test face —
-/// the fixed-path kernel-cache dir (see [`NameRule::TestKernelCache`]).
+/// `.dart_tool/flutter_build/<name>` hash dir, or a fixed project-
+/// relative dir — the test face's kernel cache (see
+/// [`NameRule::TestKernelCache`]), the bundle face's asset dir (see
+/// [`NameRule::AssetDir`]).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DirRecord {
-    /// Dir name (hash dirs) or project-relative path (the test kernel
-    /// cache) observed at ingest; provenance, and the replay name for
+    /// Dir name (hash dirs) or project-relative path (the fixed dirs)
+    /// observed at ingest; provenance, and the replay name for
     /// [`NameRule::VerbatimRelative`] only.
     pub name_observed: String,
     pub name_rule: NameRule,
@@ -349,8 +362,9 @@ pub struct EntryManifest {
     pub pub_cache_root: String,
     pub flutter_root_at_ingest: String,
     /// Every dir the ingested run touched — hash dirs sorted by
-    /// [`DirRecord::name_observed`], plus the test kernel-cache dir of a
-    /// `flutter test` run (appended last).
+    /// [`DirRecord::name_observed`], then the fixed dirs: the asset dir
+    /// of a `build bundle` run, the test kernel-cache dir of a `flutter
+    /// test` run.
     pub dirs: Vec<DirRecord>,
     pub defines: BTreeMap<String, String>,
     pub target: TargetSpec,

@@ -205,12 +205,17 @@ impl AssembleArgs {
     /// whatever it starts with; `-x` is short, `-xyz` attaches `yz` to
     /// `-x`; every other token is positional (an assemble target). An
     /// unknown option is assumed value-taking — conservative skipping
-    /// only loses a capture, never misparses a known one.
+    /// only loses a capture, never misparses a known one. Positional
+    /// tokens are recorded as targets only in the COMMAND segment
+    /// (`count_targets`): flutter's target/debug checks iterate the
+    /// command's `argResults.rest` alone, and a stray token before the
+    /// command is neither a target nor a veto.
     fn walk(
         &mut self,
         tokens: &[String],
         slot_of: fn(&str) -> Option<Slot>,
         shorts_of: fn(u8) -> Option<Slot>,
+        count_targets: bool,
     ) -> Result<(), ArgModelError> {
         let mut i = 0;
         let mut options = true;
@@ -270,7 +275,7 @@ impl AssembleArgs {
                     }
                     None => {} // a cluster of unknown short flags
                 }
-            } else {
+            } else if count_targets {
                 self.targets.push(token.to_owned());
                 if let Some(define) = self.pending_define.take() {
                     // The whitespace split of a spaced define value: the
@@ -331,15 +336,18 @@ const MAX_JOIN_VARIANTS: usize = 64;
 
 /// Rebuilds every [`AssembleCapture`] one `flutter assemble` argv can
 /// yield. The first is the argv as tokenized; each positional run
-/// directly following a define value (the ps whitespace split of a
-/// spaced value, e.g. the multi-arch `-dAndroidArchs=… android-arm
-/// android-arm64 android-x64`) additionally yields one capture per
-/// prefix of the run folded back into the value — the split is
+/// directly following a define value additionally yields one capture
+/// per prefix of the run folded back into the value — the split is
 /// unrecoverable from the tokens alone, so every fold stays a candidate
 /// and the outer POST's name verification accepts exactly the variant
-/// whose dir materialized. Every capture carries the define map exactly
-/// as the flutter_tools 3.47.1 `AssembleCommand` assembles it for the
-/// `Environment` factory —
+/// whose dir materialized. That enumeration answers the ps whitespace
+/// split of a spaced value (e.g. the multi-arch `-dAndroidArchs=…
+/// android-arm android-arm64 android-x64`), so `enumerate_joins`
+/// carries the argv's source: `true` for a whitespace-split line, and
+/// `false` for a kernel-read argv whose tokens are exact and yield the
+/// as-tokenized capture alone. Every capture carries the define map
+/// exactly as the flutter_tools 3.47.1 `AssembleCommand` assembles it
+/// for the `Environment` factory —
 ///
 /// * every `-dK=V` value, then every `--dart-define` value
 ///   (padded-standard-base64 `k=v`, decoded to its own top-level key,
@@ -372,18 +380,19 @@ pub fn capture_templates(
     argv: &[String],
     cwd: &Path,
     toolchain_engine_revision: &str,
+    enumerate_joins: bool,
 ) -> Result<Vec<AssembleCapture>, ArgModelError> {
     let at = locate_command(argv).ok_or_else(|| {
         ArgModelError::Unsupported("no `assemble` command token in argv".into())
     })?;
     let mut args = AssembleArgs::default();
-    args.walk(&argv[..at], global_slot, global_short)?;
-    args.walk(&argv[at + 1..], command_slot, short_slot)?;
+    args.walk(&argv[..at], global_slot, global_short, false)?;
+    args.walk(&argv[at + 1..], command_slot, short_slot, true)?;
 
     let mut captures = vec![finish_args(&args, cwd, toolchain_engine_revision)?];
     let runs = std::mem::take(&mut args.orphan_runs);
     let total: usize = runs.iter().map(|run| run.tokens.len() + 1).product();
-    if total <= MAX_JOIN_VARIANTS {
+    if enumerate_joins && total <= MAX_JOIN_VARIANTS {
         // Combination 0 — every fold zero — is the as-tokenized capture
         // already in place; the rest are mixed-radix digits of the runs.
         for combination in 1..total {
@@ -549,9 +558,12 @@ fn deferred_components(targets: &[String], cwd: &Path) -> bool {
 }
 
 /// Whether the pubspec at `cwd` declares `flutter: deferred-components:`.
-/// Line-level: true only for an indented `deferred-components:` key
-/// inside the top-level `flutter:` section. Unreadable or absent pubspec
-/// reads as false.
+/// Line-level: true only for an indented `deferred-components:` KEY
+/// inside the top-level `flutter:` section — first on the line, with or
+/// without an inline value or trailing comment (`[]`, `# note`, a bare
+/// colon all declare, mirroring the manifest parser: any presence of
+/// the key counts; a commented-out line does not). Unreadable or absent
+/// pubspec reads as false.
 fn pubspec_declares_deferred_components(cwd: &Path) -> bool {
     let Ok(text) = fs::read_to_string(cwd.join("pubspec.yaml")) else {
         return false;
@@ -565,7 +577,7 @@ fn pubspec_declares_deferred_components(cwd: &Path) -> bool {
         if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
             in_flutter = false;
         }
-        if in_flutter && line.trim() == "deferred-components:" {
+        if in_flutter && line.trim().starts_with("deferred-components:") {
             return true;
         }
     }
@@ -605,8 +617,8 @@ mod tests {
     /// The as-tokenized parse of one argv: the first of the enumerated
     /// join-variants.
     fn capture_argv(argv: &[String], cwd: &Path, engine_revision: &str) -> AssembleCapture {
-        let mut all =
-            capture_templates(argv, cwd, engine_revision).unwrap_or_else(|err| panic!("{argv:?}: {err}"));
+        let mut all = capture_templates(argv, cwd, engine_revision, true)
+            .unwrap_or_else(|err| panic!("{argv:?}: {err}"));
         assert!(!all.is_empty(), "an Ok capture always has the base parse");
         all.remove(0)
     }
@@ -799,7 +811,7 @@ mod tests {
             "debug_android_application",
         ]);
         let variants =
-            capture_templates(&argv, tmp.path(), ENGINE).expect("the real argv must parse");
+            capture_templates(&argv, tmp.path(), ENGINE, true).expect("the real argv must parse");
         // Two orphan runs — the split archs value (3 folds) and the
         // trailing target after the last define (2 folds) — plus the
         // as-tokenized base: 3 * 2 captures.
@@ -847,7 +859,7 @@ mod tests {
     fn join_variants_fold_each_prefix_of_a_spaced_define_value() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let argv = strings(&["assemble", "-o", "/out", "-dK=a", "b", "c"]);
-        let variants = capture_templates(&argv, tmp.path(), "e").expect("parse");
+        let variants = capture_templates(&argv, tmp.path(), "e", true).expect("parse");
         assert_eq!(variants.len(), 3);
         let values: Vec<&str> = variants
             .iter()
@@ -870,7 +882,7 @@ mod tests {
     fn a_target_after_the_last_define_is_its_own_orphan_run() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let argv = strings(&["assemble", "-o", "/out", "-dA=x", "y", "z", "-dB=1", "t"]);
-        let variants = capture_templates(&argv, tmp.path(), "e").expect("parse");
+        let variants = capture_templates(&argv, tmp.path(), "e", true).expect("parse");
         assert_eq!(variants.len(), 6, "3 A-folds x 2 B-folds");
         let true_parse = variants
             .iter()
@@ -891,7 +903,7 @@ mod tests {
     fn an_argv_without_orphans_yields_the_single_parse() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let argv = strings(&["assemble", "-o", "/out", "t", "-dA=1"]);
-        let variants = capture_templates(&argv, tmp.path(), "e").expect("parse");
+        let variants = capture_templates(&argv, tmp.path(), "e", true).expect("parse");
         assert_eq!(variants.len(), 1);
     }
 
@@ -906,8 +918,31 @@ mod tests {
             tokens.push(format!("-dK{index}=v"));
             tokens.push(format!("o{index}"));
         }
-        let variants = capture_templates(&tokens, tmp.path(), "e").expect("parse");
+        let variants = capture_templates(&tokens, tmp.path(), "e", true).expect("parse");
         assert_eq!(variants.len(), 1, "2^7 folds exceed the budget");
+    }
+
+    /// A kernel-read argv (true NUL-separated elements) is exact: the
+    /// multi-arch define value is one token and the trailing target is a
+    /// real positional — no fold is enumerated, the as-tokenized capture
+    /// is the answer the observer takes.
+    #[test]
+    fn kernel_argv_skips_the_join_variant_enumeration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let argv = strings(&[
+            "assemble",
+            "-o",
+            "/out/release",
+            "-dAndroidArchs=android-arm android-arm64 android-x64",
+            "android_aot_bundle_release",
+        ]);
+        let captures = capture_templates(&argv, tmp.path(), "e", false).expect("parse");
+        assert_eq!(captures.len(), 1, "the exact parse alone");
+        assert_eq!(
+            captures[0].defines.get("AndroidArchs").map(String::as_str),
+            Some("android-arm android-arm64 android-x64"),
+            "the spaced value is captured whole, the target unfolded"
+        );
     }
 
     #[test]
@@ -984,6 +1019,126 @@ mod tests {
         );
     }
 
+    /// The debug veto and the target check see only the COMMAND's
+    /// positional targets — flutter iterates `argResults.rest` — so a
+    /// stray token before `assemble` (here one containing `debug`, the
+    /// shape the old whole-argv check misread into a veto) neither
+    /// vetoes nor counts.
+    #[test]
+    fn deferred_components_checks_only_command_targets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            tmp.path().join("pubspec.yaml"),
+            "name: app\nflutter:\n  deferred-components:\n    - name: big\n",
+        )
+        .expect("pubspec");
+        let deferred = strings(&[
+            "debug-tooling",
+            "assemble",
+            "-o",
+            "/out",
+            "android_aot_deferred_components_bundle_release_android-arm64",
+        ]);
+        assert_eq!(
+            capture_argv(&deferred, tmp.path(), "e")
+                .defines
+                .get("DeferredComponents")
+                .map(String::as_str),
+            Some("true"),
+            "a pre-command token containing `debug` is not a veto"
+        );
+
+        // A debug TARGET after the command still vetoes.
+        let debug_target = strings(&[
+            "assemble",
+            "-o",
+            "/out",
+            "-dBuildMode=release",
+            "debug_android_application",
+            "android_aot_deferred_components_bundle_release_android-arm64",
+        ]);
+        assert_eq!(
+            capture_argv(&debug_target, tmp.path(), "e")
+                .defines
+                .get("DeferredComponents")
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    /// The pubspec declaration matches the manifest parser's key
+    /// presence: `[]`, a trailing comment, and a bare colon all
+    /// declare; a commented-out line and other sections do not.
+    #[test]
+    fn pubspec_deferred_components_accepts_every_declared_spelling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let declared = [
+            "name: app\nflutter:\n  deferred-components:\n    - name: big\n",
+            "name: app\nflutter:\n  deferred-components: []\n",
+            "name: app\nflutter:\n  deferred-components: # none yet\n",
+        ];
+        for pubspec in declared {
+            fs::write(tmp.path().join("pubspec.yaml"), pubspec).expect("pubspec");
+            assert!(
+                pubspec_declares_deferred_components(tmp.path()),
+                "declared: {pubspec:?}"
+            );
+        }
+        let undeclared = [
+            "name: app\nflutter:\n  # deferred-components:\n",
+            "name: app\nflutter:\n  deferred-components-guide: x\n",
+            "name: app\ntest:\n  deferred-components:\n",
+            "name: app\nflutter:\n  uses-material-design: true\n",
+            "name: app\n",
+        ];
+        for pubspec in undeclared {
+            fs::write(tmp.path().join("pubspec.yaml"), pubspec).expect("pubspec");
+            assert!(
+                !pubspec_declares_deferred_components(tmp.path()),
+                "undeclared: {pubspec:?}"
+            );
+        }
+    }
+
+    /// `--output=<value>` and `--output <value>` (and `-o <value>`)
+    /// parse to the same capture — the split form is accepted wherever
+    /// the joined form is (the audit's stale line pointed at a revision
+    /// where it was not; this pins the equivalence).
+    #[test]
+    fn output_split_and_joined_forms_capture_identically() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let joined = strings(&[
+            "assemble",
+            "--output=/out/long",
+            "-dBuildMode=release",
+            "android_aot_bundle_release_android-arm64",
+        ]);
+        let split = strings(&[
+            "assemble",
+            "--output",
+            "/out/long",
+            "-dBuildMode=release",
+            "android_aot_bundle_release_android-arm64",
+        ]);
+        assert_eq!(
+            capture_templates(&joined, tmp.path(), "e", true).expect("joined"),
+            capture_templates(&split, tmp.path(), "e", true).expect("split"),
+            "both spellings yield the same captures"
+        );
+        assert_eq!(
+            capture_argv(&split, tmp.path(), "e").output_dir,
+            "/out/long"
+        );
+
+        // The short spelling in both forms agrees too.
+        let short_split = strings(&["assemble", "-o", "/out/s", "-dA=b"]);
+        let short_attached = strings(&["assemble", "-o/out/s", "-dA=b"]);
+        assert_eq!(
+            capture_argv(&short_split, tmp.path(), "e").output_dir,
+            capture_argv(&short_attached, tmp.path(), "e").output_dir
+        );
+    }
+
     #[test]
     fn rejects_shapes_flutter_rejects() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -998,7 +1153,7 @@ mod tests {
             ),
         ];
         for (argv, why) in bad {
-            let err = capture_templates(&strings(argv), tmp.path(), "e")
+            let err = capture_templates(&strings(argv), tmp.path(), "e", true)
                 .expect_err(why);
             let kind = match err {
                 ArgModelError::Unsupported(_) => "unsupported",

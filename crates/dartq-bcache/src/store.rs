@@ -87,6 +87,8 @@
 //! * `record_hit`: metadata-only — one existence check and one sidecar
 //!   timestamp write; no manifest I/O.
 //! * `used_bytes`: one small counter read — the O(1) budget probe.
+//! * `over_budget`: that counter read plus one `statvfs` — the
+//!   post-ingest gc gate.
 //! * `gc` / `stats`: the only full passes — one pass over the manifests
 //!   plus one walk over the blobs, O(entries + blobs), holding one small
 //!   record per blob. `gc` rebooks the usage counter to what it saw.
@@ -102,7 +104,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BcacheError, Result};
-use crate::fsutil::{clone_file_hashed, mtime_ns, touch};
+use crate::fsutil::{VolumeSpace, clone_file_hashed, mtime_ns, touch, volume_space};
 use crate::types::{BlobId, EntryManifest, StoreStats, blob_id_hex, is_hex_digest};
 
 const BLOBS: &str = "blobs";
@@ -123,6 +125,10 @@ const CHUNK: usize = 1 << 20;
 /// another process (blobs written, manifest not yet published); gc never
 /// deletes them, be they scratch files or unreferenced blobs.
 const IN_FLIGHT_SECS: u64 = 60 * 60;
+
+/// The least free space gc leaves on the store's volume; volumes past
+/// 200 GiB keep 2% of their size instead (see [`eviction_threshold`]).
+const RESERVE_FLOOR_BYTES: u64 = 4 << 30;
 
 /// A store rooted at a caller-chosen directory.
 #[derive(Debug)]
@@ -307,11 +313,21 @@ impl CasStore {
     /// Brings the blobs under `budget_bytes` if it can, then deletes every
     /// blob no remaining manifest references.
     ///
+    /// `budget_bytes` is a ceiling, not a reservation: the pass evicts
+    /// down to `min(budget_bytes, used + available − reserve)` — `used`
+    /// the blob bytes it finds, `available` the free space `statvfs`
+    /// reports for the volume holding the store, `reserve` the larger of
+    /// 4 GiB and 2% of that volume — so a filling disk makes the cache
+    /// give space back before the volume runs out, even under budget. A
+    /// shortfall the cache cannot cover drives the threshold to 0: the
+    /// pass yields everything it may evict. An unmeasurable volume (a
+    /// failed `statvfs`, a non-unix host) leaves the plain budget.
+    ///
     /// Entries are evicted least recently hit first (by the effective hit
     /// time: the newer of the manifest's `last_hit_unix` and the hit
-    /// sidecar's mtime) until the blobs that remain fit the budget. An
-    /// entry hit within `grace_secs` of `now_unix` is never evicted, even
-    /// if the store stays over budget. A manifest that cannot be read or
+    /// sidecar's mtime) until the blobs that remain fit that threshold.
+    /// An entry hit within `grace_secs` of `now_unix` is never evicted,
+    /// even if the store stays over it. A manifest that cannot be read or
     /// decoded is evicted and counted in
     /// [`GcReport::corrupt_manifests`], never fatal — no single bad file
     /// may disable the budget. Scratch files and unreferenced blobs
@@ -335,6 +351,12 @@ impl CasStore {
         }
         let entries = self.scan_entries()?;
         let blobs = self.scan_blobs()?;
+        // Everything this pass could free, and the threshold it evicts
+        // down to. A stats failure is not the build's problem: unknown
+        // space keeps the plain budget.
+        let scanned_bytes: u64 = blobs.iter().map(|blob| blob.len).sum();
+        let threshold =
+            eviction_threshold(budget_bytes, scanned_bytes, volume_space(&self.root).ok());
         let mut report = GcReport {
             entries_before: entries.len() as u64,
             ..GcReport::default()
@@ -385,7 +407,7 @@ impl CasStore {
         let mut evicted = 0;
         let mut grace_edge: Option<u64> = None;
         for (last_hit, _, ids) in &live {
-            if kept <= budget_bytes {
+            if kept <= threshold {
                 break;
             }
             if now_unix.saturating_sub(*last_hit) < grace_secs {
@@ -419,7 +441,6 @@ impl CasStore {
                 Err(e) => return Err(io_at(dir)(e)),
             }
         }
-        let scanned_bytes: u64 = blobs.iter().map(|blob| blob.len).sum();
         let mut blob_bytes_freed = 0u64;
         for blob in &blobs {
             if is_referenced(&refs, &blob.id) || in_flight(blob.secs()) {
@@ -470,14 +491,13 @@ impl CasStore {
     }
 
     /// The bytes currently held by blobs under this root, from the
-    /// running counter — one small file read, no walk. This is the
-    /// O(1) "is the store over budget?" probe for the post-ingest
-    /// opportunistic gc; the number is advisory (concurrent writers can
-    /// lose an update) and every gc pass rewrites it to the truth it
-    /// observed. A missing counter reads as 0; an unparsable one (a
-    /// foreign file; atomic rewrites cannot tear) also reads as 0 and
-    /// heals at the next gc — the probe never fails the budget it
-    /// serves.
+    /// running counter — one small file read, no walk. This is the usage
+    /// side of [`Self::over_budget`], the O(1) post-ingest gc gate; the
+    /// number is advisory (concurrent writers can lose an update) and
+    /// every gc pass rewrites it to the truth it observed. A missing
+    /// counter reads as 0; an unparsable one (a foreign file; atomic
+    /// rewrites cannot tear) also reads as 0 and heals at the next gc —
+    /// the probe never fails the budget it serves.
     pub fn used_bytes(&self) -> Result<u64> {
         let path = self.used_path();
         match fs::read_to_string(&path) {
@@ -485,6 +505,18 @@ impl CasStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
             Err(e) => Err(io_at(&path)(e)),
         }
+    }
+
+    /// Whether the store holds more than a [`Self::gc`] pass with
+    /// `budget_bytes` would keep: the usage counter against the same
+    /// free-space-tightened threshold the pass enforces, so a filling
+    /// volume calls for gc while the store is still under its budget.
+    /// One counter read plus one `statvfs`; an unmeasurable volume
+    /// compares against the plain budget, and only an unreadable
+    /// counter is an error.
+    pub fn over_budget(&self, budget_bytes: u64) -> Result<bool> {
+        let used = self.used_bytes()?;
+        Ok(used > eviction_threshold(budget_bytes, used, volume_space(&self.root).ok()))
     }
 
     /// Adds `delta` to the running usage counter, atomically. A
@@ -792,6 +824,24 @@ impl CasStore {
 struct EntryFacts {
     last_hit_unix: u64,
     blobs: Vec<BlobId>,
+}
+
+/// The size a gc pass shrinks the blobs to: `budget_bytes`, tightened
+/// so the volume keeps `reserve = max(4 GiB, total / 50)` free —
+/// `min(budget, used + available − reserve)`, where `used` is what the
+/// pass can free on top of `available`. The difference saturates at 0
+/// (a shortfall the cache cannot cover alone makes it yield all it may
+/// evict), and the threshold never falls as free space grows. Unknown
+/// space keeps the plain budget.
+fn eviction_threshold(budget_bytes: u64, used_bytes: u64, space: Option<VolumeSpace>) -> u64 {
+    let Some(space) = space else {
+        return budget_bytes;
+    };
+    let reserve = RESERVE_FLOOR_BYTES.max(space.total / 50);
+    let room = used_bytes
+        .saturating_add(space.available)
+        .saturating_sub(reserve);
+    budget_bytes.min(room)
 }
 
 /// One entry found on disk: its directory, and its facts or why lookup
@@ -1483,6 +1533,87 @@ mod tests {
         assert!(!f.store.blob_path(&v1.1).exists());
         assert!(f.store.blob_path(&v2.1).exists());
         assert!(f.store.lookup(&key(1)).unwrap().is_some());
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// A volume of `total_gib` with `available_gib` free.
+    fn volume(available_gib: u64, total_gib: u64) -> Option<VolumeSpace> {
+        Some(VolumeSpace {
+            available: available_gib * GIB,
+            total: total_gib * GIB,
+        })
+    }
+
+    /// A volume with room leaves the configured budget in charge.
+    #[test]
+    fn eviction_threshold_is_the_budget_while_the_volume_has_room() {
+        assert_eq!(
+            eviction_threshold(96 * GIB, 5 * GIB, volume(400, 1000)),
+            96 * GIB
+        );
+        assert_eq!(eviction_threshold(0, 5 * GIB, volume(400, 1000)), 0);
+    }
+
+    /// A volume short of space tightens the threshold so the reserve
+    /// stays free — 2% of a large volume, the 4 GiB floor on a small
+    /// one. It never goes negative (a shortfall the cache cannot cover
+    /// drives it to 0) and never falls as free space grows.
+    #[test]
+    fn eviction_threshold_keeps_the_reserve_free() {
+        // 1000 GiB volume reserves 20 GiB: 30 used + 25 free − 20 = 35.
+        assert_eq!(
+            eviction_threshold(96 * GIB, 30 * GIB, volume(25, 1000)),
+            35 * GIB
+        );
+        // 100 GiB volume: 2% is under the floor, so 4 GiB: 10 + 1 − 4 = 7.
+        assert_eq!(
+            eviction_threshold(96 * GIB, 10 * GIB, volume(1, 100)),
+            7 * GIB
+        );
+        // Full volume, 2 GiB of cache: the 4 GiB reserve is out of reach.
+        assert_eq!(eviction_threshold(96 * GIB, 2 * GIB, volume(0, 100)), 0);
+
+        let mut previous = 0;
+        for free_gib in 0..=200 {
+            let threshold = eviction_threshold(96 * GIB, 30 * GIB, volume(free_gib, 1000));
+            assert!(
+                threshold >= previous,
+                "{free_gib} GiB free: {threshold} < {previous}"
+            );
+            previous = threshold;
+        }
+        assert_eq!(
+            previous,
+            96 * GIB,
+            "room enough hands control back to the budget"
+        );
+    }
+
+    /// Unknown space — a failed `statvfs`, a non-unix host — keeps the
+    /// plain budget whatever the store holds.
+    #[test]
+    fn eviction_threshold_is_the_budget_when_space_is_unknown() {
+        assert_eq!(eviction_threshold(96 * GIB, 5 * GIB, None), 96 * GIB);
+        assert_eq!(eviction_threshold(GIB, 500 * GIB, None), GIB);
+    }
+
+    /// The post-ingest gate reads the usage counter against the
+    /// threshold: an empty store is never over, and stored bytes exceed
+    /// a zero budget whatever the volume.
+    #[test]
+    fn store_over_budget_compares_usage_with_the_threshold() {
+        let f = fixture();
+        assert!(
+            !f.store.over_budget(0).unwrap(),
+            "nothing stored, nothing to free"
+        );
+        let a = source(&f.build, "a", &[b'a'; 10]);
+        put(&f, 1, &[a], 100);
+        assert!(
+            f.store.over_budget(0).unwrap(),
+            "stored bytes exceed a zero budget"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use dartq_bcache::{BcacheError, CasStore, GcReport, StoreStats};
 use crate::config::{BuildCacheConfig, ConfigError, load as load_config};
 
 /// The default store size budget, in GiB.
-const DEFAULT_BUDGET_GB: u64 = 40;
+const DEFAULT_BUDGET_GB: u64 = 96;
 /// The default grace window, in seconds.
 const DEFAULT_GRACE_SECS: u64 = 3600;
 
@@ -35,7 +35,7 @@ const CONFIG_TEMPLATE: &str = "\
 # passthrough until at least one key below is set.
 build_cache:
   # root: ~/.cache/dartq/cas  # CAS store root (~ expands; default honors $XDG_CACHE_HOME)
-  # budget_gb: 40             # store size budget in GiB
+  # budget_gb: 96             # store size budget in GiB
   # grace_secs: 3600          # seconds a recently-hit entry is unevictable
   # flutter: /path/to/flutter # explicit flutter binary (~ expands; default: PATH)
 ";
@@ -470,7 +470,7 @@ mod tests {
         assert!(report.config_written);
         let config = fs::read_to_string(&report.config_path).expect("config");
         assert!(config.contains("build_cache:"));
-        assert!(config.contains("# budget_gb: 40"));
+        assert!(config.contains(&format!("# budget_gb: {DEFAULT_BUDGET_GB} ")));
         assert!(report.shim_installed);
         assert_eq!(
             fs::read_link(&report.shim_path).expect("symlink"),

@@ -22,7 +22,8 @@
 //!    the output dir AND define values re-aimed at this tree otherwise
 //!    (a define carrying an absolute path under the worktree — Xcode's
 //!    `-dSrcRoot`, an absolute `-dTargetFile` — hashes differently
-//!    here, so the recomputed name must follow it), and the
+//!    here, so the recomputed name must follow it), the `build bundle`
+//!    asset dir into this invocation's asset dir, and the
 //!    `flutter test` kernel cache into the build dir's `test_cache` —
 //!    where a cross-tree hit rewrites the dill's embedded `file://` URI
 //!    prefixes to this tree (see [`crate::dill_rewrite`]) so
@@ -61,7 +62,10 @@
 //!    [`DirRecord`] — hash dirs with name and template from an observed
 //!    assemble invocation, or verbatim-replayable on the `build bundle`
 //!    face, or not-replayable provenance otherwise — under the same
-//!    coarse key; a `flutter test` run additionally ingests the
+//!    coarse key; a `build bundle` run adds its asset output dir
+//!    (`copy_flutter_bundle`'s outputs, recorded whenever present so a
+//!    fresh tree's copy target skips too), and a `flutter test` run
+//!    additionally ingests the
 //!    fixed-path kernel-cache dir (`<buildDir>/test_cache`; after a
 //!    rewritten cross-tree hit, flutter rewrites the dill with this
 //!    tree's URIs, and the re-ingest converges the entry onto it — no
@@ -81,10 +85,12 @@
 //!    is re-referenced without reading (see
 //!    [`crate::ingest_scan::scan_entry_files`]) — a warm run stores only
 //!    what flutter actually changed. A hit whose rerun reproduced the
-//!    key AND touched nothing needs no re-ingest; a rerun that rewrote
-//!    outputs always re-ingests, so a hit can never freeze a stale
-//!    entry. Then run gc opportunistically when the store is over
-//!    budget.
+//!    key AND touched nothing needs no re-ingest, and a rerun whose
+//!    outputs reproduce the stored snapshot byte for byte (flutter's
+//!    every-build rewrites of `.filecache` and `outputs.json` included)
+//!    publishes nothing; a rerun that changed outputs always
+//!    re-ingests, so a hit can never freeze a stale entry. Then run gc
+//!    opportunistically when the store is over budget.
 //!
 //! Zero-config lives above this module: with no `build_cache` section
 //! the caller never reaches [`run_shim`] at all.
@@ -129,7 +135,8 @@ pub struct ShimConfig {
     /// CAS store root (default `$XDG_CACHE_HOME/dartq/cas`, falling
     /// back to `~/.cache/dartq/cas`; assembled by the config glue).
     pub store_root: PathBuf,
-    /// Store size budget (default 40 GiB); gc runs when exceeded.
+    /// Store size budget (default 96 GiB); gc runs when exceeded, or
+    /// sooner when the store's volume runs short of its free-space reserve.
     pub budget_bytes: u64,
     /// Seconds after a hit during which an entry is unevictable.
     pub grace_secs: u64,
@@ -483,6 +490,22 @@ pub fn run_shim(
     let test_cache_rel = test_cache_dir
         .strip_prefix(&cwd)
         .map_or_else(|_| test_cache_dir.clone(), Path::to_path_buf);
+    // The `build bundle` face's asset output dir (`--asset-dir`, else
+    // `<buildDir>/flutter_assets`): `copy_flutter_bundle` writes there,
+    // and a tree that lacks it reruns the copy however faithfully the
+    // hash dir replays. A plain project-relative path only — an asset
+    // dir elsewhere is not this tree's to replay.
+    let asset_dir_rel = (parsed.target.command == "build bundle")
+        .then(|| {
+            flag_value(&parsed.target.extra_key_args, "asset-dir")
+                .map_or_else(|| build_dir.join("flutter_assets"), PathBuf::from)
+        })
+        .filter(|path| {
+            !path.as_os_str().is_empty()
+                && path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        });
 
     let mut report = ShimReport {
         action: Action::PreMiss,
@@ -575,6 +598,29 @@ pub fn run_shim(
                     });
                     plan_names.push(test_cache_rel.to_string_lossy().into_owned());
                 }
+                // Like the test cache, the recorded path is provenance:
+                // the asset dir is this invocation's. Its files carry
+                // the same anchor classification as a hash dir's.
+                NameRule::AssetDir => {
+                    let Some(asset_dir) = &asset_dir_rel else {
+                        skipped += 1;
+                        continue;
+                    };
+                    if cross_tree && dir.files.iter().any(|file| file.foreign_paths) {
+                        skipped += 1;
+                        note(&format!(
+                            "dir {} records paths outside the ingest anchors; cross-tree replay refused",
+                            dir.name_observed
+                        ));
+                        continue;
+                    }
+                    dirs.push(DirPlan {
+                        path: asset_dir.clone(),
+                        name_rewrite: None,
+                        files: dir.files.clone(),
+                    });
+                    plan_names.push(asset_dir.to_string_lossy().into_owned());
+                }
                 NameRule::NotReplayable => skipped += 1,
             }
         }
@@ -602,9 +648,10 @@ pub fn run_shim(
                     Ok(outcome) => {
                         report.action = Action::PreHitMaterialized;
                         note(&format!(
-                            "hit {} materialized {} dirs, {skipped} skipped",
+                            "hit {} materialized {} dirs, {skipped} skipped{}",
                             &key[..8],
-                            replayable
+                            replayable,
+                            if outcome.report.intact { " (tree intact)" } else { "" }
                         ));
                         if outcome.report.dill_rewrites > 0
                             || outcome.report.dill_rewrite_refused > 0
@@ -612,6 +659,12 @@ pub fn run_shim(
                             note(&format!(
                                 "dill: {} rewritten, {} verbatim (rewrite refused)",
                                 outcome.report.dill_rewrites, outcome.report.dill_rewrite_refused
+                            ));
+                        }
+                        if outcome.report.filecache_patched > 0 {
+                            note(&format!(
+                                "filecache: {} md5 records re-aimed at rewritten outputs",
+                                outcome.report.filecache_patched
                             ));
                         }
                         report.materialize = Some(outcome.report);
@@ -764,6 +817,14 @@ pub fn run_shim(
                     name: test_cache_rel.to_string_lossy().into_owned(),
                     scan,
                 });
+                // The asset dir rides along on every bundle-face ingest
+                // where it exists, touched or not: a warm run skips
+                // `copy_flutter_bundle` and writes nothing there, and an
+                // entry that dropped the dir would cost the next fresh
+                // tree that copy.
+                let asset_dir = asset_dir_rel
+                    .as_ref()
+                    .map(|rel| (rel.to_string_lossy().into_owned(), cwd.join(rel)));
                 let ingested = CasStore::open(&config.store_root).and_then(|store| {
                     let count = ingest_observed(
                         &store,
@@ -778,6 +839,7 @@ pub fn run_shim(
                         engine_for_names,
                         post_key.clone(),
                         &placed,
+                        asset_dir.as_ref().map(|(name, dir)| (name.as_str(), dir.as_path())),
                         test_scan.as_ref(),
                     )?;
                     maybe_gc(&store, config);
@@ -1257,17 +1319,20 @@ struct TestCacheScan {
 /// the dir is tree-relative and replays verbatim
 /// ([`NameRule::VerbatimRelative`]); anything else is recorded as
 /// [`NameRule::NotReplayable`] provenance. Templates whose dir never
-/// materialized are dropped (a failed or partial assemble). The test
-/// kernel-cache scan, when the run produced one, joins as the entry's
-/// fixed-path dir.
+/// materialized are dropped (a failed or partial assemble). Then the
+/// fixed-path dirs join: the bundle face's `asset_dir` (`(name, path)`)
+/// whenever it holds files ([`NameRule::AssetDir`]), and the test
+/// kernel-cache scan when the run produced one.
 ///
 /// Each dir's scan consults two identities (see
 /// [`crate::ingest_scan`]): the files `placed` by this invocation's own
 /// materialization, and the stamps of the entry currently stored under
 /// `key` whose [`replayed_hash_name`] is the dir — a file either record
 /// proves is re-referenced, so a warm run stores only what flutter
-/// actually changed. Returns the count of files streamed into the
-/// store this run (reused references excluded).
+/// actually changed. A draft that records exactly the stored snapshot
+/// stores nothing at all (see [`same_snapshot`]). Returns the count of
+/// files streamed into the store this run (reused references
+/// excluded).
 ///
 /// # Errors
 ///
@@ -1285,13 +1350,14 @@ fn ingest_observed(
     engine_for_names: &str,
     key: String,
     placed: &[(String, Vec<PlacedFile>)],
+    asset_dir: Option<(&str, &Path)>,
     test_cache: Option<&TestCacheScan>,
 ) -> Result<(u64, ScanSkips)> {
     let bundle_face = parsed.target.command == "build bundle";
     // Decision-time prior: the entry stored under the ingest key.
     let prior = store.lookup(&key)?;
     let mut skips = ScanSkips::default();
-    let mut dirs = Vec::with_capacity(observed.len() + usize::from(test_cache.is_some()));
+    let mut dirs = Vec::with_capacity(observed.len() + 2);
     let mut sources: Vec<(PathBuf, BlobId)> = Vec::new();
     // `observed` is name-sorted, so the DirRecords come out name-sorted.
     for (name, _) in observed {
@@ -1357,6 +1423,38 @@ fn ingest_observed(
         sources.extend(scan.sources);
         skips.add(&scan.skipped);
     }
+    if let Some((name, dir)) = asset_dir
+        && dir.is_dir()
+    {
+        let prior_dir = prior.as_ref().and_then(|manifest| {
+            manifest
+                .dirs
+                .iter()
+                .find(|record| record.name_rule == NameRule::AssetDir)
+        });
+        let placed_dir = placed
+            .iter()
+            .find(|(placed_name, _)| placed_name == name)
+            .map(|(_, files)| files.as_slice());
+        let scan = scan_entry_files(
+            dir,
+            anchors,
+            prior_dir,
+            placed_dir,
+            &|id| store.blob_path(id).is_file(),
+        )?;
+        if !scan.files.is_empty() {
+            dirs.push(DirRecord {
+                name_observed: name.to_owned(),
+                name_rule: NameRule::AssetDir,
+                name_defines: BTreeMap::new(),
+                name_output_dir: String::new(),
+                files: scan.files,
+            });
+            sources.extend(scan.sources);
+            skips.add(&scan.skipped);
+        }
+    }
     if let Some(scan) = test_cache {
         dirs.push(DirRecord {
             name_observed: scan.name.clone(),
@@ -1385,22 +1483,63 @@ fn ingest_observed(
         created_at_unix: prior.as_ref().map_or(now, |manifest| manifest.created_at_unix),
         last_hit_unix: now,
     };
+    // A rerun that reproduced the stored snapshot byte for byte has
+    // nothing to store. That is every warm validate-only build: flutter
+    // rewrites `.filecache`, `outputs.json`, and runtime-skipped stamps
+    // on EVERY build, with identical bytes when nothing changed
+    // (flutter_tools 3.47.1 build_system.dart: `fileCache.persist()` in
+    // `build`'s finally, `outputs.json` right after it), so the publish
+    // would only move those files' recorded stamps — which the next run
+    // moves again. A re-hashed file may keep its stale stamp only while
+    // re-hashing it is cheaper than a publish; a larger one is published
+    // once so its fresh stamp spares every later run the re-read. A
+    // vanished entry (gc between lookup and here) is published afresh.
+    let unchanged = prior.as_ref().is_some_and(|prior| same_snapshot(prior, &draft))
+        && sources.iter().all(|(path, blob)| {
+            store.blob_path(blob).is_file()
+                && fs::metadata(path).is_ok_and(|metadata| metadata.len() <= STALE_STAMP_LIMIT)
+        });
+    if unchanged && store.record_hit(&draft.key).is_ok() {
+        return Ok((0, skips));
+    }
     store.ingest(draft, &sources)?;
     Ok((sources.len() as u64, skips))
 }
 
-/// GC when the store is over budget (the O(1) running usage counter
-/// decides; the full walk only runs once gc actually collects — see
-/// [`CasStore::used_bytes`]). Failures surface as one stderr line and
-/// never affect the build.
+/// The largest re-hashed file an unchanged rerun leaves on a stale
+/// recorded stamp (see [`ingest_observed`]): 1 MiB re-hashes in well
+/// under a millisecond, below the cost of a manifest publish.
+const STALE_STAMP_LIMIT: u64 = 1 << 20;
+
+/// Whether `draft` records exactly `prior`'s snapshot: every field,
+/// dir, name, and file byte (blob) equal — file stamps and the entry
+/// timestamps aside, which are bookkeeping of WHEN, not WHAT.
+fn same_snapshot(prior: &EntryManifest, draft: &EntryManifest) -> bool {
+    let normalized = |manifest: &EntryManifest| {
+        let mut manifest = manifest.clone();
+        manifest.created_at_unix = 0;
+        manifest.last_hit_unix = 0;
+        for file in manifest.dirs.iter_mut().flat_map(|dir| dir.files.iter_mut()) {
+            file.stamp = None;
+        }
+        manifest
+    };
+    normalized(prior) == normalized(draft)
+}
+
+/// GC when the store is over budget or its volume is short of the
+/// free-space reserve (the O(1) running usage counter plus one
+/// `statvfs` decide; the full walk only runs once gc actually collects
+/// — see [`CasStore::over_budget`]). Failures surface as one stderr
+/// line and never affect the build.
 fn maybe_gc(store: &CasStore, config: &ShimConfig) {
-    match store.used_bytes() {
-        Ok(used) if used > config.budget_bytes => {
+    match store.over_budget(config.budget_bytes) {
+        Ok(true) => {
             if let Err(err) = store.gc(config.budget_bytes, config.grace_secs, unix_now()) {
                 note(&err);
             }
         }
-        Ok(_) => {}
+        Ok(false) => {}
         Err(err) => note(&err),
     }
 }

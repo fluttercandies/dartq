@@ -28,10 +28,10 @@
 //! VALUE with embedded spaces (the default multi-arch apk build's
 //! `-dAndroidArchs=android-arm android-arm64 android-x64`) arrives as
 //! ONE element — the whitespace ambiguity of a `ps`-sourced line does
-//! not exist at this source. [`assemble::capture_templates`] still
-//! enumerates join-variants of positional runs (its argv input is also
-//! replayed from whitespace-split fixtures), and the post-run name
-//! check accepts exactly the variant whose dir materialized.
+//! not exist at this source, so kernel argv is captured without the
+//! join-variant enumeration (whitespace-split fixtures replayed
+//! through the [`collect`] test seam keep it, and the post-run name
+//! check accepts exactly the variant whose dir materialized).
 //!
 //! # Miss-window honesty
 //!
@@ -238,17 +238,19 @@ fn sweep(
     engine_revision: &str,
     seen: &mut FxHashSet<[u8; 32]>,
 ) -> Vec<AssembleCapture> {
-    collect(process_argv(), cwd, engine_revision, seen)
+    collect(process_argv(), cwd, engine_revision, seen, false)
 }
 
 /// One poll's classification and parsing over an injected argv list (the
 /// test seam of [`sweep`]): every newly seen flutter-assemble argv
-/// becomes its templates — one, or several join-variants where a
-/// whitespace split of a spaced define value is ambiguous (see
-/// [`assemble::capture_templates`]). An argv that parses to nothing (an
-/// unmodeled shape, a misread token) still counts as seen — retrying it
-/// every poll would only burn the same parse, and skipping it can cost
-/// that dir its template, never misplace one.
+/// becomes its templates. `whitespace_split` tells whether the tokens
+/// came from a whitespace-split line — the `ps`-fixture shape, whose
+/// spaced define values are ambiguous and enumerate join-variants (see
+/// [`assemble::capture_templates`]); the kernel argv of [`sweep`] is
+/// exact and takes the as-tokenized parse alone. An argv that parses to
+/// nothing (an unmodeled shape, a misread token) still counts as seen —
+/// retrying it every poll would only burn the same parse, and skipping
+/// it can cost that dir its template, never misplace one.
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
     allow(dead_code)
@@ -258,6 +260,7 @@ fn collect(
     cwd: &Path,
     engine_revision: &str,
     seen: &mut FxHashSet<[u8; 32]>,
+    whitespace_split: bool,
 ) -> Vec<AssembleCapture> {
     let mut found = Vec::new();
     for argv in argvs {
@@ -272,7 +275,9 @@ fn collect(
         if !seen.insert(*hasher.finalize().as_bytes()) {
             continue; // already captured (or skipped) on an earlier poll
         }
-        if let Ok(captures) = assemble::capture_templates(&argv, cwd, engine_revision) {
+        if let Ok(captures) =
+            assemble::capture_templates(&argv, cwd, engine_revision, whitespace_split)
+        {
             found.extend(captures);
         }
     }
@@ -549,7 +554,9 @@ mod tests {
         cwd: &Path,
         seen: &mut FxHashSet<[u8; 32]>,
     ) -> Vec<AssembleCapture> {
-        collect(argvs.to_vec(), cwd, "enginerev0000000000000000", seen)
+        // Fixture replay keeps the ps heritage: a spaced define value
+        // is split tokens, so the join-variant enumeration runs.
+        collect(argvs.to_vec(), cwd, "enginerev0000000000000000", seen, true)
     }
 
     /// A gradle-shaped assemble argv, as the observer receives it.
@@ -877,6 +884,7 @@ mod tests {
                 tmp.path(),
                 "enginerev0000000000000000",
                 &mut seen,
+                false,
             ) {
                 if capture.output_dir == output_text {
                     found = Some(capture);
@@ -1006,13 +1014,16 @@ mod tests {
         ];
         direct_argv.extend(tokens.iter().cloned());
         let mut seen = FxHashSet::default();
+        // Handed over as the kernel spells it: the exact parse alone,
+        // no join-variants enumerated for the trailing target.
         let direct = collect(
             vec![direct_argv],
             tmp.path(),
             "enginerev0000000000000000",
             &mut seen,
+            false,
         );
-        assert_eq!(direct.len(), 2, "the clean argv: base plus target-fold");
+        assert_eq!(direct.len(), 1, "the clean kernel argv: the exact parse");
         let base = &direct[0];
         assert!(
             captures

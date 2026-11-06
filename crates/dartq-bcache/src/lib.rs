@@ -44,12 +44,14 @@
 //!   paths — and the `flutter_build/<hash>` dir-name segments — flutter
 //!   bakes into its bookkeeping files; on the test face's kernel-cache
 //!   dills replayed into a different tree, the `file://` URI prefixes
-//!   baked into the kernel tables are rewritten too ([`dill_rewrite`]).
+//!   baked into the kernel tables are rewritten too ([`dill_rewrite`]),
+//!   and a placed `.filecache` records the md5 of every file the replay
+//!   rewrote, so flutter's content validation accepts them.
 //! * **Flutter surface** ([`args_model`], [`assemble`], [`ingest_scan`]):
 //!   the flutter argv model that feeds the key, the `flutter assemble`
 //!   argv→template parser, and the post-build scan that turns fresh build
-//!   directories — and, for `flutter test`, the fixed-path kernel-cache
-//!   dir — into an ingest draft.
+//!   directories — and the fixed-path dirs: the `build bundle` asset
+//!   dir, the `flutter test` kernel cache — into an ingest draft.
 //! * **Assemble observer** ([`observer`]): the process-table watch that
 //!   reads the nested `flutter assemble` invocations the platform build
 //!   systems spawn behind the PATH shim, feeding [`assemble`] their argv.

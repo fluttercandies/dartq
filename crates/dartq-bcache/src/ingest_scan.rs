@@ -64,6 +64,61 @@ fn is_token_delimiter(byte: u8) -> bool {
     byte <= 0x20 || byte == b'"' || byte == b'\''
 }
 
+/// The escaped spellings a bookkeeping file may record a path in, on
+/// top of the plain one: depfiles escape spaces (`\ `), JSON escapes
+/// backslashes (`\\`), and a backslash-separator platform writing a
+/// depfile does both. The three forms come in a fixed order so callers
+/// can pair them root-by-root; a form that escapes nothing equals the
+/// plain bytes.
+pub(crate) fn escaped_forms(bytes: &[u8]) -> [Vec<u8>; 3] {
+    let Some(text) = std::str::from_utf8(bytes).ok() else {
+        return std::array::from_fn(|_| bytes.to_vec());
+    };
+    let json = text.replace('\\', "\\\\");
+    let depfile = text.replace(' ', "\\ ");
+    let both = json.replace(' ', "\\ ");
+    [json.into_bytes(), depfile.into_bytes(), both.into_bytes()]
+}
+
+/// Named counts of the files a scan left OUT of the manifest — the
+/// honesty rule: every skip is a counted, surfaced reason, never a
+/// silent hole in an entry.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct ScanSkips {
+    /// A bookkeeping file over the rewrite limit: recorded, it would
+    /// fail every materialization (the hit-time rewrite refuses files
+    /// past the limit), so the entry never carries it — flutter
+    /// rewrites the file itself on the next run.
+    pub oversize_rewrite: u64,
+    /// A symlink or other non-regular file: a manifest records regular
+    /// files only.
+    pub non_regular: u64,
+    /// A file whose name is not UTF-8: manifest paths are UTF-8.
+    pub non_utf8_names: u64,
+}
+
+impl ScanSkips {
+    pub fn total(&self) -> u64 {
+        self.oversize_rewrite + self.non_regular + self.non_utf8_names
+    }
+
+    pub(crate) fn add(&mut self, other: &ScanSkips) {
+        self.oversize_rewrite += other.oversize_rewrite;
+        self.non_regular += other.non_regular;
+        self.non_utf8_names += other.non_utf8_names;
+    }
+}
+
+impl std::fmt::Display for ScanSkips {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} oversized bookkeeping, {} non-regular, {} non-UTF-8 names",
+            self.oversize_rewrite, self.non_regular, self.non_utf8_names
+        )
+    }
+}
+
 /// Streaming classifier of the absolute paths inside a bookkeeping
 /// file. A token delimited per [`is_token_delimiter`] that starts with
 /// `/` (but not `//`, a URL artifact) is classified against the
@@ -88,8 +143,23 @@ impl<'a> ForeignPathScan<'a> {
     }
 
     fn feed(&mut self, window: &[u8]) {
+        let mut escaped = false;
         for &byte in window {
-            if is_token_delimiter(byte) {
+            if escaped {
+                // The byte after a backslash continues the token: the
+                // depfile `\ ` and JSON `\\` spellings of a path are one
+                // token, and its class is decided at the delimiter that
+                // follows the whole thing.
+                if self.token.len() < PATH_TOKEN_CAP {
+                    self.token.push(byte);
+                }
+                escaped = false;
+            } else if byte == b'\\' {
+                if self.token.len() < PATH_TOKEN_CAP {
+                    self.token.push(byte);
+                }
+                escaped = true;
+            } else if is_token_delimiter(byte) {
                 self.end_token();
             } else if self.token.len() < PATH_TOKEN_CAP {
                 self.token.push(byte);
@@ -113,12 +183,39 @@ impl<'a> ForeignPathScan<'a> {
             // unknown, so refuse conservatively (costs a replay, never
             // correctness).
             let truncated = self.token.len() >= PATH_TOKEN_CAP;
-            if truncated || !self.anchors.carries_absolute(&self.token) {
+            // Escaped spellings are undone for the comparison: the
+            // anchors hold real paths, the token may hold their depfile
+            // or JSON spelling.
+            let carries = if self.token.contains(&b'\\') {
+                self.anchors.carries_absolute(&unescape(&self.token))
+            } else {
+                self.anchors.carries_absolute(&self.token)
+            };
+            if truncated || !carries {
                 self.foreign = true;
             }
         }
         self.token.clear();
     }
+}
+
+/// Undoes the backslash escapes of depfile and JSON path spellings:
+/// every `\X` becomes `X`. A trailing lone backslash (a token cut at
+/// the cap) drops off — such tokens are refused as truncated anyway.
+fn unescape(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut escaped = false;
+    for &byte in bytes {
+        if escaped {
+            out.push(byte);
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else {
+            out.push(byte);
+        }
+    }
+    out
 }
 
 /// Streaming classifier of the `file://` URIs a kernel dill embeds.
@@ -226,8 +323,14 @@ enum ByteScan<'a> {
         needles: Vec<memmem::Finder<'a>>,
         foreign: ForeignPathScan<'a>,
     },
-    /// A kernel-cache dill: the `file://` URI scan only.
-    DillUris { foreign: ForeignUriScan<'a> },
+    /// A kernel dill: the `file://` URI scan, plus — on the payload
+    /// face — the worktree-root URI needle whose occurrence marks the
+    /// dill replayable (the test face classifies every non-foreign dill
+    /// as rewriteable and passes `None`).
+    DillUris {
+        foreign: ForeignUriScan<'a>,
+        root_uri: Option<memmem::Finder<'a>>,
+    },
 }
 
 impl ByteScan<'_> {
@@ -236,7 +339,7 @@ impl ByteScan<'_> {
     fn feed_foreign(&mut self, window: &[u8]) {
         match self {
             ByteScan::Bookkeeping { foreign, .. } => foreign.feed(window),
-            ByteScan::DillUris { foreign } => foreign.feed(window),
+            ByteScan::DillUris { foreign, .. } => foreign.feed(window),
         }
     }
 
@@ -247,7 +350,9 @@ impl ByteScan<'_> {
             ByteScan::Bookkeeping { needles, .. } => {
                 needles.iter().any(|needle| needle.find(bytes).is_some())
             }
-            ByteScan::DillUris { .. } => false,
+            ByteScan::DillUris { root_uri, .. } => root_uri
+                .as_ref()
+                .is_some_and(|finder| finder.find(bytes).is_some()),
         }
     }
 
@@ -259,7 +364,9 @@ impl ByteScan<'_> {
                 .map(|needle| needle.needle().len())
                 .max()
                 .unwrap_or(1),
-            ByteScan::DillUris { .. } => 1,
+            ByteScan::DillUris { root_uri, .. } => root_uri
+                .as_ref()
+                .map_or(1, |finder| finder.needle().len()),
         }
     }
 
@@ -267,7 +374,7 @@ impl ByteScan<'_> {
     fn foreign(&mut self) -> bool {
         match self {
             ByteScan::Bookkeeping { foreign, .. } => foreign.finish(),
-            ByteScan::DillUris { foreign } => foreign.finish(),
+            ByteScan::DillUris { foreign, .. } => foreign.finish(),
         }
     }
 }
@@ -343,11 +450,13 @@ pub fn dir_touched_since(dir: &Path, since: SystemTime) -> Result<bool> {
 /// One scanned ingest dir: every file, manifest-shaped and stamped,
 /// and the re-hashed subset — the ingest sources. A file whose identity
 /// a placed or prior record proves (see [`reused_identity`]) is no
-/// source: its bytes are never read.
+/// source: its bytes are never read. `skipped` names and counts the
+/// files the scan left out (see [`ScanSkips`]).
 #[derive(Clone, Debug)]
 pub struct DirScan {
     pub files: Vec<ManifestFile>,
     pub sources: Vec<(PathBuf, BlobId)>,
+    pub skipped: ScanSkips,
 }
 
 /// The known content one scanned file is proven to hold without reading
@@ -426,11 +535,11 @@ fn reused_identity(
 ///
 /// `None` when the dir is missing, untouched since `since` (the run
 /// wrote nothing — nothing to ingest), or holds no kernel-cache file.
+/// Files a manifest cannot represent (a symlink, a non-UTF-8 name) are
+/// skipped with a named count instead of failing the scan.
 ///
 /// # Errors
 ///
-/// [`BcacheError::Unsupported`] for an entry a manifest cannot represent
-/// (a symlink or other non-regular file, a non-UTF-8 name);
 /// [`BcacheError::Io`] when reading or hashing fails.
 pub fn scan_test_cache(
     cache_dir: &Path,
@@ -444,7 +553,8 @@ pub fn scan_test_cache(
         return Ok(None);
     }
     let mut scanned = Vec::new();
-    collect_files(cache_dir, &mut scanned)?;
+    let mut skipped = ScanSkips::default();
+    collect_files(cache_dir, &mut scanned, &mut skipped)?;
     scanned.sort_unstable_by(|a, b| a.relative.cmp(&b.relative));
     let mut files = Vec::new();
     let mut sources = Vec::new();
@@ -460,6 +570,7 @@ pub fn scan_test_cache(
                     file.size,
                     Some(&mut ByteScan::DillUris {
                         foreign: ForeignUriScan::new(anchors),
+                        root_uri: None,
                     }),
                 )?;
                 sources.push((file.absolute.clone(), blob));
@@ -484,7 +595,11 @@ pub fn scan_test_cache(
             stamp: Some(file.stamp),
         });
     }
-    Ok((!files.is_empty()).then_some(DirScan { files, sources }))
+    Ok((!files.is_empty()).then_some(DirScan {
+        files,
+        sources,
+        skipped,
+    }))
 }
 
 /// Whether a file name is one the test kernel cache claims: it contains
@@ -507,14 +622,29 @@ fn is_kernel_cache(path: &Path) -> bool {
 /// contain the WORKTREE root — the anchor a replay rewrites, wider than
 /// the project root so workspace-sibling paths classify too — or the
 /// dir's own `flutter_build/<name>` segment (a name that differs in
-/// another tree must be rewritten there, A4). Everything else — dills,
-/// snapshots, shared libraries, assets — is [`RewriteKind::None`]
-/// whatever it contains, and only bookkeeping files are ever searched.
-/// The search covers the whole file: up to 1 MiB in the buffer that is
-/// hashed, beyond that while the file streams through the hash, so a
-/// root mentioned only in the middle of a large file is found at no
-/// extra I/O. Escaped spellings of the root (depfiles escape spaces as
-/// `\ `, JSON escapes backslashes) are not recognized.
+/// another tree must be rewritten there, A4). Escaped spellings of the
+/// root are recognized as their own needles: depfiles escape spaces as
+/// `\ `, JSON escapes backslashes (see [`escaped_forms`]). A payload
+/// dill (`app.dill`, `kernel_blob.bin`) is classified through its
+/// embedded `file://` URIs: the worktree-root URI occurring makes it
+/// [`RewriteKind::DillUris`]. Unlike the test face there is no foreign
+/// veto — a payload dill's constant pool legitimately carries synthetic
+/// `file://` string literals (URI-shaped constants compiled into the
+/// program), which the prefix-exact rewrite passes through untouched;
+/// without the root URI it is a verbatim clone, never a dir-refusing
+/// foreign record. Everything else — snapshots, shared libraries,
+/// assets — is [`RewriteKind::None`] whatever it contains, and only
+/// bookkeeping files and payload dills are ever searched. The search
+/// covers the whole file: up to 1 MiB in the buffer that is hashed,
+/// beyond that while the file streams through the hash, so a root
+/// mentioned only in the middle of a large file is found at no extra
+/// I/O.
+///
+/// A bookkeeping file over the materializer's rewrite limit is skipped
+/// with a counted reason (see [`ScanSkips::oversize_rewrite`]): the
+/// entry never carries a file every hit would refuse to rewrite.
+/// Symlinks and non-UTF-8 names are skipped and counted the same way
+/// instead of failing the scan.
 ///
 /// The same pass classifies every absolute-path token against
 /// `anchors`: one under neither the worktree root nor a cache root sets
@@ -534,8 +664,6 @@ fn is_kernel_cache(path: &Path) -> bool {
 /// # Errors
 ///
 /// [`BcacheError::Invalid`] for a relative worktree anchor;
-/// [`BcacheError::Unsupported`] for an entry a manifest cannot represent (a
-/// symlink or other non-regular file, a non-UTF-8 name);
 /// [`BcacheError::Io`] when reading fails.
 pub fn scan_entry_files(
     hash_dir: &Path,
@@ -553,7 +681,9 @@ pub fn scan_entry_files(
     // The rewrite needles' bytes: the worktree anchor, plus the dir's
     // own `flutter_build/<name>` segment when the dir is a config-hash
     // dir (its name embeds the ingest tree and must be rewritten in
-    // another tree). Owned, so per-file `Finder`s can borrow them.
+    // another tree) — each in its escaped spellings (depfiles escape
+    // spaces, JSON backslashes). Owned, so per-file `Finder`s can
+    // borrow them.
     let mut needle_bytes = vec![anchors.worktree_root.as_os_str().as_encoded_bytes().to_vec()];
     if let Some(name) = hash_dir
         .file_name()
@@ -562,9 +692,35 @@ pub fn scan_entry_files(
     {
         needle_bytes.push(format!("flutter_build/{name}").into_bytes());
     }
+    let escaped: Vec<Vec<u8>> = needle_bytes
+        .iter()
+        .flat_map(|plain| {
+            escaped_forms(plain)
+                .into_iter()
+                .filter(|escaped| escaped.as_slice() != plain.as_slice())
+        })
+        .collect();
+    needle_bytes.extend(escaped);
+    // The payload face's worktree-rootedness needle: the URI prefix a
+    // kernel dill embeds for sources under the ingest root.
+    let root_uri = {
+        let mut needle = b"file://".to_vec();
+        needle.extend_from_slice(anchors.worktree_root.as_os_str().as_encoded_bytes());
+        needle.push(b'/');
+        needle
+    };
+    let mut skipped = ScanSkips::default();
     let mut scanned = Vec::new();
-    collect_files(hash_dir, &mut scanned)?;
+    collect_files(hash_dir, &mut scanned, &mut skipped)?;
     scanned.sort_unstable_by(|a, b| a.relative.cmp(&b.relative));
+    // A bookkeeping file over the rewrite limit can never materialize
+    // as recorded: leave it out of the entry — flutter rewrites the
+    // file itself on the next run.
+    let oversize = |file: &ScannedFile| {
+        file.bookkeeping && file.size > crate::materialize::REWRITE_LIMIT as u64
+    };
+    skipped.oversize_rewrite += scanned.iter().filter(|file| oversize(file)).count() as u64;
+    scanned.retain(|file| !oversize(file));
     let scanned: Vec<(ManifestFile, Option<(PathBuf, BlobId)>)> = scanned
         .into_par_iter()
         .map(|file| {
@@ -591,6 +747,11 @@ pub fn scan_entry_files(
                         .collect(),
                     foreign: ForeignPathScan::new(anchors),
                 })
+            } else if file.payload_dill {
+                Some(ByteScan::DillUris {
+                    foreign: ForeignUriScan::new(anchors),
+                    root_uri: Some(memmem::Finder::new(&root_uri)),
+                })
             } else {
                 None
             };
@@ -599,12 +760,24 @@ pub fn scan_entry_files(
                 path: PathBuf::from(&file.relative),
                 blob,
                 executable: file.executable,
+                // A payload dill rewrites cross-tree when the worktree
+                // root URI occurs. The test face's foreign veto is
+                // deliberately absent here: a real payload dill's
+                // constant pool carries synthetic `file://` literals
+                // (URI-shaped string constants compiled into the
+                // program) that are data, not references, and the
+                // prefix-exact rewrite passes them through untouched —
+                // one literal must not cost the dill its rewriter.
+                // Without the root URI it stays the verbatim clone it
+                // always was — never a dir-refusing foreign record.
                 rewrite: if file.bookkeeping && mentions {
                     RewriteKind::PathText
+                } else if file.payload_dill && mentions {
+                    RewriteKind::DillUris
                 } else {
                     RewriteKind::None
                 },
-                foreign_paths: foreign,
+                foreign_paths: file.bookkeeping && foreign,
                 stamp: Some(file.stamp),
             };
             Ok((manifest, Some((file.absolute, blob))))
@@ -618,7 +791,18 @@ pub fn scan_entry_files(
         }
         files.push(manifest);
     }
-    Ok(DirScan { files, sources })
+    Ok(DirScan {
+        files,
+        sources,
+        skipped,
+    })
+}
+
+/// Whether a file name is a payload dill whose embedded `file://` URIs
+/// decide its replay class: the kernel payloads `flutter build`
+/// produces (`app.dill`) and the web face's `kernel_blob.bin`.
+fn is_payload_dill(name: &str) -> bool {
+    matches!(name, "app.dill" | "kernel_blob.bin")
 }
 
 fn is_config_hash(name: &str) -> bool {
@@ -654,22 +838,27 @@ struct ScannedFile {
     executable: bool,
     /// Named like a bookkeeping file that may record absolute paths.
     bookkeeping: bool,
+    /// Named like a payload dill whose embedded URIs decide its class.
+    payload_dill: bool,
     /// Filesystem identity, computed from the metadata the walk already
     /// holds; the reuse fast path and the manifest stamps read it.
     stamp: FileStamp,
 }
 
-fn collect_files(hash_dir: &Path, files: &mut Vec<ScannedFile>) -> Result<()> {
+/// Walks `hash_dir` collecting every regular file below it. Files a
+/// manifest cannot represent — a symlink or other non-regular file, a
+/// non-UTF-8 name — are skipped and counted in `skips` (a named
+/// reason, never a failed scan: one odd file must not cost the run its
+/// whole ingest).
+fn collect_files(hash_dir: &Path, files: &mut Vec<ScannedFile>, skips: &mut ScanSkips) -> Result<()> {
     let mut pending = vec![(hash_dir.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = pending.pop() {
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let absolute = entry.path();
             let Ok(name) = entry.file_name().into_string() else {
-                return Err(BcacheError::Unsupported(format!(
-                    "{}: file name is not UTF-8",
-                    absolute.display()
-                )));
+                skips.non_utf8_names += 1;
+                continue;
             };
             let kind = entry.file_type()?;
             if kind.is_dir() {
@@ -678,6 +867,7 @@ fn collect_files(hash_dir: &Path, files: &mut Vec<ScannedFile>) -> Result<()> {
                 let metadata = entry.metadata()?;
                 files.push(ScannedFile {
                     bookkeeping: is_bookkeeping(&name),
+                    payload_dill: is_payload_dill(&name),
                     relative: format!("{prefix}{name}"),
                     absolute,
                     size: metadata.len(),
@@ -685,10 +875,7 @@ fn collect_files(hash_dir: &Path, files: &mut Vec<ScannedFile>) -> Result<()> {
                     stamp: stamp_of(&metadata),
                 });
             } else {
-                return Err(BcacheError::Unsupported(format!(
-                    "{}: not a regular file or directory",
-                    absolute.display()
-                )));
+                skips.non_regular += 1;
             }
         }
     }
@@ -1301,16 +1488,179 @@ mod tests {
         assert_eq!(scanned.sources.len(), 1, "a missing recorded blob re-hashes");
     }
 
+    /// Files a manifest cannot represent are skipped with named
+    /// counts — one symlink or odd name never costs the run its whole
+    /// ingest (the pre-P3 behavior aborted the scan on them).
     #[cfg(unix)]
     #[test]
-    fn scan_rejects_symlinks() {
+    fn scan_skips_unrepresentable_files_with_named_counts() {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("a.stamp"), b"{}");
         std::os::unix::fs::symlink("a.stamp", dir.path().join("b.stamp")).expect("symlink");
-        let err =
+        // A name that is not valid UTF-8 (a raw byte sequence no
+        // manifest path can carry). macOS's kernel refuses to create
+        // such a name at all, so the skip only materializes where the
+        // write lands.
+        let mut expected = ScanSkips {
+            non_regular: 1,
+            ..ScanSkips::default()
+        };
+        if fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"\xff\xfe.stamp")), b"{}").is_ok()
+        {
+            expected.non_utf8_names = 1;
+        }
+
+        let scanned =
             scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
-            .expect_err("symlink");
-        assert!(matches!(err, BcacheError::Unsupported(_)), "{err}");
+                .expect("the scan keeps going");
+        assert_eq!(scanned.skipped, expected);
+        let names: Vec<&str> = scanned
+            .files
+            .iter()
+            .map(|file| file.path.to_str().expect("UTF-8"))
+            .collect();
+        assert_eq!(names, ["a.stamp"], "only the regular file is recorded");
+    }
+
+    /// A bookkeeping file over the rewrite limit is refused at INGEST
+    /// with a counted reason: recorded, it would fail every hit's
+    /// rewrite; left out, the rest of the dir caches and flutter
+    /// rewrites the file itself.
+    #[test]
+    fn scan_skips_oversize_bookkeeping_with_counted_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("app.dill"), b"payload");
+        let mut huge = Vec::new();
+        huge.resize(crate::materialize::REWRITE_LIMIT + 1, b' ');
+        fs::write(dir.path().join("kernel_snapshot_program.d"), &huge).expect("write huge");
+
+        let scanned =
+            scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
+                .expect("scan");
+        assert_eq!(scanned.skipped.oversize_rewrite, 1);
+        assert_eq!(scanned.skipped.total(), 1);
+        let names: Vec<&str> = scanned
+            .files
+            .iter()
+            .map(|file| file.path.to_str().expect("UTF-8"))
+            .collect();
+        assert_eq!(names, ["app.dill"], "the dir's other files are kept");
+
+        // A payload of any size stays eligible (it streams, never
+        // rewrites as text): the app.dill above is recorded — and a
+        // non-bookkeeping file over the limit would be too.
+        assert_eq!(scanned.files[0].rewrite, RewriteKind::None);
+    }
+
+    /// Depfiles spell a root containing spaces in escaped form
+    /// (`\ `): the escaped spelling classifies the file as a rewrite
+    /// candidate and does not mark it foreign — the tree with a space
+    /// in its root caches and replays like any other.
+    #[test]
+    fn scan_matches_the_depfiles_escaped_root_spelling() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let root = project.path().join("work tree");
+        let root_text = root.to_str().expect("UTF-8 path");
+        let escaped = root_text.replace(' ', "\\ ");
+        let hash_dir = root.join(HASH_A);
+        let depfile = format!("{escaped}/build/app.dill: {escaped}/lib/main.dart\n");
+        write(&hash_dir.join("kernel_snapshot_program.d"), depfile.as_bytes());
+        // The plain spelling in the same dir still classifies too.
+        write(
+            &hash_dir.join("outputs.json"),
+            format!(r#"{{"out":["{root_text}/build/app.dill"]}}"#).as_bytes(),
+        );
+
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(&root), None, None, &|_| true)
+            .expect("scan");
+        let by_name = |name: &str| {
+            scanned
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(name))
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        assert_eq!(
+            by_name("kernel_snapshot_program.d").rewrite,
+            RewriteKind::PathText,
+            "the escaped root is a rewrite needle"
+        );
+        assert!(
+            !by_name("kernel_snapshot_program.d").foreign_paths,
+            "the escaped path token classifies as carried, not foreign"
+        );
+        assert_eq!(
+            by_name("outputs.json").rewrite,
+            RewriteKind::PathText,
+            "the plain spelling still classifies"
+        );
+    }
+
+    /// The payload face of the dill classification (A19, reworked by the
+    /// #4069 finding): an `app.dill` (or `kernel_blob.bin`) that embeds
+    /// worktree-rooted `file://` URIs ingests as
+    /// [`RewriteKind::DillUris`] — the existing cross-tree rewrite
+    /// applies to it — EVEN when the constant pool also carries
+    /// synthetic `file://` literals (URI-shaped strings compiled into
+    /// every real program, which the prefix-exact rewrite passes
+    /// through). No root URI at all leaves it the verbatim clone it
+    /// always was, never a dir-refusing foreign record.
+    #[test]
+    fn scan_classifies_payload_dills_by_worktree_uris() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let root = project.path();
+        let root_text = root.to_str().expect("UTF-8 path");
+        let hash_dir = root.join(HASH_A);
+        write(
+            &hash_dir.join("app.dill"),
+            format!(
+                "file://{root_text}/lib/main.dart kernel \
+                 file:///pubs/hosted/pub.dev/widgets-1.0.0/lib/widgets.dart \
+                 file:///path/to/foo file:///root/path/a/b.dart"
+            )
+            .as_bytes(),
+        );
+        write(
+            &hash_dir.join("kernel_blob.bin"),
+            format!("file://{root_text}/lib/main.dart blob").as_bytes(),
+        );
+        write(
+            &hash_dir.join("elsewhere.dill"),
+            format!("file://{root_text}/lib/main.dart").as_bytes(),
+        );
+        // A dill whose only URIs sit outside every anchor.
+        write(
+            &hash_dir.join("sub").join("app.dill"),
+            b"file:///elsewhere/lib/main.dart file:///path/to/foo",
+        );
+
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true)
+            .expect("scan");
+        let kind_of = |path: &str| {
+            scanned
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path}"))
+                .rewrite
+        };
+        // The worktree URI decides; cache-root and synthetic literals
+        // ride along without a veto.
+        assert_eq!(kind_of("app.dill"), RewriteKind::DillUris);
+        assert_eq!(kind_of("kernel_blob.bin"), RewriteKind::DillUris);
+        // A dill by another name is not the payload face: no scan, no
+        // classification, whatever it embeds.
+        assert_eq!(kind_of("elsewhere.dill"), RewriteKind::None);
+        // A payload with no worktree URI stays the verbatim clone — and
+        // never flags the dir.
+        let foreign = scanned
+            .files
+            .iter()
+            .find(|file| file.path == Path::new("sub/app.dill"))
+            .expect("nested payload");
+        assert_eq!(foreign.rewrite, RewriteKind::None);
+        assert!(!foreign.foreign_paths);
     }
 
     #[test]
