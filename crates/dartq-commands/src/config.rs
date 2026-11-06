@@ -180,16 +180,44 @@ pub fn load(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
 }
 
 /// Finds the `dartq.yaml` governing `dir`: the nearest file up the chain
-/// from `dir` to the filesystem root that loads. `Ok(None)`: none exists.
-/// The faces that key off workspace config (the cache maintenance faces,
-/// the build cache) resolve every section from this one governing file, so
-/// one walk answers them all.
+/// from `dir` to the filesystem root, overlaid on the user-level global
+/// config (`~/.dartq/dartq.yaml`) key by key — the project file wins every
+/// key it declares, the global fills the rest, built-in defaults the
+/// remainder. `Ok(None)`: neither exists. The faces that key off workspace
+/// config (the cache maintenance faces, the build cache) resolve every
+/// section from this one governing result, so one walk answers them all.
+/// The global file is read-only to every face: nothing a project run does
+/// ever writes it, so one tree's config cannot leak into another's or into
+/// the machine's.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] on a malformed file (either tier);
+/// [`ConfigError::Io`] when a file exists but cannot be read.
+pub fn discover(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
+    discover_with(dir, std::env::home_dir().as_deref())
+}
+
+/// [`discover`] against an explicit home directory, so the global tier is
+/// testable without touching the user's real `~/.dartq`.
+pub(crate) fn discover_with(
+    dir: &Path,
+    home: Option<&Path>,
+) -> Result<Option<DartqConfig>, ConfigError> {
+    let project = discover_project(dir)?;
+    let global = load_global_at(home)?;
+    Ok(overlay(global, project))
+}
+
+/// The project tier on its own: the nearest `dartq.yaml` up the chain from
+/// `dir` to the filesystem root. Faces that must resolve paths against the
+/// file's own directory (context `path:` locators) still want this root.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
 /// a file exists but cannot be read.
-pub fn discover(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
+fn discover_project(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
     let mut current = dir;
     loop {
         if let Some(config) = load(current)? {
@@ -200,6 +228,88 @@ pub fn discover(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
             None => return Ok(None),
         }
     }
+}
+
+/// Loads the global tier, `<home>/.dartq/dartq.yaml` — machine-level
+/// defaults (store budgets, memory caps) a project file overrides key by
+/// key. `Ok(None)` when the file or the home directory does not exist.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
+/// the file exists but cannot be read.
+fn load_global_at(home: Option<&Path>) -> Result<Option<DartqConfig>, ConfigError> {
+    let Some(home) = home else {
+        return Ok(None);
+    };
+    let text = match fs::read_to_string(home.join(".dartq").join("dartq.yaml")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    parse(&text).map(Some)
+}
+
+/// Two tiers folded into one governing config: every key the project tier
+/// declares wins; the global tier fills the keys it leaves unset. Scalar
+/// sections (`memory`, `cache`) and list-shaped ones (`contexts`,
+/// `packages`) are whole-section — the project tier replaces the global's
+/// section when present. `build_cache` and `generated` merge key by key
+/// inside the section, so a machine-wide `budget_gb` survives a project
+/// that only pins `root`.
+fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<DartqConfig> {
+    let (mut governing, project) = match (global, project) {
+        (Some(global), Some(project)) => (global, project),
+        (global, project) => return global.or(project),
+    };
+    if !project.contexts.is_empty() {
+        governing.contexts = project.contexts;
+    }
+    governing.generated = match (governing.generated, project.generated) {
+        (None, project) => project,
+        (global, None) => global,
+        (Some(mut global), Some(project)) => {
+            if project.include.is_some() {
+                global.include = project.include;
+            }
+            if project.editable.is_some() {
+                global.editable = project.editable;
+            }
+            if project.patterns.is_some() {
+                global.patterns = project.patterns;
+            }
+            Some(global)
+        }
+    };
+    if project.memory.is_some() {
+        governing.memory = project.memory;
+    }
+    if project.cache.is_some() {
+        governing.cache = project.cache;
+    }
+    if project.packages.is_some() {
+        governing.packages = project.packages;
+    }
+    governing.build_cache = match (governing.build_cache, project.build_cache) {
+        (None, project) => project,
+        (global, None) => global,
+        (Some(mut global), Some(project)) => {
+            if project.root.is_some() {
+                global.root = project.root;
+            }
+            if project.budget_gb.is_some() {
+                global.budget_gb = project.budget_gb;
+            }
+            if project.grace_secs.is_some() {
+                global.grace_secs = project.grace_secs;
+            }
+            if project.flutter.is_some() {
+                global.flutter = project.flutter;
+            }
+            Some(global)
+        }
+    };
+    Some(governing)
 }
 
 /// The compat face's axis roots for one invocation: the explicit
@@ -476,6 +586,109 @@ mod tests {
 
     fn write_config(root: &Path, yaml: &str) {
         fs::write(root.join("dartq.yaml"), yaml).expect("config");
+    }
+
+    /// A home directory whose `~/.dartq/dartq.yaml` holds `yaml` (`None`
+    /// leaves the global tier absent), plus a project root.
+    fn tiered(global_yaml: Option<&str>) -> (tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("home");
+        if let Some(yaml) = global_yaml {
+            let dir = home.path().join(".dartq");
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(dir.join("dartq.yaml"), yaml).expect("global");
+        }
+        let project = tempfile::tempdir().expect("project");
+        (home, project)
+    }
+
+    #[test]
+    fn global_fills_keys_the_project_leaves_unset() {
+        let (home, project) = tiered(Some(
+            "version: 1\nbuild_cache:\n  budget_gb: 8\nmemory:\n  limit_mib: 2048\n",
+        ));
+        write_config(
+            project.path(),
+            "version: 1\nbuild_cache:\n  root: /store\n",
+        );
+        let config = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config");
+        let build = config.build_cache.expect("build_cache");
+        assert_eq!(build.root, Some(PathBuf::from("/store")));
+        assert_eq!(build.budget_gb, Some(8));
+        assert_eq!(
+            config.memory.expect("memory").limit_mib,
+            2048,
+            "a project section the project omits falls through to the global"
+        );
+    }
+
+    #[test]
+    fn project_overrides_the_global_key_by_key() {
+        let (home, project) = tiered(Some(
+            "version: 1\nbuild_cache:\n  budget_gb: 8\n  grace_secs: 60\n",
+        ));
+        write_config(
+            project.path(),
+            "version: 1\nbuild_cache:\n  budget_gb: 96\n",
+        );
+        let build = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config")
+            .build_cache
+            .expect("build_cache");
+        assert_eq!(build.budget_gb, Some(96));
+        assert_eq!(
+            build.grace_secs,
+            Some(60),
+            "a key the project omits keeps the global value"
+        );
+    }
+
+    #[test]
+    fn global_alone_governs_and_nothing_yields_none() {
+        let (home, project) = tiered(Some("version: 1\ncache:\n  size_limit_gib: 4\n"));
+        let config = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config");
+        assert_eq!(config.cache.expect("cache").size_limit_gib, 4);
+        let (home, project) = tiered(None);
+        assert!(
+            discover_with(project.path(), Some(home.path()))
+                .expect("discover")
+                .is_none()
+        );
+        assert!(
+            discover_with(project.path(), None)
+                .expect("discover")
+                .is_none(),
+            "no home directory at all still resolves a project-only config world"
+        );
+    }
+
+    #[test]
+    fn malformed_global_is_loud() {
+        let (home, project) = tiered(Some("version: 1\nbuild_cache:\n  budget_gb: [oops\n"));
+        assert!(discover_with(project.path(), Some(home.path())).is_err());
+    }
+
+    #[test]
+    fn contexts_and_packages_replace_the_whole_section() {
+        let (home, project) = tiered(Some(
+            "version: 1\ncontexts:\n  ci:\n    sdk: path:sdks/ci\npackages:\n  include:\n    - packages/*\n",
+        ));
+        write_config(
+            project.path(),
+            "version: 1\ncontexts:\n  local:\n    sdk: system\npackages:\n  exclude:\n    - fixtures/*\n",
+        );
+        let config = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config");
+        let labels: Vec<_> = config.contexts.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["local"], "the project's contexts replace the global's");
+        let packages = config.packages.expect("packages");
+        assert!(packages.include.is_empty(), "section replacement, not a merge");
+        assert_eq!(packages.exclude, ["fixtures/*"]);
     }
 
     /// The config's two contexts are the whole axis set — no explicit

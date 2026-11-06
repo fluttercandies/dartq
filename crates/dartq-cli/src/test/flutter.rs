@@ -47,7 +47,7 @@ use dartq_test::{ExecConfig, Settled, SuiteBlock};
 
 use super::{
     Invocation, NO_TESTS, Outputs, Sink, Tally, complete, delegate_requested, delegate_with,
-    idle_timeout, tally, terminal_width,
+    idle_timeout, impact_sdk, tally, terminal_width, with_selection,
 };
 use crate::exit;
 
@@ -142,8 +142,15 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     {
         return delegate_with(args, true, "integration_test suites present");
     }
+    // Once `--impacted` bounds the run, a delegation hands the tool the
+    // suites the changes reach, not the typed selection.
+    let mut line = Cow::Borrowed(args);
     if let Some(base) = &inv.impacted {
-        match dartq_commands::impact::impacted_tests(&root, None, base) {
+        let sdk = impact_sdk(
+            std::env::var_os("DART_SDK"),
+            Some(flutter_dart(&flutter).as_path()),
+        );
+        match dartq_commands::impact::impacted_tests(&root, sdk.as_deref(), base) {
             Ok(reached) => {
                 let reached: FxHashSet<PathBuf> =
                     reached.iter().map(|rel| root.join(rel)).collect();
@@ -152,6 +159,13 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
                     eprintln!("dartq test: no suite is reachable from the changes since {base}");
                     return exit::CLEAN;
                 }
+                line = Cow::Owned(with_selection(
+                    args,
+                    &inv,
+                    suites
+                        .iter()
+                        .map(|suite| suite.abs.to_string_lossy().into_owned()),
+                ));
             }
             // The conservative fallback — the shared selection cannot bound
             // the change, so everything runs.
@@ -164,13 +178,13 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     // uncertain belongs to the tool.
     let Some(filter) = dartq_test::select::TagFilter::new(&inv.include_tags, &inv.exclude_tags)
     else {
-        return delegate_requested(args, true, inv.stats, "invalid tag selector");
+        return delegate_requested(&line, true, inv.stats, "invalid tag selector");
     };
     let files: Vec<PathBuf> = suites.iter().map(|suite| suite.abs.clone()).collect();
     let selections = dartq_test::select::select_all(&files, &filter);
     if json && selections.contains(&dartq_test::select::Selection::Unknown) {
         return delegate_requested(
-            args,
+            &line,
             true,
             inv.stats,
             "json reporter with an uncertain selection",
@@ -184,7 +198,7 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     // reproduced here, so no shard ever resolves.
     if !inv.no_pub {
         if let Some(reason) = stale_resolution(&root, &flutter) {
-            return delegate_with(args, true, reason);
+            return delegate_with(&line, true, reason);
         }
     }
     let workers = inv.concurrency.or(config.concurrency).unwrap_or_else(|| {
@@ -1672,6 +1686,96 @@ mod tests {
         assert_eq!(
             flutter_dart(Path::new("/sdk/bin/flutter")),
             PathBuf::from("/sdk/bin/cache/dart-sdk/bin/dart")
+        );
+    }
+
+    /// `--impacted` bounds a change with no SDK configured: the semantic
+    /// graph assembles against the Dart SDK bundled in the Flutter SDK the
+    /// run executes, so the suite importing the changed library is selected
+    /// and the suite importing nothing of the package (only `dart:io`, the
+    /// shape of a platform-configuration check) is not. A Flutter SDK
+    /// without its Dart SDK assembles no graph: nothing is bounded, and
+    /// everything runs.
+    #[test]
+    fn impacted_selection_assembles_against_the_tools_sdk() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let base = tmp.path().canonicalize().expect("canonical");
+        let put = |path: PathBuf, content: &str| {
+            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            fs::write(path, content).expect("write");
+        };
+        // A Flutter SDK whose bundled Dart SDK is the synthetic
+        // `dart:core`-only SDK the engine fixtures load.
+        let tool = base.join("flutter");
+        let bundled = tool.join("bin/cache/dart-sdk");
+        put(tool.join("bin/flutter"), "");
+        put(bundled.join("version"), "3.13.1\n");
+        put(
+            bundled.join("lib/libraries.json"),
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        put(
+            bundled.join("lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        // The package, committed, then `lib/a.dart` edited.
+        let root = base.join("app");
+        put(
+            root.join("pubspec.yaml"),
+            "name: app\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        put(
+            root.join("pubspec.lock"),
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        put(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        );
+        put(root.join("lib/a.dart"), "class A {}\n");
+        put(
+            root.join("test/a_test.dart"),
+            "import 'package:app/a.dart';\nvoid main() {}\n",
+        );
+        put(
+            root.join("test/platform_test.dart"),
+            "import 'dart:io';\nvoid main() {}\n",
+        );
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git runs")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "--no-verify", "-m", "fixture"]);
+        put(root.join("lib/a.dart"), "class A2 {}\n");
+        let selection = |toolchain: &Path| {
+            let sdk = impact_sdk(
+                None,
+                Some(flutter_dart(&toolchain.join("bin/flutter")).as_path()),
+            );
+            dartq_commands::impact::impacted_tests(&root, sdk.as_deref(), "HEAD")
+        };
+        assert_eq!(selection(&tool), Ok(vec!["test/a_test.dart".to_owned()]));
+        let bare = base.join("bare");
+        put(bare.join("bin/flutter"), "");
+        let reason = selection(&bare).expect_err("the full-run fallback");
+        assert!(
+            reason.starts_with("cannot assemble the workspace:"),
+            "{reason}"
         );
     }
 

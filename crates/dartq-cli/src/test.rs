@@ -32,9 +32,11 @@
 //!
 //! dartq's own options: `--no-cache` (run everything, store nothing),
 //! `--impacted[=REF]` (run only the suites the changes since REF can reach;
-//! default `HEAD`), `--stats` (one line on stderr saying where suites ran).
+//! default `HEAD` — a delegated run gets those suites as its selection),
+//! `--stats` (one line on stderr saying where suites ran).
 
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -310,6 +312,9 @@ struct Invocation {
     flutter: bool,
     /// Positional selections, as typed.
     paths: Vec<String>,
+    /// Where `paths` sit on the command line: each positional's index, and
+    /// a `--` ending the options with everything after it. Ascending.
+    path_tokens: Vec<usize>,
     /// Options every runner gets, in `--name=value` form, in order.
     pass: Vec<String>,
     reporter: Option<Kind>,
@@ -349,6 +354,7 @@ fn parse(args: &[String]) -> Result<Invocation, ()> {
         let arg = &args[index];
         index += 1;
         if arg == "--" {
+            inv.path_tokens.extend(index - 1..args.len());
             inv.paths.extend(args[index..].iter().cloned());
             break;
         }
@@ -403,6 +409,7 @@ fn parse(args: &[String]) -> Result<Invocation, ()> {
                 _ => (option, (!rest.is_empty()).then_some(rest)),
             }
         } else {
+            inv.path_tokens.push(index - 1);
             inv.paths.push(arg.clone());
             continue;
         };
@@ -542,6 +549,26 @@ fn runner_args(args: &[String]) -> Vec<String> {
         out.push(arg.clone());
     }
     out
+}
+
+/// `args` with its positional selections replaced by `suites`: what a
+/// delegation runs once `--impacted` has bounded the run, so the stock
+/// runner runs the suites the changes reach rather than every suite the
+/// typed selection names.
+fn with_selection(
+    args: &[String],
+    inv: &Invocation,
+    suites: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut line: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| inv.path_tokens.binary_search(index).is_err())
+        .map(|(_, arg)| arg.clone())
+        .collect();
+    line.push("--".to_owned());
+    line.extend(suites);
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,8 +1254,14 @@ fn run(args: &[String]) -> u8 {
         || root
             .join(spell(&selections[0]).unwrap_or_default())
             .is_dir();
+    let dart = dartq_test::host::find("dart");
+    // Once `--impacted` bounds the run, a delegation hands the runner the
+    // suites the changes reach, not the typed selection.
+    let mut line = Cow::Borrowed(args);
     if let Some(base) = &inv.impacted {
-        match dartq_commands::impact::impacted_tests(&root, None, base) {
+        let vm = dart.as_deref().map(vm_executable);
+        let sdk = impact_sdk(std::env::var_os("DART_SDK"), vm.as_deref());
+        match dartq_commands::impact::impacted_tests(&root, sdk.as_deref(), base) {
             Ok(reached) => {
                 let reached: FxHashSet<&str> = reached.iter().map(String::as_str).collect();
                 suites.retain(|suite| {
@@ -1240,6 +1273,11 @@ fn run(args: &[String]) -> u8 {
                     eprintln!("dartq test: no suite is reachable from the changes since {base}");
                     return exit::CLEAN;
                 }
+                line = Cow::Owned(with_selection(
+                    args,
+                    &inv,
+                    suites.iter().map(|suite| suite.spelling.clone()),
+                ));
             }
             // The conservative fallback — the shared selection cannot bound
             // the change, so everything runs.
@@ -1257,7 +1295,7 @@ fn run(args: &[String]) -> u8 {
     if config.selects {
         if json {
             return delegate_requested(
-                args,
+                &line,
                 false,
                 inv.stats,
                 "json reporter with an uncertain selection",
@@ -1266,13 +1304,13 @@ fn run(args: &[String]) -> u8 {
     } else {
         let Some(filter) = dartq_test::select::TagFilter::new(&inv.include_tags, &inv.exclude_tags)
         else {
-            return delegate_requested(args, false, inv.stats, "invalid tag selector");
+            return delegate_requested(&line, false, inv.stats, "invalid tag selector");
         };
         let files: Vec<PathBuf> = suites.iter().map(|suite| suite.abs.clone()).collect();
         let selections = dartq_test::select::select_all(&files, &filter);
         if json && selections.contains(&dartq_test::select::Selection::Unknown) {
             return delegate_requested(
-                args,
+                &line,
                 false,
                 inv.stats,
                 "json reporter with an uncertain selection",
@@ -1281,8 +1319,8 @@ fn run(args: &[String]) -> u8 {
         let mut selections = selections.into_iter();
         suites.retain(|_| selections.next() != Some(dartq_test::select::Selection::Dropped));
     }
-    let Some(dart) = dartq_test::host::find("dart") else {
-        return delegate_with(args, false, "no dart on PATH");
+    let Some(dart) = dart else {
+        return delegate_with(&line, false, "no dart on PATH");
     };
     let workers = inv.concurrency.or(config.concurrency).unwrap_or_else(|| {
         // The runner's default: half the cores, at least one.
@@ -1734,6 +1772,18 @@ fn vm_executable(dart: &Path) -> PathBuf {
     }
 }
 
+/// The SDK root `--impacted` assembles the workspace's semantic graph
+/// against: `env` (`$DART_SDK`, every engine face's SDK root), else the SDK
+/// of `vm` (`<sdk>/bin/dart`), the Dart VM of the toolchain this run
+/// executes — so the selection bounds a change with no SDK configured. An
+/// SDK that does not load fails the selection, and everything runs.
+fn impact_sdk(env: Option<OsString>, vm: Option<&Path>) -> Option<PathBuf> {
+    env.map(PathBuf::from).or_else(|| {
+        vm.and_then(|vm| vm.parent()?.parent())
+            .map(Path::to_path_buf)
+    })
+}
+
 fn idle_timeout() -> Duration {
     std::env::var("DARTQ_TEST_IDLE_TIMEOUT")
         .ok()
@@ -2177,6 +2227,74 @@ mod tests {
         ] {
             assert!(parse(&args(line)).is_err(), "{line:?}");
         }
+    }
+
+    /// A delegation after `--impacted` bounded the run hands the runner the
+    /// bounded suites in place of the typed selection: positionals and a
+    /// `--` with what follows it give way, options keep their values (one
+    /// spelled like a positional), and dartq's own options stay dartq's.
+    #[test]
+    fn bounded_delegation_hands_over_the_selected_suites() {
+        let line = args(&[
+            "test",
+            "--impacted",
+            "-N",
+            "test",
+            "-r",
+            "json",
+            "--",
+            "-weird_test.dart",
+        ]);
+        let inv = parse(&line).expect("parse");
+        assert_eq!(inv.paths, ["test", "-weird_test.dart"]);
+        let bounded = with_selection(&line, &inv, ["test/a_test.dart".to_owned()]);
+        assert_eq!(
+            runner_args(&bounded),
+            ["-N", "test", "-r", "json", "--", "test/a_test.dart"]
+        );
+
+        let line = args(&["--flutter", "--impacted=main", "test", "--no-pub"]);
+        let inv = parse(&line).expect("parse");
+        let suites = ["/p/test/a_test.dart", "/p/test/b_test.dart"].map(str::to_owned);
+        assert_eq!(
+            runner_args(&with_selection(&line, &inv, suites)),
+            [
+                "--no-pub",
+                "--",
+                "/p/test/a_test.dart",
+                "/p/test/b_test.dart"
+            ]
+        );
+    }
+
+    /// `--impacted` assembles against `$DART_SDK` when it is set, else the
+    /// SDK of the toolchain the run executes: a Flutter SDK's bundled Dart
+    /// SDK behind its `bin/dart` script, a Dart SDK's own root behind its VM.
+    #[test]
+    fn impact_sdk_falls_back_to_the_toolchain() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let flutter = root.join("flutter");
+        fs::create_dir_all(flutter.join("bin/cache/dart-sdk/bin")).expect("flutter sdk");
+        fs::write(flutter.join("bin/dart"), "").expect("dart script");
+        fs::write(flutter.join("bin/cache/dart-sdk/bin/dart"), "").expect("bundled vm");
+        let dart_sdk = root.join("dart-sdk");
+        fs::create_dir_all(dart_sdk.join("bin")).expect("dart sdk");
+        fs::write(dart_sdk.join("bin/dart"), "").expect("vm");
+        let sdk_of = |dart: &Path| impact_sdk(None, Some(vm_executable(dart).as_path()));
+        assert_eq!(
+            sdk_of(&flutter.join("bin/dart")),
+            Some(flutter.join("bin/cache/dart-sdk"))
+        );
+        assert_eq!(sdk_of(&dart_sdk.join("bin/dart")), Some(dart_sdk.clone()));
+        assert_eq!(
+            impact_sdk(
+                Some(OsString::from("/env/sdk")),
+                Some(dart_sdk.join("bin/dart").as_path()),
+            ),
+            Some(PathBuf::from("/env/sdk"))
+        );
+        assert_eq!(impact_sdk(None, None), None);
     }
 
     /// Selections are keyed as URI paths: dot segments removed, a

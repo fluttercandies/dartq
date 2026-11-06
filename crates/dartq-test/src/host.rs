@@ -457,10 +457,24 @@ fn lock(file: &File, try_only: bool) -> io::Result<bool> {
     }
 }
 
-/// An executable on `PATH` (`dart`, `flutter`), as `which` finds it.
+/// An executable on `PATH` (`dart`, `flutter`), as `which` finds it, never
+/// this binary itself: `dartq init` puts a `flutter` link to dartq first on
+/// `PATH`, while a run needs the toolchain behind the link.
 #[must_use]
 pub fn find(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let this = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    find_in(std::env::split_paths(&path), name, this.as_deref())
+}
+
+/// [`find`] over `dirs`, skipping every candidate that resolves to `this`
+/// (the running binary's canonical path; `None` skips nothing). A candidate
+/// that does not resolve is not this binary.
+fn find_in(
+    dirs: impl IntoIterator<Item = PathBuf>,
+    name: &str,
+    this: Option<&Path>,
+) -> Option<PathBuf> {
     let names: &[String] = &if cfg!(windows) {
         vec![
             format!("{name}.exe"),
@@ -470,11 +484,13 @@ pub fn find(name: &str) -> Option<PathBuf> {
     } else {
         vec![name.to_owned()]
     };
-    std::env::split_paths(&path).find_map(|dir| {
-        names
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|candidate| candidate.is_file())
+    dirs.into_iter().find_map(|dir| {
+        names.iter().map(|name| dir.join(name)).find(|candidate| {
+            candidate.is_file()
+                && this.is_none_or(|this| {
+                    std::fs::canonicalize(candidate).ok().as_deref() != Some(this)
+                })
+        })
     })
 }
 
@@ -731,5 +747,87 @@ mod tests {
         assert_eq!(Profile::GROUPED.measurement(12 * unit, 0, 7, 2), Some(2));
         // Nothing sampled.
         assert_eq!(grouped.measurement(0, 0, 4, 1), None);
+    }
+
+    /// `PATH` directories for the lookup tests: `shim` holds a `flutter`
+    /// link to this test binary (the `dartq init` shape), `sdk` and `other`
+    /// a real `flutter` each, `dangling` a `flutter` link to nothing.
+    struct Dirs {
+        _tmp: tempfile::TempDir,
+        shim: PathBuf,
+        dangling: PathBuf,
+        sdk: PathBuf,
+        other: PathBuf,
+    }
+
+    fn dirs() -> Dirs {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = |name: &str| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("dir");
+            dir
+        };
+        let shim = dir("shim");
+        let dangling = dir("dangling");
+        let sdk = dir("sdk");
+        let other = dir("other");
+        let exe = std::env::current_exe().expect("test binary");
+        std::os::unix::fs::symlink(&exe, shim.join("flutter")).expect("shim link");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), dangling.join("flutter"))
+            .expect("dangling link");
+        std::fs::write(sdk.join("flutter"), "").expect("sdk tool");
+        std::fs::write(other.join("flutter"), "").expect("other tool");
+        Dirs {
+            _tmp: tmp,
+            shim,
+            dangling,
+            sdk,
+            other,
+        }
+    }
+
+    /// The running binary's canonical path, as [`find`] resolves it.
+    fn this() -> PathBuf {
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .expect("test binary resolves")
+    }
+
+    /// The `dartq init` state: a `flutter` link to this very binary first
+    /// on `PATH` is passed over for the real tool behind it.
+    #[test]
+    fn find_skips_a_link_to_this_binary() {
+        let dirs = dirs();
+        let found = find_in(
+            [dirs.shim.clone(), dirs.sdk.clone()],
+            "flutter",
+            Some(this().as_path()),
+        );
+        assert_eq!(found, Some(dirs.sdk.join("flutter")));
+    }
+
+    /// With nothing resolving to this binary the scan is `which`'s: the
+    /// first directory holding a file of the name wins, and a link that
+    /// resolves nowhere neither matches nor stops the scan.
+    #[test]
+    fn find_without_a_self_match_takes_the_first_file() {
+        let dirs = dirs();
+        let found = find_in(
+            [dirs.dangling.clone(), dirs.sdk.clone(), dirs.other.clone()],
+            "flutter",
+            Some(this().as_path()),
+        );
+        assert_eq!(found, Some(dirs.sdk.join("flutter")));
+        let alone = find_in([dirs.dangling.clone()], "flutter", Some(this().as_path()));
+        assert_eq!(alone, None);
+    }
+
+    /// Where the running binary does not resolve, nothing is skipped: the
+    /// lookup degrades to the plain scan, link to this binary included.
+    #[test]
+    fn find_without_this_binary_skips_nothing() {
+        let dirs = dirs();
+        let found = find_in([dirs.shim.clone(), dirs.sdk.clone()], "flutter", None);
+        assert_eq!(found, Some(dirs.shim.join("flutter")));
     }
 }

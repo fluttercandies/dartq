@@ -85,7 +85,17 @@ impl CacheConfig {
     ///
     /// [`ConfigError`] as [`crate::config::discover`] reports it.
     pub fn discover(dir: &Path) -> Result<Self, ConfigError> {
-        let governing = crate::config::discover(dir)?;
+        Self::discover_with_home(dir, std::env::home_dir().as_deref())
+    }
+
+    /// [`Self::discover`] against an explicit home directory, so tests are
+    /// independent of the developer's real `~/.dartq/dartq.yaml` global
+    /// tier.
+    pub(crate) fn discover_with_home(
+        dir: &Path,
+        home: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        let governing = crate::config::discover_with(dir, home)?;
         let limit = governing
             .as_ref()
             .and_then(|config| config.cache)
@@ -975,14 +985,14 @@ mod tests {
         let yaml = scratch.0.join("dartq.yaml");
         fs::write(&yaml, "build_cache:\n  root: /fixture/cas\n").expect("config");
 
-        let config = CacheConfig::discover(&scratch.0).expect("discover");
+        let config = CacheConfig::discover_with_home(&scratch.0, None).expect("discover");
 
         assert_eq!(config.bcache.store_root, PathBuf::from("/fixture/cas"));
         assert_eq!(config.snapshot.root, None);
 
         fs::write(&yaml, "build_cache:\n  typo: 1\n").expect("config");
         assert!(matches!(
-            CacheConfig::discover(&scratch.0),
+            CacheConfig::discover_with_home(&scratch.0, None),
             Err(ConfigError::Invalid(_))
         ));
     }
@@ -1001,7 +1011,7 @@ mod tests {
         )
         .expect("config");
 
-        let config = CacheConfig::discover(&scratch.0.join("nested/deep")).expect("discover");
+        let config = CacheConfig::discover_with_home(&scratch.0.join("nested/deep"), None).expect("discover");
 
         assert_eq!(config.snapshot.capacity_bytes, 2 << 30);
         assert_eq!(
@@ -1022,7 +1032,7 @@ mod tests {
     #[test]
     fn discover_without_the_cache_section_keeps_store_defaults() {
         let scratch = Scratch::ticket("discover-defaults");
-        let config = CacheConfig::discover(&scratch.0).expect("no config file");
+        let config = CacheConfig::discover_with_home(&scratch.0, None).expect("no config file");
         assert_eq!(config.snapshot.capacity_bytes, DEFAULT_CAPACITY_BYTES);
         assert_eq!(
             config.content.as_ref().expect("content").size_limit,
@@ -1034,7 +1044,7 @@ mod tests {
             "build_cache:\n  root: /fixture/cas\n",
         )
         .expect("config");
-        let config = CacheConfig::discover(&scratch.0).expect("config without the section");
+        let config = CacheConfig::discover_with_home(&scratch.0, None).expect("config without the section");
         assert_eq!(config.snapshot.capacity_bytes, DEFAULT_CAPACITY_BYTES);
         assert_eq!(
             config.content.as_ref().expect("content").size_limit,
@@ -1054,7 +1064,7 @@ mod tests {
         let scratch = Scratch::ticket("gc-configured");
         fs::write(&scratch.0.join("dartq.yaml"), "cache:\n  size_limit_gib: 1\n")
             .expect("config");
-        let discovered = CacheConfig::discover(&scratch.0).expect("discover");
+        let discovered = CacheConfig::discover_with_home(&scratch.0, None).expect("discover");
         let cap = 1 << 30;
         assert_eq!(discovered.snapshot.capacity_bytes, cap);
         assert_eq!(

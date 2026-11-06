@@ -364,7 +364,12 @@ Caps live in `dartq.yaml`: `cache.size_limit_gib` bounds both analysis
 stores (snapshots and content store; each defaults to 10 GiB), and
 `build_cache.budget_gb` bounds the build cache (default 96 GiB). The
 analyze and daemon `--cache-size-limit` flag overrides the content cap for
-the run that arms it.
+the run that arms it. Config resolves in two tiers: a global
+`~/.dartq/dartq.yaml` supplies machine-level defaults and the project's
+`dartq.yaml` wins key by key (`build_cache` and `generated` merge per key
+inside the section; `contexts`, `packages`, `memory`, `cache` replace the
+whole section). The global file is read-only to every face — a project run
+never writes it.
 
 ## Performance
 
