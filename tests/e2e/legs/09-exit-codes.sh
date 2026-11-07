@@ -25,19 +25,19 @@ legs_09_run() {
 
   leg_begin rc-ladder "the analyze severity ladder (0/1/2/3) with fatal flags"
   # Info severity: clean by default, 1 under --fatal-infos.
-  run_dartq_in rc-info "$base/info" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in rc-info "$base/info" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 0 "an info-only tree exits 0 by default"
-  run_dartq_in rc-info-fatal "$base/info" analyze --sdk-path "$base/sdk" --fatal-infos lib
+  run_dartq_in rc-info-fatal "$base/info" analyze --engine --sdk-path "$base/sdk" --fatal-infos lib
   assert_eq "$DQ_RC" 1 "an info-only tree exits 1 under --fatal-infos"
   # Warning severity: 2 by default (fatal warnings), 0 negated.
-  run_dartq_in rc-warn "$base/warning" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in rc-warn "$base/warning" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 2 "a warning-only tree exits 2 by default"
-  run_dartq_in rc-warn-no "$base/warning" analyze --sdk-path "$base/sdk" --no-fatal-warnings lib
+  run_dartq_in rc-warn-no "$base/warning" analyze --engine --sdk-path "$base/sdk" --no-fatal-warnings lib
   assert_eq "$DQ_RC" 0 "a warning-only tree exits 0 under --no-fatal-warnings"
   # Error severity: always 3.
-  run_dartq_in rc-err "$base/error" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in rc-err "$base/error" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 3 "an error tree exits 3"
-  run_dartq_in rc-err-no "$base/error" analyze --sdk-path "$base/sdk" --no-fatal-warnings lib
+  run_dartq_in rc-err-no "$base/error" analyze --engine --sdk-path "$base/sdk" --no-fatal-warnings lib
   assert_eq "$DQ_RC" 3 "errors stay fatal regardless of the warning flags"
   # The syntax-error face without any options file is also tier 3.
   # (Recovery shapes with an unbalanced/missing body delimiter —
@@ -48,12 +48,12 @@ legs_09_run() {
   make_pkg "$base/syn" "rc_syn"
   wf "$base/syn/lib/main.dart" 'int main() => 1 oops;
 '
-  run_dartq_in rc-syn "$base/syn" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in rc-syn "$base/syn" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 3 "a parser error exits 3"
 
   leg_begin rc-usage "usage errors are 64 across the verbs"
   # analyze: a missing target.
-  run_dartq_in rc-an-missing "$base/syn" analyze /nonexistent/dq_e2e
+  run_dartq_in rc-an-missing "$base/syn" analyze --engine /nonexistent/dq_e2e
   assert_eq "$DQ_RC" 64 "analyze on a missing target is usage"
   # query: a missing dir (no pubspec → no workspace).
   run_dartq rc-q-missing query symbol nope "$base/rc-missing-dir"
@@ -84,7 +84,7 @@ legs_09_run() {
   # The top level: an unknown verb is the clap usage error.
   run_dartq rc-unknown-verb no-such-verb
   assert_eq "$DQ_RC" 64 "an unknown verb is usage"
-  run_dartq rc-unknown-flag analyze --bogus-flag lib
+  run_dartq rc-unknown-flag analyze --engine --bogus-flag lib
   assert_eq "$DQ_RC" 64 "an unknown flag is usage"
 
   leg_begin rc-version "the version faces exit 0"

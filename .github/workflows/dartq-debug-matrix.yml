@@ -157,7 +157,7 @@ jobs:
         run: |
           set -euo pipefail
           code=0
-          out="$("$DARTQ" analyze --format=json "$SMOKE/pkg")" || code=$?
+          out="$("$DARTQ" analyze --engine --format=json "$SMOKE/pkg")" || code=$?
           if [ "$code" -ne 0 ]; then
             echo "::error::clean analyze exited $code (expected 0)"
             printf '%s\n' "$out"
@@ -194,7 +194,7 @@ jobs:
           class {
           EOF
           code=0
-          out="$("$DARTQ" analyze --format=json --sdk "$DART_SDK" "$SMOKE/pkg")" || code=$?
+          out="$("$DARTQ" analyze --engine --format=json --sdk "$DART_SDK" "$SMOKE/pkg")" || code=$?
           printf '%s\n' "$out"
           if [ "$code" -ne 3 ]; then
             echo "::error::broken analyze exited $code (expected 3, ERROR severity)"

@@ -1415,6 +1415,7 @@ Future<void> runCmd(List<String> args, Stopwatch watch) async {
     if (dartqBin != null) {
       dq = await runProcess(dartqBin, [
         'analyze',
+        '--engine',
         '--cold',
         '--format=json',
         '--sdk',

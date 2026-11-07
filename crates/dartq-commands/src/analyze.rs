@@ -4,6 +4,11 @@
 //! 707): severity, file path, position, message. Position order is the
 //! UTF-16 offset (line/column are monotone in it), so no line-column
 //! computation is spent on sorting.
+//!
+//! The analyze face's default backend is the official analyzer, delegated to
+//! through [`official`]; the engine pass here is the `--engine` backend.
+
+pub mod official;
 
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};

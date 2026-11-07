@@ -374,10 +374,10 @@ pub fn oracle_command(sdk_bin: &Path, chunk_dir: &Path) -> Command {
     command
 }
 
-/// The dartq command: `<bin> analyze --cold --format=json [--sdk-path S] <chunk>`.
+/// The dartq command: `<bin> analyze --engine --cold --format=json [--sdk-path S] <chunk>`.
 pub fn dartq_command(bin: &Path, sdk: Option<&Path>, chunk_dir: &Path) -> Command {
     let mut command = Command::new(bin);
-    command.arg("analyze").arg("--cold").arg("--format=json");
+    command.arg("analyze").arg("--engine").arg("--cold").arg("--format=json");
     if let Some(sdk) = sdk {
         command.arg(format!("--sdk-path={}", sdk.display()));
     }
@@ -527,7 +527,7 @@ mod tests {
         );
         assert_eq!(
             debug,
-            r#""/bin/dartq" "analyze" "--cold" "--format=json" "--sdk-path=/sdk" "/chunk""#
+            r#""/bin/dartq" "analyze" "--engine" "--cold" "--format=json" "--sdk-path=/sdk" "/chunk""#
         );
         let debug = format!(
             "{:?}",

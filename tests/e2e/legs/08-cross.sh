@@ -17,17 +17,17 @@ legs_08_run() {
 '
   # One-shot: clean → inject an error → the error appears; fix the file →
   # clean again (both directions, no stale carry-over).
-  run_dartq_in ed-clean "$base/ed" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in ed-clean "$base/ed" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 0 "the clean tree analyzes clean"
   wf "$base/ed/lib/main.dart" 'int main() => 1 oops;
 '
-  run_dartq_in ed-dirty "$base/ed" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in ed-dirty "$base/ed" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 3 "the injected error flips the exit tier"
   assert_contains "$(cat "$(out_file ed-dirty)")" "expected_token" \
     "the second command reports the new diagnostic"
   wf "$base/ed/lib/main.dart" 'int main() => 1;
 '
-  run_dartq_in ed-clean2 "$base/ed" analyze --sdk-path "$base/sdk" lib
+  run_dartq_in ed-clean2 "$base/ed" analyze --engine --sdk-path "$base/sdk" lib
   assert_eq "$DQ_RC" 0 "the reverted file is clean again (no stale rows)"
 
   # Resident: the same delta through the session's engine (MCP analyze).
@@ -84,10 +84,10 @@ int main() => alpha();
   wf "$base/cc/lib/alpha.dart" 'int alpha() => 1;
 '
   local a_rc=0 b_rc=0
-  ( cd "$base/cc" && "$DARTQ" analyze --sdk-path "$base/sdk" lib >"$EVIDENCE/cc-a.out" 2>"$EVIDENCE/cc-a.err" ) || a_rc=$?
-  ( cd "$base/cc" && "$DARTQ" analyze --sdk-path "$base/sdk" lib >"$EVIDENCE/cc-b.out" 2>"$EVIDENCE/cc-b.err" ) &
+  ( cd "$base/cc" && "$DARTQ" analyze --engine --sdk-path "$base/sdk" lib >"$EVIDENCE/cc-a.out" 2>"$EVIDENCE/cc-a.err" ) || a_rc=$?
+  ( cd "$base/cc" && "$DARTQ" analyze --engine --sdk-path "$base/sdk" lib >"$EVIDENCE/cc-b.out" 2>"$EVIDENCE/cc-b.err" ) &
   local bg=$!
-  ( cd "$base/cc" && "$DARTQ" analyze --sdk-path "$base/sdk" lib >"$EVIDENCE/cc-a2.out" 2>"$EVIDENCE/cc-a2.err" ) || a_rc=$?
+  ( cd "$base/cc" && "$DARTQ" analyze --engine --sdk-path "$base/sdk" lib >"$EVIDENCE/cc-a2.out" 2>"$EVIDENCE/cc-a2.err" ) || a_rc=$?
   wait "$bg" || b_rc=$?
   assert_eq "$a_rc" 0 "the foreground user succeeds"
   assert_eq "$b_rc" 0 "the background user succeeds"
@@ -121,7 +121,7 @@ int main() => extra();
   # Before: the resolution does not know dep — the import dangles.
   ( cd "$base/pg" && "$DARTQ_DART_SDK/bin/dart" pub get ) >"$EVIDENCE/pg-get1.log" 2>&1
   assert_eq "$?" 0 "the first pub get succeeds"
-  run_dartq_in pg-before "$base/pg" analyze --sdk-path "$DARTQ_DART_SDK"
+  run_dartq_in pg-before "$base/pg" analyze --engine --sdk-path "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 3 "the dangling import is an error before the dependency exists"
   # The dependency joins the pubspec; a real pub get resolves it.
   make_pkg "$base/dep" "dep"
@@ -149,7 +149,7 @@ dependencies:
     "the path dependency is now a work point (kinded by its consumer)"
   assert_contains "$(cat "$(out_file pg-packages)")" '"name":"dep"' \
     "the dependency names itself"
-  run_dartq_in pg-after "$base/pg" analyze --sdk-path "$DARTQ_DART_SDK"
+  run_dartq_in pg-after "$base/pg" analyze --engine --sdk-path "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 0 "the once-dangling import now resolves (no stale universe)"
   # The resident engine answers over the same changed tree.
   cat >"$EVIDENCE/pg-mcp.json" <<'SCRIPT'

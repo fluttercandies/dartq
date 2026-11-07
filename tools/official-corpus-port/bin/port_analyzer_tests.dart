@@ -417,7 +417,7 @@ Future<void> runCommand(List<String> args) async {
     );
     var dq = await _runTool(
       dartqBin,
-      ['analyze', '--cold', '--format=json', '--sdk', sdkReal, pkgReal],
+      ['analyze', '--engine', '--cold', '--format=json', '--sdk', sdkReal, pkgReal],
       '$outDir/$pkg.dq.json',
       '$outDir/$pkg.dq.log',
       checkLog: false,

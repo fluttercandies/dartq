@@ -12,9 +12,9 @@
 # with one deterministic caliber, uniform across legs:
 #
 #   corpus (a staged clone — the original tree is never written):
-#     lon    : dartq analyze --format=lon (the constant default face — the
-#              product's real token cost; short-vocabulary {v diags:[...]})
-#     json   : dartq analyze --format=json (the oracle-parity envelope —
+#     lon    : dartq analyze --engine --format=lon (the constant default face —
+#              the product's real token cost; short-vocabulary {v diags:[...]})
+#     json   : dartq analyze --engine --format=json (the oracle-parity envelope —
 #              the machine face's successor for jq consumers)
 #     oracle : dart analyze --format=machine
 #
@@ -199,8 +199,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  stage: cp -Rc $CORPUS/. -> $OUT/staging/ (clonefile, cp fallback)${MAX_FILES:+; selective copy of files.manifest}"
   echo "    + synthesize staging/{pubspec.yaml,.dart_tool/package_config.json} when the corpus lacks them (self rootUri ../, languageVersion 3.13)"
   echo "  corpus legs on $OUT/staging:"
-  echo "    $dartq_bin analyze --format=lon --sdk $sdk_desc <staging> (the constant default face)"
-  echo "    $dartq_bin analyze --format=json --sdk $sdk_desc <staging>"
+  echo "    $dartq_bin analyze --engine --format=lon --sdk $sdk_desc <staging> (the constant default face)"
+  echo "    $dartq_bin analyze --engine --format=json --sdk $sdk_desc <staging>"
   echo "    $sdk_desc/bin/dart analyze --format=machine <staging>"
   echo "  fixture legs (check face) on $FIXTURE and $MULTI_FIXTURE: the same three each, oracle via dart analyze --format=machine"
   echo "  gates: G1 single-fixture lon <= 120 tokens; G2 multi-fixture lon saving >= 50% vs multi-fixture oracle"
@@ -295,18 +295,18 @@ run_leg() { # $1 leg name; rest = command words
 }
 
 echo "token-cost-bench: corpus legs on $STAGE"
-run_leg lon "$DARTQ_BIN" analyze --format=lon --sdk "$DARTQ_DART_SDK" "$STAGE"
-run_leg json "$DARTQ_BIN" analyze --format=json --sdk "$DARTQ_DART_SDK" "$STAGE"
+run_leg lon "$DARTQ_BIN" analyze --engine --format=lon --sdk "$DARTQ_DART_SDK" "$STAGE"
+run_leg json "$DARTQ_BIN" analyze --engine --format=json --sdk "$DARTQ_DART_SDK" "$STAGE"
 run_leg oracle "$DART" analyze --format=machine "$STAGE"
 
 echo "token-cost-bench: fixture legs on $FIXTURE (check face)"
-run_leg fixture-lon "$DARTQ_BIN" check --format=lon "$FIXTURE"
-run_leg fixture-json "$DARTQ_BIN" check --format=json "$FIXTURE"
+run_leg fixture-lon "$DARTQ_BIN" check --engine --format=lon "$FIXTURE"
+run_leg fixture-json "$DARTQ_BIN" check --engine --format=json "$FIXTURE"
 run_leg fixture-oracle "$DART" analyze --format=machine "$FIXTURE"
 
 echo "token-cost-bench: fixture legs on $MULTI_FIXTURE (check face)"
-run_leg multi-lon "$DARTQ_BIN" check --format=lon "$MULTI_FIXTURE"
-run_leg multi-json "$DARTQ_BIN" check --format=json "$MULTI_FIXTURE"
+run_leg multi-lon "$DARTQ_BIN" check --engine --format=lon "$MULTI_FIXTURE"
+run_leg multi-json "$DARTQ_BIN" check --engine --format=json "$MULTI_FIXTURE"
 run_leg multi-oracle "$DART" analyze --format=machine "$MULTI_FIXTURE"
 
 # --- fixture integrity -------------------------------------------------------

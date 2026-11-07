@@ -6,8 +6,8 @@ The package is `dartq-cli`; the binary it ships is named `dartq`.
 ## Usage
 
 ```text
-dartq check ...     # differential face against `dart analyze`
-dartq analyze ...   # full engine analysis
+dartq check ...     # delegates to `dart analyze` (the default backend)
+dartq analyze ...   # same delegation; `--engine` selects the in-process engine
 dartq --help        # full command list
 ```
 

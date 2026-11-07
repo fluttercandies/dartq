@@ -307,7 +307,7 @@ for diag in doc.get("diagnostics", []):
 PYEOF
 face cli-check-machine-parity
 rc=0
-"$DARTQ_BIN" check --format json "$probe_file" >"$work/probe.json" 2>"$work/probe.err" || rc=$?
+"$DARTQ_BIN" check --engine --format json "$probe_file" >"$work/probe.json" 2>"$work/probe.err" || rc=$?
 chk "error fixture exits 3 (ERRORS)" [ "$rc" -eq 3 ]
 chk "envelope carries three diagnostic rows (one per directive)" \
   jq_eq "$work/probe.json" '.diagnostics | length' 3
@@ -331,17 +331,17 @@ chk "reconstructed rows are byte-identical to the oracle machine output" \
 # The retired faces: the machine value and the verbosity flag are usage
 # errors on the CLI now (the freeze that #2606 cast).
 rc=0
-"$DARTQ_BIN" check --format machine "$fx" >/dev/null 2>"$work/retired-machine.err" || rc=$?
+"$DARTQ_BIN" check --engine --format machine "$fx" >/dev/null 2>"$work/retired-machine.err" || rc=$?
 chk "--format machine is retired: usage error 64" [ "$rc" -eq 64 ]
 rc=0
-"$DARTQ_BIN" check --format json --verbosity concise "$fx" >/dev/null 2>&1 || rc=$?
+"$DARTQ_BIN" check --engine --format json --verbosity concise "$fx" >/dev/null 2>&1 || rc=$?
 chk "--verbosity is retired: usage error 64" [ "$rc" -eq 64 ]
 
 clean_dir="$work/clean"
 mkdir -p "$clean_dir"
 printf 'void main() {}\n' >"$clean_dir/main.dart"
 rc=0
-"$DARTQ_BIN" check --format json "$clean_dir" >"$work/clean.txt" 2>/dev/null || rc=$?
+"$DARTQ_BIN" check --engine --format json "$clean_dir" >"$work/clean.txt" 2>/dev/null || rc=$?
 chk "clean fixture exits 0" [ "$rc" -eq 0 ]
 chk "clean json face prints exactly the empty-diagnostics envelope" \
   [ "$(cat "$work/clean.txt")" = '{"version":1,"diagnostics":[]}' ]
@@ -351,7 +351,7 @@ end_face
 json_out="$work/check.json"
 face cli-check-json
 rc=0
-"$DARTQ_BIN" check --format json "$fx" >"$json_out" 2>/dev/null || rc=$?
+"$DARTQ_BIN" check --engine --format json "$fx" >"$json_out" 2>/dev/null || rc=$?
 chk "error fixture exits 3 (ERRORS)" [ "$rc" -eq 3 ]
 chk "single-line envelope" [ "$(wc -l <"$json_out" | tr -d ' ')" -eq 1 ]
 chk "version is the frozen 1 (the envelope's version alias)" jq_eq "$json_out" '.version' 1

@@ -74,7 +74,7 @@ R_WALL=""
 R_RSS_MIB=""
 run_cold() {
     local input=$1 err="$TMP/$2.time" t
-    /usr/bin/time -l "$DARTQ_BIN" analyze --cold --format=json \
+    /usr/bin/time -l "$DARTQ_BIN" analyze --engine --cold --format=json \
         ${SDK_ARGS[@]+"${SDK_ARGS[@]}"} "$input" >/dev/null 2>"$err" &
     t=$!
     R_RC=124
@@ -115,7 +115,7 @@ run_conc() {
     local input=$1 i p alive s rc stuck=0
     local pids=()
     for i in 1 2 3 4 5; do
-        /usr/bin/time -l "$DARTQ_BIN" analyze --cold --format=json \
+        /usr/bin/time -l "$DARTQ_BIN" analyze --engine --cold --format=json \
             ${SDK_ARGS[@]+"${SDK_ARGS[@]}"} "$input" >/dev/null 2>"$TMP/conc$i.time" &
         pids+=($!)
     done

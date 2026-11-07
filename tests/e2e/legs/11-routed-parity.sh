@@ -44,9 +44,9 @@ legs_11_run() {
   wf "$base/w1/lib/broken.dart" 'void f() { x }
 '
   for format in lon json text; do
-    run_dartq_in "r11-cold-$format" "$base/w1" analyze --sdk-path "$base/sdk" --cold --format "$format" . >/dev/null
+    run_dartq_in "r11-cold-$format" "$base/w1" analyze --engine --sdk-path "$base/sdk" --cold --format "$format" . >/dev/null
     local cold_rc=$DQ_RC
-    run_dartq_in "r11-routed-$format" "$base/w1" analyze --sdk-path "$base/sdk" --format "$format" . >/dev/null
+    run_dartq_in "r11-routed-$format" "$base/w1" analyze --engine --sdk-path "$base/sdk" --format "$format" . >/dev/null
     assert_eq "$DQ_RC" "$cold_rc" "exit tier matches ($format)"
     bytes_equal "r11-cold-$format" "r11-routed-$format" "routed stdout == cold stdout ($format)"
   done
@@ -59,16 +59,16 @@ legs_11_run() {
 
   # --- 11.2 target filter and multiple targets ---------------------------
   leg_begin routed-parity-targets "a filtered target and multiple targets stay filtered and byte-equal"
-  run_dartq_in r11-cold-one "$base/w1" analyze --sdk-path "$base/sdk" --cold lib/main.dart >/dev/null
+  run_dartq_in r11-cold-one "$base/w1" analyze --engine --sdk-path "$base/sdk" --cold lib/main.dart >/dev/null
   local cold_one_rc=$DQ_RC
-  run_dartq_in r11-routed-one "$base/w1" analyze --sdk-path "$base/sdk" lib/main.dart >/dev/null
+  run_dartq_in r11-routed-one "$base/w1" analyze --engine --sdk-path "$base/sdk" lib/main.dart >/dev/null
   assert_eq "$DQ_RC" "$cold_one_rc" "the single-file target's exit tier matches"
   bytes_equal r11-cold-one r11-routed-one "the single-file target answers the cold bytes"
   bytes_differ r11-cold-one r11-cold-lon "the single-file target actually filters (differs from the whole tree)"
 
-  run_dartq_in r11-cold-many "$base/w1" analyze --sdk-path "$base/sdk" --cold lib/main.dart lib/broken.dart >/dev/null
+  run_dartq_in r11-cold-many "$base/w1" analyze --engine --sdk-path "$base/sdk" --cold lib/main.dart lib/broken.dart >/dev/null
   local cold_many_rc=$DQ_RC
-  run_dartq_in r11-routed-many "$base/w1" analyze --sdk-path "$base/sdk" lib/main.dart lib/broken.dart >/dev/null
+  run_dartq_in r11-routed-many "$base/w1" analyze --engine --sdk-path "$base/sdk" lib/main.dart lib/broken.dart >/dev/null
   assert_eq "$DQ_RC" "$cold_many_rc" "the multi-target exit tier matches"
   bytes_equal r11-cold-many r11-routed-many "the multi-target run answers the cold bytes"
   run_dartq_in r11-stop-2 "$base/w1" session stop "$base/w1" --format json >/dev/null || true
@@ -95,7 +95,7 @@ legs_11_run() {
   # The next default call answers over the killed session's residue — the
   # ladder re-elects (or falls back); either way the bytes are the cold
   # bytes and the exit tier is the cold tier.
-  run_dartq_in r11-after-kill "$base/w1" analyze --sdk-path "$base/sdk" --format lon . >/dev/null
+  run_dartq_in r11-after-kill "$base/w1" analyze --engine --sdk-path "$base/sdk" --format lon . >/dev/null
   assert_eq "$DQ_RC" "$(cat "$EVIDENCE/r11-cold-lon.rc")" "the post-kill exit tier matches cold"
   bytes_equal r11-after-kill r11-cold-lon "the post-kill answer equals the cold bytes"
   run_dartq_in r11-stop-3 "$base/w1" session stop "$base/w1" --format json >/dev/null || true

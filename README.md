@@ -31,14 +31,16 @@ Building from source:
 ```bash
 cargo build --release -p dartq-cli   # the binary lands at target/release/dartq
 
-# Scan + parse a package tree: syntax diagnostics in the oracle's machine
-# format by default.
+# Delegate to the official analyzer (the default backend): full semantic
+# analysis over a package directory with plugin support — syntax
+# diagnostics in the oracle's machine format by default.
+target/release/dartq analyze .
 target/release/dartq check lib/ test/
 
-# Full engine over a package directory (pubspec.yaml plus
-# .dart_tool/package_config.json — run `dart pub get` first). --sdk
-# defaults to $DART_SDK when omitted.
-target/release/dartq analyze . --format=machine --sdk <dart-sdk-root>
+# The in-process dartq engine (experimental — diagnostic parity is still
+# converging; `--engine` opts in). Same faces, same exit tiers.
+target/release/dartq analyze --engine . --sdk <dart-sdk-root>
+target/release/dartq check --engine lib/ test/
 ```
 
 For differential confidence, the same faces are compared against
@@ -59,8 +61,10 @@ cache — see [Differential Testing](#differential-testing).
 5. **Extensibility** — new Dart versions, experiments, platforms, and
    plugins are "add data / add rules", never "change the architecture".
 6. **Analyzer replacement** — `dartq analyze` / `dartq check` take the
-   place of `dart analyze` (machine-readable superset), measured against
-   the official analyzer as the oracle.
+   place of `dart analyze` (machine-readable superset): they delegate to
+   the official analyzer by default, with the in-process engine one
+   `--engine` flag away, measured against the official analyzer as the
+   oracle.
 
 ## Build
 
@@ -83,8 +87,8 @@ binary (`dartq-cli`). Concurrent cargo invocations share
 
 | Command | Purpose |
 | --- | --- |
-| `analyze` | Full engine over a package directory: scan, parse, resolution |
-| `check` | Scan + parse only — the differential face against `dart analyze` |
+| `analyze` | Package-directory analysis: delegates to the official analyzer by default, `--engine` the in-process engine |
+| `check` | Scan + parse only — the differential face against `dart analyze` (same `--engine` opt-in) |
 | `compatibility` | One file under several SDK roots: a per-axis compatibility matrix (`compat` remains as an alias) |
 | `daemon` | JSON-RPC daemon over stdin/stdout (`dartq/*` methods) |
 | `explain` | One-stop AI report for one symbol over the analyzed workspace |
@@ -97,22 +101,23 @@ binary (`dartq-cli`). Concurrent cargo invocations share
 | `version` | Print the version |
 
 ```bash
-# Scan + parse a directory tree (the differential face): syntax
-# diagnostics in the oracle's machine format by default — one
+# Delegate to the official analyzer (the default backend): syntax and
+# semantic diagnostics in the oracle's machine format by default — one
 # SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE row per diagnostic.
 dartq check lib/ test/
 # ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|lib/broken.dart|2|11|1|Expected to find ';'.
 dartq check lib/ --format=json
 
-# Full engine over a package directory (needs pubspec.yaml and
-# .dart_tool/package_config.json): pub faces, discovery, scan, parse,
-# resolution. Formats: machine rows (default), human groups, or one
-# single-line JSON envelope — at the daemon's default verbosity, the same
-# bytes the daemon's dartq/analyze answers with (its verbosity tiers add
-# or reduce row fields).
-dartq analyze ~/src/my_app
-dartq analyze ~/src/my_app --format=human
-dartq analyze ~/src/my_app --format=json
+# The in-process engine (`--engine`, experimental): the same faces over
+# dartq's own scan/parse/resolve pipeline — over a package directory (needs
+# pubspec.yaml and .dart_tool/package_config.json): pub faces, discovery,
+# scan, parse, resolution. Formats: machine rows (default), human groups,
+# or one single-line JSON envelope — at the daemon's default verbosity,
+# the same bytes the daemon's dartq/analyze answers with (its verbosity
+# tiers add or reduce row fields).
+dartq analyze --engine ~/src/my_app
+dartq analyze --engine ~/src/my_app --format=human
+dartq analyze --engine ~/src/my_app --format=json
 
 # Symbol index: declarations of one name plus resolved references to them —
 # machine rows (DECL/REF, stable field order) or one-line JSON.
@@ -173,13 +178,13 @@ concise|default|verbose` — the machine-row volume tier: `concise` drops
 the message field, `default` is the oracle machine row, `verbose` appends
 the correctionMessage — and `--metrics-json PATH`: one JSON object at exit
 with file/LOC/diagnostic counts, phase timings, library cache counters,
-and peak RSS. `analyze` additionally accepts `--overlay PATH=FILE`
-(repeatable: analyze PATH with FILE's content instead of the on-disk
-bytes, `-` reads stdin — the AI-agent edit case), `--memory-limit MiB`
-(off by default on the CLI — unlimited; the tiered degradation ladder
-fires an INFO `dartq/memory_degraded` row on breach), `--trace-events
-PATH` (one JSONL engine event per line), and `--cache-size-limit SIZE`
-(the persistent content store cap).
+and peak RSS. On `analyze --engine` the engine-only flags come into play:
+`--overlay PATH=FILE` (repeatable: analyze PATH with FILE's content
+instead of the on-disk bytes, `-` reads stdin — the AI-agent edit case),
+`--memory-limit MiB` (off by default on the CLI — unlimited; the tiered
+degradation ladder fires an INFO `dartq/memory_degraded` row on breach),
+`--trace-events PATH` (one JSONL engine event per line), and
+`--cache-size-limit SIZE` (the persistent content store cap).
 
 ## Verbosity Tiers
 

@@ -1,10 +1,12 @@
-//! dartq CLI — the converged verb surface: `analyze` (the engine face;
-//! `--fast` the parser-only pass), `query`, `explain`, `impact`, `fix`,
-//! `rename`, `test`, `packages` (the universe inventory), and the
+//! dartq CLI — the converged verb surface: `analyze` (the official
+//! analyzer by default, the in-process engine behind `--engine`,
+//! `--engine --fast` the parser-only pass), `query`, `explain`, `impact`,
+//! `fix`, `rename`, `test`, `packages` (the universe inventory), and the
 //! position faces `resolve` / `complete`; `check`, `index`, `assists`,
-//! and `daemon` stay reachable as hidden faces (`check` is `analyze
-//! --fast`'s alias; `compatibility`, `resolve-at`, and `completion`
-//! alias `compat`, `resolve`, and `complete`).
+//! and `daemon` stay reachable as hidden faces (`check` takes `analyze`'s
+//! default, `check --engine` is `analyze --engine --fast`'s alias;
+//! `compatibility`, `resolve-at`, and `completion` alias `compat`,
+//! `resolve`, and `complete`).
 //!
 //! Output is the one `--format <lon|json|text>` axis on every verb with
 //! output, `lon` the constant default (never the terminal's shape — the
@@ -19,13 +21,17 @@
 //! the daemon RPC faces share); this binary adds only argument
 //! parsing, output formatting, and the exit tiers.
 //!
-//! `check` drives the M0 pipeline — bytes → scan →
+//! `analyze` and `check` delegate to the official analyzer by default: a
+//! `dart analyze --format machine` child whose rows re-emit through the
+//! same writers and exit tiers. `Backend` is the one dispatch point.
+//!
+//! `check --engine` drives the M0 pipeline — bytes → scan →
 //! `@dart` override rescan → parse, with all diagnostics written through
 //! `dartq-diagnostics`' oracle-exact writers. It stops there by design: no
 //! pub/package/SDK/engine involvement — the M0 differential face covers
 //! scan + parse and nothing downstream.
 //!
-//! `analyze` drives the full engine over a real package directory:
+//! `analyze --engine` drives the full engine over a real package directory:
 //! pub faces → [`dartq_commands::workspace::open_engine`] → engine
 //! discovery → analysis, printed through the same oracle-exact writers.
 //!
@@ -64,6 +70,7 @@
 //! regardless — the main loop observes the channel disconnect and ends the
 //! session through the transport's own exit path.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -73,6 +80,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::analyze::Target;
+use dartq_commands::analyze::official::{self, OfficialRun};
 use dartq_commands::config::{
     ConfigError, ContextConfig, ContextTarget, load as load_dartq_config, resolve_locator,
 };
@@ -192,7 +200,7 @@ fn run(args: &[String]) -> u8 {
     match Cli::try_parse_from(std::iter::once("dartq").chain(args.iter().map(String::as_str))) {
         Ok(Cli {
             command: Some(Command::Check(check_args)),
-        }) => check(&check_args),
+        }) => check_entry(&check_args),
         Ok(Cli {
             command: Some(Command::Analyze(analyze_args)),
         }) => analyze(&analyze_args),
@@ -293,12 +301,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Analyze a package directory through the full engine: scan, parse,
-    /// resolution, and the semantic/flow/lint diagnostic tiers. With
-    /// `--fast`, scan + parse only (the parser-tier pass, no engine).
+    /// Analyze a package directory: delegates to the official `dart
+    /// analyze` (analyzer plugins included) and prints its findings through
+    /// dartq's output faces. `--engine` runs the in-process dartq engine
+    /// instead (`--engine --fast`: scan + parse only).
     Analyze(AnalyzeArgs),
-    /// Scan + parse only (the M0 differential face) — the hidden spelling
-    /// of `analyze --fast`, kept for compat.
+    /// The hidden spelling of `analyze`, kept for compat: the same official
+    /// default, and `--engine` runs scan + parse only (the M0 differential
+    /// face, `analyze --engine --fast`).
     #[command(hide = true)]
     Check(CheckArgs),
     /// Assess the workspace under several SDK roots — a per-axis ✓/✗
@@ -398,9 +408,11 @@ enum Command {
     Version,
 }
 
-/// Scan + parse only (the M0 differential face).
+/// The hidden `analyze` spelling: the official analyzer by default,
+/// `--engine` the scan + parse pass (the M0 differential face).
 ///
-/// Analysis-options boundary: this face consumes no `analysis_options.yaml` —
+/// Analysis-options boundary: the `--engine` pass consumes no
+/// `analysis_options.yaml` —
 /// no `exclude:` on the walk, no `errors:` remaps, no lint rules. Options
 /// are the engine/analyze face's concern (`dartq-engine`'s
 /// `AnalysisOptions`, whose loader needs the package universe this face
@@ -408,9 +420,14 @@ enum Command {
 /// options-free.
 #[derive(Args)]
 struct CheckArgs {
+    /// Run the in-process scan + parse pass instead of the official
+    /// analyzer (experimental, not diagnostic-parity yet; one stderr line
+    /// says so).
+    #[arg(long)]
+    engine: bool,
     #[arg(long, value_enum, default_value_t = CheckFormat::Lon)]
     format: CheckFormat,
-    /// Write one metrics JSON object to PATH at exit.
+    /// Write one metrics JSON object to PATH at exit. Requires `--engine`.
     #[arg(long)]
     metrics_json: Option<PathBuf>,
     /// The `--fatal-warnings` positive spelling (the oracle declares
@@ -427,11 +444,12 @@ struct CheckArgs {
     /// Off by default (`--fatal-infos` sets it) — mirrors the oracle.
     #[arg(long)]
     fatal_infos: bool,
-    /// Run in-process, without the worktree's resident session. The
-    /// default consults the session layer: a live session is attached,
-    /// and when none is live one is spawned and waited for — the answer
-    /// is the daemon's over the same targets, rendered through the same
-    /// writers. `--cold` skips all of that (the pre-#2627 behavior).
+    /// Run in-process, without the worktree's resident session. Requires
+    /// `--engine`. The engine face consults the session layer by default:
+    /// a live session is attached, and when none is live one is spawned
+    /// and waited for — the answer is the daemon's over the same targets,
+    /// rendered through the same writers. `--cold` skips all of that (the
+    /// pre-#2627 behavior).
     /// Invocations carrying a per-run engine posture (`--overlay`,
     /// `--packages`, `--enable-experiment`, `--no-plugins`,
     /// `--memory-limit`, `--trace-events`, `--cache-size-limit`) and
@@ -439,8 +457,7 @@ struct CheckArgs {
     /// engine serves the plain face.
     #[arg(long)]
     cold: bool,
-    /// The dartdev global flags, accepted and ignored — see
-    /// [`DartdevGlobals`].
+    /// The dartdev global flags — see [`DartdevGlobals`].
     #[command(flatten)]
     dartdev_globals: DartdevGlobals,
     /// Targets; empty resolves to the current directory.
@@ -466,6 +483,12 @@ struct AnalyzeArgs {
     /// directory (the oracle's `Directory.current` fallback).
     #[arg(default_value = ".")]
     targets: Vec<PathBuf>,
+    /// Run the in-process dartq engine instead of delegating to the
+    /// official `dart analyze` (experimental, not diagnostic-parity yet;
+    /// one stderr line says so). The flags marked `Requires --engine` are
+    /// usage errors without it.
+    #[arg(long)]
+    engine: bool,
     /// Output format: the constant default is `lon` (canonical LON over
     /// the short vocabulary — never the terminal's shape, so a piped run
     /// and a TTY run print the same bytes); `json` is the frozen
@@ -473,16 +496,17 @@ struct AnalyzeArgs {
     #[arg(long, value_enum, default_value_t = AnalyzeFormat::Lon)]
     format: AnalyzeFormat,
     /// Scan + parse only (the `check` pipeline): parser-tier diagnostics
-    /// without the engine — the fast pass for pure-syntax sweeps.
+    /// without the engine — the fast pass for pure-syntax sweeps. Requires
+    /// `--engine`.
     #[arg(long)]
     fast: bool,
-    /// Write one metrics JSON object to PATH at exit.
+    /// Write one metrics JSON object to PATH at exit. Requires `--engine`.
     #[arg(long)]
     metrics_json: Option<PathBuf>,
     /// Analyze PATH with the content of FILE instead of the on-disk bytes:
     /// repeatable, relative PATH resolves against DIR, and
-    /// FILE `-` reads stdin. The engine-view faces only — `check` has no
-    /// engine to overlay.
+    /// FILE `-` reads stdin. Requires `--engine`; the engine-view faces
+    /// only — `check` has no engine to overlay.
     #[arg(long = "overlay", value_name = "PATH=FILE")]
     overlays: Vec<String>,
     /// Dart SDK root; defaults to `$DART_SDK`. The oracle's spelling
@@ -511,7 +535,8 @@ struct AnalyzeArgs {
     )]
     enable_experiments: Vec<String>,
     /// Load analysis plugins (the dartdev `--[no-]plugins`, default on).
-    /// When the effective `analysis_options.yaml` declares a `plugins:`
+    /// The official analyzer runs them itself. On `--engine`, when the
+    /// effective `analysis_options.yaml` declares a `plugins:`
     /// section and this is not disabled, the analyze cycle spawns the
     /// declared plugins, feeds the engine diagnostics, and merges their
     /// findings (plus `dartq/plugin_crashed` crash rows) into the output;
@@ -539,14 +564,16 @@ struct AnalyzeArgs {
     /// library boundaries; over budget the engine degrades tier-by-tier
     /// and reports each step as an INFO `dartq/memory_degraded` row
     /// (diagnostics stay complete at every tier). Unset = unlimited —
-    /// the output is byte-identical to an unbudgeted run.
+    /// the output is byte-identical to an unbudgeted run. Requires
+    /// `--engine`.
     #[arg(long, value_name = "MiB")]
     memory_limit: Option<u64>,
     /// Print each workspace engine's memory posture to stderr after the
-    /// run — one `dartq-memory` line per engine carrying the budget
-    /// ladder's state (the armed limit, descended tiers, deepest tier
-    /// key), its last phase-boundary RSS sample, and the warm lane's
-    /// counters. The 5-instance product budget's observability face; the
+    /// run (requires `--engine`) — one `dartq-memory` line per engine
+    /// carrying the budget ladder's state (the armed limit, descended
+    /// tiers, deepest tier key), its last phase-boundary RSS sample, and
+    /// the warm lane's counters. The 5-instance product budget's
+    /// observability face; the
     /// resident session's own posture is the daemon's `dartq/memory`
     /// face, so the flag always runs in-process.
     #[arg(long)]
@@ -555,18 +582,20 @@ struct AnalyzeArgs {
     /// engine event — stable event names, stable field order, flushed per
     /// event so a killed CI run keeps its tail. Unset = no sink and zero
     /// event work: the output face is byte-identical to an untraced run.
+    /// Requires `--engine`.
     #[arg(long, value_name = "PATH")]
     trace_events: Option<PathBuf>,
     /// Override the analysis cache location (the oracle's hidden
-    /// `--cache PATH`). dartq manages its own content store under
-    /// `~/.cache/dartq/` (see `--cache-size-limit`), so the flag is accepted
-    /// for CLI parity and ignored.
+    /// `--cache PATH`). The official analyzer takes it; on `--engine` dartq
+    /// manages its own content store under `~/.cache/dartq/` (see
+    /// `--cache-size-limit`), so the flag is accepted for CLI parity and
+    /// ignored.
     #[arg(long, value_name = "PATH", hide = true)]
     cache: Option<PathBuf>,
     /// The oracle's hidden `--[no-]use-aot-snapshot` flag (defaults on
-    /// upstream; picks the analysis-server snapshot flavor). dartq runs
-    /// in-process — no snapshot exists — so both spellings parse and do
-    /// nothing.
+    /// upstream; picks the analysis-server snapshot flavor). The official
+    /// analyzer takes it; `--engine` runs in-process — no snapshot exists —
+    /// so both spellings parse and do nothing there.
     #[arg(long = "use-aot-snapshot", hide = true)]
     use_aot_snapshot: bool,
     /// The `--no-use-aot-snapshot` spelling — see `use_aot_snapshot`.
@@ -583,22 +612,22 @@ struct AnalyzeArgs {
     /// the store evicts least-recently-touched, unreferenced contents until
     /// the stored total is at or under this size. Grammar: NUMBER
     /// [KiB|MiB|GiB] — suffix case-insensitive, a bare number is bytes
-    /// (512MiB, 10GiB, 4096). Unset = the 10 GiB default.
+    /// (512MiB, 10GiB, 4096). Unset = the 10 GiB default. Requires
+    /// `--engine`.
     #[arg(
         long,
         value_name = "SIZE",
         value_parser = dartq_engine::store::parse_size_limit
     )]
     cache_size_limit: Option<u64>,
-    /// Run in-process, without the worktree's resident session. The
-    /// default consults a live session when one is attached (never
-    /// spawning one — a syntax sweep must not pay an engine bring-up);
-    /// `--cold` skips the consult (`--fast` under the analyze spelling
-    /// takes the same route).
+    /// Run in-process, without the worktree's resident session. Requires
+    /// `--engine`. The engine face consults a live session when one is
+    /// attached (never spawning one — a syntax sweep must not pay an engine
+    /// bring-up); `--cold` skips the consult (`--fast` under the analyze
+    /// spelling takes the same route).
     #[arg(long)]
     cold: bool,
-    /// The dartdev global flags, accepted and ignored — see
-    /// [`DartdevGlobals`].
+    /// The dartdev global flags — see [`DartdevGlobals`].
     #[command(flatten)]
     dartdev_globals: DartdevGlobals,
 }
@@ -619,15 +648,145 @@ enum AnalyzeFormat {
     Text,
 }
 
-/// The dartdev global flags, accepted and ignored on the diagnostic faces
-/// (ticket #2385, the cli-compat Flag-face P2). Upstream declares them on
-/// the runner's global parser (`upstream Dart SDK source,
+impl From<CheckFormat> for AnalyzeFormat {
+    fn from(format: CheckFormat) -> Self {
+        match format {
+            CheckFormat::Lon => Self::Lon,
+            CheckFormat::Json => Self::Json,
+            CheckFormat::Text => Self::Text,
+        }
+    }
+}
+
+/// The analyze flags against the official backend, every flag in one class
+/// (`check` carries a subset, same class):
+///
+/// | Class | Flags |
+/// | --- | --- |
+/// | forward — `dart analyze` takes it | the targets, `--sdk-path`, `--packages`, `--cache`, `--enable-experiment`, `--[no-]plugins`, `--[no-]use-aot-snapshot`, `--[no-]fatal-warnings`, `--fatal-infos`, `--verbose`, `--version`, `--suppress-analytics`, `--disable-telemetry`, `--[no-]analytics` |
+/// | engine-only — legal only with `--engine` | `--fast`, `--metrics-json`, `--overlay`, `--memory-limit`, `--memory-report`, `--trace-events`, `--cache-size-limit`, `--cold` |
+/// | consumed — dartq answers it, the child never sees it | `--engine`, `--format`, `--memory`, `--diagnostics`, `--enable-analytics`, `--disable-analytics` |
+///
+/// The child always runs the machine format, so `--format` selects dartq's
+/// re-emission and `--memory` (upstream reads it on its json format only)
+/// keeps the json face's own splice. The last three would break the run:
+/// `--diagnostics` swaps upstream's logger for one that prefixes every
+/// machine row and traces the server protocol to stdout, and
+/// `--enable-analytics`/`--disable-analytics` make upstream rewrite the
+/// machine's analytics setting and exit 0 without analyzing — a false clean.
+impl AnalyzeArgs {
+    /// The first engine-only flag set on this invocation.
+    fn engine_only_flag(&self) -> Option<&'static str> {
+        [
+            (self.fast, "--fast"),
+            (self.metrics_json.is_some(), "--metrics-json"),
+            (!self.overlays.is_empty(), "--overlay"),
+            (self.memory_limit.is_some(), "--memory-limit"),
+            (self.memory_report, "--memory-report"),
+            (self.trace_events.is_some(), "--trace-events"),
+            (self.cache_size_limit.is_some(), "--cache-size-limit"),
+            (self.cold, "--cold"),
+        ]
+        .into_iter()
+        .find_map(|(set, flag)| set.then_some(flag))
+    }
+
+    /// The `dart analyze` arguments: the forwarded flags, then the targets.
+    fn official_args(&self) -> Vec<OsString> {
+        let mut argv = shared_official_args(
+            self.fatal_warnings,
+            self.no_fatal_warnings,
+            self.fatal_infos,
+            self.dartdev_globals,
+        );
+        for (flag, path) in [
+            ("--sdk-path", &self.sdk_path),
+            ("--packages", &self.packages),
+            ("--cache", &self.cache),
+        ] {
+            if let Some(path) = path {
+                argv.extend([OsString::from(flag), OsString::from(path)]);
+            }
+        }
+        for name in &self.enable_experiments {
+            argv.push(format!("--enable-experiment={name}").into());
+        }
+        argv.extend(set_flags([
+            (self.plugins, "--plugins"),
+            (self.no_plugins, "--no-plugins"),
+            (self.use_aot_snapshot, "--use-aot-snapshot"),
+            (self.no_use_aot_snapshot, "--no-use-aot-snapshot"),
+        ]));
+        argv.extend(self.targets.iter().map(OsString::from));
+        argv
+    }
+}
+
+impl CheckArgs {
+    /// The first engine-only flag set on this invocation.
+    fn engine_only_flag(&self) -> Option<&'static str> {
+        [
+            (self.metrics_json.is_some(), "--metrics-json"),
+            (self.cold, "--cold"),
+        ]
+        .into_iter()
+        .find_map(|(set, flag)| set.then_some(flag))
+    }
+
+    /// The `dart analyze` arguments: the forwarded flags, then the targets.
+    fn official_args(&self) -> Vec<OsString> {
+        let mut argv = shared_official_args(
+            self.fatal_warnings,
+            self.no_fatal_warnings,
+            self.fatal_infos,
+            self.dartdev_globals,
+        );
+        argv.extend(self.paths.iter().map(OsString::from));
+        argv
+    }
+}
+
+/// The forwarded flags both faces carry: the fatal tiers and the dartdev
+/// globals that leave the run intact.
+fn shared_official_args(
+    fatal_warnings: bool,
+    no_fatal_warnings: bool,
+    fatal_infos: bool,
+    globals: DartdevGlobals,
+) -> Vec<OsString> {
+    set_flags([
+        (fatal_warnings, "--fatal-warnings"),
+        (no_fatal_warnings, "--no-fatal-warnings"),
+        (fatal_infos, "--fatal-infos"),
+        (globals.verbose, "--verbose"),
+        (globals.version, "--version"),
+        (globals.suppress_analytics, "--suppress-analytics"),
+        (globals.disable_telemetry, "--disable-telemetry"),
+        (globals.analytics, "--analytics"),
+        (globals.no_analytics, "--no-analytics"),
+    ])
+    .collect()
+}
+
+/// The spellings of the set flags, in order.
+fn set_flags<const N: usize>(flags: [(bool, &str); N]) -> impl Iterator<Item = OsString> {
+    flags
+        .into_iter()
+        .filter_map(|(set, flag)| set.then(|| flag.into()))
+}
+
+/// The dartdev global flags, accepted on the diagnostic faces (ticket
+/// #2385, the cli-compat Flag-face P2): the official backend forwards the
+/// ones that leave `dart analyze`'s run intact (see
+/// [`shared_official_args`]), the engine ignores them all. Upstream declares
+/// them on the runner's global parser (`upstream Dart SDK source,
 /// pkg/dartdev/lib/src/utils.dart`, `globalDartdevOptionsParser`), and the
 /// global parse is merged past the command name, so they are accepted
 /// positioned *after* the subcommand — `dart analyze --suppress-analytics`
-/// is the standard CI incantation. dartq runs no analytics/telemetry layer
-/// and no verbose logger, so the flags change nothing. Hidden, matching
-/// the oracle's `analyze --help` face where the globals don't appear.
+/// is the standard CI incantation. The engine has no analytics/telemetry
+/// layer and no verbose logger, so the flags change nothing there. Hidden,
+/// matching the oracle's `analyze --help` face where the globals don't
+/// appear.
 /// Known upstream corner, not replicated: `--suppress-analytics` combined
 /// with `--enable-analytics`/`--disable-analytics` is an analytics-layer
 /// usage error (exit 254) upstream; dartq has no analytics layer to
@@ -781,6 +940,7 @@ impl Verbosity {
 /// same tri-axis).
 fn check_from_analyze(args: &AnalyzeArgs) -> CheckArgs {
     CheckArgs {
+        engine: args.engine,
         format: match args.format {
             AnalyzeFormat::Lon => CheckFormat::Lon,
             AnalyzeFormat::Json => CheckFormat::Json,
@@ -996,11 +1156,7 @@ fn check_run(args: &CheckArgs, out: &mut impl Write) -> u8 {
 
     let output = run.output();
     let render_at = Instant::now();
-    let written = match args.format {
-        CheckFormat::Lon => write_lon(out, &diags_document(&output)),
-        CheckFormat::Json => write_json(out, &output),
-        CheckFormat::Text => write_human(out, output.diagnostics, output.files),
-    };
+    let written = emit_diagnostics(args.format.into(), false, &output, out);
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -1115,10 +1271,191 @@ impl RunMetrics {
     }
 }
 
-/// `dartq analyze` — crash tier like [`check`]: a
+/// The analyze and check faces' analyzer. Both backends feed one row model,
+/// one emitter set ([`emit_diagnostics`]), and one exit table, so this enum
+/// is the whole seam: [`dispatch`] is its one match, another backend is one
+/// more variant, and moving the product default is the one line in
+/// [`Backend::of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    /// The official analyzer: a `dart analyze` child, analyzer plugins
+    /// included (the default).
+    Official,
+    /// The in-process dartq engine (`--engine`).
+    Engine,
+}
+
+impl Backend {
+    const fn of(engine: bool) -> Self {
+        if engine { Self::Engine } else { Self::Official }
+    }
+}
+
+/// The `--engine` path's one stderr line; the default path prints none.
+const ENGINE_NOTE: &str =
+    "dartq analyze: using the dartq engine (experimental, not diagnostic-parity yet)";
+
+/// The usage error of an engine-only flag on the official backend.
+fn engine_only_message(flag: &str) -> String {
+    format!("error: {flag} requires --engine: only the in-process dartq engine reads it")
+}
+
+/// Routes one analyze or check invocation to its backend. `engine_only` is
+/// the invocation's first engine-only flag: legal on [`Backend::Engine`], a
+/// usage error on [`Backend::Official`] rather than a flag silently dropped.
+fn dispatch(
+    backend: Backend,
+    engine_only: Option<&str>,
+    official: impl FnOnce() -> u8,
+    engine: impl FnOnce() -> u8,
+) -> u8 {
+    match (backend, engine_only) {
+        (Backend::Official, None) => official(),
+        (Backend::Official, Some(flag)) => {
+            eprintln!("{}", engine_only_message(flag));
+            exit::USAGE
+        }
+        (Backend::Engine, _) => {
+            eprintln!("{ENGINE_NOTE}");
+            engine()
+        }
+    }
+}
+
+/// `dartq analyze`.
+fn analyze(args: &AnalyzeArgs) -> u8 {
+    dispatch(
+        Backend::of(args.engine),
+        args.engine_only_flag(),
+        || {
+            official_face(
+                args.format,
+                args.memory,
+                &args.official_args(),
+                &args.targets,
+            )
+        },
+        || analyze_engine(args),
+    )
+}
+
+/// `dartq check`: `analyze`'s entry under the hidden spelling, with
+/// [`check`] the engine face.
+fn check_entry(args: &CheckArgs) -> u8 {
+    dispatch(
+        Backend::of(args.engine),
+        args.engine_only_flag(),
+        || {
+            official_face(
+                args.format.into(),
+                false,
+                &args.official_args(),
+                &args.paths,
+            )
+        },
+        || check(args),
+    )
+}
+
+/// One official analysis, crash tier included: the targets classify the way
+/// the engine path classifies them (a missing one is the same usage tier
+/// with the same wording), `dart` resolves through the shared toolchain
+/// resolver, and a resolver miss or a binary that does not start is the
+/// usage tier — the environment failed, like the engine path's missing SDK.
+fn official_face(
+    format: AnalyzeFormat,
+    memory: bool,
+    argv: &[OsString],
+    targets: &[PathBuf],
+) -> u8 {
+    let outcome = crash_tier(|| {
+        let targets = match resolve_targets(targets) {
+            Ok(targets) => targets,
+            Err(path) => {
+                eprintln!("error: Directory or file doesn't exist: {}", path.display());
+                return exit::USAGE;
+            }
+        };
+        let dart = dartq_toolchain::find_dart(None);
+        match official::run(dart.as_deref(), argv, analysis_root(&targets)) {
+            Ok(run) => official_finish(
+                &run,
+                format,
+                memory,
+                &mut BufWriter::new(io::stdout().lock()),
+                &mut io::stderr().lock(),
+            ),
+            Err(error) => {
+                eprintln!("error: {error}");
+                exit::USAGE
+            }
+        }
+    });
+    outcome.unwrap_or_else(|_| {
+        eprintln!("dartq: internal error: analysis panicked");
+        exit::INTERNAL_ERROR
+    })
+}
+
+/// Prints one official run and answers its exit code: the official stderr
+/// verbatim, one advisory per stdout line that is no row, and the rows
+/// through [`emit_diagnostics`].
+///
+/// The official exit code is the answer on every path, because it is the
+/// only complete one. Codes 0–3 are the same severity ladder as
+/// [`severity_exit`], computed by dartdev under the same forwarded flags,
+/// and the machine format leaves out the rows behind one of them: errors in
+/// `pubspec.yaml` and `analysis_options.yaml` reach the exit code only. Any
+/// other code is the child's failure (4 its crash tier, 64 its usage tier):
+/// the code passes through and stdout stays empty unless it delivered rows.
+fn official_finish(
+    run: &OfficialRun,
+    format: AnalyzeFormat,
+    memory: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    // A failed stderr write has nowhere left to report.
+    let _ = err.write_all(&run.stderr);
+    for line in &run.unparsed {
+        let _ = writeln!(err, "note: unparsed dart analyze output: {line}");
+    }
+    let code = run
+        .code
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or_else(|| {
+            let _ = writeln!(
+                err,
+                "error: dart analyze ended with exit status {:?}",
+                run.code
+            );
+            exit::INTERNAL_ERROR
+        });
+    if code > exit::ERRORS && run.diagnostics.is_empty() {
+        return code;
+    }
+    if code == exit::ERRORS && severity_exit(&run.diagnostics, false, false) != exit::ERRORS {
+        let _ = writeln!(
+            err,
+            "note: dart analyze found errors its machine format omits (pubspec.yaml or \
+             analysis_options.yaml); run dart analyze to see them"
+        );
+    }
+    let written = emit_diagnostics(format, memory, &run.output(), out);
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        let _ = writeln!(
+            err,
+            "dartq: internal error: writing diagnostics failed: {error}"
+        );
+        return exit::INTERNAL_ERROR;
+    }
+    code
+}
+
+/// `dartq analyze --engine` — crash tier like [`check`]: a
 /// panic anywhere aborts with exit 4 and stdout kept empty, because
 /// [`analyze_run`] writes only after analysis fully succeeded.
-fn analyze(args: &AnalyzeArgs) -> u8 {
+fn analyze_engine(args: &AnalyzeArgs) -> u8 {
     // `--fast` is the check pipeline under the analyze spelling: the
     // same scan + parse tiers, the same crash discipline.
     if args.fast {
@@ -1176,6 +1513,18 @@ enum TargetKind {
     File(PathBuf),
 }
 
+impl TargetKind {
+    /// The directory the target's workspace resolves from: a directory
+    /// target itself, a file target's parent (the oracle's file context
+    /// root still finds the containing workspace for resolution).
+    fn package_dir(&self) -> &Path {
+        match self {
+            Self::Dir(dir) => dir,
+            Self::File(file) => file.parent().unwrap_or(Path::new("")),
+        }
+    }
+}
+
 /// The target classification pass ([`analyze_run`] step one): metadata per
 /// argument, `fs::metadata` following links — the discover walk's own
 /// classification ([`dartq_commands::discover`]: dir → walked, file → taken
@@ -1228,6 +1577,17 @@ fn workspace_root_of(dir: &Path) -> PathBuf {
     }
 }
 
+/// The official run's analysis root: the one workspace root its targets
+/// share, the root the engine path would project against, or `None` when
+/// they span workspaces (the no-root face, absolute spellings).
+fn analysis_root(targets: &[TargetKind]) -> Option<PathBuf> {
+    let mut roots = targets
+        .iter()
+        .map(|target| workspace_root_of(target.package_dir()));
+    let first = roots.next()?;
+    roots.all(|root| root == first).then_some(first)
+}
+
 /// The target-driven run: one engine per distinct workspace root, each
 /// serving the targets it covers; every run filters its emitted set to the
 /// covered files (the oracle pushes diagnostics only inside the targets'
@@ -1235,20 +1595,14 @@ fn workspace_root_of(dir: &Path) -> PathBuf {
 fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Write) -> u8 {
     let started = Instant::now();
 
-    // Group targets by resolved workspace root. A file target's package
-    // directory is its parent (the oracle's file context root still finds
-    // the containing workspace for resolution); a directory target's is
-    // the directory itself.
+    // Group targets by resolved workspace root.
     let mut groups: Vec<(PathBuf, Vec<Target>)> = Vec::new();
     for target in targets {
-        let (assembly_dir, mapped) = match target {
-            TargetKind::Dir(dir) => (dir.clone(), Target::Dir(dir.clone())),
-            TargetKind::File(file) => (
-                file.parent().map(Path::to_path_buf).unwrap_or_default(),
-                Target::File(file.clone()),
-            ),
+        let mapped = match target {
+            TargetKind::Dir(dir) => Target::Dir(dir.clone()),
+            TargetKind::File(file) => Target::File(file.clone()),
         };
-        let root = workspace_root_of(&assembly_dir);
+        let root = workspace_root_of(target.package_dir());
         match groups.iter_mut().find(|(key, _)| *key == root) {
             Some((_, members)) => members.push(mapped),
             None => groups.push((root, vec![mapped])),
@@ -1614,57 +1968,29 @@ fn analyze_finish(
     }
 
     // The data faces (lon, json) keep the advisory off stdout — one
-    // `Info • code • message` line on stderr per advisory; the text face
-    // leads stdout with the same human line, ahead of the groups.
+    // `Info • code • message` line on stderr per advisory, the same stream
+    // the degrade notices print on (the json envelope carries diagnostics
+    // only, so the advisories have no row in it); the text face leads stdout
+    // with the same human line, ahead of the groups. Either way the
+    // degraded-resolution signal stays on every face.
     // The render window: the format writer plus the flush (the metrics
     // write below stays outside every phase).
     let render_at = Instant::now();
-    let written = match args.format {
-        AnalyzeFormat::Lon => {
-            for advisory in advisories {
-                eprintln!("Info • {} • {}", advisory.code().name, advisory.message());
-            }
-            write_lon(
-                out,
-                &diags_document(&AnalysisOutput {
-                    diagnostics: &run.diagnostics,
-                    files: run,
-                }),
-            )
+    let written = if args.format == AnalyzeFormat::Text {
+        advisories
+            .iter()
+            .try_for_each(|advisory| write_stale_advisory_human(out, Some(advisory)))
+    } else {
+        for advisory in advisories {
+            eprintln!("Info • {} • {}", advisory.code().name, advisory.message());
         }
-        AnalyzeFormat::Text => {
-            let mut written = Ok(());
-            for advisory in advisories {
-                written = written.and_then(|()| write_stale_advisory_human(out, Some(advisory)));
-            }
-            written.and_then(|()| write_human(out, &run.diagnostics, run))
-        }
-        // The envelope is the JSON face's whole stdout contract (the oracle
-        // envelope carries diagnostics only), so the workspace advisories
-        // have no row in it; each one-line note rides stderr instead — the
-        // same stream the degrade notices print on — keeping the
-        // degraded-resolution signal on every face. The oracle's `--memory`
-        // gate (analyze.dart:200 `printMemory = memory && jsonFormat`)
-        // appends the envelope's `memory` key: the process's peak RSS in KiB
-        // (`usageInfo.memoryKB`, analyze.dart:587) — spliced before the
-        // closing brace so the shared writer's byte-parity envelope is
-        // untouched when the flag is absent. Metrics and the exit
-        // tier are face-independent below.
-        AnalyzeFormat::Json => {
-            for advisory in advisories {
-                eprintln!("Info • {} • {}", advisory.code().name, advisory.message());
-            }
-            let output = AnalysisOutput {
-                diagnostics: &run.diagnostics,
-                files: run,
-            };
-            if args.memory {
-                write_json_memory(out, &output)
-            } else {
-                write_json(out, &output)
-            }
-        }
+        Ok(())
     };
+    let output = AnalysisOutput {
+        diagnostics: &run.diagnostics,
+        files: run,
+    };
+    let written = written.and_then(|()| emit_diagnostics(args.format, args.memory, &output, out));
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -1698,6 +2024,27 @@ fn analyze_finish(
         }
     }
     severity_exit(&run.diagnostics, !args.no_fatal_warnings, args.fatal_infos)
+}
+
+/// One diagnostic set through the format's writer — the one emission point
+/// of the analyze and check faces, whichever backend produced the rows. The
+/// oracle's `--memory` gate (analyze.dart:200 `printMemory = memory &&
+/// jsonFormat`) appends the json envelope's `memory` key: the process's peak
+/// RSS in KiB (`usageInfo.memoryKB`, analyze.dart:587) — spliced before the
+/// closing brace so the shared writer's byte-parity envelope is untouched
+/// when the flag is absent.
+fn emit_diagnostics(
+    format: AnalyzeFormat,
+    memory: bool,
+    output: &AnalysisOutput<'_>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match format {
+        AnalyzeFormat::Lon => write_lon(out, &diags_document(output)),
+        AnalyzeFormat::Text => write_human(out, output.diagnostics, output.files),
+        AnalyzeFormat::Json if memory => write_json_memory(out, output),
+        AnalyzeFormat::Json => write_json(out, output),
+    }
 }
 
 /// The `--memory-report` stderr line over one engine's posture — the
@@ -2870,9 +3217,10 @@ mod tests {
             Ok(Some(Command::Analyze(args))) => args,
             _ => panic!("expected analyze command"),
         };
-        let fast = analyze_args(&["analyze", "--fast", "/pkg"]);
+        let fast = analyze_args(&["analyze", "--engine", "--fast", "/pkg"]);
         assert!(fast.fast);
         let mapped = check_from_analyze(&fast);
+        assert!(mapped.engine, "the pipeline stays on the engine face");
         assert!(matches!(mapped.format, CheckFormat::Lon), "lon default");
         assert_eq!(mapped.paths, vec![PathBuf::from("/pkg")]);
         assert!(!mapped.no_fatal_warnings, "fatal warnings stay on");
@@ -2886,6 +3234,7 @@ mod tests {
     #[test]
     fn check_defaults() {
         let check = check_args(&["check"]);
+        assert!(!check.engine, "the official backend is the default");
         assert!(matches!(check.format, CheckFormat::Lon), "lon default");
         assert!(!check.no_fatal_warnings, "fatal-warnings default on");
         assert!(
@@ -3393,6 +3742,7 @@ mod tests {
         fs::write(root.join("override.dart"), "// @dart = 99.9\nvar ok = 1;\n").expect("write");
 
         let args = CheckArgs {
+            engine: true,
             format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
@@ -3426,6 +3776,7 @@ mod tests {
         fs::write(root.join(".dart_tool/skipme.dart"), "var no = 0;\n").expect("write");
 
         let args = CheckArgs {
+            engine: true,
             format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
@@ -3469,6 +3820,7 @@ mod tests {
         let canonical = root.canonicalize().expect("root");
 
         let args = CheckArgs {
+            engine: true,
             paths: vec![root.clone()],
             format: CheckFormat::Lon,
             metrics_json: None,
@@ -3520,6 +3872,7 @@ mod tests {
 
         let metrics_path = root.join("metrics.json");
         let args = CheckArgs {
+            engine: true,
             format: CheckFormat::Lon,
             metrics_json: Some(metrics_path.clone()),
             fatal_warnings: false,
@@ -3624,6 +3977,7 @@ mod tests {
 
         // End to end: the ignored arg parses nothing → empty set, exit 0.
         let args = CheckArgs {
+            engine: true,
             format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
@@ -3636,6 +3990,389 @@ mod tests {
         assert_eq!(check(&args), exit::CLEAN);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // The backend seam: the official analyzer by default, --engine beside it
+    // -----------------------------------------------------------------------
+
+    fn analyze_face(args: &[&str]) -> AnalyzeArgs {
+        match parse_args_of(args) {
+            Ok(Some(Command::Analyze(args))) => args,
+            _ => panic!("expected analyze command"),
+        }
+    }
+
+    /// `--engine` parses on both faces and selects the engine; absent, both
+    /// faces take the official backend — `check` flips with `analyze`.
+    #[test]
+    fn engine_flag_selects_the_backend_on_both_faces() {
+        let analyze = |argv: &[&str]| Backend::of(analyze_face(argv).engine);
+        assert_eq!(analyze(&["analyze", "/p"]), Backend::Official);
+        assert_eq!(analyze(&["analyze", "--engine", "/p"]), Backend::Engine);
+        let check = |argv: &[&str]| Backend::of(check_args(argv).engine);
+        assert_eq!(check(&["check", "/p"]), Backend::Official);
+        assert_eq!(check(&["check", "--engine", "/p"]), Backend::Engine);
+    }
+
+    /// The one dispatch point: each backend runs alone, an engine-only flag
+    /// rides with `--engine` and is the usage tier without it.
+    #[test]
+    fn dispatch_routes_one_backend_and_refuses_engine_flags_on_the_official_one() {
+        const OFFICIAL: u8 = 11;
+        const ENGINE: u8 = 22;
+        let route = |backend, flag| dispatch(backend, flag, || OFFICIAL, || ENGINE);
+        assert_eq!(route(Backend::Official, None), OFFICIAL);
+        assert_eq!(route(Backend::Engine, None), ENGINE);
+        assert_eq!(route(Backend::Engine, Some("--cold")), ENGINE);
+        assert_eq!(route(Backend::Official, Some("--cold")), exit::USAGE);
+    }
+
+    /// Every engine-only flag on both faces: the classification names it,
+    /// and the real entry answers the usage tier before anything resolves
+    /// or spawns.
+    #[test]
+    fn engine_only_flags_are_usage_errors_by_name_without_engine() {
+        let refused = |argv: &[&str], flag: &str| {
+            let owned: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+            assert_eq!(run(&owned), exit::USAGE, "{argv:?}");
+            let message = engine_only_message(flag);
+            assert!(
+                message.contains(flag) && message.contains("--engine"),
+                "{message}"
+            );
+        };
+        for (flag, argv) in [
+            ("--fast", &["analyze", "--fast", "/p"][..]),
+            (
+                "--metrics-json",
+                &["analyze", "--metrics-json", "m", "/p"][..],
+            ),
+            ("--overlay", &["analyze", "--overlay", "a=b", "/p"][..]),
+            (
+                "--memory-limit",
+                &["analyze", "--memory-limit", "64", "/p"][..],
+            ),
+            ("--memory-report", &["analyze", "--memory-report", "/p"][..]),
+            (
+                "--trace-events",
+                &["analyze", "--trace-events", "t", "/p"][..],
+            ),
+            (
+                "--cache-size-limit",
+                &["analyze", "--cache-size-limit", "1MiB", "/p"][..],
+            ),
+            ("--cold", &["analyze", "--cold", "/p"][..]),
+        ] {
+            assert_eq!(analyze_face(argv).engine_only_flag(), Some(flag));
+            refused(argv, flag);
+        }
+        for (flag, argv) in [
+            (
+                "--metrics-json",
+                &["check", "--metrics-json", "m", "/p"][..],
+            ),
+            ("--cold", &["check", "--cold", "/p"][..]),
+        ] {
+            assert_eq!(check_args(argv).engine_only_flag(), Some(flag));
+            refused(argv, flag);
+        }
+        assert_eq!(analyze_face(&["analyze", "/p"]).engine_only_flag(), None);
+        assert_eq!(check_args(&["check", "/p"]).engine_only_flag(), None);
+    }
+
+    /// The forward class reaches the child with the targets last; the
+    /// consumed class never does.
+    #[test]
+    fn official_args_forward_the_flag_table() {
+        let args = analyze_face(&[
+            "analyze",
+            // Consumed.
+            "--format=json",
+            "--memory",
+            "--diagnostics",
+            "--enable-analytics",
+            "--disable-analytics",
+            // Forwarded.
+            "--sdk",
+            "/sdk",
+            "--packages",
+            "/config.json",
+            "--cache",
+            "/cache",
+            "--enable-experiment=a,b",
+            "--no-plugins",
+            "--no-use-aot-snapshot",
+            "--no-fatal-warnings",
+            "--fatal-infos",
+            "--verbose",
+            "--suppress-analytics",
+            "--disable-telemetry",
+            "--no-analytics",
+            "/pkg",
+            "lib/a.dart",
+        ]);
+        assert_eq!(
+            args.official_args(),
+            [
+                "--no-fatal-warnings",
+                "--fatal-infos",
+                "--verbose",
+                "--suppress-analytics",
+                "--disable-telemetry",
+                "--no-analytics",
+                "--sdk-path",
+                "/sdk",
+                "--packages",
+                "/config.json",
+                "--cache",
+                "/cache",
+                "--enable-experiment=a",
+                "--enable-experiment=b",
+                "--no-plugins",
+                "--no-use-aot-snapshot",
+                "/pkg",
+                "lib/a.dart",
+            ]
+        );
+        assert_eq!(analyze_face(&["analyze"]).official_args(), ["."]);
+    }
+
+    /// `check` forwards exactly what `analyze` forwards for the flags they
+    /// share.
+    #[test]
+    fn check_forwards_what_analyze_forwards() {
+        let shared = [
+            "--format=json",
+            "--no-fatal-warnings",
+            "--fatal-infos",
+            "--suppress-analytics",
+            "--diagnostics",
+            "/a",
+            "/b",
+        ];
+        let argv = |verb| std::iter::once(verb).chain(shared).collect::<Vec<_>>();
+        let forwarded = check_args(&argv("check")).official_args();
+        assert_eq!(
+            forwarded,
+            [
+                "--no-fatal-warnings",
+                "--fatal-infos",
+                "--suppress-analytics",
+                "/a",
+                "/b"
+            ]
+        );
+        assert_eq!(forwarded, analyze_face(&argv("analyze")).official_args());
+    }
+
+    const INFO_ROW: &str = "INFO|LINT|AVOID_PRINT|{file}|1|1|3|m\n";
+    const WARNING_ROW: &str = "WARNING|STATIC_WARNING|DEAD_CODE|{file}|1|1|3|m\n";
+    const ERROR_ROW: &str = "ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{file}|2|5|1|m\n";
+
+    /// A canned official run over one source file (`{file}` in `rows` is its
+    /// path), rooted at the file's directory. No child runs.
+    fn canned_run(rows: &str, code: Option<i32>, stderr: &str) -> (tempfile::TempDir, OfficialRun) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let file = root.join("a.dart");
+        fs::write(&file, "var a;\nvar b;\n").expect("write");
+        let stdout = rows.replace("{file}", &file.display().to_string());
+        let run = OfficialRun::parse(
+            stdout.as_bytes(),
+            stderr.as_bytes().to_vec(),
+            code,
+            Some(root),
+        );
+        (dir, run)
+    }
+
+    /// One run through the printer: exit code, stdout, stderr.
+    fn printed(run: &OfficialRun, format: AnalyzeFormat, memory: bool) -> (u8, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = official_finish(run, format, memory, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("UTF-8"),
+            String::from_utf8(err).expect("UTF-8"),
+        )
+    }
+
+    /// Official rows print through the engine path's writers on all three
+    /// faces, with the same root projection and a clean stderr.
+    #[test]
+    fn official_rows_print_through_the_shared_writers() {
+        let (dir, run) = canned_run(ERROR_ROW, Some(3), "");
+        let root = dir.path().canonicalize().expect("canonical root");
+
+        let (code, lon, err) = printed(&run, AnalyzeFormat::Lon, false);
+        assert_eq!((code, err.as_str()), (exit::ERRORS, ""));
+        let document: serde_json::Value = lon::from_str(lon.trim_end()).expect("one document");
+        assert_eq!(document["root"], root.display().to_string());
+        assert_eq!(
+            document["diags"][0],
+            serde_json::json!({
+                "code": "undefined_identifier",
+                "sev": "error",
+                "file": "a.dart",
+                "line": 2,
+                "col": 5,
+                "len": 1,
+                "msg": "m",
+            })
+        );
+
+        let (_, text, _) = printed(&run, AnalyzeFormat::Text, false);
+        assert_eq!(
+            text,
+            format!(
+                "root: {}\na.dart\n  error undefined_identifier 2:5 m\n1 issue found.\n",
+                root.display()
+            )
+        );
+
+        let (_, json, _) = printed(&run, AnalyzeFormat::Json, false);
+        let envelope: serde_json::Value = serde_json::from_str(&json).expect("one envelope");
+        assert_eq!(
+            envelope["diagnostics"][0]["location"]["range"]["start"],
+            serde_json::json!({"offset": 11, "line": 2, "column": 5})
+        );
+        assert!(envelope.get("memory").is_none(), "--memory unset");
+
+        let (_, json, _) = printed(&run, AnalyzeFormat::Json, true);
+        let envelope: serde_json::Value = serde_json::from_str(&json).expect("one envelope");
+        assert_eq!(envelope.get("memory").is_some(), cfg!(unix), "{json}");
+    }
+
+    /// The clean run is each face's own clean shape.
+    #[test]
+    fn a_clean_official_run_prints_the_clean_faces() {
+        let (_dir, run) = canned_run("", Some(0), "");
+        let clean = |format| printed(&run, format, false);
+        let empty = String::new();
+        assert_eq!(
+            clean(AnalyzeFormat::Lon),
+            (exit::CLEAN, "{v:1 diags:[]}\n".to_owned(), empty.clone())
+        );
+        assert_eq!(
+            clean(AnalyzeFormat::Json),
+            (
+                exit::CLEAN,
+                "{\"version\":1,\"diagnostics\":[]}\n".to_owned(),
+                empty.clone()
+            )
+        );
+        assert_eq!(
+            clean(AnalyzeFormat::Text),
+            (exit::CLEAN, "No issues found!\n".to_owned(), empty)
+        );
+    }
+
+    /// The official code is the engine ladder's answer over the same rows
+    /// and flags, and it prints nothing on stderr (the primary path, not a
+    /// fallback).
+    #[test]
+    fn official_tiers_match_the_engine_ladder() {
+        for (rows, official, fatal_warnings, fatal_infos) in [
+            ("", exit::CLEAN, true, false),
+            (INFO_ROW, exit::CLEAN, true, false),
+            (INFO_ROW, exit::FATAL_INFOS, true, true),
+            (WARNING_ROW, exit::FATAL_WARNINGS, true, false),
+            (WARNING_ROW, exit::CLEAN, false, false),
+            (ERROR_ROW, exit::ERRORS, true, false),
+            (ERROR_ROW, exit::ERRORS, false, true),
+        ] {
+            let (_dir, run) = canned_run(rows, Some(i32::from(official)), "");
+            assert_eq!(
+                severity_exit(&run.diagnostics, fatal_warnings, fatal_infos),
+                official,
+                "the ladder agrees on {rows:?}"
+            );
+            let (code, _, err) = printed(&run, AnalyzeFormat::Lon, false);
+            assert_eq!(code, official);
+            assert_eq!(err, "", "stderr stays clean for CI");
+        }
+    }
+
+    /// A code the rows do not explain still passes through, with the
+    /// official stderr verbatim; past the severity tiers stdout stays empty
+    /// unless the child delivered rows.
+    #[test]
+    fn official_failures_pass_through_with_stderr_verbatim() {
+        for official in [4, 64, 254, 255] {
+            let (_dir, run) = canned_run("", Some(official), "boom\nstack\n");
+            let (code, out, err) = printed(&run, AnalyzeFormat::Json, false);
+            assert_eq!(i32::from(code), official);
+            assert_eq!(out, "", "a failure never prints a document");
+            assert_eq!(err, "boom\nstack\n");
+        }
+
+        let (_dir, run) = canned_run("", Some(2), "fatal\n");
+        let (code, _, err) = printed(&run, AnalyzeFormat::Lon, false);
+        assert_eq!(code, exit::FATAL_WARNINGS);
+        assert_eq!(err, "fatal\n");
+
+        let (_dir, run) = canned_run(ERROR_ROW, Some(4), "crash\n");
+        let (code, out, _) = printed(&run, AnalyzeFormat::Json, false);
+        assert_eq!(code, exit::INTERNAL_ERROR);
+        assert!(out.contains("undefined_identifier"), "rows are not lost");
+
+        let (_dir, run) = canned_run("", None, "");
+        let (code, out, err) = printed(&run, AnalyzeFormat::Lon, false);
+        assert_eq!(code, exit::INTERNAL_ERROR, "a signal ended the child");
+        assert_eq!(out, "");
+        assert!(err.contains("dart analyze"), "{err}");
+    }
+
+    /// Exit 3 without an ERROR row is upstream's machine format omitting
+    /// `pubspec.yaml` and `analysis_options.yaml` errors: the code stands
+    /// and one note explains it; a row that explains the code needs none.
+    #[test]
+    fn errors_the_machine_format_omits_keep_their_tier_with_a_note() {
+        let (_dir, run) = canned_run(WARNING_ROW, Some(3), "");
+        let (code, out, err) = printed(&run, AnalyzeFormat::Json, false);
+        assert_eq!(code, exit::ERRORS, "the official code outranks the rows");
+        assert!(out.contains("dead_code"), "{out}");
+        assert!(err.contains("pubspec.yaml"), "{err}");
+    }
+
+    /// A stdout line that is no row rides stderr verbatim as one advisory;
+    /// the rows around it still print and no line is lost.
+    #[test]
+    fn an_unparseable_line_is_one_stderr_advisory() {
+        let rows = format!("Please report this at dartbug.com.\n{INFO_ROW}");
+        let (_dir, run) = canned_run(&rows, Some(0), "");
+        let (code, out, err) = printed(&run, AnalyzeFormat::Json, false);
+        assert_eq!(code, exit::CLEAN);
+        assert_eq!(
+            err,
+            "note: unparsed dart analyze output: Please report this at dartbug.com.\n"
+        );
+        assert_eq!(run.diagnostics.len() + run.unparsed.len(), 2);
+        let envelope: serde_json::Value = serde_json::from_str(&out).expect("one envelope");
+        assert_eq!(envelope["diagnostics"].as_array().expect("rows").len(), 1);
+    }
+
+    /// The official path's analysis root: the workspace root its targets
+    /// share, none across workspaces.
+    #[test]
+    fn analysis_root_is_the_one_workspace_of_the_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let package = root.join("pkg");
+        let other = root.join("other");
+        fs::create_dir_all(package.join("lib")).expect("mkdir");
+        fs::create_dir_all(package.join("test")).expect("mkdir");
+        fs::create_dir_all(&other).expect("mkdir");
+        fs::write(package.join("pubspec.yaml"), "name: pkg\n").expect("write");
+        fs::write(package.join("lib/a.dart"), "").expect("write");
+
+        let resolved = |paths: &[PathBuf]| analysis_root(&resolve_targets(paths).expect("targets"));
+        assert_eq!(
+            resolved(&[package.join("lib/a.dart"), package.join("test")]),
+            Some(package.clone())
+        );
+        assert_eq!(resolved(&[package, other]), None);
     }
 
     // -----------------------------------------------------------------------
@@ -3658,6 +4395,7 @@ mod tests {
             matches!(args.format, AnalyzeFormat::Lon),
             "lon is the constant default"
         );
+        assert!(!args.engine, "the official backend is the default");
         assert!(args.metrics_json.is_none() && args.sdk_path.is_none());
         assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
@@ -3954,6 +4692,7 @@ mod tests {
         metrics_json: Option<PathBuf>,
     ) -> AnalyzeArgs {
         AnalyzeArgs {
+            engine: true,
             targets: vec![root.to_path_buf()],
             format,
             fast: false,

@@ -53,7 +53,7 @@ int main() => 2;
     "the apply record carries only the primary rows"
   assert_not_contains "$(cat "$(out_file fix-apply)")" 'ignore_line' \
     "rows the role selection filtered out are omitted from the record"
-  run_dartq_in fix-recheck "$base/fx" analyze lib
+  run_dartq_in fix-recheck "$base/fx" analyze --engine lib
   assert_eq "$DQ_RC" 0 "the post-fix tree analyzes clean"
 
   # --- fix --role: the explicit suppression selection -------------------
