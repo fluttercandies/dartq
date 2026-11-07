@@ -480,9 +480,74 @@ pub fn impact_after_analysis_with_symbols(
 /// production callers pass `None` — the parameter exists so a pinned
 /// assembly is possible (and testable).
 ///
+/// A failure inside the selection itself takes the same fallback: the
+/// analysis pass's structured error, or a panic anywhere in the selection
+/// (on this thread or a rayon worker it fans out to), answers
+/// `Err("impact analysis failed (<reason>)")` — the bounds are lost, the
+/// run is not (see `contain_panics`).
+///
 /// [`open_engine`]: crate::workspace::open_engine
 /// [`PackageTable::containing`]: dartq_package::PackageTable::containing
 pub fn impacted_tests(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<String>, String> {
+    contain_panics(|| select_impacted(root, sdk, base))
+}
+
+/// Runs a selection pass with its panics contained: a panic anywhere in
+/// it — on this thread or on a rayon worker the pass fans out to (rayon
+/// re-raises a worker's panic at the join) — answers
+/// `Err("impact analysis failed (panicked at <location>: <message>)")`,
+/// folded onto one line, instead of unwinding further.
+///
+/// `catch_unwind` alone cannot do it: the CLI's crash tier arms a
+/// process-exiting panic hook around the whole test face, so the hook
+/// would end the process before any unwind reached this frame. For the
+/// pass's duration the installed hook is swapped for one that only
+/// records the first panic, and the previous hook is reinstated after.
+/// The swap is process-global, so concurrent passes serialize on
+/// [`CONTAIN_LOCK`] (a pass must not nest another).
+fn contain_panics(
+    pass: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    let _serial = CONTAIN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first: Arc<std::sync::OnceLock<String>> = Arc::default();
+    let record = Arc::clone(&first);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        record.get_or_init(|| {
+            let message = info
+                .payload_as_str()
+                .unwrap_or("a non-string panic payload");
+            let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+            match info.location() {
+                Some(at) => format!("panicked at {at}: {message}"),
+                None => format!("panicked: {message}"),
+            }
+        });
+    }));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass));
+    drop(std::panic::take_hook());
+    std::panic::set_hook(previous);
+    outcome.unwrap_or_else(|payload| {
+        let reason = first.get().cloned().unwrap_or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic payload".to_owned())
+        });
+        Err(format!("impact analysis failed ({reason})"))
+    })
+}
+
+/// Serializes [`contain_panics`]'s hook swap (the panic hook is
+/// process-global: two interleaved swaps would reinstate each other's
+/// hooks out of order).
+static CONTAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`impacted_tests`]' selection proper, run inside [`contain_panics`].
+fn select_impacted(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<String>, String> {
     // The one resolution witness of the whole selection: the stamp check
     // below and the ownership verdict for names outside `root` both read
     // this table — the same assembly `open_engine` runs when a seed needs
@@ -566,7 +631,20 @@ pub fn impacted_tests(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec
     let (mut engine, _dir) = crate::workspace::open_engine(root, sdk)
         .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
     crate::analyze::run_overlaid(&mut engine, &[], &[])
-        .map_err(|error| format!("the analysis pass failed: {error}"))?;
+        .map_err(|error| format!("impact analysis failed ({error})"))?;
+    // A dependency closure that hit the interface index's file cap cannot
+    // see every dependency's faces: a change inside the skipped tail could
+    // hide the suites it reaches, so the selection is unbounded — the same
+    // conservative outcome as every other "cannot determine" boundary. The
+    // engine already named the cap on stderr at the moment it tripped; the
+    // reason here names it for the `dartq test: {reason} — running
+    // everything` line.
+    if engine.dep_index_capped() {
+        return Err(format!(
+            "dependency index capped at {} files — impact scope unknown",
+            engine.dep_index_cap()
+        ));
+    }
     // The report's test paths spell through the file locator (root-relative
     // inside the analysis root, absolute outside), so a relative tail
     // resolves back against the root that stripped it — the engine's own
@@ -1681,6 +1759,63 @@ mod tests {
             "names the assembly failure: {reason}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #4123: a panic inside the selection — on a rayon worker, the
+    /// user-reported shape — degrades to the one-line full-run reason, not
+    /// a process exit. The child arms a hook that exits at the internal
+    /// tier (4), exactly the CLI crash tier's posture around the test face:
+    /// contained, the pass answers `impact analysis failed (panicked at
+    /// …)` with the multi-line message folded, no panic report reaches
+    /// stderr, and the exiting hook is back in place afterwards — the
+    /// child's next panic exits at 4.
+    #[test]
+    fn contain_panics_degrades_a_worker_panic_under_an_exiting_hook() {
+        if std::env::var_os("DARTQ_CONTAIN_PANICS_SELFTEST").is_some() {
+            fn worker() {
+                panic!("byte index 5175 is not a char boundary;\n it is inside '主'");
+            }
+            std::panic::set_hook(Box::new(|_| std::process::exit(4)));
+            let reason = contain_panics(|| {
+                rayon::join(|| (), worker);
+                Ok(Vec::new())
+            })
+            .expect_err("the contained panic");
+            println!("{reason}");
+            io::Write::flush(&mut io::stdout()).expect("flush the reason");
+            // Past the pass the crash tier's hook is back: this panic exits.
+            let _ = std::panic::catch_unwind(worker);
+            return;
+        }
+        let current = std::env::current_exe().expect("test binary");
+        let output = std::process::Command::new(current)
+            .args([
+                "--exact",
+                "impact::tests::contain_panics_degrades_a_worker_panic_under_an_exiting_hook",
+                "--nocapture",
+            ])
+            .env("DARTQ_CONTAIN_PANICS_SELFTEST", "1")
+            .output()
+            .expect("selftest child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "the restored hook exits the child at the internal tier; stdout: {stdout}; stderr: {stderr}"
+        );
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with("impact analysis failed (panicked at "))
+            .unwrap_or_else(|| panic!("the reason line; stdout: {stdout}; stderr: {stderr}"));
+        assert!(
+            line.ends_with(": byte index 5175 is not a char boundary; it is inside '主')"),
+            "the folded one-line reason: {line}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "no panic report reaches stderr while contained: {stderr}"
+        );
     }
 
     /// The pub-workspace defect (#4087): member `a`'s suite reaches member
@@ -2998,4 +3133,123 @@ mod tests {
     /// The environment-axis target of the embedder test: one `dart:ui`
     /// import, clean of every other diagnostic face.
     const UI_IMPORT: &str = "import 'dart:ui';\nvoid main() {}\n";
+
+    /// The dependency-index cap is a selection boundary: with
+    /// `DARTQ_DEP_FILE_CAP=1` the lazy closure loads one dep file and the
+    /// next `package:` target trips the cap, so `select_impacted` must
+    /// answer the unbounded reason — never a reach computed over a
+    /// truncated closure. The same fixture at the production cap bounds
+    /// the change to the one suite whose import reaches it. One test owns
+    /// both arms: the cap rides a process-global env var, and two
+    /// concurrent tests mutating it would race.
+    #[test]
+    fn impacted_tests_dep_cap_truncation_degrades_to_unbounded() {
+        let prev = std::env::var("DARTQ_DEP_FILE_CAP").ok();
+        let root = dep_cap_fixture();
+        let sdk = root.parent().expect("toplevel").join("sdk");
+        unsafe { std::env::set_var("DARTQ_DEP_FILE_CAP", "1") };
+        let capped = impacted_tests(&root, Some(&sdk), "HEAD");
+        match prev {
+            Some(value) => unsafe { std::env::set_var("DARTQ_DEP_FILE_CAP", value) },
+            None => unsafe { std::env::remove_var("DARTQ_DEP_FILE_CAP") },
+        }
+        let reason = capped.expect_err("the capped closure cannot bound the change");
+        assert!(
+            reason.starts_with("dependency index capped at "),
+            "names the cap: {reason}"
+        );
+
+        let selected =
+            impacted_tests(&root, Some(&sdk), "HEAD").expect("bounded selection");
+        assert_eq!(
+            selected,
+            vec!["test/a_test.dart".to_owned()],
+            "under the production cap the same change bounds to its reach"
+        );
+        std::fs::remove_dir_all(root.parent().expect("toplevel")).ok();
+    }
+
+    /// Builds the dep-cap fixture and returns the package root (`ws/`)
+    /// with the change applied, the stamp recorded, and `HEAD` pointing at
+    /// the pre-change tree. The layout mirrors the dep-interface engine
+    /// fixture: the analyzed package `ws` and the three dep packages are
+    /// siblings under one git toplevel — a dep root outside `ws`'s bound
+    /// is what `dep_candidate` keys on (an in-bound package root becomes a
+    /// discovery context root and its files arrive resident, never
+    /// through the lazy index, so the cap could never trip). `ws/lib/a.dart`
+    /// imports `package:dep1/d1.dart`, which chains dep2 → dep3; the stub
+    /// SDK sits beside both at `sdk/`.
+    fn dep_cap_fixture() -> PathBuf {
+        let top = std::env::temp_dir().join(format!(
+            "dq_cmd_impact_dep_cap_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&top);
+        let write = |relative: &str, content: &str| {
+            let path = top.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            fs::write(path, content).expect("file");
+        };
+        // The `ws` package: pubspec declaring the hosted dep, the lock
+        // carrying the same resolution, and the config mapping
+        // `package:depN` at the sibling `deps/` roots (rootUri is relative
+        // to `ws/.dart_tool/`).
+        write(
+            "ws/pubspec.yaml",
+            "name: ws\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  dep1: ^0.1.0\n",
+        );
+        write(
+            "ws/pubspec.lock",
+            "packages:\n  dep1:\n    dependency: \"direct main\"\n    description:\n      name: dep1\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  dep2:\n    dependency: transitive\n    description:\n      name: dep2\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  dep3:\n    dependency: transitive\n    description:\n      name: dep3\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        // `package:depN` maps at the sibling `deps/` roots: `rootUri` is
+        // relative to `ws/.dart_tool/`, so two `..` climb to the toplevel.
+        write(
+            "ws/.dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [
+                {"name": "ws", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "dep1", "rootUri": "../../deps/dep1", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "dep2", "rootUri": "../../deps/dep2", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "dep3", "rootUri": "../../deps/dep3", "packageUri": "lib/", "languageVersion": "3.5"}
+            ], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        );
+        write("ws/lib/a.dart", "import 'package:dep1/d1.dart';\nclass A {}\n");
+        write(
+            "ws/test/a_test.dart",
+            "import 'package:ws/a.dart';\nvoid main() {}\n",
+        );
+        for (name, imports, file) in [
+            ("dep1", "import 'package:dep2/d2.dart';", "d1.dart"),
+            ("dep2", "import 'package:dep3/d3.dart';", "d2.dart"),
+            ("dep3", "", "d3.dart"),
+        ] {
+            write(
+                &format!("deps/{name}/pubspec.yaml"),
+                &format!("name: {name}\nversion: 0.1.0\n"),
+            );
+            write(
+                &format!("deps/{name}/lib/{file}"),
+                &format!("{imports}\nclass {} {{}}\n", name.to_uppercase()),
+            );
+        }
+        // The stub SDK faces `workspace()` writes, at the toplevel the
+        // test names explicitly.
+        write("sdk/version", "3.13.1\n");
+        write(
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        commit_all(&top);
+        write(
+            "ws/lib/a.dart",
+            "import 'package:dep1/d1.dart';\nclass A2 {}\n",
+        );
+        let root = top.join("ws").canonicalize().expect("root");
+        record_resolution_stamp(&root).expect("record the inputs");
+        root
+    }
 }

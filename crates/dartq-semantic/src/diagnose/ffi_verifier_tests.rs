@@ -8,7 +8,9 @@
 //! `@Packed`, the invocation shapes) runs exactly as in the engine.
 
 use super::FileReport;
-use super::test_rig::{CORE_PRELUDE, RigImport, report_ops_imports, rows};
+use super::test_rig::{
+    CORE_PRELUDE, RigImport, report_ops, report_ops_imports, report_ops_with, rows,
+};
 
 /// The `dart:ffi` mount: the compound roots, the generic natives, and
 /// the primitive types the trigger shapes write. Identity for the
@@ -355,7 +357,11 @@ fn invalid_field_type_in_struct() {
 #[test]
 fn invalid_field_type_in_struct_nullable_pointer() {
     let f = "\nfinal class C extends Struct {\n  external Pointer? p;\n}\n";
-    assert_row(&report(f), "invalid_field_type_in_struct", at(f, 3, 12), 8);
+    // oracle 3.13.7 reports `Pointer?` at (3,12)+8 of the `import` case
+    //   file — the fixture drops that line but keeps its newline, so
+    //   case line 3 is fixture line index 2 (`at`'s `index + 2 ==
+    //   case_line` -> case_line 4).
+    assert_row(&report(f), "invalid_field_type_in_struct", at(f, 4, 12), 8);
 }
 
 #[test]
@@ -576,4 +582,61 @@ fn native_external_fields_stay_silent_on_not_initialized() {
     let r = report(f);
     assert_absent(&r, "not_initialized_non_nullable_instance_field");
     assert_absent(&r, "not_initialized_non_nullable_variable");
+}
+
+/// #4123, the user-reported crash: an ordinary library — no FFI anywhere —
+/// whose class header carries CJK comments inside its `with` list. The
+/// clause-entry pass runs for every class with a `with` clause; the
+/// retired byte walk sliced `&source[cursor..]` at every byte of the list
+/// and panicked on the first continuation byte of `主` (`byte index … is
+/// not a char boundary`). The token walk reads no comment text and slices
+/// only at token edges.
+#[test]
+fn with_clause_cjk_comments_stay_panic_free() {
+    let f = "\nmixin Tabs {}\nmixin Keep {}\nclass Base {}\n\
+             class Home extends Base\n    with\n        Tabs, // 主页\n\
+             \x20       Keep /* 主题 */ {\n  final String title = '主页';\n}\n";
+    assert_absent(&report_ops(f), "subtype_of_struct_class");
+}
+
+/// #4123: the `with` entries are the header's tokens — a comment (CJK
+/// included) between entries is trivia, and a clause keyword never matches
+/// inside an identifier (`Station` holds no `on` clause) — so the
+/// struct-subtype entry behind both still anchors upstream's
+/// `subtypeOfStructClassInWith` row on its own written name.
+#[test]
+fn subtype_of_struct_class_in_with_reads_entries_past_comments() {
+    let f = "\nmixin Station {}\nfinal class S extends Struct {\n  external Pointer f;\n}\n\
+             final class C with Station, /* 主 */ S // 主页\n{}\n";
+    let r = report(f);
+    assert_row(&r, "subtype_of_struct_class", at(f, 7, 37), 1);
+    assert!(
+        rows(&r).iter().any(|row| row.contains("can't mix in 'S'")),
+        "the with-clause face: {:#?}",
+        rows(&r)
+    );
+}
+
+/// #4123: a `@alias` whose top-level const spells `Native<…>(…)` parses
+/// the const's right-hand side in place. The retired path parsed a
+/// synthesized `@` + RHS copy and converted that copy's byte offsets
+/// against the unit source — offsets into one string applied to another,
+/// a `not a char boundary` panic once the unit opens with multi-byte text
+/// (no prelude here: the CJK header sits at byte 0). The alias still
+/// counts as the declaration's `@Native`.
+#[test]
+fn const_native_alias_parses_in_place_past_a_cjk_header() {
+    let f = "// 主页面的原生绑定\nconst leaf = Native<Void Function()>();\n@leaf\nf() {}\n";
+    let r = report_ops_with(
+        f,
+        &[RigImport {
+            uri: "dart:ffi",
+            prefix: None,
+            source: FFI_SOURCE,
+        }],
+        None,
+    );
+    let name = f.find("\nf()").expect("the declaring name") + 1;
+    let offset = f[..name].chars().map(char::len_utf16).sum();
+    assert_row(&r, "ffi_native_must_be_external", offset, 1);
 }

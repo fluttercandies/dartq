@@ -1556,14 +1556,14 @@ fn run(args: &[String]) -> u8 {
     };
     match execute(&plan) {
         Ok(code) => {
-            // An executed `--impacted` run is the one moment the ignored
-            // resolution inputs are known-good for the suites that ran —
-            // any exit code: a failing suite still ran. Returns before
-            // this point (usage errors, a missing runner) executed
-            // nothing and record nothing.
-            if plan.inv.impacted.is_some() {
-                record_impacted_inputs(&plan.root);
-            }
+            // An executed run is the one moment the ignored resolution
+            // inputs are known-good for the suites that ran — any exit
+            // code: a failing suite still ran. Plain runs record too: the
+            // record is what lets the first `--impacted` bound itself, and
+            // a bounded selection already recorded above on its early
+            // returns. Returns before this point (usage errors, a missing
+            // runner) executed nothing and record nothing.
+            record_impacted_inputs(&plan.root);
             code
         }
         Err(error) => {
@@ -3003,5 +3003,68 @@ mod tests {
         assert!(cut.incomplete, "a started test that never finished");
         assert!(cut.passed == 0 && cut.failed == 0, "it counts nowhere");
         assert!(!tally(&ok).incomplete, "a finished suite is complete");
+    }
+
+    /// The plain-run record (#4124): `execute` calls
+    /// [`record_impacted_inputs`] after every executed run — impacted or
+    /// not — so the first `--impacted` finds the ignored resolution
+    /// inputs already stamped instead of answering "no record … yet" and
+    /// running everything. The stamp is names-and-hashes only: it parses
+    /// as one JSON object and stays a few hundred bytes however large the
+    /// workspace.
+    #[test]
+    fn plain_run_records_the_impacted_inputs_stamp() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canonical root");
+        fs::write(
+            root.join("pubspec.yaml"),
+            "name: p\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
+        fs::create_dir_all(root.join(".dart_tool")).expect("dart_tool");
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[{"name":"p","rootUri":"../","packageUri":"lib/","languageVersion":"3.5"}],"generator":"pub","generatorVersion":"3.13.1"}"#,
+        )
+        .expect("config");
+        fs::write(
+            root.join("pubspec.lock"),
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        )
+        .expect("lock");
+        fs::create_dir_all(root.join("lib")).expect("lib");
+        fs::write(root.join("lib/a.dart"), "class A {}\n").expect("lib");
+
+        assert!(
+            !root.join(".dart_tool/dartq/impacted-inputs.json").exists(),
+            "no record before the run"
+        );
+        record_impacted_inputs(&root);
+        let stamp = root.join(".dart_tool/dartq/impacted-inputs.json");
+        let bytes = fs::read(&stamp).expect("the plain run wrote the record");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the record parses as JSON");
+        assert!(
+            parsed.is_object(),
+            "the record is one path→hash object: {parsed}"
+        );
+        assert!(
+            bytes.len() < 4096,
+            "names and hashes only, never content: {} bytes",
+            bytes.len()
+        );
+        // The recorded keys name the trio the selection diffs against —
+        // present files hash, absent ones spell "absent".
+        let map = parsed.as_object().expect("object");
+        assert!(map.contains_key("pubspec.lock"), "{map:?}");
+        assert!(
+            map.contains_key(".dart_tool/package_config.json"),
+            "{map:?}"
+        );
+        assert_eq!(
+            map.get("pubspec_overrides.yaml").and_then(|v| v.as_str()),
+            Some("absent"),
+            "the absent overrides file is recorded, not skipped"
+        );
     }
 }

@@ -15,6 +15,7 @@
 //! from the element model and source walks.
 
 use super::*;
+use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::byte_offset_to_utf16;
 
 /// The `dart:ffi` class spellings the verifier names (upstream
@@ -254,7 +255,9 @@ impl<'a> Engine<'a> {
         let stop = self.byte_of(stop16).min(self.source.len());
         let text = self.source.get(start..stop).unwrap_or_default();
         // The written name: after `@`, the dot-joined identifier run.
-        let body = &text[1..];
+        let Some(body) = text.strip_prefix('@') else {
+            return;
+        };
         let name_len = body
             .char_indices()
             .take_while(|(i, c)| *i == 0 || c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
@@ -281,7 +284,7 @@ impl<'a> Engine<'a> {
                 1
             }
         };
-        let (face, _) = self.parse_ffi_face(at16, start, text, variant);
+        let (face, _) = self.parse_ffi_face(at16, start, text, 1, variant);
         let name = self.strings.intern(name_text);
         self.ffi_pending_annos.push(FfiDeclAnno {
             at: SourceRange {
@@ -293,17 +296,22 @@ impl<'a> Engine<'a> {
         });
     }
 
-    /// Parses one FFI annotation's span into its face. `variant`: 0
+    /// Parses one FFI annotation's span into its face. `text` is the real
+    /// source run starting at byte `start` (UTF-16 `at16`); `name_at` is
+    /// the name run's byte offset in it — `1` past a written annotation's
+    /// `@`, `0` for a const alias's right-hand side. `variant`: 0
     /// `@Native`, 1 `@Array*`, 2 `@Packed`, 3 `@AbiSpecificIntegerMapping`,
     /// 4 `@DefaultAsset`. Returns the face and the argument group's span
     /// (relative information is folded in; every stored span is absolute
-    /// UTF-16).
+    /// UTF-16 — `text` offsets rebase through `start`, so `text` must be
+    /// `self.source[start..]`'s own bytes, never a synthesized copy).
     #[expect(clippy::cast_possible_truncation)] // offsets saturate at the scanner's u32 cap
     fn parse_ffi_face(
         &self,
         at16: u32,
         start: usize,
         text: &str,
+        name_at: usize,
         variant: u8,
     ) -> (FfiAnnoFace, Option<SourceRange>) {
         let mut face = FfiAnnoFace {
@@ -321,18 +329,21 @@ impl<'a> Engine<'a> {
         };
         let bytes = text.as_bytes();
         // The name run's end (the same scan `note_ffi_annotation` did).
-        let body = &text[1..];
+        let Some(body) = text.get(name_at..) else {
+            return (face, None);
+        };
         let name_len = body
             .char_indices()
             .take_while(|(i, c)| *i == 0 || c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
             .map(|(i, c)| i + c.len_utf8())
             .last()
             .unwrap_or(0);
+        let name_at16 = name_at as u32;
         face.name_span = SourceRange {
-            offset: at16 + 1,
-            length: (name_len as u32).min(u32::MAX - at16 - 1),
+            offset: at16 + name_at16,
+            length: (name_len as u32).min(u32::MAX - at16 - name_at16),
         };
-        let mut cursor = 1 + name_len;
+        let mut cursor = name_at + name_len;
         let utf16 = |byte: usize| byte_offset_to_utf16(self.source, start + byte);
         // The written `<T>` (the `@Native` signature).
         if cursor < bytes.len() && bytes[cursor] == b'<' {
@@ -370,7 +381,7 @@ impl<'a> Engine<'a> {
         match variant {
             0 => {}
             1 => {
-                let suffix = text[1..1 + name_len]
+                let suffix = body[..name_len]
                     .strip_prefix("Array.")
                     .unwrap_or_default()
                     .to_owned();
@@ -1203,7 +1214,7 @@ impl<'a> Engine<'a> {
             .find(|s| s.name == alias_id && matches!(s.kind, DeclKind::TopLevelVar))?;
         // Source-walk the const decl's `= <creation>` tail.
         let decl_start = self.byte_of(const_site.range.offset);
-        let tail = &self.source[decl_start..];
+        let tail = self.source.get(decl_start..)?;
         // Find `=` after the const name; the initializer text runs to the
         // statement's `;`.
         let eq = tail.find('=')?;
@@ -1217,88 +1228,19 @@ impl<'a> Engine<'a> {
         } else {
             return None;
         };
-        let head_len = init.len() - init_trimmed.len();
-        let head = &init_trimmed[..class_name.len().min(init_trimmed.len())];
-        if head != class_name {
-            return None;
-        }
-        // The parse runs on the REAL const-RHS slice so every produced
-        // span (sig.range, args, dims) lands in `self.source` coordinates;
-        // the face content (sig display/heads, is_leaf, dims values) is
-        // identical to the written annotation's. `parse_ffi_face` expects
-        // the text to lead with `@`, so we synthesize the slice as
-        // `@` + the RHS text in a temporary buffer whose bytes share the
-        // tail of `self.source` — but `byte_offset_to_utf16(self.source,…)`
-        // would still misindex, so instead we parse on a standalone
-        // buffer and rebase the name/at spans onto the alias's written
-        // spans (the only spans the diagnostics read for const aliases:
-        // `ffiNativeInvalidMultipleAnnotations` anchors `annotationAst.name`,
-        // the others read sig/args CONTENT not their spans).
-        let mut text = String::with_capacity(1 + init_trimmed.len());
-        text.push('@');
-        text.push_str(init_trimmed);
-        let (mut face, _) = self.parse_ffi_face(0, 0, &text, variant);
-        // Rebase: the synthetic `@` sat at offset 0 of `text`; the name
-        // span must anchor the ALIAS's written name (the diagnostic's
-        // `annotationAst.name` is the written annotation, not the const's
-        // RHS).
+        // The RHS parses in place: `init_trimmed` is `self.source`'s own
+        // run at byte `rhs`, so every span the face carries (the argument
+        // group's, the signature's) is a real source range. Only the name
+        // span is replaced — upstream anchors the alias's written name
+        // (`ffiNativeInvalidMultipleAnnotations` reads `annotationAst.name`,
+        // the `@alias` itself, not the const's RHS head).
+        let rhs = decl_start + eq + 1 + (init.len() - init_trimmed.len());
+        let (mut face, _) = self.parse_ffi_face(self.utf16_of(rhs), rhs, init_trimmed, 0, variant);
         let alias_name_range = SourceRange {
-            offset: byte_offset_to_utf16(self.source, alias_start),
-            length: byte_offset_to_utf16(self.source, alias_end)
-                - byte_offset_to_utf16(self.source, alias_start),
+            offset: self.utf16_of(alias_start),
+            length: self.utf16_of(alias_end) - self.utf16_of(alias_start),
         };
         face.name_span = alias_name_range;
-        // The `args` presence gate (`anno.face.args.is_none()` rejects a
-        // bare `@Native`) must reflect the const RHS's argument group —
-        // rebase its written span onto the const's own `(`…`)` so the
-        // external-keyword probe (`anno.at.end()` → `site.range` between-
-        // text scan) stays truthful: the `at` range covers the alias name,
-        // the args range the RHS's group — the between-text read is
-        // annotation→name anyway, so the alias's real extent is what
-        // matters.
-        if let Some(args) = face.args.as_mut() {
-            // The RHS argument group's `(` sits right after the head's
-            // `<…>` type arguments when present, else right after the
-            // class name — scan forward from the head's end in the init
-            // text for the first `(`.
-            let head_end = decl_start + eq + 1 + head_len + head.len();
-            let rest = &self.source[head_end..];
-            let mut depth = 0i32;
-            let mut open = None;
-            for (i, &b) in rest.as_bytes().iter().enumerate() {
-                match b {
-                    b'<' => depth += 1,
-                    b'>' => depth -= 1,
-                    b'(' if depth == 0 => {
-                        open = Some(head_end + i);
-                        break;
-                    }
-                    b';' | b'\n' if depth == 0 => break,
-                    _ => {}
-                }
-            }
-            let paren_open = open.unwrap_or(head_end);
-            args.offset = byte_offset_to_utf16(self.source, paren_open);
-            // Keep the group's written extent; the close paren is the
-            // init text's first `)` at depth 0.
-            let mut depth = 0i32;
-            let mut close = paren_open;
-            for (i, &b) in self.source.as_bytes()[paren_open..].iter().enumerate() {
-                match b {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = paren_open + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            args.length = byte_offset_to_utf16(self.source, close + 1)
-                - byte_offset_to_utf16(self.source, paren_open);
-        }
         Some(FfiDeclAnno {
             at: alias_name_range,
             name: self.strings.intern(class_name),
@@ -1491,176 +1433,102 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The `with` clause's written entries, source-walked from the class
-    /// name span: the comma-separated type spellings between the `with`
-    /// keyword and the body/`implements`/`on` clause that follows.
-    /// `(spelling, span)` per entry — the spelling is the source text
-    /// (`p.S` whole), the span its written range.
+    /// The `with` clause's written entries, token-walked from the class
+    /// name: the comma-separated type spellings between the `with` keyword
+    /// and the body/`implements`/`on` clause that follows. `(spelling,
+    /// span)` per entry — the spelling is the entry's written extent
+    /// (`p.S<T>` whole), the span its range.
+    ///
+    /// The walk reads the scanner's tokens, never raw bytes: comments are
+    /// no tokens (a CJK comment trailing a mixin is trivia, not entry
+    /// text), keywords are whole tokens (`RestorationMixin` holds no
+    /// `on`), and the entry text slices only at token edges — char
+    /// boundaries by construction. Groups jump whole, so a type-parameter
+    /// bound's `extends`, an entry's own type arguments, and a parameter
+    /// list never split the clause.
     fn ffi_with_clause_entries(&self, name: StringId) -> Vec<(String, SourceRange)> {
-        let Some(name_span) = self.ffi_container_name_span(name) else {
-            return Vec::new();
-        };
-        let name_start = self.byte_of(name_span.offset);
-        let bytes = self.source.as_bytes();
-        // Walk forward from the class name past the (optional) type
-        // parameters, superclass clause, and any `extends` entry, looking
-        // for the `with` keyword at depth 0 before the body `{`.
-        let mut cursor = name_start + self.strings.resolve(name).len();
         let mut entries = Vec::new();
-        while cursor < bytes.len() {
-            // Skip whitespace and comments.
-            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            if cursor + 1 < bytes.len()
-                && bytes[cursor] == b'/'
-                && bytes[cursor + 1] == b'/'
-            {
-                while cursor < bytes.len() && bytes[cursor] != b'\n' {
-                    cursor += 1;
-                }
-                continue;
-            }
-            if cursor + 1 < bytes.len()
-                && bytes[cursor] == b'/'
-                && bytes[cursor + 1] == b'*'
-            {
-                cursor += 2;
-                while cursor + 1 < bytes.len()
-                    && !(bytes[cursor] == b'*' && bytes[cursor + 1] == b'/')
-                {
-                    cursor += 1;
-                }
-                cursor = (cursor + 2).min(bytes.len());
-                continue;
-            }
-            if cursor >= bytes.len() {
-                break;
-            }
-            match bytes[cursor] {
-                // The body opens: no `with` clause.
-                b'{' | b';' => return entries,
-                // Type-parameter group.
-                b'<' => {
-                    let Some(close) = matching_close(bytes, cursor, b'<', b'>') else {
-                        return entries;
-                    };
-                    cursor = close + 1;
-                }
-                // `extends` — skip its single entry (the superclass clause
-                // is one type), then continue scanning for `with` or
-                // `implements`.
-                _ if self.source[cursor..].starts_with("extends") => {
-                    cursor += "extends".len();
-                    // Skip the superclass entry (one comma-free type
-                    // spelling: head + optional `<...>`).
-                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                        cursor += 1;
+        let Some(name_span) = self.ffi_container_name_span(name) else {
+            return entries;
+        };
+        let tokens = self.tokens.as_slice();
+        let mut cursor = tokens.partition_point(|t| t.utf16_offset < name_span.end());
+        // Open `<` brackets: clause keywords and separators count only at
+        // depth 0 (`>>`/`>>>` close two/three levels at once).
+        let mut angles = 0u32;
+        // `Some` once the `with` keyword is read: the open entry's first
+        // and last token indices.
+        let mut list: Option<Option<(usize, usize)>> = None;
+        while let Some(token) = tokens.get(cursor) {
+            let mut last = cursor;
+            match token.kind {
+                // The header ends: the body, a mixin application's `;`, or
+                // an unbalanced group's recovery stop.
+                TokenKind::Eof
+                | TokenKind::OpenCurly
+                | TokenKind::CloseCurly
+                | TokenKind::Semicolon => break,
+                TokenKind::Lt => angles += 1,
+                TokenKind::Gt => angles = angles.saturating_sub(1),
+                TokenKind::GtGt => angles = angles.saturating_sub(2),
+                TokenKind::GtGtGt => angles = angles.saturating_sub(3),
+                TokenKind::OpenParen | TokenKind::OpenSquare => {
+                    match self.tokens.matching_end(cursor) {
+                        Some(close) if close > cursor => last = close,
+                        _ => break,
                     }
-                    // The head identifier (possibly prefixed).
-                    while cursor < bytes.len()
-                        && (bytes[cursor].is_ascii_alphanumeric()
-                            || bytes[cursor] == b'_'
-                            || bytes[cursor] == b'$'
-                            || bytes[cursor] == b'.')
+                }
+                _ if angles > 0 => {}
+                // `implements` (or a mixin's `on`) ends the `with` list —
+                // or, ahead of `with`, means no `with` clause follows.
+                TokenKind::Keyword(Keyword::Implements | Keyword::On) => break,
+                TokenKind::Keyword(Keyword::With) if list.is_none() => {
+                    list = Some(None);
+                    cursor += 1;
+                    continue;
+                }
+                TokenKind::Comma => {
+                    if let Some(open) = list.as_mut()
+                        && let Some((first, end)) = open.take()
+                        && let Some(entry) = self.ffi_token_run(first, end)
                     {
-                        cursor += 1;
+                        entries.push(entry);
                     }
-                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                        cursor += 1;
-                    }
-                    if cursor < bytes.len() && bytes[cursor] == b'<' {
-                        if let Some(close) = matching_close(bytes, cursor, b'<', b'>') {
-                            cursor = close + 1;
-                        }
-                    }
-                }
-                _ if self.source[cursor..].starts_with("with") => {
-                    cursor += "with".len();
-                    // The comma-separated entries until the body or the
-                    // next clause keyword at depth 0.
-                    let mut entry_start = cursor;
-                    let mut depth = 0i32;
-                    while cursor < bytes.len() {
-                        match bytes[cursor] {
-                            b'<' | b'(' | b'[' => depth += 1,
-                            b'>' | b')' | b']' => depth -= 1,
-                            b',' if depth == 0 => {
-                                let text = self.source[entry_start..cursor].trim();
-                                if !text.is_empty() {
-                                    let lead = entry_start
-                                        + (self.source[entry_start..cursor].len()
-                                            - self.source[entry_start..cursor].trim_start().len());
-                                    let span = SourceRange {
-                                        offset: byte_offset_to_utf16(self.source, lead),
-                                        length: byte_offset_to_utf16(
-                                            self.source,
-                                            lead + text.len(),
-                                        ) - byte_offset_to_utf16(self.source, lead),
-                                    };
-                                    entries.push((text.to_owned(), span));
-                                }
-                                entry_start = cursor + 1;
-                            }
-                            b'{' | b';' if depth == 0 => {
-                                let text = self.source[entry_start..cursor].trim();
-                                if !text.is_empty() {
-                                    let lead = entry_start
-                                        + (self.source[entry_start..cursor].len()
-                                            - self.source[entry_start..cursor].trim_start().len());
-                                    let span = SourceRange {
-                                        offset: byte_offset_to_utf16(self.source, lead),
-                                        length: byte_offset_to_utf16(
-                                            self.source,
-                                            lead + text.len(),
-                                        ) - byte_offset_to_utf16(self.source, lead),
-                                    };
-                                    entries.push((text.to_owned(), span));
-                                }
-                                return entries;
-                            }
-                            // The next clause keyword at depth 0 ends the
-                            // `with` list (`with M implements I` — the
-                            // `implements` tail is not a mixin).
-                            _ if depth == 0
-                                && (self.source[cursor..].starts_with("implements")
-                                    || self.source[cursor..].starts_with("on")) =>
-                            {
-                                let text = self.source[entry_start..cursor].trim();
-                                if !text.is_empty() {
-                                    let lead = entry_start
-                                        + (self.source[entry_start..cursor].len()
-                                            - self.source[entry_start..cursor].trim_start().len());
-                                    let span = SourceRange {
-                                        offset: byte_offset_to_utf16(self.source, lead),
-                                        length: byte_offset_to_utf16(
-                                            self.source,
-                                            lead + text.len(),
-                                        ) - byte_offset_to_utf16(self.source, lead),
-                                    };
-                                    entries.push((text.to_owned(), span));
-                                }
-                                return entries;
-                            }
-                            _ => {}
-                        }
-                        cursor += 1;
-                    }
-                    return entries;
-                }
-                _ if self.source[cursor..].starts_with("implements")
-                    || self.source[cursor..].starts_with("on") =>
-                {
-                    // A clause keyword ahead of `with` means no `with`
-                    // clause follows.
-                    return entries;
-                }
-                _ => {
                     cursor += 1;
+                    continue;
                 }
+                _ => {}
             }
+            if let Some(open) = list.as_mut() {
+                let first = open.map_or(cursor, |(first, _)| first);
+                *open = Some((first, last));
+            }
+            cursor = last + 1;
+        }
+        if let Some(Some((first, last))) = list
+            && let Some(entry) = self.ffi_token_run(first, last)
+        {
+            entries.push(entry);
         }
         entries
+    }
+
+    /// The written text and span of the token run `first..=last`: from the
+    /// first token's start through the last token's end (token edges are
+    /// char boundaries, so the slice never splits a character).
+    fn ffi_token_run(&self, first: usize, last: usize) -> Option<(String, SourceRange)> {
+        let head = self.tokens.get(first)?;
+        let tail = self.tokens.get(last)?;
+        let start = head.byte_offset as usize;
+        let end = tail.byte_range().end;
+        let text = self.source.get(start..end)?;
+        Some((
+            text.to_owned(),
+            SourceRange {
+                offset: head.utf16_offset,
+                length: self.utf16_of(end).saturating_sub(head.utf16_offset),
+            },
+        ))
     }
 
     /// The written clause-entry spelling resolves to a container whose
@@ -1913,8 +1781,7 @@ impl<'a> Engine<'a> {
                     break;
                 }
                 depth += 1;
-                let list = pool.get(args_id);
-                let Some(first) = list.first() else {
+                let Some(first) = pool.get_checked(args_id).and_then(<[Ty]>::first) else {
                     break;
                 };
                 cursor = *first;
@@ -2949,6 +2816,16 @@ impl<'a> Engine<'a> {
             ("NativeCallable", Some("isolateLocal")) => {
                 self.ffi_check_native_callable_isolate_local(invocation);
             }
+            // The send-arm capture of `NativeCallable.<ctor>(` when the
+            // fold carried the group as a plain send (the named
+            // constructor never resolved against the declaring class —
+            // upstream's `NativeCallable` element owns `listener` and
+            // `isolateLocal`, so the oracle's verifier still runs while
+            // a member lookup answers none here). The receiver must be
+            // `NativeCallable` itself; any other `listener`/`isolateLocal`
+            // send drops the capture.
+            ("listener", None) => self.ffi_route_native_callable_send(invocation, false),
+            ("isolateLocal", None) => self.ffi_route_native_callable_send(invocation, true),
             _ => {
                 // A generative creation of a compound subtype (upstream
                 // `visitInstanceCreationExpression`; factory creations and
@@ -3108,9 +2985,10 @@ impl<'a> Engine<'a> {
     /// past the range's end, the span extends to its matching `)` (the
     /// oracle anchors the row over the full argument expression).
     fn ffi_whole_arg_span(&self, range: SourceRange) -> SourceRange {
-        let start_byte = self.byte_of(range.offset);
         let end_byte = self.byte_of(range.end()).min(self.source.len());
-        let tail = &self.source[end_byte..];
+        let Some(tail) = self.source.get(end_byte..) else {
+            return range;
+        };
         let trimmed = tail.trim_start();
         if !trimmed.starts_with('(') {
             return range;
@@ -3119,10 +2997,9 @@ impl<'a> Engine<'a> {
         let Some(close) = matching_close(self.source.as_bytes(), open, b'(', b')') else {
             return range;
         };
-        let utf16 = |b: usize| byte_offset_to_utf16(self.source, b);
         SourceRange {
             offset: range.offset,
-            length: utf16(close + 1) - utf16(start_byte),
+            length: self.utf16_of(close + 1).saturating_sub(range.offset),
         }
     }
 
@@ -3167,10 +3044,12 @@ impl<'a> Engine<'a> {
         if self.strings.resolve(recv_head) != "Pointer" {
             return;
         }
+        // The receiver row's argument lists answer through the checked
+        // read: a stale or foreign slot is no `Pointer<NativeFunction<…>>`
+        // face (the #3526 posture), never a crash.
         let native_fn = {
             let pool = self.boundary.args.borrow();
-            let args = pool.get(recv_args);
-            args.first().copied()
+            pool.get_checked(recv_args).and_then(<[Ty]>::first).copied()
         };
         let Some(Ty::Named {
             name: nf_head,
@@ -3185,7 +3064,7 @@ impl<'a> Engine<'a> {
         }
         let pointer_arg = {
             let pool = self.boundary.args.borrow();
-            pool.get(nf_args).first().copied()
+            pool.get_checked(nf_args).and_then(<[Ty]>::first).copied()
         };
         let Some(pointer_arg) = pointer_arg else {
             return;
@@ -3483,8 +3362,14 @@ impl<'a> Engine<'a> {
         // path; the source check before the name covers `const`/`final`
         // (a `final` local is not a compile-time constant upstream —
         // `computeConstantValue` answers null for it — so only `const`
-        // qualifies).
-        let is_ident = !text.is_empty()
+        // qualifies). The first character decides the kind — a digit
+        // (or sign) leads a numeric literal, never an identifier, so the
+        // literal arm below must see it (`4` computes a constant where a
+        // name lookup would silently answer none).
+        let is_ident = text
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
             && text
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
@@ -3496,9 +3381,12 @@ impl<'a> Engine<'a> {
                 }
                 // Source-walk back from the declaring name for `const`.
                 let decl_start = self.byte_of(site.range.offset);
-                self.source[..decl_start]
-                    .rsplit(|c: char| c.is_alphanumeric() || c == '_')
-                    .next()
+                self.source
+                    .get(..decl_start)
+                    .and_then(|head| {
+                        head.rsplit(|c: char| c.is_alphanumeric() || c == '_')
+                            .next()
+                    })
                     .is_some_and(|prev| prev == "const")
             });
         }
@@ -3653,7 +3541,7 @@ impl<'a> Engine<'a> {
                 .unwrap_or(invocation.head);
         };
         let bytes = self.source.as_bytes();
-        let mut cursor = self.byte_of(shape.range.offset);
+        let mut cursor = self.byte_of(shape.range.offset).min(bytes.len());
         // Walk back over the `:` and whitespace to the name's start.
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
@@ -3665,16 +3553,18 @@ impl<'a> Engine<'a> {
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
         }
+        // The label must sit flush before the `:` — a checked slice, since
+        // whatever precedes it (a comment's text) may be multi-byte.
         let name_text = self.strings.resolve(*name);
-        let name_len = name_text.len();
-        if cursor >= name_len && &self.source[cursor - name_len..cursor] == name_text {
-            cursor -= name_len;
-            SourceRange {
-                offset: byte_offset_to_utf16(self.source, cursor),
-                length: shape.range.end().saturating_sub(byte_offset_to_utf16(self.source, cursor)),
-            }
-        } else {
-            shape.range
+        let label = cursor
+            .checked_sub(name_text.len())
+            .filter(|&at| self.source.get(at..cursor) == Some(name_text));
+        match label {
+            Some(at) => SourceRange {
+                offset: self.utf16_of(at),
+                length: shape.range.end().saturating_sub(self.utf16_of(at)),
+            },
+            None => shape.range,
         }
     }
 
@@ -3841,6 +3731,207 @@ impl<'a> Engine<'a> {
                 "",
             );
         }
+    }
+
+    /// The send-arm `NativeCallable.<ctor>(` capture's normalization:
+    /// the fold linked `listener`/`isolateLocal` as an ordinary send when
+    /// the named constructor never resolved (the declaring class owns no
+    /// member of that name — a stub face or a miss), so the captured
+    /// `callee` is the selector and the class head was never latched.
+    /// Upstream's verifier keys on `node.constructorName` regardless of
+    /// member resolution — `ffi_verifier.dart`'s `visitMethodInvocation`
+    /// dispatches on the spelled selector against the `NativeCallable`
+    /// receiver — so the send is rebuilt into the named-constructor
+    /// shape the verifier arms already read: `head` = the class-name
+    /// span, `type_arg` = the `<...>` group between class and selector,
+    /// `whole` = the class's offset through the group's close.
+    fn ffi_route_native_callable_send(&mut self, invocation: &FfiInvocation, isolate_local: bool) {
+        let Ty::Named { name: recv, .. } = invocation.recv_ty else {
+            return;
+        };
+        if self.strings.resolve(recv) != "NativeCallable" || !self.ffi_class_spelling(recv) {
+            return;
+        }
+        let Some((class, class_offset)) = self.ffi_callable_class_before(invocation.head) else {
+            return;
+        };
+        let class_text = self.strings.resolve(class);
+        let head = SourceRange {
+            offset: class_offset,
+            length: class_text.chars().map(char::len_utf16).sum::<usize>() as u32,
+        };
+        let normalized = FfiInvocation {
+            callee: self.strings.intern("NativeCallable"),
+            selector: Some(invocation.callee),
+            head,
+            type_arg: self.ffi_callable_type_arg(head),
+            args: invocation.args.clone(),
+            recv_ty: invocation.recv_ty,
+            whole: SourceRange {
+                offset: head.offset,
+                length: invocation
+                    .whole
+                    .end()
+                    .saturating_sub(head.offset),
+            },
+            is_creation: true,
+        };
+        if isolate_local {
+            self.ffi_check_native_callable_isolate_local(&normalized);
+        } else {
+            self.ffi_check_native_callable_listener(&normalized);
+        }
+    }
+
+    /// The class-name segment before a named-constructor selector
+    /// (`NativeCallable<T>.listener` → `NativeCallable` + its offset):
+    /// source-walked back over the `.`, trivia, and the optional `<...>`
+    /// type-argument group — the mirror of [`Self::ffi_constructor_name_span`]'s
+    /// forward walk. `None` when no `.name` precedes.
+    fn ffi_callable_class_before(&self, selector: SourceRange) -> Option<(StringId, u32)> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(selector.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'.' {
+            return None;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor > 0 && bytes[cursor - 1] == b'>' {
+            let mut depth = 0usize;
+            while cursor > 0 {
+                let byte = bytes[cursor - 1];
+                cursor -= 1;
+                if byte == b'>' {
+                    depth += 1;
+                } else if byte == b'<' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if cursor == 0 {
+                return None;
+            }
+            while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                cursor -= 1;
+            }
+        }
+        let end = cursor;
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric()
+                || bytes[cursor - 1] == b'_'
+                || bytes[cursor - 1] == b'$')
+        {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        Some((
+            self.strings.intern(&self.source[cursor..end]),
+            self.utf16_of(cursor),
+        ))
+    }
+
+    /// The written `<...>` type argument after a class-name head
+    /// (`NativeCallable<Void Function(Double)>.listener`), source-parsed —
+    /// the same `FfiTypeArg` shape the send/creation captures carry.
+    /// `None` when no group follows the head.
+    fn ffi_callable_type_arg(&self, head: SourceRange) -> Option<FfiTypeArg> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(head.end());
+        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'<') {
+            return None;
+        }
+        let close = matching_close(bytes, cursor, b'<', b'>')?;
+        let inner = &self.source[cursor + 1..close];
+        let trimmed = inner.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let head_len: usize = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .map(char::len_utf8)
+            .sum();
+        if head_len == 0 {
+            return None;
+        }
+        let start = cursor + 1 + (inner.len() - inner.trim_start().len());
+        let end = start + trimmed.len();
+        Some(FfiTypeArg {
+            display: trimmed.into(),
+            span: SourceRange {
+                offset: byte_offset_to_utf16(self.source, start),
+                length: byte_offset_to_utf16(self.source, end)
+                    .saturating_sub(byte_offset_to_utf16(self.source, start)),
+            },
+            head: self.strings.intern(&trimmed[..head_len]),
+            fn_sig: self.ffi_callable_fn_sig(trimmed),
+        })
+    }
+
+    /// The written `R Function(P...)` form: the last top-level `Function`
+    /// word (a return type never nests a bare `Function` outside groups)
+    /// whose group closes at the text's end. Each parameter contributes
+    /// its first identifier.
+    fn ffi_callable_fn_sig(&self, text: &str) -> Option<(StringId, Box<[StringId]>)> {
+        let bytes = text.as_bytes();
+        let mut depth_angle = 0i32;
+        let mut depth_paren = 0i32;
+        let mut best: Option<(usize, usize)> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'<' => depth_angle += 1,
+                b'>' => depth_angle -= 1,
+                b'(' => depth_paren += 1,
+                b')' => depth_paren -= 1,
+                b'F' if depth_angle == 0 && depth_paren == 0 => {
+                    let word_end = i + "Function".len();
+                    let word_before =
+                        i == 0 || bytes.get(i - 1).is_some_and(|b| b.is_ascii_whitespace());
+                    if word_before
+                        && text[i..].starts_with("Function")
+                        && bytes.get(word_end) == Some(&b'(')
+                        && let Some(close) = matching_close(bytes, word_end, b'(', b')')
+                    {
+                        best = Some((i, close));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (ret_end, group_close) = best?;
+        let ret = text[..ret_end].trim();
+        let params_text = &text[ret_end + "Function".len() + 1..group_close];
+        let ret_head: String = ret
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        if ret_head.is_empty() {
+            return None;
+        }
+        let params: Vec<StringId> = params_text
+            .split(',')
+            .filter_map(|param| {
+                let head: String = param
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                    .collect();
+                (!head.is_empty()).then(|| self.strings.intern(&head))
+            })
+            .collect();
+        Some((self.strings.intern(&ret_head), params.into_boxed_slice()))
     }
 
     /// A generative creation of a compound subtype (upstream
@@ -4112,7 +4203,7 @@ impl<'a> Engine<'a> {
             .iter()
             .find(|s| s.name == alias_id && matches!(s.kind, DeclKind::TopLevelVar))?;
         let decl_start = self.byte_of(const_site.range.offset);
-        let tail = &self.source[decl_start..];
+        let tail = self.source.get(decl_start..)?;
         let open = tail.find('{')?;
         let close = matching_close(tail.as_bytes(), open, b'{', b'}')?;
         let mut values = Vec::new();
@@ -4143,7 +4234,9 @@ impl<'a> Engine<'a> {
             return false;
         };
         let decl_start = self.byte_of(const_site.range.offset);
-        let tail = &self.source[decl_start..];
+        let Some(tail) = self.source.get(decl_start..) else {
+            return false;
+        };
         let Some(eq) = tail.find('=') else {
             return false;
         };
@@ -4195,8 +4288,14 @@ impl<'a> Engine<'a> {
         if decl.kind != crate::model::MicroKind::TopLevelFn {
             return None;
         }
+        // The head-level face of the declared type: `Ty::Void` carries no
+        // name slot, so the `void` spelling interns — the compat and
+        // display arms read the head text back as `void` (a `void`
+        // callback return accepts the native `Void` in `dartToNative`,
+        // upstream `_validateCompatibleNativeType`'s void arm).
         let heads = |ty: &Ty| match ty {
             Ty::Named { name, .. } => Some(*name),
+            Ty::Void => Some(self.strings.intern("void")),
             _ => None,
         };
         let ret = heads(&decl.return_ty)?;

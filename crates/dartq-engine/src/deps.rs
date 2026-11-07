@@ -67,6 +67,18 @@ use crate::state::{DirectiveKind, EngineState, UnitFacts};
 /// is.
 pub(crate) const DEP_FILE_CAP: usize = 4096;
 
+/// The cap in force: the constant, or the `DARTQ_DEP_FILE_CAP` override a
+/// test lowers to reach saturation without materializing thousands of dep
+/// files. A non-numeric or zero override keeps the constant — the env face
+/// exists for tests only and never weakens the production bound.
+pub(crate) fn dep_file_cap() -> usize {
+    std::env::var("DARTQ_DEP_FILE_CAP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(DEP_FILE_CAP)
+}
+
 /// One indexed dependency file: the interface facts (its diagnostics are
 /// dead weight — the file is never an engine library and never folds), the
 /// sites-shed declaration capture (the [`FileCapture::without_sites`]
@@ -198,12 +210,13 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
         if state.deps.units.contains_key(&file) || state.residency.contains_key(&file) {
             continue;
         }
-        if state.deps.units.len() - state.deps.sdk_file_count >= DEP_FILE_CAP {
+        if state.deps.units.len() - state.deps.sdk_file_count >= dep_file_cap() {
             if !state.deps.cap_noted {
                 state.deps.cap_noted = true;
                 eprintln!(
-                    "dartq: dependency interface index capped at {DEP_FILE_CAP} files; \
-                     further dependency files are skipped"
+                    "dartq: dependency interface index capped at {} files; \
+                     further dependency files are skipped",
+                    dep_file_cap()
                 );
             }
             continue;

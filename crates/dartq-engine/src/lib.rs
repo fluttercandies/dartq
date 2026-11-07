@@ -2049,6 +2049,24 @@ impl Engine {
         self.state.warm_start = staging;
         staged
     }
+
+    /// Whether the lazy dependency index hit its file cap during the last
+    /// analyze — the one fact the `--impacted` selection consults: a capped
+    /// closure cannot see every dependency's faces, so a change inside the
+    /// skipped tail could hide affected suites. `false` before the first
+    /// analyze and whenever the closure stayed under the cap.
+    #[must_use]
+    pub fn dep_index_capped(&self) -> bool {
+        self.state.deps.cap_noted
+    }
+
+    /// The dependency index's file cap in force — the number the
+    /// saturation note and the `--impacted` fallback name (the
+    /// `DARTQ_DEP_FILE_CAP` test override included).
+    #[must_use]
+    pub fn dep_index_cap(&self) -> usize {
+        crate::deps::dep_file_cap()
+    }
 }
 
 /// What one [`Engine::apply_pending`] changed.

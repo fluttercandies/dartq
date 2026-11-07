@@ -230,14 +230,14 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     };
     match execute(&plan) {
         Ok(code) => {
-            // An executed `--impacted` run is the one moment the ignored
-            // resolution inputs are known-good for the suites that ran —
-            // any exit code: a failing suite still ran. Returns before
-            // this point (usage errors, a missing runner) executed
-            // nothing and record nothing.
-            if plan.inv.impacted.is_some() {
-                record_impacted_inputs(&plan.root);
-            }
+            // An executed run is the one moment the ignored resolution
+            // inputs are known-good for the suites that ran — any exit
+            // code: a failing suite still ran. Plain runs record too: the
+            // record is what lets the first `--impacted` bound itself, and
+            // a bounded selection already recorded above on its early
+            // returns. Returns before this point (usage errors, a missing
+            // runner) executed nothing and record nothing.
+            record_impacted_inputs(&plan.root);
             code
         }
         Err(error) => {
