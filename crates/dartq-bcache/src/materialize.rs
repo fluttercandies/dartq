@@ -385,6 +385,9 @@ pub fn materialize(
             // hash of what finally landed (KBs).
             placed_file.on_disk = Some(file_blake3(&path)?);
         }
+        // What flutter's every-build rewrite of the record must still
+        // hold for the post-run scan to recognize it as this placement.
+        placed_file.content = file_store_content(&fs::read(&path)?);
         placed[dir_at].push(placed_file);
     }
     Ok(MaterializeOutcome {
@@ -677,6 +680,7 @@ fn materialize_one(
         rewrite: file.rewrite,
         foreign_paths: file.foreign_paths,
         on_disk,
+        content: None,
     };
     Ok(Some((placed_file, md5)))
 }
@@ -705,6 +709,43 @@ const FILE_STORE_VERSION: u32 = 2;
 
 fn is_file_store(path: &Path) -> bool {
     path == Path::new(FILE_STORE)
+}
+
+/// Whether a dir-relative path names a FileStore record (the post-run
+/// scan's test for [`file_store_content`]).
+pub(crate) fn is_file_store_record(relative: &str) -> bool {
+    is_file_store(Path::new(relative))
+}
+
+/// The order-free identity of a FileStore record's content: the blake3
+/// of its `(path, hash)` records in sorted order, each field
+/// length-prefixed. flutter_tools persists the record from a Dart
+/// `HashMap` (`FileStore.persist`, file_store.dart), whose iteration
+/// order follows the hash codes of the recorded paths: the same records
+/// under another tree's root land in another order (measured on an apk
+/// replay: 825 identical records, different order), so the bytes of an
+/// unchanged record are not a function of what it records. `None` for
+/// bytes that do not parse as a format-2 record — those keep byte
+/// identity only.
+pub(crate) fn file_store_content(bytes: &[u8]) -> Option<BlobId> {
+    let storage = serde_json::from_slice::<FileStorage>(bytes).ok()?;
+    if storage.version != FILE_STORE_VERSION {
+        return None;
+    }
+    let mut records: Vec<(&str, &str)> = storage
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.hash.as_str()))
+        .collect();
+    records.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for (path, hash) in records {
+        for field in [path, hash] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+    }
+    Some(BlobId(*hasher.finalize().as_bytes()))
 }
 
 /// Streamed md5 of a placed file as lowercase hex — the digest a
@@ -742,6 +783,17 @@ fn file_md5_hex(path: &Path) -> std::io::Result<String> {
 /// files this run placed, so every tracked INPUT keeps its recorded
 /// md5 and flutter still rebuilds whatever this tree's sources change.
 ///
+/// A record elsewhere that still holds the OLD md5 of a re-aimed file
+/// tracks a byte copy of it — `debug_android_application` copies
+/// `app.dill` to the gradle output dir's `kernel_blob.bin`, outside
+/// every replayed dir — and follows it to the new md5: flutter
+/// regenerates that copy from the rewritten bytes, so the patched
+/// record is the one flutter's own rewrite will hold, and the post-run
+/// scan recognizes that rewrite as this placement
+/// ([`file_store_content`]). It never buys a wrong skip: flutter
+/// validates outputs by content, so a copy whose bytes are not the
+/// rewritten file's reads as changed and reruns its target.
+///
 /// A record that does not parse as format version 2 is left as placed:
 /// flutter rebuilds what it cannot validate — the cost of a miss, never
 /// a wrong skip. Returns the number of records patched.
@@ -759,9 +811,19 @@ fn patch_file_store(path: &Path, rewritten: &FxHashMap<PathBuf, String>) -> Resu
         return Ok(0);
     }
     let mut patched = 0u64;
+    // Old md5 → new md5 of every re-aimed record, for the copies.
+    let mut followed: FxHashMap<String, String> = FxHashMap::default();
     for file in &mut storage.files {
         if let Some(md5) = rewritten.get(Path::new(&file.path))
             && file.hash != *md5
+        {
+            followed.insert(std::mem::replace(&mut file.hash, md5.clone()), md5.clone());
+            patched += 1;
+        }
+    }
+    for file in &mut storage.files {
+        if !rewritten.contains_key(Path::new(&file.path))
+            && let Some(md5) = followed.get(&file.hash)
         {
             file.hash.clone_from(md5);
             patched += 1;
@@ -2575,5 +2637,130 @@ mod tests {
             fs::read(own_dir.join(FILE_STORE)).expect("own record"),
             b"this tree's own record"
         );
+    }
+
+    /// #4126: the apk face's `debug_android_application` copies `app.dill`
+    /// into gradle's output dir as `kernel_blob.bin` — outside every
+    /// replayed dir, so never placed. Its record follows the rewritten
+    /// dill anyway: flutter regenerates that copy from the placed bytes,
+    /// so the patched record is the one flutter's own rewrite holds (live
+    /// before this, the stale copy md5 alone made every cross-tree apk
+    /// hit republish the entry). The placed record carries its
+    /// order-free identity, which a reordered rewrite still matches:
+    /// order never counts, every path and md5 does, and only a format-2
+    /// record has one.
+    #[test]
+    fn placed_record_follows_unplaced_dill_copies_and_names_its_content() {
+        use crate::dill_rewrite::synthetic_component;
+        use md5::{Digest, Md5};
+
+        let md5_hex = |bytes: &[u8]| format!("{:x}", Md5::digest(bytes));
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = CasStore::open(store_dir.path()).expect("open store");
+        let tree_a = tempfile::tempdir().expect("tree a");
+        let tree_b = tempfile::tempdir().expect("tree b");
+        let a = fs::canonicalize(tree_a.path())
+            .expect("canonical a")
+            .to_string_lossy()
+            .into_owned();
+        let root_b = fs::canonicalize(tree_b.path()).expect("canonical b");
+        let hash = "c04e6105834f6d5f4ffd798f1b39830f";
+        let source = b"void main() {}\n";
+        let dill_a = synthetic_component(
+            &[(
+                &format!("file://{a}/app/lib/main.dart"),
+                "package:app/main.dart",
+            )],
+            &[],
+            1,
+        );
+        let copy = "app/build/app/intermediates/flutter/debug/flutter_assets/kernel_blob.bin";
+        let file_store = format!(
+            concat!(
+                r#"{{"version":2,"files":["#,
+                r#"{{"path":"{a}/app/lib/main.dart","hash":"{src}"}},"#,
+                r#"{{"path":"{a}/app/.dart_tool/flutter_build/{hash}/app.dill","hash":"{dill}"}},"#,
+                r#"{{"path":"{a}/{copy}","hash":"{dill}"}}"#,
+                r#"]}}"#
+            ),
+            a = a,
+            hash = hash,
+            copy = copy,
+            src = md5_hex(source),
+            dill = md5_hex(&dill_a),
+        );
+        let dill_id = place_blob(&store, store_dir.path(), "dill", &dill_a);
+        let store_id = place_blob(&store, store_dir.path(), "filecache", file_store.as_bytes());
+        let plan = MaterializePlan {
+            dirs: vec![hash_dir(
+                hash,
+                vec![
+                    manifest(".filecache", store_id, false, RewriteKind::PathText),
+                    manifest("app.dill", dill_id, false, RewriteKind::DillUris),
+                ],
+            )],
+            old_root: a.clone(),
+            new_root: root_b.clone(),
+        };
+        let project_b = root_b.join("app");
+        fs::create_dir_all(project_b.join("lib")).expect("mkdir lib");
+        fs::write(project_b.join("lib/main.dart"), source).expect("source");
+
+        let outcome = materialize(&store, &plan, &project_b).expect("materialize");
+        assert_eq!(
+            outcome.report.filecache_patched, 2,
+            "the dill and its gradle copy"
+        );
+        let placed_dir = project_b.join(".dart_tool/flutter_build").join(hash);
+        let dill_b = fs::read(placed_dir.join("app.dill")).expect("placed dill");
+        assert_ne!(dill_b, dill_a, "the URIs were rewritten");
+        let bytes = fs::read(placed_dir.join(FILE_STORE)).expect("placed record");
+        let mut record: FileStorage = serde_json::from_slice(&bytes).expect("a version-2 record");
+        let md5_of = |record: &FileStorage, suffix: &str| {
+            record
+                .files
+                .iter()
+                .find(|file| file.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no record ending {suffix}"))
+                .hash
+                .clone()
+        };
+        assert_eq!(md5_of(&record, "/app.dill"), md5_hex(&dill_b));
+        assert_eq!(
+            md5_of(&record, "/kernel_blob.bin"),
+            md5_hex(&dill_b),
+            "the unplaced copy follows the rewritten dill"
+        );
+        assert_eq!(
+            md5_of(&record, "/lib/main.dart"),
+            md5_hex(source),
+            "an input keeps its recorded md5"
+        );
+
+        let placed = outcome.placed[0]
+            .iter()
+            .find(|file| file.path == Path::new(FILE_STORE))
+            .expect("placed record");
+        assert!(placed.content.is_some());
+        assert_eq!(placed.content, file_store_content(&bytes));
+        let dill = outcome.placed[0]
+            .iter()
+            .find(|file| file.path == Path::new("app.dill"))
+            .expect("placed dill");
+        assert_eq!(dill.content, None, "only a FileStore record has one");
+
+        record.files.reverse();
+        let reordered = serde_json::to_vec(&record).expect("encode");
+        assert_ne!(reordered, bytes, "another order is other bytes");
+        assert_eq!(
+            file_store_content(&reordered),
+            placed.content,
+            "but the same content"
+        );
+        record.files[0].hash = md5_hex(b"changed");
+        let changed = serde_json::to_vec(&record).expect("encode");
+        assert_ne!(file_store_content(&changed), placed.content);
+        assert_eq!(file_store_content(br#"{"version":1,"files":[]}"#), None);
+        assert_eq!(file_store_content(b"not a record"), None);
     }
 }

@@ -20,9 +20,9 @@
 //! `/proc/<pid>/comm`) keeps only processes running under a name a
 //! flutter tool invocation uses — the interpreter the
 //! `#!/usr/bin/env bash` wrapper script runs as (`sh`/`bash`/`zsh`/
-//! `dash`) and the `dart` VM the wrapper execs — and only the matches
-//! get their argv read (macOS: `KERN_PROCARGS2`; Linux:
-//! `/proc/<pid>/cmdline`).
+//! `dash`), the `dart` launcher the wrapper execs, and the `dartvm` that
+//! launcher execs on Dart 3.13+ SDKs — and only the matches get their
+//! argv read (macOS: `KERN_PROCARGS2`; Linux: `/proc/<pid>/cmdline`).
 //!
 //! The kernel spells argv as true NUL-separated elements, so a define
 //! VALUE with embedded spaces (the default multi-arch apk build's
@@ -37,8 +37,9 @@
 //!
 //! A poll can miss an invocation shorter than the interval, and the
 //! name pass skips a flutter token carried under some other process
-//! name — every real producer (the SDK's bash wrapper and the dart VM
-//! it execs) matches by construction. Every failure mode is safe by
+//! name — every real producer (the SDK's bash wrapper, the `dart`
+//! launcher it execs, and the `dartvm` the launcher execs) matches by
+//! construction. Every failure mode is safe by
 //! construction: a missing or misread template leaves that build dir
 //! [`crate::types::NameRule::NotReplayable`] (counted in the shim
 //! report's skipped dirs) — never a wrong replay, because the post-run
@@ -298,10 +299,15 @@ fn is_flutter_process(argv: &[String]) -> bool {
 /// Kernel process names (`p_comm` / comm) a flutter tool invocation runs
 /// under: the `#!/usr/bin/env bash` wrapper script runs as the
 /// interpreter's name, the tool the wrapper execs runs as `dart`, and
-/// `flutter` covers a hypothetical compiled launcher. The kernel
-/// truncates the name to 15 chars — every name here fits.
+/// `flutter` covers a hypothetical compiled launcher. From the Dart 3.13
+/// SDK on (flutter 3.47) `dart` is a launcher that execs `dartvm`
+/// (`dartvm --resolved_executable_name=… --executable_name=… --packages=…
+/// flutter_tools.snapshot …`), the name the tool then carries for the
+/// whole assemble — the wrapper and launcher stages last ~100–200 ms, so
+/// a 200 ms poll that watched only them captured one apk build in seven.
+/// The kernel truncates the name to 15 chars — every name here fits.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-const WATCHED_COMM: &[&str] = &["sh", "bash", "zsh", "dash", "dart", "flutter"];
+const WATCHED_COMM: &[&str] = &["sh", "bash", "zsh", "dash", "dart", "dartvm", "flutter"];
 
 /// The argv of every watched-name process, as the kernel spells it:
 /// true NUL-separated elements, never truncated, never
@@ -725,6 +731,52 @@ mod tests {
             from_wrapper, from_dartvm,
             "the dartvm shape and the wrapper shape capture identically"
         );
+    }
+
+    /// #4126: from the Dart 3.13 SDK on (flutter 3.47) the `dart`
+    /// launcher execs `dartvm`, the name the tool carries for the whole
+    /// assemble. Unwatched, only the ~100–200 ms wrapper and launcher
+    /// stages were visible to the 200 ms poll — live, one apk build in
+    /// seven recorded a replayable dir, and every hit on the rest
+    /// materialized nothing. The name pass keeps it, and its real argv —
+    /// the launcher's resolved and executable names ahead of the
+    /// snapshot — captures exactly like the wrapper's.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn dartvm_is_watched_and_its_launcher_argv_captures_like_the_wrapper() {
+        assert!(WATCHED_COMM.contains(&"dartvm"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tail = [
+            "--quiet",
+            "assemble",
+            "--no-version-check",
+            "--depfile",
+            "flutter_build.d",
+            "--output",
+            "/out/debug",
+            "-dTargetFile=lib/main_dev.dart",
+            "-dTargetPlatform=android",
+            "-dBuildMode=debug",
+            "-dTrackWidgetCreation=true",
+            "-dFlavor=",
+            "-dAndroidArchs=android-arm android-arm64 android-x64",
+            "-dMinSdkVersion=24",
+            "debug_android_application",
+        ];
+        let mut wrapper = argv(&["/bin/bash", "/opt/flutter/bin/flutter"]);
+        wrapper.extend(argv(&tail));
+        let mut dartvm = argv(&[
+            "/opt/flutter/bin/cache/dart-sdk/bin/dartvm",
+            "--resolved_executable_name=/opt/flutter/bin/cache/dart-sdk/bin/dart",
+            "--executable_name=/opt/flutter/bin/cache/dart-sdk/bin/dart",
+            "--packages=/opt/flutter/packages/flutter_tools/.dart_tool/package_config.json",
+            "/opt/flutter/bin/cache/flutter_tools.snapshot",
+        ]);
+        dartvm.extend(argv(&tail));
+        let from_wrapper = poll(&[wrapper], tmp.path(), &mut FxHashSet::default());
+        let from_dartvm = poll(&[dartvm], tmp.path(), &mut FxHashSet::default());
+        assert!(!from_wrapper.is_empty());
+        assert_eq!(from_wrapper, from_dartvm);
     }
 
     /// The kernel hands argv over as true NUL-separated elements, so a

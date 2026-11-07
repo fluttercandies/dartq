@@ -276,6 +276,16 @@ pub struct PlacedFile {
     /// of the blob — a reference only valid while the entry is not
     /// being re-published (see [`crate::ingest_scan`]).
     pub on_disk: Option<BlobId>,
+    /// For flutter's FileStore record (`.filecache`) only: the
+    /// order-free identity of the records on disk (the materializer's
+    /// `file_store_content`). flutter_tools
+    /// rewrites the record on every build in a Dart `HashMap`'s
+    /// iteration order, which follows the recorded paths' hash codes —
+    /// under another tree's root the same records land in another
+    /// order — so a rewrite that changed nothing is recognized by this
+    /// identity where [`Self::on_disk`] cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<BlobId>,
 }
 
 impl PlacedFile {

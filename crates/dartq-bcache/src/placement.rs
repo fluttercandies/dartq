@@ -164,6 +164,7 @@ mod tests {
             rewrite: RewriteKind::None,
             foreign_paths: false,
             on_disk: Some(BlobId([blob; 32])),
+            content: None,
         }
     }
 

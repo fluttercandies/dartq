@@ -478,6 +478,10 @@ struct Vouched {
     /// [`PlacedFile::on_disk`]); a prior-manifest stamp vouches the
     /// blob's own bytes.
     on_disk: Option<BlobId>,
+    /// The vouching record's order-free FileStore identity (see
+    /// [`PlacedFile::content`]); the next scan proves a reordered
+    /// rewrite by it.
+    content: Option<BlobId>,
 }
 
 impl Vouched {
@@ -522,13 +526,21 @@ impl Scanned {
                 rewrite: vouched.rewrite,
                 foreign_paths: vouched.foreign_paths,
                 on_disk: vouched.on_disk,
+                content: vouched.content,
             },
         }
     }
 
     /// A file hashed to its own content: a source, and a record entry
-    /// whose on-disk bytes are the blob's.
-    fn hashed(file: ScannedFile, blob: BlobId, rewrite: RewriteKind, foreign_paths: bool) -> Self {
+    /// whose on-disk bytes are the blob's (`content`: the FileStore
+    /// identity of a `.filecache`, see [`PlacedFile::content`]).
+    fn hashed(
+        file: ScannedFile,
+        blob: BlobId,
+        rewrite: RewriteKind,
+        foreign_paths: bool,
+        content: Option<BlobId>,
+    ) -> Self {
         let path = PathBuf::from(&file.relative);
         Self {
             manifest: ManifestFile {
@@ -548,6 +560,7 @@ impl Scanned {
                 rewrite,
                 foreign_paths,
                 on_disk: Some(blob),
+                content,
             },
         }
     }
@@ -629,6 +642,7 @@ fn reused_identity(
             rewrite: placed.rewrite,
             foreign_paths: placed.foreign_paths,
             on_disk: placed.on_disk,
+            content: placed.content,
         });
     }
     prior
@@ -644,6 +658,7 @@ fn reused_identity(
             rewrite: recorded.rewrite,
             foreign_paths: recorded.foreign_paths,
             on_disk: Some(recorded.blob),
+            content: None,
         })
 }
 
@@ -663,8 +678,9 @@ fn recorded_placement<'a>(
 /// hash its re-read bytes must equal to still be the placed rendering
 /// of the recorded blob — flutter rewrites `.filecache`, `outputs.json`,
 /// and runtime-skipped stamps on EVERY build, byte for byte when
-/// nothing changed, and a re-rooted placement that reproduces itself
-/// is no new content. `None` when nothing is recorded, the placement
+/// nothing changed (`.filecache` up to its order, see
+/// [`vouched_by_content`]), and a re-rooted placement that reproduces
+/// itself is no new content. `None` when nothing is recorded, the placement
 /// did not hash its bytes (a rewritten kernel dill), the rendering is
 /// re-rooted while `rerooted_ok` is off, or the store no longer holds
 /// the recorded blob — a vouch that could not be honored must not skip
@@ -697,6 +713,29 @@ fn vouched_by_bytes(
         rewrite: placed.rewrite,
         foreign_paths: placed.foreign_paths,
         on_disk: placed.on_disk,
+        content: placed.content,
+    })
+}
+
+/// The vouch a recorded FileStore record earns by what it records when
+/// its bytes moved: flutter rewrote it in another order, but every
+/// tracked path still carries the md5 the placement left (see
+/// [`PlacedFile::content`]), so the recorded blob still renders it.
+/// Gated like [`expected_bytes`]: a re-rooted rendering vouches only
+/// while `rerooted_ok`, and only while the store holds the blob.
+fn vouched_by_content(
+    recorded: Option<&PlacedFile>,
+    content: Option<BlobId>,
+    rerooted_ok: bool,
+    blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
+) -> Option<Vouched> {
+    let placed = recorded.filter(|placed| rerooted_ok || placed.verbatim())?;
+    (content.is_some() && placed.content == content && blob_exists(&placed.blob)).then(|| Vouched {
+        blob: placed.blob,
+        rewrite: placed.rewrite,
+        foreign_paths: placed.foreign_paths,
+        on_disk: placed.on_disk,
+        content: placed.content,
     })
 }
 
@@ -776,7 +815,7 @@ pub fn scan_test_cache(
         } else {
             RewriteKind::DillUris
         };
-        outcomes.push(Scanned::hashed(file, blob, rewrite, false));
+        outcomes.push(Scanned::hashed(file, blob, rewrite, false, None));
     }
     Ok((!outcomes.is_empty()).then(|| collect_scan(outcomes, skipped)))
 }
@@ -841,7 +880,9 @@ fn is_kernel_cache(path: &Path) -> bool {
 /// ~100 MB payload that provably was not written is pure overhead. A
 /// recorded file whose stamp moved is read, and still rides along when
 /// its bytes are the placed ones (flutter rewrote it byte for byte, see
-/// [`expected_bytes`]). Everything else is hashed (in parallel) and
+/// [`expected_bytes`]) or, for flutter's FileStore record, when it
+/// records exactly what the placement recorded in another order (see
+/// [`PlacedFile::content`]). Everything else is hashed (in parallel) and
 /// becomes an ingest source.
 ///
 /// `rerooted_ok` admits references to the entry's tree: a cross-tree
@@ -950,6 +991,18 @@ pub fn scan_entry_files(
             if let Some(vouched) = vouched_by_bytes(recorded, blob, expected, blob_exists) {
                 return Ok(Scanned::vouched(&file, vouched));
             }
+            // flutter's FileStore record is rewritten on every build in
+            // hash-map order: what it records, not its byte order, says
+            // whether the run changed it. Bounded by the oversize rule
+            // above (a record past REWRITE_LIMIT never gets here).
+            let content = if crate::materialize::is_file_store_record(&file.relative) {
+                crate::materialize::file_store_content(&fs::read(&file.absolute)?)
+            } else {
+                None
+            };
+            if let Some(vouched) = vouched_by_content(recorded, content, rerooted_ok, blob_exists) {
+                return Ok(Scanned::vouched(&file, vouched));
+            }
             // A payload dill rewrites cross-tree when the worktree root
             // URI occurs. The test face's foreign veto is deliberately
             // absent here: a real payload dill's constant pool carries
@@ -967,7 +1020,7 @@ pub fn scan_entry_files(
                 RewriteKind::None
             };
             let foreign_paths = file.bookkeeping && foreign;
-            Ok(Scanned::hashed(file, blob, rewrite, foreign_paths))
+            Ok(Scanned::hashed(file, blob, rewrite, foreign_paths, content))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(collect_scan(scanned, skipped))
@@ -1620,7 +1673,111 @@ mod tests {
             rewrite: RewriteKind::None,
             foreign_paths: false,
             on_disk,
+            content: None,
         }
+    }
+
+    /// #4126: flutter rewrites `.filecache` on every build from a hash
+    /// map, so an unchanged record can come back in another order (under
+    /// another tree's root it always does). The placement's order-free
+    /// identity vouches such a rewrite — no source, the recorded blob
+    /// rides along, the record keeps the identity for the next run —
+    /// with the gates of the byte vouch: a re-rooted placement only
+    /// while references into the entry's tree are admitted, and only
+    /// while the store holds the blob. A changed md5 is new content.
+    #[test]
+    fn reordered_file_store_rewrite_is_vouched_by_its_content() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let root = project.path();
+        let hash_dir = root.join(HASH_A);
+        let record_path = hash_dir.join(".filecache");
+        let encode = |files: &[(&str, &str)]| {
+            let files: Vec<String> = files
+                .iter()
+                .map(|(path, hash)| format!(r#"{{"path":"{path}","hash":"{hash}"}}"#))
+                .collect();
+            format!(r#"{{"version":2,"files":[{}]}}"#, files.join(",")).into_bytes()
+        };
+        let main = format!("{}/lib/main.dart", root.display());
+        let dill = format!("{}/app.dill", hash_dir.display());
+        let placed_bytes = encode(&[(&main, "11"), (&dill, "22")]);
+        let content = crate::materialize::file_store_content(&placed_bytes);
+        assert!(content.is_some());
+        let stored = blob(b"the entry's record");
+        // The placement as recorded before flutter's rewrite moved it.
+        let placement = |on_disk: BlobId| {
+            let mut file = placed_file(
+                ".filecache",
+                FileStamp {
+                    dev: 0,
+                    inode: 0,
+                    size: 0,
+                    mtime_ns: 0,
+                },
+                stored,
+                Some(on_disk),
+            );
+            file.rewrite = RewriteKind::PathText;
+            file.content = content;
+            vec![file]
+        };
+        let scan = |placed: &[PlacedFile], rerooted_ok: bool, stored_present: bool| {
+            scan_entry_files(
+                &hash_dir,
+                &anchors_for(root),
+                None,
+                Some(placed),
+                rerooted_ok,
+                &|id| stored_present || *id != stored,
+            )
+            .expect("scan")
+        };
+
+        // flutter's rewrite: the same records in the other order.
+        let reordered = encode(&[(&dill, "22"), (&main, "11")]);
+        write(&record_path, &reordered);
+        let verbatim = placement(stored);
+        let same_tree = scan(verbatim.as_slice(), false, true);
+        assert!(same_tree.sources.is_empty(), "a reorder is not content");
+        assert_eq!(
+            same_tree.files[0].blob, stored,
+            "the recorded blob rides along"
+        );
+        assert_eq!(
+            same_tree.record[0].content, content,
+            "kept for the next run"
+        );
+        assert_eq!(same_tree.rerooted, 0);
+
+        let rerooted = placement(blob(&placed_bytes));
+        let cross_tree = scan(rerooted.as_slice(), true, true);
+        assert!(cross_tree.sources.is_empty());
+        assert_eq!(cross_tree.files[0].blob, stored);
+        assert_eq!(cross_tree.rerooted, 1, "a reference into the entry's tree");
+        let demoted = scan(rerooted.as_slice(), false, true);
+        assert_eq!(
+            demoted.sources.len(),
+            1,
+            "references off: this tree's own bytes"
+        );
+        assert_eq!(demoted.files[0].blob, blob(&reordered));
+        assert_eq!(
+            demoted.record[0].content, content,
+            "a hashed record names its content too"
+        );
+        assert_eq!(
+            scan(verbatim.as_slice(), false, false).sources.len(),
+            1,
+            "a blob the store lost vouches nothing"
+        );
+
+        // A changed md5 is a real change, whatever the order.
+        let changed = encode(&[(&dill, "33"), (&main, "11")]);
+        write(&record_path, &changed);
+        let rebuilt = scan(verbatim.as_slice(), false, true);
+        assert_eq!(rebuilt.sources.len(), 1);
+        assert_eq!(rebuilt.files[0].blob, blob(&changed));
+        assert_ne!(rebuilt.record[0].content, content);
     }
 
     /// The build-face prior fast path: a file the stored entry stamped

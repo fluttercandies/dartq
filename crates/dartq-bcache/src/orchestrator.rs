@@ -90,8 +90,9 @@
 //!    replayed into. A hit whose rerun reproduced the
 //!    key AND touched nothing needs no re-ingest, and a rerun whose
 //!    outputs reproduce the stored snapshot byte for byte (flutter's
-//!    every-build rewrites of `.filecache` and `outputs.json` included;
-//!    a cross-tree hit's re-rooted rendering of it counts) publishes
+//!    every-build rewrites of `.filecache` and `outputs.json` included —
+//!    `.filecache` up to the order a hash map persists it in; a
+//!    cross-tree hit's re-rooted rendering of it counts) publishes
 //!    nothing — the manifest stays the shared source, as ingested, and
 //!    each tree's identities live in that tree's record; a tree whose
 //!    first run did republish the entry under its own root (flutter
@@ -1719,7 +1720,9 @@ fn ingest_observed(
     // rewrites `.filecache`, `outputs.json`, and runtime-skipped stamps
     // on EVERY build, with identical bytes when nothing changed
     // (flutter_tools 3.47.1 build_system.dart: `fileCache.persist()` in
-    // `build`'s finally, `outputs.json` right after it), so the publish
+    // `build`'s finally, `outputs.json` right after it) — `.filecache`
+    // up to its hash-map order, which the scan's FileStore vouch
+    // absorbs (see `crate::ingest_scan::scan_entry_files`) — so the publish
     // would only move those files' recorded stamps — which the next run
     // moves again. The tree's placement record takes the fresh stamps
     // instead (below); the manifest's stale stamp on a re-hashed file
@@ -5030,6 +5033,117 @@ mod tests {
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
         assert_eq!(manifest.dirs, flipped_dirs);
         assert_eq!(store.stats().expect("stats").blobs, flipped_blobs);
+    }
+
+    /// A FileStore record naming the tree's files as flutter writes it
+    /// into `dir`: an input, the payload, and the payload's byte copy
+    /// outside every replayed dir (gradle's `kernel_blob.bin`).
+    fn write_file_store(project: &Path, dir: &Path) {
+        let record = serde_json::json!({
+            "version": 2,
+            "files": [
+                {"path": format!("{}/lib/main.dart", project.display()), "hash": "11111111111111111111111111111111"},
+                {"path": format!("{}/app.dill", dir.display()), "hash": "22222222222222222222222222222222"},
+                {"path": format!("{}/build/flutter_assets/kernel_blob.bin", project.display()), "hash": "22222222222222222222222222222222"},
+                {"path": format!("{}/.dart_tool/package_config.json", project.display()), "hash": "33333333333333333333333333333333"},
+            ],
+        });
+        write(
+            &dir.join(".filecache"),
+            &serde_json::to_vec(&record).expect("encode record"),
+        );
+    }
+
+    /// flutter's every-build rewrite of the FileStore record, as a run
+    /// effect: the same records persisted in another hash-map order, the
+    /// mtime moved a second on.
+    fn rewrite_file_store_reordered(dir: &Path) {
+        let path = dir.join(".filecache");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read record")).expect("decode record");
+        record["files"].as_array_mut().expect("records").reverse();
+        fs::write(&path, serde_json::to_vec(&record).expect("encode record")).expect("rewrite");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open for mtime")
+            .set_modified(SystemTime::now() + Duration::from_secs(1))
+            .expect("move mtime");
+    }
+
+    /// #4126, closed at the store: a cold hit — a fresh worktree, or a
+    /// tree after `flutter clean`, which also takes the tree's placement
+    /// record — whose flutter run rewrites `.filecache` in another order
+    /// (a hash map's, which follows each tree's paths) stores nothing.
+    /// Live, before the order-free identity, every such cold hit read
+    /// the rewrite as new content and republished the whole re-rooted
+    /// dir under the hit tree — 14 files a cycle, the kernel among them,
+    /// alternating between two trees forever. Now the entry keeps its
+    /// ingest frame and the store gains no blob, across trees and in
+    /// the ingest tree alike.
+    #[test]
+    fn cold_hits_whose_flutter_run_reorders_the_file_store_store_nothing() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree_a = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                let dir = build_fixture_large(cwd, DIR_MAIN);
+                write_file_store(cwd, &dir);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        assert_eq!(seeded.ingest_files, 4, "the cold run stores the whole dir");
+        let key = seeded.key.expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let seed_blobs = store.stats().expect("stats").blobs;
+
+        let cold_hit = |tree: &Path| {
+            for wiped in ["flutter_build", "dartq-bcache"] {
+                let _ = fs::remove_dir_all(tree.join(".dart_tool").join(wiped));
+            }
+            let mut runner = FakeRunner {
+                code: 0,
+                argv: Vec::new(),
+                effect: Some(Box::new(|cwd| {
+                    rewrite_file_store_reordered(
+                        &cwd.join(".dart_tool").join("flutter_build").join(DIR_MAIN),
+                    );
+                })),
+            };
+            run_shim(&raw_argv(&BUNDLE_ARGV), tree, &config, &mut runner)
+        };
+        let tree_b = synthetic_project(&tmp, "b");
+        for (tree, label) in [
+            (&tree_b, "tree B"),
+            (&tree_b, "tree B after a clean"),
+            (&tree_a, "tree A after a clean"),
+            (&tree_b, "tree B again"),
+        ] {
+            let report = cold_hit(tree.as_path());
+            assert_eq!(report.action, Action::PreHitMaterialized, "{label}");
+            assert_eq!(
+                report.ingest_files, 0,
+                "{label}: the reordered record is the placement's"
+            );
+            let manifest = store.lookup(&key).expect("lookup").expect("entry");
+            assert_eq!(
+                manifest.worktree_root_at_ingest,
+                tree_a.to_string_lossy(),
+                "{label}: the entry keeps its ingest frame"
+            );
+            assert_eq!(manifest.dirs, seed_manifest.dirs, "{label}");
+            assert_eq!(
+                store.stats().expect("stats").blobs,
+                seed_blobs,
+                "{label}: no blob written"
+            );
+        }
     }
 
     /// A record is keyed: a run under another key (a provenance change)
