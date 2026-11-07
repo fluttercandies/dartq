@@ -43,7 +43,10 @@
 //!
 //! [`LibraryChange::hypothetical`]: dartq_ai::impact::LibraryChange::hypothetical
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::iter::repeat_n;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,6 +60,7 @@ use dartq_pub::{PackageConfig, ResolvedPackageGraph};
 use dartq_sdk::SdkSnapshot;
 use dartq_source::{FileId, FileTable, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::analyze::AnalyzeError;
@@ -421,92 +425,168 @@ pub fn impact_after_analysis_with_symbols(
 /// files plus every suite the semantic impact graph reports for the changed
 /// libraries, as root-relative `/`-joined spellings.
 ///
+/// The changes are collected worktree-wide (`changed_since`) and
+/// classified by ownership, not location: a pub workspace (or a `path:`
+/// dependency) puts libraries `root`'s suites import — and the config
+/// resolving them — outside `root`, and a change there that selects nothing
+/// is a wrong answer (over-inclusion merely runs too much).
+///
+/// * Under `root`: a config-like or generated name is a full run, a `.dart`
+///   file a seed, and a changed `_test.dart` that still exists is selected
+///   directly.
+/// * Outside `root`, a config-like name in a directory `root` descends from
+///   (the toplevel included) is a full run, ownership unasked:
+///   `analysis_options.yaml` and `dartq.yaml` are discovered by walking up,
+///   a workspace root's pubspec and lock govern membership, and its
+///   `pubspec_overrides.yaml` rewrites resolution (a path override onto a
+///   local checkout), so an edit that breaks that resolution is exactly the
+///   one ownership can no longer see. A melos-style root pubspec edit thus
+///   runs its members in full — over-inclusion, accepted.
+/// * Any other config-like, generated, or `.dart` name outside `root`
+///   counts only when the package table attributes it to a package of this
+///   resolution ([`PackageTable::containing`], the attribution the analysis
+///   itself runs on): an owned config-like or generated name is a full run,
+///   an owned `.dart` file a seed (never selected directly — its suites are
+///   another package's), and an unowned one is ignored, so an independent
+///   workspace sharing the repository never moves this selection.
+/// * Anything else (docs, assets, tooling) is ignored.
+///
+/// Before any git work, the **ignored resolution inputs** are checked
+/// against the record the last run left ([`ResolutionStamp`]): git never
+/// lists `pubspec.lock`, `pubspec_overrides.yaml`, or
+/// `.dart_tool/package_config.json` in the setups that ignore them, so a
+/// dependency bump or a path override that rewrites resolution is invisible
+/// to the diff — a change the selection cannot see is treated like a config
+/// change, the full run. No record yet, or any input differing, is that
+/// fallback; the record is written by the CLI once the selected suites have
+/// executed ([`record_resolution_stamp`]).
+///
+/// The resolution table is built once, SDK-free, for the stamp check and
+/// the ownership verdict; the engine opens only when a seed needs the
+/// graph, and the analysis pass runs only for seeds.
+///
 /// `Err(reason)` is the conservative fallback — run the full selection —
-/// taken when the change cannot be bounded: no repository (or `base` does
+/// taken when the change cannot be bounded: no record of the ignored
+/// resolution inputs (or one that differs), no repository (or `base` does
 /// not resolve), a change whose blast radius no selection can approximate
-/// (a pubspec, an options file, generated code), or a workspace whose
-/// semantic graph cannot assemble. The reason is the diagnostic the caller
-/// prints (the CLI's `dartq test: {reason} — running everything` line);
-/// there is no narrower heuristic to fall back to — the retired
-/// same-package-tests guess is gone, and the fallback is the full run,
-/// never a guess.
+/// (a pubspec or its overrides, an options file, generated code), or a
+/// workspace whose semantic graph cannot assemble. The reason is the
+/// diagnostic the caller prints (the CLI's `dartq test: {reason} — running
+/// everything` line); there is no narrower heuristic to fall back to — the
+/// retired same-package-tests guess is gone, and the fallback is the full
+/// run, never a guess.
 ///
 /// `sdk` is the SDK root override ([`open_engine`]'s `None` = discovery);
 /// production callers pass `None` — the parameter exists so a pinned
 /// assembly is possible (and testable).
 ///
 /// [`open_engine`]: crate::workspace::open_engine
+/// [`PackageTable::containing`]: dartq_package::PackageTable::containing
 pub fn impacted_tests(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<String>, String> {
+    // The one resolution witness of the whole selection: the stamp check
+    // below and the ownership verdict for names outside `root` both read
+    // this table — the same assembly `open_engine` runs when a seed needs
+    // the graph, minus the SDK snapshot load no verdict here needs.
+    let (packages, ..) = crate::workspace::package_assembly(root)
+        .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
+    let current = ResolutionStamp::current(root, &packages)
+        .map_err(|error| format!("cannot read the ignored resolution inputs: {error}"))?;
+    match ResolutionStamp::load(&stamp_path(root)) {
+        Some(recorded) => {
+            if let Some(input) = current.first_difference(&recorded) {
+                return Err(format!(
+                    "{input} changed since the last impacted run (ignored by git)"
+                ));
+            }
+        }
+        None => return Err("no record of the ignored resolution inputs yet".to_owned()),
+    }
     let changed = changed_since(root, base)
         .ok_or_else(|| format!("cannot diff against {base} (no git repository?)"))?;
     let mut selected: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut sources = Vec::new();
-    for relative in &changed {
-        let path = if relative.is_absolute() {
-            relative.clone()
-        } else {
-            root.join(relative)
-        };
+    let mut seeds = Vec::new();
+    // Outside `root`, pending the ownership verdict; the flag marks a name
+    // no selection can bound.
+    let mut foreign: Vec<(PathBuf, bool)> = Vec::new();
+    for path in changed {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if matches!(
+        let config = matches!(
             name,
             "pubspec.yaml"
                 | "pubspec.lock"
+                | "pubspec_overrides.yaml"
                 | "analysis_options.yaml"
                 | "build.yaml"
                 | "dartq.yaml"
                 | "dart_test.yaml"
-        ) || name.ends_with(".g.dart")
+        );
+        let unbounded = config
+            || name.ends_with(".g.dart")
             || name.ends_with(".freezed.dart")
-            || name.ends_with(".mocks.dart")
-        {
-            return Err(format!("{} changed", path.display()));
-        }
-        if name.ends_with(".dart") {
-            if name.ends_with("_test.dart") && path.is_file() {
-                selected.insert(path.clone());
+            || name.ends_with(".mocks.dart");
+        if path.starts_with(root) {
+            if unbounded {
+                return Err(format!("{} changed", path.display()));
             }
-            sources.push(path);
+            if name.ends_with(".dart") {
+                if name.ends_with("_test.dart") && path.is_file() {
+                    selected.insert(path.clone());
+                }
+                seeds.push(path);
+            }
+        } else if config && path.parent().is_some_and(|dir| root.starts_with(dir)) {
+            // Config above `root` shapes its resolution even when an edit
+            // leaves no package owning it: unbounded by name alone.
+            return Err(format!("{} changed", path.display()));
+        } else if unbounded || name.ends_with(".dart") {
+            foreign.push((path, unbounded));
         }
     }
-    if !sources.is_empty() {
-        let tests = (|| -> Result<Vec<PathBuf>, String> {
-            let (mut engine, _dir) = crate::workspace::open_engine(root, sdk)
-                .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
-            crate::analyze::run_overlaid(&mut engine, &[], &[])
-                .map_err(|error| format!("the analysis pass failed: {error}"))?;
-            // The report's test paths spell through the file locator
-            // (root-relative inside the analysis root, absolute outside),
-            // so a relative tail resolves back against the root that
-            // stripped it — the engine's own workspace root, the one base
-            // every row's spelling was derived from.
-            let analysis_root = engine.packages().workspace_root().to_path_buf();
-            let mut tests = Vec::new();
-            for seed in &sources {
-                let report = impact_after_analysis(&engine, seed).map_err(|error| {
-                    format!(
-                        "{} is outside the analyzed workspace: {error}",
-                        seed.display()
-                    )
-                })?;
-                tests.extend(report.affected_tests.into_iter().map(|test| {
-                    let path = PathBuf::from(test.path);
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        analysis_root.join(path)
-                    }
-                }));
-            }
-            Ok(tests)
-        })();
-        match tests {
-            Ok(tests) => selected.extend(tests),
-            Err(reason) => return Err(reason),
+    if seeds.is_empty() && foreign.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (path, unbounded) in foreign {
+        if packages.containing(&path).is_none() {
+            continue;
         }
+        if unbounded {
+            return Err(format!("{} changed", path.display()));
+        }
+        seeds.push(path);
+    }
+    if seeds.is_empty() {
+        // Every outside name was unowned: nothing needs the graph, so no
+        // engine opens — an unusable SDK cannot make unowned noise a full
+        // run.
+        return Ok(Vec::new());
+    }
+    let (mut engine, _dir) = crate::workspace::open_engine(root, sdk)
+        .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
+    crate::analyze::run_overlaid(&mut engine, &[], &[])
+        .map_err(|error| format!("the analysis pass failed: {error}"))?;
+    // The report's test paths spell through the file locator (root-relative
+    // inside the analysis root, absolute outside), so a relative tail
+    // resolves back against the root that stripped it — the engine's own
+    // workspace root, the one base every row's spelling was derived from.
+    let analysis_root = engine.packages().workspace_root().to_path_buf();
+    for seed in &seeds {
+        let report = impact_after_analysis(&engine, seed).map_err(|error| {
+            format!(
+                "{} is outside the analyzed workspace: {error}",
+                seed.display()
+            )
+        })?;
+        selected.extend(report.affected_tests.into_iter().map(|test| {
+            let path = PathBuf::from(test.path);
+            if path.is_absolute() {
+                path
+            } else {
+                analysis_root.join(path)
+            }
+        }));
     }
     Ok(selected
         .into_iter()
@@ -519,27 +599,193 @@ pub fn impacted_tests(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec
         .collect())
 }
 
+/// The ignored resolution inputs of one `--impacted` run: `pubspec.lock`,
+/// `pubspec_overrides.yaml`, and `.dart_tool/package_config.json` under the
+/// workspace root and every member package below the invocation root —
+/// relative path (`/`-joined, `..` above the root) to the blake3 hex of
+/// the file's bytes, `"absent"` for a file that is not there, so an
+/// input's appearance or disappearance counts as a change.
+///
+/// Git never lists these in the setups that ignore them (`.dart_tool`
+/// always; library packages' `pubspec.lock`; the `pubspec_overrides.yaml`
+/// a melos bootstrap writes into every package), so the selection's diff
+/// cannot see a dependency bump or a path override that rewrites
+/// resolution — the record is the only witness, and it compares content,
+/// never mtimes: pub rewrites these files on every `pub get`, resolved or
+/// not, so a touch must not cost the next run its bounds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResolutionStamp(BTreeMap<String, String>);
+
+/// The stamped trio, in map-key order — `pubspec.lock` first, so a
+/// rewritten lock names before an appearing overrides file at the same
+/// directory.
+const RESOLUTION_INPUTS: [&str; 3] = [
+    "pubspec.lock",
+    "pubspec_overrides.yaml",
+    ".dart_tool/package_config.json",
+];
+
+impl ResolutionStamp {
+    /// The inputs as they stand: the trio for the workspace root (the one
+    /// config resolving the invocation root's packages) and for every
+    /// package the table owns below the invocation root (the melos shape:
+    /// every package its own resolution root, so its own trio).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the read error of an input that exists but cannot be
+    /// read; a missing input is the recorded `"absent"`, never an error.
+    pub fn current(root: &Path, packages: &PackageTable) -> io::Result<Self> {
+        let mut dirs = BTreeSet::from([packages.workspace_root().to_path_buf()]);
+        dirs.extend(
+            packages
+                .iter()
+                .map(|package| package.root.as_path())
+                .filter(|dir| dir.starts_with(root))
+                .map(Path::to_path_buf),
+        );
+        let mut inputs = BTreeMap::new();
+        for dir in dirs {
+            for name in RESOLUTION_INPUTS {
+                let path = dir.join(name);
+                let digest = match fs::read(&path) {
+                    Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => "absent".to_owned(),
+                    Err(error) => return Err(error),
+                };
+                inputs.insert(relative_input(root, &path), digest);
+            }
+        }
+        Ok(Self(inputs))
+    }
+
+    /// The record as it was stored — `None` when there is nothing legible:
+    /// no record yet (the first run bounds nothing), or one that cannot be
+    /// read back (either way the caller runs everything).
+    #[must_use]
+    pub fn load(path: &Path) -> Option<Self> {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    }
+
+    /// Stores the record as pretty JSON — the map is ordered, so the bytes
+    /// of one state are always the same.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the directory-create or write error.
+    pub fn store(&self, path: &Path) -> io::Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(self).expect("the stamp serializes"),
+        )
+    }
+
+    /// The first input the two records disagree on, in key order — the
+    /// reason's path, stable for the same pair. A key on one side only is
+    /// a disagreement (a package joined or left the resolution).
+    fn first_difference<'a>(&'a self, recorded: &'a Self) -> Option<&'a str> {
+        let mut keys: Vec<&str> = self
+            .0
+            .keys()
+            .chain(recorded.0.keys())
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.into_iter()
+            .find(|key| self.0.get(*key) != recorded.0.get(*key))
+    }
+}
+
+/// Records the ignored resolution inputs of this run
+/// ([`ResolutionStamp::store`]) — `current`, over the same table
+/// [`impacted_tests`] consults, at the invocation root's stamp path. The
+/// CLI calls it once the selected suites have executed (`--impacted` in
+/// effect, any exit code — a failing suite still ran): an executed run is
+/// the only moment the inputs are known-good for what ran, and the record
+/// is what bounds the next run.
+///
+/// # Errors
+///
+/// Propagates the assembly or write failure — recording is the caller's
+/// best effort: a failed record only costs the next run its bounds (it
+/// runs everything), never this one's result.
+pub fn record_resolution_stamp(root: &Path) -> io::Result<()> {
+    let (packages, ..) = crate::workspace::package_assembly(root)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    ResolutionStamp::current(root, &packages)?.store(&stamp_path(root))
+}
+
+/// Where the record lives: the invocation root's `.dart_tool/dartq/`
+/// directory (the daemon session layout's directory — mirrored here;
+/// this crate does not depend on that one), one record per invocation
+/// root, never shared between the packages of a repository.
+fn stamp_path(root: &Path) -> PathBuf {
+    root.join(".dart_tool")
+        .join("dartq")
+        .join("impacted-inputs.json")
+}
+
+/// `path` relative to `root` as the stamp's key — `..` above it (the
+/// workspace root of a member invocation), components `/`-joined. The
+/// covered directories all descend from `root`'s own chain, so the
+/// spelling is defined for every input.
+fn relative_input(root: &Path, path: &Path) -> String {
+    let root: Vec<_> = root.iter().collect();
+    let input: Vec<_> = path.iter().collect();
+    let common = root.iter().zip(&input).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = repeat_n("..".to_owned(), root.len() - common).collect();
+    parts.extend(
+        input[common..]
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned()),
+    );
+    parts.join("/")
+}
+
 /// Files that differ from `base` in the working tree — committed since,
-/// staged, unstaged, and untracked (not ignored) — relative to `root`.
-/// `None` when there is no repository or `base` does not resolve.
+/// staged, unstaged, and untracked (not ignored) — across the whole
+/// repository, as absolute paths: a pub workspace's sibling members and
+/// root config never sit under `root`, and what a change means is the
+/// caller's ownership question. Both listings run at the toplevel (`git
+/// rev-parse --show-toplevel`, where a configured `diff.relative` is inert
+/// too), canonicalized once so every path shares the canonical spelling
+/// `root` and the package table carry. A rename lists as its deleted
+/// original plus the added file (`--no-renames`, overriding any
+/// `diff.renames`), so the old path's importers never drop out: the
+/// caller's seed for a missing file is the full run. A single-package
+/// repository (toplevel = `root`) yields the package-local set. `None` when
+/// there is no repository, `base` does not resolve, or the toplevel cannot
+/// be canonicalized.
 fn changed_since(root: &Path, base: &str) -> Option<Vec<PathBuf>> {
-    let git = |args: &[&str]| -> Option<Vec<PathBuf>> {
+    let stdout = |dir: &Path, args: &[&str]| -> Option<Vec<u8>> {
         let out = std::process::Command::new("git")
             .args(args)
-            .current_dir(root)
+            .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
             .ok()?;
-        out.status.success().then(|| {
-            out.stdout
+        out.status.success().then_some(out.stdout)
+    };
+    let toplevel = String::from_utf8(stdout(root, &["rev-parse", "--show-toplevel"])?).ok()?;
+    let toplevel = std::fs::canonicalize(toplevel.strip_suffix('\n').unwrap_or(&toplevel)).ok()?;
+    let git = |args: &[&str]| -> Option<Vec<PathBuf>> {
+        Some(
+            stdout(&toplevel, args)?
                 .split(|&b| b == 0)
                 .filter(|path| !path.is_empty())
-                .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
-                .collect()
-        })
+                .map(|path| toplevel.join(&*String::from_utf8_lossy(path)))
+                .collect(),
+        )
     };
-    let mut changed = git(&["diff", "--name-only", "-z", "--relative", base, "--"])?;
+    let mut changed = git(&["diff", "--name-only", "-z", "--no-renames", base, "--"])?;
     changed.extend(git(&["ls-files", "-z", "--others", "--exclude-standard"])?);
     Some(changed)
 }
@@ -1255,30 +1501,53 @@ mod tests {
         std::fs::remove_dir_all(&canonical).ok();
     }
 
+    /// Runs one fixture git command in `dir`, asserting success; the
+    /// identity rides the environment.
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// Commits everything under `dir` as the one commit of a fresh
+    /// repository, keeping the host's global configuration out of the
+    /// fixture: a set `commit.gpgsign` would sign with the host's key (and
+    /// fail without one), and `--no-verify` skips the commit hooks a host
+    /// may wire globally.
+    fn commit_all(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["add", "-A"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "-m",
+                "fixture",
+            ],
+        );
+    }
+
     /// The `--impacted` selection's input shape: the workspace fixture with
     /// everything committed, then `lib/a.dart` modified — one unstaged
     /// change against `HEAD`.
     fn git_workspace(tag: &str, libraries: &[(&str, &str)]) -> PathBuf {
         let root = workspace(tag, libraries);
-        let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&root)
-                .env("GIT_AUTHOR_NAME", "fixture")
-                .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
-                .env("GIT_COMMITTER_NAME", "fixture")
-                .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("git runs")
-                .success();
-            assert!(ok, "git {args:?} failed");
-        };
-        git(&["init", "-q"]);
-        git(&["add", "-A"]);
-        git(&["commit", "-q", "-m", "fixture"]);
+        commit_all(&root);
         std::fs::write(root.join("lib/a.dart"), "class A2 {}\n").expect("modify a.dart");
         // The callers' root is canonical (`current_dir().canonicalize()`),
         // and the selection strips it off the engine's canonical paths —
@@ -1287,12 +1556,76 @@ mod tests {
         root.canonicalize().expect("root")
     }
 
+    /// The workspace root pubspec of [`git_pub_workspace`]: root package
+    /// `ws`, members `packages/a` and `packages/b`.
+    const WS_PUBSPEC: &str = "name: ws\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  \
+                              - packages/a\n  - packages/b\n";
+
+    /// The pub-workspace shape of the selection (#4087), fully committed in
+    /// a repository whose toplevel holds no pubspec (one there would sit
+    /// above every member — config the selection never attributes). `ws/`
+    /// is a pub workspace whose one config lists the root package `ws` and
+    /// the members `packages/a` — `lib/a.dart` imports `package:b/b.dart`,
+    /// and `test/a_test.dart` imports `package:a/a.dart` — and
+    /// `packages/b`, whose `b.dart` already imports an `extra.dart` that
+    /// was never committed (the forgotten `git add`). Beside it sits what
+    /// no package of that resolution owns: `other/`, an independent plain
+    /// package (the workspace fixture's own faces, moved off the toplevel),
+    /// `tools/x.dart`, and a `README.md`; the stub SDK stays at `sdk/`. The
+    /// selection's `root` is member `a`; the canonical toplevel is
+    /// returned.
+    fn git_pub_workspace(tag: &str) -> PathBuf {
+        let top = workspace(
+            tag,
+            &[
+                ("README.md", "# fixture\n"),
+                ("tools/x.dart", "void main() {}\n"),
+                ("ws/pubspec.yaml", WS_PUBSPEC),
+                (
+                    "ws/pubspec.lock",
+                    "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+                ),
+                (
+                    "ws/.dart_tool/package_config.json",
+                    r#"{"configVersion": 2, "packages": [{"name": "ws", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "a", "rootUri": "../packages/a", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "b", "rootUri": "../packages/b", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+                ),
+                (
+                    "ws/packages/a/pubspec.yaml",
+                    "name: a\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+                ),
+                (
+                    "ws/packages/a/lib/a.dart",
+                    "import 'package:b/b.dart';\nclass A {}\n",
+                ),
+                (
+                    "ws/packages/a/test/a_test.dart",
+                    "import 'package:a/a.dart';\nvoid main() {}\n",
+                ),
+                (
+                    "ws/packages/b/pubspec.yaml",
+                    "name: b\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+                ),
+                (
+                    "ws/packages/b/lib/b.dart",
+                    "import 'extra.dart';\nclass B {}\n",
+                ),
+            ],
+        );
+        fs::create_dir(top.join("other")).expect("other/");
+        for face in ["pubspec.yaml", "pubspec.lock", ".dart_tool"] {
+            fs::rename(top.join(face), top.join("other").join(face)).expect("move to other/");
+        }
+        commit_all(&top);
+        top.canonicalize().expect("toplevel")
+    }
+
     /// The selection is the semantic reach — the one answer every test face
     /// (the CLI run and the daemon's child) shares for the same input: with
-    /// `lib/a.dart` changed since `HEAD`, the suite whose import reaches it
-    /// is selected and the same-package suite that imports nothing of it
-    /// stays out — the discrimination the retired same-package heuristic
-    /// could not make.
+    /// `lib/a.dart` changed since `HEAD` and the ignored resolution inputs
+    /// unchanged since the last run's record, the suite whose import
+    /// reaches it is selected and the same-package suite that imports
+    /// nothing of it stays out — the discrimination the retired
+    /// same-package heuristic could not make.
     #[test]
     fn impacted_tests_select_the_semantic_reach() {
         let root = git_workspace(
@@ -1307,6 +1640,7 @@ mod tests {
                 ("test/other_test.dart", "void main() {}\n"),
             ],
         );
+        record_resolution_stamp(&root).expect("record the inputs");
         let selected =
             impacted_tests(&root, Some(&root.join("sdk")), "HEAD").expect("bounded selection");
         assert_eq!(
@@ -1317,12 +1651,14 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The no-repository boundary: nothing to diff against, so the selection
-    /// refuses — the caller's full run — with the diagnostic naming the
-    /// base.
+    /// The no-repository boundary: nothing to diff against — the stamp leg
+    /// passes first (recording needs no repository), then the diff refuses
+    /// with the diagnostic naming the base.
     #[test]
     fn impacted_tests_without_a_repository_run_everything() {
         let root = workspace("impact_sel_norepo", &[("lib/a.dart", "class A {}\n")]);
+        let root = root.canonicalize().expect("root");
+        record_resolution_stamp(&root).expect("record the inputs");
         let reason = impacted_tests(&root, Some(&root.join("sdk")), "HEAD")
             .expect_err("the full-run fallback");
         assert_eq!(reason, "cannot diff against HEAD (no git repository?)");
@@ -1332,10 +1668,12 @@ mod tests {
     /// The graph-unavailable boundary: the change is bounded by a
     /// repository, but the workspace's semantic graph cannot assemble (here:
     /// an unusable SDK root) — the conservative full run, never a partial
-    /// guess.
+    /// guess. The stamp leg passes first: it builds the table SDK-free, so
+    /// the refusal is the engine's, not the stamp's.
     #[test]
     fn impacted_tests_fall_back_when_the_graph_cannot_assemble() {
         let root = git_workspace("impact_sel_noengine", &[("lib/a.dart", "class A {}\n")]);
+        record_resolution_stamp(&root).expect("record the inputs");
         let reason = impacted_tests(&root, Some(&root.join("no-such-sdk")), "HEAD")
             .expect_err("the full-run fallback");
         assert!(
@@ -1343,6 +1681,290 @@ mod tests {
             "names the assembly failure: {reason}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The pub-workspace defect (#4087): member `a`'s suite reaches member
+    /// `b` through `package:b`, so an edit to `b`'s `lib/` selects it — the
+    /// package-scoped diff never saw the sibling and selected nothing.
+    #[test]
+    fn impacted_tests_reach_through_a_sibling_member() {
+        let top = git_pub_workspace("impact_sel_ws_sibling");
+        fs::write(top.join("ws/packages/b/lib/b.dart"), "class B2 {}\n").expect("modify b.dart");
+        let root = top.join("ws/packages/a");
+        record_resolution_stamp(&root).expect("record the inputs");
+        let selected =
+            impacted_tests(&root, Some(&top.join("sdk")), "HEAD").expect("bounded selection");
+        assert_eq!(
+            selected,
+            vec!["test/a_test.dart".to_owned()],
+            "the sibling library's reach into member a"
+        );
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// The workspace root's pubspec and its overrides file resolve every
+    /// member, so a change to either is unbounded for a member's selection.
+    /// The overrides file is the stamp's witness — untracked and one of the
+    /// ignored inputs, so the record leg refuses before the diff leg ever
+    /// sees it — and it leaves before the pubspec edit, a tracked config
+    /// above `root` the diff leg alone catches; each change the run's only
+    /// one, each reason names its file.
+    #[test]
+    fn impacted_tests_run_everything_when_the_workspace_root_config_changes() {
+        let top = git_pub_workspace("impact_sel_ws_config");
+        let root = top.join("ws/packages/a");
+        let sdk = top.join("sdk");
+        record_resolution_stamp(&root).expect("record the inputs");
+        let overrides = top.join("ws/pubspec_overrides.yaml");
+        fs::write(
+            &overrides,
+            "dependency_overrides:\n  ext:\n    path: ../ext\n",
+        )
+        .expect("create overrides");
+        let reason = impacted_tests(&root, Some(&sdk), "HEAD").expect_err("the full-run fallback");
+        assert_eq!(
+            reason,
+            "../../pubspec_overrides.yaml changed since the last impacted run (ignored by git)"
+        );
+        fs::remove_file(&overrides).expect("remove overrides");
+        let pubspec = top.join("ws/pubspec.yaml");
+        fs::write(&pubspec, format!("{WS_PUBSPEC}description: edited\n")).expect("modify pubspec");
+        let reason = impacted_tests(&root, Some(&sdk), "HEAD").expect_err("the full-run fallback");
+        assert_eq!(reason, format!("{} changed", pubspec.display()));
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// What no package of the resolution owns never moves the selection:
+    /// the independent package beside the workspace — its pubspec included,
+    /// which sits in no directory member `a` descends from — the tooling
+    /// script, and the docs neither seed nor force the full run, the
+    /// selectivity a repository-wide "any pubspec changed" rule would give
+    /// up. None of it is a stamped input either.
+    #[test]
+    fn impacted_tests_ignore_changes_no_package_owns() {
+        let top = git_pub_workspace("impact_sel_ws_unowned");
+        for (relative, content) in [
+            ("other/pubspec.yaml", "name: fixture\ndescription: edited\n"),
+            ("tools/x.dart", "void main() {}\nvoid edited() {}\n"),
+            ("README.md", "# edited\n"),
+        ] {
+            fs::write(top.join(relative), content).expect("modify");
+        }
+        let root = top.join("ws/packages/a");
+        record_resolution_stamp(&root).expect("record the inputs");
+        let selected =
+            impacted_tests(&root, Some(&top.join("sdk")), "HEAD").expect("bounded selection");
+        assert!(
+            selected.is_empty(),
+            "nothing this resolution owns changed: {selected:?}"
+        );
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// The untracked listing is repository-wide too: `b.dart` already
+    /// imports `extra.dart`, and the file's appearance — untracked, in the
+    /// sibling member, the change's one path — reaches member `a`'s suite
+    /// (an untracked `.dart` file is no stamped input; the record stays
+    /// equal).
+    #[test]
+    fn impacted_tests_see_untracked_files_beyond_the_package() {
+        let top = git_pub_workspace("impact_sel_ws_untracked");
+        fs::write(top.join("ws/packages/b/lib/extra.dart"), "class Extra {}\n")
+            .expect("create extra.dart");
+        let root = top.join("ws/packages/a");
+        record_resolution_stamp(&root).expect("record the inputs");
+        let selected =
+            impacted_tests(&root, Some(&top.join("sdk")), "HEAD").expect("bounded selection");
+        assert_eq!(
+            selected,
+            vec!["test/a_test.dart".to_owned()],
+            "the untracked library's reach into member a"
+        );
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// An edit that breaks the workspace's resolution is the one ownership
+    /// can no longer see: with the root pubspec unparseable, member `a`
+    /// assembles as a standalone floor that owns nothing above it, so the
+    /// stamp's covered set collapses from the workspace root's trio to the
+    /// member's own — every workspace-root input now differs from the
+    /// record, the first in key order being the root's config — and the
+    /// full run answers before any git work or engine. The unusable SDK
+    /// root proves the refusal precedes the engine.
+    #[test]
+    fn impacted_tests_run_everything_when_the_workspace_pubspec_breaks() {
+        let top = git_pub_workspace("impact_sel_ws_broken");
+        let root = top.join("ws/packages/a");
+        record_resolution_stamp(&root).expect("record the inputs");
+        let pubspec = top.join("ws/pubspec.yaml");
+        fs::write(&pubspec, "name: ws\nworkspace: [packages/a\n").expect("break pubspec");
+        let reason = impacted_tests(&root, Some(&top.join("no-such-sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert_eq!(
+            reason,
+            "../../.dart_tool/package_config.json changed since the last impacted run (ignored \
+             by git)"
+        );
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// A staged rename lists as the deleted original plus the added file:
+    /// the original seeds and, missing, refuses — the full run. Under
+    /// rename detection only `c.dart` would list, reaching nothing, while
+    /// `a.dart`'s `package:b/b.dart` import now dangles.
+    #[test]
+    fn impacted_tests_run_everything_when_a_library_is_renamed() {
+        let top = git_pub_workspace("impact_sel_ws_rename");
+        let root = top.join("ws/packages/a");
+        record_resolution_stamp(&root).expect("record the inputs");
+        git(
+            &top,
+            &["mv", "ws/packages/b/lib/b.dart", "ws/packages/b/lib/c.dart"],
+        );
+        let reason = impacted_tests(&root, Some(&top.join("sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        let original = top.join("ws/packages/b/lib/b.dart");
+        assert!(
+            reason.starts_with(&format!(
+                "{} is outside the analyzed workspace",
+                original.display()
+            )),
+            "the deleted original refuses: {reason}"
+        );
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// The first `--impacted` run of a workspace bounds nothing: there is
+    /// no record of the ignored resolution inputs to compare against, so
+    /// the run is the full one and the record it leaves behind is what
+    /// bounds the next.
+    #[test]
+    fn impacted_stamp_first_run_is_unbounded() {
+        let root = git_workspace(
+            "impact_stamp_first",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                (
+                    "test/a_test.dart",
+                    "import 'package:fixture/a.dart';\nvoid main() {}\n",
+                ),
+            ],
+        );
+        let reason = impacted_tests(&root, Some(&root.join("sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert_eq!(reason, "no record of the ignored resolution inputs yet");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An equal record keeps the bounded selection — and pins where the
+    /// record lives: `record_resolution_stamp`'s write is the file
+    /// `impacted_tests` reads (the invocation root's
+    /// `.dart_tool/dartq/impacted-inputs.json`), the whole reason a
+    /// second run can bound itself.
+    #[test]
+    fn impacted_stamp_equal_keeps_the_bounded_selection() {
+        let root = git_workspace(
+            "impact_stamp_equal",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                (
+                    "test/a_test.dart",
+                    "import 'package:fixture/a.dart';\nvoid main() {}\n",
+                ),
+                ("test/other_test.dart", "void main() {}\n"),
+            ],
+        );
+        record_resolution_stamp(&root).expect("record the inputs");
+        let stamp = root.join(".dart_tool/dartq/impacted-inputs.json");
+        assert!(stamp.is_file(), "the record lives at the stamp path");
+        let selected =
+            impacted_tests(&root, Some(&root.join("sdk")), "HEAD").expect("bounded selection");
+        assert_eq!(
+            selected,
+            vec!["test/a_test.dart".to_owned()],
+            "the record equal, the selection is the semantic reach alone"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The defect the record exists for: `.gitignore` lists `pubspec.lock`,
+    /// so a rewritten lock — a dependency bump — never reaches the diff,
+    /// and without the record the selection would answer the run before it
+    /// as if resolution had not moved. The record leg refuses first,
+    /// naming the file.
+    #[test]
+    fn impacted_stamp_detects_an_ignored_lock_change() {
+        let root = workspace(
+            "impact_stamp_lock",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                (
+                    "test/a_test.dart",
+                    "import 'package:fixture/a.dart';\nvoid main() {}\n",
+                ),
+            ],
+        );
+        fs::write(root.join(".gitignore"), "pubspec.lock\n").expect("gitignore");
+        commit_all(&root);
+        fs::write(root.join("lib/a.dart"), "class A2 {}\n").expect("modify a.dart");
+        let root = root.canonicalize().expect("root");
+        record_resolution_stamp(&root).expect("record the inputs");
+        fs::write(
+            root.join("pubspec.lock"),
+            "packages:\n  test:\n    version: 1.24.0\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        )
+        .expect("rewrite the lock");
+        let reason = impacted_tests(&root, Some(&root.join("sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert_eq!(
+            reason,
+            "pubspec.lock changed since the last impacted run (ignored by git)"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A member's ignored overrides file appearing is the melos moment: the
+    /// bootstrap writes `pubspec_overrides.yaml` into every package, git
+    /// never lists it, and the record leg answers with the full run — the
+    /// member's own key, spelled relative to the invocation root.
+    #[test]
+    fn impacted_stamp_detects_a_member_override_appearing() {
+        let top = git_pub_workspace("impact_stamp_member_over");
+        let root = top.join("ws/packages/a");
+        record_resolution_stamp(&root).expect("record the inputs");
+        fs::write(
+            root.join("pubspec_overrides.yaml"),
+            "dependency_overrides:\n  ext:\n    path: ../../ext\n",
+        )
+        .expect("create the member overrides");
+        let reason = impacted_tests(&root, Some(&top.join("sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert_eq!(
+            reason,
+            "pubspec_overrides.yaml changed since the last impacted run (ignored by git)"
+        );
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// The record is content and nothing else: two `current`s over the same
+    /// tree are equal, a store loads back equal, and the bytes of one
+    /// state are the same every time they are written — no mtimes, no map
+    /// order, no ambient spelling.
+    #[test]
+    fn impacted_stamp_round_trips_deterministically() {
+        let root = workspace("impact_stamp_roundtrip", &[("lib/a.dart", "class A {}\n")]);
+        let root = root.canonicalize().expect("root");
+        let (packages, ..) = crate::workspace::package_assembly(&root).expect("table");
+        let first = ResolutionStamp::current(&root, &packages).expect("current");
+        let second = ResolutionStamp::current(&root, &packages).expect("current again");
+        assert_eq!(first, second, "the same tree hashes the same");
+        let stamp = stamp_path(&root);
+        first.store(&stamp).expect("store");
+        assert_eq!(ResolutionStamp::load(&stamp), Some(first.clone()));
+        let bytes = fs::read(&stamp).expect("bytes");
+        first.store(&stamp).expect("store again");
+        assert_eq!(fs::read(&stamp).expect("bytes again"), bytes);
+        fs::remove_dir_all(&root).ok();
     }
 
     /// The scan configuration of every non-version-gated capture face (the

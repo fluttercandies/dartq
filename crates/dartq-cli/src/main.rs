@@ -143,26 +143,49 @@ mod exit {
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
+    let mut raw_args = std::env::args_os();
+    let argv0 = raw_args.next();
     // `flutter` PATH shim: when argv0 names this binary `flutter` (the
-    // symlink `dartq init` puts on PATH) or DARTQ_SHIM is set, the
-    // process IS the shim — config discovery, cache logic, and the
+    // symlink `dartq shim install` puts on PATH) or DARTQ_SHIM is set,
+    // the process IS the shim — config discovery, cache logic, and the
     // child spawn replace the usual CLI entirely, before any argument
-    // parsing (the child gets the original OsString argv, never a
-    // lossy copy).
-    if dartq_commands::bcache::is_shim_invocation(std::env::args_os().next().as_deref()) {
-        let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // parsing (the child gets the original OsString argv, never a lossy
+    // copy).
+    if dartq_commands::bcache::is_shim_invocation(argv0.as_deref()) {
+        let raw: Vec<std::ffi::OsString> = raw_args.collect();
         let code = dartq_commands::bcache::run_flutter_shim(&raw);
+        return ExitCode::from(u8::try_from(code).unwrap_or(exit::INTERNAL_ERROR));
+    }
+    // The explicit flutter forwarder: `dartq flutter <args…>` takes every
+    // trailing argument verbatim (raw OsStrings, the same contract as the
+    // shim face) and runs the same bcache orchestration. Dispatching
+    // ahead of the clap parse keeps flutter's own flags (`--help`,
+    // `--version`, `-d …`) out of dartq's grammar entirely — they are
+    // flutter's to answer.
+    let raw: Vec<std::ffi::OsString> = raw_args.collect();
+    if let Some(argv) = flutter_face_argv(&raw) {
+        let code = dartq_commands::bcache::run_flutter_explicit(argv);
         return ExitCode::from(u8::try_from(code).unwrap_or(exit::INTERNAL_ERROR));
     }
     // Lossy argv decode: `env::args` panics (exit 101) on a non-UTF-8
     // argument, ahead of any parse; the lossy spelling keeps the process in
     // control — an invalid path fails downstream resolution as the ordinary
     // usage error (exit 64), never a panic.
-    let args: Vec<String> = std::env::args_os()
-        .skip(1)
+    let args: Vec<String> = raw
+        .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     ExitCode::from(run(&args))
+}
+
+/// The explicit flutter face's dispatch: whether the raw argv (after the
+/// program name) starts with the `flutter` token, and the forwarder's
+/// argv — everything after it, verbatim, flags and all.
+fn flutter_face_argv(argv: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
+    match argv.split_first() {
+        Some((token, rest)) if token == std::ffi::OsStr::new("flutter") => Some(rest),
+        _ => None,
+    }
 }
 
 fn run(args: &[String]) -> u8 {
@@ -219,13 +242,18 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Events(events_args)),
         }) => events::run_entry(&events_args),
-        Ok(Cli { command: Some(Command::Init) }) => init(),
+        Ok(Cli {
+            command: Some(Command::Init),
+        }) => init(),
         Ok(Cli {
             command: Some(Command::Mcp(mcp_args)),
         }) => mcp::run_entry(&mcp_args),
         Ok(Cli {
             command: Some(Command::Rename(rename_args)),
         }) => rename::run_entry(&rename_args),
+        Ok(Cli {
+            command: Some(Command::Shim(shim_args)),
+        }) => shim(&shim_args),
         Ok(Cli {
             command: Some(Command::Test(test_args)),
         }) => test::run_entry(&test_args),
@@ -330,8 +358,9 @@ enum Command {
     /// (`progress` handle — files scanned, current package).
     Events(events::EventsArgs),
     /// Set up this Flutter project for dartq: write a documented
-    /// `dartq.yaml` (only when none exists) and install the `flutter`
-    /// PATH shim into `~/.dartq/bin`.
+    /// `dartq.yaml` (only when none exists). The build cache is on with
+    /// its defaults from then on; `dartq flutter <args…>` runs it
+    /// explicitly, `dartq shim install` opts into PATH interception.
     Init,
     /// Serve the MCP stdio face: every tool mirrors a CLI verb and
     /// converges on the worktree's resident session — one engine for
@@ -345,6 +374,11 @@ enum Command {
     /// prints the machine-readable edit set; `--write` applies it in
     /// place, refusing any file outside the workspace.
     Rename(rename::RenameArgs),
+    /// Manage the `flutter` PATH shim: `install` links
+    /// `~/.dartq/bin/flutter` at this executable (the opt-in
+    /// interception — `dartq flutter` needs no shim), `remove` unlinks
+    /// it. A real file at the path is never touched.
+    Shim(ShimArgs),
     /// `dart test` (or, with `--flutter`, `flutter test`) with the same
     /// arguments and output, plus a result cache shared across worktrees,
     /// parallel execution under a host-wide memory lease, and
@@ -655,9 +689,9 @@ struct DaemonArgs {
     #[arg(long = "context")]
     contexts: Vec<String>,
     /// Watch the package directory and re-analyze after changes settle.
-    /// Poll-based — a bounded-interval walk with burst
-    /// debouncing — a convenience layer: explicit push and content
-    /// verification stay the truth.
+    /// OS file events by default, a bounded-interval walk under
+    /// `DARTQ_WATCH_SUBSTRATE=poll` — a convenience layer: explicit push
+    /// and content verification stay the truth.
     #[arg(long)]
     watch: bool,
     /// Memory budget in MiB: every session context arms the
@@ -2601,9 +2635,25 @@ enum CacheFace {
     Gc,
 }
 
-/// `dartq init`: project scaffolding plus the shim install. The report
-/// is human-facing prose on stdout — the command is interactive setup,
-/// not a machine face.
+/// The `shim` interception face.
+#[derive(Args)]
+struct ShimArgs {
+    #[command(subcommand)]
+    cmd: ShimFace,
+}
+
+#[derive(Subcommand)]
+enum ShimFace {
+    /// Link `~/.dartq/bin/flutter` at this executable (idempotent; a
+    /// real file at the path is never clobbered).
+    Install,
+    /// Remove the `~/.dartq/bin/flutter` link — only the link; a real
+    /// file is never deleted.
+    Remove,
+}
+
+/// `dartq init`: project scaffolding. The report is human-facing prose
+/// on stdout — the command is interactive setup, not a machine face.
 fn init() -> u8 {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -2619,13 +2669,40 @@ fn init() -> u8 {
             } else {
                 println!("{} already present", report.config_path.display());
             }
-            if report.shim_installed {
-                println!("shim: {}", report.shim_path.display());
-            } else {
-                println!(
-                    "shim: {} (not installed: occupied by a non-symlink)",
-                    report.shim_path.display()
-                );
+            println!(
+                "flutter cache: `dartq flutter <args>` (or `dartq shim install` for PATH \
+                 interception)"
+            );
+            exit::CLEAN
+        }
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// `dartq shim install|remove`: the opt-in PATH-interception pair, like
+/// `init` a human-facing prose face. Every outcome — including a
+/// refused removal over a real file — reports and exits clean: the
+/// outcome is the answer, not a failure.
+fn shim(args: &ShimArgs) -> u8 {
+    let result = match args.cmd {
+        ShimFace::Install => dartq_commands::bcache::shim_install(),
+        ShimFace::Remove => dartq_commands::bcache::shim_remove(),
+    };
+    match result {
+        Ok(report) => {
+            use dartq_commands::bcache::ShimOutcome;
+            let path = report.shim_path.display();
+            match report.outcome {
+                ShimOutcome::Installed => println!("installed shim: {path}"),
+                ShimOutcome::AlreadyPresent => println!("shim already installed: {path}"),
+                ShimOutcome::Removed => println!("removed shim: {path}"),
+                ShimOutcome::NotInstalled => println!("no shim at {path}"),
+                ShimOutcome::Blocked => {
+                    println!("{path} occupied by a non-symlink; left untouched")
+                }
             }
             if let Some(export) = report.path_missing {
                 println!("{export}");
@@ -2641,7 +2718,9 @@ fn init() -> u8 {
 
 /// `dartq bcache stats|gc`: the build cache's maintenance faces, one
 /// JSON line on stdout each (the machine-channel convention). A missing
-/// `build_cache` section maintains the default store.
+/// `build_cache` section maintains the default store; `enabled: false`
+/// gates the flutter faces, never the maintenance of the store it left
+/// behind.
 fn bcache(args: &BcacheArgs) -> u8 {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -2650,20 +2729,24 @@ fn bcache(args: &BcacheArgs) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
-    let config = match dartq_commands::bcache::discover_shim_config(&cwd) {
-        Ok(Some(config)) => config,
-        Ok(None) => dartq_commands::bcache::default_shim_config(),
-        Err(err) => {
-            eprintln!("dartq: {err}");
+    let config = match dartq_commands::bcache::discover_store_config(&cwd) {
+        Ok(config) => config,
+        Err(ConfigError::Invalid(message)) => {
+            eprintln!("error: {message}");
             return exit::USAGE;
         }
+        Err(ConfigError::Io(err)) => {
+            eprintln!("dartq: {err}");
+            return exit::INTERNAL_ERROR;
+        }
     };
-    let value = match args.cmd {
-        BcacheFace::Stats => dartq_commands::bcache::bcache_stats(&config)
-            .map(|stats| serde_json::to_value(stats)),
-        BcacheFace::Gc => dartq_commands::bcache::bcache_gc(&config)
-            .map(|report| serde_json::to_value(report)),
-    };
+    let value =
+        match args.cmd {
+            BcacheFace::Stats => dartq_commands::bcache::bcache_stats(&config)
+                .map(|stats| serde_json::to_value(stats)),
+            BcacheFace::Gc => dartq_commands::bcache::bcache_gc(&config)
+                .map(|report| serde_json::to_value(report)),
+        };
     let value = match value {
         Ok(Ok(value)) => value,
         Ok(Err(err)) => {
@@ -3733,6 +3816,52 @@ mod tests {
                 cmd: BcacheFace::Stats
             })))
         ));
+    }
+
+    /// `shim` carries the opt-in interception pair and needs one of
+    /// them — `dartq init` no longer installs anything.
+    #[test]
+    fn shim_parses_its_install_and_remove_faces() {
+        assert!(matches!(
+            parse_args_of(&["shim", "install"]),
+            Ok(Some(Command::Shim(ShimArgs {
+                cmd: ShimFace::Install
+            })))
+        ));
+        assert!(matches!(
+            parse_args_of(&["shim", "remove"]),
+            Ok(Some(Command::Shim(ShimArgs {
+                cmd: ShimFace::Remove
+            })))
+        ));
+        assert!(parse_args_of(&["shim"]).is_err());
+    }
+
+    /// The explicit flutter face dispatches on the first raw token and
+    /// passes everything after it through verbatim — flutter's own
+    /// flags included — while any other head stays with the usual CLI
+    /// (a bare `dartq flutter` forwards an empty argv to flutter).
+    #[test]
+    fn flutter_face_argv_dispatches_on_the_first_token() {
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        let full = argv(&["flutter", "build", "apk", "--release"]);
+        let forwarded = flutter_face_argv(&full).expect("the flutter token selects the face");
+        assert_eq!(
+            forwarded,
+            argv(&["build", "apk", "--release"]),
+            "every trailing argument rides along verbatim"
+        );
+        let bare_args = argv(&["flutter"]);
+        let bare = flutter_face_argv(&bare_args).expect("bare selects the face");
+        assert!(
+            bare.is_empty(),
+            "bare `dartq flutter` forwards an empty argv"
+        );
+        assert!(flutter_face_argv(&argv(&["analyze", "flutter"])).is_none());
+        assert!(flutter_face_argv(&argv(&["fluttertest"])).is_none());
+        assert!(flutter_face_argv(&[]).is_none());
     }
 
     /// The `--cache-size-limit` grammar rides the engine's

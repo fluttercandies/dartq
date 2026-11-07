@@ -30,6 +30,7 @@ members = [
     "crates/dartq-schema",
     "crates/dartq-session",
     "crates/dartq-test",
+    "crates/dartq-toolchain",
     "crates/dartq-bcache",
     "tools/conformance",
     "tools/sdk-faces-gen",
@@ -115,6 +116,7 @@ dartq-session = { path = "crates/dartq-session", version = "0.1.0" }
 dartq-snapshot = { path = "crates/dartq-snapshot", version = "0.1.0" }
 dartq-source = { path = "crates/dartq-source", version = "0.1.0" }
 dartq-test = { path = "crates/dartq-test", version = "0.1.0" }
+dartq-toolchain = { path = "crates/dartq-toolchain", version = "0.1.0" }
 dartq-types = { path = "crates/dartq-types", version = "0.1.0" }
 notify = "6.1.1"
 tempfile = "3"

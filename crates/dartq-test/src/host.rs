@@ -462,36 +462,23 @@ fn lock(file: &File, try_only: bool) -> io::Result<bool> {
 /// `PATH`, while a run needs the toolchain behind the link.
 #[must_use]
 pub fn find(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let this = std::env::current_exe().and_then(std::fs::canonicalize).ok();
-    find_in(std::env::split_paths(&path), name, this.as_deref())
+    dartq_toolchain::find_on_path(name)
 }
 
-/// [`find`] over `dirs`, skipping every candidate that resolves to `this`
-/// (the running binary's canonical path; `None` skips nothing). A candidate
-/// that does not resolve is not this binary.
-fn find_in(
-    dirs: impl IntoIterator<Item = PathBuf>,
-    name: &str,
-    this: Option<&Path>,
-) -> Option<PathBuf> {
-    let names: &[String] = &if cfg!(windows) {
-        vec![
-            format!("{name}.exe"),
-            format!("{name}.bat"),
-            format!("{name}.cmd"),
-        ]
-    } else {
-        vec![name.to_owned()]
-    };
-    dirs.into_iter().find_map(|dir| {
-        names.iter().map(|name| dir.join(name)).find(|candidate| {
-            candidate.is_file()
-                && this.is_none_or(|this| {
-                    std::fs::canonicalize(candidate).ok().as_deref() != Some(this)
-                })
-        })
-    })
+/// The `flutter` a run spawns, resolved as every dartq face resolves it:
+/// `explicit` (the `build_cache.flutter` pin), then `$DARTQ_FLUTTER`, then
+/// [`find`]'s scan — so the SDK a user pins for the shim is the one the
+/// test faces run.
+#[must_use]
+pub fn find_flutter(explicit: Option<&Path>) -> Option<PathBuf> {
+    dartq_toolchain::find_flutter(explicit)
+}
+
+/// The `dart` a run spawns, through the same resolution: `explicit`, then
+/// `$DARTQ_DART`, then [`find`]'s scan.
+#[must_use]
+pub fn find_dart(explicit: Option<&Path>) -> Option<PathBuf> {
+    dartq_toolchain::find_dart(explicit)
 }
 
 /// Memory the host can hand out now: available memory on Linux
@@ -624,6 +611,9 @@ fn install_signal_handler() {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    // The scan behind [`find`]: the lookup tests drive it over injected
+    // directories, as `find` drives it over `PATH`.
+    use dartq_toolchain::scan_in;
 
     /// A weak host gets one process; extra processes only when the units
     /// pay for their bases.
@@ -798,7 +788,7 @@ mod tests {
     #[test]
     fn find_skips_a_link_to_this_binary() {
         let dirs = dirs();
-        let found = find_in(
+        let found = scan_in(
             [dirs.shim.clone(), dirs.sdk.clone()],
             "flutter",
             Some(this().as_path()),
@@ -812,13 +802,13 @@ mod tests {
     #[test]
     fn find_without_a_self_match_takes_the_first_file() {
         let dirs = dirs();
-        let found = find_in(
+        let found = scan_in(
             [dirs.dangling.clone(), dirs.sdk.clone(), dirs.other.clone()],
             "flutter",
             Some(this().as_path()),
         );
         assert_eq!(found, Some(dirs.sdk.join("flutter")));
-        let alone = find_in([dirs.dangling.clone()], "flutter", Some(this().as_path()));
+        let alone = scan_in([dirs.dangling.clone()], "flutter", Some(this().as_path()));
         assert_eq!(alone, None);
     }
 
@@ -827,7 +817,7 @@ mod tests {
     #[test]
     fn find_without_this_binary_skips_nothing() {
         let dirs = dirs();
-        let found = find_in([dirs.shim.clone(), dirs.sdk.clone()], "flutter", None);
+        let found = scan_in([dirs.shim.clone(), dirs.sdk.clone()], "flutter", None);
         assert_eq!(found, Some(dirs.shim.join("flutter")));
     }
 }

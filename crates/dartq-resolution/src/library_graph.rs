@@ -474,6 +474,29 @@ pub struct ExportEntry {
     pub is_local: bool,
 }
 
+/// The terminal declaration kind a names-only SDK face entry carries — the
+/// fact the clause-kind check (`implements`/`extends`/`with`/`on`
+/// legality) reads for a declaration the element index does not model.
+///
+/// The generator resolves typedefs through their right-hand side at
+/// extraction, so the table carries the verdict the oracle's
+/// `type.element` switch sees — a `typedef A = SomeClass` reports
+/// [`FaceKind::Class`], a `typedef A = int Function()` reports
+/// [`FaceKind::NonClass`]. Mirrors the three clause-relevant element
+/// families upstream: `ClassElement` (legal under every clause),
+/// `MixinElement` (legal under `implements`/`with`/`on` only), and
+/// everything else (`FunctionType`, `TypeAliasElement` of a function type,
+/// variables, extensions, extension types — the clause code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FaceKind {
+    /// A `ClassElement` — clause-legal under every clause.
+    Class,
+    /// A `MixinElement` — clause-legal under `implements`/`with`/`on` only.
+    Mixin,
+    /// Anything else — the clause code emits.
+    NonClass,
+}
+
 /// One undefined directive-combinator name ([`LibraryGraph::
 /// undefined_combinator_names`]): one report per **written** `show`/`hide`
 /// token the directive target's export scope defines under neither spelling
@@ -563,6 +586,11 @@ pub struct LibraryGraphBuilder<'t> {
     /// ([`Self::declare_extension`]) — the element-kind facts the deferred
     /// import-of-extension face consumes ([`crate::export_graph`]).
     extensions: FxHashSet<(FileId, StringId)>,
+    /// Names-only SDK face entries carrying their terminal declaration kind
+    /// ([`Self::declare_face`]) — the clause-kind fact
+    /// [`LibraryGraph::face_kind`] reads for declarations the element index
+    /// never models.
+    face_kinds: FxHashMap<(FileId, StringId), FaceKind>,
 }
 
 struct NodeBuilder {
@@ -609,6 +637,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             by_uri: FxHashMap::default(),
             face_files: FxHashSet::default(),
             extensions: FxHashSet::default(),
+            face_kinds: FxHashMap::default(),
         }
     }
 
@@ -720,6 +749,24 @@ impl<'t> LibraryGraphBuilder<'t> {
     pub fn declare_extension(&mut self, lib: LibraryId, name: StringId, file: FileId) {
         self.declare(lib, name, file);
         self.extensions.insert((file, name));
+    }
+
+    /// [`Self::declare`] for a names-only SDK face entry that also carries
+    /// its terminal declaration kind ([`FaceKind`]) — the clause-legality
+    /// fact the generated `SDK_LIBRARY_FACES` table records per name. The
+    /// `(file, name)` pair is keyed by declaration identity exactly like
+    /// [`Self::declare_extension`], so a re-exported face entry answers
+    /// [`LibraryGraph::face_kind`] identically at any distance. First kind
+    /// wins on a duplicate spelling (the `declare` posture).
+    pub fn declare_face(
+        &mut self,
+        lib: LibraryId,
+        name: StringId,
+        file: FileId,
+        kind: FaceKind,
+    ) {
+        self.declare(lib, name, file);
+        self.face_kinds.entry((file, name)).or_insert(kind);
     }
 
     /// Records `lib`'s resolved `import` directive, in source order.
@@ -980,6 +1027,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             file_lib,
             face_files,
             extensions: self.extensions,
+            face_kinds: self.face_kinds,
         }
     }
 }
@@ -1201,6 +1249,10 @@ pub struct LibraryGraph {
     /// ([`LibraryGraphBuilder::declare_extension`]) — the kind facts behind
     /// [`LibraryGraph::is_extension`].
     extensions: FxHashSet<(FileId, StringId)>,
+    /// Names-only SDK face entries carrying their terminal declaration kind
+    /// ([`LibraryGraphBuilder::declare_face`]) — the clause-legality fact
+    /// behind [`LibraryGraph::face_kind`].
+    face_kinds: FxHashMap<(FileId, StringId), FaceKind>,
 }
 
 struct LibraryNode {
@@ -1332,6 +1384,17 @@ impl LibraryGraph {
     #[must_use]
     pub fn is_extension(&self, file: FileId, name: StringId) -> bool {
         self.extensions.contains(&(file, name))
+    }
+
+    /// The terminal declaration kind of the names-only SDK face entry
+    /// `name` declared in `file` ([`LibraryGraphBuilder::declare_face`]) —
+    /// the clause-legality fact for a declaration the element index never
+    /// models. `None` when the entry carries no kind (a plain [`declare`]
+    /// rig, or a real source declaration — those answer through the element
+    /// index instead). One hash hit.
+    #[must_use]
+    pub fn face_kind(&self, file: FileId, name: StringId) -> Option<FaceKind> {
+        self.face_kinds.get(&(file, name)).copied()
     }
 
     /// The resolved import edges of `lib`, in directive source order —

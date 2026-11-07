@@ -198,7 +198,9 @@ pub(crate) fn import_contexts(
         if mask & ARM_SDK != 0 {
             for (library, names) in dartq_engine::sdk_faces_gen::SDK_LIBRARY_FACES {
                 let uri = format!("dart:{library}");
-                if names.contains(&name) && !imported_dart.contains(uri.as_str()) {
+                if names.iter().any(|(face_name, _)| *face_name == name)
+                    && !imported_dart.contains(uri.as_str())
+                {
                     candidates.push(ImportCandidate { uri, sdk: true });
                 }
             }

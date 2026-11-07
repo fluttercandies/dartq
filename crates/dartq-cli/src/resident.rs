@@ -105,7 +105,7 @@ use serde_json::{Value, json};
 use dartq_session::{Ensured, Layout, STALE_HEARTBEAT, SessionState, SessionTriple, ensure};
 
 use crate::exit;
-use crate::session::resolved_sdk_root;
+use crate::session::sdk_root_for;
 /// How long one routed round trip may run before the caller hears about
 /// it: the first routed call on a cold resident pays the daemon's whole
 /// workspace analysis inside this window (the MCP face's bound, which
@@ -320,9 +320,10 @@ pub(crate) fn route_analyze(
     if roots.iter().any(|other| *other != root) {
         return None;
     }
-    // The triple keys on the concrete SDK root; without one the cold
-    // path owns the usage error (its assembly resolves the same way).
-    let sdk_root = resolved_sdk_root(args.sdk_path.as_deref()).ok()?;
+    // The triple keys on the concrete SDK root: the flag, the env, or
+    // the live resident session's own; without one the cold path owns
+    // the usage error (its assembly resolves the same way).
+    let sdk_root = sdk_root_for(&root, args.sdk_path.as_deref()).ok()?;
     let params = json!({
         "targets": targets
             .iter()
@@ -511,9 +512,10 @@ fn route_answer(
     params: &Value,
     out: &mut impl Write,
 ) -> Option<u8> {
-    // The triple keys on the concrete SDK root; without one the cold
-    // path owns the usage error (its assembly resolves the same way).
-    let sdk_root = resolved_sdk_root(sdk_path).ok()?;
+    // The triple keys on the concrete SDK root: the flag, the env, or
+    // the live resident session's own; without one the cold path owns
+    // the usage error (its assembly resolves the same way).
+    let sdk_root = sdk_root_for(root, sdk_path).ok()?;
     let socket = attached_socket_for(root, &sdk_root)?;
     match session_call(&socket, method, params, CALL_TIMEOUT) {
         Ok(answer) if answer["stdout"].is_string() => {

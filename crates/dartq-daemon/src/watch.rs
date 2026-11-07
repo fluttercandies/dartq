@@ -13,16 +13,11 @@
 //! init-failure fallback. The poll source
 //! re-walks the workspace per drain (reusing
 //! `dartq_commands::discover` for exact walk-rule parity with the CLI's
-//! discovery), fingerprints each `.dart` file by `(mtime, len)` — plus the
-//! three non-`.dart` context inputs ([`CONFIG_INPUTS`], the files a context
-//! assembly consumes) — and diffs
+//! discovery), fingerprints each `.dart` file by `(mtime, len)`, and diffs
 //! the walk against the previous tick — the tick's walk *is* the on-disk
 //! set, so the diff reports content changes, files that appeared, and files
 //! that vanished (re-discovery: what the session's `queue_disk_changes`
-//! turns into the same set the sweep's discovery takes, or a removal; a
-//! context input instead refreshes the contexts at intake — their bytes
-//! never stage as analysis content, and the batch re-evaluates the
-//! session's workspace advisory).
+//! turns into the same set the sweep's discovery takes, or a removal).
 //!
 //! A burst coalesces through the [`Debounce`]
 //! state machine until a changeless tick (the quiet period is one poll
@@ -40,9 +35,36 @@
 //! file's mtime; the OS substrate stamps delivery, the best known time it
 //! has) — and logs it the way the daemon logs everything operational.
 //!
+//! The session's config files ride the same cycle, independent of the
+//! substrate. Armed with the substrate (ahead of the boot tick), the
+//! [`ConfigWatch`] fixes their paths under the session's workspace root —
+//! the root the session assembled from, which the watched directory need
+//! not spell the same way (`.`, a symlink alias, a workspace member) — and
+//! every tick stats each one by the poll substrate's `(mtime, len)`
+//! fingerprint; absent is a state, so an appearance or a deletion is a
+//! change. A moved path rides the debounce like any touch. The three
+//! context inputs ([`CONFIG_INPUTS`], the files a context assembly
+//! consumes) reach the intake in that root's own spelling — the root the
+//! intake compares against — so they refresh the contexts there: their
+//! bytes never stage as analysis content, and the batch re-evaluates the
+//! session's workspace advisory. The governing `dartq.yaml` pair — the
+//! project tier, the nearest one up the chain from the session's root (the
+//! root's own path when none governs), and the global tier,
+//! `<home>/.dartq/dartq.yaml` — never reaches the intake: a session
+//! assembles its `dartq.yaml` rows once at startup, so a mid-session edit
+//! cannot apply in place, and the flush routes the pair off the batch into
+//! one restart advisory per batch, naming the tier — never staged as
+//! analysis content, never a context refresh (re-assembly is structural; a
+//! restart applies it). Neither substrate could carry these files
+//! faithfully — the global file sits outside the root, the session's root
+//! can sit above the watched tree, and the OS substrate reports paths in
+//! the watched directory's spelling — which is why the stat lives in the
+//! cycle.
+//!
 //! Bounded by construction: the thread's state is the substrate (the poll
 //! source's one fingerprint map, replaced per tick; the OS substrate's
-//! event queue, drained non-blocking every tick) plus the pending set —
+//! event queue, drained non-blocking every tick), the config files' five
+//! fingerprints (replaced per tick), and the pending set —
 //! no per-event accumulation in our own state, no timer thread, and a
 //! bounded intake queue (the channel item is one batch; a full queue hands
 //! the batch back to the accumulator instead of stalling the drain). Watch
@@ -62,32 +84,34 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::{Sender, TrySendError};
 use rustc_hash::FxHashMap;
 
+use dartq_commands::config;
 use dartq_commands::discover::{DiscoverError, discover};
 
 use crate::server::Incoming;
+use crate::session::CONFIG_INPUTS;
 
 /// The watch cadence: one substrate drain + debounce cycle per interval —
 /// and the poll substrate's walk cadence, polling being that substrate's
 /// documented cost.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The non-`.dart` context inputs tracked beside the `.dart` walk: the
-/// files a context assembly consumes (the package manifest, the resolved
-/// package graph, the analysis options — the reload surface). They
-/// are fingerprinted like `.dart` files so a change (or appearance, or
-/// deletion) surfaces in the tick diff, but they never stage as analysis
-/// content — [`is_config_input`] routes them to the context refresh at
-/// intake.
-const CONFIG_INPUTS: [&str; 3] = [
-    "pubspec.yaml",
-    ".dart_tool/package_config.json",
-    "analysis_options.yaml",
-];
-
-/// Whether `path` is one of the watched non-`.dart` context inputs under
-/// `root`: its change routes to the context refresh (re-discovery +
-/// re-analysis), never to the content sync — a pubspec's bytes are not Dart
-/// source, and staging them would intern a phantom analysis file.
+/// The non-`.dart` context inputs, relative to the session's workspace
+/// root: the files a context assembly consumes (the package manifest, the
+/// resolved package graph, the analysis options — the reload surface),
+/// spelled once in [`crate::session::CONFIG_INPUTS`]. The
+/// [`ConfigWatch`] stats them every tick from that root, so a change (or
+/// appearance, or deletion) rides the batch in the root's own spelling,
+/// but they never stage as analysis content — [`is_config_input`] routes
+/// them to the context refresh at intake. `dartq.yaml` is deliberately not
+/// one: its rows are structural (the contexts open at session start), so
+/// the [`ConfigWatch`] advises a restart instead.
+///
+/// Whether `path` is one of the context inputs under `root` — the
+/// session's workspace root, the same root the watch builds them from, so
+/// the comparison holds however the watched directory is spelled: its
+/// change routes to the context refresh (re-discovery + re-analysis),
+/// never to the content sync — a pubspec's bytes are not Dart source, and
+/// staging them would intern a phantom analysis file.
 pub(crate) fn is_config_input(path: &Path, root: &Path) -> bool {
     CONFIG_INPUTS
         .iter()
@@ -129,12 +153,16 @@ struct SourceEvent {
 /// event's wait — change time to the drain that observed it — and the count
 /// of such drains. Surfaced the way the daemon surfaces everything
 /// operational, one log line per observed drain; the atomics are the
-/// recorded values the tests read.
+/// recorded values the tests read. The config watch's restart advisories
+/// are counted here too, per tier — each one already its own log line
+/// ([`ConfigWatch::route`]).
 #[derive(Default)]
 #[cfg_attr(not(test), allow(dead_code))] // the atomics are the tests' read face
 struct WatchMetrics {
     observed_drains: AtomicU64,
     last_max_latency_micros: AtomicU64,
+    project_advisories: AtomicU64,
+    global_advisories: AtomicU64,
 }
 
 impl WatchMetrics {
@@ -161,6 +189,14 @@ impl WatchMetrics {
             events.len(),
             stalest.as_millis(),
         );
+    }
+
+    /// The restart-advisory counter of `tier`.
+    fn advised(&self, tier: ConfigTier) -> &AtomicU64 {
+        match tier {
+            ConfigTier::Project => &self.project_advisories,
+            ConfigTier::Global => &self.global_advisories,
+        }
     }
 }
 
@@ -314,22 +350,20 @@ impl WatchSource for NotifySource {
                         let path = self.normalize(path)?;
                         // The intake contract is the poll substrate's walk
                         // surface: `.dart` files under non-hidden names
-                        // (the walk's dot-prefix rule) plus the watched
-                        // context inputs. Directory events and the rest of
-                        // the tree (`.dart_tool` churn, editor scratch) are
-                        // not change hints — staging them would intern dead
-                        // paths against the session's live-path ceiling.
+                        // (the walk's dot-prefix rule). Directory events and
+                        // the rest of the tree (`.dart_tool` churn, editor
+                        // scratch) are not change hints — staging them would
+                        // intern dead paths against the session's live-path
+                        // ceiling — and the config files are the shared
+                        // cycle's stat (`ConfigWatch`), never substrate
+                        // events.
                         let watched_dart = path.extension().is_some_and(|ext| ext == "dart")
                             && path.strip_prefix(&self.root).is_ok_and(|relative| {
                                 !relative.components().any(|component| {
                                     component.as_os_str().as_encoded_bytes().starts_with(b".")
                                 })
                             });
-                        if watched_dart || is_config_input(&path, &self.root) {
-                            Some(SourceEvent { path, kind, at })
-                        } else {
-                            None
-                        }
+                        watched_dart.then_some(SourceEvent { path, kind, at })
                     }));
                 }
                 Ok(Err(error)) => eprintln!("dartq-daemon: watch substrate error: {error}"),
@@ -433,13 +467,18 @@ fn init_source(root: &Path, _substrate: Substrate) -> Option<Box<dyn WatchSource
     PollSource::new(root).map(|source| Box::new(source) as Box<dyn WatchSource>)
 }
 
-/// Where the watcher polls and how fast. `poll_interval` is injectable for
-/// tests; production uses `POLL_INTERVAL` via [`Self::new`].
+/// Where the watcher polls and how fast. `poll_interval` and `home` are
+/// injectable for tests; production takes `POLL_INTERVAL` and the user's
+/// home directory via [`Self::new`].
 pub struct WatchOptions {
     /// The package directory to walk (the daemon's workspace root).
     pub(crate) root: PathBuf,
     /// One walk + diff per interval; also the quiet period.
     pub(crate) poll_interval: Duration,
+    /// The directory whose `.dartq/dartq.yaml` is the global config tier
+    /// the config watch fingerprints; `None` (no home directory) leaves
+    /// that tier unwatched — the governing-config discovery's own posture.
+    pub(crate) home: Option<PathBuf>,
 }
 
 impl WatchOptions {
@@ -449,6 +488,7 @@ impl WatchOptions {
         Self {
             root,
             poll_interval: POLL_INTERVAL,
+            home: std::env::home_dir(),
         }
     }
 }
@@ -463,8 +503,9 @@ struct Debounce {
 }
 
 impl Debounce {
-    /// One poll tick: `touched` is what the walk diff reported. Returns the
-    /// batch to enqueue, if any.
+    /// One poll tick: `touched` is what the tick observed — the substrate's
+    /// drain plus the config files' moved paths. Returns the batch to
+    /// route, if any.
     fn tick(&mut self, touched: Vec<PathBuf>, now: Instant) -> Option<Vec<PathBuf>> {
         let quiet = touched.is_empty();
         if !quiet {
@@ -499,6 +540,13 @@ impl Debounce {
 /// engine's `ContentId` discipline stays the truth).
 type Fingerprint = (SystemTime, u64);
 
+/// The file's fingerprint as it sits now — one `stat`. `None` when it is
+/// absent, or its metadata unreadable (untracked, the same as absent).
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 /// One workspace walk: every `.dart` file by the discovery walk rules, with
 /// its fingerprint. `None` when the walk itself fails — the tick is skipped
 /// with the previous map kept, so a transient walk error can never masquerade
@@ -518,18 +566,7 @@ fn scan(root: &std::path::Path) -> Option<FxHashMap<PathBuf, Fingerprint>> {
     Some(
         files
             .into_iter()
-            .filter_map(|path| {
-                let meta = fs::metadata(&path).ok()?;
-                Some((path, (meta.modified().ok()?, meta.len())))
-            })
-            // The context inputs ride the same fingerprint map: present
-            // files are tracked, absent ones are not, so a later creation
-            // or deletion diffs as a touch like any file event.
-            .chain(CONFIG_INPUTS.iter().filter_map(|relative| {
-                let path = root.join(relative);
-                let meta = fs::metadata(&path).ok()?;
-                Some((path, (meta.modified().ok()?, meta.len())))
-            }))
+            .filter_map(|path| fingerprint(&path).map(|seen| (path, seen)))
             .collect(),
     )
 }
@@ -558,6 +595,148 @@ fn diff(
     touched
 }
 
+/// A governing config tier, as the restart advisory names it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigTier {
+    /// The nearest `dartq.yaml` up the chain from the session's workspace
+    /// root.
+    Project,
+    /// `<home>/.dartq/dartq.yaml`: the machine-level defaults the project
+    /// tier overrides key by key.
+    Global,
+}
+
+impl ConfigTier {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
+/// One config file the session read at assembly, fixed at arm: its path,
+/// its fingerprint at the last tick — `None` while absent, so an
+/// appearance or a deletion moves it the way an edit does — and its tier
+/// when it is a governing `dartq.yaml` (`None`: a context input).
+struct ConfigSlot {
+    path: PathBuf,
+    seen: Option<Fingerprint>,
+    tier: Option<ConfigTier>,
+}
+
+/// The session's config files, every path built from its workspace root —
+/// the root the intake compares against: the three context inputs (a move
+/// rides the batch to the context refresh at intake) and the governing
+/// `dartq.yaml` pair (a move becomes a restart advisory here). Bounded by
+/// construction — at most five slots, fixed at arm, each fingerprint
+/// replaced per tick.
+pub(crate) struct ConfigWatch {
+    slots: Vec<ConfigSlot>,
+}
+
+impl ConfigWatch {
+    /// Fixes every slot under the session's workspace root `root` and takes
+    /// the baseline: the context inputs; the project tier — the governing
+    /// file the shared project walk finds from `root`, or, when none
+    /// governs, `root`'s own path (where a new project config lands and the
+    /// next session's walk finds it first); the global tier under `home`.
+    pub(crate) fn arm(root: &Path, home: Option<&Path>) -> Self {
+        let project =
+            config::project_config_file(root).unwrap_or_else(|| root.join(config::FILE_NAME));
+        let slots = CONFIG_INPUTS
+            .iter()
+            .map(|input| (root.join(input), None))
+            .chain([(project, Some(ConfigTier::Project))])
+            .chain(home.map(|home| (config::global_config_file(home), Some(ConfigTier::Global))))
+            .map(|(path, tier)| ConfigSlot {
+                seen: fingerprint(&path),
+                path,
+                tier,
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// One tick: stats each slot once and returns the paths whose state
+    /// moved since the last tick, keeping the new fingerprints — a quiet
+    /// tick returns nothing, and an unchanged file never re-reports.
+    fn changed(&mut self) -> Vec<PathBuf> {
+        let mut changed = Vec::new();
+        for slot in &mut self.slots {
+            let seen = fingerprint(&slot.path);
+            if seen != slot.seen {
+                slot.seen = seen;
+                changed.push(slot.path.clone());
+            }
+        }
+        changed
+    }
+
+    /// Routes one flushed batch: the governing `dartq.yaml` paths it
+    /// carries become the batch's one restart advisory — a log line naming
+    /// each changed tier, counted per tier on the probe — and the rest
+    /// returns as the intake batch, the context inputs with it (the intake
+    /// routes those to the context refresh). The `dartq.yaml` paths never
+    /// cross to the main loop: their bytes are not analysis content, and
+    /// applying them is a restart, not a context refresh.
+    fn route(&self, mut batch: Vec<PathBuf>, metrics: &WatchMetrics) -> Vec<PathBuf> {
+        let changed: Vec<(ConfigTier, PathBuf)> = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.tier.map(|tier| (tier, slot.path.clone())))
+            .filter(|(_, path)| batch.contains(path))
+            .collect();
+        if changed.is_empty() {
+            return batch;
+        }
+        batch.retain(|touched| changed.iter().all(|(_, path)| touched != path));
+        for &(tier, _) in &changed {
+            metrics.advised(tier).fetch_add(1, Ordering::Relaxed);
+        }
+        self.advise(&changed);
+        batch
+    }
+
+    /// The serve face's advisory tick (#4106): one [`Self::changed`] pass,
+    /// and every moved governing `dartq.yaml` slot becomes the one restart
+    /// advisory through the shared [`Self::advise`] emission the watch
+    /// face's route also uses — so the line and the tier naming live once.
+    /// The fingerprint state dedups: a change between drains advises at
+    /// the next drain, never per drain, and the context-input slots ride
+    /// the same tick's state update (their moves are the session's own
+    /// stamps' business, never this advisory's). Returns the advised
+    /// slots' paths — the tests' observable for the exactly-once contract.
+    pub(crate) fn advise_changed(&mut self) -> Vec<PathBuf> {
+        let changed = self.changed();
+        let moved: Vec<(ConfigTier, PathBuf)> = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.tier.map(|tier| (tier, slot.path.clone())))
+            .filter(|(_, path)| changed.contains(path))
+            .collect();
+        if !moved.is_empty() {
+            self.advise(&moved);
+        }
+        moved.into_iter().map(|(_, path)| path).collect()
+    }
+
+    /// The one restart-advisory emission — the exact line both faces
+    /// print, naming each changed tier and its path. Stderr only: no
+    /// intake, no context refresh, no restart.
+    fn advise(&self, changed: &[(ConfigTier, PathBuf)]) {
+        let named: Vec<String> = changed
+            .iter()
+            .map(|(tier, path)| format!("{}: {}", tier.name(), path.display()))
+            .collect();
+        eprintln!(
+            "dartq-daemon: watch: dartq.yaml changed ({}) — restart the session \
+             (or rerun the command) to apply it",
+            named.join("; "),
+        );
+    }
+}
+
 /// A handle to the one watch thread: dropping it stops the poll and joins
 /// the thread, so session end shuts the watcher down cleanly (and a send
 /// failure exits the thread on its own once the main loop is gone).
@@ -569,27 +748,44 @@ pub(crate) struct Watcher {
 impl Watcher {
     /// Spawns the watch thread (one thread per watcher, by construction;
     /// the substrate is inited on the thread, so a slow OS stream arm never
-    /// blocks the caller). A failed spawn only loses the convenience layer —
-    /// the daemon logs and serves without watch.
-    pub(crate) fn spawn(options: WatchOptions, sender: Sender<Vec<Incoming>>) -> Self {
-        Self::spawn_with(options, sender, Substrate::from_env())
+    /// blocks the caller). `session_root` is the session's workspace root —
+    /// where its assembly read the context inputs and `dartq.yaml`: the
+    /// config watch builds every config path from it, the same root the
+    /// intake compares against, however the watched directory is spelled. A
+    /// failed spawn only loses the convenience layer — the daemon logs and
+    /// serves without watch.
+    pub(crate) fn spawn(
+        options: WatchOptions,
+        session_root: &Path,
+        sender: Sender<Vec<Incoming>>,
+    ) -> Self {
+        Self::spawn_with(
+            options,
+            session_root,
+            sender,
+            Substrate::from_env(),
+            Arc::default(),
+        )
     }
 
-    /// `spawn` with the substrate chosen by the caller — the tests pin the
-    /// OS substrate this way instead of mutating the process-wide env var
-    /// under libtest's parallel worker threads.
+    /// `spawn` with the substrate and the probe chosen by the caller — the
+    /// tests pin the OS substrate this way instead of mutating the
+    /// process-wide env var under libtest's parallel worker threads, and
+    /// read the probe's recorded values off their own handle.
     fn spawn_with(
         options: WatchOptions,
+        session_root: &Path,
         sender: Sender<Vec<Incoming>>,
         substrate: Substrate,
+        metrics: Arc<WatchMetrics>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let session_root = session_root.to_path_buf();
         let join = thread::Builder::new()
             .name("dartq-daemon-watch".into())
             .spawn({
                 let stop = Arc::clone(&stop);
-                let metrics = Arc::new(WatchMetrics::default());
-                move || watch_loop(&options, &sender, &stop, &metrics, substrate)
+                move || watch_loop(&options, &session_root, &sender, &stop, &metrics, substrate)
             })
             .inspect_err(|error| eprintln!("dartq-daemon: watch thread unavailable: {error}"))
             .ok();
@@ -604,7 +800,8 @@ impl Watcher {
 /// `continue`s, a disconnected receiver `return`s) leads back to that
 /// check — so the join waits at most one in-flight poll interval (the
 /// sleep is not interruptible) plus one tick's work (one walk, one diff,
-/// one batch hand-off), or the pre-loop baseline walk in the spawn race.
+/// the config files' five stats, one batch hand-off), or the pre-loop arm
+/// in the spawn race (the baseline walk, the config watch's arm).
 /// Session end is never held unbounded by the watcher's shutdown.
 impl Drop for Watcher {
     fn drop(&mut self) {
@@ -624,6 +821,7 @@ impl Drop for Watcher {
 /// shutdown past the receiver's own drop, so the send never waits.
 fn watch_loop(
     options: &WatchOptions,
+    session_root: &Path,
     sender: &Sender<Vec<Incoming>>,
     stop: &AtomicBool,
     metrics: &WatchMetrics,
@@ -632,6 +830,10 @@ fn watch_loop(
     let Some(mut source) = init_source(&options.root, substrate) else {
         return;
     };
+    // The config files arm with the substrate, ahead of the boot tick: once
+    // the boot tick is out, their baseline is taken, so any later config
+    // write is a change, never part of the baseline.
+    let mut config = ConfigWatch::arm(session_root, options.home.as_deref());
     // The boot tick: the substrate is armed, so the face's guarantee of a
     // published base view starts now — an empty `Watch` batch (a shape the
     // debouncer never produces) that stages the lazy base analysis at the
@@ -655,8 +857,22 @@ fn watch_loop(
         thread::sleep(options.poll_interval);
         let events = source.drain();
         metrics.observe(&events, SystemTime::now());
-        let touched: Vec<PathBuf> = events.into_iter().map(|event| event.path).collect();
+        // The config files' moved paths ride the debounce like any touch — a
+        // burst of config writes coalesces into one batch, hence one context
+        // refresh or one advisory — and the flush routes the governing
+        // `dartq.yaml` pair off the intake batch.
+        let touched: Vec<PathBuf> = events
+            .into_iter()
+            .map(|event| event.path)
+            .chain(config.changed())
+            .collect();
         if let Some(batch) = debounce.tick(touched, Instant::now()) {
+            let batch = config.route(batch, metrics);
+            // A `dartq.yaml`-only batch is answered by its advisory alone: an
+            // empty intake item is the boot tick's shape, never sent again.
+            if batch.is_empty() {
+                continue;
+            }
             match sender.try_send(vec![Incoming::Watch { touched: batch }]) {
                 Ok(()) => {}
                 Err(TrySendError::Disconnected(_)) => return,
@@ -835,7 +1051,9 @@ mod tests {
             WatchOptions {
                 root: root.clone(),
                 poll_interval: Duration::from_millis(25),
+                home: None,
             },
+            &root,
             sender,
         );
 
@@ -870,7 +1088,9 @@ mod tests {
             WatchOptions {
                 root: root.clone(),
                 poll_interval: Duration::from_millis(25),
+                home: None,
             },
+            &root,
             sender,
         );
 
@@ -902,7 +1122,9 @@ mod tests {
             WatchOptions {
                 root: root.clone(),
                 poll_interval: Duration::from_millis(25),
+                home: None,
             },
+            &root,
             sender,
         );
 
@@ -952,67 +1174,91 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// The non-`.dart` context inputs ride the same fingerprint map as the
-    /// `.dart` walk: each of the three triggers the diff on creation,
-    /// rewrite, and deletion — the watch trigger set the reload
-    /// surface needs.
+    /// The context inputs ride the shared cycle's stat, not a substrate:
+    /// the config watch builds each path from the session's root — the
+    /// spelling the intake classifies — and reports it on creation,
+    /// rewrite, and deletion (absent is a state), while the poll walk
+    /// carries `.dart` alone. With no `dartq.yaml` up the chain, the
+    /// project slot is the root's own path: a config created there is
+    /// reported too, and the flush routes it off the batch into one
+    /// project-tier advisory while the context input stays on it.
     #[test]
-    fn scan_and_diff_track_each_config_input() {
+    fn config_watch_tracks_each_context_input_from_the_session_root() {
         let (root, _main) = workspace("config-inputs");
-        // The fixture seeds none of the three: the baseline map is the
-        // `.dart` set alone.
-        let baseline = scan(&root).expect("baseline");
-        assert_eq!(baseline.len(), 1, "the seeded file only");
-        assert!(
-            !baseline.keys().any(|path| is_config_input(path, &root)),
-            "no config input is tracked before it exists"
-        );
-
         let pubspec = root.join("pubspec.yaml");
+        let package_config = root.join(".dart_tool/package_config.json");
         let options = root.join("analysis_options.yaml");
-        let config = root.join(".dart_tool/package_config.json");
-        fs::create_dir_all(config.parent().expect("parent")).expect("dir");
-
-        // Creation of the package manifest: one touch.
-        fs::write(&pubspec, "name: w\n").expect("write pubspec");
-        let after_pubspec = scan(&root).expect("scan");
+        let project = root.join(config::FILE_NAME);
+        let mut watch = ConfigWatch::arm(&root, None);
+        let slots: Vec<&PathBuf> = watch.slots.iter().map(|slot| &slot.path).collect();
         assert_eq!(
-            diff(&baseline, &after_pubspec),
-            vec![pubspec.clone()],
-            "the manifest's creation is the batch"
+            slots,
+            [&pubspec, &package_config, &options, &project],
+            "every slot under the session root; no home, no global slot"
         );
+        assert!(
+            [&pubspec, &package_config, &options]
+                .iter()
+                .all(|input| is_config_input(input, &root)),
+            "the watch's spelling is the intake's"
+        );
+        // The fixture seeds none of them: the absent baseline is no change.
+        assert!(watch.changed().is_empty(), "the baseline is quiet");
 
-        // Creation of the analysis options: one touch (the manifest's
-        // unchanged fingerprint stays out of the diff).
+        // Creation of each: one report apiece (an unchanged fingerprint
+        // never re-reports).
+        fs::write(&pubspec, "name: w\n").expect("write pubspec");
+        assert_eq!(
+            watch.changed(),
+            [pubspec.clone()],
+            "the manifest's creation"
+        );
         fs::write(
             &options,
             "analyzer:\n  errors:\n    unused_import: ignore\n",
         )
         .expect("write options");
-        let after_options = scan(&root).expect("scan");
+        assert_eq!(watch.changed(), [options.clone()], "the options' creation");
+        fs::create_dir_all(package_config.parent().expect("parent")).expect("dir");
+        fs::write(&package_config, "{}").expect("write package config");
         assert_eq!(
-            diff(&after_pubspec, &after_options),
-            vec![options.clone()],
-            "the options file's creation is the batch"
+            watch.changed(),
+            [package_config.clone()],
+            "the package config's creation"
         );
-
-        // Rewrite of the package config: one touch (a differing length
-        // moves the fingerprint even under mtime granularity ties).
-        fs::write(&config, r#"{"configVersion": 2, "packages": []}"#).expect("write config");
-        let after_config = scan(&root).expect("scan");
-        assert_eq!(
-            diff(&after_options, &after_config),
-            vec![config.clone()],
-            "the package config's rewrite is the batch"
-        );
-
-        // Deletion is a touch too (the vanished half of the diff).
-        fs::remove_file(&options).expect("remove options");
-        let after_removal = scan(&root).expect("scan");
-        let touched = diff(&after_config, &after_removal);
         assert!(
-            touched.contains(&options),
-            "the deletion is the batch: {touched:?}"
+            !scan(&root)
+                .expect("walk")
+                .keys()
+                .any(|path| is_config_input(path, &root)),
+            "the poll walk carries `.dart` alone"
+        );
+
+        // A rewrite (a differing length moves the fingerprint even under
+        // an mtime tie) and a deletion each report too.
+        fs::write(&package_config, r#"{"configVersion": 2, "packages": []}"#)
+            .expect("rewrite package config");
+        assert_eq!(watch.changed(), [package_config.clone()], "the rewrite");
+        fs::remove_file(&options).expect("remove options");
+        assert_eq!(watch.changed(), [options.clone()], "the deletion");
+        assert!(watch.changed().is_empty(), "a quiet tick reports nothing");
+
+        // The project fallback: the created config is reported, and the
+        // flush routes it to one advisory, keeping the context input.
+        fs::write(&project, "version: 1\n").expect("create the project config");
+        assert_eq!(
+            watch.changed(),
+            [project.clone()],
+            "the project config's creation"
+        );
+        let metrics = WatchMetrics::default();
+        let batch = watch.route(vec![pubspec.clone(), project], &metrics);
+        assert_eq!(batch, [pubspec], "the context input stays on the batch");
+        assert_eq!(advisories(&metrics, ConfigTier::Project), 1, "one advisory");
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Global),
+            0,
+            "no global slot"
         );
 
         fs::remove_dir_all(&root).ok();
@@ -1255,9 +1501,12 @@ mod tests {
             WatchOptions {
                 root: root.clone(),
                 poll_interval: Duration::from_millis(25),
+                home: None,
             },
+            &root,
             sender,
             Substrate::Os,
+            Arc::default(),
         );
 
         // Noise that must never reach the batch: an unwatched extension and
@@ -1313,5 +1562,244 @@ mod tests {
         let mut source = init_source(&root, Substrate::Poll).expect("poll inits");
         assert!(source.drain().is_empty(), "a clean tree drains quiet");
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// How long the config tests hold after their last expected advisory:
+    /// a dozen ticks at the tests' 25 ms cadence, several full debounce
+    /// cycles — a re-advising unchanged file, or a config path crossing to
+    /// the main loop, would show within it. A slowed (instrumented) build
+    /// fits fewer ticks, which only weakens the negative check, never fails
+    /// it falsely.
+    const QUIET_HOLD: Duration = Duration::from_millis(300);
+
+    /// Fast watch options over `root` for the config tests, with `home` as
+    /// the global tier's directory — never the developer's real one.
+    fn config_options(root: &Path, home: Option<&Path>) -> WatchOptions {
+        WatchOptions {
+            root: root.to_path_buf(),
+            poll_interval: Duration::from_millis(25),
+            home: home.map(Path::to_path_buf),
+        }
+    }
+
+    /// A fresh home directory beside `root` — outside the watched tree, as
+    /// the real global tier is — with its `.dartq` directory made, plus the
+    /// global tier's `dartq.yaml` path (the file itself is the test's call).
+    fn injected_home(root: &Path) -> (PathBuf, PathBuf) {
+        let home = root.with_extension("home");
+        let _ = fs::remove_dir_all(&home);
+        let global = config::global_config_file(&home);
+        fs::create_dir_all(global.parent().expect("the tier directory")).expect("mkdir home");
+        (home, global)
+    }
+
+    /// Blocks until the watch thread's boot tick — sent once the substrate
+    /// and the config files are armed, both ahead of it — so every write
+    /// after this returns is post-baseline: the config watch sees it as a
+    /// change, never folds it into the baseline.
+    fn await_boot(receiver: &Receiver<Vec<Incoming>>) {
+        match receiver.recv_timeout(SETTLE_WINDOW) {
+            Ok(item) => assert!(
+                watch_paths(&item).is_empty(),
+                "the first hand-off is the boot tick"
+            ),
+            Err(error) => panic!("the watch thread never armed: {error}"),
+        }
+    }
+
+    /// The restart advisories `tier` has surfaced so far.
+    fn advisories(metrics: &WatchMetrics, tier: ConfigTier) -> u64 {
+        metrics.advised(tier).load(Ordering::Relaxed)
+    }
+
+    /// Waits until `tier` has surfaced `count` restart advisories in all —
+    /// bounded by the settle window, never a hang.
+    fn await_advisories(metrics: &WatchMetrics, tier: ConfigTier, count: u64) {
+        let deadline = Instant::now() + SETTLE_WINDOW;
+        while advisories(metrics, tier) < count {
+            assert!(
+                Instant::now() < deadline,
+                "advisory {count} of the {tier:?} tier never surfaced within the window"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Every intake batch that reaches the channel before `window` closes —
+    /// anything queued earlier included.
+    fn batches_within(receiver: &Receiver<Vec<Incoming>>, window: Duration) -> Vec<Vec<PathBuf>> {
+        let deadline = Instant::now() + window;
+        let mut batches = Vec::new();
+        loop {
+            match receiver.recv_deadline(deadline) {
+                Ok(item) => batches.push(watch_paths(&item)),
+                Err(RecvTimeoutError::Timeout) => return batches,
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the watch thread exited mid-test")
+                }
+            }
+        }
+    }
+
+    /// T1 — a mid-session edit of the project tier's `dartq.yaml` surfaces
+    /// exactly one restart advisory on the shipped default substrate, which
+    /// never delivers the path (the stat in the shared cycle observes it),
+    /// and nothing crosses to the main loop for it: no batch carries the
+    /// path and no boot-shaped empty batch goes out, so no analysis content
+    /// stages and no context refresh fires — both live behind the channel,
+    /// at the intake's `handle_watch`. The unchanged file then never
+    /// re-advises.
+    #[test]
+    fn config_watch_advises_a_project_config_edit_once() {
+        let (root, _main) = workspace("config-project");
+        let project = root.join(config::FILE_NAME);
+        fs::write(&project, "version: 1\n").expect("seed the project config");
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(4);
+        let metrics = Arc::new(WatchMetrics::default());
+        let watcher = Watcher::spawn_with(
+            config_options(&root, None),
+            &root,
+            sender,
+            Substrate::Os,
+            Arc::clone(&metrics),
+        );
+        await_boot(&receiver);
+
+        // A differing length moves the fingerprint even under an mtime tie.
+        fs::write(&project, "version: 1\ncache:\n  size_limit_gib: 4\n").expect("edit");
+        await_advisories(&metrics, ConfigTier::Project, 1);
+
+        // The OS stream may still deliver the fixture's pre-arm seed writes
+        // as a batch of their own; whatever crosses carries no config path
+        // and is never the boot tick's empty shape.
+        let crossed = batches_within(&receiver, QUIET_HOLD);
+        assert!(
+            crossed
+                .iter()
+                .all(|batch| !batch.is_empty() && !batch.contains(&project)),
+            "the config never crosses to the main loop: {crossed:?}"
+        );
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Project),
+            1,
+            "one edit, one advisory"
+        );
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Global),
+            0,
+            "no home, no global slot"
+        );
+
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// T2 — the global tier, in an injected home outside the watched root
+    /// (no substrate could see it): its creation and its deletion each
+    /// surface one restart advisory — absent is a state — while the
+    /// untouched project tier stays silent and nothing at all crosses to
+    /// the main loop (the poll substrate's baseline holds the whole
+    /// fixture, which makes "nothing at all" exact).
+    #[test]
+    fn config_watch_advises_global_config_creation_and_deletion() {
+        let (root, _main) = workspace("config-global");
+        // Pins the project tier inside the fixture: the discovery never
+        // climbs into the shared temp directory's ancestors.
+        fs::write(root.join(config::FILE_NAME), "version: 1\n").expect("seed the project config");
+        let (home, global) = injected_home(&root);
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(4);
+        let metrics = Arc::new(WatchMetrics::default());
+        let watcher = Watcher::spawn_with(
+            config_options(&root, Some(&home)),
+            &root,
+            sender,
+            Substrate::Poll,
+            Arc::clone(&metrics),
+        );
+        await_boot(&receiver);
+
+        // Absent → present, then present → absent: one advisory each. The
+        // first settles before the second lands, so one tick never holds
+        // both and reads them as no change.
+        fs::write(&global, "version: 1\n").expect("create the global config");
+        await_advisories(&metrics, ConfigTier::Global, 1);
+        fs::remove_file(&global).expect("delete the global config");
+        await_advisories(&metrics, ConfigTier::Global, 2);
+
+        let crossed = batches_within(&receiver, QUIET_HOLD);
+        assert!(
+            crossed.is_empty(),
+            "nothing crosses to the main loop: {crossed:?}"
+        );
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Global),
+            2,
+            "creation and deletion, once each"
+        );
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Project),
+            0,
+            "the untouched project tier stays silent"
+        );
+
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// T3 — quiet ticks and a `.dart`-only change surface no config
+    /// advisory: both tiers seeded and left alone (present and unchanged is
+    /// silent, not only absent), a quiet run passes clean, and the
+    /// rewrite's batch crosses to the main loop as ever — the cycle saw a
+    /// change, none of it config.
+    #[test]
+    fn config_watch_stays_silent_on_quiet_ticks_and_dart_changes() {
+        let (root, main) = workspace("config-quiet");
+        fs::write(root.join(config::FILE_NAME), "version: 1\n").expect("seed the project config");
+        let (home, global) = injected_home(&root);
+        fs::write(&global, "version: 1\n").expect("seed the global config");
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(4);
+        let metrics = Arc::new(WatchMetrics::default());
+        let watcher = Watcher::spawn_with(
+            config_options(&root, Some(&home)),
+            &root,
+            sender,
+            Substrate::Os,
+            Arc::clone(&metrics),
+        );
+        await_boot(&receiver);
+
+        // The quiet run: a dozen ticks over unchanged files (the OS stream
+        // may deliver the fixture's pre-arm seed writes meanwhile — not
+        // config changes either).
+        batches_within(&receiver, QUIET_HOLD);
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Project),
+            0,
+            "quiet: project"
+        );
+        assert_eq!(advisories(&metrics, ConfigTier::Global), 0, "quiet: global");
+
+        // A `.dart`-only change: its batch crosses, and no advisory follows.
+        let (touched, _) = settle_rewrite(&main, "var edited = 3;\n", &receiver);
+        assert!(
+            touched.contains(&main),
+            "the source change crossed: {touched:?}"
+        );
+        batches_within(&receiver, QUIET_HOLD);
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Project),
+            0,
+            "dart-only: project"
+        );
+        assert_eq!(
+            advisories(&metrics, ConfigTier::Global),
+            0,
+            "dart-only: global"
+        );
+
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&home).ok();
     }
 }

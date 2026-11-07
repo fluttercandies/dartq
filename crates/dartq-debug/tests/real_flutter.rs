@@ -1,7 +1,7 @@
 //! Live integration tests against a real `flutter run` process.
 //!
 //! Skipped by default: running them requires a real `flutter`
-//! executable (set `DARTQ_FLUTTER_BIN`, put it on `PATH`, or have
+//! executable (set `DARTQ_FLUTTER`, put it on `PATH`, or have
 //! `~/fvm/default/bin/flutter`), a macOS desktop target with its
 //! toolchain, and spawns real apps. Run explicitly:
 //!
@@ -40,14 +40,14 @@ use dartq_debug::{
 /// build of the macOS debug app can take minutes).
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Finds the flutter executable: `DARTQ_FLUTTER_BIN`, then `PATH`,
-/// then this host's fvm default. Panics with instructions when none
-/// exists — these are opt-in tests, a missing toolchain is a skip
-/// condition, not a failure of the crate.
+/// Finds the flutter executable: `DARTQ_FLUTTER`, then `PATH`, then
+/// this host's fvm default. Panics with instructions when none exists —
+/// these are opt-in tests, a missing toolchain is a skip condition, not
+/// a failure of the crate.
 fn flutter_bin() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("DARTQ_FLUTTER_BIN") {
+    if let Some(explicit) = std::env::var_os("DARTQ_FLUTTER") {
         let path = PathBuf::from(explicit);
-        assert!(path.is_file(), "DARTQ_FLUTTER_BIN={:?} is not a file", path);
+        assert!(path.is_file(), "DARTQ_FLUTTER={:?} is not a file", path);
         return path;
     }
     if let Some(paths) = std::env::var_os("PATH")
@@ -62,7 +62,7 @@ fn flutter_bin() -> PathBuf {
         return fvm;
     }
     panic!(
-        "no flutter executable found: set DARTQ_FLUTTER_BIN or add flutter to PATH \
+        "no flutter executable found: set DARTQ_FLUTTER or add flutter to PATH \
          (this host keeps it at ~/fvm/default/bin/flutter)"
     );
 }
@@ -100,7 +100,7 @@ fn prepare_fixture() -> PathBuf {
     // every test in this binary reaches any environment access only
     // after this initialization has completed (they all start at the
     // scenario lock / this fixture).
-    unsafe { std::env::set_var("DARTQ_FLUTTER_BIN", &bin) };
+    unsafe { std::env::set_var("DARTQ_FLUTTER", &bin) };
 
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flutter_app");
     if !root.join("lib/main.dart").is_file() {

@@ -64,12 +64,12 @@ pub enum Error {
     },
 
     /// The `dart` executable could not be located (neither
-    /// `DARTQ_DART_BIN` nor `PATH` produced one).
+    /// `DARTQ_DART` nor `PATH` produced one).
     #[error("dart binary not found: {0}")]
     DartBinaryNotFound(String),
 
     /// The `flutter` executable could not be located (neither
-    /// `DARTQ_FLUTTER_BIN` nor `PATH` produced one).
+    /// `DARTQ_FLUTTER` nor `PATH` produced one).
     #[error("flutter binary not found: {0}")]
     FlutterBinaryNotFound(String),
 
@@ -83,9 +83,11 @@ pub enum Error {
     #[error("could not parse the VM service URI from process output: {0}")]
     BannerParse(String),
 
-    /// The process exited before the service connection was
-    /// established or while the session was active.
-    #[error("dart process exited early (exit code {0:?})")]
+    /// The launched process exited — before the service connection was
+    /// established, or while the session was active. Once it has, every
+    /// VM-facing call on the session answers this with the same status:
+    /// the exit code, or `None` when a signal ended the process.
+    #[error("process exited {}", exit_detail(*.0))]
     ProcessExited(Option<i32>),
 
     /// A local deadline elapsed: an RPC round-trip, a full write queue,
@@ -94,12 +96,25 @@ pub enum Error {
     #[error("timed out: {0}")]
     Timeout(String),
 
-    /// The isolate a call was waiting on exited.
+    /// The isolate a call addressed exited (the event stream showed its
+    /// exit); a launched process that exited answers
+    /// [`Error::ProcessExited`] instead.
     #[error("isolate {0} exited")]
     IsolateExited(String),
 
     /// The connection was closed — either the peer hung up or the
-    /// session was shut down; pending RPCs are answered with this.
+    /// session was shut down; pending RPCs are answered with this. A
+    /// session that knows the exit behind the close answers that exit
+    /// instead.
     #[error("connection closed")]
     Closed,
+}
+
+/// The tail of [`Error::ProcessExited`]'s message: the exit code, or the
+/// signal that left none.
+fn exit_detail(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("with code {code}"),
+        None => "by signal".to_owned(),
+    }
 }

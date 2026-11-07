@@ -11,6 +11,9 @@ keywords = ["dart", "analyzer"]
 categories = ["development-tools"]
 
 [dependencies]
+# The `--impacted` selection's resolution-input stamp: blake3 over the
+# ignored files' bytes, content-addressed like every other stamp face.
+blake3 = { workspace = true }
 dartq-ai = { workspace = true }
 dartq-ast = { workspace = true }
 dartq-bcache = { workspace = true }

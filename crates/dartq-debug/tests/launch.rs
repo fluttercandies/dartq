@@ -8,14 +8,14 @@ fn launch_reports_missing_dart_binary() {
     let missing =
         std::env::temp_dir().join(format!("dartq-debug-missing-dart-{}", std::process::id()));
     assert!(!missing.exists(), "test path must not exist");
-    let previous = std::env::var_os("DARTQ_DART_BIN");
+    let previous = std::env::var_os("DARTQ_DART");
     // SAFETY: this test binary contains exactly one test, so no other
     // thread reads or writes the process environment concurrently.
-    unsafe { std::env::set_var("DARTQ_DART_BIN", &missing) };
+    unsafe { std::env::set_var("DARTQ_DART", &missing) };
     let result = DebugSession::launch(LaunchConfig::new("main.dart"));
     match previous {
-        Some(value) => unsafe { std::env::set_var("DARTQ_DART_BIN", value) },
-        None => unsafe { std::env::remove_var("DARTQ_DART_BIN") },
+        Some(value) => unsafe { std::env::set_var("DARTQ_DART", value) },
+        None => unsafe { std::env::remove_var("DARTQ_DART") },
     }
     let error = match result {
         Ok(_session) => panic!("a missing dart binary must fail clearly"),

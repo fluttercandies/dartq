@@ -9,7 +9,7 @@
 //! is surfaced as a warning, never guessed (a partial face silently joining
 //! the engine map would flip used imports into false `unused_import`s).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One top-level `export` directive of a library file.
 pub struct Export {
@@ -22,12 +22,42 @@ pub struct Export {
     pub hide: Vec<String>,
 }
 
+/// The clause-relevant declaration family a scanned top-level name carries,
+/// BEFORE cross-library typedef resolution. The engine's clause-kind check
+/// (`implements`/`extends`/`with`/`on`) distinguishes a `ClassElement` (legal
+/// under every clause), a `MixinElement` (legal under `implements`/`with`/
+/// `on` only), and everything else (the clause code). Typedefs are
+/// transparent upstream — `TypeAliasElementImpl` instantiation yields the
+/// right-hand side's element — so a typedef records its RHS head and the
+/// caller resolves the terminal kind; every other declaration family that
+/// is never a class or mixin folds into [`ScanKind::Other`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanKind {
+    /// A `class`/`mixin class` and every class-modifier run — a `ClassElement`.
+    Class,
+    /// A bare `mixin` declaration — a `MixinElement`.
+    Mixin,
+    /// A typedef. `Some(head)` carries the new-style right-hand side's
+    /// leading type name (`typedef A = B<C>` → `B`, generic arguments and
+    /// `?` stripped, the last dotted segment kept); `None` marks a function
+    /// type — old-style `Ret name(…)`, or a `… Function(…)` right-hand side —
+    /// which instantiates to a `FunctionType` (never a class or mixin).
+    Typedef(Option<String>),
+    /// Every other top-level declaration — functions, accessors, variables,
+    /// enums, extension types, extensions — never a `ClassElement`/`MixinElement`.
+    Other,
+}
+
 /// The extracted top-level surface of one compilation unit.
 #[derive(Default)]
 pub struct UnitScan {
     /// Public top-level names; setters under their `name=` namespace
     /// spelling. `_`-private names excluded.
     pub names: BTreeSet<String>,
+    /// The declaration family of each name in [`Self::names`], first
+    /// declaration wins on a duplicate spelling (mirroring the graph
+    /// builder's first-wins `declare`). Populated in lockstep with `names`.
+    pub kinds: BTreeMap<String, ScanKind>,
     /// `part 'x.dart';` targets of a library file, source order.
     pub parts: Vec<String>,
     /// Top-level `export` directives in source order.
@@ -131,6 +161,10 @@ pub fn scan_unit(text: &str) -> UnitScan {
     let mut in_string: Option<&'static str> = None;
     // A multi-line `export` directive accumulates until its `;`.
     let mut export_acc: Option<String> = None;
+    // A multi-line `typedef` accumulates until its `;` — the right-hand side
+    // (the kind the clause check reads) sits on the indented continuation
+    // lines the column-0 anchor would otherwise skip.
+    let mut typedef_acc: Option<String> = None;
     for raw in text.lines() {
         // Column-0 anchor: continuation lines are indented, so top-level
         // classification only ever considers unindented lines (the SDK tree
@@ -198,6 +232,22 @@ pub fn scan_unit(text: &str) -> UnitScan {
             }
             continue;
         }
+        if let Some(acc) = &mut typedef_acc {
+            acc.push(' ');
+            acc.push_str(line);
+            if line.contains(';') {
+                match classify_decl(acc) {
+                    Some((name, kind)) if !name.starts_with('_') => {
+                        scan.kinds.entry(name.clone()).or_insert(kind);
+                        scan.names.insert(name);
+                    }
+                    Some(_) => {}
+                    None => scan.warnings.push(acc.clone()),
+                }
+                typedef_acc = None;
+            }
+            continue;
+        }
         if !top_level {
             continue;
         }
@@ -215,16 +265,24 @@ pub fn scan_unit(text: &str) -> UnitScan {
                 scan.parts.push(part);
             }
         } else if !directive_or_noise(line) {
-            match classify_decl(line) {
-                Some(name) if !name.starts_with('_') => {
-                    scan.names.insert(name);
+            if line.starts_with("typedef ") && !line.contains(';') {
+                typedef_acc = Some(line.to_owned());
+            } else {
+                match classify_decl(line) {
+                    Some((name, kind)) if !name.starts_with('_') => {
+                        scan.kinds.entry(name.clone()).or_insert(kind);
+                        scan.names.insert(name);
+                    }
+                    Some(_) => {}
+                    None => scan.warnings.push(line.to_owned()),
                 }
-                Some(_) => {}
-                None => scan.warnings.push(line.to_owned()),
             }
         }
     }
     if let Some(acc) = export_acc {
+        scan.warnings.push(acc);
+    }
+    if let Some(acc) = typedef_acc {
         scan.warnings.push(acc);
     }
     scan
@@ -291,17 +349,18 @@ fn parse_export(directive: &str) -> Option<Export> {
     Some(Export { target, show, hide })
 }
 
-/// The declared name of a column-0 top-level declaration, or `None` when no
-/// rule claims the line (surfaced as a warning, never guessed).
-fn classify_decl(line: &str) -> Option<String> {
-    if let Some(name) = type_decl_name(line) {
-        return Some(name);
+/// The declared name and clause-relevant family of a column-0 top-level
+/// declaration, or `None` when no rule claims the line (surfaced as a
+/// warning, never guessed).
+fn classify_decl(line: &str) -> Option<(String, ScanKind)> {
+    if let Some(found) = type_decl_name(line) {
+        return Some(found);
     }
     if let Some(name) = accessor_name(line, "get", false) {
-        return Some(name);
+        return Some((name, ScanKind::Other));
     }
     if let Some(name) = accessor_name(line, "set", true) {
-        return Some(format!("{name}="));
+        return Some((format!("{name}="), ScanKind::Other));
     }
     if keyword_prefixed(line) {
         // A parenthesis before any `=` marks an external function
@@ -313,36 +372,39 @@ fn classify_decl(line: &str) -> Option<String> {
             None => line.contains('('),
         };
         return if function_shaped {
-            function_name(line).or_else(|| var_or_external_name(line))
+            function_name(line)
+                .or_else(|| var_or_external_name(line))
+                .map(|name| (name, ScanKind::Other))
         } else {
-            var_or_external_name(line)
+            var_or_external_name(line).map(|name| (name, ScanKind::Other))
         };
     }
     if let Some(name) = function_name(line) {
-        return Some(name);
+        return Some((name, ScanKind::Other));
     }
     // A bare top-level variable with no keyword prefix: `Type name;` or
     // `Type? name = …;` — the declared name is the last identifier before
     // the first `=`/`;`.
-    bare_variable_name(line)
+    bare_variable_name(line).map(|name| (name, ScanKind::Other))
 }
 
-/// The declared name of a type-family declaration: class (with its modifier
-/// run), `mixin class`, mixin, enum, `extension [type] [const]?`, or
-/// typedef (both the `Name = …` and old-style `Ret name(…)` shapes).
-fn type_decl_name(line: &str) -> Option<String> {
+/// The declared name and clause-relevant family of a type-family
+/// declaration: class (with its modifier run), `mixin class`, mixin, enum,
+/// `extension [type] [const]?`, or typedef (both the `Name = …` and
+/// old-style `Ret name(…)` shapes).
+fn type_decl_name(line: &str) -> Option<(String, ScanKind)> {
     let (head, tail) = split_first_word(line)?;
     match head {
-        "class" | "enum" => first_ident(tail).map(str::to_owned),
+        "class" => first_ident(tail).map(|name| (name.to_owned(), ScanKind::Class)),
+        "enum" => first_ident(tail).map(|name| (name.to_owned(), ScanKind::Other)),
         "abstract" | "base" | "final" | "interface" | "sealed" => type_decl_name(tail),
         "mixin" => {
             let (next, rest) = split_first_word(tail)?;
             if next == "class" {
-                first_ident(rest)
+                first_ident(rest).map(|name| (name.to_owned(), ScanKind::Class))
             } else {
-                first_ident(tail)
+                first_ident(tail).map(|name| (name.to_owned(), ScanKind::Mixin))
             }
-            .map(str::to_owned)
         }
         "extension" => {
             let (next, rest) = split_first_word(tail)?;
@@ -357,11 +419,25 @@ fn type_decl_name(line: &str) -> Option<String> {
                 }
                 _ => first_ident(tail),
             }
-            .map(str::to_owned)
+            .map(|name| (name.to_owned(), ScanKind::Other))
         }
-        "typedef" => typedef_name(tail),
+        "typedef" => typedef_decl(tail),
         _ => None,
     }
+}
+
+/// A typedef declaration: the name plus its [`ScanKind::Typedef`] family —
+/// `Some(head)` for a new-style `Name = RHS` whose right-hand side names a
+/// type (the head identifier, generic arguments stripped), `None` for a
+/// function type (old-style `Ret name(…)` or a `… Function(…)` RHS).
+fn typedef_decl(tail: &str) -> Option<(String, ScanKind)> {
+    let name = typedef_name(tail)?;
+    let kind = if typedef_rhs_is_function(tail) {
+        ScanKind::Typedef(None)
+    } else {
+        ScanKind::Typedef(typedef_rhs_head(tail))
+    };
+    Some((name, kind))
 }
 
 /// The typedef name: `Name<T> = …` (the token after `typedef`, cut at its
@@ -376,6 +452,79 @@ fn typedef_name(tail: &str) -> Option<String> {
     } else {
         function_name(tail)
     }
+}
+
+/// Whether the typedef's right-hand side is a function type — the
+/// `… Function<…>(…)` constructor at angle-depth zero. Old-style
+/// `Ret name(…)` declarations have no `=` and read as function types too.
+/// The `Function` inside a generic argument (`NativeFunction<Void
+/// Function(…)>`) sits at angle-depth ≥ 1 and does not count: the outer
+/// type there is the named `NativeFunction`.
+fn typedef_rhs_is_function(tail: &str) -> bool {
+    // Old-style `Ret name(…)` carries no `=` — always a function type.
+    let paren = tail.find('(').unwrap_or(tail.len());
+    if !tail[..paren].contains('=') {
+        return true;
+    }
+    let Some(eq) = tail.find('=') else {
+        return true;
+    };
+    let rhs = &tail[eq + 1..];
+    let bytes = rhs.as_bytes();
+    let mut angle = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => angle += 1,
+            b'>' => angle -= 1,
+            b'F' if angle == 0 && rhs[i..].starts_with("Function") => {
+                let bounded_before =
+                    i == 0 || !is_ident_byte(bytes[i - 1]);
+                let after = i + "Function".len();
+                let bounded_after =
+                    after >= bytes.len() || !is_ident_byte(bytes[after]);
+                if bounded_before && bounded_after {
+                    let mut j = after;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && (bytes[j] == b'(' || bytes[j] == b'<') {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The leading type name of a new-style typedef right-hand side — the
+/// identifier before the first `<` or `?`, last dotted segment kept
+/// (`js.JSValue?` → `JSValue`; the prefix itself is not resolvable here and
+/// such heads only occur in `_`-internal libraries). `None` for a function
+/// type or an empty right-hand side.
+fn typedef_rhs_head(tail: &str) -> Option<String> {
+    let paren = tail.find('(').unwrap_or(tail.len());
+    if !tail[..paren].contains('=') {
+        return None;
+    }
+    let eq = tail.find('=')?;
+    let rhs = tail[eq + 1..].trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    let end = rhs.find(['<', '?']).unwrap_or(rhs.len());
+    rhs[..end]
+        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .find(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+/// Whether `byte` continues an identifier.
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
 }
 
 /// A top-level accessor: `… get name` followed by a body terminator
@@ -409,20 +558,21 @@ fn accessor_name(line: &str, keyword: &str, followed_by_paren: bool) -> Option<S
 }
 
 /// The name of a keyword-less top-level variable declaration
-/// (`Type name;`, `Type? name = …;`, `void Function(T) name = …;`): at least
+/// (`Type name;`, `Type? name = …;`, `Type Function(T) name;`): at least
 /// a type token and a name token precede the first `=` or `;`, and the
-/// declared name is the last identifier before that cut (function-typed
-/// declaration heads carry the parenthesized type earlier in the line —
-/// those lines function_name resolved already).
+/// declared name is the last whitespace token before that cut, read
+/// backward — a function-typed head inserts its parenthesized type earlier
+/// in the line, so walking forward from the type would hit the `Function`
+/// constructor instead of the declared variable.
 fn bare_variable_name(line: &str) -> Option<String> {
     let cut = line.find(['=', ';']).unwrap_or(line.len());
     let head = line[..cut].trim_end();
     if !head.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$') {
         return None;
     }
-    let mut tokens = head.split_whitespace();
-    tokens.next()?;
+    let mut tokens = head.split_whitespace().rev();
     let name = tokens.next()?;
+    tokens.next()?;
     (!name.starts_with('(')).then(|| first_ident_of_token(name))
 }
 

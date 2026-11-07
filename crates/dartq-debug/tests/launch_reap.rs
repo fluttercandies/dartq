@@ -1,7 +1,7 @@
 //! Launch-failure hygiene with a stand-in `dart` executable: a child
 //! that never prints the service banner is killed and reaped on
 //! timeout, and a child that exits first is reported as such. Both
-//! cases share one test because they mutate `DARTQ_DART_BIN`.
+//! cases share one test because they mutate `DARTQ_DART`.
 
 #![cfg(unix)]
 
@@ -39,11 +39,11 @@ fn failed_launches_reap_the_child() {
 
     // SAFETY: this test binary holds exactly one test, so nothing else
     // reads or writes the environment concurrently.
-    unsafe { std::env::set_var("DARTQ_DART_BIN", &silent) };
+    unsafe { std::env::set_var("DARTQ_DART", &silent) };
     let timed_out = DebugSession::launch(config.clone());
-    unsafe { std::env::set_var("DARTQ_DART_BIN", &exits) };
+    unsafe { std::env::set_var("DARTQ_DART", &exits) };
     let exited = DebugSession::launch(config);
-    unsafe { std::env::remove_var("DARTQ_DART_BIN") };
+    unsafe { std::env::remove_var("DARTQ_DART") };
 
     assert!(
         matches!(timed_out, Err(Error::LaunchTimeout)),

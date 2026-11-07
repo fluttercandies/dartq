@@ -1,4 +1,5 @@
-//! URI prefix rewriter for Dart kernel dill files (binary format 138).
+//! URI prefix rewriter for Dart kernel dill files (binary formats
+//! 124–138, see [`FORMAT_VERSIONS`]).
 //!
 //! A `flutter test` kernel-cache dill embeds its tree's absolute URIs
 //! (`file://<project-root>/lib/main.dart`) in exactly two tables per
@@ -34,14 +35,14 @@
 //!   size stay 8-byte aligned (the official writer's own contract for
 //!   concatenation), which is where the two padding runs come from.
 //!
-//! Safety gates: every component must carry the kernel magic, binary
-//! format version 138, and an ASCII sdkHash near its head. A mismatch
+//! Safety gates: every component must carry the kernel magic, a modeled
+//! binary format version, and an ASCII sdkHash near its head. A mismatch
 //! on any gate, a non-ASCII string matched by the prefix (the string
 //! table blob is WTF-8; the conservative contract rewrites ASCII-only
 //! strings), or a table walk that does not land exactly on the
-//! footer's recorded boundary refuses the whole file — callers fall
-//! back to placing the blob verbatim, which only costs a
-//! frontend_server recompile, never a wrong artifact.
+//! footer's recorded boundary refuses the whole file — the caller then
+//! falls back to a placement that costs a recompile, never a wrong
+//! artifact (see [`crate::materialize`]).
 //!
 //! Cost: the input is read through a bounded sliding window (a small
 //! mmap remapped as the walk advances and unmapped behind it — an
@@ -57,10 +58,9 @@
 //! bounds-checked (a value that does not describe real bytes refuses
 //! the file), no capacity is ever allocated from an unchecked count,
 //! and the whole rewrite runs inside `catch_unwind` so even an
-//! unforeseen panic surfaces as the same refusal the gates produce —
-//! the caller falls back to placing the blob verbatim. Each window is
-//! PROT_READ for its whole lifetime and the input is a cache-owned
-//! blob that nothing truncates mid-rewrite.
+//! unforeseen panic surfaces as the same refusal the gates produce.
+//! Each window is PROT_READ for its whole lifetime and the input is a
+//! cache-owned blob that nothing truncates mid-rewrite.
 
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -78,9 +78,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// `Tag.ComponentFile`: the u32 BE magic every kernel component starts
 /// with.
 const MAGIC: u32 = 0x90AB_CDEF;
-/// `Tag.BinaryFormatVersion` of the one layout this module rewrites
-/// (the SDK flutter 3.47.1 ships).
-const FORMAT_VERSION: u32 = 138;
+/// The `Tag.BinaryFormatVersion`s whose component layout this module
+/// rewrites: 124 (Dart 3.8, flutter 3.32), 125 (Dart 3.9 and 3.10,
+/// flutter 3.35 and 3.38), 127 (Dart 3.11, flutter 3.41), 130 (Dart
+/// 3.12, flutter 3.44), and 138 (Dart 3.13, flutter 3.47). The upstream
+/// `pkg/kernel/binary.md` of each declares identical component-level
+/// types — `ComponentFile`, `UriSource`/`SourceInfo`, `StringTable`,
+/// `MetadataPayload`/`MetadataMapping`, `ComponentIndex` — so the
+/// formats differ only inside the byte-copied AST region. Format 122
+/// and older add a `compilationMode` field to the component index (a
+/// footer this walk does not model) and are refused.
+const FORMAT_VERSIONS: &[u32] = &[124, 125, 127, 130, 138];
 /// The sdkHash region right after the version, in bytes: a Git short
 /// hash. Its length never enters the offset arithmetic (all table
 /// positions come from the footer), so the gate only checks that the
@@ -344,9 +352,9 @@ fn check_header(input: &mut Reader, comp_start: usize, comp_len: usize) -> Resul
         )));
     }
     let version = input.slice_u32(comp_start + 4)?;
-    if version != FORMAT_VERSION {
+    if !FORMAT_VERSIONS.contains(&version) {
         return Err(BcacheError::Unsupported(format!(
-            "kernel format version {version} is not the modeled {FORMAT_VERSION}"
+            "kernel format version {version} is not modeled ({FORMAT_VERSIONS:?})"
         )));
     }
     let hash = input.slice(comp_start + 8, comp_start + 8 + SDK_HASH_LEN)?;
@@ -942,7 +950,7 @@ pub(crate) fn synthetic_component(
     // AST region: header + arbitrary filler (copied verbatim).
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&MAGIC.to_be_bytes());
-    out.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    out.extend_from_slice(&138_u32.to_be_bytes());
     out.extend_from_slice(b"852b3e3608"); // ascii sdk hash
     out.push(0); // empty problemsAsJson list
     out.extend_from_slice(b"AST-FILLER");
@@ -1296,19 +1304,24 @@ mod tests {
         );
     }
 
-    /// The version gate: wrong magic, wrong format version, non-ASCII
-    /// sdkHash, and unframeable garbage each refuse the file.
+    /// The version gate: wrong magic, an unmodeled format version (122,
+    /// the last layout with the `compilationMode` footer field, and an
+    /// unknown newer one), non-ASCII sdkHash, and unframeable garbage
+    /// each refuse the file.
     #[test]
     fn version_and_magic_gates_refuse() {
         let dirs = tempfile::tempdir().expect("tempdir");
         let dst = dirs.path().join("o.dill");
 
-        let mut wrong_version =
-            synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
-        wrong_version[4..8].copy_from_slice(&139_u32.to_be_bytes());
-        let src = write_fixture(dirs.path(), "wrong-version.dill", &wrong_version);
-        let err = rewrite_file(&src, &dst, b"file:///a/", b"file:///b/").expect_err("version gate");
-        assert!(err.to_string().contains("version"), "{err}");
+        for version in [122_u32, 139] {
+            let mut wrong_version =
+                synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
+            wrong_version[4..8].copy_from_slice(&version.to_be_bytes());
+            let src = write_fixture(dirs.path(), "wrong-version.dill", &wrong_version);
+            let err =
+                rewrite_file(&src, &dst, b"file:///a/", b"file:///b/").expect_err("version gate");
+            assert!(err.to_string().contains("version"), "{err}");
+        }
 
         let mut wrong_magic =
             synthetic_component(&[("file:///a.dart", "")], &["file:///a.dart"], 0);
@@ -1327,6 +1340,29 @@ mod tests {
         let src = write_fixture(dirs.path(), "garbage.dill", b"\x00\x00\x00\x00");
         let err = rewrite_file(&src, &dst, b"file:///a/", b"file:///b/").expect_err("framing");
         assert!(matches!(err, BcacheError::Unsupported(_)), "{err}");
+    }
+
+    /// Every modeled format passes the version gate and rewrites the
+    /// same tables (the layouts are identical, see [`FORMAT_VERSIONS`];
+    /// real SDK dills of each enabled flutter line are exercised by the
+    /// orchestrator's region harness).
+    #[test]
+    fn modeled_formats_pass_the_version_gate() {
+        let dirs = tempfile::tempdir().expect("tempdir");
+        let dst = dirs.path().join("o.dill");
+        for &version in FORMAT_VERSIONS {
+            let mut dill =
+                synthetic_component(&[("file:///a/x.dart", "")], &["file:///a/x.dart"], 0);
+            dill[4..8].copy_from_slice(&version.to_be_bytes());
+            let src = write_fixture(dirs.path(), "modeled.dill", &dill);
+            let stats = rewrite_file(&src, &dst, b"file:///a/", b"file:///b/")
+                .unwrap_or_else(|err| panic!("format {version} refused: {err}"));
+            assert_eq!(
+                (stats.source_uris, stats.strings),
+                (1, 1),
+                "format {version}"
+            );
+        }
     }
 
     /// A matched non-ASCII string refuses the whole file; an UNmatched

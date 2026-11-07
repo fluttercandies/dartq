@@ -2,9 +2,10 @@
 //! argv that feeds the cache key, and the name flutter_tools gives the
 //! build directory of one build configuration.
 //!
-//! Pinned to flutter_tools 3.47.1 and the `package:args` 2.7.0 parser it
-//! uses. Everything here is pure: no file system, no process environment,
-//! no flutter invocation.
+//! Pinned to the flutter_tools of the lines
+//! [`crate::orchestrator::SUPPORTED_FLUTTER_LINES`] (derived from 3.47.1)
+//! and the `package:args` 2.7.0 parser they use. Everything here is pure:
+//! no file system, no process environment, no flutter invocation.
 //!
 //! # Parsing
 //!
@@ -54,9 +55,13 @@ use crate::types::TargetSpec;
 pub struct ParsedFlutterCmd {
     pub target: TargetSpec,
     /// `--dart-define` map exactly as passed (before define filtering). A
-    /// repeated key keeps its last value, as the Dart compilers do; empty
-    /// values are dropped, as flutter_tools drops them. A define without a
-    /// key (`V`, `=V`) stays verbatim in `extra_key_args` instead.
+    /// repeated key keeps its last value, as the Dart compilers do. A
+    /// define without a key (`V`, `=V`) or an empty one stays verbatim in
+    /// `extra_key_args` instead. flutter_tools 3.41+ drops an empty
+    /// define, but 3.38 and older forward it as a bare `-D` that swallows
+    /// the next define while their test kernel-cache name hashes it as
+    /// nothing — keyed as dropped, it would merge two configurations those
+    /// lines compile differently.
     pub defines: BTreeMap<String, String>,
     /// `--dart-define-from-file` paths in argv order, relative to the
     /// flutter working directory. flutter_tools folds the files' contents
@@ -1123,9 +1128,6 @@ impl<'a> Parser<'a> {
                 return Ok(());
             }
             Role::Define => {
-                if value.is_empty() {
-                    return Ok(());
-                }
                 if let Some((key, val)) = value.split_once('=')
                     && !key.is_empty()
                 {
@@ -1323,7 +1325,9 @@ mod tests {
                 ("E", "x=y,z")
             ])
         );
-        assert!(parsed.target.extra_key_args.is_empty());
+        // The empty define is no map entry either, but it stays in the key
+        // (see `ParsedFlutterCmd::defines`).
+        assert_eq!(parsed.target.extra_key_args, strings(&["--dart-define="]));
         // A define without a key is not a map entry: it stays in the key.
         let keyless = parse(&["build", "web", "--dart-define", "NOVALUE", "-D=V"]);
         assert!(keyless.defines.is_empty());

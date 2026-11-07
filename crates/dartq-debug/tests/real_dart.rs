@@ -1,30 +1,31 @@
-//! Live integration test against a real `dart` process.
+//! Live integration tests against a real `dart` process.
 //!
-//! Skipped by default: running it requires a `dart` executable on
-//! `PATH` (or `DARTQ_DART_BIN`) and spawns a real VM. Run explicitly:
+//! Skipped by default: running them requires a `dart` executable on
+//! `PATH` (or `DARTQ_DART`) and spawns a real VM. Run explicitly:
 //!
 //! ```text
 //! cargo test -p dartq-debug --test real_dart -- --ignored
 //! ```
 //!
-//! Expected shape when it passes:
+//! Expected shape when they pass:
 //!
 //! ```text
-//! running 1 test
+//! running 2 tests
+//! test finished_program_names_its_exit ... ok
 //! test live_debug_session ... ok
-//! test result: ok. 1 passed; 0 failed; 0 ignored
+//! test result: ok. 2 passed; 0 failed; 0 ignored
 //! ```
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use dartq_debug::{
-    BreakpointLocationSpec, BreakpointSpec, DebugSession, LaunchConfig, SessionConfig, StepOption,
-    StoppedReason, VmObject,
+    BreakpointLocationSpec, BreakpointSpec, DebugSession, Error, LaunchConfig, SessionConfig,
+    StepOption, StoppedReason, VmObject,
 };
 
 #[test]
-#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART_BIN)"]
+#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART)"]
 fn live_debug_session() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.dart");
     assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
@@ -156,4 +157,70 @@ fn live_debug_session() {
     }
 
     session.terminate().expect("terminate");
+}
+
+/// A program run to completion names its exit on every later call: the
+/// snapshot that waited the run out, an evaluation, and a breakpoint all
+/// answer the process exit with its code — never the closed transport.
+#[test]
+#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART)"]
+fn finished_program_names_its_exit() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exits.dart");
+    assert!(fixture.is_file(), "fixture missing: {}", fixture.display());
+
+    let settings = SessionConfig {
+        pause_timeout: Duration::from_secs(10),
+        rpc_timeout: Duration::from_secs(10),
+        ..SessionConfig::default()
+    };
+    let mut session = DebugSession::launch_with(LaunchConfig::new(&fixture), settings)
+        .unwrap_or_else(|error| panic!("launch failed (is `dart` installed?): {error}"));
+    let main = session.main_isolate().expect("main isolate").to_owned();
+
+    // A breakpoint in a script that never loads stays latent, so nothing
+    // stops the run.
+    let never_loaded = |isolate: Option<String>| BreakpointSpec {
+        isolate,
+        location: BreakpointLocationSpec::Line {
+            script_uri: "package:never_loaded/never_loaded.dart".to_owned(),
+            line: 1,
+            column: None,
+        },
+        condition: None,
+    };
+    let handle = session
+        .add_breakpoint(never_loaded(None))
+        .expect("add a latent breakpoint");
+    assert!(!handle.resolved, "a never-loaded script cannot resolve");
+    session.resume(None).expect("resume into the exit");
+
+    // The snapshot waits the run out and answers its exit.
+    let snapshot = session.wait_for_pause(&main);
+    assert!(
+        matches!(snapshot, Err(Error::ProcessExited(Some(0)))),
+        "snapshot after the run: {snapshot:?}"
+    );
+    let error = session
+        .evaluate_in_root_lib(None, "1 + 1")
+        .expect_err("evaluate after the exit");
+    assert!(
+        matches!(error, Error::ProcessExited(Some(0))),
+        "evaluate after the exit: {error:?}"
+    );
+    assert_eq!(error.to_string(), "process exited with code 0");
+    // The reaped status keeps answering.
+    let error = session
+        .add_breakpoint(never_loaded(Some(main.clone())))
+        .expect_err("breakpoint after the exit");
+    assert!(
+        matches!(error, Error::ProcessExited(Some(0))),
+        "breakpoint after the exit: {error:?}"
+    );
+    let snapshot = session.wait_for_pause(&main);
+    assert!(
+        matches!(snapshot, Err(Error::ProcessExited(Some(0)))),
+        "second snapshot: {snapshot:?}"
+    );
+
+    session.terminate().expect("terminate after the exit");
 }

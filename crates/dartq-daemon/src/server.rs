@@ -192,8 +192,19 @@ where
     let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(MAX_QUEUED_BATCHES);
     // Held for the session's lifetime: dropping it at return stops and
     // joins the watch thread. A send past a dead receiver ends the thread
-    // on its own, too.
-    let _watcher = watch.map(|options| Watcher::spawn(options, sender.clone()));
+    // on its own, too. Its config watch builds every config path — the
+    // context inputs, the governing `dartq.yaml` — from the session's
+    // workspace root: where the assembly read them, and the very root
+    // `handle_watch` classifies against, however the watched dir is spelled.
+    let _watcher =
+        watch.map(|options| Watcher::spawn(options, session.workspace_root(), sender.clone()));
+    // The session-side dartq.yaml advisory (#4106): armed only when no
+    // watch thread owns it — the serve face (and a watch-less daemon) get
+    // the same restart cue the watch face's route emits, ticked on the
+    // session's own engine-work drains.
+    if _watcher.is_none() {
+        session.arm_config_advisory(std::env::home_dir().as_deref());
+    }
     let reader = thread::Builder::new()
         .name("dartq-daemon-reader".into())
         .spawn(move || reader_loop(BufReader::new(input), sender))?;
@@ -751,7 +762,12 @@ fn test_response(
 /// re-discovery re-reads the `.dart` set, re-analysis republishes, and the
 /// batch re-evaluates the session's workspace advisory
 /// ([`Session::refresh_workspace_advisory`]) — while the config bytes
-/// themselves never stage as analysis content.
+/// themselves never stage as analysis content. The watch thread builds the
+/// context inputs' paths from this session's workspace root, the root the
+/// split classifies against, so it holds however the watched directory is
+/// spelled (`.`, a symlink alias, a workspace member). The governing
+/// `dartq.yaml` pair never arrives here at all: its rows are structural, so
+/// the watch thread answers a change with a restart advisory of its own.
 ///
 /// The empty batch is the boot tick: under the lazy-boot posture (#2591)
 /// nothing else stages the base view on a quiet workspace, so the armed
@@ -1617,6 +1633,7 @@ mod tests {
                 Some(WatchOptions {
                     root,
                     poll_interval: Duration::from_millis(10),
+                    home: None,
                 }),
             )
         });
@@ -1675,6 +1692,145 @@ mod tests {
             json!([]),
             "the view converged to the touched disk state: {analyze}"
         );
+    }
+
+    /// The intake split holds however the watch is spelled. Watched through
+    /// a symlink alias of the session's root (`--watch .`, a `/var` vs
+    /// `/private/var` temp path, and a workspace member take the same shape:
+    /// the watched directory spelled unlike the root), a manifest touch
+    /// still routes to the context refresh, never to the content sync — the
+    /// watch builds the context inputs from the session's root, the root
+    /// `handle_watch` classifies against. The refresh is observed by its
+    /// advisory: the touch renames the package, which the package config
+    /// does not list, so the re-evaluated verdict goes stale and
+    /// republishes. The content sync — where the paths built from the alias
+    /// used to land — would stage the manifest's bytes as a phantom analysis
+    /// file, surfacing as a push of its URI and as an analyze entry naming
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn watch_through_an_alias_routes_a_manifest_touch_to_the_refresh() {
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let alias = workspace.root.with_extension("alias");
+        let _ = fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&workspace.root, &alias).expect("alias the root");
+        let main_uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let config_uri = crate::uri::from_path(&workspace.path(".dart_tool/package_config.json"));
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("watch-alias")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let (client, receiver) = mpsc::channel::<Vec<u8>>();
+        let output = TestOutput::default();
+        let server_output = output.clone();
+        let watched = alias.clone();
+        let server = thread::spawn(move || {
+            run(
+                BufReader::new(FeedClient {
+                    receiver,
+                    pending: Vec::new(),
+                }),
+                server_output,
+                &mut { session },
+                Some(WatchOptions {
+                    root: watched,
+                    poll_interval: Duration::from_millis(10),
+                    home: None,
+                }),
+            )
+        });
+
+        // The boot tick's push of the fixture's seeded error: the watch armed
+        // its config files ahead of that tick, so the touch below is a
+        // change, never part of their baseline.
+        wait_for(
+            || {
+                publishes(&transcript_of(&output))
+                    .iter()
+                    .any(|frame| frame["params"]["uri"] == main_uri)
+                    .then_some(())
+            },
+            "the boot tick never published the base view",
+        );
+
+        // The touch: new bytes of a new length (the fingerprint moves under
+        // any mtime granularity) renaming the package — a membership finding
+        // the re-evaluation reports from content alone (a same-name edit's
+        // mtime staleness is excused against its own content baseline).
+        fs::write(
+            workspace.path("pubspec.yaml"),
+            "name: renamed_app\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("touch the manifest");
+        wait_for(
+            || {
+                publishes(&transcript_of(&output))
+                    .iter()
+                    .any(|frame| {
+                        frame["params"]["uri"] == config_uri
+                            && frame["params"]["diagnostics"][0]["code"]
+                                == "dartq/package_config_out_of_date"
+                    })
+                    .then_some(())
+            },
+            "the manifest touch never refreshed the contexts",
+        );
+
+        // The pull answers in a later turn than the touch's batch, so every
+        // push that batch produced is out ahead of it.
+        client
+            .send(framed(&request(2, "dartq/analyze", json!({}))))
+            .expect("analyze send");
+        let analyze = wait_for(
+            || {
+                transcript_of(&output)
+                    .iter()
+                    .find(|frame| frame.get("id") == Some(&json!(2)))
+                    .cloned()
+            },
+            "the analyze request never answered",
+        );
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(server.is_finished(), "the server did not end");
+        let code = server
+            .join()
+            .expect("server thread does not panic")
+            .expect("transport does not fail on memory pipes");
+        assert_eq!(code, EXIT_CLEAN);
+
+        // Nothing staged as content: no push and no analyze entry names the
+        // manifest.
+        let names_manifest = |value: &Value| {
+            value
+                .as_str()
+                .is_some_and(|path| path.ends_with("pubspec.yaml"))
+        };
+        let transcript = transcript_of(&output);
+        let manifest_pushes: Vec<&Value> = publishes(&transcript)
+            .into_iter()
+            .filter(|frame| names_manifest(&frame["params"]["uri"]))
+            .collect();
+        assert!(
+            manifest_pushes.is_empty(),
+            "the manifest was staged as analysis content: {manifest_pushes:?}"
+        );
+        assert!(
+            !analyze["result"]["diags"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| names_manifest(&entry["file"])),
+            "an analyze entry names the manifest: {analyze}"
+        );
+
+        fs::remove_file(&alias).ok();
+        fs::remove_dir_all(&workspace.root).ok();
     }
 
     /// A quiet daemon — zero client input after the contained turn — wakes

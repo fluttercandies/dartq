@@ -31,12 +31,38 @@ mod scan;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
+use std::rc::Rc;
 
-use scan::{FlatEntry, parse_flat_table, scan_unit};
+use scan::{Export, FlatEntry, ScanKind, parse_flat_table, scan_unit};
+
+/// The terminal clause-relevant kind emitted per face name — mirrors
+/// `dartq_resolution::FaceKind` (the generated table spells it through that
+/// type via a `use`, so this local enum only names the three variants the
+/// emitter writes; the tool stays dependency-free).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FaceKind {
+    /// A `ClassElement` — clause-legal under every clause.
+    Class,
+    /// A `MixinElement` — clause-legal under `implements`/`with`/`on` only.
+    Mixin,
+    /// Anything else — the clause code emits.
+    NonClass,
+}
+
+impl FaceKind {
+    /// The `dartq_resolution::FaceKind` variant spelling the emitter writes.
+    fn variant(self) -> &'static str {
+        match self {
+            Self::Class => "Class",
+            Self::Mixin => "Mixin",
+            Self::NonClass => "NonClass",
+        }
+    }
+}
 
 /// The workspace-relative output paths, keyed by what they hold.
 const FLAT_OUT: &str = "crates/dartq-sdk/src/flat_libraries.rs";
@@ -47,8 +73,13 @@ const FACES_OUT: &str = "crates/dartq-engine/src/sdk_faces_gen.rs";
 /// SDK's `lib/` sources (the front end synthesizes the type in its type
 /// universe and exposes it through dart:core's namespace), so a pure source
 /// scan drops it — yet `dart analyze` resolves bare `Never` through the
-/// implicit core import, and so must the engine's face table.
-const SYNTHETIC_NAMES: &[(&str, &[&str])] = &[("core", &["Never"])];
+/// implicit core import, and so must the engine's face table. Each entry
+/// carries its clause kind: `Never` is the bottom type, not a class or
+/// mixin, so `implements Never` reports `implements_non_class` upstream.
+const SYNTHETIC_NAMES: &[(&str, &[(&str, FaceKind)])] = &[(
+    "core",
+    &[("Never", FaceKind::NonClass)],
+)];
 
 /// Public top-level names that must be present in a library's face for the
 /// run to succeed — the pinned acceptance symbols of the facade census
@@ -310,8 +341,12 @@ struct Tables {
     /// The flat `libraries.dart` table, source order preserved.
     flat: Vec<FlatEntry>,
     /// Public-library faces; libraries whose sources could not be read are
-    /// excluded and reported as residuals (never faked as empty sets).
-    faces: BTreeMap<String, BTreeSet<String>>,
+    /// excluded and reported as residuals (never faked as empty sets). Each
+    /// face maps a public name to its terminal clause kind — typedefs are
+    /// resolved through their right-hand side at extraction, so the table
+    /// carries the `ClassElement`/`MixinElement`/other verdict the oracle's
+    /// `type.element` switch reads, not the raw declaration spelling.
+    faces: BTreeMap<String, BTreeMap<String, FaceKind>>,
     residuals: Vec<String>,
 }
 
@@ -343,12 +378,13 @@ fn extract(root: &Path) -> Result<Tables, String> {
         residuals: Vec::new(),
     };
     let mut memo = BTreeMap::new();
+    let mut own_memo: BTreeMap<String, Result<Rc<OwnDecls>, String>> = BTreeMap::new();
     for entry in &tables.flat {
         let name = &entry.name;
         if name.starts_with('_') {
             continue;
         }
-        match face(name, &tables, &mut memo, &mut Vec::new()) {
+        match face(name, &tables, &mut memo, &mut Vec::new(), &mut own_memo) {
             Ok(names) => {
                 tables.faces.insert(name.clone(), names);
             }
@@ -358,16 +394,142 @@ fn extract(root: &Path) -> Result<Tables, String> {
     Ok(tables)
 }
 
+/// A library's own top-level declarations — the library file plus its
+/// parts — as name → [`ScanKind`], together with the library file's export
+/// directives. Memoized: the face fold and the typedef-kind resolver share
+/// one scan per library.
+struct OwnDecls {
+    /// Own declarations only (no re-exports): the scan kind each name
+    /// carries before cross-library typedef resolution.
+    kinds: BTreeMap<String, ScanKind>,
+    /// The library file's top-level `export` directives, source order.
+    exports: Vec<Export>,
+}
+
+/// Scans `name`'s own declarations (library file plus parts), memoized.
+/// Mirrors the face fold's per-library failure contract: a missing flat
+/// entry, an unreadable file, unclassified top-level lines, or an
+/// unreadable part all surface as the same `Err` the fold propagates.
+fn own_decls(
+    name: &str,
+    sdk: &Tables,
+    memo: &mut BTreeMap<String, Result<Rc<OwnDecls>, String>>,
+) -> Result<Rc<OwnDecls>, String> {
+    if let Some(cached) = memo.get(name) {
+        return cached.clone();
+    }
+    let scanned = (|| -> Result<OwnDecls, String> {
+        let entry = sdk
+            .flat
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| "not in the flat libraries table".to_owned())?;
+        // The dart2js implementation variant carries the face when present
+        // (`html_common`): it is the surface the oracle's export chains flow
+        // through.
+        let path = entry.face_path().to_owned();
+        let text = std::fs::read_to_string(sdk.root.join("lib").join(&path))
+            .map_err(|e| format!("read lib/{path}: {e}"))?;
+        let unit = scan_unit(&text);
+        if !unit.warnings.is_empty() {
+            return Err(format!(
+                "lib/{path}: {} unclassified top-level line(s): {}",
+                unit.warnings.len(),
+                unit.warnings.first().expect("non-empty")
+            ));
+        }
+        let mut kinds = unit.kinds;
+        // Parts contribute their top-level surface; their own `part of`
+        // shape never carries parts or exports. First declaration wins on a
+        // duplicate spelling (the graph builder's `declare` posture).
+        let lib_dir = Path::new(&path)
+            .parent()
+            .expect("library path has a parent");
+        for part in &unit.parts {
+            let part_path = lib_dir.join(part);
+            let part_text = std::fs::read_to_string(sdk.root.join("lib").join(&part_path))
+                .map_err(|e| format!("read lib/{}: {e}", part_path.display()))?;
+            let part_unit = scan_unit(&part_text);
+            if !part_unit.warnings.is_empty() {
+                return Err(format!(
+                    "lib/{}: {} unclassified top-level line(s): {}",
+                    part_path.display(),
+                    part_unit.warnings.len(),
+                    part_unit.warnings.first().expect("non-empty")
+                ));
+            }
+            for (name, kind) in part_unit.kinds {
+                kinds.entry(name).or_insert(kind);
+            }
+        }
+        Ok(OwnDecls {
+            kinds,
+            exports: unit.exports,
+        })
+    })();
+    let result = scanned.map(Rc::new);
+    memo.insert(name.to_owned(), result.clone());
+    result
+}
+
+/// Resolves a [`ScanKind`] to its terminal [`FaceKind`] in `lib`'s
+/// namespace: a typedef's right-hand-side head is looked up in the
+/// declaring library's own declarations first, then `dart:core` (the
+/// implicit import every library carries), and a head that resolves to
+/// nothing — a function type, a keyword, a `_`-internal or unscanned
+/// target — answers [`FaceKind::NonClass`]. `depth` bounds typedef chains
+/// (`typedef A = B; typedef B = A;`) — past it the alias is unresolvable
+/// and answers `NonClass` rather than spin.
+fn resolve_kind(
+    lib: &str,
+    kind: &ScanKind,
+    sdk: &Tables,
+    own_memo: &mut BTreeMap<String, Result<Rc<OwnDecls>, String>>,
+    depth: usize,
+) -> FaceKind {
+    const MAX_DEPTH: usize = 16;
+    match kind {
+        ScanKind::Class => FaceKind::Class,
+        ScanKind::Mixin => FaceKind::Mixin,
+        ScanKind::Other | ScanKind::Typedef(None) => FaceKind::NonClass,
+        ScanKind::Typedef(Some(head)) => {
+            if depth >= MAX_DEPTH {
+                return FaceKind::NonClass;
+            }
+            // The declaring library's own declarations win; `dart:core`
+            // (the implicit import) is the fallback scope. A `_`-internal
+            // or unscanned target leaves the head unresolved.
+            let scopes: &[&str] = if lib == "core" {
+                &[lib]
+            } else {
+                &[lib, "core"]
+            };
+            for scope in scopes {
+                let Ok(decls) = own_decls(scope, sdk, own_memo) else {
+                    continue;
+                };
+                if let Some(next) = decls.kinds.get(head) {
+                    return resolve_kind(scope, next, sdk, own_memo, depth + 1);
+                }
+            }
+            FaceKind::NonClass
+        }
+    }
+}
+
 /// The full public export face of library `name`: its own top-level
 /// declarations (library file plus parts) plus every transitively re-exported
-/// name through `export` directives, `show`/`hide` applied. `_`-private
-/// names never enter (the scanner drops them at the source).
+/// name through `export` directives, `show`/`hide` applied — each name
+/// carrying its terminal clause kind. `_`-private names never enter (the
+/// scanner drops them at the source). First declaration wins on a duplicate
+/// spelling, mirroring the graph builder's `declare`.
 fn face(
     name: &str,
     sdk: &Tables,
-    memo: &mut BTreeMap<String, BTreeSet<String>>,
+    memo: &mut BTreeMap<String, BTreeMap<String, FaceKind>>,
     stack: &mut Vec<String>,
-) -> Result<BTreeSet<String>, String> {
+    own_memo: &mut BTreeMap<String, Result<Rc<OwnDecls>, String>>,
+) -> Result<BTreeMap<String, FaceKind>, String> {
     if let Some(names) = memo.get(name) {
         return Ok(names.clone());
     }
@@ -378,80 +540,45 @@ fn face(
             cycle.join(" -> ")
         }));
     }
-    let entry = sdk
-        .flat
-        .iter()
-        .find(|entry| entry.name == name)
-        .ok_or_else(|| "not in the flat libraries table".to_owned())?;
-    // The dart2js implementation variant carries the face when present
-    // (`html_common`): it is the surface the oracle's export chains flow
-    // through.
-    let path = entry.face_path().to_owned();
-    let text = std::fs::read_to_string(sdk.root.join("lib").join(&path))
-        .map_err(|e| format!("read lib/{path}: {e}"))?;
-    let unit = scan_unit(&text);
-    if !unit.warnings.is_empty() {
-        return Err(format!(
-            "lib/{path}: {} unclassified top-level line(s): {}",
-            unit.warnings.len(),
-            unit.warnings.first().expect("non-empty")
-        ));
-    }
-    let mut names = unit.names;
-    // Parts contribute their top-level surface; their own `part of` shape
-    // never carries parts or exports.
-    let lib_dir = Path::new(&path)
-        .parent()
-        .expect("library path has a parent");
-    for part in &unit.parts {
-        let part_path = lib_dir.join(part);
-        let part_text = std::fs::read_to_string(sdk.root.join("lib").join(&part_path))
-            .map_err(|e| format!("read lib/{}: {e}", part_path.display()))?;
-        let part_unit = scan_unit(&part_text);
-        if !part_unit.warnings.is_empty() {
-            return Err(format!(
-                "lib/{}: {} unclassified top-level line(s): {}",
-                part_path.display(),
-                part_unit.warnings.len(),
-                part_unit.warnings.first().expect("non-empty")
-            ));
-        }
-        names.extend(part_unit.names);
+    let own = own_decls(name, sdk, own_memo)?;
+    let mut face_map: BTreeMap<String, FaceKind> = BTreeMap::new();
+    for (decl_name, kind) in &own.kinds {
+        let terminal = resolve_kind(name, kind, sdk, own_memo, 0);
+        face_map.entry(decl_name.clone()).or_insert(terminal);
     }
     stack.push(name.to_owned());
-    for export in &unit.exports {
+    for export in &own.exports {
         let target = export.target.strip_prefix("dart:").ok_or_else(|| {
             format!(
-                "unsupported export target `{}` in lib/{path}",
+                "unsupported export target `{}` in lib/{name}",
                 export.target
             )
         })?;
-        let target_face = face(target, sdk, memo, stack)?;
+        let target_face = face(target, sdk, memo, stack, own_memo)?;
         match &export.show {
             Some(show) => {
                 for shown in show {
-                    if !target_face.contains(shown) {
+                    let Some(&kind) = target_face.get(shown) else {
                         stack.pop();
                         return Err(format!(
-                            "lib/{path}: export of dart:{target} shows `{shown}`, which the \
+                            "lib/{name}: export of dart:{target} shows `{shown}`, which the \
                              extracted face of dart:{target} does not carry"
                         ));
-                    }
-                    names.insert(shown.clone());
+                    };
+                    face_map.entry(shown.clone()).or_insert(kind);
                 }
             }
             None => {
-                names.extend(
-                    target_face
-                        .iter()
-                        .filter(|n| !export.hide.contains(n))
-                        .cloned(),
-                );
+                for (exported, kind) in &target_face {
+                    if !export.hide.contains(exported) {
+                        face_map.entry(exported.clone()).or_insert(*kind);
+                    }
+                }
             }
         }
         for hidden in &export.hide {
             if !export.show.as_ref().is_some_and(|s| s.contains(hidden)) {
-                names.remove(hidden);
+                face_map.remove(hidden);
             }
         }
     }
@@ -460,10 +587,12 @@ fn face(
     // fold — they are part of the oracle's namespace shape for the library
     // despite having no source declaration to scan.
     if let Some((_, names_injected)) = SYNTHETIC_NAMES.iter().find(|(lib, _)| *lib == name) {
-        names.extend(names_injected.iter().map(|n| n.to_string()));
+        for (injected, kind) in *names_injected {
+            face_map.entry((*injected).to_owned()).or_insert(*kind);
+        }
     }
-    memo.insert(name.to_owned(), names.clone());
-    Ok(names)
+    memo.insert(name.to_owned(), face_map.clone());
+    Ok(face_map)
 }
 
 /// Verification: pinned anchors, per-library floors, and no empty faces.
@@ -477,7 +606,7 @@ fn verify(tables: &Tables) -> Result<String, String> {
             )
         })?;
         for anchor in *required {
-            if !face.contains(*anchor) {
+            if !face.contains_key(*anchor) {
                 return Err(format!(
                     "anchor missing: dart:{name} does not carry `{anchor}`"
                 ));
@@ -554,7 +683,7 @@ fn emit_flat(tables: &Tables) -> String {
 
 /// Renders the generated `sdk_faces_gen.rs`.
 fn emit_faces(tables: &Tables) -> String {
-    let total: usize = tables.faces.values().map(BTreeSet::len).sum();
+    let total: usize = tables.faces.values().map(BTreeMap::len).sum();
     let mut out = String::new();
     out.push_str("// GENERATED FILE — do not edit.\n");
     let _ = writeln!(
@@ -574,15 +703,23 @@ fn emit_faces(tables: &Tables) -> String {
     out.push_str("// through `export` directives with `show`/`hide` applied, `_`-private\n");
     out.push_str("// names dropped — the oracle's import-namespace shape at name granularity.\n");
     out.push_str("// A library joins the table only with its complete set; a partial face\n");
-    out.push_str("// would flip used imports into false `unused_import`s.\n\n");
+    out.push_str("// would flip used imports into false `unused_import`s.\n");
+    out.push_str("//\n");
+    out.push_str("// Each name carries its terminal clause kind — `Class`/`Mixin` mirror the\n");
+    out.push_str("// oracle's `type.element` switch for clause legality, `NonClass` covers\n");
+    out.push_str("// typedef-to-function-type aliases (`Comparator`), functions, variables,\n");
+    out.push_str("// and other non-class top-levels. Typedefs were resolved through their\n");
+    out.push_str("// right-hand side at extraction, so a `typedef A = SomeClass` reports\n");
+    out.push_str("// `Class` here — the verdict the consumer reads, not the spelling.\n\n");
+    out.push_str("use dartq_resolution::FaceKind;\n\n");
     out.push_str("#[rustfmt::skip]\n");
-    out.push_str("pub static SDK_LIBRARY_FACES: &[(&str, &[&str])] = &[\n");
+    out.push_str("pub static SDK_LIBRARY_FACES: &[(&str, &[(&str, FaceKind)])] = &[\n");
     for (name, face) in &tables.faces {
         out.push_str("    (\n        \"");
         out.push_str(name);
         out.push_str("\",\n        &[\n");
-        for name in face {
-            let _ = writeln!(out, "            \"{name}\",");
+        for (decl_name, kind) in face {
+            let _ = writeln!(out, "            (\"{decl_name}\", FaceKind::{}),", kind.variant());
         }
         out.push_str("        ],\n    ),\n");
     }

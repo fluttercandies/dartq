@@ -91,10 +91,7 @@ impl CacheConfig {
     /// [`Self::discover`] against an explicit home directory, so tests are
     /// independent of the developer's real `~/.dartq/dartq.yaml` global
     /// tier.
-    pub(crate) fn discover_with_home(
-        dir: &Path,
-        home: Option<&Path>,
-    ) -> Result<Self, ConfigError> {
+    pub(crate) fn discover_with_home(dir: &Path, home: Option<&Path>) -> Result<Self, ConfigError> {
         let governing = crate::config::discover_with(dir, home)?;
         let limit = governing
             .as_ref()
@@ -847,7 +844,9 @@ mod tests {
         let fresh_path = store_dir.join(&fresh_hex[..2]).join(&fresh_hex);
         plant_blob(&store_dir, &in_flight, 4096, false);
         let torn_hex = content_hash(b"torn write").to_string();
-        let torn = store_dir.join(&torn_hex[..2]).join(format!("{torn_hex}.tmp"));
+        let torn = store_dir
+            .join(&torn_hex[..2])
+            .join(format!("{torn_hex}.tmp"));
         fs::create_dir_all(torn.parent().expect("shard")).expect("torn shard");
         fs::write(&torn, b"half-written").expect("torn tmp");
         set_file_mtime(&torn, FileTime::from_unix_time(0, 0)).expect("age tmp");
@@ -1011,7 +1010,8 @@ mod tests {
         )
         .expect("config");
 
-        let config = CacheConfig::discover_with_home(&scratch.0.join("nested/deep"), None).expect("discover");
+        let config = CacheConfig::discover_with_home(&scratch.0.join("nested/deep"), None)
+            .expect("discover");
 
         assert_eq!(config.snapshot.capacity_bytes, 2 << 30);
         assert_eq!(
@@ -1044,7 +1044,8 @@ mod tests {
             "build_cache:\n  root: /fixture/cas\n",
         )
         .expect("config");
-        let config = CacheConfig::discover_with_home(&scratch.0, None).expect("config without the section");
+        let config =
+            CacheConfig::discover_with_home(&scratch.0, None).expect("config without the section");
         assert_eq!(config.snapshot.capacity_bytes, DEFAULT_CAPACITY_BYTES);
         assert_eq!(
             config.content.as_ref().expect("content").size_limit,
@@ -1062,8 +1063,11 @@ mod tests {
     #[test]
     fn gc_enforces_the_configured_cap_on_fixture_stores() {
         let scratch = Scratch::ticket("gc-configured");
-        fs::write(&scratch.0.join("dartq.yaml"), "cache:\n  size_limit_gib: 1\n")
-            .expect("config");
+        fs::write(
+            &scratch.0.join("dartq.yaml"),
+            "cache:\n  size_limit_gib: 1\n",
+        )
+        .expect("config");
         let discovered = CacheConfig::discover_with_home(&scratch.0, None).expect("discover");
         let cap = 1 << 30;
         assert_eq!(discovered.snapshot.capacity_bytes, cap);
@@ -1103,7 +1107,9 @@ mod tests {
             .rows
             .iter()
             .find_map(|row| match row {
-                StatsRow::Snapshot { cap_bytes, stats, .. } if *cap_bytes == cap => Some(*stats),
+                StatsRow::Snapshot {
+                    cap_bytes, stats, ..
+                } if *cap_bytes == cap => Some(*stats),
                 _ => None,
             })
             .expect("snapshot row at the configured cap");

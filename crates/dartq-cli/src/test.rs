@@ -39,6 +39,7 @@ use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use clap::Args;
@@ -616,13 +617,36 @@ fn state_reason(root: &Path, global_config: bool) -> Option<Cow<'static, str>> {
     global_config.then(|| "global dart_test config present".into())
 }
 
+/// The `build_cache.flutter` pin for this run's toolchain lookups, read
+/// once per process. The key names the flutter binary for every dartq
+/// face — the shim, `dartq flutter`, and `dartq test --flutter` alike —
+/// so it is honored regardless of `build_cache.enabled`: it selects a
+/// toolchain, it is not a cache feature. A malformed config warns once,
+/// in bcache's own fail-open posture, and the run continues on the
+/// environment and `PATH` steps; it never blocks the run.
+fn flutter_pin() -> Option<PathBuf> {
+    static PIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PIN.get_or_init(|| {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match dartq_commands::bcache::discover_store_config(&cwd) {
+            Ok(config) => config.flutter_bin,
+            Err(err) => {
+                eprintln!("dartq-bcache: {err} (running tests with the PATH flutter)");
+                None
+            }
+        }
+    })
+    .clone()
+}
+
 /// Run plain `dart test` (or `flutter test`) with `args` and the terminal
 /// attached, returning its exit status.
 fn delegate(args: &[String], flutter: bool) -> u8 {
     let bin = if flutter {
-        dartq_test::host::find("flutter").unwrap_or_else(|| PathBuf::from("flutter"))
+        dartq_test::host::find_flutter(flutter_pin().as_deref())
+            .unwrap_or_else(|| PathBuf::from("flutter"))
     } else {
-        dartq_test::host::find("dart").unwrap_or_else(|| PathBuf::from("dart"))
+        dartq_test::host::find_dart(None).unwrap_or_else(|| PathBuf::from("dart"))
     };
     match std::process::Command::new(&bin)
         .arg("test")
@@ -1205,6 +1229,15 @@ struct Plan {
     print_path: bool,
 }
 
+/// Records the ignored resolution inputs for the next `--impacted` run —
+/// best-effort: a failure costs only the next run its bounds (it runs
+/// everything), so it is reported and never fatal.
+fn record_impacted_inputs(root: &Path) {
+    if let Err(error) = dartq_commands::impact::record_resolution_stamp(root) {
+        eprintln!("dartq test: cannot record the impacted inputs ({error})");
+    }
+}
+
 fn run(args: &[String]) -> u8 {
     let Ok(inv) = parse(args) else {
         // No `Invocation`, so `--stats` is read off the line itself.
@@ -1254,7 +1287,7 @@ fn run(args: &[String]) -> u8 {
         || root
             .join(spell(&selections[0]).unwrap_or_default())
             .is_dir();
-    let dart = dartq_test::host::find("dart");
+    let dart = dartq_test::host::find_dart(None);
     // Once `--impacted` bounds the run, a delegation hands the runner the
     // suites the changes reach, not the typed selection.
     let mut line = Cow::Borrowed(args);
@@ -1271,6 +1304,9 @@ fn run(args: &[String]) -> u8 {
                 });
                 if suites.is_empty() {
                     eprintln!("dartq test: no suite is reachable from the changes since {base}");
+                    // The selection was bounded on the current inputs —
+                    // the next run may bound itself against them too.
+                    record_impacted_inputs(&root);
                     return exit::CLEAN;
                 }
                 line = Cow::Owned(with_selection(
@@ -1335,7 +1371,17 @@ fn run(args: &[String]) -> u8 {
         print_path,
     };
     match execute(&plan) {
-        Ok(code) => code,
+        Ok(code) => {
+            // An executed `--impacted` run is the one moment the ignored
+            // resolution inputs are known-good for the suites that ran —
+            // any exit code: a failing suite still ran. Returns before
+            // this point (usage errors, a missing runner) executed
+            // nothing and record nothing.
+            if plan.inv.impacted.is_some() {
+                record_impacted_inputs(&plan.root);
+            }
+            code
+        }
         Err(error) => {
             eprintln!("dartq: internal error: {error}");
             exit::INTERNAL_ERROR

@@ -8,10 +8,11 @@
 //! unmodeled or rejected argv runs as a pure passthrough. A modeled
 //! invocation:
 //!
-//! 1. **Version gate**: the toolchain fingerprint must name
-//!    [`SUPPORTED_FLUTTER_VERSION`] — the args/option tables and the
-//!    build-dir name formula are pinned to it. Anything else passes
-//!    through before the store is ever touched.
+//! 1. **Version gate**: the toolchain fingerprint's version stamp must
+//!    name a line of [`SUPPORTED_FLUTTER_LINES`] — the args/option
+//!    tables and the build-dir name formula are pinned to those lines'
+//!    flutter_tools. Anything else passes through before the store is
+//!    ever touched.
 //! 2. **PRE**: compute the coarse config key (toolchain, filtered define
 //!    vector, target, provenance file contents — no depfile closure and
 //!    no file that exists only after a build, so a fresh worktree keys
@@ -81,16 +82,28 @@
 //!    worst a torn in-place dill copy is bounded by frontend_server's
 //!    fall-back to a full compile when the initialize-from-dill file
 //!    will not read. A file whose identity this invocation's
-//!    materialization placed, or the prior entry under the key stamped,
-//!    is re-referenced without reading (see
+//!    materialization placed, the tree's placement record remembers
+//!    from an earlier one ([`crate::placement`]), or the prior entry
+//!    under the key stamped, is re-referenced without reading (see
 //!    [`crate::ingest_scan::scan_entry_files`]) — a warm run stores only
-//!    what flutter actually changed. A hit whose rerun reproduced the
+//!    what flutter actually changed, in any tree the entry was ever
+//!    replayed into. A hit whose rerun reproduced the
 //!    key AND touched nothing needs no re-ingest, and a rerun whose
 //!    outputs reproduce the stored snapshot byte for byte (flutter's
-//!    every-build rewrites of `.filecache` and `outputs.json` included)
-//!    publishes nothing; a rerun that changed outputs always
-//!    re-ingests, so a hit can never freeze a stale entry. Then run gc
-//!    opportunistically when the store is over budget.
+//!    every-build rewrites of `.filecache` and `outputs.json` included;
+//!    a cross-tree hit's re-rooted rendering of it counts) publishes
+//!    nothing — the manifest stays the shared source, as ingested, and
+//!    each tree's identities live in that tree's record; a tree whose
+//!    first run did republish the entry under its own root (flutter
+//!    regenerated what it could not validate) moves the frame once,
+//!    and no later run in any tree moves it back while its bytes are
+//!    the ones its record claims ([`frame_only`]); a rerun that
+//!    changed outputs always
+//!    re-ingests, so a hit can never freeze a stale entry. Then reclaim
+//!    the blobs the re-ingest detached from the entry (the test face's
+//!    kernel changes bytes on every run, so without this the store would
+//!    grow one kernel per run — see [`CasStore::reclaim_detached`]), or
+//!    run the full gc when the store is over budget.
 //!
 //! Zero-config lives above this module: with no `build_cache` section
 //! the caller never reaches [`run_shim`] at all.
@@ -120,16 +133,147 @@ use crate::ingest_scan::{
 use crate::key;
 use crate::materialize::{self, DirPlan, MaterializePlan, MaterializeReport};
 use crate::observer::CaptureObserver;
+use crate::placement::{self, PlacedDir, PlacementRecord};
 use crate::store::CasStore;
 use crate::types::{
     BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, KeyInputs, ManifestFile, NameRule,
-    PathAnchors, PlacedFile, ToolchainFingerprint,
+    PathAnchors, ToolchainFingerprint,
 };
 
-/// The one flutter version whose option tables and build-dir name
-/// formula this crate models (flutter_tools 3.47.1). Every other
-/// version passes through untouched.
-pub const SUPPORTED_FLUTTER_VERSION: &str = "3.47.1";
+/// The flutter version lines whose flutter_tools this crate's embedded
+/// model generation was derived from and verified against — the option
+/// tables ([`crate::args_model`]), the `flutter assemble` argv model
+/// ([`crate::assemble`]), the build-dir name formula
+/// ([`crate::args_model::flutter_build_dir_name`]), and the bookkeeping
+/// contract those models cite (`.filecache` v2, the every-build
+/// rewrites, the test kernel-cache path; see [`crate::materialize`] and
+/// [`crate::ingest_scan`]). Every other version passes through
+/// untouched.
+///
+/// An entry names the MINOR line it covers — `(3, 44)` admits 3.44.0
+/// and any later 3.44.x patch. A line lands here only after the pinned
+/// flutter_tools regions of its reviewed patches were classified hunk
+/// by hunk against the model. The harness pins every reviewed patch's
+/// region digest (`REVIEWED_LINES` in the tests, one or more pins per
+/// line) and its `supported_line_patches_match_their_reviewed_regions`
+/// test fails for any installed patch of an enabled line that matches
+/// none of its line's pins — patch releases do carry fixes into these
+/// regions (3.24.0 → 3.24.5 changed `build web` source-map plumbing),
+/// so an unreviewed patch is admitted on its line's evidence until the
+/// tripwire sees it installed.
+/// Cross-line safety needs no table discipline: the toolchain
+/// fingerprint keys the full version stamp AND both hashed toolchain
+/// artifacts, so patches of one line share the MODEL but never a stored
+/// entry.
+///
+/// Verification evidence, per line. Drift classes: A — an option the
+/// model knows is gone (flutter rejects the argv, so no entry can exist
+/// under its key); B — an option the model does not know (kept verbatim
+/// in the key); C — the semantics of a modeled option; D — a
+/// bookkeeping or naming contract; E — the `package:args` parser.
+///
+/// * `3.47` — 3.47.0 and 3.47.1: all 21 regions byte-identical to the
+///   3.47.1 baseline the model was derived from.
+/// * `3.44` (3.44.0), `3.41` (3.41.9), `3.38` (3.38.1), `3.35` (3.35.0),
+///   `3.32` (3.32.0) — every hunk of each region diff against the next
+///   newer line classified; `package:args` 2.7.0 in every pubspec (no E):
+///   * A/B only on the option surface: no model-known option changes
+///     arity, negatability, abbreviation, or role, and no added option
+///     takes a model-known spelling (`-D` abbreviates nothing before
+///     3.38, so flutter rejects it there);
+///   * C: before 3.41 an empty `--dart-define=` reaches the compilers as
+///     a bare `-D` (the model keys it verbatim, see
+///     [`crate::args_model::ParsedFlutterCmd::defines`]); before 3.35
+///     `FLUTTER_APP_FLAVOR`, before 3.47 `FLUTTER_BUILD_NAME`/`_NUMBER`
+///     are not injected, so a user define of that name and value keys
+///     like the model's injection — every face hashes the full define
+///     list into the name flutter looks up (build-dir names, the test
+///     kernel-cache name), so the merge can only miss;
+///   * D: the `.filecache` v2 store, stamps, `outputs.json` and
+///     `.last_build_id` cleanup, the build-dir name formula, the
+///     test-cache path, and `getBuildDirectory` are unchanged. Before
+///     3.41 the assemble define map differs (3.38 parses raw
+///     `--dart-define` values as `K=V` defines, 3.35 and older fold them
+///     into `DartDefines` only): those templates fail the POST name
+///     check and their dirs record as not replayable — a miss. Kernel
+///     formats 124–130 share format 138's component layout
+///     ([`crate::dill_rewrite`]), and a payload dill the rewriter
+///     refuses is left out of a cross-tree replay
+///     ([`crate::materialize`]).
+///
+/// The latest patch of each line carries its own pin after the same
+/// hunk-by-hunk review of its region diff against the line's baseline
+/// patch (the fleet keeps only latest patches installed; every hunk
+/// below is the complete drift — no other region moved):
+///
+/// * `3.32.8` — `flutter_command.dart` backports 3.35.0's
+///   `FLUTTER_APP_FLAVOR` injection block byte-identically (the model
+///   already keys exactly that injection, so 3.32.8 converges onto the
+///   model instead of away from it; a pubspec `default-flavor` rides
+///   the keyed pubspec closure) and rejects a `FLUTTER_APP_FLAVOR`
+///   user define or env var with `throwToolExit` — a narrowing of the
+///   accepted surface: no entry can exist under an argv the patch
+///   itself rejects, and cross-patch entries never share a key (the
+///   version-stamped toolchain). Pubspec pins only; `args` stays 2.7.0.
+/// * `3.35.7` — `build web` without `--wasm`: the extra
+///   `WasmCompilerConfig` is added only under `--wasm-dry-run` (whose
+///   default is true, so the default build is unchanged);
+///   `--no-wasm-dry-run` — a keyed option, kept verbatim in the key —
+///   stops compiling a stray full wasm target it never asked for. The
+///   option declarations are byte-identical, the build-dir name formula
+///   is untouched, and the web faces are capture-not-predict. Pubspec
+///   pins only; `args` stays 2.7.0.
+/// * `3.38.10` — an empty `--dart-define=` value is dropped instead of
+///   forwarded (the model keeps the token verbatim in the key — the
+///   fail-safe over-keying side: two argvs that now build identically
+///   simply never share an entry); `assemble` skips an empty define
+///   chunk it used to reject, with any name-recompute mismatch bounded
+///   by the POST name check to a not-replayable miss; `run.dart` is a
+///   nullability annotation and `build_system.dart` adds
+///   `Environment.copyWith` (sole caller: the native-assets hooks
+///   runner; the hash-dir name formula unchanged). No pubspec drift.
+/// * `3.44.9` — all 21 regions byte-identical to the reviewed 3.44.0
+///   (same digest, pinned under both patch names).
+/// * `3.47.9` — `toEnvironmentConfig` adds `BUILD_NAME`/`BUILD_NUMBER`
+///   for the generated CMake/xcconfig inputs (linux/windows/xcode
+///   regenerate them on every build, and `--build-name`/`--build-number`
+///   are keyed options whose values also ride the model's define
+///   vector); `toBuildSystemEnvironment` — the define map the dir names
+///   hash — is unchanged. Pubspec pins only; `args` stays 2.7.0.
+///
+/// Everything older passes through: 3.29.x (3.29.0 and 3.29.3 are
+/// region-identical) and older were surveyed, not classified hunk by
+/// hunk, and their kernel formats (122 and older) add a component-index
+/// field the dill rewriter does not model.
+pub const SUPPORTED_FLUTTER_LINES: &[(u32, u32)] =
+    &[(3, 32), (3, 35), (3, 38), (3, 41), (3, 44), (3, 47)];
+
+/// The (major, minor) line of a toolchain version stamp, when the stamp
+/// is a plain `MAJOR.MINOR.PATCH` — non-empty decimal components and
+/// nothing else. This is exactly the shape stable `frameworkVersion`
+/// values carry (the stamp [`crate::key::fingerprint_toolchain`] reads
+/// from `bin/cache/flutter.version.json`; a stamp with a pre-release or
+/// build suffix, an `unknown`, or any malformed spelling matches no
+/// line and the invocation passes through.
+fn version_line(stamp: &str) -> Option<(u32, u32)> {
+    fn number(part: Option<&str>) -> Option<u32> {
+        let part = part?;
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse().ok())
+            .flatten()
+    }
+    let mut parts = stamp.split('.');
+    let line = (number(parts.next())?, number(parts.next())?);
+    number(parts.next())?;
+    (parts.next().is_none()).then_some(line)
+}
+
+/// Whether `stamp` names a line of [`SUPPORTED_FLUTTER_LINES`] — the
+/// shim's model gate.
+#[must_use]
+pub fn supported_flutter_version(stamp: &str) -> bool {
+    version_line(stamp).is_some_and(|line| SUPPORTED_FLUTTER_LINES.contains(&line))
+}
 
 /// Everything the shim needs beyond the invocation itself.
 #[derive(Debug, Clone)]
@@ -458,7 +602,7 @@ pub fn run_shim(
     // pays its one rehash and never another: the negative record serves
     // every later invocation of the same SDK state.
     store_fingerprint_cache(&config.store_root, &root, &toolchain);
-    if toolchain.flutter_version != SUPPORTED_FLUTTER_VERSION {
+    if !supported_flutter_version(&toolchain.flutter_version) {
         return run_passthrough(argv, cwd, runner, "unsupported_flutter_version");
     }
 
@@ -525,7 +669,12 @@ pub fn run_shim(
     let key = coarse_key(&cwd, &parsed, &key_defines, &toolchain);
     report.key = Some(key.clone());
     let mut hit: Option<EntryManifest> = None;
+    // Held from the lookup through the placement below: a concurrent
+    // run's post-run reclaim cannot take a blob this hit is about to
+    // place (see `CasStore::pin`). Released before the run.
+    let mut pin = None;
     if let Ok(store) = CasStore::open(&config.store_root) {
+        pin = store.pin();
         match store.lookup(&key) {
             Ok(Some(manifest)) => hit = Some(manifest),
             Ok(None) => {}
@@ -544,7 +693,7 @@ pub fn run_shim(
     // What PRE's materialization placed, by the name POST knows each dir
     // under — the hash-dir name for build faces, the project-relative
     // test-cache path for the test face. Empty unless a hit materialized.
-    let mut placed: Vec<(String, Vec<PlacedFile>)> = Vec::new();
+    let mut placed: Vec<PlacedDir> = Vec::new();
 
     if let Some(manifest) = hit {
         // Cross-tree means different worktree roots: only then do the
@@ -659,12 +808,13 @@ pub fn run_shim(
                                 ""
                             }
                         ));
-                        if outcome.report.dill_rewrites > 0
-                            || outcome.report.dill_rewrite_refused > 0
+                        let dills = &outcome.report;
+                        if dills.dill_rewrites + dills.dill_rewrite_refused + dills.dill_omitted > 0
                         {
                             note(&format!(
-                                "dill: {} rewritten, {} verbatim (rewrite refused)",
-                                outcome.report.dill_rewrites, outcome.report.dill_rewrite_refused
+                                "dill: {} rewritten; rewrite refused: {} placed verbatim, {} left \
+                                 out for flutter to rebuild",
+                                dills.dill_rewrites, dills.dill_rewrite_refused, dills.dill_omitted
                             ));
                         }
                         if outcome.report.filecache_patched > 0 {
@@ -675,7 +825,21 @@ pub fn run_shim(
                         }
                         report.materialize = Some(outcome.report);
                         report.reason = "pre_hit";
-                        placed = plan_names.into_iter().zip(outcome.placed).collect();
+                        placed = plan_names
+                            .into_iter()
+                            .zip(outcome.placed)
+                            .map(|(name, files)| PlacedDir { name, files })
+                            .collect();
+                        // The tree's placement record learns the fresh
+                        // identities now, overlaid on what it remembered
+                        // of this entry, so a run whose POST never gets
+                        // to write (a non-zero exit, a busy tree lock)
+                        // still leaves the next run a record to vouch by.
+                        store_placement(
+                            &cwd,
+                            &key,
+                            placement::overlay(placement::known_dirs(&cwd, &key), placed.clone()),
+                        );
                     }
                     Err(err) => {
                         report.reason = "materialize_failed";
@@ -690,6 +854,7 @@ pub fn run_shim(
             }
         }
     }
+    drop(pin);
 
     // RUN: the original argv, the canonical cwd (flutter's bookkeeping
     // paths then match the POST scan's root), the child's exit code —
@@ -714,6 +879,19 @@ pub fn run_shim(
             return report;
         }
     }
+
+    // A flutter_tools defect (measured on 3.44.0) leaks the run's
+    // frontend_server parentless (pid 1) — one idle process per build,
+    // forever. The sweep is one ps spawn; anything it does not certainly
+    // own (a live parent, a pre-run start) it leaves alone, and any
+    // failure is a note on stderr. Gated out under the test harness: the
+    // fake runner spawns no child that could leak, and a sweep firing
+    // from one fixture test would reap another test's fixture — to the
+    // sweep, any frontend_server-named orphan born during the run is a
+    // leak, which is exactly what a concurrent test's fixture is. The
+    // sweep itself is unit-tested in [`crate::reaper`].
+    #[cfg(all(unix, not(test)))]
+    crate::reaper::reap_orphaned_frontend_servers(run_started);
 
     // POST: ingest every dir the run touched; a hit whose key the rebuild
     // reproduced needs no re-ingest (the entry is already stored). A
@@ -758,6 +936,11 @@ pub fn run_shim(
             Vec::new()
         };
         let post_key = coarse_key(&cwd, &parsed, &key_defines, &toolchain);
+        // Every placed identity this tree knows for the ingest key: what
+        // this run placed, overlaid on the tree's placement record of
+        // earlier runs (see `crate::placement`). A record for a key the
+        // run moved away from is not this entry's and is not consulted.
+        let known = placement::overlay(placement::known_dirs(&cwd, &post_key), placed);
         // The test face: the kernel cache the run compiled into, when it
         // wrote one. Unlike the assemble faces nothing observes whether a
         // hit's rerun really recompiled — and frontend_server rewrites
@@ -767,7 +950,8 @@ pub fn run_shim(
         // prior stamps, and a hit's placement supplies the placed ones: a
         // dill whose identity either record proves reuses its blob
         // without re-reading tens of MB; a rewritten dill re-hashes and
-        // replaces the reference, leaving the superseded blob to gc.
+        // replaces the reference, and the post-run reclaim takes the
+        // superseded blob (see `maybe_gc`).
         let test_cache = if test_face {
             match CasStore::open(&config.store_root).and_then(|store| {
                 let prior = store.lookup(&post_key)?;
@@ -777,10 +961,10 @@ pub fn run_shim(
                         .iter()
                         .find(|dir| dir.name_rule == NameRule::TestKernelCache)
                 });
-                let placed_dir = placed
+                let placed_dir = known
                     .iter()
-                    .find(|(name, _)| Path::new(name) == test_cache_rel)
-                    .map(|(_, files)| files.as_slice());
+                    .find(|dir| Path::new(&dir.name) == test_cache_rel)
+                    .map(|dir| dir.files.as_slice());
                 scan_test_cache(
                     &test_cache_dir,
                     run_started,
@@ -819,7 +1003,7 @@ pub fn run_shim(
                 && report.key.as_deref() == Some(post_key.as_str())
                 && captures.is_empty()
                 && test_cache.is_none()
-                && placements_intact(&touched, &build_root, &placed);
+                && placements_intact(&touched, &build_root, &known);
             if !already_stored {
                 let test_scan = test_cache.map(|scan| TestCacheScan {
                     name: test_cache_rel.to_string_lossy().into_owned(),
@@ -846,7 +1030,7 @@ pub fn run_shim(
                         &toolchain,
                         engine_for_names,
                         post_key.clone(),
-                        &placed,
+                        &known,
                         asset_dir
                             .as_ref()
                             .map(|(name, dir)| (name.as_str(), dir.as_path())),
@@ -897,19 +1081,24 @@ fn hash_dir_plan(
     }
 }
 
-/// Whether every touched dir is still exactly what PRE's materialization
-/// placed: each placed file keeps the stamp the placement recorded and
-/// the dir holds nothing beside the placement. This is the "flutter
-/// changed nothing" signal for a hit — every write moves the ns mtime
-/// (the shared identity semantics), so a flutter rewrite, delete, or new
-/// file breaks the match and the rerun re-ingests.
+/// Whether every touched dir is still exactly what the tree's known
+/// placements say: each known file keeps the stamp the placement (or
+/// the tree's record of it) holds and the dir holds nothing beside
+/// them. This is the "flutter changed nothing" signal for a hit —
+/// every write moves the ns mtime (the shared identity semantics), so a
+/// flutter rewrite, delete, or new file breaks the match and the rerun
+/// re-ingests.
 fn placements_intact(
     touched: &[(String, SystemTime)],
     build_root: &Path,
-    placed: &[(String, Vec<PlacedFile>)],
+    known: &[PlacedDir],
 ) -> bool {
     for (name, _) in touched {
-        let Some(files) = placed.iter().find(|(n, _)| n == name).map(|(_, f)| f) else {
+        let Some(files) = known
+            .iter()
+            .find(|dir| dir.name == *name)
+            .map(|dir| &dir.files)
+        else {
             // A dir this run fabricated or re-aimed, not the placement.
             return false;
         };
@@ -1335,12 +1524,26 @@ struct TestCacheScan {
 /// kernel-cache scan when the run produced one.
 ///
 /// Each dir's scan consults two identities (see
-/// [`crate::ingest_scan`]): the files `placed` by this invocation's own
-/// materialization, and the stamps of the entry currently stored under
-/// `key` whose [`replayed_hash_name`] is the dir — a file either record
-/// proves is re-referenced, so a warm run stores only what flutter
-/// actually changed. A draft that records exactly the stored snapshot
-/// stores nothing at all (see [`same_snapshot`]). Returns the count of
+/// [`crate::ingest_scan`]): the placements this tree `known` — this
+/// invocation's own materialization overlaid on the tree's placement
+/// record of earlier ones — and the stamps of the entry currently
+/// stored under `key` whose [`replayed_hash_name`] is the dir; a file
+/// either record proves is re-referenced, so a warm run stores only
+/// what flutter actually changed. A draft that records exactly the
+/// stored snapshot stores nothing at all (see [`same_snapshot`]) —
+/// and that holds across trees: a cross-tree placement's files are
+/// vouched as this tree's re-rooted rendering of the entry's blobs
+/// (first scan, references admitted), so a hit tree that reproduces
+/// the entry leaves it exactly as ingested, in its one frame of
+/// reference; only when the draft differs anyway is every such file
+/// re-scanned to this tree's own bytes (second scan, references off),
+/// so what gets published under this tree's root names only this
+/// tree's bytes — unless that re-scan shows the draft carrying nothing
+/// the tree's own record does not already claim ([`frame_only`]): then
+/// the prior differs only in the frame it was last published in, the
+/// first scan stands, and nothing publishes. Either way the tree's
+/// placement record is rewritten with the scan's fresh identities
+/// last, so the next run vouches by stamp alone. Returns the count of
 /// files streamed into the store this run (reused references
 /// excluded).
 ///
@@ -1359,44 +1562,60 @@ fn ingest_observed(
     toolchain: &ToolchainFingerprint,
     engine_for_names: &str,
     key: String,
-    placed: &[(String, Vec<PlacedFile>)],
+    known: &[PlacedDir],
     asset_dir: Option<(&str, &Path)>,
     test_cache: Option<&TestCacheScan>,
 ) -> Result<(u64, ScanSkips)> {
     let bundle_face = parsed.target.command == "build bundle";
     // Decision-time prior: the entry stored under the ingest key.
     let prior = store.lookup(&key)?;
-    let mut skips = ScanSkips::default();
-    let mut dirs = Vec::with_capacity(observed.len() + 2);
-    let mut sources: Vec<(PathBuf, BlobId)> = Vec::new();
-    // `observed` is name-sorted, so the DirRecords come out name-sorted.
-    for (name, _) in observed {
-        let prior_dir = prior.as_ref().and_then(|manifest| {
-            manifest.dirs.iter().find(|dir| {
-                matches!(
-                    dir.name_rule,
-                    NameRule::VerbatimRelative | NameRule::RecomputeFromTemplate
-                ) && replayed_hash_name(
-                    dir,
-                    &manifest.worktree_root_at_ingest,
-                    &anchors.worktree_root,
-                    engine_for_names,
-                ) == *name
-            })
-        });
-        let placed_dir = placed
+    let blob_exists = |id: &BlobId| store.blob_path(id).is_file();
+    let known_dir = |name: &str| {
+        known
             .iter()
-            .find(|(placed_name, _)| placed_name == name)
-            .map(|(_, files)| files.as_slice());
-        let scan = scan_entry_files(
-            &build_root.join(name),
-            anchors,
-            prior_dir,
-            placed_dir,
-            &|id| store.blob_path(id).is_file(),
-        )?;
-        let (name_rule, name_defines, name_output_dir) =
-            match captures.iter().find(|capture| &capture.name == name) {
+            .find(|dir| dir.name == name)
+            .map(|dir| dir.files.as_slice())
+    };
+    // One scan of every dir the draft covers: the touched hash dirs,
+    // the asset dir, and the test kernel cache (scanned once by the
+    // caller; it never vouches across trees, see `scan_test_cache`).
+    // `rerooted_ok` is `scan_entry_files`'s: references into the
+    // entry's tree admitted or not.
+    let scan_all = |rerooted_ok: bool| -> Result<ScannedDirs> {
+        let mut scanned = ScannedDirs::with_capacity(observed.len() + 2);
+        // `observed` is name-sorted, so the DirRecords come out name-sorted.
+        for (name, _) in observed {
+            // The prior's dir whose replay lands at this name, with the
+            // tree it was recorded in.
+            let prior_dir = prior.as_ref().and_then(|manifest| {
+                manifest
+                    .dirs
+                    .iter()
+                    .find(|dir| {
+                        matches!(
+                            dir.name_rule,
+                            NameRule::VerbatimRelative | NameRule::RecomputeFromTemplate
+                        ) && replayed_hash_name(
+                            dir,
+                            &manifest.worktree_root_at_ingest,
+                            &anchors.worktree_root,
+                            engine_for_names,
+                        ) == *name
+                    })
+                    .map(|dir| (dir, manifest.worktree_root_at_ingest.as_str()))
+            });
+            let scan = scan_entry_files(
+                &build_root.join(name),
+                anchors,
+                prior_dir.map(|(dir, _)| dir),
+                known_dir(name),
+                rerooted_ok,
+                &blob_exists,
+            )?;
+            let (name_rule, name_defines, name_output_dir) = match captures
+                .iter()
+                .find(|capture| &capture.name == name)
+            {
                 Some(capture) => (
                     NameRule::RecomputeFromTemplate,
                     capture.defines.clone(),
@@ -1404,73 +1623,81 @@ fn ingest_observed(
                 ),
                 None if bundle_face => (NameRule::VerbatimRelative, BTreeMap::new(), String::new()),
                 // A missed capture for a dir the prior entry already
-                // recorded keeps the prior record's naming (audit A22):
-                // the absence of an observation this run says nothing
-                // about replayability — without this arm one missed
-                // assemble capture silently demoted the dir to
-                // not-replayable provenance and the entry stopped
-                // serving fresh trees.
+                // recorded keeps the prior record's naming (audit
+                // A22): the absence of an observation this run says
+                // nothing about replayability — without this arm one
+                // missed assemble capture silently demoted the dir
+                // to not-replayable provenance and the entry stopped
+                // serving fresh trees. The template is carried in
+                // THIS tree's frame — re-aimed from the prior's tree
+                // the way its replay name was — so a draft published
+                // under this tree's root never names another tree's
+                // output dir.
                 None => match prior_dir {
-                    Some(previous) => (
-                        previous.name_rule.clone(),
-                        previous.name_defines.clone(),
-                        previous.name_output_dir.clone(),
+                    Some((previous, ingest_root)) => (
+                        previous.name_rule,
+                        previous
+                            .name_defines
+                            .iter()
+                            .map(|(define, value)| {
+                                (
+                                    define.clone(),
+                                    rerooted(value, ingest_root, &anchors.worktree_root),
+                                )
+                            })
+                            .collect(),
+                        rerooted(
+                            &previous.name_output_dir,
+                            ingest_root,
+                            &anchors.worktree_root,
+                        ),
                     ),
                     None => (NameRule::NotReplayable, BTreeMap::new(), String::new()),
                 },
             };
-        dirs.push(DirRecord {
-            name_observed: name.clone(),
-            name_rule,
-            name_defines,
-            name_output_dir,
-            files: scan.files,
-        });
-        sources.extend(scan.sources);
-        skips.add(&scan.skipped);
-    }
-    if let Some((name, dir)) = asset_dir
-        && dir.is_dir()
-    {
-        let prior_dir = prior.as_ref().and_then(|manifest| {
-            manifest
-                .dirs
-                .iter()
-                .find(|record| record.name_rule == NameRule::AssetDir)
-        });
-        let placed_dir = placed
-            .iter()
-            .find(|(placed_name, _)| placed_name == name)
-            .map(|(_, files)| files.as_slice());
-        let scan = scan_entry_files(dir, anchors, prior_dir, placed_dir, &|id| {
-            store.blob_path(id).is_file()
-        })?;
-        if !scan.files.is_empty() {
-            dirs.push(DirRecord {
-                name_observed: name.to_owned(),
-                name_rule: NameRule::AssetDir,
-                name_defines: BTreeMap::new(),
-                name_output_dir: String::new(),
-                files: scan.files,
-            });
-            sources.extend(scan.sources);
-            skips.add(&scan.skipped);
+            scanned.push(name.clone(), name_rule, name_defines, name_output_dir, scan);
         }
-    }
-    if let Some(scan) = test_cache {
-        dirs.push(DirRecord {
-            name_observed: scan.name.clone(),
-            name_rule: NameRule::TestKernelCache,
-            name_defines: BTreeMap::new(),
-            name_output_dir: String::new(),
-            files: scan.scan.files.clone(),
-        });
-        sources.extend(scan.scan.sources.iter().cloned());
-        skips.add(&scan.scan.skipped);
-    }
+        if let Some((name, dir)) = asset_dir
+            && dir.is_dir()
+        {
+            let prior_dir = prior.as_ref().and_then(|manifest| {
+                manifest
+                    .dirs
+                    .iter()
+                    .find(|record| record.name_rule == NameRule::AssetDir)
+            });
+            let scan = scan_entry_files(
+                dir,
+                anchors,
+                prior_dir,
+                known_dir(name),
+                rerooted_ok,
+                &blob_exists,
+            )?;
+            if !scan.files.is_empty() {
+                scanned.push(
+                    name.to_owned(),
+                    NameRule::AssetDir,
+                    BTreeMap::new(),
+                    String::new(),
+                    scan,
+                );
+            }
+        }
+        if let Some(scan) = test_cache {
+            scanned.push(
+                scan.name.clone(),
+                NameRule::TestKernelCache,
+                BTreeMap::new(),
+                String::new(),
+                scan.scan.clone(),
+            );
+        }
+        Ok(scanned)
+    };
     let now = unix_now();
-    let draft = EntryManifest {
-        key,
+    let draft_of = |dirs: Vec<DirRecord>| EntryManifest {
+        key: key.clone(),
         project_root_at_ingest: cwd.to_string_lossy().into_owned(),
         worktree_root_at_ingest: anchors.worktree_root.to_string_lossy().into_owned(),
         pub_cache_root: anchors.pub_cache.to_string_lossy().into_owned(),
@@ -1494,22 +1721,186 @@ fn ingest_observed(
     // (flutter_tools 3.47.1 build_system.dart: `fileCache.persist()` in
     // `build`'s finally, `outputs.json` right after it), so the publish
     // would only move those files' recorded stamps — which the next run
-    // moves again. A re-hashed file may keep its stale stamp only while
-    // re-hashing it is cheaper than a publish; a larger one is published
-    // once so its fresh stamp spares every later run the re-read. A
-    // vanished entry (gc between lookup and here) is published afresh.
-    let unchanged = prior
-        .as_ref()
-        .is_some_and(|prior| same_snapshot(prior, &draft))
-        && sources.iter().all(|(path, blob)| {
-            store.blob_path(blob).is_file()
-                && fs::metadata(path).is_ok_and(|metadata| metadata.len() <= STALE_STAMP_LIMIT)
-        });
-    if unchanged && store.record_hit(&draft.key).is_ok() {
-        return Ok((0, skips));
+    // moves again. The tree's placement record takes the fresh stamps
+    // instead (below); the manifest's stale stamp on a re-hashed file
+    // only costs a re-hash while the record is missing, and a larger
+    // such file is still published once so even a tree that keeps no
+    // record is spared every later re-read. A vanished entry (gc
+    // between lookup and here) is published afresh.
+    let unchanged_against = |draft: &EntryManifest, sources: &[(PathBuf, BlobId)]| {
+        prior
+            .as_ref()
+            .is_some_and(|prior| same_snapshot(prior, draft, engine_for_names))
+            && sources.iter().all(|(path, blob)| {
+                store.blob_path(blob).is_file()
+                    && fs::metadata(path).is_ok_and(|metadata| metadata.len() <= STALE_STAMP_LIMIT)
+            })
+    };
+    let mut scanned = scan_all(true)?;
+    let mut draft = draft_of(std::mem::take(&mut scanned.dirs));
+    let mut unchanged = unchanged_against(&draft, &scanned.sources);
+    let mut flip_suppressed = false;
+    if !unchanged && let Some(entry) = prior.as_ref() {
+        if scanned.rerooted > 0 {
+            // The entry changed under this tree: a reference into the
+            // entry's tree cannot be published under this tree's root.
+            // The second scan hashes every such file to this tree's own
+            // bytes. The demotion is speculative: when it turns out the
+            // draft carries nothing the tree's own record does not
+            // already claim (`frame_only` below), the prior differed
+            // only in the frame it was last published in and the first
+            // scan stands.
+            let vouched = (scanned, draft);
+            scanned = scan_all(false)?;
+            draft = draft_of(std::mem::take(&mut scanned.dirs));
+            unchanged = unchanged_against(&draft, &scanned.sources);
+            if !unchanged && frame_only(entry, &draft, known, engine_for_names) {
+                (scanned, draft) = vouched;
+                flip_suppressed = true;
+            }
+        } else if frame_only(entry, &draft, known, engine_for_names) {
+            // No reference to demote, yet the draft diverges from the
+            // prior while every file renders what the record claims:
+            // the entry's own tree after another tree republished it
+            // (the claimed blobs the flip detached may even be
+            // reclaimed by now — the tree needs none of them stored on
+            // its behalf, and no manifest is touched here).
+            flip_suppressed = true;
+        }
     }
-    store.ingest(draft, &sources)?;
-    Ok((sources.len() as u64, skips))
+    let record = placement::replace_dirs(known.to_vec(), scanned.record);
+    if (unchanged || flip_suppressed) && store.record_hit(&key).is_ok() {
+        store_placement(cwd, &key, record);
+        return Ok((0, scanned.skips));
+    }
+    let count = scanned.sources.len() as u64;
+    store.ingest(draft, &scanned.sources)?;
+    store_placement(cwd, &key, record);
+    Ok((count, scanned.skips))
+}
+
+/// Whether `draft` diverges from `prior` in frame alone: the two record
+/// the same snapshot in every respect but file bytes ([`same_snapshot`]
+/// over the draft carrying the prior's blobs, path for path), and every
+/// draft file renders what this tree's record already claims — the
+/// stored blob it was placed from, or the exact on-disk bytes the
+/// record hashed at placement. One tree's first run republishes the
+/// entry under its own root (flutter regenerates the re-rooted files it
+/// cannot validate), and every later run in any other tree would flip
+/// the frame back, each alternation paying a full republish of files
+/// whose bytes never changed. Publishing such a draft serves no one — a
+/// fresh tree regenerates its own frame regardless — so the entry stays
+/// as ingested and the tree's record absorbs the scan's identities; a
+/// run that rewrote real content hashes outside both claims, and a
+/// prior missing a dir or a path is missing content, not a frame — both
+/// still publish. Whether the store still holds a claimed blob is
+/// immaterial: nothing is published off this verdict, so nothing can
+/// dangle.
+fn frame_only(
+    prior: &EntryManifest,
+    draft: &EntryManifest,
+    known: &[PlacedDir],
+    engine_for_names: &str,
+) -> bool {
+    let claimed = draft.dirs.iter().all(|dir| {
+        let Some(files) = known
+            .iter()
+            .find(|record| record.name == dir.name_observed)
+            .map(|record| record.files.as_slice())
+        else {
+            return false;
+        };
+        dir.files.len() == files.len()
+            && dir.files.iter().all(|file| {
+                files.iter().any(|claim| {
+                    claim.path == file.path
+                        && (file.blob == claim.blob || Some(file.blob) == claim.on_disk)
+                })
+            })
+    });
+    if !claimed || prior.dirs.len() != draft.dirs.len() {
+        return false;
+    }
+    let mut shadow = draft.clone();
+    for (dir, prior_dir) in shadow.dirs.iter_mut().zip(&prior.dirs) {
+        if dir.files.len() != prior_dir.files.len() {
+            return false;
+        }
+        for (file, prior_file) in dir.files.iter_mut().zip(&prior_dir.files) {
+            if file.path != prior_file.path {
+                return false;
+            }
+            file.blob = prior_file.blob;
+        }
+    }
+    same_snapshot(prior, &shadow, engine_for_names)
+}
+
+/// The scan of every dir one ingest draft covers (see
+/// [`ingest_observed`]): the dir records and ingest sources of the
+/// draft, the scans' skip counts, the tree placement record's view of
+/// the same dirs, and how many files were vouched as re-rooted
+/// renderings of the entry's blobs ([`DirScan::rerooted`]).
+struct ScannedDirs {
+    dirs: Vec<DirRecord>,
+    sources: Vec<(PathBuf, BlobId)>,
+    skips: ScanSkips,
+    record: Vec<PlacedDir>,
+    rerooted: u64,
+}
+
+impl ScannedDirs {
+    fn with_capacity(dirs: usize) -> Self {
+        Self {
+            dirs: Vec::with_capacity(dirs),
+            sources: Vec::new(),
+            skips: ScanSkips::default(),
+            record: Vec::with_capacity(dirs),
+            rerooted: 0,
+        }
+    }
+
+    /// Adds one scanned dir under the name POST knows it by.
+    fn push(
+        &mut self,
+        name: String,
+        name_rule: NameRule,
+        name_defines: BTreeMap<String, String>,
+        name_output_dir: String,
+        scan: DirScan,
+    ) {
+        self.sources.extend(scan.sources);
+        self.skips.add(&scan.skipped);
+        self.rerooted += scan.rerooted;
+        self.record.push(PlacedDir {
+            name: name.clone(),
+            files: scan.record,
+        });
+        self.dirs.push(DirRecord {
+            name_observed: name,
+            name_rule,
+            name_defines,
+            name_output_dir,
+            files: scan.files,
+        });
+    }
+}
+
+/// Writes `dirs` as this tree's placement record for `key` (see
+/// [`crate::placement`]). Best-effort: a record that fails to land
+/// costs the next run the re-hash the record would have spared, and
+/// that run writes it again — one stderr line says so.
+fn store_placement(project_root: &Path, key: &str, dirs: Vec<PlacedDir>) {
+    let record = PlacementRecord {
+        key: key.to_owned(),
+        dirs,
+    };
+    if let Err(err) = placement::store(project_root, &record) {
+        note(&format!(
+            "placement record for {} not written: {err}",
+            &key[..8]
+        ));
+    }
 }
 
 /// The largest re-hashed file an unchanged rerun leaves on a stale
@@ -1517,31 +1908,67 @@ fn ingest_observed(
 /// under a millisecond, below the cost of a manifest publish.
 const STALE_STAMP_LIMIT: u64 = 1 << 20;
 
-/// Whether `draft` records exactly `prior`'s snapshot: every field,
-/// dir, name, and file byte (blob) equal — file stamps and the entry
-/// timestamps aside, which are bookkeeping of WHEN, not WHAT.
-fn same_snapshot(prior: &EntryManifest, draft: &EntryManifest) -> bool {
-    let normalized = |manifest: &EntryManifest| {
-        let mut manifest = manifest.clone();
-        manifest.created_at_unix = 0;
-        manifest.last_hit_unix = 0;
-        for file in manifest
-            .dirs
-            .iter_mut()
-            .flat_map(|dir| dir.files.iter_mut())
-        {
-            file.stamp = None;
-        }
-        manifest
+/// Whether `draft` records exactly `prior`'s snapshot: the same key,
+/// defines, target, toolchain, and cache roots, and dir for dir the
+/// same rule, naming, and file bytes (blobs) — file stamps, the entry
+/// timestamps, and the tree the entry was ingested from aside, which
+/// are bookkeeping of WHEN and WHERE, not WHAT. Naming is compared
+/// across trees: a template dir's name embeds its tree's absolute
+/// output dir, so the prior's naming is re-aimed at the draft's tree
+/// first (exactly the replay's recomputation, [`replayed_hash_name`]).
+/// A tree that re-roots the entry's bookkeeping and reproduces it
+/// holds the entry's snapshot, and the entry stays as ingested.
+fn same_snapshot(prior: &EntryManifest, draft: &EntryManifest, engine_for_names: &str) -> bool {
+    let target = Path::new(&draft.worktree_root_at_ingest);
+    let ingest_root = prior.worktree_root_at_ingest.as_str();
+    let same_file = |prior: &ManifestFile, draft: &ManifestFile| {
+        prior.path == draft.path
+            && prior.blob == draft.blob
+            && prior.executable == draft.executable
+            && prior.rewrite == draft.rewrite
+            && prior.foreign_paths == draft.foreign_paths
     };
-    normalized(prior) == normalized(draft)
+    let same_dir = |prior: &DirRecord, draft: &DirRecord| {
+        prior.name_rule == draft.name_rule
+            && replayed_hash_name(prior, ingest_root, target, engine_for_names)
+                == draft.name_observed
+            && rerooted(&prior.name_output_dir, ingest_root, target) == draft.name_output_dir
+            && prior.name_defines.len() == draft.name_defines.len()
+            && prior.name_defines.iter().zip(&draft.name_defines).all(
+                |((name, value), (draft_name, draft_value))| {
+                    name == draft_name && rerooted(value, ingest_root, target) == *draft_value
+                },
+            )
+            && prior.files.len() == draft.files.len()
+            && prior
+                .files
+                .iter()
+                .zip(&draft.files)
+                .all(|(p, d)| same_file(p, d))
+    };
+    prior.key == draft.key
+        && prior.pub_cache_root == draft.pub_cache_root
+        && prior.flutter_root_at_ingest == draft.flutter_root_at_ingest
+        && prior.defines == draft.defines
+        && prior.target == draft.target
+        && prior.toolchain == draft.toolchain
+        && prior.dirs.len() == draft.dirs.len()
+        && prior
+            .dirs
+            .iter()
+            .zip(&draft.dirs)
+            .all(|(p, d)| same_dir(p, d))
 }
 
-/// GC when the store is over budget or its volume is short of the
-/// free-space reserve (the O(1) running usage counter plus one
-/// `statvfs` decide; the full walk only runs once gc actually collects
-/// — see [`CasStore::over_budget`]). Failures surface as one stderr
-/// line and never affect the build.
+/// Post-ingest store upkeep. Over budget — or with the store's volume
+/// short of the free-space reserve; the O(1) running usage counter plus
+/// one `statvfs` decide, see [`CasStore::over_budget`] — the full gc runs
+/// (which reclaims detached blobs first). Under budget, the targeted
+/// [`CasStore::reclaim_detached`] takes the blobs this ingest (or an
+/// earlier one a pin deferred) detached, without walking the blobs — a
+/// warm `flutter test` loop then holds one kernel per entry instead of
+/// one per run. Failures surface as one stderr line and never affect the
+/// build.
 fn maybe_gc(store: &CasStore, config: &ShimConfig) {
     match store.over_budget(config.budget_bytes) {
         Ok(true) => {
@@ -1549,7 +1976,11 @@ fn maybe_gc(store: &CasStore, config: &ShimConfig) {
                 note(&err);
             }
         }
-        Ok(false) => {}
+        Ok(false) => {
+            if let Err(err) = store.reclaim_detached() {
+                note(&err);
+            }
+        }
         Err(err) => note(&err),
     }
 }
@@ -1567,7 +1998,7 @@ fn maybe_gc(store: &CasStore, config: &ShimConfig) {
 /// Safety: a stale cache yields a wrong fingerprint, hence a wrong
 /// key, hence a lookup miss — entries live under their true keys, so a
 /// stale cache can never serve a wrong hit. The same argument covers
-/// the version gate: a gate that passes on a stale `3.47.1` only
+/// the version gate: a gate that passes on a stale supported stamp only
 /// produces misses, and the negative record only skips a rehash whose
 /// result the gate would discard anyway.
 fn cached_fingerprint(root: &Path, store_root: &Path) -> Result<ToolchainFingerprint> {
@@ -1606,7 +2037,7 @@ fn store_fingerprint_cache(store_root: &Path, root: &Path, fingerprint: &Toolcha
         fs::create_dir_all(&dir)?;
         let bytes = serde_json::to_vec(&cache)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let name = if fingerprint.flutter_version == SUPPORTED_FLUTTER_VERSION {
+        let name = if supported_flutter_version(&fingerprint.flutter_version) {
             "toolchain.json"
         } else {
             "toolchain-unsupported.json"
@@ -1668,74 +2099,29 @@ fn artifact_stamp(path: &Path) -> Option<ArtifactStamp> {
     })
 }
 
-/// Resolves the flutter binary the shim spawns: the config override,
-/// then `$DARTQ_FLUTTER`, then a PATH search that skips the shim
-/// binary itself (either an explicit override or a PATH hit resolving
-/// to this executable would recurse — each shim spawning another at
-/// ~210 processes/second, audit A10; the refusal below fires first).
-/// Symlinks resolve to the real SDK binary. Returns `None` — after one
-/// explanatory stderr line naming both paths — when the resolution IS
-/// this executable; the caller's not-found exit (127) then applies.
-pub fn discover_flutter(explicit: Option<&Path>, own_exe: Option<&Path>) -> Option<PathBuf> {
-    let own = own_exe.and_then(|exe| fs::canonicalize(exe).ok());
-    if let Some(path) = explicit {
-        return non_recursing(path, own.as_deref());
-    }
-    if let Some(path) = std::env::var_os("DARTQ_FLUTTER").filter(|value| !value.is_empty()) {
-        return non_recursing(&PathBuf::from(path), own.as_deref());
-    }
-    let dirs: Vec<PathBuf> =
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-    first_flutter_on_path(&dirs, own.as_deref())
-}
-
-/// A resolved-by-configuration flutter path, canonicalized when
-/// possible and refused when it names this executable: spawning it
-/// would fork-bomb the shim into itself (audit A10). The message names
-/// both the requested and the current path so the misconfiguration is
-/// visible in one line.
-fn non_recursing(path: &Path, own: Option<&Path>) -> Option<PathBuf> {
-    let resolved = match fs::canonicalize(path) {
-        Ok(resolved) => resolved,
-        // Unresolvable (absent, dangling symlink): hand the path on
-        // verbatim — the spawn fails with its own diagnostic later.
-        Err(_) => return Some(path.to_path_buf()),
-    };
-    if let Some(own_path) = own
-        && own_path == resolved.as_path()
-    {
-        note(&format!(
-            "refusing to run flutter at {}: it is this shim itself ({}) — point the build_cache `flutter` setting or DARTQ_FLUTTER at the real SDK binary",
-            resolved.display(),
-            own_path.display()
-        ));
-        return None;
-    }
-    Some(resolved)
-}
-
-/// The PATH-search core of [`discover_flutter`]: the first `flutter` on
-/// `dirs` that is not the shim executable itself (compared after
-/// symlink resolution). Only the shim BINARY is excluded — audit A10:
-/// excluding the shim's entire directory also hid a real SDK flutter
-/// installed beside it.
-fn first_flutter_on_path(dirs: &[PathBuf], exclude_file: Option<&Path>) -> Option<PathBuf> {
-    for dir in dirs {
-        let candidate = dir.join("flutter");
-        if !candidate.is_file() {
-            continue;
-        }
-        match fs::canonicalize(&candidate) {
-            Ok(resolved) => {
-                if exclude_file == Some(resolved.as_path()) {
-                    continue;
-                }
-                return Some(resolved);
-            }
-            Err(_) => continue,
-        }
-    }
-    None
+/// Resolves the flutter binary the shim spawns, the way every dartq
+/// face resolves it ([`dartq_toolchain::find_flutter`]): the config
+/// override, then `$DARTQ_FLUTTER`, then a PATH search that skips the
+/// running dartq binary itself (either an explicit override or a PATH
+/// hit resolving to this executable would recurse — each shim spawning
+/// another at ~210 processes/second, audit A10; the shared resolver's
+/// refusal fires first, as one `dartq: refusing to run flutter at …`
+/// stderr line naming both paths — the shim's old `dartq-bcache:`
+/// prefix on that line is gone with the duplicate). Returns `None`
+/// when nothing resolves or the resolution IS this executable; the
+/// caller's not-found exit (127) then applies.
+///
+/// The shim's contract that symlinks resolve to the real SDK binary is
+/// kept here: the shared PATH step returns the entry as found (an fvm
+/// shim, a `~/fvm/default/bin/flutter` link), and this face
+/// canonicalizes it once. Every later consumer keys through
+/// [`key::flutter_root`], which canonicalizes anyway; the spawn runs
+/// the real binary either way (flutter's wrapper script follows its
+/// own links). An unresolvable override passes through verbatim — the
+/// spawn, not the lookup, reports it.
+#[must_use]
+pub fn discover_flutter(explicit: Option<&Path>) -> Option<PathBuf> {
+    dartq_toolchain::find_flutter(explicit).map(|found| fs::canonicalize(&found).unwrap_or(found))
 }
 
 /// `now`, floored to whole seconds: the conservative fallback touch
@@ -2856,6 +3242,547 @@ mod tests {
         );
     }
 
+    // ---- the multi-line model gate ---------------------------------
+
+    #[test]
+    fn version_line_parses_release_stamps_only() {
+        assert_eq!(version_line("3.47.1"), Some((3, 47)));
+        assert_eq!(version_line("3.47.0"), Some((3, 47)));
+        assert_eq!(version_line("0.0.0"), Some((0, 0)));
+        // Pre-release and build suffixes, short stamps, and malformed
+        // spellings match no line: the gate stays exact-shape.
+        for stamp in [
+            "3.47.0-1.0.pre",
+            "3.47.1+hotfix",
+            "3.47",
+            "3.47.1.2",
+            "3.47.x",
+            "3.47.-1",
+            "3.47.+1",
+            "v3.47.1",
+            "",
+            "unknown",
+        ] {
+            assert_eq!(version_line(stamp), None, "{stamp}");
+        }
+    }
+
+    #[test]
+    fn version_gate_admits_exactly_the_supported_lines() {
+        for stamp in [
+            "3.32.0", "3.35.0", "3.38.1", "3.41.9", "3.44.0", "3.44.3", "3.47.0", "3.47.1",
+        ] {
+            assert!(supported_flutter_version(stamp), "{stamp}");
+        }
+        for stamp in [
+            "3.29.3",
+            "3.29.0",
+            "3.27.0",
+            "3.24.5",
+            "3.19.6",
+            "3.10.6",
+            "3.33.0",
+            "3.46.0",
+            "3.48.0",
+            "3.47.0-1.0.pre",
+        ] {
+            assert!(!supported_flutter_version(stamp), "{stamp}");
+        }
+    }
+
+    /// The per-line golden: a toolchain stamped `stamp` runs the full
+    /// modeled path — the gate admits its LINE — and the fingerprint
+    /// record lands under the supported name.
+    fn assert_full_shim_path(stamp: &str) {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, stamp);
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "app");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture(cwd, DIR_MAIN);
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.action, Action::Ingested, "{stamp}");
+        assert_eq!(report.reason, "pre_miss", "{stamp}");
+        assert!(report.key.is_some(), "the gate admitted {stamp}");
+        let meta = store_root.join("meta");
+        assert!(meta.join("toolchain.json").is_file(), "{stamp}");
+        assert!(!meta.join("toolchain-unsupported.json").exists(), "{stamp}");
+    }
+
+    /// 3.47.0: the baseline line's other installed patch.
+    #[test]
+    fn supported_line_patch_runs_the_full_shim_path() {
+        assert_full_shim_path("3.47.0");
+    }
+
+    #[test]
+    fn supported_line_3_44_runs_the_full_shim_path() {
+        assert_full_shim_path("3.44.0");
+    }
+
+    #[test]
+    fn supported_line_3_41_runs_the_full_shim_path() {
+        assert_full_shim_path("3.41.9");
+    }
+
+    #[test]
+    fn supported_line_3_38_runs_the_full_shim_path() {
+        assert_full_shim_path("3.38.1");
+    }
+
+    #[test]
+    fn supported_line_3_35_runs_the_full_shim_path() {
+        assert_full_shim_path("3.35.0");
+    }
+
+    #[test]
+    fn supported_line_3_32_runs_the_full_shim_path() {
+        assert_full_shim_path("3.32.0");
+    }
+
+    // The latest patch of each line, pinned after its region diff was
+    // classified hunk by hunk (see [`REVIEWED_LINES`] and the per-line
+    // notes on [`SUPPORTED_FLUTTER_LINES`]).
+    #[test]
+    fn supported_line_3_32_8_runs_the_full_shim_path() {
+        assert_full_shim_path("3.32.8");
+    }
+
+    #[test]
+    fn supported_line_3_35_7_runs_the_full_shim_path() {
+        assert_full_shim_path("3.35.7");
+    }
+
+    #[test]
+    fn supported_line_3_38_10_runs_the_full_shim_path() {
+        assert_full_shim_path("3.38.10");
+    }
+
+    #[test]
+    fn supported_line_3_44_9_runs_the_full_shim_path() {
+        assert_full_shim_path("3.44.9");
+    }
+
+    #[test]
+    fn supported_line_3_47_9_runs_the_full_shim_path() {
+        assert_full_shim_path("3.47.9");
+    }
+
+    // ---- the flutter_tools source-region harness -------------------
+    //
+    // The mechanical basis of [`SUPPORTED_FLUTTER_LINES`]: each enabled
+    // line pins the digests of the flutter_tools source regions of
+    // every patch that was classified hunk by hunk, and every installed
+    // patch of the line must hash to one of them. Everything here
+    // except the table check
+    // reads an fvm-managed SDK checkout and therefore SKIPS (or, for the
+    // probe, refuses to run) when none is present — a CI machine has no
+    // fvm. `DARTQ_FVM_HOME` relocates the versions root (default
+    // `$HOME/fvm`).
+
+    /// Each enabled line's reviewed flutter_tools: EVERY patch whose
+    /// [`MODEL_REGIONS`] were classified hunk by hunk against the line's
+    /// derivation baseline (see [`SUPPORTED_FLUTTER_LINES`]) with its
+    /// [`region_digest`], oldest patch first. 3.47.1 is the model's
+    /// derivation source. An installed patch of an enabled line passes
+    /// the tripwire when its digest matches ANY of its line's pins; a
+    /// line's later pins carry the patch-review notes recorded on the
+    /// line in [`SUPPORTED_FLUTTER_LINES`].
+    const REVIEWED_LINES: &[((u32, u32), &[(&str, &str)])] = &[
+        (
+            (3, 32),
+            &[
+                ("3.32.0", "1fe30f9f57945a3d22b456901db0fe7b"),
+                ("3.32.8", "1e6686488d29d1bab4dedc53131ae307"),
+            ],
+        ),
+        (
+            (3, 35),
+            &[
+                ("3.35.0", "8cf08ac333fd85a13159e6202d0b6247"),
+                ("3.35.7", "5827e14e6a1295cd73807ad7a4bd9f98"),
+            ],
+        ),
+        (
+            (3, 38),
+            &[
+                ("3.38.1", "2f3efc0a8d8518f49c4c9ea60ee49cd8"),
+                ("3.38.10", "12531edd865367e7ae2f50b58018963f"),
+            ],
+        ),
+        ((3, 41), &[("3.41.9", "8353dd6f37388a63c6d073d6ba4df1da")]),
+        (
+            (3, 44),
+            &[
+                ("3.44.0", "23a71b4ec7214f7726638d99cd27387f"),
+                ("3.44.9", "23a71b4ec7214f7726638d99cd27387f"),
+            ],
+        ),
+        (
+            (3, 47),
+            &[
+                ("3.47.1", "2f814ff47408e470995eb5720ec8fbc4"),
+                ("3.47.9", "02a9960e7b34d044503fc7d95f5490a8"),
+            ],
+        ),
+    ];
+
+    /// The flutter_tools source regions the model generation pins, as
+    /// paths under `packages/flutter_tools/`:
+    ///
+    /// * the runner pair — the GLOBAL option table
+    ///   (`flutter_command_runner.dart`) and every shared option helper
+    ///   the command grammars call (`flutter_command.dart`);
+    /// * the modeled commands' own declarations — the per-subcommand
+    ///   option tables and default build modes (`build*.dart`, plus
+    ///   `build.dart`'s command registry), `run.dart`, `test.dart`, and
+    ///   the assemble argv model (`assemble.dart`);
+    /// * the build-dir name formula and `.filecache`/persist contract
+    ///   (`build_system.dart`, `file_store.dart`);
+    /// * the deferred-components target names the assemble gate keys
+    ///   (`targets/android.dart`);
+    /// * `build_info.dart` — `getBuildDirectory`, the injected-define
+    ///   set, `getDefaultCachedKernelPath`, and
+    ///   `toBuildSystemEnvironment` (the bundle face's define map);
+    /// * `bundle_builder.dart` — the `build bundle` define map and
+    ///   asset-dir handling;
+    /// * `test_compiler.dart` — the `<buildDir>/test_cache` kernel-cache
+    ///   path;
+    /// * `pubspec.yaml` — the `package:args` pin whose parser semantics
+    ///   the argv model mirrors.
+    ///
+    /// A file that moved or vanished counts as drift (see
+    /// [`region_digest`]).
+    const MODEL_REGIONS: &[&str] = &[
+        "lib/src/runner/flutter_command_runner.dart",
+        "lib/src/runner/flutter_command.dart",
+        "lib/src/commands/build.dart",
+        "lib/src/commands/build_apk.dart",
+        "lib/src/commands/build_appbundle.dart",
+        "lib/src/commands/build_bundle.dart",
+        "lib/src/commands/build_ios.dart",
+        "lib/src/commands/build_linux.dart",
+        "lib/src/commands/build_macos.dart",
+        "lib/src/commands/build_web.dart",
+        "lib/src/commands/build_windows.dart",
+        "lib/src/commands/run.dart",
+        "lib/src/commands/test.dart",
+        "lib/src/commands/assemble.dart",
+        "lib/src/build_system/build_system.dart",
+        "lib/src/build_system/file_store.dart",
+        "lib/src/build_system/targets/android.dart",
+        "lib/src/build_info.dart",
+        "lib/src/bundle_builder.dart",
+        "lib/src/test/test_compiler.dart",
+        "pubspec.yaml",
+    ];
+
+    /// The fvm versions root: `$DARTQ_FVM_HOME/versions`, else
+    /// `$HOME/fvm/versions`; `None` when it does not exist (no fvm on
+    /// this machine — the region tests then skip).
+    fn fvm_versions_root() -> Option<PathBuf> {
+        let root = match std::env::var_os("DARTQ_FVM_HOME") {
+            Some(home) => PathBuf::from(home).join("versions"),
+            None => PathBuf::from(std::env::var_os("HOME")?)
+                .join("fvm")
+                .join("versions"),
+        };
+        root.is_dir().then_some(root)
+    }
+
+    /// `frameworkVersion` of one version dir's flutter.version.json —
+    /// the same stamp the toolchain fingerprint reads.
+    fn version_stamp(root: &Path, version: &str) -> Option<String> {
+        let manifest = fs::read(
+            root.join(version)
+                .join("bin")
+                .join("cache")
+                .join("flutter.version.json"),
+        )
+        .ok()?;
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&manifest))
+            .ok()?
+            .get("frameworkVersion")?
+            .as_str()
+            .filter(|stamp| !stamp.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Component-wise numeric stamp order (`3.38.9` < `3.38.10`; a
+    /// non-numeric component parses as `None` and sorts lowest).
+    fn stamp_order(a: &str, b: &str) -> std::cmp::Ordering {
+        let components = |stamp: &str| {
+            stamp
+                .split('.')
+                .map(|part| part.parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        };
+        components(a).cmp(&components(b))
+    }
+
+    /// Every fvm version dir that carries a readable stamp, oldest
+    /// stamp first (component-wise numeric; ties keep directory order —
+    /// the order is presentation only, never a correctness input).
+    fn installed_versions(root: &Path) -> Vec<(String, String)> {
+        let mut versions: Vec<(String, String)> = fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let stamp = version_stamp(root, &name)?;
+                Some((name, stamp))
+            })
+            .collect();
+        versions.sort_by(|a, b| stamp_order(&a.1, &b.1).then_with(|| a.0.cmp(&b.0)));
+        versions
+    }
+
+    /// The md5 of `version`'s [`MODEL_REGIONS`]: per region in table
+    /// order, its path, a NUL, its byte length (u64 LE), and its bytes.
+    /// `None` when a region is missing — a moved or vanished file is
+    /// drift.
+    fn region_digest(root: &Path, version: &str) -> Option<String> {
+        use md5::{Digest, Md5};
+        let tools = root.join(version).join("packages").join("flutter_tools");
+        let mut md5 = Md5::new();
+        for region in MODEL_REGIONS {
+            let bytes = fs::read(tools.join(region)).ok()?;
+            md5.update(region.as_bytes());
+            md5.update([0_u8]);
+            md5.update((bytes.len() as u64).to_le_bytes());
+            md5.update(&bytes);
+        }
+        Some(format!("{:x}", md5.finalize()))
+    }
+
+    /// The [`REVIEWED_LINES`] row of `stamp`'s line, if it is enabled:
+    /// the line with its reviewed (patch, digest) pins.
+    fn reviewed_line(
+        stamp: &str,
+    ) -> Option<&'static ((u32, u32), &'static [(&'static str, &'static str)])> {
+        let line = version_line(stamp)?;
+        REVIEWED_LINES
+            .iter()
+            .find(|(reviewed, _)| *reviewed == line)
+    }
+
+    /// The kernel files every flutter SDK ships in its own format: the
+    /// Dart VM platform and flutter's patched-SDK platform.
+    fn platform_dills(root: &Path, version: &str) -> [PathBuf; 2] {
+        let cache = root.join(version).join("bin").join("cache");
+        [
+            cache
+                .join("dart-sdk")
+                .join("lib")
+                .join("_internal")
+                .join("vm_platform_strong.dill"),
+            cache
+                .join("artifacts")
+                .join("engine")
+                .join("common")
+                .join("flutter_patched_sdk")
+                .join("platform_strong.dill"),
+        ]
+    }
+
+    /// Enabling a line pins its reviewed regions: the reviewed table and
+    /// [`SUPPORTED_FLUTTER_LINES`] name the same lines in the same
+    /// (ascending) order, every reviewed patch belongs to its line, and
+    /// each line's pins are sorted oldest-patch-first and distinct.
+    #[test]
+    fn reviewed_lines_pin_exactly_the_supported_lines() {
+        let lines: Vec<(u32, u32)> = REVIEWED_LINES.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, SUPPORTED_FLUTTER_LINES);
+        assert!(
+            SUPPORTED_FLUTTER_LINES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "supported lines are sorted and distinct"
+        );
+        for (line, pins) in REVIEWED_LINES {
+            assert!(!pins.is_empty(), "{line:?} has no reviewed patch");
+            let stamps = pins.iter().map(|(patch, _)| *patch).collect::<Vec<_>>();
+            assert!(
+                stamps
+                    .windows(2)
+                    .all(|pair| stamp_order(&pair[0], &pair[1]) != std::cmp::Ordering::Greater),
+                "{line:?}: pins are sorted oldest-first: {stamps:?}"
+            );
+            for (patch, digest) in pins.iter() {
+                assert_eq!(version_line(patch), Some(*line), "{patch}");
+                assert!(
+                    digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{patch}: {digest}"
+                );
+            }
+        }
+    }
+
+    /// The enabling backstop: every INSTALLED flutter whose stamp names
+    /// a supported line must hash its regions to one of the line's
+    /// reviewed digests — a patch of an enabled line whose flutter_tools
+    /// drifted (or is simply not yet reviewed) fails here instead of
+    /// being mis-modeled (see [`SUPPORTED_FLUTTER_LINES`]). Skips when
+    /// no fvm versions root exists (CI machines have none).
+    #[test]
+    fn supported_line_patches_match_their_reviewed_regions() {
+        let Some(root) = fvm_versions_root() else {
+            return;
+        };
+        let drifted: Vec<String> = installed_versions(&root)
+            .into_iter()
+            .filter_map(|(name, stamp)| {
+                let (_, pins) = reviewed_line(&stamp)?;
+                let actual = region_digest(&root, &name);
+                let matches = actual
+                    .as_deref()
+                    .is_some_and(|digest| pins.iter().any(|(_, pinned)| *pinned == digest));
+                (!matches).then(|| {
+                    let reviewed = pins
+                        .iter()
+                        .map(|(patch, digest)| format!("{patch} ({digest})"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "{name} ({stamp}): regions {} match no reviewed patch of its line \
+                         (reviewed: {reviewed}) — classify its region diff or exclude the patch",
+                        actual.as_deref().unwrap_or("missing")
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "installed patches of supported lines drifted from their reviewed \
+             flutter_tools regions:\n{}",
+            drifted.join("\n")
+        );
+    }
+
+    /// The kernel files of every installed patch of an enabled line walk
+    /// through [`crate::dill_rewrite`]: a no-match rewrite reproduces
+    /// each byte for byte (every table boundary, padding run, and footer
+    /// field lands where the official writer put it), relocating its
+    /// `org-dartlang-sdk:///` URIs and back rewrites the same strings
+    /// both ways, and the relocated dill re-walks byte for byte. Skips
+    /// without an fvm versions root.
+    #[test]
+    fn supported_line_platform_dills_walk_through_the_rewriter() {
+        use crate::dill_rewrite::rewrite_file;
+        const ABSENT: &[u8] = b"file:///dartq-absent-root/";
+        const OTHER: &[u8] = b"file:///dartq-other-root/";
+        const SDK: &[u8] = b"org-dartlang-sdk:///";
+        const RELOCATED: &[u8] = b"org-dartlang-sdk:///dartq-relocated/";
+        let Some(root) = fvm_versions_root() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let out = |name: &str| scratch.path().join(name);
+        let bytes = |path: &Path| fs::read(path).expect("read dill");
+        for (name, stamp) in installed_versions(&root) {
+            if !supported_flutter_version(&stamp) {
+                continue;
+            }
+            for dill in platform_dills(&root, &name) {
+                if !dill.is_file() {
+                    continue;
+                }
+                let what = format!("{name} ({stamp}) {}", dill.display());
+                let rewrite = |src: &Path, dst: &str, from: &[u8], to: &[u8]| {
+                    rewrite_file(src, &out(dst), from, to)
+                        .unwrap_or_else(|err| panic!("{what}: {err}"))
+                };
+                let noop = rewrite(&dill, "noop", ABSENT, OTHER);
+                assert_eq!((noop.source_uris, noop.strings), (0, 0), "{what}");
+                assert!(
+                    bytes(&out("noop")) == bytes(&dill),
+                    "{what}: a no-match rewrite is byte-identical"
+                );
+                let there = rewrite(&dill, "there", SDK, RELOCATED);
+                assert!(there.source_uris > 0, "{what}: no SDK URI relocated");
+                let back = rewrite(&out("there"), "back", RELOCATED, SDK);
+                assert_eq!(
+                    (back.source_uris, back.strings),
+                    (there.source_uris, there.strings),
+                    "{what}: relocation and its inverse rewrite the same strings"
+                );
+                rewrite(&out("there"), "again", ABSENT, OTHER);
+                assert!(
+                    bytes(&out("again")) == bytes(&out("there")),
+                    "{what}: the relocated dill re-walks byte for byte"
+                );
+            }
+        }
+    }
+
+    /// The probe for extending [`SUPPORTED_FLUTTER_LINES`]: prints every
+    /// installed version's verdict — `reviewed` (a patch of an enabled
+    /// line matching one of the line's reviewed digests, naming the
+    /// pin), `DRIFT` (one that matches none), `passthrough` (a line not
+    /// enabled: its region diff against the nearest reviewed line is the
+    /// work before enabling it) — with its region digest and kernel
+    /// format (the dill rewriter's gate). Ignored by default (evidence
+    /// gathering, not an assertion):
+    /// `cargo test -p dartq-bcache flutter_tools_region_verdicts -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "probe: run with --ignored --nocapture to survey installed SDKs"]
+    fn flutter_tools_region_verdicts() {
+        use std::io::Read as _;
+        let Some(root) = fvm_versions_root() else {
+            panic!("no fvm versions root (set DARTQ_FVM_HOME to relocate it)");
+        };
+        let installed = installed_versions(&root);
+        assert!(
+            !installed.is_empty(),
+            "no version dirs under {}",
+            root.display()
+        );
+        for (name, stamp) in installed {
+            let digest = region_digest(&root, &name);
+            let verdict = match (reviewed_line(&stamp), digest.as_deref()) {
+                (Some((line, pins)), Some(actual))
+                    if pins.iter().any(|(_, pinned)| *pinned == actual) =>
+                {
+                    let matching = pins
+                        .iter()
+                        .filter(|(_, pinned)| *pinned == actual)
+                        .map(|(patch, _)| *patch)
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    format!("reviewed (matches {matching} of {line:?})")
+                }
+                (Some((_, pins)), _) => {
+                    let reviewed = pins
+                        .iter()
+                        .map(|(patch, _)| *patch)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("DRIFT from reviewed {reviewed}")
+                }
+                (None, _) => "passthrough".to_owned(),
+            };
+            let mut head = [0_u8; 8];
+            let format = fs::File::open(&platform_dills(&root, &name)[0])
+                .and_then(|mut dill| dill.read_exact(&mut head))
+                .map_or_else(
+                    |_| "unknown".to_owned(),
+                    |()| u32::from_be_bytes([head[4], head[5], head[6], head[7]]).to_string(),
+                );
+            println!(
+                "{name} ({stamp}): {verdict}; regions {}; kernel format {format}",
+                digest.as_deref().unwrap_or("missing")
+            );
+        }
+    }
+
     /// A byte-identical fingerprint record is not rewritten: the file's
     /// mtime survives a second store call (a rewrite would bump it past
     /// the sleep), a changed record is.
@@ -3503,8 +4430,8 @@ mod tests {
 
     /// The warm apk shape with one rewritten payload: only that file is
     /// re-hashed and stored, the bookkeeping references stay put — and
-    /// the superseded payload blob stays gc-able while the entry
-    /// survives.
+    /// the run's own upkeep reclaims the superseded payload blob while
+    /// the entry survives.
     #[cfg(unix)]
     #[test]
     fn warm_hit_run_rehashes_only_the_file_flutter_rewrote() {
@@ -3586,17 +4513,22 @@ mod tests {
             "the untouched stamp reference is kept"
         );
 
-        // The superseded payload is unreferenced and gc-able; the entry
-        // and its current blobs survive.
+        // The run's own upkeep reclaimed the superseded payload — no hour
+        // in gc's in-flight window — and nothing else: a later full pass
+        // finds no garbage, and the entry and its blobs survive.
         let superseded = BlobId(*blake3::hash(b"kernel payload bytes").as_bytes());
         assert!(
-            store.blob_path(&superseded).exists(),
-            "unreferenced until gc"
+            !store.blob_path(&superseded).exists(),
+            "the detached payload is reclaimed by the run itself"
+        );
+        assert_eq!(
+            store.used_bytes().expect("used"),
+            store.stats().expect("stats").blob_bytes,
+            "the reclaim books the counter down"
         );
         let report = store.gc(u64::MAX, 0, unix_now() + 2 * 3600).expect("gc");
         assert_eq!(report.entries_evicted, 0, "the entry survives");
-        assert_eq!(report.blobs_removed, 1, "only the superseded payload goes");
-        assert!(!store.blob_path(&superseded).exists());
+        assert_eq!(report.blobs_removed, 0, "nothing else was garbage");
         assert!(store.lookup(&key).expect("lookup").is_some());
     }
 
@@ -3683,7 +4615,497 @@ mod tests {
             by_path(&seed_manifest, "flutter_build.dill.stamp"),
             "the rewritten file got a fresh blob"
         );
-        assert_eq!(store.stats().expect("stats").blobs, seed_blobs + 1);
+        assert_eq!(
+            store.stats().expect("stats").blobs,
+            seed_blobs,
+            "the rewritten stamp's fresh blob replaced the superseded one, which the run reclaimed"
+        );
+    }
+
+    /// A payload past [`STALE_STAMP_LIMIT`]: re-hashed as a source it
+    /// forces a publish, so `ingested 0` with it in the dir proves the
+    /// post-run scan never read it — the tree record vouched it by
+    /// stamp.
+    fn large_payload() -> Vec<u8> {
+        vec![0x90u8; STALE_STAMP_LIMIT as usize + 1]
+    }
+
+    /// The `build bundle` fixture dir with a large payload (see
+    /// [`large_payload`]).
+    fn build_fixture_large(project: &Path, name: &str) -> PathBuf {
+        let dir = build_fixture(project, name);
+        write(&dir.join("app.dill"), &large_payload());
+        dir
+    }
+
+    /// Flutter's every-build bookkeeping rewrite, as a run effect: the
+    /// file is written back byte for byte and its mtime moved a second
+    /// on, so the identity the placement recorded no longer matches and
+    /// only the bytes can vouch for it.
+    fn rewrite_byte_identical(path: &Path) {
+        let bytes = fs::read(path).expect("read bookkeeping");
+        fs::write(path, bytes).expect("rewrite bookkeeping");
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(SystemTime::now() + Duration::from_secs(1))
+            .expect("move mtime");
+    }
+
+    /// Seeds the bundle entry from `tree` with the large fixture:
+    /// the cold run, its key, and the store.
+    fn seed_large_bundle(tree: &Path, config: &ShimConfig) -> (String, CasStore) {
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                build_fixture_large(cwd, DIR_MAIN);
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), tree, config, &mut runner);
+        assert_eq!(seeded.action, Action::Ingested);
+        assert_eq!(seeded.ingest_files, 3, "the cold run stores the whole dir");
+        let key = seeded.key.expect("post key");
+        let store = CasStore::open(&config.store_root).expect("open store");
+        (key, store)
+    }
+
+    /// A warm run of the bundle face in `tree` whose only effect is
+    /// flutter's byte-identical rewrite of the stamp file.
+    fn validate_only_run(tree: &Path, config: &ShimConfig) -> ShimReport {
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                rewrite_byte_identical(
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
+                        .join("flutter_build.dill.stamp"),
+                );
+            })),
+        };
+        run_shim(&raw_argv(&BUNDLE_ARGV), tree, config, &mut runner)
+    }
+
+    /// The F5 shape, closed: a wiped tree's hit re-places every file
+    /// under fresh identities and publishes nothing (the entry is
+    /// reproduced); the next run in that tree — which the manifest's
+    /// stamps, naming the cold run's files, cannot vouch for — reads
+    /// nothing and publishes nothing either, because the tree's
+    /// placement record vouches the re-placed files by stamp and the
+    /// rewritten bookkeeping by its bytes. The large payload makes a
+    /// read observable: re-hashed, it would have forced a publish.
+    #[test]
+    fn wiped_tree_hit_then_same_tree_run_publishes_and_reads_nothing() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "a");
+        let (key, store) = seed_large_bundle(&tree, &config);
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let seed_blobs = store.stats().expect("stats").blobs;
+
+        // The wipe-and-hit: everything is re-placed under new inodes.
+        fs::remove_dir_all(tree.join(".dart_tool").join("flutter_build")).expect("wipe");
+        let report = validate_only_run(&tree, &config);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.reason, "pre_hit");
+        assert_eq!(report.ingest_files, 0, "the hit reproduced the entry");
+        let record = placement::load(&tree, &key).expect("the placement wrote the tree's record");
+        assert_eq!(record.dirs.len(), 1);
+        assert_eq!(record.dirs[0].name, DIR_MAIN);
+        assert_eq!(record.dirs[0].files.len(), 3);
+        let dill_stamp = stamp_of(
+            &fs::metadata(
+                tree.join(".dart_tool")
+                    .join("flutter_build")
+                    .join(DIR_MAIN)
+                    .join("app.dill"),
+            )
+            .expect("stat placed dill"),
+        );
+        assert!(
+            record.dirs[0]
+                .files
+                .iter()
+                .any(|file| file.path == Path::new("app.dill") && file.stamp == dill_stamp),
+            "the record names the re-placed identity"
+        );
+
+        // The same-tree run after it: nothing placed, nothing read.
+        let report = validate_only_run(&tree, &config);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(
+            report.ingest_files, 0,
+            "the record vouched every file: no re-hash, no republish"
+        );
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(
+            manifest.dirs, seed_manifest.dirs,
+            "the manifest still names the cold run's identities — it was never republished"
+        );
+        assert_eq!(store.stats().expect("stats").blobs, seed_blobs);
+        let record = placement::load(&tree, &key).expect("record");
+        assert!(
+            record.dirs[0].files.iter().all(|file| {
+                stamp_of(
+                    &fs::metadata(
+                        tree.join(".dart_tool")
+                            .join("flutter_build")
+                            .join(DIR_MAIN)
+                            .join(&file.path),
+                    )
+                    .expect("stat"),
+                ) == file.stamp
+            }),
+            "the record carries the tree's current identities, the rewritten stamp's included"
+        );
+    }
+
+    /// The #4077 shape, closed: a cross-tree hit's post-run scan vouches
+    /// the re-rooted bookkeeping as this tree's rendering of the
+    /// entry's blobs — by stamp where flutter left it alone, by bytes
+    /// where flutter rewrote it byte for byte — and publishes nothing,
+    /// so the entry keeps the tree it was ingested from; and the ingest
+    /// tree's next run vouches by its own record, so two trees sharing
+    /// the entry never republish it between them.
+    #[test]
+    fn cross_tree_hit_publishes_nothing_and_trees_do_not_ping_pong() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree_a = synthetic_project(&tmp, "a");
+        let (key, store) = seed_large_bundle(&tree_a, &config);
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let seed_blobs = store.stats().expect("stats").blobs;
+
+        // Tree B hits: the stamp and depfile land re-rooted, the
+        // payload verbatim; flutter then rewrites the stamp as placed.
+        let tree_b = synthetic_project(&tmp, "b");
+        let report = validate_only_run(&tree_b, &config);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(
+            report.ingest_files, 0,
+            "re-rooted files are vouched, not re-hashed and republished"
+        );
+        let dir_b = tree_b
+            .join(".dart_tool")
+            .join("flutter_build")
+            .join(DIR_MAIN);
+        let stamp = fs::read_to_string(dir_b.join("flutter_build.dill.stamp")).expect("stamp");
+        assert!(stamp.contains(tree_b.to_str().expect("UTF-8")));
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(
+            manifest.worktree_root_at_ingest,
+            tree_a.to_string_lossy(),
+            "the entry keeps its ingest tree"
+        );
+        assert_eq!(
+            manifest.dirs, seed_manifest.dirs,
+            "and its blobs and stamps"
+        );
+        assert_eq!(store.stats().expect("stats").blobs, seed_blobs);
+        let record_b = placement::load(&tree_b, &key).expect("tree B's record");
+        let recorded = |path: &str| {
+            record_b.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path} in the record"))
+                .clone()
+        };
+        assert!(
+            !recorded("flutter_build.dill.stamp").verbatim(),
+            "the stamp is recorded as a re-rooted rendering"
+        );
+        assert!(recorded("app.dill").verbatim());
+        let by_path = |manifest: &EntryManifest, path: &str| {
+            manifest.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path} in the manifest"))
+                .blob
+        };
+        assert_eq!(
+            recorded("flutter_build.dill.stamp").blob,
+            by_path(&seed_manifest, "flutter_build.dill.stamp"),
+            "of the entry's blob"
+        );
+
+        // Back in tree A, and in tree B again: each vouches by its own
+        // record, nothing is republished either way.
+        let report = validate_only_run(&tree_a, &config);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.ingest_files, 0, "tree A's record holds");
+        let report = validate_only_run(&tree_b, &config);
+        assert_eq!(report.ingest_files, 0, "tree B's record holds");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.worktree_root_at_ingest, tree_a.to_string_lossy());
+        assert_eq!(manifest.dirs, seed_manifest.dirs);
+        assert_eq!(store.stats().expect("stats").blobs, seed_blobs);
+    }
+
+    /// The record never masks a real change: a file flutter rewrote with
+    /// new bytes after the placement re-hashes and republishes — in the
+    /// same tree (only that file stores), and across trees, where the
+    /// entry then moves to the hit tree whole: every re-rooted file is
+    /// re-hashed to that tree's bytes, so the published manifest names
+    /// one tree and one tree's bytes.
+    #[test]
+    fn rewritten_file_after_placement_is_rehashed_and_republished() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree_a = synthetic_project(&tmp, "a");
+        let (key, store) = seed_large_bundle(&tree_a, &config);
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let by_path = |manifest: &EntryManifest, path: &str| {
+            manifest.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path} in the manifest"))
+                .blob
+        };
+
+        // Same tree, wiped and re-placed; flutter rebuilds the payload.
+        fs::remove_dir_all(tree_a.join(".dart_tool").join("flutter_build")).expect("wipe");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write(
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
+                        .join("app.dill"),
+                    b"kernel payload bytes v2",
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(report.ingest_files, 1, "only the rewritten payload stores");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(
+            by_path(&manifest, "app.dill"),
+            BlobId(*blake3::hash(b"kernel payload bytes v2").as_bytes())
+        );
+        assert_eq!(
+            by_path(&manifest, "kernel_snapshot.d"),
+            by_path(&seed_manifest, "kernel_snapshot.d"),
+            "the placed depfile is vouched by the record"
+        );
+        let record = placement::load(&tree_a, &key).expect("record");
+        assert_eq!(
+            record.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new("app.dill"))
+                .expect("recorded dill")
+                .blob,
+            by_path(&manifest, "app.dill"),
+            "the record follows the new content"
+        );
+
+        // Across trees: tree B hits, flutter rewrites the stamp with NEW
+        // bytes. The re-rooted depfile cannot stay a reference into tree
+        // A under a manifest rooted in tree B — it is re-hashed too.
+        let tree_b = synthetic_project(&tmp, "b");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                write(
+                    &cwd.join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
+                        .join("flutter_build.dill.stamp"),
+                    br#"{"inputs":[],"outputs":[]}"#,
+                );
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(
+            report.ingest_files, 2,
+            "the changed stamp and the re-rooted depfile store; the verbatim payload is reused"
+        );
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(
+            manifest.worktree_root_at_ingest,
+            tree_b.to_string_lossy(),
+            "the entry moved to tree B"
+        );
+        let depfile = fs::read_to_string(store.blob_path(&by_path(&manifest, "kernel_snapshot.d")))
+            .expect("stored depfile");
+        assert!(
+            depfile.contains(tree_b.to_str().expect("UTF-8"))
+                && !depfile.contains(tree_a.to_str().expect("UTF-8")),
+            "the stored depfile is tree B's bytes: {depfile}"
+        );
+    }
+
+    /// A frame flip is paid once, never per alternation: after tree B
+    /// published the entry under its root (real new bytes, as above),
+    /// a plain run in tree A demotes its vouched draft, re-hashes, and
+    /// finds every file rendering exactly what A's own record claims —
+    /// the prior differed only in its frame. The flip back is
+    /// suppressed: nothing publishes, the entry keeps B's frame, and
+    /// B's next run is a plain same-snapshot hit.
+    #[test]
+    fn frame_flip_is_suppressed_instead_of_ping_ponging() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree_a = synthetic_project(&tmp, "a");
+        let (key, store) = seed_large_bundle(&tree_a, &config);
+
+        // Tree B's first run rewrites the stamp with new bytes of the
+        // same class (still naming the tree): the entry publishes under
+        // B — the flip itself.
+        let tree_b = synthetic_project(&tmp, "b");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                let stamp = cwd
+                    .join(".dart_tool")
+                    .join("flutter_build")
+                    .join(DIR_MAIN)
+                    .join("flutter_build.dill.stamp");
+                let mut bytes = fs::read(&stamp).expect("placed stamp");
+                bytes.push(b'\n');
+                write(&stamp, &bytes);
+            })),
+        };
+        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        assert_eq!(report.ingest_files, 2, "real new bytes publish");
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.worktree_root_at_ingest, tree_b.to_string_lossy());
+        let flipped_dirs = manifest.dirs.clone();
+        let flipped_blobs = store.stats().expect("stats").blobs;
+
+        // Tree A, unchanged since the seed: the demotion lands on A's
+        // own claims, so the flip back is suppressed.
+        let report = validate_only_run(&tree_a, &config);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(
+            report.ingest_files, 0,
+            "a frame-only divergence never publishes"
+        );
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(
+            manifest.worktree_root_at_ingest,
+            tree_b.to_string_lossy(),
+            "the entry keeps the frame it was last published in"
+        );
+        assert_eq!(manifest.dirs, flipped_dirs);
+        assert_eq!(store.stats().expect("stats").blobs, flipped_blobs);
+        let record_a = placement::load(&tree_a, &key).expect("tree A's record");
+        assert!(
+            record_a.dirs[0].files.iter().all(|file| {
+                fs::metadata(
+                    tree_a
+                        .join(".dart_tool")
+                        .join("flutter_build")
+                        .join(DIR_MAIN)
+                        .join(&file.path),
+                )
+                .is_ok_and(|meta| stamp_of(&meta) == file.stamp)
+            }),
+            "A's record absorbed the run's identities"
+        );
+
+        // B again, then A again: plain hits both ways, no publish.
+        assert_eq!(validate_only_run(&tree_b, &config).ingest_files, 0);
+        assert_eq!(validate_only_run(&tree_a, &config).ingest_files, 0);
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs, flipped_dirs);
+        assert_eq!(store.stats().expect("stats").blobs, flipped_blobs);
+    }
+
+    /// A record is keyed: a run under another key (a provenance change)
+    /// finds no record of its own and hashes the whole dir, however
+    /// well the other key's record would have matched the same files.
+    #[test]
+    fn record_of_another_key_is_never_consulted() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "a");
+        let (key, _store) = seed_large_bundle(&tree, &config);
+        fs::remove_dir_all(tree.join(".dart_tool").join("flutter_build")).expect("wipe");
+        let report = validate_only_run(&tree, &config);
+        assert_eq!(report.ingest_files, 0);
+        assert!(placement::load(&tree, &key).is_some());
+
+        // The key moves; the same files sit in the dir under the same
+        // identities the other record names.
+        write(&tree.join("pubspec.yaml"), b"name: app\nversion: 9.0.0\n");
+        let report = validate_only_run(&tree, &config);
+        assert_eq!(report.action, Action::Ingested, "a miss under the new key");
+        let other = report.key.expect("post key");
+        assert_ne!(other, key);
+        assert_eq!(
+            report.ingest_files, 3,
+            "nothing vouched: the other key's record is not this entry's"
+        );
+        assert!(
+            placement::load(&tree, &other).is_some(),
+            "the new key got its own record"
+        );
+        assert!(
+            placement::load(&tree, &key).is_some(),
+            "the old one is untouched"
+        );
+    }
+
+    /// A record that does not decode is ignored — the run proceeds as
+    /// if the tree kept none (the manifest's stale stamps re-hash and
+    /// republish once) — and the post-run scan writes a sound record
+    /// over it.
+    #[test]
+    fn corrupt_record_is_ignored_and_rewritten() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "a");
+        let (key, _store) = seed_large_bundle(&tree, &config);
+        fs::remove_dir_all(tree.join(".dart_tool").join("flutter_build")).expect("wipe");
+        assert_eq!(validate_only_run(&tree, &config).ingest_files, 0);
+
+        let record_path = tree
+            .join(".dart_tool")
+            .join("dartq-bcache")
+            .join("placed")
+            .join(format!("{key}.json"));
+        assert!(record_path.is_file());
+        fs::write(&record_path, b"{\"key\": \"not even").expect("corrupt");
+        assert_eq!(placement::load(&tree, &key), None);
+
+        let report = validate_only_run(&tree, &config);
+        assert_eq!(report.action, Action::PreHitMaterialized);
+        assert_eq!(
+            report.ingest_files, 3,
+            "no record to vouch: the re-placed identities re-hash and the large payload forces the publish"
+        );
+        let record = placement::load(&tree, &key).expect("a sound record again");
+        assert_eq!(record.dirs[0].files.len(), 3);
+        assert_eq!(
+            validate_only_run(&tree, &config).ingest_files,
+            0,
+            "and the next run vouches by it"
+        );
     }
 
     /// `created_at` survives a re-ingest of the same key: the rewritten
@@ -3827,88 +5249,35 @@ mod tests {
         );
     }
 
-    /// A10's narrowing: the PATH search skips only the shim BINARY —
-    /// a real flutter living in the shim executable's own directory is
-    /// found (the old code excluded that entire directory) — while a
-    /// symlink to the shim in any other directory is still skipped by
-    /// file identity.
+    /// The shim's resolution is the shared one (A10 lives in
+    /// `dartq-toolchain`, whose own tests cover the PATH scan and the
+    /// self-spawn refusal): a configured flutter that IS this executable
+    /// — directly or through a symlink, the `~/.dartq/bin/flutter` shape
+    /// `dartq init` installs — yields None and no child is ever spawned;
+    /// a different binary resolves, canonical, so the fingerprint and
+    /// the spawn see the real SDK binary behind any link.
     #[cfg(unix)]
     #[test]
-    fn path_resolution_skips_only_the_shim_binary() {
+    fn discovery_refuses_this_binary_and_canonicalizes_the_rest() {
         let (_guard, tmp) = tempdir();
-        let real_dir = tmp.join("sdk").join("bin");
-        write(&real_dir.join("flutter"), b"#!/bin/sh\n# the real one\n");
-        let real = fs::canonicalize(real_dir.join("flutter")).expect("canonicalize real");
-
-        // A dartq executable and an unrelated real flutter side by
-        // side: the old directory exclusion hid the flutter; only the
-        // file identity may exclude.
-        let bin_dir = tmp.join("dartq-bin");
-        write(&bin_dir.join("dartq"), b"the dartq executable\n");
-        write(
-            &bin_dir.join("flutter"),
-            b"#!/bin/sh\n# a real flutter beside dartq\n",
-        );
-        let own = fs::canonicalize(bin_dir.join("dartq")).expect("canonicalize own");
-        let beside =
-            first_flutter_on_path(&[bin_dir.clone()], Some(&own)).expect("found beside the shim");
-        assert_eq!(
-            beside,
-            fs::canonicalize(bin_dir.join("flutter")).expect("canonicalize")
-        );
-
-        // A symlink to the shim binary in another directory is skipped
-        // by file identity, and the search moves on to the real one.
-        let alias_dir = tmp.join("alias");
-        fs::create_dir_all(&alias_dir).expect("mkdir alias");
-        std::os::unix::fs::symlink(bin_dir.join("dartq"), alias_dir.join("flutter"))
-            .expect("symlink alias");
-        let found = first_flutter_on_path(&[alias_dir, real_dir], Some(&own))
-            .expect("the alias is skipped, the real one found");
-        assert_eq!(found, real);
-
-        // Nothing but the shim on PATH: no resolution at all.
-        assert_eq!(
-            first_flutter_on_path(&[bin_dir.join("nowhere")], Some(&own)),
-            None
-        );
-    }
-
-    /// A10: a configured flutter (config key, DARTQ_FLUTTER, or a PATH
-    /// hit) that resolves to this executable is refused — spawning it
-    /// would recurse the shim into itself. The refusal yields None
-    /// (the caller's not-found exit applies) after one line naming
-    /// both paths; no child is ever spawned.
-    #[cfg(unix)]
-    #[test]
-    fn discovery_refuses_a_flutter_that_is_this_shim() {
-        let (_guard, tmp) = tempdir();
-        let shim = tmp.join("dartq");
-        write(&shim, b"the shim executable\n");
-        let canonical = fs::canonicalize(&shim).expect("canonicalize");
-
-        // The explicit config path pointing straight at the shim.
-        assert_eq!(discover_flutter(Some(&shim), Some(&shim)), None);
-        // ... and through a symlink to it (the ~/.dartq/bin/flutter
-        // shape `dartq init` installs).
+        let this = std::env::current_exe().expect("test binary");
+        assert_eq!(discover_flutter(Some(&this)), None);
         let alias = tmp.join("flutter");
-        std::os::unix::fs::symlink(&shim, &alias).expect("symlink alias");
-        assert_eq!(discover_flutter(Some(&alias), Some(&shim)), None);
+        std::os::unix::fs::symlink(&this, &alias).expect("symlink alias");
+        assert_eq!(discover_flutter(Some(&alias)), None);
 
-        // A PATH whose only `flutter` is the shim resolves to nothing.
-        let bindir = tmp.join("pathdir");
-        write(&bindir.join("unrelated"), b"keep dir non-empty\n");
-        std::os::unix::fs::symlink(&shim, bindir.join("flutter")).expect("symlink shim");
-        assert_eq!(first_flutter_on_path(&[bindir], Some(&canonical)), None);
-
-        // A DIFFERENT binary still resolves — the refusal is identity,
-        // not existence.
-        let other = tmp.join("flutter-real");
-        write(&other, b"#!/bin/sh\nexit 0\n");
+        let real = tmp.join("sdk").join("bin").join("flutter");
+        write(&real, b"#!/bin/sh\nexit 0\n");
+        let link = tmp.join("flutter-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink real");
         assert_eq!(
-            discover_flutter(Some(&other), Some(&shim)),
-            Some(fs::canonicalize(&other).expect("canonicalize other"))
+            discover_flutter(Some(&link)),
+            Some(fs::canonicalize(&real).expect("canonicalize real")),
+            "a link to a real binary resolves to the binary"
         );
+        // Unresolvable passes through verbatim: the spawn reports it.
+        let missing = tmp.join("nowhere").join("flutter");
+        assert_eq!(discover_flutter(Some(&missing)), Some(missing));
     }
 
     #[test]

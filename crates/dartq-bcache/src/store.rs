@@ -16,6 +16,11 @@
 //!   its content; it exists so a hit never rewrites the manifest.
 //! * `tmp/` — scratch space: every file is written here and renamed into
 //!   place, never written in place.
+//! * `meta/` — bookkeeping: `used` (the running usage counter),
+//!   `gc-grace` (gc's walk-stability memo), `reclaim.lock` (the pin
+//!   lock, see [`CasStore::pin`]), and `detached/<hex>` — one marker per
+//!   blob a published manifest stopped referencing (see
+//!   [`CasStore::reclaim_detached`]).
 //!
 //! # Regenerability
 //!
@@ -43,7 +48,8 @@
 //! # Concurrency
 //!
 //! Several dartq processes (one per worktree) may share a store; the
-//! store takes no locks. Content addressing makes blob publication idempotent — two
+//! only lock is the advisory pin lock of the detach reclaim (below) —
+//! no reader or writer ever waits on another. Content addressing makes blob publication idempotent — two
 //! writers of one blob rename identical bytes onto the same name.
 //! Manifests are last-writer-wins per key, and every writer of a key wrote
 //! a valid entry for it. `tmp/` lives under the root, so every rename stays
@@ -67,14 +73,31 @@
 //! guards, every reuse is visible to a gc that started before, during,
 //! or after it.
 //!
-//! `gc` is the only operation that deletes. It spares files young enough
-//! to belong to an ingest in flight, and tolerates the remaining races by
-//! design: when a reader resolves an entry while gc evicts it, the worst
-//! case is a materialize that finds a blob gone and reports
-//! [`BcacheError::NotFound`]; the caller rebuilds, and the post-build
-//! ingest restores the blob. Should a demonstrated failure ever call for
-//! mutual exclusion, the seam is a store-wide lock held by `gc` alone —
-//! readers and ingest stay lock-free.
+//! `gc` and the detach reclaim are the only operations that delete. gc
+//! spares files young enough to belong to an ingest in flight, and
+//! tolerates the remaining races by design: when a reader resolves an
+//! entry while gc evicts it, the worst case is a materialize that finds a
+//! blob gone and reports [`BcacheError::NotFound`]; the caller rebuilds,
+//! and the post-build ingest restores the blob.
+//!
+//! A re-ingest that drops a blob from its key's manifest (the test
+//! face's kernel changes bytes on every run) leaves that blob young and
+//! unreferenced — exactly what gc's in-flight window must spare, so it
+//! would linger for an hour per run. The ingest therefore marks each
+//! blob it detached, recording the blob's [`FileStamp`] once its own
+//! publish has landed, and [`CasStore::reclaim_detached`] takes a marked
+//! blob at once when three facts hold together: no manifest references
+//! it, its stamp still equals the marked one (no reuse touched it, no
+//! write replaced it since), and no pin is live. Pins are shared
+//! `flock(2)` holds on `meta/reclaim.lock`: every ingest holds one from
+//! before it first looks at a blob until its markers are written, and a
+//! hit holds one from its lookup until its placement is done; the
+//! reclaim takes the lock exclusively, never waiting — a pinned store
+//! defers it, the markers stay for the next pass. So nothing that
+//! resolved a blob through a manifest can lose it to the reclaim before
+//! it is done with it, and a crashed holder's lock dies with its
+//! process. Off unix there is no `flock`: nothing is marked and the
+//! store keeps the plain gc behavior.
 //!
 //! # Cost
 //!
@@ -82,13 +105,21 @@
 //!   (hashing the bytes that landed), falling back to a bounded copy —
 //!   on a copy-on-write filesystem that halves the I/O of the old
 //!   read-and-copy loop; parallel across files; target: 100 MB of new
-//!   blobs in under 2 s.
+//!   blobs in under 2 s. On top: one pin (open plus `flock`), one read
+//!   of the manifest it replaces, and per blob the publish detached, one
+//!   `stat` and one marker write.
 //! * `lookup`: one small file read and parse; target: under 5 ms warm.
 //! * `record_hit`: metadata-only — one existence check and one sidecar
 //!   timestamp write; no manifest I/O.
 //! * `used_bytes`: one small counter read — the O(1) budget probe.
 //! * `over_budget`: that counter read plus one `statvfs` — the
 //!   post-ingest gc gate.
+//! * `reclaim_detached`: one listing of the markers — nothing more when
+//!   there are none, the steady state of every face but `flutter test`.
+//!   Otherwise one read of every manifest, searched for the marked ids
+//!   as bytes (no parse, no blob walk), plus one `stat` per marker:
+//!   O(manifest bytes), milliseconds at store scale, under the
+//!   exclusive lock.
 //! * `gc` / `stats`: the only full passes — one pass over the manifests
 //!   plus one walk over the blobs, O(entries + blobs), holding one small
 //!   record per blob. `gc` rebooks the usage counter to what it saw.
@@ -97,23 +128,42 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use memchr::memmem::Finder;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BcacheError, Result};
-use crate::fsutil::{VolumeSpace, clone_file_hashed, mtime_ns, touch, volume_space};
-use crate::types::{BlobId, EntryManifest, StoreStats, blob_id_hex, is_hex_digest};
+use crate::fsutil::{VolumeSpace, clone_file_hashed, mtime_ns, stamp_of, touch, volume_space};
+use crate::types::{BlobId, EntryManifest, FileStamp, StoreStats, blob_id_hex, is_hex_digest};
 
 const BLOBS: &str = "blobs";
 const ENTRIES: &str = "entries";
 const TMP: &str = "tmp";
+const META: &str = "meta";
 const MANIFEST: &str = "manifest.json";
 /// The hit sidecar beside a manifest: its mtime is the last-hit clock,
 /// its content a diagnostic timestamp no code parses.
 const HIT: &str = "hit";
+/// The detach markers under `meta/`: one file per blob a published
+/// manifest stopped referencing, named by the blob's hex id, holding
+/// the blob's [`FileStamp`] as JSON (see [`CasStore::reclaim_detached`]).
+const DETACHED: &str = "detached";
+/// The pin lock under `meta/` (see [`CasStore::pin`]).
+const PIN_LOCK: &str = "reclaim.lock";
+
+/// How long [`CasStore::pin`] waits out a reclaim holding the pin lock
+/// exclusively before going on unpinned. A reclaim holds it for one
+/// byte search over the manifests — milliseconds at store scale — so
+/// the cap is only ever reached behind a stopped process.
+#[cfg(unix)]
+const PIN_WAIT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const PIN_POLL: Duration = Duration::from_millis(5);
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -135,6 +185,21 @@ const RESERVE_FLOOR_BYTES: u64 = 4 << 30;
 pub struct CasStore {
     root: PathBuf,
 }
+
+/// A shared hold on the store's pin lock (see [`CasStore::pin`]): while
+/// any pin is live, no [`CasStore::reclaim_detached`] pass runs.
+/// Dropping it closes the descriptor and releases the hold.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct Pin {
+    _lock: File,
+}
+
+/// Off unix nothing is ever marked detached, so no reclaim can run and
+/// every pin holds trivially.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub(crate) struct Pin;
 
 /// What one [`CasStore::gc`] pass did.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
@@ -255,11 +320,22 @@ impl CasStore {
     /// malformed, a file path is not a plain relative path, or a
     /// referenced blob is neither sourced nor stored — the checks run
     /// over the files of every [`crate::DirRecord`] of the draft. A
-    /// previous manifest for the key is replaced whole. The draft is
-    /// persisted as given, timestamps included.
+    /// previous manifest for the key is replaced whole, and every blob it
+    /// referenced that the draft drops is marked detached once the
+    /// publish has landed — never deleted here (see
+    /// [`Self::reclaim_detached`]); the ingest holds a pin throughout. The
+    /// draft is persisted as given, timestamps included.
     pub fn ingest(&self, draft: EntryManifest, sources: &[(PathBuf, BlobId)]) -> Result<()> {
         check_key(&draft.key)?;
         let manifest = to_json(&draft)?;
+        // Held to the end: from before this ingest first looks at a blob
+        // until its markers are written, no detach reclaim runs.
+        let _pin = self.pin();
+        // What the key references now: the publish below detaches every
+        // blob of it the draft drops. A missing prior detaches nothing,
+        // and so does an unreadable one (its blobs fall to gc's plain
+        // sweep).
+        let prior = self.lookup(&draft.key).ok().flatten();
         let sourced: FxHashSet<BlobId> = sources.iter().map(|(_, id)| *id).collect();
         // Blobs referenced without a source: already stored, reused
         // as-is — and re-touched below, before the manifest lands.
@@ -302,6 +378,13 @@ impl CasStore {
             touch(&path).map_err(io_at(&path))?;
         }
         self.publish(&self.entry_path(&draft.key), &manifest)?;
+        if let Some(prior) = prior {
+            let kept: FxHashSet<BlobId> = manifest_blobs(&draft).collect();
+            let dropped: FxHashSet<BlobId> = manifest_blobs(&prior)
+                .filter(|id| !kept.contains(id))
+                .collect();
+            self.mark_detached(dropped);
+        }
         // The store changed: any gc walk-stability memo is now stale
         // (this ingest may hold the youngest grace window, or have
         // freed evictable state). Best-effort — a missed clear only
@@ -310,8 +393,15 @@ impl CasStore {
         Ok(())
     }
 
-    /// Brings the blobs under `budget_bytes` if it can, then deletes every
-    /// blob no remaining manifest references.
+    /// Reclaims the detached blobs it can, brings the blobs under
+    /// `budget_bytes` if it can, then deletes every blob no remaining
+    /// manifest references.
+    ///
+    /// The reclaim ([`Self::reclaim_detached`]) runs first and always —
+    /// whatever the budget, and inside the walk-stability memo's window
+    /// too — and its counts join the report's. A reclaim that fails
+    /// leaves its blobs to the sweep below and to later passes: detach
+    /// bookkeeping must never disable the budget.
     ///
     /// `budget_bytes` is a ceiling, not a reservation: the pass evicts
     /// down to `min(budget_bytes, used + available − reserve)` — `used`
@@ -327,15 +417,28 @@ impl CasStore {
     /// time: the newer of the manifest's `last_hit_unix` and the hit
     /// sidecar's mtime) until the blobs that remain fit that threshold.
     /// An entry hit within `grace_secs` of `now_unix` is never evicted,
-    /// even if the store stays over it. A manifest that cannot be read or
+    /// even if the store stays over it — and neither, through it, is any
+    /// blob it references. The grace window protects entries only: a blob
+    /// no manifest references is in no entry, and no hit can be served
+    /// from it. A manifest that cannot be read or
     /// decoded is evicted and counted in
     /// [`GcReport::corrupt_manifests`], never fatal — no single bad file
     /// may disable the budget. Scratch files and unreferenced blobs
     /// younger than one hour may belong to an ingest in flight and are
-    /// spared. Files that vanish mid-pass (a concurrent gc) are skipped,
+    /// spared (the reclaim above is how a blob proven detached skips that
+    /// hour). Files that vanish mid-pass (a concurrent gc) are skipped,
     /// and the running usage counter is rewritten to the truth this pass
     /// observed (see [`Self::used_bytes`]).
     pub fn gc(&self, budget_bytes: u64, grace_secs: u64, now_unix: u64) -> Result<GcReport> {
+        // Detached blobs first, memo or not. A failed reclaim is not this
+        // pass's failure (its blobs stay for the sweep below), and the
+        // post-run upkeep that calls it directly reports the same fault.
+        let (reclaimed, reclaimed_bytes) = self.reclaim_detached().unwrap_or_default();
+        let reclaim = GcReport {
+            blobs_removed: reclaimed,
+            bytes_freed: reclaimed_bytes,
+            ..GcReport::default()
+        };
         // The walk-stability memo: a prior pass that evicted nothing and
         // stopped at a grace-protected entry remembered when that window
         // closes. Until then a walk is provably a no-op — nothing moves
@@ -346,7 +449,7 @@ impl CasStore {
         {
             return Ok(GcReport {
                 grace_skipped_until_unix: deadline,
-                ..GcReport::default()
+                ..reclaim
             });
         }
         let entries = self.scan_entries()?;
@@ -359,7 +462,7 @@ impl CasStore {
             eviction_threshold(budget_bytes, scanned_bytes, volume_space(&self.root).ok());
         let mut report = GcReport {
             entries_before: entries.len() as u64,
-            ..GcReport::default()
+            ..reclaim
         };
         let in_flight = |mtime_secs: u64| now_unix.saturating_sub(mtime_secs) < IN_FLIGHT_SECS;
 
@@ -462,6 +565,10 @@ impl CasStore {
                 report.blobs_removed += 1;
                 report.bytes_freed += blob.len;
                 blob_bytes_freed += blob.len;
+                // A marker the reclaim never consumed (a volume without
+                // `flock`, a faulted marker dir) goes with its blob, so
+                // markers stay bounded by the blobs on disk.
+                let _ = fs::remove_file(self.detached_path(&blob.id));
             }
         }
         for (path, meta) in list(&self.root.join(TMP))? {
@@ -519,6 +626,104 @@ impl CasStore {
         Ok(used > eviction_threshold(budget_bytes, used, volume_space(&self.root).ok()))
     }
 
+    /// Pins the store's blobs against [`Self::reclaim_detached`] for as
+    /// long as the returned guard lives: a shared `flock(2)` hold on
+    /// `meta/reclaim.lock`. Whoever resolves blobs through a manifest and
+    /// acts on them later — an ingest validating, touching, and
+    /// publishing references; a hit placing them into a tree — holds a
+    /// pin across that span, so no reclaim takes a blob between the look
+    /// and the use. Pins never exclude each other, and a reclaim only
+    /// ever tries the lock: it defers while any pin is live.
+    ///
+    /// `None` when no pin could be taken — the lock file is unusable, or
+    /// a reclaim held the lock past [`PIN_WAIT`] (a stopped process) —
+    /// and the caller goes on unpinned. A race an unpinned caller then
+    /// loses costs what any store race costs, never a wrong artifact: an
+    /// ingest whose blob vanished fails its validation or reuse touch and
+    /// publishes nothing, a reuse touch moves the blob's stamp off its
+    /// marker (the reclaim then spares it), and a placement whose blob
+    /// vanished is a miss and a rebuild.
+    pub(crate) fn pin(&self) -> Option<Pin> {
+        #[cfg(unix)]
+        {
+            let lock = self.pin_lock().ok()?;
+            let deadline = Instant::now() + PIN_WAIT;
+            loop {
+                match try_flock(&lock, libc::LOCK_SH) {
+                    Ok(true) => return Some(Pin { _lock: lock }),
+                    Ok(false) if Instant::now() < deadline => std::thread::sleep(PIN_POLL),
+                    _ => return None,
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Some(Pin)
+    }
+
+    /// Deletes every blob an ingest marked detached that no manifest
+    /// references any more, without walking the blobs — the post-run
+    /// upkeep that keeps a face whose outputs change bytes on every run
+    /// (`flutter test`'s kernel) at one stored generation per entry
+    /// instead of one per run. Returns the blobs removed and the bytes
+    /// freed.
+    ///
+    /// The pass takes the pin lock exclusively without waiting; while
+    /// any pin is live it does nothing and the markers stay for a later
+    /// pass. Holding the lock, it reads every manifest and searches its
+    /// bytes for each marked blob's hex id: a manifest that names a blob
+    /// keeps it, however that manifest decodes (and a 64-digit
+    /// coincidence with another digest field can only ever keep one). A
+    /// marked blob goes only when no manifest names it AND its current
+    /// [`FileStamp`] equals the marked one — a moved stamp means a reuse
+    /// touched it or a write replaced it after the detach, and the blob
+    /// is left to gc's in-flight window and plain sweep. Every marker the
+    /// pass decides is removed, ahead of its blob — a shared blob's
+    /// included: whichever entry drops it last marks it afresh. The
+    /// usage counter is booked down by the bytes freed.
+    ///
+    /// Grace does not enter: the pass evicts no entry, and a blob no
+    /// manifest references belongs to no entry a grace window protects.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures listing the markers, opening or locking the pin lock,
+    /// reading a manifest, removing a blob, or booking the counter. A
+    /// pass that fails part-way has removed only blobs it proved free.
+    pub(crate) fn reclaim_detached(&self) -> Result<(u64, u64)> {
+        if !self.has_markers()? {
+            return Ok((0, 0));
+        }
+        let Some(_lock) = self.lock_exclusive()? else {
+            return Ok((0, 0));
+        };
+        // Read under the lock: no pinned ingest can be writing one now.
+        let markers = self.scan_detached()?;
+        let ids: Vec<BlobId> = markers.keys().copied().collect();
+        let named = self.named_by_manifests(&ids)?;
+        let (mut blobs, mut bytes) = (0u64, 0u64);
+        for (id, marked) in &markers {
+            let path = self.blob_path(id);
+            let take = match fs::metadata(&path) {
+                Ok(meta) if !named.contains(id) && *marked == Some(stamp_of(&meta)) => {
+                    Some(meta.len())
+                }
+                _ => None,
+            };
+            // Best-effort: a marker that survives is decided again by
+            // the next pass, and once its blob is gone it can never match
+            // a later blob of its id (a fresh write is a new inode).
+            let _ = fs::remove_file(self.detached_path(id));
+            if let Some(len) = take
+                && removed(&path, fs::remove_file(&path))?
+            {
+                blobs += 1;
+                bytes += len;
+            }
+        }
+        self.release_used(bytes)?;
+        Ok((blobs, bytes))
+    }
+
     /// Adds `delta` to the running usage counter, atomically. A
     /// read-modify-write racing another writer's can lose an update;
     /// that drift is the accepted price of lock-free booking and is
@@ -536,18 +741,159 @@ impl CasStore {
         self.write_used(total)
     }
 
+    /// Books `delta` freed bytes off the running usage counter — the
+    /// reclaim's twin of [`Self::bump_used`], with the same lost-update
+    /// caveat and the same gc heal.
+    fn release_used(&self, delta: u64) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let total = self.used_bytes()?.saturating_sub(delta);
+        self.write_used(total)
+    }
+
     fn write_used(&self, total: u64) -> Result<()> {
         let path = self.used_path();
         self.publish(&path, format!("{total}\n").as_bytes())
     }
 
     fn used_path(&self) -> PathBuf {
-        self.root.join("meta").join("used")
+        self.root.join(META).join("used")
     }
 
     /// The gc walk-stability memo's path (see [`Self::gc`]).
     fn grace_path(&self) -> PathBuf {
-        self.root.join("meta").join("gc-grace")
+        self.root.join(META).join("gc-grace")
+    }
+
+    fn detached_dir(&self) -> PathBuf {
+        self.root.join(META).join(DETACHED)
+    }
+
+    fn detached_path(&self, id: &BlobId) -> PathBuf {
+        self.detached_dir().join(blob_id_hex(id))
+    }
+
+    /// Marks `ids` — blobs a publish that just landed stopped referencing
+    /// — detached, each with its blob's current stamp. Best-effort: a
+    /// blob already gone needs no marker, and a marker that fails to land
+    /// leaves its blob to gc's in-flight window and plain sweep. A torn
+    /// marker (a crash mid-write) does not decode, and the reclaim keeps
+    /// its blob. Off unix nothing is marked: no reclaim could consume it.
+    fn mark_detached(&self, ids: FxHashSet<BlobId>) {
+        if !cfg!(unix) || ids.is_empty() {
+            return;
+        }
+        let dir = self.detached_dir();
+        if fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        for id in ids {
+            let Ok(meta) = fs::metadata(self.blob_path(&id)) else {
+                continue;
+            };
+            if let Ok(stamp) = serde_json::to_vec(&stamp_of(&meta)) {
+                let _ = fs::write(dir.join(blob_id_hex(&id)), stamp);
+            }
+        }
+    }
+
+    /// Whether `meta/detached/` holds anything: the reclaim's one-call
+    /// probe for the common case of nothing to do.
+    fn has_markers(&self) -> Result<bool> {
+        let dir = self.detached_dir();
+        match fs::read_dir(&dir) {
+            Ok(mut items) => Ok(items.next().is_some()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io_at(&dir)(e)),
+        }
+    }
+
+    /// Every detach marker: the blob it names and the stamp it recorded —
+    /// `None` for content that does not decode. Names that are not a
+    /// canonical blob id are foreign and left alone.
+    fn scan_detached(&self) -> Result<FxHashMap<BlobId, Option<FileStamp>>> {
+        let mut markers = FxHashMap::default();
+        for (path, meta) in list(&self.detached_dir())? {
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<BlobId>().ok())
+            else {
+                continue;
+            };
+            if meta.is_file() {
+                let stamp = fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                markers.insert(id, stamp);
+            }
+        }
+        Ok(markers)
+    }
+
+    /// Which of `ids` some manifest names: each manifest's bytes searched
+    /// for every still-unnamed id's hex spelling — no parse, so a
+    /// manifest that does not decode keeps what it names too. Stops
+    /// reading once every id is named.
+    fn named_by_manifests(&self, ids: &[BlobId]) -> Result<FxHashSet<BlobId>> {
+        let hexes: Vec<String> = ids.iter().map(blob_id_hex).collect();
+        let mut pending: Vec<(BlobId, Finder<'_>)> = ids
+            .iter()
+            .zip(&hexes)
+            .map(|(id, hex)| (*id, Finder::new(hex.as_bytes())))
+            .collect();
+        let mut named = FxHashSet::default();
+        for dir in self.entry_dirs()? {
+            if pending.is_empty() {
+                break;
+            }
+            let path = dir.join(MANIFEST);
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_at(&path)(e)),
+            };
+            pending.retain(|(id, finder)| {
+                let found = finder.find(&bytes).is_some();
+                if found {
+                    named.insert(*id);
+                }
+                !found
+            });
+        }
+        Ok(named)
+    }
+
+    /// The pin lock taken exclusively, without waiting: `None` while any
+    /// pin is live — and always off unix, where nothing is marked.
+    fn lock_exclusive(&self) -> Result<Option<File>> {
+        #[cfg(unix)]
+        {
+            let lock = self.pin_lock()?;
+            let taken = try_flock(&lock, libc::LOCK_EX).map_err(io_at(&self.pin_lock_path()))?;
+            return Ok(taken.then_some(lock));
+        }
+        #[cfg(not(unix))]
+        Ok(None)
+    }
+
+    #[cfg(unix)]
+    fn pin_lock_path(&self) -> PathBuf {
+        self.root.join(META).join(PIN_LOCK)
+    }
+
+    /// Opens the pin lock file, creating it and `meta/` as needed.
+    #[cfg(unix)]
+    fn pin_lock(&self) -> Result<File> {
+        let path = self.pin_lock_path();
+        create_parent(&path)?;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io_at(&path))
     }
 
     /// The remembered earliest moment a gc pass could evict again, when
@@ -747,43 +1093,46 @@ impl CasStore {
     /// is the empty leftover of a crashed one) and is not an entry.
     fn scan_entries(&self) -> Result<Vec<ScannedEntry>> {
         let mut entries = Vec::new();
+        for dir in self.entry_dirs()? {
+            let path = dir.join(MANIFEST);
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    entries.push(ScannedEntry {
+                        dir,
+                        facts: Err(io_at(&path)(e)),
+                    });
+                    continue;
+                }
+            };
+            let key = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let facts = parse_manifest(&path, &key, &bytes).map(|manifest| EntryFacts {
+                last_hit_unix: hit_unix(&dir, manifest.last_hit_unix),
+                blobs: manifest_blobs(&manifest).collect(),
+            });
+            entries.push(ScannedEntry { dir, facts });
+        }
+        Ok(entries)
+    }
+
+    /// Every entry directory, manifest or not: `entries/<shard>/<key>`.
+    fn entry_dirs(&self) -> Result<Vec<PathBuf>> {
+        let mut dirs = Vec::new();
         for (shard, meta) in list(&self.root.join(ENTRIES))? {
             if !meta.is_dir() {
                 continue;
             }
             for (dir, meta) in list(&shard)? {
-                if !meta.is_dir() {
-                    continue;
+                if meta.is_dir() {
+                    dirs.push(dir);
                 }
-                let path = dir.join(MANIFEST);
-                let bytes = match fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        entries.push(ScannedEntry {
-                            dir,
-                            facts: Err(io_at(&path)(e)),
-                        });
-                        continue;
-                    }
-                };
-                let key = dir
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let facts = parse_manifest(&path, &key, &bytes).map(|manifest| EntryFacts {
-                    last_hit_unix: hit_unix(&dir, manifest.last_hit_unix),
-                    blobs: manifest
-                        .dirs
-                        .into_iter()
-                        .flat_map(|dir| dir.files)
-                        .map(|file| file.blob)
-                        .collect(),
-                });
-                entries.push(ScannedEntry { dir, facts });
             }
         }
-        Ok(entries)
+        Ok(dirs)
     }
 
     /// Every blob on disk. A file counts as a blob only where
@@ -1028,6 +1377,33 @@ fn is_plain_relative(path: &Path) -> bool {
 
 fn is_referenced(refs: &FxHashMap<BlobId, u64>, id: &BlobId) -> bool {
     refs.get(id).is_some_and(|&count| count > 0)
+}
+
+/// Every blob `manifest` references, one per file (repeats included).
+fn manifest_blobs(manifest: &EntryManifest) -> impl Iterator<Item = BlobId> + '_ {
+    manifest
+        .dirs
+        .iter()
+        .flat_map(|dir| &dir.files)
+        .map(|file| file.blob)
+}
+
+/// One non-blocking `flock(2)` attempt with `op` (`LOCK_SH` or
+/// `LOCK_EX`): `Ok(false)` while a conflicting hold exists, or when a
+/// signal interrupted the call (the caller's retry policy decides).
+#[cfg(unix)]
+fn try_flock(file: &File, op: libc::c_int) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock(2) operates on the descriptor `file` keeps open for
+    // the whole call; LOCK_NB makes it return instead of sleeping.
+    if unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK | libc::EINTR) => Ok(false),
+        _ => Err(err),
+    }
 }
 
 fn to_json(value: &impl Serialize) -> Result<Vec<u8>> {
@@ -1511,10 +1887,14 @@ mod tests {
 
     /// The blob-versioning contract of a re-ingested key (the warm
     /// `flutter test` face): a replacement manifest swaps the file's
-    /// blob reference — nothing accumulates per dir — and the
-    /// superseded blob is reclaimed by gc once past the in-flight
-    /// window, while the entry and its current blob survive.
+    /// blob reference — nothing accumulates per dir. The ingest marks
+    /// the superseded blob detached instead of deleting it, and the next
+    /// gc — whatever its budget — takes it at once: the blob is young,
+    /// but its own entry's landed publish proved it detached, so it does
+    /// not wait out the in-flight hour. The entry and its current blob
+    /// survive.
     #[test]
+    #[cfg(unix)]
     fn store_gc_frees_superseded_blob_after_manifest_replacement() {
         let f = fixture();
         // Two runs rewrote the same dill path with different bytes.
@@ -1530,19 +1910,242 @@ mod tests {
             manifest.dirs[0].files[0].blob, v2.1,
             "the reference is replaced"
         );
-        assert!(f.store.blob_path(&v1.1).exists(), "unreferenced until gc");
+        assert!(
+            f.store.blob_path(&v1.1).exists(),
+            "the ingest itself deletes nothing"
+        );
 
-        // Fresh blobs may belong to an ingest in flight: v1 is spared.
         let now = unix_secs(SystemTime::now());
-        assert_eq!(f.store.gc(u64::MAX, 0, now).unwrap().blobs_removed, 0);
-
-        let report = f.store.gc(u64::MAX, 0, later()).unwrap();
+        let report = f.store.gc(u64::MAX, 0, now).unwrap();
         assert_eq!(report.entries_evicted, 0, "a huge budget keeps the entry");
         assert_eq!(report.blobs_removed, 1);
         assert_eq!(report.bytes_freed, (b"kernel v1".len() as u64));
         assert!(!f.store.blob_path(&v1.1).exists());
         assert!(f.store.blob_path(&v2.1).exists());
         assert!(f.store.lookup(&key(1)).unwrap().is_some());
+        assert_eq!(
+            f.store.gc(u64::MAX, 0, later()).unwrap().blobs_removed,
+            0,
+            "nothing is left for the plain sweep"
+        );
+    }
+
+    /// Route (b) under CAS sharing: a re-ingest marks exactly the blobs
+    /// its entry dropped; the reclaim takes those no manifest names,
+    /// keeps one another entry still references, and consumes every
+    /// marker it decided; the usage counter follows. The shared blob goes
+    /// once its last referencing entry drops it too.
+    #[test]
+    #[cfg(unix)]
+    fn store_reclaim_takes_detached_blobs_and_keeps_shared_ones() {
+        let f = fixture();
+        let own = source(&f.build, "own", &[b'o'; 48]);
+        let shared = source(&f.build, "shared", &[b's'; 32]);
+        put(&f, 1, &[own.clone(), shared.clone()], 100);
+        put(&f, 2, &[shared.clone()], 100);
+        let next = source(&f.build, "next", &[b'n'; 16]);
+        put(&f, 1, &[next.clone()], 200);
+
+        assert!(f.store.blob_path(&own.1).exists(), "marked, not deleted");
+        assert_eq!(f.store.scan_detached().unwrap().len(), 2, "both drops");
+
+        assert_eq!(f.store.reclaim_detached().unwrap(), (1, 48));
+        assert!(
+            !f.store.blob_path(&own.1).exists(),
+            "the unshared drop goes"
+        );
+        assert!(
+            f.store.blob_path(&shared.1).exists(),
+            "key 2 still references the shared blob"
+        );
+        assert!(f.store.blob_path(&next.1).exists());
+        assert!(
+            f.store.scan_detached().unwrap().is_empty(),
+            "every decided marker is consumed"
+        );
+        assert_eq!(
+            f.store.used_bytes().unwrap(),
+            f.store.stats().unwrap().blob_bytes,
+            "the counter is booked down"
+        );
+        assert_eq!(f.store.reclaim_detached().unwrap(), (0, 0), "idempotent");
+
+        put(&f, 2, &[next.clone()], 300);
+        assert_eq!(f.store.reclaim_detached().unwrap(), (1, 32));
+        assert!(!f.store.blob_path(&shared.1).exists());
+        assert!(f.store.lookup(&key(1)).unwrap().is_some());
+        assert!(f.store.lookup(&key(2)).unwrap().is_some());
+    }
+
+    /// A live pin defers the reclaim — gc's included — so a blob its
+    /// holder resolved through a manifest outlives the hold. Pins share
+    /// the lock, any one of them defers, and once the last drops the
+    /// deferred marker is taken.
+    #[test]
+    #[cfg(unix)]
+    fn store_reclaim_waits_for_every_pin() {
+        let f = fixture();
+        let v1 = source(&f.build, "k.dill", b"kernel v1");
+        put(&f, 1, &[v1.clone()], 100);
+        let v2 = source(&f.build, "k.dill", b"kernel v2!");
+        put(&f, 1, &[v2], 200);
+
+        let first = f.store.pin().expect("pin");
+        let second = f.store.pin().expect("pins share the lock");
+        assert_eq!(f.store.reclaim_detached().unwrap(), (0, 0));
+        let now = unix_secs(SystemTime::now());
+        assert_eq!(
+            f.store.gc(u64::MAX, 0, now).unwrap().blobs_removed,
+            0,
+            "pinned and young: spared"
+        );
+        drop(first);
+        assert_eq!(
+            f.store.reclaim_detached().unwrap(),
+            (0, 0),
+            "one pin defers"
+        );
+        assert!(f.store.blob_path(&v1.1).exists());
+        drop(second);
+        assert_eq!(
+            f.store.reclaim_detached().unwrap(),
+            (1, b"kernel v1".len() as u64)
+        );
+        assert!(!f.store.blob_path(&v1.1).exists());
+    }
+
+    /// The stamp guard: a blob touched after its detach — a reuse the pin
+    /// did not cover — no longer matches its marker. The reclaim spares
+    /// it and consumes the marker; the in-flight window then holds it,
+    /// and the plain sweep takes it once the window has passed.
+    #[test]
+    #[cfg(unix)]
+    fn store_reclaim_spares_a_blob_touched_after_its_detach() {
+        let f = fixture();
+        let v1 = source(&f.build, "k.dill", b"kernel v1");
+        put(&f, 1, &[v1.clone()], 100);
+        // As written by an earlier run: the touch below then moves the
+        // mtime unmistakably, whatever the filesystem's clock grain.
+        backdate(&f.store.blob_path(&v1.1), 600);
+        let v2 = source(&f.build, "k.dill", b"kernel v2!");
+        put(&f, 1, &[v2], 200);
+        touch(&f.store.blob_path(&v1.1)).unwrap();
+
+        assert_eq!(f.store.reclaim_detached().unwrap(), (0, 0));
+        assert!(
+            f.store.blob_path(&v1.1).exists(),
+            "a moved stamp spares the blob"
+        );
+        assert!(
+            f.store.scan_detached().unwrap().is_empty(),
+            "the marker is consumed"
+        );
+        let now = unix_secs(SystemTime::now());
+        assert_eq!(f.store.gc(u64::MAX, 0, now).unwrap().blobs_removed, 0);
+        assert_eq!(f.store.gc(u64::MAX, 0, later()).unwrap().blobs_removed, 1);
+    }
+
+    /// Grace protects entries, never a detached blob: at a zero budget a
+    /// hit-fresh entry survives the pass with every blob it references,
+    /// while the generation it dropped is reclaimed. And the
+    /// walk-stability memo never holds a reclaim back: a detach a pin
+    /// deferred past a memo-arming pass is still taken by a pass the memo
+    /// skips.
+    #[test]
+    #[cfg(unix)]
+    fn store_grace_protects_entries_not_their_detached_blobs() {
+        let f = fixture();
+        let now = unix_secs(SystemTime::now());
+        let grace = 3_600;
+        let v1 = source(&f.build, "k.dill", b"kernel v1");
+        put(&f, 1, &[v1.clone()], now);
+        let v2 = source(&f.build, "k.dill", b"kernel v2!");
+        put(&f, 1, &[v2.clone()], now);
+
+        let report = f.store.gc(0, grace, now).unwrap();
+        assert_eq!(report.entries_evicted, 0, "the hit is grace-young");
+        assert_eq!(
+            report.blobs_removed, 1,
+            "the dropped generation goes anyway"
+        );
+        assert!(!f.store.blob_path(&v1.1).exists());
+        assert!(
+            f.store.blob_path(&v2.1).exists(),
+            "the protected entry keeps its blob"
+        );
+        assert_eq!(f.store.grace_deadline(), Some(now + grace), "memo armed");
+
+        let pin = f.store.pin().expect("pin");
+        let v3 = source(&f.build, "k.dill", b"kernel v3!!");
+        put(&f, 1, &[v3.clone()], now);
+        let pinned = f.store.gc(0, grace, now).unwrap();
+        assert_eq!(pinned.blobs_removed, 0, "the pin defers the reclaim");
+        assert_eq!(f.store.grace_deadline(), Some(now + grace), "re-armed");
+        drop(pin);
+
+        let skipped = f.store.gc(0, grace, now + 1).unwrap();
+        assert_eq!(
+            skipped.grace_skipped_until_unix,
+            now + grace,
+            "the walk is skipped"
+        );
+        assert_eq!(skipped.blobs_removed, 1, "the deferred detach is taken");
+        assert!(!f.store.blob_path(&v2.1).exists());
+        assert!(f.store.blob_path(&v3.1).exists());
+    }
+
+    /// Fail-open: an unusable marker directory never fails an ingest or
+    /// disables the budget. The reclaim reports the fault; gc falls back
+    /// to its plain sweep (young blobs spared, old ones taken).
+    #[test]
+    #[cfg(unix)]
+    fn store_detach_bookkeeping_faults_never_fail_ingest_or_gc() {
+        let f = fixture();
+        fs::create_dir_all(f.root.join(META)).unwrap();
+        fs::write(f.store.detached_dir(), b"not a directory").unwrap();
+        let v1 = source(&f.build, "k.dill", b"kernel v1");
+        put(&f, 1, &[v1.clone()], 100);
+        let v2 = source(&f.build, "k.dill", b"kernel v2!");
+        put(&f, 1, &[v2], 200);
+
+        assert!(
+            f.store.reclaim_detached().is_err(),
+            "the reclaim surfaces the fault"
+        );
+        let now = unix_secs(SystemTime::now());
+        assert_eq!(
+            f.store.gc(u64::MAX, 0, now).unwrap().blobs_removed,
+            0,
+            "unmarked and young: spared"
+        );
+        assert_eq!(f.store.gc(u64::MAX, 0, later()).unwrap().blobs_removed, 1);
+        assert!(!f.store.blob_path(&v1.1).exists());
+    }
+
+    /// A marker no reclaim consumed (every pass deferred by a pin, as on a
+    /// volume without `flock`) goes with its blob when gc's plain sweep
+    /// takes the aged orphan: markers stay bounded by the blobs on disk.
+    #[test]
+    #[cfg(unix)]
+    fn store_plain_sweep_drops_an_unconsumed_marker_with_its_blob() {
+        let f = fixture();
+        let v1 = source(&f.build, "k.dill", b"kernel v1");
+        put(&f, 1, &[v1.clone()], 100);
+        let v2 = source(&f.build, "k.dill", b"kernel v2!");
+        put(&f, 1, &[v2], 200);
+        assert_eq!(f.store.scan_detached().unwrap().len(), 1);
+
+        let _pin = f.store.pin().expect("pin");
+        let report = f.store.gc(u64::MAX, 0, later()).unwrap();
+        assert_eq!(
+            report.blobs_removed, 1,
+            "the plain sweep takes the aged orphan"
+        );
+        assert!(!f.store.blob_path(&v1.1).exists());
+        assert!(
+            f.store.scan_detached().unwrap().is_empty(),
+            "its marker goes with it"
+        );
     }
 
     const GIB: u64 = 1 << 30;
@@ -2015,9 +2618,15 @@ mod tests {
     /// a store that sat between builds — without waiting an hour.
     #[cfg(unix)]
     fn age_past_in_flight(path: &Path) {
+        backdate(path, 2 * IN_FLIGHT_SECS);
+    }
+
+    /// Sets `path`'s mtime `secs` into the past (atime untouched).
+    #[cfg(unix)]
+    fn backdate(path: &Path, secs: u64) {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        let since = (SystemTime::now() - Duration::from_secs(2 * IN_FLIGHT_SECS))
+        let since = (SystemTime::now() - Duration::from_secs(secs))
             .duration_since(UNIX_EPOCH)
             .unwrap();
         let times = [

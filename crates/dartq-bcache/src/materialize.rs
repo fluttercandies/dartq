@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dill_rewrite;
 use crate::error::{BcacheError, Result};
-use crate::fsutil::{CloneStatus, clone_file, stamp_of};
+use crate::fsutil::{CloneStatus, clone_file, file_blake3, stamp_of};
 use crate::store::CasStore;
 use crate::types::{BlobId, ManifestFile, PlacedFile, RewriteKind, blob_id_hex};
 
@@ -150,11 +150,17 @@ pub struct MaterializeReport {
     /// cloned from a placement this run already rewrote from the same
     /// blob (`app.dill` and the bundle's `kernel_blob.bin`).
     pub dill_rewrites: u64,
-    /// Kernel-cache dills placed verbatim because the URI rewriter
+    /// Test kernel-cache dills placed verbatim because the URI rewriter
     /// refused them (version gate, non-ASCII match, unknown layout):
-    /// today's same-tree behavior, at the cost of a frontend_server
-    /// recompile.
+    /// frontend_server's initialize-from-dill validation re-resolves
+    /// their URIs, at the cost of a recompile.
     pub dill_rewrite_refused: u64,
+    /// Payload dills (`app.dill`, `kernel_blob.bin`) the URI rewriter
+    /// refused, left out of the tree. Verbatim, such a dill would carry
+    /// the ingest tree's URIs past flutter's FileStore validation (its
+    /// md5 is the recorded one) into this tree's artifacts; missing, it
+    /// makes flutter rerun the target that produces it.
+    pub dill_omitted: u64,
     /// `.filecache` md5 records re-aimed at the bytes this run
     /// rewrote (see [`patch_file_store`]).
     pub filecache_patched: u64,
@@ -345,7 +351,11 @@ pub fn materialize(
                 deferred.push((dir_at, file_at));
                 continue;
             }
-            let (placed_file, md5) = materialize_one(store, plan, dir, file, &target, &mut run)?;
+            let Some((placed_file, md5)) =
+                materialize_one(store, plan, dir, file, &target, &mut run)?
+            else {
+                continue;
+            };
             if let Some(md5) = md5 {
                 rewritten.insert(target.join(&file.path), md5.clone());
                 rewritten.insert(dir.path.join(&file.path), md5);
@@ -358,7 +368,11 @@ pub fn materialize(
         let dir = &plan.dirs[dir_at];
         let file = &dir.files[file_at];
         let target = project_root.join(&dir.path);
-        let (mut placed_file, _) = materialize_one(store, plan, dir, file, &target, &mut run)?;
+        let Some((mut placed_file, _)) =
+            materialize_one(store, plan, dir, file, &target, &mut run)?
+        else {
+            continue;
+        };
         let path = target.join(&file.path);
         let patched = patch_file_store(&path, &rewritten)?;
         if patched > 0 {
@@ -367,7 +381,9 @@ pub fn materialize(
             run.report.total_bytes =
                 run.report.total_bytes - placed_file.stamp.size + metadata.len();
             placed_file.stamp = stamp_of(&metadata);
-            placed_file.verbatim = false;
+            // The patch changed the bytes again: the record carries the
+            // hash of what finally landed (KBs).
+            placed_file.on_disk = Some(file_blake3(&path)?);
         }
         placed[dir_at].push(placed_file);
     }
@@ -499,6 +515,8 @@ fn verify_missing_blobs(
 /// reports it with the identity it landed under, plus the md5 of the
 /// landed bytes when the run wants it ([`Run::want_md5`]) and they are
 /// not the blob's: the hash a FileStore record must carry for them.
+/// `None` when the file is deliberately left out (a refused payload
+/// dill, see [`MaterializeReport::dill_omitted`]).
 fn materialize_one(
     store: &CasStore,
     plan: &MaterializePlan,
@@ -506,7 +524,7 @@ fn materialize_one(
     file: &ManifestFile,
     dir_path: &Path,
     run: &mut Run,
-) -> Result<(PlacedFile, Option<String>)> {
+) -> Result<Option<(PlacedFile, Option<String>)>> {
     let src = store.blob_path(&file.blob);
 
     let dst = dir_path.join(&file.path);
@@ -535,8 +553,11 @@ fn materialize_one(
     // A kernel dill replayed into a different tree carries the ingest
     // tree's `file://` URIs, which frontend_server cannot resolve
     // here — rewrite the prefixes while the bytes stream into the
-    // temp. A refused rewrite (or a same-root plan) falls through to
-    // the verbatim clone: today's behavior, never a blocked build.
+    // temp. A refused rewrite of a test kernel-cache dill falls through
+    // to the verbatim clone (frontend_server's initialize-from-dill
+    // validation re-resolves its URIs); a refused payload dill is left
+    // out instead (see [`MaterializeReport::dill_omitted`]). A same-root
+    // plan keeps the verbatim clone.
     let mut placed = false;
     if matches!(file.rewrite, RewriteKind::DillUris) && plan.roots_differ() {
         if let Some((earlier, earlier_md5)) = run.dills.get(&file.blob) {
@@ -562,8 +583,17 @@ fn materialize_one(
                     fresh_dill = true;
                 }
                 Err(_) => {
-                    run.report.dill_rewrite_refused += 1;
                     let _ = fs::remove_file(&tmp);
+                    let payload = file
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(crate::ingest_scan::is_payload_dill);
+                    if payload {
+                        run.report.dill_omitted += 1;
+                        return Ok(None);
+                    }
+                    run.report.dill_rewrite_refused += 1;
                 }
             }
         }
@@ -627,15 +657,28 @@ fn materialize_one(
 
     let metadata = fs::metadata(&dst)?;
     run.report.total_bytes += metadata.len();
+    // What the record can prove about the landed bytes later: a
+    // verbatim clone is the blob (identity-verified up front); a
+    // re-rooted bookkeeping file is hashed here, at KB cost, so a
+    // byte-identical flutter rewrite of it is recognizable; a re-rooted
+    // kernel dill (tens of MB) is not — flutter rewriting one is a real
+    // change that is hashed regardless (see [`PlacedFile::on_disk`]).
+    let on_disk = if verbatim {
+        Some(file.blob)
+    } else if matches!(file.rewrite, RewriteKind::PathText) {
+        Some(file_blake3(&dst)?)
+    } else {
+        None
+    };
     let placed_file = PlacedFile {
         path: file.path.clone(),
         stamp: stamp_of(&metadata),
         blob: file.blob,
         rewrite: file.rewrite,
         foreign_paths: file.foreign_paths,
-        verbatim,
+        on_disk,
     };
-    Ok((placed_file, md5))
+    Ok(Some((placed_file, md5)))
 }
 
 /// flutter_tools' FileStore record — `.filecache`, format version 2
@@ -1772,6 +1815,73 @@ mod tests {
         );
     }
 
+    /// A payload dill the rewriter refuses never lands cross-tree: its
+    /// recorded md5 would pass flutter's FileStore validation with the
+    /// ingest tree's URIs inside, so it is left out (counted) and
+    /// flutter reruns the target that produces it. The dir's other
+    /// files still land; a same-root replay places it verbatim.
+    #[test]
+    fn refused_payload_dill_is_left_out_cross_tree() {
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = CasStore::open(store_dir.path()).expect("open store");
+        let garbage_id = place_blob(&store, store_dir.path(), "src-garbage", b"not a dill");
+        let stamp_id = place_blob(&store, store_dir.path(), "src-stamp", b"{}");
+        let name = "dir000000000000000000000000000000a";
+        let files = || {
+            vec![
+                manifest("app.dill", garbage_id, false, RewriteKind::DillUris),
+                manifest(
+                    "kernel_snapshot_program.stamp",
+                    stamp_id,
+                    false,
+                    RewriteKind::None,
+                ),
+            ]
+        };
+
+        let project = tempfile::tempdir().expect("project dir");
+        let plan = MaterializePlan {
+            dirs: vec![hash_dir(name, files())],
+            old_root: "/old/canonical/root".to_string(),
+            new_root: fs::canonicalize(project.path()).expect("canonical root"),
+        };
+        let MaterializeOutcome { report, placed } =
+            materialize(&store, &plan, project.path()).expect("materialize");
+        assert_eq!(report.dill_omitted, 1);
+        assert_eq!(report.dill_rewrite_refused, 0);
+        assert_eq!(report.dill_rewrites, 0);
+        let dir = project.path().join(".dart_tool/flutter_build").join(name);
+        assert!(
+            !dir.join("app.dill").exists(),
+            "the refused payload dill is left out"
+        );
+        assert!(dir.join("kernel_snapshot_program.stamp").is_file());
+        assert_eq!(placed[0].len(), 1, "only the stamp is a placement");
+
+        let same_project = tempfile::tempdir().expect("same-root project dir");
+        let same_root = fs::canonicalize(same_project.path()).expect("canonical root");
+        let same = MaterializePlan {
+            dirs: vec![hash_dir(name, files())],
+            old_root: same_root.to_string_lossy().into_owned(),
+            new_root: same_root,
+        };
+        let MaterializeOutcome { report, .. } =
+            materialize(&store, &same, same_project.path()).expect("materialize");
+        assert_eq!(report.dill_omitted, 0);
+        assert_eq!(
+            fs::read(
+                same_project
+                    .path()
+                    .join(".dart_tool/flutter_build")
+                    .join(name)
+                    .join("app.dill")
+            )
+            .expect("same-root payload"),
+            b"not a dill".to_vec(),
+            "a same-root replay places the payload verbatim"
+        );
+    }
+
     /// The placed-identity handoff: every placed file reports its fresh
     /// on-disk stamp, and `verbatim` is exactly "the placed bytes are
     /// the blob's bytes" — true for payload clones and same-root
@@ -1815,7 +1925,7 @@ mod tests {
             .iter()
             .find(|f| f.path == Path::new("app.dill"))
             .expect("placed dill");
-        assert!(dill.verbatim, "a payload clone is the blob's bytes");
+        assert!(dill.verbatim(), "a payload clone is the blob's bytes");
         assert_eq!(dill.blob, payload_id);
         assert_eq!(
             dill.stamp,
@@ -1835,10 +1945,22 @@ mod tests {
             .find(|f| f.path == Path::new("flutter_build.dill.stamp"))
             .expect("placed stamp");
         assert!(
-            !stamp_file.verbatim,
+            !stamp_file.verbatim(),
             "a cross-tree rewrite changed the bytes"
         );
         assert_eq!(stamp_file.rewrite, RewriteKind::PathText);
+        assert_eq!(
+            stamp_file.on_disk,
+            Some(
+                file_blake3(
+                    &project
+                        .path()
+                        .join(".dart_tool/flutter_build/abc123/flutter_build.dill.stamp")
+                )
+                .expect("hash placed stamp")
+            ),
+            "the record carries the hash of the re-rooted bytes that landed"
+        );
 
         // Same-root: the rewrite replaces the root onto itself — bytes
         // unchanged — so every placement stays verbatim. The root must
@@ -1851,7 +1973,7 @@ mod tests {
         };
         let outcome = materialize(&store, &same, project.path()).expect("materialize");
         assert!(
-            outcome.placed[0].iter().all(|file| file.verbatim),
+            outcome.placed[0].iter().all(PlacedFile::verbatim),
             "same-root placements keep the blob's bytes"
         );
     }
@@ -2116,7 +2238,7 @@ mod tests {
             assert!(
                 outcome.placed[0]
                     .iter()
-                    .all(|file| file.verbatim && file.rewrite == RewriteKind::None),
+                    .all(|file| file.verbatim() && file.rewrite == RewriteKind::None),
                 "root {unusable:?}: verbatim placements all the way down"
             );
             let placed_stamp = fs::read_to_string(
@@ -2407,15 +2529,29 @@ mod tests {
             "the input keeps its recorded md5"
         );
 
-        // The placed identity of the patched record is its final one.
+        // The placed identity of the patched record is its final one,
+        // and so is the hash the tree record carries for it.
         let filecache = outcome.placed[0]
             .iter()
             .find(|file| file.path == Path::new(FILE_STORE))
             .expect("placed record");
-        assert!(!filecache.verbatim);
+        assert!(!filecache.verbatim());
         assert_eq!(
             filecache.stamp,
             stamp_of(&fs::metadata(placed_dir.join(FILE_STORE)).expect("stat record"))
+        );
+        assert_eq!(
+            filecache.on_disk,
+            Some(file_blake3(&placed_dir.join(FILE_STORE)).expect("hash record")),
+            "the on-disk hash is of the patched bytes"
+        );
+        let payload = outcome.placed[0]
+            .iter()
+            .find(|file| file.path == Path::new("app.dill"))
+            .expect("placed dill");
+        assert_eq!(
+            payload.on_disk, None,
+            "a rewritten kernel dill is not hashed at placement"
         );
 
         // A tree that keeps its own record: the dill is filled and

@@ -15,6 +15,9 @@ dartq-pub.workspace = true
 # Directive extraction runs on the official-grammar token table.
 dartq-scanner.workspace = true
 dartq-source.workspace = true
+# The flutter/dart lookups a run spawns resolve through the one precedence
+# every dartq face shares (config pin, env override, PATH scan).
+dartq-toolchain.workspace = true
 hex.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true

@@ -46,7 +46,11 @@
 //!   dills replayed into a different tree, the `file://` URI prefixes
 //!   baked into the kernel tables are rewritten too ([`dill_rewrite`]),
 //!   and a placed `.filecache` records the md5 of every file the replay
-//!   rewrote, so flutter's content validation accepts them.
+//!   rewrote, so flutter's content validation accepts them. Each tree
+//!   keeps a per-entry record of what was placed under which identity
+//!   ([`placement`]), so later runs in that tree re-reference the
+//!   placed files without reading them while the shared entry stays as
+//!   ingested.
 //! * **Flutter surface** ([`args_model`], [`assemble`], [`ingest_scan`]):
 //!   the flutter argv model that feeds the key, the `flutter assemble`
 //!   argv→template parser, and the post-build scan that turns fresh build
@@ -55,6 +59,9 @@
 //! * **Assemble observer** ([`observer`]): the process-table watch that
 //!   reads the nested `flutter assemble` invocations the platform build
 //!   systems spawn behind the PATH shim, feeding [`assemble`] their argv.
+//! * **Orphan reaper** ([`reaper`], unix): the one-`ps` sweep after each
+//!   modeled run that SIGTERMs the parentless frontend_server process
+//!   flutter_tools leaves behind.
 
 pub mod args_model;
 pub mod assemble;
@@ -66,6 +73,9 @@ pub mod key;
 pub mod materialize;
 pub mod observer;
 pub mod orchestrator;
+pub mod placement;
+#[cfg(unix)]
+pub mod reaper;
 pub mod store;
 pub mod types;
 

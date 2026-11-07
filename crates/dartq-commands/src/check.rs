@@ -574,7 +574,10 @@ fn is_name_token(kind: TokenKind) -> bool {
     match kind {
         TokenKind::Identifier => true,
         TokenKind::Keyword(keyword) => {
-            matches!(keyword.style(), KeywordStyle::BuiltIn | KeywordStyle::Pseudo)
+            matches!(
+                keyword.style(),
+                KeywordStyle::BuiltIn | KeywordStyle::Pseudo
+            )
         }
         _ => false,
     }

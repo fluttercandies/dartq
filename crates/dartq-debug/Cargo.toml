@@ -12,6 +12,9 @@ repository.workspace = true
 # a commodity decoder, not something this crate hand-rolls.
 base64.workspace = true
 crossbeam-channel.workspace = true
+# The `dart`/`flutter` a launch spawns resolve through the one precedence
+# every dartq face shares (env override, then PATH, never dartq itself).
+dartq-toolchain.workspace = true
 # SIGTERM to a launched `flutter run` (its cleanup handler stops the
 # app); `Child::kill` is SIGKILL-only and would orphan the app.
 libc.workspace = true

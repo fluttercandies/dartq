@@ -1,0 +1,13 @@
+[package]
+name = "dartq-toolchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Toolchain binary resolution shared by every dartq face: one precedence (config pin, environment override, PATH scan) for the flutter and dart executables."
+repository.workspace = true
+categories = ["development-tools"]
+keywords = ["dart", "flutter", "toolchain"]
+
+[lints]
+workspace = true

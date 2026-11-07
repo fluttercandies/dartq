@@ -238,16 +238,19 @@ pub struct FileStamp {
     pub mtime_ns: u64,
 }
 
-/// One file a pre-run materialization placed, as the post-run scan
-/// finds it again: the placed file's fresh identity, the blob the
-/// placement wrote from, and whether the placed bytes are that blob's
-/// bytes verbatim (a cross-tree placement rewrites bookkeeping paths
-/// and kernel URIs — those files are not their blob's bytes and are
-/// hashed normally even when the stamp matches).
+/// One file a materialization placed, as the post-run scan finds it
+/// again: the placed file's fresh identity, the blob the placement
+/// wrote from, and whether the placed bytes are that blob's bytes
+/// verbatim (a cross-tree placement rewrites bookkeeping paths and
+/// kernel URIs — those files are not their blob's bytes, but their
+/// on-disk hash is carried so a later scan can still prove a
+/// byte-identical flutter rewrite of them).
 ///
-/// In-memory handoff between the phases of one shim invocation; never
-/// persisted.
-#[derive(Clone, Debug)]
+/// The handoff between the phases of one shim invocation AND the
+/// per-tree placement record's persisted entry (see
+/// [`crate::placement`]): what one run placed in memory, the record
+/// remembers on disk for the runs that place nothing.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct PlacedFile {
     /// Path relative to the placed dir; matches [`ManifestFile::path`].
     pub path: PathBuf,
@@ -258,8 +261,30 @@ pub struct PlacedFile {
     /// worktree paths between trees but leaves foreign paths foreign,
     /// so the bit survives both verbatim and rewritten placements.
     pub foreign_paths: bool,
-    /// Whether the bytes on disk equal the blob's bytes.
-    pub verbatim: bool,
+    /// The blake3 of the bytes on disk as placed, when the placement
+    /// knows it: the blob's own id for a verbatim clone (the blob was
+    /// identity-verified before any byte landed), the rewritten bytes'
+    /// id for a re-rooted bookkeeping file (KBs, hashed at rewrite
+    /// cost), and `None` for a re-rooted kernel dill (tens of MB — a
+    /// placement that flutter did not just rewrite would prove itself
+    /// by stamp alone, and one flutter DID rewrite is a real change
+    /// that must be hashed whatever a recorded hash said).
+    ///
+    /// [`Self::verbatim`] is `on_disk == Some(blob)`: the manifest may
+    /// reference the blob directly for such a placement anywhere; any
+    /// other value means the bytes are this tree's re-rooted rendering
+    /// of the blob — a reference only valid while the entry is not
+    /// being re-published (see [`crate::ingest_scan`]).
+    pub on_disk: Option<BlobId>,
+}
+
+impl PlacedFile {
+    /// Whether the bytes on disk are the blob's own bytes — the
+    /// placement verified the blob's content and wrote it unchanged, so
+    /// a matching stamp proves the file is the blob wherever it sits.
+    pub fn verbatim(&self) -> bool {
+        self.on_disk == Some(self.blob)
+    }
 }
 
 /// One file of a cached build directory.

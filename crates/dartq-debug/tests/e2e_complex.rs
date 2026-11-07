@@ -1,7 +1,7 @@
 //! Comprehensive live end-to-end session test against a real `dart`
 //! process — one process exercises every face of the crate.
 //!
-//! Skipped by default: requires `dart` on `PATH` (or `DARTQ_DART_BIN`)
+//! Skipped by default: requires `dart` on `PATH` (or `DARTQ_DART`)
 //! and spawns a real VM. Run explicitly:
 //!
 //! ```text
@@ -91,7 +91,7 @@ fn eval_str(session: &mut DebugSession, expr: &str) -> String {
 }
 
 #[test]
-#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART_BIN)"]
+#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART)"]
 fn complex_debug_session() {
     let mut session = launch();
     let main_id = session.main_isolate().expect("main isolate").to_owned();

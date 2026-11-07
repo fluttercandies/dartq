@@ -965,13 +965,11 @@ fn with_context_identities(packages: PackageTable, roots: &[PathBuf]) -> Package
         .collect();
     PackageTable::basic_with_contexts(
         packages.workspace_root(),
-        packages
-            .root()
-            .and_then(|name| {
-                packages
-                    .get(name.as_str())
-                    .map(|identity| (name.as_str(), identity.language_version))
-            }),
+        packages.root().and_then(|name| {
+            packages
+                .get(name.as_str())
+                .map(|identity| (name.as_str(), identity.language_version))
+        }),
         &contexts,
     )
     .unwrap_or(packages)

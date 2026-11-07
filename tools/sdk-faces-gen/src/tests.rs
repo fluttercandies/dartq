@@ -1,12 +1,16 @@
 //! Generator self-tests: the extraction rules pinned on miniature SDK-source
 //! shapes (the offline twin of the corpus pin tests).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::scan::{FlatEntry, parse_flat_table, scan_unit};
+use super::scan::{FlatEntry, ScanKind, parse_flat_table, scan_unit};
 
 fn names(source: &str) -> BTreeSet<String> {
     scan_unit(source).names
+}
+
+fn kinds(source: &str) -> BTreeMap<String, ScanKind> {
+    scan_unit(source).kinds
 }
 
 fn set(names: &[&str]) -> BTreeSet<String> {
@@ -90,6 +94,60 @@ typedef int OldStyle(Object a);
             "StringExt",
         ])
     );
+}
+
+#[test]
+fn declaration_kinds_follow_the_clauses() {
+    let kinds = kinds(
+        r#"class Widget {}
+mixin Plain {}
+mixin class Hybrid {}
+typedef Compare<T> = int Function(T a, T b);
+typedef Sink = void Function(dynamic event);
+typedef Name = Widget;
+typedef Number = int;
+typedef Handler<T> = void Function(T event);
+typedef Chain = Name;
+typedef Alias = js.JSValue?;
+typedef OldStyle(int a);
+"#,
+    );
+    assert_eq!(kinds["Widget"], ScanKind::Class);
+    assert_eq!(kinds["Plain"], ScanKind::Mixin);
+    assert_eq!(kinds["Hybrid"], ScanKind::Class);
+    // Function-type right-hand sides never carry a head.
+    assert_eq!(kinds["Compare"], ScanKind::Typedef(None));
+    assert_eq!(kinds["Sink"], ScanKind::Typedef(None));
+    assert_eq!(kinds["Handler"], ScanKind::Typedef(None));
+    assert_eq!(kinds["OldStyle"], ScanKind::Typedef(None));
+    // Named right-hand sides keep their leading type identifier.
+    assert_eq!(kinds["Name"], ScanKind::Typedef(Some("Widget".to_owned())));
+    assert_eq!(kinds["Number"], ScanKind::Typedef(Some("int".to_owned())));
+    assert_eq!(kinds["Chain"], ScanKind::Typedef(Some("Name".to_owned())));
+    // Generic arguments and `?` strip; the last dotted segment survives.
+    assert_eq!(
+        kinds["Alias"],
+        ScanKind::Typedef(Some("JSValue".to_owned()))
+    );
+    // The unterminated `typedef Broken =` never enters the map (a warning
+    // instead) — eleven names total.
+    assert_eq!(kinds.len(), 11);
+}
+
+#[test]
+fn multi_line_typedef_collects_its_right_hand_side() {
+    let scan = scan_unit(
+        r#"typedef Finalizer =
+    NativeFunction<Void Function(Pointer<NativeType>, int)>;
+typedef Broken =
+"#,
+    );
+    assert_eq!(
+        scan.kinds["Finalizer"],
+        ScanKind::Typedef(Some("NativeFunction".to_owned()))
+    );
+    // An unterminated typedef is a warning, not a guessed face name.
+    assert_eq!(scan.warnings, vec!["typedef Broken =".to_owned()]);
 }
 
 #[test]
@@ -220,4 +278,22 @@ const Map<String, LibraryInfo> libraries = const {
     let scan = scan_unit("Type name;\nType? other = null;\nwhat even is this {}\n");
     assert_eq!(scan.names, set(&["name", "other"]));
     assert_eq!(scan.warnings, vec!["what even is this {}".to_owned()]);
+}
+
+#[test]
+fn function_typed_bare_variables_declare_their_variable() {
+    // The vmservice_io shape: a function-typed head inserts its
+    // parenthesized type earlier in the line, so the declared name is the
+    // LAST whitespace token before the cut — never the `Function`
+    // constructor the head carries.
+    let scan = scan_unit(
+        r#"Stream<ProcessSignal> Function(ProcessSignal signal)? _signalWatch;
+Stream<int> Function(int signal)? publicWatch;
+"#,
+    );
+    // The private watch drops entirely (a face never carries the bogus
+    // `Function` name); the public twin keeps its own name.
+    assert_eq!(scan.names, set(&["publicWatch"]));
+    assert_eq!(scan.kinds["publicWatch"], ScanKind::Other);
+    assert!(scan.warnings.is_empty());
 }

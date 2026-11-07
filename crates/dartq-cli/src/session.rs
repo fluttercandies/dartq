@@ -104,13 +104,32 @@ pub fn run_entry(args: &SessionArgs) -> u8 {
     }
 }
 
-/// The SDK root a session keys on: the flag, else `$DART_SDK` — the
-/// engine assembly's own resolution order, surfaced here because the
-/// triple needs the concrete root.
-pub(crate) fn resolved_sdk_root(sdk: Option<&Path>) -> Result<PathBuf, String> {
+/// The pure flag/env step of [`sdk_root_for`]: the flag, else
+/// `$DART_SDK` — the engine assembly's own resolution order, surfaced
+/// here because the triple needs the concrete root. Its error is the
+/// navigation text `sdk_root_for` answers when no live session fills in
+/// either, so it names the session way too.
+fn resolved_sdk_root(sdk: Option<&Path>) -> Result<PathBuf, String> {
     sdk.map(Path::to_path_buf)
         .or_else(|| std::env::var_os("DART_SDK").map(PathBuf::from))
-        .ok_or_else(|| "no Dart SDK root (pass --sdk PATH or set DART_SDK)".to_owned())
+        .ok_or_else(|| {
+            "no Dart SDK root (pass --sdk PATH, set DART_SDK, or start a session with \
+             `dartq session start --sdk PATH`)"
+                .to_owned()
+        })
+}
+
+/// The SDK root a face that attaches to `root`'s session keys on: the
+/// flag, else `$DART_SDK`, else the live resident session's own triple
+/// (the state file is keyed by root alone, so a live session names the
+/// one SDK to attach under — `session start` without a flag attaches to
+/// it, and the debug/MCP/answer faces inherit it silently). No live
+/// session answers the navigation error, which names all three ways.
+pub(crate) fn sdk_root_for(root: &Path, sdk: Option<&Path>) -> Result<PathBuf, String> {
+    match resolved_sdk_root(sdk) {
+        Ok(sdk_root) => Ok(sdk_root),
+        Err(navigation) => dartq_session::resident_sdk_root(root).ok_or(navigation),
+    }
 }
 
 /// The detached serve spawn: the current binary, `session serve`, quiet
@@ -187,7 +206,7 @@ fn start_session(args: &StartArgs) -> u8 {
             return exit::USAGE;
         }
     };
-    let sdk_root = match resolved_sdk_root(args.sdk.as_deref()) {
+    let sdk_root = match sdk_root_for(&root, args.sdk.as_deref()) {
         Ok(sdk) => sdk,
         Err(message) => {
             eprintln!("error: {message}");
@@ -1380,32 +1399,83 @@ pub(crate) mod tests {
         assert!(parse(&["bogus"]).is_err());
     }
 
-    /// The SDK root order: the flag wins, `$DART_SDK` answers when the
-    /// flag is absent, and neither is the navigation error.
+    /// #4105: the SDK root order a face that attaches resolves by — the
+    /// flag wins, `$DART_SDK` next, then the live resident session's own
+    /// triple, and only then the navigation error, which names all three
+    /// ways. One test owns `$DART_SDK` throughout: the environment is
+    /// process-wide and the binary's tests run in parallel.
     #[test]
-    fn resolved_sdk_root_flag_then_env_then_error() {
-        let flag = resolved_sdk_root(Some(Path::new("/flag")));
-        assert_eq!(flag, Ok(PathBuf::from("/flag")));
+    fn sdk_root_order_flag_then_env_then_resident_then_error() {
         let saved = std::env::var_os("DART_SDK");
+        unsafe {
+            std::env::remove_var("DART_SDK");
+        }
+        // A live session fixture: a listening socket plus the state file
+        // naming this process with a fresh heartbeat — the same technique
+        // the serve tests build placeholders with.
+        let home = PathBuf::from("/tmp").join(format!("dqs-sdkorder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("w");
+        std::fs::create_dir_all(&root).expect("root dir");
+        let sdk = root.join("sdk");
+        std::fs::create_dir_all(&sdk).expect("sdk dir");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let triple = SessionTriple::compute(&root, &sdk);
+        let listener = UnixListener::bind(&layout.socket).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+        SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: SessionState::now_ms(),
+            triple: triple.clone(),
+            debug_sessions: 0,
+        }
+        .write(&layout)
+        .expect("state");
+
+        // No flag, no env: the live session's SDK.
+        assert_eq!(
+            sdk_root_for(&root, None),
+            Ok(sdk.canonicalize().expect("canonical sdk")),
+            "the live session answers its own sdk root"
+        );
+        // The env outranks the resident session; the flag outranks both.
         unsafe {
             std::env::set_var("DART_SDK", "/env/sdk");
         }
-        assert_eq!(resolved_sdk_root(None), Ok(PathBuf::from("/env/sdk")));
+        assert_eq!(sdk_root_for(&root, None), Ok(PathBuf::from("/env/sdk")));
         assert_eq!(
-            resolved_sdk_root(Some(Path::new("/flag"))),
+            sdk_root_for(&root, Some(Path::new("/flag"))),
             Ok(PathBuf::from("/flag")),
-            "the flag still wins over the environment"
+            "the flag still wins over the environment and the session"
         );
         unsafe {
             std::env::remove_var("DART_SDK");
         }
-        let error = resolved_sdk_root(None).expect_err("no sdk source");
-        assert!(error.contains("DART_SDK"), "{error}");
+
+        // No flag, no env, no live session: the navigation error names
+        // all three ways.
+        let bare = home.join("bare");
+        std::fs::create_dir_all(&bare).expect("bare dir");
+        let error = sdk_root_for(&bare, None).expect_err("no sdk source");
+        assert_eq!(
+            error,
+            "no Dart SDK root (pass --sdk PATH, set DART_SDK, or start a session with \
+             `dartq session start --sdk PATH`)"
+        );
+
         if let Some(saved) = saved {
             unsafe {
                 std::env::set_var("DART_SDK", saved);
             }
         }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// One `stop` of a live record: the process dies, the socket, the

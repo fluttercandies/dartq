@@ -14,6 +14,9 @@ keywords = ["dart", "flutter", "cache", "build"]
 # recomputes: each `k=v` pair rides as padded standard base64.
 base64 = { workspace = true }
 blake3 = { workspace = true }
+# The flutter binary resolution every dartq face shares (config pin,
+# environment override, PATH scan past the running binary).
+dartq-toolchain = { workspace = true }
 md-5 = { workspace = true }
 memchr = { workspace = true }
 # The kernel-dill rewriter streams its input through a read-only map,

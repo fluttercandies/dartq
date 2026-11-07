@@ -632,25 +632,33 @@ fn derive_unit(
         let Some(target) = state.capture(row.target_file) else {
             continue;
         };
+        // The equal-name run probe: `decls()` orders rows by `(name bytes,
+        // offset)` — byte-canonical, not interned-id order — so the run is
+        // located through `by_name`'s id-keyed directory, and the row
+        // indexes the edges need come back off the run's pointer into the
+        // row slice. Within a run the rows stay offset-ascending, the same
+        // sequence the pre-#3974 id-ordered partition produced.
         let decls = target.index.decls();
-        let first = decls.partition_point(|decl| decl.name < row.target_name);
-        let run = decls[first..].partition_point(|decl| decl.name == row.target_name);
-        if run == 0 {
+        let Some(run) = target.index.by_name(row.target_name) else {
             // A resolved reference row's target has a declaring row (the
             // resolver admits library faces of live captures only); a
             // phase disagreement contributes nothing, like the SDK miss
             // above.
             continue;
-        }
+        };
+        let first = saturate_slot_u32(
+            (run.as_ptr() as usize - decls.as_ptr() as usize)
+                / std::mem::size_of::<DeclRow>(),
+        );
         for source in sources.into_iter().flatten() {
-            for target_row in first..first + run {
-                edges.push((source, row.target_file, saturate_slot_u32(target_row)));
+            for target_row in first..first + run.len() as u32 {
+                edges.push((source, row.target_file, target_row));
             }
         }
         // A member-targeted reference also marks the enclosing
         // top-level container (the official double marking).
-        if decls[first].container != DeclRow::NONE {
-            let top = top_container(target, saturate_slot_u32(first));
+        if run[0].container != DeclRow::NONE {
+            let top = top_container(target, first);
             for source in sources.into_iter().flatten() {
                 edges.push((source, row.target_file, top));
             }
@@ -835,6 +843,7 @@ mod tests {
     use rustc_hash::FxHashMap;
 
     use crate::{CancellationToken, DEFAULT_TARGET, Engine, EngineConfig, EngineEvent};
+    use dartq_source::saturate_slot_u32;
 
     /// A throwaway workspace: package `t` plus the `flutter` package the
     /// Preview test imports, the synthetic-SDK fixture shape of the facade
@@ -933,17 +942,23 @@ mod tests {
         (engine, ids)
     }
 
-    /// The capture row of `name`'s first declaration in `file`.
+    /// The capture row of `name`'s first declaration in `file` — the row
+    /// index the reachability bits are keyed by, located through the
+    /// id-keyed `by_name` run directory (the `decls()` table orders rows
+    /// by name bytes, so a raw partition over `StringId` order would miss).
     fn row_of(engine: &Engine, file: dartq_source::FileId, name: &str) -> u32 {
         let capture = engine.file_capture(file).expect("analyzed file");
         let id = engine.strings().intern(name);
+        let run = capture
+            .index
+            .by_name(id)
+            .unwrap_or_else(|| panic!("declaration `{name}` present"));
         let decls = capture.index.decls();
-        let start = decls.partition_point(|row| row.name < id);
-        assert!(
-            start < decls.len() && decls[start].name == id,
-            "declaration `{name}` present",
+        let start = saturate_slot_u32(
+            (run.as_ptr() as usize - decls.as_ptr() as usize)
+                / std::mem::size_of::<dartq_index::DeclRow>(),
         );
-        u32::try_from(start).expect("decl row fits u32")
+        start
     }
 
     /// The reachability flag of `name`'s first declaration in `file`.
@@ -1375,5 +1390,51 @@ mod tests {
         // The fresh derive skips the target-less edge; `main` still seeds
         // from its own capture.
         assert!(flag(&engine, b, "main"), "the map builds and main seeds");
+    }
+
+    /// #4029 attribution pin: `decls()` orders rows by `(name bytes,
+    /// offset)` — byte-canonical — while `StringId` values follow
+    /// intern order (first-use). The fixture declares `zebra` before
+    /// `apple`, so the byte order is `apple < zebra` while intern order is
+    /// the reverse. Every name probe must locate its run through the
+    /// id-keyed directory (`by_name`), never by partitioning `decls()`
+    /// on raw `StringId` order — the pre-#3974 assumption the six
+    /// reachability panics exposed.
+    #[test]
+    fn decl_rows_sort_by_name_bytes_not_interned_ids() {
+        let (engine, ids) = fixture(&[(
+            "lib/a.dart",
+            "void zebra() {}\nvoid apple() {}\nvoid main() { zebra(); apple(); }\n",
+        )]);
+        let [a] = ids[..] else { unreachable!() };
+        let capture = engine.file_capture(a).expect("analyzed file");
+        let zebra = engine.strings().intern("zebra");
+        let apple = engine.strings().intern("apple");
+
+        // Byte-canonical order: `apple`'s row precedes `zebra`'s even
+        // though `zebra` was declared (and interned) first.
+        let apple_run = capture.index.by_name(apple).expect("apple run");
+        let zebra_run = capture.index.by_name(zebra).expect("zebra run");
+        let decls = capture.index.decls();
+        let apple_row = (apple_run.as_ptr() as usize - decls.as_ptr() as usize)
+            / std::mem::size_of::<dartq_index::DeclRow>();
+        let zebra_row = (zebra_run.as_ptr() as usize - decls.as_ptr() as usize)
+            / std::mem::size_of::<dartq_index::DeclRow>();
+        assert!(
+            apple_row < zebra_row,
+            "byte order: apple ({apple_row}) before zebra ({zebra_row})"
+        );
+
+        // The runs are contiguous equal-name slices inside `decls()`.
+        assert_eq!(apple_run.len(), 1);
+        assert_eq!(zebra_run.len(), 1);
+        assert_eq!(apple_run[0].name, apple);
+        assert_eq!(zebra_run[0].name, zebra);
+
+        // Reachability still resolves through the byte-ordered table:
+        // both callees of `main` report reachable.
+        assert!(flag(&engine, a, "zebra"));
+        assert!(flag(&engine, a, "apple"));
+        assert!(flag(&engine, a, "main"));
     }
 }

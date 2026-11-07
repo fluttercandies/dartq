@@ -810,7 +810,7 @@ impl Mcp {
     /// the `debug` verb group's proxy). `session` carries the
     /// standalone degradation reason when the tree cannot host one.
     pub(crate) fn attach(root: PathBuf, sdk: Option<&Path>) -> Self {
-        let session = match crate::session::resolved_sdk_root(sdk) {
+        let session = match crate::session::sdk_root_for(&root, sdk) {
             Ok(sdk_root) => {
                 match dartq_session::ensure(&root, &sdk_root, &crate::session::spawn_server) {
                     dartq_session::Ensured::Attached(_) => Ok(()),

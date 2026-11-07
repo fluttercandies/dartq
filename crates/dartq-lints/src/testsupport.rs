@@ -239,7 +239,8 @@ impl Fixture {
             .iter()
             .find(|(uri, _)| *uri == "core")
             .expect("generated SDK table carries dart:core");
-        builder.seed_implicit_core(lib, core_file, core_face);
+        let core_names: Vec<&str> = core_face.iter().map(|(name, _)| *name).collect();
+        builder.seed_implicit_core(lib, core_file, &core_names);
         let mut index = dartq_semantic::ElementIndex::default();
         index.insert(file, elements);
         let graph: &'static dartq_resolution::LibraryGraph = Box::leak(Box::new(builder.finish()));

@@ -18,7 +18,7 @@ use dartq_parser::ParserFeatures;
 use dartq_resolution::{
     ClassModifiers, Combinators, DEFERRED_IMPORT_OF_EXTENSION, DUPLICATE_EXPORT,
     DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT, DUPLICATE_SHOWN_NAME, EXPORT_INTERNAL_LIBRARY,
-    ExportEdge, FileRole, INVALID_EXPORT_OF_INTERNAL_ELEMENT,
+    ExportEdge, FaceKind, FileRole, INVALID_EXPORT_OF_INTERNAL_ELEMENT,
     INVALID_EXPORT_OF_INTERNAL_ELEMENT_INDIRECTLY, ImportEdge, InternalExportFinding,
     LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces, PartOfRow,
     RECURSIVE_INTERFACE_INHERITANCE, RECURSIVE_INTERFACE_INHERITANCE_EXTENDS,
@@ -1822,21 +1822,28 @@ fn export_graph_diagnostics(
     // `invalid_export_of_internal_element`(_indirectly)
     // (best_practices_verifier.dart:1004-1050 `_checkForInternalExport`):
     // gated on the exporting library's defining file sitting in its
-    // package's public API (`sourceIsInPublicApi`, workspace/pub.dart
-    // :585-607 — under <root>/lib/, not under lib/src/). The metadata facts
-    // the face wants are the captured annotation stars read name-level
-    // (`element.isInternal` ⇔ an `@internal` meta getter on the
-    // declaration's own star; the oracle's `hasInternal` is the same
-    // `_isPackageMetaGetter` test `is_meta_getter` mirrors); the signature
-    // arm resolves each written `Ty::Named` leaf through the member's own
-    // file's import scope to the alias declaration, matching the oracle's
-    // `type?.alias?.element` ask at name level.
+    // package's public API — `sourceIsInPublicApi`
+    // (workspace/pub.dart:585-607) anchors at the pubspec directory's
+    // `lib/` folder: under `lib/` but not under `lib/src/`. The anchor is
+    // the literal `lib/` folder, NOT the config's `packageUri` — an
+    // absent `packageUri` collapses `lib_dir` to the package root, which
+    // would wrongly make every file under the root "public". The
+    // metadata facts the face wants are the captured annotation stars
+    // read name-level (`element.isInternal` ⇔ an `@internal` meta getter
+    // on the declaration's own star; the oracle's `hasInternal` is the
+    // same `_isPackageMetaGetter` test `is_meta_getter` mirrors); the
+    // signature arm resolves each written `Ty::Named` leaf through the
+    // member's own file's import scope to the alias declaration,
+    // matching the oracle's `type?.alias?.element` ask at name level.
     let in_public_api = state
         .files
         .path(state.libraries.info(library).expect("live library").defining)
         .and_then(|path| {
             let identity = state.packages.containing(path)?;
-            let rel = path.strip_prefix(&identity.lib_dir).ok()?;
+            // Upstream `root.getFolder('lib')` (pub.dart:585-607): the
+            // pubspec root's literal `lib/` folder, packageUri-irrelevant.
+            let lib_dir = identity.root.join("lib");
+            let rel = path.strip_prefix(&lib_dir).ok()?;
             Some(rel.components().next().is_none_or(|c| c.as_os_str() != "src"))
         })
         .unwrap_or(false);
@@ -2527,16 +2534,16 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                     .filter_map(|file| state.deps.units.get(file))
                     .flat_map(|unit| unit.facts.elements.declarations().map(|(name, _)| name))
                     .collect();
-                let face_only: Vec<StringId> = names
+                let face_only: Vec<(StringId, FaceKind)> = names
                     .iter()
-                    .map(|name| state.strings.intern(name))
-                    .filter(|name| !declared.contains(name))
+                    .map(|(name, kind)| (state.strings.intern(name), *kind))
+                    .filter(|(name, _)| !declared.contains(name))
                     .collect();
                 if !face_only.is_empty() {
                     let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
                     builder.face_unit(node, file);
-                    for name in face_only {
-                        builder.declare(node, name, file);
+                    for (name, kind) in face_only {
+                        builder.declare_face(node, name, file, kind);
                     }
                 }
             }
@@ -2548,8 +2555,8 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                 // name loses to a same-spelling package declaration,
                 // `element/scope.dart:811-832`).
                 builder.face_unit(node, file);
-                for name in *names {
-                    builder.declare(node, state.strings.intern(name), file);
+                for (name, kind) in *names {
+                    builder.declare_face(node, state.strings.intern(name), file, *kind);
                 }
             }
         }
@@ -5160,8 +5167,8 @@ mod tests {
                 let node = builder.intern(&format!("dart:{uri}"));
                 let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
                 builder.unit(node, file);
-                for name in *names {
-                    builder.declare(node, state.strings.intern(name), file);
+                for (name, kind) in *names {
+                    builder.declare_face(node, state.strings.intern(name), file, *kind);
                 }
                 (*uri, node)
             })
@@ -5438,11 +5445,11 @@ mod tests {
             .expect("dart:core face")
             .1;
         assert!(
-            core.contains(&"Iterable"),
+            core.iter().any(|(name, _)| *name == "Iterable"),
             "the implicit core import must resolve `Iterable`"
         );
         assert!(
-            core.windows(2).all(|pair| pair[0] <= pair[1]),
+            core.windows(2).all(|pair| pair[0].0 <= pair[1].0),
             "the core face table stays ASCII-sorted"
         );
     }
@@ -5952,6 +5959,15 @@ mod tests {
     fn internal_member_export_reports_from_the_annotation_star() {
         let root = meta_workspace();
         let mut engine = meta_engine(&root);
+        // The oracle's driver walks the whole workspace context root
+        // (`_collectFiles`, analyzer_cli driver.dart:424-449), so every
+        // real analyze path runs workspace discovery first (CLI
+        // `run_overlaid`/`run_targets`, daemon session). `package:meta`
+        // resolves on disk regardless, but its unit only enters the graph
+        // when discovered — otherwise the resolved target is neither
+        // resident nor dep-indexed and the staleness-gap arm reports
+        // `uri_does_not_exist`.
+        engine.discover_workspace().expect("discover");
         engine.set_content(
             &root.join("lib/hidden.dart"),
             b"import 'package:meta/meta.dart';\n\n@internal\nclass Secret {}\nclass Plain {}\n",

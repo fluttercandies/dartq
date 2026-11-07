@@ -785,19 +785,28 @@ fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>, 
     let _ = done.send(FixMail { hosts, outcome });
 }
 
+/// The workspace root's non-`.dart` context inputs, in that fixed order:
+/// the package manifest, the resolved package graph, the analysis
+/// options — the reload surface. The single spelling for every face that
+/// reads them from the session's workspace root: `config_input_stamps`
+/// below (the advisory re-evaluation's stamps) and the watch face's
+/// `is_config_input` (the intake's routing of a move to the context
+/// refresh) both drive off this one list, so a fourth input moves every
+/// face at once.
+pub(crate) const CONFIG_INPUTS: [&str; 3] = [
+    "pubspec.yaml",
+    ".dart_tool/package_config.json",
+    "analysis_options.yaml",
+];
+
 /// The workspace root's three config-input stamps — pubspec, package
 /// config, analysis options — in that fixed order. A missing file stamps
 /// `None`, so its (re)creation counts as a move.
 fn config_input_stamps(root: &Path) -> [Option<(SystemTime, u64)>; 3] {
-    let stamp = |rel: &str| {
-        let meta = std::fs::metadata(root.join(rel)).ok()?;
+    std::array::from_fn(|index| {
+        let meta = fs::metadata(root.join(CONFIG_INPUTS[index])).ok()?;
         Some((meta.modified().ok()?, meta.len()))
-    };
-    [
-        stamp("pubspec.yaml"),
-        stamp(".dart_tool/package_config.json"),
-        stamp("analysis_options.yaml"),
-    ]
+    })
 }
 
 /// The wire form of a request id (the progress notice carries it, so a
@@ -947,6 +956,12 @@ pub struct Session {
     /// (#2596): a moved stamp on an engine-work drain re-evaluates the
     /// workspace advisory (a mid-session `pub get` heals its verdict).
     config_stamps: [Option<(SystemTime, u64)>; 3],
+    /// The session-side `dartq.yaml` restart advisory (#4106): the run
+    /// loop arms it when no watch thread owns the advisory (the serve
+    /// face, and a watch-less daemon); the `--watch` face's thread
+    /// carries its own, so this stays `None` there. Ticked once per
+    /// engine-work drain beside the stamps check — stderr only.
+    config_advisory: Option<crate::watch::ConfigWatch>,
     /// The universe stamp (#2675): the package config the analysis
     /// universe was assembled from and the on-disk bytes it was read at.
     /// Re-noted by the config-input watch's universe rebuild (including
@@ -1426,6 +1441,7 @@ impl Session {
             publishes_due: false,
             discovered: false,
             config_stamps,
+            config_advisory: None,
             package_stamp,
             context_memory_limit_mib,
             context_content_store_limit,
@@ -1580,6 +1596,11 @@ impl Session {
                 }
             }
         }
+        // The serve face's `dartq.yaml` advisory (#4106): ticked on this
+        // same drain, beside the stamps check — stderr only (no intake,
+        // no context refresh, no restart), and a no-op on the watch face,
+        // whose thread's route owns the advisory there.
+        self.advise_config_change();
         // The stamps were noted at assembly (the advisory's evaluation
         // moment), so a first-turn comparison never misreads the
         // assembly's own stamps as a move: only a real config-input
@@ -1602,6 +1623,30 @@ impl Session {
     /// cheap per-drain gate for the advisory re-evaluation.
     fn config_stamps_moved(&self) -> bool {
         self.config_stamps != config_input_stamps(&self.workspace_root)
+    }
+
+    /// Arms the session-side `dartq.yaml` restart advisory (#4106): the
+    /// run loop's call when no watch thread owns the advisory — the serve
+    /// face (and a watch-less daemon) get the same one-line restart cue
+    /// the watch face's route emits. The arm takes the baseline, so only
+    /// a later move of the governing project or global slot advises.
+    /// `home` is injectable the way the watch face's options are;
+    /// production passes the user's home directory.
+    pub(crate) fn arm_config_advisory(&mut self, home: Option<&Path>) {
+        self.config_advisory = Some(crate::watch::ConfigWatch::arm(&self.workspace_root, home));
+    }
+
+    /// One drain-side tick of the armed `dartq.yaml` advisory: prints the
+    /// restart line once per settled governing-config change (the
+    /// fingerprint state dedups across drains) and returns the advised
+    /// slots' paths — empty when nothing moved or the advisory is unarmed.
+    /// The returned paths are the observable for the exactly-once
+    /// contract's tests, the way the watch face's metrics are.
+    fn advise_config_change(&mut self) -> Vec<PathBuf> {
+        match &mut self.config_advisory {
+            Some(watch) => watch.advise_changed(),
+            None => Vec::new(),
+        }
     }
 
     /// The config-input watch's one re-derivation (#2675): a moved
@@ -4639,6 +4684,61 @@ mod tests {
             turn.publishes.iter().all(|push| push.uri != fresh_uri),
             "a fresh assembly never publishes the advisory"
         );
+    }
+
+    /// The serve face's `dartq.yaml` advisory (#4106): a mid-session
+    /// project-tier edit surfaces exactly one restart advisory naming the
+    /// project slot — the drain's own tick consumes the change (a later
+    /// tick stays silent), an unchanged file never re-advises, and neither
+    /// a `.dart` nor a pubspec edit advises at all (their moves are the
+    /// stamps'/intake's business, never the governing config's). The arm
+    /// passes no home, mirroring the watch tests' posture — no global
+    /// slot, so the project tier is the only one that can fire.
+    #[test]
+    fn serve_advises_once_on_a_mid_session_config_edit() {
+        let (workspace, mut session) = fixture("serve-config-advisory");
+        let project = workspace.root.join(dartq_commands::config::FILE_NAME);
+        fs::write(&project, "version: 1\n").expect("seed the project config");
+        session.arm_config_advisory(None);
+
+        // A differing length moves the fingerprint even under an mtime tie.
+        fs::write(&project, "version: 1\ncache:\n  size_limit_gib: 4\n").expect("edit");
+        // The drain the advisory hangs on: its tick advises, and the very
+        // next tick — the drain's own cadence — reads the settled state.
+        session.refresh_workspace_state();
+        assert!(
+            session.advise_config_change().is_empty(),
+            "the drain consumed the change: never two advisories for one edit"
+        );
+
+        // A second edit advises in its turn, exactly once, naming the
+        // project slot; an immediate re-tick stays silent.
+        fs::write(&project, "version: 1\ncache:\n  size_limit_gib: 8\n").expect("edit again");
+        assert_eq!(
+            session.advise_config_change(),
+            vec![project.clone()],
+            "one advisory naming the project slot"
+        );
+        assert!(
+            session.advise_config_change().is_empty(),
+            "the settled change never re-advises"
+        );
+
+        // A `.dart` edit and a pubspec edit never advise: neither moves a
+        // governing slot.
+        fs::write(workspace.path("lib/main.dart"), "var edited = 2;\n").expect("dart edit");
+        let pubspec = workspace.path("pubspec.yaml");
+        let moved_pubspec = format!(
+            "{}# advisory probe\n",
+            fs::read_to_string(&pubspec).expect("read the pubspec"),
+        );
+        fs::write(&pubspec, moved_pubspec).expect("pubspec edit");
+        assert!(
+            session.advise_config_change().is_empty(),
+            "content and context inputs never advise"
+        );
+
+        fs::remove_dir_all(&workspace.root).ok();
     }
 
     /// The universe rebuild (#2675): a mid-session package-config rewrite

@@ -17,6 +17,13 @@
 //! a falsy or failing condition auto-resumes. Consecutive auto-resumes
 //! are capped so a ping-ponging condition surfaces as a stop instead
 //! of hanging the session.
+//!
+//! Exit naming: once a launched program has exited, every VM-facing call
+//! answers [`Error::ProcessExited`] with its exit code — the state an
+//! agent acts on by launching again — never the transport's
+//! [`Error::Closed`]; a call addressed to an isolate whose exit the event
+//! stream showed answers [`Error::IsolateExited`]. One classifier,
+//! `DebugSession::name_exit_state`, decides.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -545,8 +552,8 @@ impl DebugSession {
     /// # Errors
     ///
     /// [`Error::DartBinaryNotFound`] / [`Error::FlutterBinaryNotFound`]
-    /// when neither the `DARTQ_DART_BIN` / `DARTQ_FLUTTER_BIN` override
-    /// nor `PATH` yields the tool; [`Error::LaunchTimeout`] when no
+    /// when neither the `DARTQ_DART` / `DARTQ_FLUTTER` override nor
+    /// `PATH` yields the tool; [`Error::LaunchTimeout`] when no
     /// banner (or, for Flutter, no debuggable main isolate) arrives in
     /// time; [`Error::ProcessExited`] when the child dies first; plus
     /// the connection errors of [`DebugSession::attach_with`].
@@ -641,7 +648,9 @@ impl DebugSession {
             session.stderr.push(chunk);
         }
         // On failure `session` drops here, and its Drop reaps the child.
-        session.handshake(false, Instant::now() + session.config.handshake_timeout)?;
+        session
+            .handshake(false, Instant::now() + session.config.handshake_timeout)
+            .map_err(|error| session.name_exit_state(None, error))?;
         if config.kind == LaunchKind::Flutter {
             // The engine spawns the root isolate after the service is
             // up; without this wait a launch could hand back a session
@@ -652,7 +661,9 @@ impl DebugSession {
                 .launch_timeout
                 .saturating_sub(started.elapsed())
                 .max(Duration::from_secs(10));
-            session.wait_for_main_isolate(budget)?;
+            session
+                .wait_for_main_isolate(budget)
+                .map_err(|error| session.name_exit_state(None, error))?;
         }
         Ok(session)
     }
@@ -862,10 +873,8 @@ impl DebugSession {
             if self.main_isolate.is_some() {
                 return Ok(());
             }
-            if let Some(child) = self.process.as_mut()
-                && let Some(status) = child.try_wait()?
-            {
-                return Err(Error::ProcessExited(status.code()));
+            if let Some(exited) = self.process_exit()? {
+                return Err(exited);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -887,6 +896,8 @@ impl DebugSession {
             {
                 Ok(Some(event)) => self.absorb_event(event),
                 Ok(None) => {}
+                // Launched: the VM may be mid-exit — the process check
+                // above names the exit within one quantum.
                 Err(Error::Closed) if self.process.is_some() => {
                     std::thread::sleep(remaining.min(Duration::from_millis(20)));
                 }
@@ -964,8 +975,8 @@ impl DebugSession {
     /// [`Error::Rpc`] code 102 when the VM cannot place the breakpoint;
     /// [`Error::Sentinel`] when the isolate is gone.
     pub fn add_breakpoint(&mut self, spec: BreakpointSpec) -> Result<BreakpointHandle> {
-        let isolate = self.resolve_isolate(spec.isolate.as_deref())?;
-        let breakpoint: Breakpoint = match &spec.location {
+        let isolate = self.target(spec.isolate.as_deref())?;
+        let answer = match &spec.location {
             BreakpointLocationSpec::Line {
                 script_uri,
                 line,
@@ -983,14 +994,16 @@ impl DebugSession {
                     "addBreakpointWithScriptUri",
                     params,
                     self.config.rpc_timeout,
-                )?
+                )
             }
             BreakpointLocationSpec::Function { function_id } => self.client.call_typed(
                 "addBreakpointAtEntry",
                 json!({ "isolateId": isolate, "functionId": function_id }),
                 self.config.rpc_timeout,
-            )?,
+            ),
         };
+        let breakpoint: Breakpoint =
+            answer.map_err(|error| self.name_exit_state(Some(&isolate), error))?;
         let handle = BreakpointHandle {
             id: breakpoint.id,
             isolate,
@@ -1013,7 +1026,7 @@ impl DebugSession {
     /// [`Error::Rpc`] when the VM rejects the removal — the handle is
     /// kept, so the caller can retry.
     pub fn remove_breakpoint(&mut self, isolate: Option<&str>, breakpoint_id: &str) -> Result<()> {
-        let isolate = self.resolve_isolate(isolate)?;
+        let isolate = self.target(isolate)?;
         let key = (isolate, breakpoint_id.to_owned());
         if !self.breakpoints.contains_key(&key) {
             return Ok(());
@@ -1028,7 +1041,7 @@ impl DebugSession {
                 self.breakpoint_specs.remove(&key);
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => Err(self.name_exit_state(Some(&key.0), error)),
         }
     }
 
@@ -1048,12 +1061,12 @@ impl DebugSession {
         isolate: Option<&str>,
         mode: ExceptionPauseMode,
     ) -> Result<()> {
-        let isolate = self.resolve_isolate(isolate)?;
+        let isolate = self.target(isolate)?;
         // `setExceptionPauseMode` is deprecated upstream in favor of
         // `setIsolatePauseMode` (protocol 3.53); prefer the forward
         // RPC and fall back only for VMs that predate it (-32601
         // "method not found").
-        match self.client.call_unit(
+        let answer = match self.client.call_unit(
             "setIsolatePauseMode",
             json!({ "isolateId": isolate, "exceptionPauseMode": mode }),
             self.config.rpc_timeout,
@@ -1064,7 +1077,8 @@ impl DebugSession {
                 self.config.rpc_timeout,
             ),
             other => other,
-        }
+        };
+        answer.map_err(|error| self.name_exit_state(Some(&isolate), error))
     }
 
     /// Resumes the isolate and packages everything an agent needs about
@@ -1077,19 +1091,22 @@ impl DebugSession {
     ///
     /// [`Error::Rpc`] code 106 when the isolate is not paused;
     /// [`Error::Timeout`] when no pause follows within the configured
-    /// pause timeout; [`Error::IsolateExited`] when the isolate exits.
+    /// pause timeout; [`Error::ProcessExited`] when the launched program
+    /// exits instead; [`Error::IsolateExited`] when the isolate exits.
     pub fn step_and_package(
         &mut self,
         isolate: Option<&str>,
         step: Option<StepOption>,
     ) -> Result<StoppedSnapshot> {
-        let isolate = self.resolve_isolate(isolate)?;
+        let isolate = self.target(isolate)?;
         let mut params = json!({ "isolateId": isolate });
         if let Some(step) = step {
             params["step"] = json!(step.as_str());
         }
-        let mark = self.resume_marked(&isolate, params)?;
-        self.wait_for_pause_after(&isolate, mark)
+        let answer = self
+            .resume_marked(&isolate, params)
+            .and_then(|mark| self.wait_for_pause_after(&isolate, mark));
+        answer.map_err(|error| self.name_exit_state(Some(&isolate), error))
     }
 
     /// Resumes without waiting for the next stop (fire-and-forget
@@ -1099,9 +1116,11 @@ impl DebugSession {
     ///
     /// [`Error::Sentinel`] when the isolate is gone; transport errors.
     pub fn resume(&mut self, isolate: Option<&str>) -> Result<()> {
-        let isolate = self.resolve_isolate(isolate)?;
-        self.resume_marked(&isolate, json!({ "isolateId": isolate }))
+        let isolate = self.target(isolate)?;
+        let answer = self.resume_marked(&isolate, json!({ "isolateId": isolate }));
+        answer
             .map(|_| ())
+            .map_err(|error| self.name_exit_state(Some(&isolate), error))
     }
 
     /// Issues `resume` and retires the isolate's pause record. Returns
@@ -1128,12 +1147,13 @@ impl DebugSession {
     ///
     /// [`Error::Sentinel`] when the isolate is gone.
     pub fn pause(&mut self, isolate: Option<&str>) -> Result<()> {
-        let isolate = self.resolve_isolate(isolate)?;
-        self.client.call_unit(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call_unit(
             "pause",
             json!({ "isolateId": isolate }),
             self.config.rpc_timeout,
-        )
+        );
+        answer.map_err(|error| self.name_exit_state(Some(&isolate), error))
     }
 
     /// Waits until `isolate` is paused, then builds the snapshot. An
@@ -1146,11 +1166,13 @@ impl DebugSession {
     /// # Errors
     ///
     /// [`Error::Timeout`] when no pause arrives within the configured
-    /// pause timeout; [`Error::IsolateExited`] when the isolate exits
-    /// first; [`Error::ProcessExited`] when the launched process dies;
+    /// pause timeout; [`Error::ProcessExited`] when the launched process
+    /// dies (a program run to completion reports its exit code here);
+    /// [`Error::IsolateExited`] when the isolate exits first;
     /// [`Error::Closed`] when the connection drops.
     pub fn wait_for_pause(&mut self, isolate: &str) -> Result<StoppedSnapshot> {
-        self.wait_for_pause_after(isolate, 0)
+        let answer = self.wait_for_pause_after(isolate, 0);
+        answer.map_err(|error| self.name_exit_state(Some(isolate), error))
     }
 
     /// The wait loop shared by [`DebugSession::wait_for_pause`] and the
@@ -1192,18 +1214,22 @@ impl DebugSession {
                     }
                 }
             }
-            if !self.isolates.contains_key(isolate) {
-                return Err(Error::IsolateExited(isolate.to_owned()));
-            }
-            if let Some(child) = &mut self.process
-                && let Some(status) = child.try_wait()?
-            {
+            if let Some(exited) = self.process_exit()? {
                 // Fold whatever the exiting process still had in
                 // flight before reporting.
                 self.poll_events()?;
-                return Err(Error::ProcessExited(status.code()));
+                return Err(exited);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if !self.isolates.contains_key(isolate) {
+                // A launched program left with no isolate at all is on
+                // its way out: its exit status (checked above) is the
+                // answer worth the wait, within the deadline.
+                let exiting = self.process.is_some() && self.main_isolate.is_none();
+                if !exiting || remaining.is_zero() {
+                    return Err(Error::IsolateExited(isolate.to_owned()));
+                }
+            }
             if remaining.is_zero() {
                 return Err(Error::Timeout(format!(
                     "isolate {isolate} did not pause within {:?}",
@@ -1233,9 +1259,9 @@ impl DebugSession {
     ///
     /// [`Error::Closed`] once an attached session's connection is down
     /// and every event it delivered has been drained. A launched
-    /// session keeps draining its pipes after the VM exits, so it
-    /// reports process death through [`DebugSession::wait_for_pause`]
-    /// instead.
+    /// session keeps draining its pipes after the VM exits (the output
+    /// stays readable), so it reports process death through its
+    /// VM-facing calls instead ([`Error::ProcessExited`]).
     pub fn poll_events(&mut self) -> Result<()> {
         // Read the settle mark *before* draining: every event below it
         // is then either drained below or was dropped by the feed.
@@ -1332,12 +1358,13 @@ impl DebugSession {
     ///
     /// [`Error::Sentinel`] when the isolate is gone.
     pub fn stack(&mut self, isolate: Option<&str>, limit: usize) -> Result<Stack> {
-        let isolate = self.resolve_isolate(isolate)?;
-        self.client.call_typed(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call_typed(
             "getStack",
             json!({ "isolateId": isolate, "limit": limit }),
             self.config.rpc_timeout,
-        )
+        );
+        answer.map_err(|error| self.name_exit_state(Some(&isolate), error))
     }
 
     /// The full isolate object (`getIsolate`).
@@ -1346,12 +1373,13 @@ impl DebugSession {
     ///
     /// [`Error::Sentinel`] when the isolate is gone.
     pub fn isolate(&mut self, isolate: Option<&str>) -> Result<crate::protocol::Isolate> {
-        let isolate = self.resolve_isolate(isolate)?;
-        self.client.call_typed(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call_typed(
             "getIsolate",
             json!({ "isolateId": isolate }),
             self.config.rpc_timeout,
-        )
+        );
+        answer.map_err(|error| self.name_exit_state(Some(&isolate), error))
     }
 
     /// Every script loaded in `isolate` — line-breakpoint targets and
@@ -1361,12 +1389,14 @@ impl DebugSession {
     ///
     /// [`Error::Sentinel`] when the isolate is gone.
     pub fn scripts(&mut self, isolate: Option<&str>) -> Result<Vec<ScriptRef>> {
-        let isolate = self.resolve_isolate(isolate)?;
-        let list: crate::protocol::ScriptList = self.client.call_typed(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call_typed(
             "getScripts",
             json!({ "isolateId": isolate }),
             self.config.rpc_timeout,
-        )?;
+        );
+        let list: crate::protocol::ScriptList =
+            answer.map_err(|error| self.name_exit_state(Some(&isolate), error))?;
         Ok(list.scripts)
     }
 
@@ -1399,8 +1429,8 @@ impl DebugSession {
         frame_index: u32,
         expression: &str,
     ) -> Result<VmObject> {
-        let isolate = self.resolve_isolate(isolate)?;
-        let value = self.client.call(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call(
             "evaluateInFrame",
             json!({
                 "isolateId": isolate,
@@ -1408,8 +1438,8 @@ impl DebugSession {
                 "expression": expression,
             }),
             self.config.rpc_timeout,
-        )?;
-        Ok(VmObject::from_value(value))
+        );
+        self.object_answer(&isolate, answer)
     }
 
     /// Evaluates `expression` against `target_id` — a Library, Class,
@@ -1427,8 +1457,8 @@ impl DebugSession {
         target_id: &str,
         expression: &str,
     ) -> Result<VmObject> {
-        let isolate = self.resolve_isolate(isolate)?;
-        let value = self.client.call(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call(
             "evaluate",
             json!({
                 "isolateId": isolate,
@@ -1436,8 +1466,8 @@ impl DebugSession {
                 "expression": expression,
             }),
             self.config.rpc_timeout,
-        )?;
-        Ok(VmObject::from_value(value))
+        );
+        self.object_answer(&isolate, answer)
     }
 
     /// Evaluates `expression` in the isolate's root library — the
@@ -1455,15 +1485,18 @@ impl DebugSession {
         isolate: Option<&str>,
         expression: &str,
     ) -> Result<VmObject> {
-        let isolate_id = self.resolve_isolate(isolate)?;
+        let isolate_id = self.target(isolate)?;
         let target = match self.root_libs.get(&isolate_id) {
             Some(library_id) => library_id.clone(),
             None => {
-                let fetched: crate::protocol::Isolate = self.client.call_typed(
-                    "getIsolate",
-                    json!({ "isolateId": isolate_id }),
-                    self.config.rpc_timeout,
-                )?;
+                let fetched: crate::protocol::Isolate = self
+                    .client
+                    .call_typed(
+                        "getIsolate",
+                        json!({ "isolateId": isolate_id }),
+                        self.config.rpc_timeout,
+                    )
+                    .map_err(|error| self.name_exit_state(Some(&isolate_id), error))?;
                 let library_id = fetched.root_lib.map(|library| library.id).ok_or_else(|| {
                     Error::Protocol(format!(
                         "isolate {isolate_id} reports no root library (not Runnable yet?)"
@@ -1490,8 +1523,8 @@ impl DebugSession {
         selector: &str,
         argument_ids: &[String],
     ) -> Result<VmObject> {
-        let isolate = self.resolve_isolate(isolate)?;
-        let value = self.client.call(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call(
             "invoke",
             json!({
                 "isolateId": isolate,
@@ -1500,8 +1533,8 @@ impl DebugSession {
                 "argumentIds": argument_ids,
             }),
             self.config.rpc_timeout,
-        )?;
-        Ok(VmObject::from_value(value))
+        );
+        self.object_answer(&isolate, answer)
     }
 
     /// Fetches one object by handle (`getObject`) — the primitive
@@ -1511,13 +1544,13 @@ impl DebugSession {
     ///
     /// [`Error::Sentinel`] for expired/collected handles.
     pub fn get_object(&mut self, isolate: Option<&str>, handle: &str) -> Result<VmObject> {
-        let isolate = self.resolve_isolate(isolate)?;
-        let value = self.client.call(
+        let isolate = self.target(isolate)?;
+        let answer = self.client.call(
             "getObject",
             json!({ "isolateId": isolate, "objectId": handle }),
             self.config.rpc_timeout,
-        )?;
-        match VmObject::from_value(value) {
+        );
+        match self.object_answer(&isolate, answer)? {
             // A sentinel means the handle is dead — the caller needs a
             // structured failure, not an object placeholder.
             VmObject::Sentinel(sentinel) => Err(Error::Sentinel {
@@ -1559,9 +1592,9 @@ impl DebugSession {
         handle: &str,
         offset: usize,
     ) -> Result<Vec<Variable>> {
-        let isolate = self.resolve_isolate(isolate)?;
+        let isolate = self.target(isolate)?;
         let max_children = self.config.expand_limits.max_children;
-        let value = self.client.call(
+        let answer = self.client.call(
             "getObject",
             json!({
                 "isolateId": isolate,
@@ -1570,8 +1603,8 @@ impl DebugSession {
                 "count": max_children,
             }),
             self.config.rpc_timeout,
-        )?;
-        let instance = match VmObject::from_value(value) {
+        );
+        let instance = match self.object_answer(&isolate, answer)? {
             VmObject::Instance(instance) => instance,
             VmObject::Sentinel(sentinel) => {
                 return Err(Error::Sentinel {
@@ -1600,7 +1633,7 @@ impl DebugSession {
     /// cannot fail the whole expansion.
     pub fn expand_graph(&mut self, isolate: Option<&str>, handle: &str) -> Result<Vec<Variable>> {
         let limits = self.config.expand_limits;
-        let isolate = Some(self.resolve_isolate(isolate)?);
+        let isolate = Some(self.target(isolate)?);
         let isolate = isolate.as_deref();
         let mut out = Vec::new();
         // Each object is expanded once: cyclic graphs (`a.next.prev`)
@@ -1672,7 +1705,7 @@ impl DebugSession {
     /// [`Error::Rpc`] codes 108/109/110 for reload-state conflicts,
     /// or the tool's compile diagnostics on a broken edit.
     pub fn reload_sources(&mut self, isolate: Option<&str>, force: bool) -> Result<bool> {
-        let isolate = self.resolve_isolate(isolate)?;
+        let isolate = self.target(isolate)?;
         // A reload may replace the root library object.
         self.root_libs.clear();
         let params = json!({ "isolateId": isolate, "force": force });
@@ -1680,14 +1713,20 @@ impl DebugSession {
         // timeout.
         let timeout = self.config.rpc_timeout.max(Duration::from_secs(120));
         if let Some(method) = self.tool_service_method("reloadSources") {
-            let value = self.client.call(&method, params, timeout)?;
+            let value = self
+                .client
+                .call(&method, params, timeout)
+                .map_err(|error| self.name_exit_state(Some(&isolate), error))?;
             return tool_answer_ok(&value)
                 .map(|()| true)
                 .ok_or_else(|| Error::Protocol(format!("tool reload answered {value}")));
         }
-        let value = self.client.call("reloadSources", params, timeout)?;
-        let report: crate::protocol::ReloadReport = serde_json::from_value(value)
-            .map_err(|error| Error::Protocol(format!("malformed reload report: {error}")))?;
+        // Typed: a `Collected` sentinel (the isolate is gone) is a
+        // failure to name, not a malformed report.
+        let report: crate::protocol::ReloadReport = self
+            .client
+            .call_typed("reloadSources", params, timeout)
+            .map_err(|error| self.name_exit_state(Some(&isolate), error))?;
         Ok(report.success)
     }
 
@@ -1714,6 +1753,12 @@ impl DebugSession {
     /// restart fails; [`Error::Timeout`] when no post-restart isolate
     /// appears in a bounded window.
     pub fn hot_restart(&mut self) -> Result<RestartOutcome> {
+        let outcome = self.restart_and_rearm();
+        outcome.map_err(|error| self.name_exit_state(None, error))
+    }
+
+    /// The restart sequence behind [`DebugSession::hot_restart`].
+    fn restart_and_rearm(&mut self) -> Result<RestartOutcome> {
         let specs: Vec<BreakpointSpec> = self.breakpoint_specs.values().cloned().collect();
         let timeout = self.config.rpc_timeout.max(Duration::from_secs(120));
         if let Some(method) = self.tool_service_method("hotRestart") {
@@ -1868,6 +1913,20 @@ impl DebugSession {
         Ok(match self.process.as_mut() {
             Some(child) => child.try_wait()?.is_none(),
             None => false,
+        })
+    }
+
+    /// [`Error::ProcessExited`] once the launched child has exited: a
+    /// non-blocking `try_wait` that reaps it. `Child` keeps the reaped
+    /// status and `try_wait` repeats it, so every later check names the
+    /// same code. `None` while the child runs, and for an attached
+    /// session.
+    fn process_exit(&mut self) -> Result<Option<Error>> {
+        Ok(match self.process.as_mut() {
+            Some(child) => child
+                .try_wait()?
+                .map(|status| Error::ProcessExited(status.code())),
+            None => None,
         })
     }
 
@@ -2085,6 +2144,68 @@ impl DebugSession {
             .ok_or_else(|| {
                 Error::Protocol("no isolate available yet (wait for an Isolate event)".into())
             })
+    }
+
+    /// [`DebugSession::resolve_isolate`] for a VM-facing call. With no
+    /// isolate left to name — an exited program's main isolate is
+    /// forgotten with it — the exit is the answer, not "no isolate yet".
+    fn target(&mut self, isolate: Option<&str>) -> Result<String> {
+        self.resolve_isolate(isolate)
+            .map_err(|error| self.exit_state(None).unwrap_or(error))
+    }
+
+    /// The classifier every VM-facing call's failure goes through. A call
+    /// whose target is gone fails with the connection closed under it, or
+    /// with the VM's answer for an isolate it no longer has (a `Collected`
+    /// sentinel; 105, "isolate must be runnable"); such a failure becomes
+    /// the exit behind it when the session knows one
+    /// ([`DebugSession::exit_state`]). Every other failure passes through
+    /// unchanged.
+    fn name_exit_state(&mut self, isolate: Option<&str>, error: Error) -> Error {
+        let gone = match &error {
+            Error::Closed | Error::IsolateExited(_) | Error::Rpc { code: 105, .. } => true,
+            Error::Sentinel { kind, .. } => kind == SentinelKind::Collected.as_str(),
+            _ => false,
+        };
+        if gone {
+            self.exit_state(isolate).unwrap_or(error)
+        } else {
+            error
+        }
+    }
+
+    /// The exit a call addressed to `isolate` ran into, in a fixed order:
+    /// the launched process exited ([`Error::ProcessExited`], with its
+    /// code); else the event stream showed the isolate's exit
+    /// ([`Error::IsolateExited`]); else none — an attached session or a
+    /// genuine transport loss keeps its own failure. Never blocks: the
+    /// child is checked, not waited for.
+    fn exit_state(&mut self, isolate: Option<&str>) -> Option<Error> {
+        // A status the OS cannot report leaves the verdict to the stream.
+        if let Ok(Some(exited)) = self.process_exit() {
+            return Some(exited);
+        }
+        // Fold what the connection already delivered: an `IsolateExit`
+        // that arrived with the failure counts. A closed feed is no news.
+        let _ = self.poll_events();
+        let isolate = isolate?;
+        (!self.isolates.contains_key(isolate)).then(|| Error::IsolateExited(isolate.to_owned()))
+    }
+
+    /// The object a call addressed to `isolate` answered. `Collected` is
+    /// also the VM's answer for an isolate it no longer has, so that
+    /// sentinel defers to an exit the session knows of; without one it
+    /// stays a value (a collected object).
+    fn object_answer(&mut self, isolate: &str, answer: Result<Value>) -> Result<VmObject> {
+        match answer.map(VmObject::from_value) {
+            Ok(VmObject::Sentinel(sentinel)) if sentinel.kind == SentinelKind::Collected => {
+                match self.exit_state(Some(isolate)) {
+                    Some(exit) => Err(exit),
+                    None => Ok(VmObject::Sentinel(sentinel)),
+                }
+            }
+            other => other.map_err(|error| self.name_exit_state(Some(isolate), error)),
+        }
     }
 
     /// Classifies a pause event of `isolate`: report it, or auto-resume
@@ -2534,49 +2655,48 @@ impl ServiceUri {
     }
 }
 
-/// Finds the `dart` executable: `DARTQ_DART_BIN` wins, then `PATH`.
+/// Finds the `dart` executable: `DARTQ_DART` wins, then `PATH` — the one
+/// resolution every dartq face shares.
 fn find_dart_binary() -> Result<PathBuf> {
-    find_binary("DARTQ_DART_BIN", "dart", Error::DartBinaryNotFound)
+    find_binary(
+        dartq_toolchain::find_dart(None),
+        "dart",
+        "DARTQ_DART",
+        Error::DartBinaryNotFound,
+    )
 }
 
-/// Finds the `flutter` executable: `DARTQ_FLUTTER_BIN` wins, then
-/// `PATH`.
+/// Finds the `flutter` executable: `DARTQ_FLUTTER` wins, then `PATH`.
 fn find_flutter_binary() -> Result<PathBuf> {
-    find_binary("DARTQ_FLUTTER_BIN", "flutter", Error::FlutterBinaryNotFound)
+    find_binary(
+        dartq_toolchain::find_flutter(None),
+        "flutter",
+        "DARTQ_FLUTTER",
+        Error::FlutterBinaryNotFound,
+    )
 }
 
-/// One lookup shared by both toolchains: the explicit override, then
-/// every `PATH` entry.
-fn find_binary(override_var: &str, name: &str, missing: fn(String) -> Error) -> Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os(override_var) {
-        let path = PathBuf::from(explicit);
-        if is_executable(&path) {
-            return Ok(path);
-        }
-        return Err(missing(format!(
-            "{override_var}={} is not an executable file",
+/// One check shared by both toolchains: the shared resolver's answer as a
+/// launchable executable. The resolver hands an unresolvable override
+/// through verbatim (a spawn would diagnose it); the launch reports it as
+/// the typed missing-binary error instead, so the failure stays named and
+/// recoverable rather than a bare spawn error.
+fn find_binary(
+    found: Option<PathBuf>,
+    name: &str,
+    override_var: &str,
+    missing: fn(String) -> Error,
+) -> Result<PathBuf> {
+    match found {
+        Some(path) if is_executable(&path) => Ok(path),
+        Some(path) => Err(missing(format!(
+            "{} is not an executable file (from {override_var} or PATH)",
             path.display()
-        )));
+        ))),
+        None => Err(missing(format!(
+            "no `{name}` executable on PATH (set {override_var} to override)"
+        ))),
     }
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return Err(missing(format!(
-            "PATH is unset and {override_var} is not set"
-        )));
-    };
-    let file = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(&file);
-        if is_executable(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    Err(missing(format!(
-        "no `{name}` executable on PATH (set {override_var} to override)"
-    )))
 }
 
 /// The `dart <script>` argument vector: VM flags, the script, then the

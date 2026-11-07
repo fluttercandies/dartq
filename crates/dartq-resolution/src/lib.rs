@@ -80,8 +80,9 @@ pub use export_graph::{
 pub use file_role::{FileRole, PartOfRow, part_of_row};
 pub use uri::{SdkFileKind, SdkFileKinds, canonical_dart_uri};
 pub use library_graph::{
-    CombinatorClause, Combinators, DuplicateCombinatorName, ExportEdge, ExportEntry, ImportEdge,
-    LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,
+    CombinatorClause, Combinators, DuplicateCombinatorName, ExportEdge, ExportEntry, FaceKind,
+    ImportEdge, LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup,
+    UndefinedCombinatorName,
 };
 pub use modifiers::{
     ClassModifiers, DeclKind, DeclarationViolation, ExplicitBaseFinal, ImplementsStep,

@@ -312,6 +312,7 @@ version = "0.1.9"
 dependencies = [
  "base64",
  "blake3",
+ "dartq-toolchain",
  "libc",
  "md-5",
  "memchr",
@@ -355,6 +356,7 @@ dependencies = [
 name = "dartq-commands"
 version = "0.1.9"
 dependencies = [
+ "blake3",
  "dartq-ai",
  "dartq-ast",
  "dartq-bcache",
@@ -423,6 +425,7 @@ version = "0.1.9"
 dependencies = [
  "base64",
  "crossbeam-channel",
+ "dartq-toolchain",
  "libc",
  "parking_lot",
  "rustc-hash",
@@ -696,6 +699,7 @@ dependencies = [
  "dartq-pub",
  "dartq-scanner",
  "dartq-source",
+ "dartq-toolchain",
  "hex",
  "libc",
  "parking_lot",
@@ -707,6 +711,10 @@ dependencies = [
  "tempfile",
  "thiserror",
 ]
+
+[[package]]
+name = "dartq-toolchain"
+version = "0.1.9"
 
 [[package]]
 name = "dartq-types"

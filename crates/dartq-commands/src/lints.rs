@@ -1321,7 +1321,7 @@ fn seed_imports(
                     })
                     .map(|(_, names)| {
                         let node = builder.intern(uri);
-                        for name in *names {
+                        for (name, _) in *names {
                             builder.declare(node, strings.intern(name), core_file);
                         }
                         node
@@ -1419,7 +1419,8 @@ fn build_library_semantics(engine: &Engine, file: FileId, members: &[FileId]) ->
         .iter()
         .find(|(uri, _)| *uri == "core")
         .expect("generated SDK table carries dart:core");
-    builder.seed_implicit_core(lib, core_file, core_face);
+    let core_names: Vec<&str> = core_face.iter().map(|(name, _)| *name).collect();
+    builder.seed_implicit_core(lib, core_file, &core_names);
     let mut index = ElementIndex::default();
     for &member in members {
         if let Some(facts) = engine.file_facts(member) {

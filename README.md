@@ -354,11 +354,16 @@ age guard that spares any in-flight write. `dartq bcache stats|gc` manage
 the build cache alone; a face that fails prints its own `error` line and
 the others still report.
 
-The `flutter` build-cache shim: `dartq init` scaffolds a `dartq.yaml` (only
-when none exists) and installs `~/.dartq/bin/flutter` as a symlink to the
-dartq binary. With that bin directory ahead of the real flutter on `PATH`,
-`flutter` runs cache their tool outputs in the CAS store; until a
-`build_cache:` key is set in `dartq.yaml`, the shim is a pure passthrough.
+The Flutter build cache runs through two explicit doors: `dartq flutter
+<args…>` (forward flutter's arguments verbatim — modeled invocations
+(`build`, `run`, `test`) cache their tool outputs in the CAS store, the
+rest pass through) and, as an opt-in, the `~/.dartq/bin/flutter` PATH
+shim that `dartq shim install` links (plain `flutter` calls get
+intercepted when that directory sits ahead of the real flutter on
+`PATH`; `dartq shim remove` unlinks it). `dartq init` scaffolds a
+`dartq.yaml` (only when none exists) — the cache is on with its
+defaults from the first run; `build_cache.enabled: false` in
+`dartq.yaml` is the one spelling that turns it off.
 
 Caps live in `dartq.yaml`: `cache.size_limit_gib` bounds both analysis
 stores (snapshots and content store; each defaults to 10 GiB), and

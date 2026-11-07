@@ -582,14 +582,34 @@ fn under_election(
 }
 
 /// Whether the state names the live session for `triple`: the triple
-/// matches, the pid is a real live process, the socket answers, and the
-/// heartbeat is fresh. The placeholder's pid 0 is never live, so a
-/// bring-up in progress is never "attached" before its first beat.
+/// matches a state that is alive. The placeholder's pid 0 is never
+/// alive, so a bring-up in progress is never "attached" before its
+/// first beat.
 fn state_is_live(state: &SessionState, triple: &SessionTriple, layout: &Layout) -> bool {
-    state.triple == *triple
-        && pid_alive(state.pid)
+    state.triple == *triple && state_is_alive(state, layout)
+}
+
+/// Whether the state describes a live session at all: the pid is a real
+/// live process, the socket answers, and the heartbeat is fresh — the
+/// triple-independent legs of [`state_is_live`] (the triple match is the
+/// caller's question; the liveness arithmetic is this crate's).
+fn state_is_alive(state: &SessionState, layout: &Layout) -> bool {
+    pid_alive(state.pid)
         && socket_open(layout)
         && SessionState::now_ms().saturating_sub(state.heartbeat_ms) <= STALE_HEARTBEAT.as_millis()
+}
+
+/// The SDK root the live resident session for `root` runs on — the
+/// fallback for a face that attaches without naming an SDK. The state
+/// file is keyed by root alone (one layout, one session), so the live
+/// state's own triple is the only coherent answer. A bring-up
+/// placeholder (pid 0), a dead pid, a socket nobody answers, a stale
+/// heartbeat, or no state at all answers `None`.
+#[must_use]
+pub fn resident_sdk_root(root: &Path) -> Option<PathBuf> {
+    let layout = Layout::new(root);
+    let state = SessionState::read(&layout)?;
+    state_is_alive(&state, &layout).then_some(state.triple.sdk_root)
 }
 
 /// How long ago the placeholder was written.
@@ -1941,6 +1961,65 @@ mod tests {
             1,
             "the wedged session was replaced, not attached"
         );
+    }
+
+    /// #4105: the attaching faces' SDK fallback names the live session's
+    /// own SDK and nothing else. The match is liveness only — a live
+    /// session of another binary generation still names the SDK it runs
+    /// on (the caller's election then re-raises the session under that
+    /// SDK) — while the bring-up placeholder, a dead pid, a stale
+    /// heartbeat, a socket nobody answers, and an absent state answer
+    /// `None`.
+    #[test]
+    fn resident_sdk_root_names_a_live_session_and_nothing_else() {
+        let root = temp("rsdk");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let sdk = temp("rsdk-sdk");
+        write(&sdk.join("version"), "3.13.1\n");
+        let triple = SessionTriple::compute(&root, &sdk);
+        bring_up(&layout, &triple);
+        let sdk_root = sdk.canonicalize().expect("canonical sdk");
+        assert_eq!(resident_sdk_root(&root), Some(sdk_root.clone()));
+
+        let stamp = |pid: u32, heartbeat_ms: u128, binary_hash: &str| {
+            SessionState {
+                pid,
+                heartbeat_ms,
+                triple: SessionTriple {
+                    binary_hash: binary_hash.to_owned(),
+                    ..triple.clone()
+                },
+                debug_sessions: 0,
+            }
+            .write(&layout)
+            .expect("state");
+        };
+        let live = std::process::id();
+        stamp(live, SessionState::now_ms(), "another-binary");
+        assert_eq!(
+            resident_sdk_root(&root),
+            Some(sdk_root),
+            "liveness, not the caller's triple, decides"
+        );
+        stamp(0, SessionState::now_ms(), &triple.binary_hash);
+        assert_eq!(resident_sdk_root(&root), None, "the bring-up placeholder");
+        stamp(u32::MAX - 1, SessionState::now_ms(), &triple.binary_hash);
+        assert_eq!(resident_sdk_root(&root), None, "a dead pid");
+        stamp(
+            live,
+            SessionState::now_ms().saturating_sub(10 * STALE_HEARTBEAT.as_millis()),
+            &triple.binary_hash,
+        );
+        assert_eq!(resident_sdk_root(&root), None, "a stale heartbeat");
+        stamp(live, SessionState::now_ms(), &triple.binary_hash);
+        std::fs::remove_file(&layout.socket).expect("unlink the socket");
+        assert_eq!(resident_sdk_root(&root), None, "a socket nobody answers");
+        std::fs::remove_file(&layout.state).expect("drop the state");
+        assert_eq!(resident_sdk_root(&root), None, "no state at all");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&sdk).ok();
     }
 
     /// Pid 0 (the bring-up sentinel) and out-of-`pid_t` ids are never

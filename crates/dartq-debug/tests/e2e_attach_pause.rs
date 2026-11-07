@@ -54,7 +54,7 @@ fn resume_tagged(session: &mut DebugSession, tag: &str) -> dartq_debug::StoppedS
 /// the isolate parks at the entry point and stays alive for attach;
 /// returns the child and the ws URI.
 fn spawn_free_running() -> (Child, String) {
-    let dart = std::env::var("DARTQ_DART_BIN").unwrap_or_else(|_| "dart".to_owned());
+    let dart = std::env::var("DARTQ_DART").unwrap_or_else(|_| "dart".to_owned());
     let mut child = Command::new(&dart)
         .arg("--enable-vm-service=0")
         .arg("--pause-isolates-on-start")
@@ -94,7 +94,7 @@ fn spawn_free_running() -> (Child, String) {
 }
 
 #[test]
-#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART_BIN)"]
+#[ignore = "requires a real `dart` executable on PATH (or DARTQ_DART)"]
 fn attach_pause_step_rewind() {
     let (mut child, ws_uri) = spawn_free_running();
 

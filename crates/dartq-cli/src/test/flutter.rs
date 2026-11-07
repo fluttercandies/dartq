@@ -47,7 +47,8 @@ use dartq_test::{ExecConfig, Settled, SuiteBlock};
 
 use super::{
     Invocation, NO_TESTS, Outputs, Sink, Tally, complete, delegate_requested, delegate_with,
-    idle_timeout, impact_sdk, tally, terminal_width, with_selection,
+    flutter_pin, idle_timeout, impact_sdk, record_impacted_inputs, tally, terminal_width,
+    with_selection,
 };
 use crate::exit;
 
@@ -69,7 +70,7 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
-    let Some(flutter) = dartq_test::host::find("flutter") else {
+    let Some(flutter) = dartq_test::host::find_flutter(flutter_pin().as_deref()) else {
         return delegate_with(args, true, "no flutter on PATH");
     };
     // The tool's own preconditions (and their error text) are its to
@@ -157,6 +158,9 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
                 suites.retain(|suite| reached.contains(&suite.abs));
                 if suites.is_empty() {
                     eprintln!("dartq test: no suite is reachable from the changes since {base}");
+                    // The selection was bounded on the current inputs —
+                    // the next run may bound itself against them too.
+                    record_impacted_inputs(&root);
                     return exit::CLEAN;
                 }
                 line = Cow::Owned(with_selection(
@@ -225,7 +229,17 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
         workers,
     };
     match execute(&plan) {
-        Ok(code) => code,
+        Ok(code) => {
+            // An executed `--impacted` run is the one moment the ignored
+            // resolution inputs are known-good for the suites that ran —
+            // any exit code: a failing suite still ran. Returns before
+            // this point (usage errors, a missing runner) executed
+            // nothing and record nothing.
+            if plan.inv.impacted.is_some() {
+                record_impacted_inputs(&plan.root);
+            }
+            code
+        }
         Err(error) => {
             eprintln!("dartq: internal error: {error}");
             exit::INTERNAL_ERROR
@@ -1695,7 +1709,9 @@ mod tests {
     /// and the suite importing nothing of the package (only `dart:io`, the
     /// shape of a platform-configuration check) is not. A Flutter SDK
     /// without its Dart SDK assembles no graph: nothing is bounded, and
-    /// everything runs.
+    /// everything runs. The stamp a prior run recorded keeps the first
+    /// call bounded; the second, against the SDK-less toolchain, passes
+    /// the stamp and fails at assembly.
     #[test]
     fn impacted_selection_assembles_against_the_tools_sdk() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -1762,6 +1778,9 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-q", "--no-verify", "-m", "fixture"]);
         put(root.join("lib/a.dart"), "class A2 {}\n");
+        // A prior run's record: the selection below bounds itself against
+        // it instead of falling back to the first-run full run.
+        dartq_commands::impact::record_resolution_stamp(&root).expect("record the inputs");
         let selection = |toolchain: &Path| {
             let sdk = impact_sdk(
                 None,

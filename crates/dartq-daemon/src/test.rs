@@ -289,7 +289,7 @@ pub(crate) fn handle(
                         .map(|package| package.version.to_string())
                 });
             Ok(json!({
-                "dart": dartq_test::host::find("dart").map(|path| path.display().to_string()),
+                "dart": dartq_test::host::find_dart(None).map(|path| path.display().to_string()),
                 "test_package": test,
             }))
         }

@@ -24,11 +24,13 @@
 //! which costs a frontend_server recompile, never a wrong artifact.
 //!
 //! Both faces share one re-ingest fast path: a file whose recorded
-//! identity matches — placed by this invocation's own materialization,
-//! or stamped by the prior entry under the ingest key — is re-referenced
-//! without reading a byte (its recorded class carried verbatim), so a
-//! warm run stores only what flutter actually changed (see
-//! [`reused_identity`]).
+//! identity matches — placed by this invocation's own materialization
+//! or by an earlier one the tree's placement record remembers
+//! ([`crate::placement`]), or stamped by the prior entry under the
+//! ingest key — is re-referenced without reading a byte (its recorded
+//! class carried verbatim), and a recorded file flutter rewrote byte
+//! for byte is re-referenced after one read, so a warm run stores only
+//! what flutter actually changed (see [`reused_identity`]).
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
@@ -448,30 +450,152 @@ pub fn dir_touched_since(dir: &Path, since: SystemTime) -> Result<bool> {
 /// One scanned ingest dir: every file, manifest-shaped and stamped,
 /// and the re-hashed subset — the ingest sources. A file whose identity
 /// a placed or prior record proves (see [`reused_identity`]) is no
-/// source: its bytes are never read. `skipped` names and counts the
-/// files the scan left out (see [`ScanSkips`]).
+/// source: its bytes are never read. `record` is the tree placement
+/// record's view of the same files (see [`crate::placement`]): every
+/// file under its fresh identity, with the hash of its on-disk bytes
+/// where known. `rerooted` counts the files vouched as this tree's
+/// re-rooted rendering of a blob of the entry's tree — references the
+/// orchestrator may keep only while the entry stays as ingested (see
+/// [`scan_entry_files`]). `skipped` names and counts the files the scan
+/// left out (see [`ScanSkips`]).
 #[derive(Clone, Debug)]
 pub struct DirScan {
     pub files: Vec<ManifestFile>,
     pub sources: Vec<(PathBuf, BlobId)>,
+    pub record: Vec<PlacedFile>,
+    pub rerooted: u64,
     pub skipped: ScanSkips,
 }
 
+/// What a record proves about one scanned file without reading it (see
+/// [`reused_identity`]): the manifest reference to make, and what the
+/// tree record remembers about the bytes on disk.
+struct Vouched {
+    blob: BlobId,
+    rewrite: RewriteKind,
+    foreign_paths: bool,
+    /// The on-disk hash as the vouching record knows it (see
+    /// [`PlacedFile::on_disk`]); a prior-manifest stamp vouches the
+    /// blob's own bytes.
+    on_disk: Option<BlobId>,
+}
+
+impl Vouched {
+    /// Whether the bytes on disk are this tree's re-rooted rendering of
+    /// `blob` rather than its own bytes — a cross-tree placement — so
+    /// the reference points into the entry's tree, not this one.
+    fn rerooted(&self) -> bool {
+        self.on_disk != Some(self.blob)
+    }
+}
+
+/// One scanned file's outcome: its manifest entry, the ingest source
+/// when it was hashed to new content, the tree record's entry for it,
+/// and whether a record vouched it across trees.
+struct Scanned {
+    manifest: ManifestFile,
+    source: Option<(PathBuf, BlobId)>,
+    record: PlacedFile,
+    rerooted: bool,
+}
+
+impl Scanned {
+    /// A file a record vouched for, or whose re-read bytes proved it the
+    /// placed rendering: referenced as the record says, never a source.
+    fn vouched(file: &ScannedFile, vouched: Vouched) -> Self {
+        let path = PathBuf::from(&file.relative);
+        Self {
+            manifest: ManifestFile {
+                path: path.clone(),
+                blob: vouched.blob,
+                executable: file.executable,
+                rewrite: vouched.rewrite,
+                foreign_paths: vouched.foreign_paths,
+                stamp: Some(file.stamp),
+            },
+            source: None,
+            rerooted: vouched.rerooted(),
+            record: PlacedFile {
+                path,
+                stamp: file.stamp,
+                blob: vouched.blob,
+                rewrite: vouched.rewrite,
+                foreign_paths: vouched.foreign_paths,
+                on_disk: vouched.on_disk,
+            },
+        }
+    }
+
+    /// A file hashed to its own content: a source, and a record entry
+    /// whose on-disk bytes are the blob's.
+    fn hashed(file: ScannedFile, blob: BlobId, rewrite: RewriteKind, foreign_paths: bool) -> Self {
+        let path = PathBuf::from(&file.relative);
+        Self {
+            manifest: ManifestFile {
+                path: path.clone(),
+                blob,
+                executable: file.executable,
+                rewrite,
+                foreign_paths,
+                stamp: Some(file.stamp),
+            },
+            source: Some((file.absolute, blob)),
+            rerooted: false,
+            record: PlacedFile {
+                path,
+                stamp: file.stamp,
+                blob,
+                rewrite,
+                foreign_paths,
+                on_disk: Some(blob),
+            },
+        }
+    }
+}
+
+/// Folds per-file outcomes into one [`DirScan`].
+fn collect_scan(scanned: Vec<Scanned>, skipped: ScanSkips) -> DirScan {
+    let mut files = Vec::with_capacity(scanned.len());
+    let mut record = Vec::with_capacity(scanned.len());
+    let mut sources = Vec::new();
+    let mut rerooted = 0u64;
+    for file in scanned {
+        if let Some(source) = file.source {
+            sources.push(source);
+        }
+        rerooted += u64::from(file.rerooted);
+        files.push(file.manifest);
+        record.push(file.record);
+    }
+    DirScan {
+        files,
+        sources,
+        record,
+        rerooted,
+        skipped,
+    }
+}
+
 /// The known content one scanned file is proven to hold without reading
-/// it, as `(blob, rewrite, foreign)` to reference verbatim: the blob
-/// identity is established when — and only when — the file's
-/// [`FileStamp`] equals a recorded stamp AND the store still holds the
-/// recorded blob. The path classification rides along from the record
-/// it was proven by: the worktree-root rewrite preserves it (worktree
-/// paths move between trees, foreign paths do not move at all).
+/// it, as a [`Vouched`] reference: the blob identity is established
+/// when — and only when — the file's [`FileStamp`] equals a recorded
+/// stamp AND the store still holds the recorded blob. The path
+/// classification rides along from the record it was proven by: the
+/// worktree-root rewrite preserves it (worktree paths move between
+/// trees, foreign paths do not move at all).
 ///
 /// Two records can vouch, in this precedence:
 ///
-/// 1. **Placed** (this invocation's own materialization): a matching
-///    stamp means the file is the one the shim placed after the prior
-///    run; when the placement was verbatim (the placed bytes are the
-///    blob's bytes) the blob is referenced directly. A mismatching
-///    stamp means the run rewrote the file — it is hashed, even when a
+/// 1. **Placed** (this invocation's own materialization, and the tree's
+///    placement record of earlier ones — see [`crate::placement`]): a
+///    matching stamp means the file is the one placed from the recorded
+///    blob and untouched since. A verbatim placement (the placed bytes
+///    are the blob's bytes) is referenced directly anywhere; a
+///    re-rooted one (a cross-tree placement rewrote its paths or URIs)
+///    only when `rerooted_ok` — its reference names the entry's tree,
+///    which is right while the entry stays as ingested and wrong in a
+///    draft re-published under this tree's root. A mismatching stamp
+///    means the run rewrote the file — it is read, even when a
 ///    prior-entry stamp from an older ingest also happens to match.
 ///    That suppression is what keeps the rule honest: only the
 ///    placement knows the bytes that are on disk NOW.
@@ -482,23 +606,30 @@ pub struct DirScan {
 ///    write moves the ns mtime, a replaced file gets a new inode).
 ///
 /// Anything else — no record for the path, a stamp mismatch, a legacy
-/// record without a stamp, a blob gc has removed, a placed-but-rewritten
-/// file — yields `None` and the file is hashed, so the fast path can
-/// never keep a stale blob reference for changed content. The ms-scale
-/// window where gc removes the blob after `blob_exists` agreed is the
-/// store's documented gc race: the ingest's upfront check rejects the
-/// draft, the run loses one ingest, and the next run re-hashes.
+/// record without a stamp, a blob gc has removed, a re-rooted placement
+/// when `rerooted_ok` is off — yields `None` and the file is read, so
+/// the fast path can never keep a stale blob reference for changed
+/// content. The ms-scale window where gc removes the blob after
+/// `blob_exists` agreed is the store's documented gc race: the ingest's
+/// upfront check rejects the draft, the run loses one ingest, and the
+/// next run re-hashes.
 fn reused_identity(
     file: &ScannedFile,
     prior: Option<&DirRecord>,
     placed: Option<&[PlacedFile]>,
+    rerooted_ok: bool,
     blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
-) -> Option<(BlobId, RewriteKind, bool)> {
-    if let Some(placed) =
-        placed.and_then(|files| files.iter().find(|f| f.path == Path::new(&file.relative)))
-    {
-        return (placed.verbatim && placed.stamp == file.stamp && blob_exists(&placed.blob))
-            .then_some((placed.blob, placed.rewrite, placed.foreign_paths));
+) -> Option<Vouched> {
+    if let Some(placed) = recorded_placement(placed, file) {
+        let proves = placed.stamp == file.stamp
+            && (rerooted_ok || placed.verbatim())
+            && blob_exists(&placed.blob);
+        return proves.then(|| Vouched {
+            blob: placed.blob,
+            rewrite: placed.rewrite,
+            foreign_paths: placed.foreign_paths,
+            on_disk: placed.on_disk,
+        });
     }
     prior
         .and_then(|dir| {
@@ -508,7 +639,65 @@ fn reused_identity(
                     && blob_exists(&recorded.blob)
             })
         })
-        .map(|recorded| (recorded.blob, recorded.rewrite, recorded.foreign_paths))
+        .map(|recorded| Vouched {
+            blob: recorded.blob,
+            rewrite: recorded.rewrite,
+            foreign_paths: recorded.foreign_paths,
+            on_disk: Some(recorded.blob),
+        })
+}
+
+/// The placement record of `file`, when one names its path.
+fn recorded_placement<'a>(
+    placed: Option<&'a [PlacedFile]>,
+    file: &ScannedFile,
+) -> Option<&'a PlacedFile> {
+    placed.and_then(|files| {
+        files
+            .iter()
+            .find(|placed| placed.path == Path::new(&file.relative))
+    })
+}
+
+/// The second chance a recorded file gets once its stamp moved: the
+/// hash its re-read bytes must equal to still be the placed rendering
+/// of the recorded blob — flutter rewrites `.filecache`, `outputs.json`,
+/// and runtime-skipped stamps on EVERY build, byte for byte when
+/// nothing changed, and a re-rooted placement that reproduces itself
+/// is no new content. `None` when nothing is recorded, the placement
+/// did not hash its bytes (a rewritten kernel dill), the rendering is
+/// re-rooted while `rerooted_ok` is off, or the store no longer holds
+/// the recorded blob — a vouch that could not be honored must not skip
+/// the read's classification, or a path-anchored bookkeeping file
+/// would enter a draft as verbatim; a verbatim record's hash is the
+/// blob itself.
+fn expected_bytes(
+    recorded: Option<&PlacedFile>,
+    rerooted_ok: bool,
+    blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
+) -> Option<BlobId> {
+    let placed = recorded.filter(|placed| rerooted_ok || placed.verbatim())?;
+    blob_exists(&placed.blob)
+        .then_some(placed.on_disk)
+        .flatten()
+}
+
+/// The vouch a recorded file earns by its bytes: the re-read hash
+/// equals the recorded on-disk hash and the store still holds the
+/// recorded blob (see [`expected_bytes`]).
+fn vouched_by_bytes(
+    recorded: Option<&PlacedFile>,
+    blob: BlobId,
+    expected: Option<BlobId>,
+    blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
+) -> Option<Vouched> {
+    let placed = recorded?;
+    (expected == Some(blob) && blob_exists(&placed.blob)).then(|| Vouched {
+        blob: placed.blob,
+        rewrite: placed.rewrite,
+        foreign_paths: placed.foreign_paths,
+        on_disk: placed.on_disk,
+    })
 }
 
 /// Scans the `flutter test` kernel-cache dir for ingest: every
@@ -525,9 +714,12 @@ fn reused_identity(
 ///
 /// `prior` is the test-cache [`DirRecord`] of the entry currently stored
 /// under the ingest key; `placed` the files this invocation's
-/// materialization placed into the dir (a same-tree hit places the dill
-/// verbatim, so a run that left it alone re-references it without
-/// reading tens of MB). Both feed [`reused_identity`].
+/// materialization placed into the dir, and the tree's record of
+/// earlier ones (a same-tree hit places the dill verbatim, so a run
+/// that left it alone re-references it without reading tens of MB).
+/// Both feed [`reused_identity`] — verbatim placements only: a
+/// cross-tree dill rewrite is re-read, as frontend_server rewrites the
+/// cache dill on every run anyway.
 ///
 /// `None` when the dir is missing, untouched since `since` (the run
 /// wrote nothing — nothing to ingest), or holds no kernel-cache file.
@@ -552,50 +744,41 @@ pub fn scan_test_cache(
     let mut skipped = ScanSkips::default();
     collect_files(cache_dir, &mut scanned, &mut skipped)?;
     scanned.sort_unstable_by(|a, b| a.relative.cmp(&b.relative));
-    let mut files = Vec::new();
-    let mut sources = Vec::new();
+    let mut outcomes = Vec::new();
     for file in scanned {
         if !is_kernel_cache(Path::new(&file.relative)) {
             continue;
         }
-        let (blob, rewrite) = match reused_identity(&file, prior, placed, blob_exists) {
-            Some((blob, rewrite, _)) => (blob, rewrite),
-            None => {
-                let (blob, _, foreign) = digest(
-                    &file.absolute,
-                    file.size,
-                    Some(&mut ByteScan::DillUris {
-                        foreign: ForeignUriScan::new(anchors),
-                        root_uri: None,
-                    }),
-                )?;
-                sources.push((file.absolute.clone(), blob));
-                // The dill face encodes its classification in the kind
-                // alone: a foreign dill is a verbatim clone everywhere,
-                // never a dir-refusing foreign_paths record.
-                let rewrite = if foreign {
-                    RewriteKind::None
-                } else {
-                    RewriteKind::DillUris
-                };
-                (blob, rewrite)
-            }
+        if let Some(vouched) = reused_identity(&file, prior, placed, false, blob_exists) {
+            outcomes.push(Scanned::vouched(&file, vouched));
+            continue;
+        }
+        let recorded = recorded_placement(placed, &file);
+        let expected = expected_bytes(recorded, false, blob_exists);
+        let (blob, _, foreign) = digest(
+            &file.absolute,
+            file.size,
+            Some(&mut ByteScan::DillUris {
+                foreign: ForeignUriScan::new(anchors),
+                root_uri: None,
+            }),
+            expected,
+        )?;
+        if let Some(vouched) = vouched_by_bytes(recorded, blob, expected, blob_exists) {
+            outcomes.push(Scanned::vouched(&file, vouched));
+            continue;
+        }
+        // The dill face encodes its classification in the kind alone:
+        // a foreign dill is a verbatim clone everywhere, never a
+        // dir-refusing foreign_paths record.
+        let rewrite = if foreign {
+            RewriteKind::None
+        } else {
+            RewriteKind::DillUris
         };
-        files.push(ManifestFile {
-            path: PathBuf::from(&file.relative),
-            blob,
-            executable: file.executable,
-            rewrite,
-            // See above: a dill never sets the dir-refusing flag.
-            foreign_paths: false,
-            stamp: Some(file.stamp),
-        });
+        outcomes.push(Scanned::hashed(file, blob, rewrite, false));
     }
-    Ok((!files.is_empty()).then_some(DirScan {
-        files,
-        sources,
-        skipped,
-    }))
+    Ok((!outcomes.is_empty()).then(|| collect_scan(outcomes, skipped)))
 }
 
 /// Whether a file name is one the test kernel cache claims: it contains
@@ -650,12 +833,26 @@ fn is_kernel_cache(path: &Path) -> bool {
 ///
 /// `prior` is the dir record of the entry currently stored under the
 /// ingest key whose replay name is this dir; `placed` the files this
-/// invocation's materialization placed into it. A file whose identity
-/// either record proves (see [`reused_identity`]) rides along as a
-/// manifest reference without being read — flutter's content validation
-/// touches stamp files on every warm run, and re-hashing a ~100 MB
-/// payload that provably was not written is pure overhead. Everything
-/// else is hashed (in parallel) and becomes an ingest source.
+/// invocation's materialization placed into it, overlaid on the tree's
+/// placement record of earlier ones (see [`crate::placement`]). A file
+/// whose identity either record proves (see [`reused_identity`]) rides
+/// along as a manifest reference without being read — flutter's content
+/// validation touches stamp files on every warm run, and re-hashing a
+/// ~100 MB payload that provably was not written is pure overhead. A
+/// recorded file whose stamp moved is read, and still rides along when
+/// its bytes are the placed ones (flutter rewrote it byte for byte, see
+/// [`expected_bytes`]). Everything else is hashed (in parallel) and
+/// becomes an ingest source.
+///
+/// `rerooted_ok` admits references to the entry's tree: a cross-tree
+/// placement's files are this tree's re-rooted rendering of blobs that
+/// embed the entry's tree, and vouching them keeps the entry — and its
+/// one frame of reference — exactly as ingested, which is right as
+/// long as nothing else changed. The orchestrator scans with it on
+/// first; a draft that then differs from the entry anyway is re-scanned
+/// with it off, so what gets published under this tree's root names
+/// only this tree's bytes ([`DirScan::rerooted`] says whether the
+/// re-scan is needed).
 ///
 /// # Errors
 ///
@@ -666,6 +863,7 @@ pub fn scan_entry_files(
     anchors: &PathAnchors,
     prior: Option<&DirRecord>,
     placed: Option<&[PlacedFile]>,
+    rerooted_ok: bool,
     blob_exists: &(dyn Fn(&BlobId) -> bool + Sync),
 ) -> Result<DirScan> {
     if !anchors.worktree_root.is_absolute() {
@@ -723,24 +921,14 @@ pub fn scan_entry_files(
     };
     skipped.oversize_rewrite += scanned.iter().filter(|file| oversize(file)).count() as u64;
     scanned.retain(|file| !oversize(file));
-    let scanned: Vec<(ManifestFile, Option<(PathBuf, BlobId)>)> = scanned
+    let scanned: Vec<Scanned> = scanned
         .into_par_iter()
         .map(|file| {
-            if let Some((blob, rewrite, foreign_paths)) =
-                reused_identity(&file, prior, placed, blob_exists)
-            {
-                return Ok((
-                    ManifestFile {
-                        path: PathBuf::from(&file.relative),
-                        blob,
-                        executable: file.executable,
-                        rewrite,
-                        foreign_paths,
-                        stamp: Some(file.stamp),
-                    },
-                    None,
-                ));
+            if let Some(vouched) = reused_identity(&file, prior, placed, rerooted_ok, blob_exists) {
+                return Ok(Scanned::vouched(&file, vouched));
             }
+            let recorded = recorded_placement(placed, &file);
+            let expected = expected_bytes(recorded, rerooted_ok, blob_exists);
             let mut scan = if file.bookkeeping {
                 Some(ByteScan::Bookkeeping {
                     needles: needle_bytes
@@ -757,53 +945,38 @@ pub fn scan_entry_files(
             } else {
                 None
             };
-            let (blob, mentions, foreign) = digest(&file.absolute, file.size, scan.as_mut())?;
-            let manifest = ManifestFile {
-                path: PathBuf::from(&file.relative),
-                blob,
-                executable: file.executable,
-                // A payload dill rewrites cross-tree when the worktree
-                // root URI occurs. The test face's foreign veto is
-                // deliberately absent here: a real payload dill's
-                // constant pool carries synthetic `file://` literals
-                // (URI-shaped string constants compiled into the
-                // program) that are data, not references, and the
-                // prefix-exact rewrite passes them through untouched —
-                // one literal must not cost the dill its rewriter.
-                // Without the root URI it stays the verbatim clone it
-                // always was — never a dir-refusing foreign record.
-                rewrite: if file.bookkeeping && mentions {
-                    RewriteKind::PathText
-                } else if file.payload_dill && mentions {
-                    RewriteKind::DillUris
-                } else {
-                    RewriteKind::None
-                },
-                foreign_paths: file.bookkeeping && foreign,
-                stamp: Some(file.stamp),
+            let (blob, mentions, foreign) =
+                digest(&file.absolute, file.size, scan.as_mut(), expected)?;
+            if let Some(vouched) = vouched_by_bytes(recorded, blob, expected, blob_exists) {
+                return Ok(Scanned::vouched(&file, vouched));
+            }
+            // A payload dill rewrites cross-tree when the worktree root
+            // URI occurs. The test face's foreign veto is deliberately
+            // absent here: a real payload dill's constant pool carries
+            // synthetic `file://` literals (URI-shaped string constants
+            // compiled into the program) that are data, not references,
+            // and the prefix-exact rewrite passes them through untouched
+            // — one literal must not cost the dill its rewriter. Without
+            // the root URI it stays the verbatim clone it always was —
+            // never a dir-refusing foreign record.
+            let rewrite = if file.bookkeeping && mentions {
+                RewriteKind::PathText
+            } else if file.payload_dill && mentions {
+                RewriteKind::DillUris
+            } else {
+                RewriteKind::None
             };
-            Ok((manifest, Some((file.absolute, blob))))
+            let foreign_paths = file.bookkeeping && foreign;
+            Ok(Scanned::hashed(file, blob, rewrite, foreign_paths))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut files = Vec::with_capacity(scanned.len());
-    let mut sources = Vec::new();
-    for (manifest, source) in scanned {
-        if let Some(source) = source {
-            sources.push(source);
-        }
-        files.push(manifest);
-    }
-    Ok(DirScan {
-        files,
-        sources,
-        skipped,
-    })
+    Ok(collect_scan(scanned, skipped))
 }
 
 /// Whether a file name is a payload dill whose embedded `file://` URIs
 /// decide its replay class: the kernel payloads `flutter build`
 /// produces (`app.dill`) and the web face's `kernel_blob.bin`.
-fn is_payload_dill(name: &str) -> bool {
+pub(crate) fn is_payload_dill(name: &str) -> bool {
     matches!(name, "app.dill" | "kernel_blob.bin")
 }
 
@@ -914,10 +1087,23 @@ fn is_executable(_: &Metadata) -> bool {
 /// [`WHOLE_READ_LIMIT`] and streamed in windows beyond it — the needle
 /// search carries its tail between windows, the foreign scanners keep
 /// their own sequential state, and each byte feeds them exactly once.
-fn digest(path: &Path, size: u64, scan: Option<&mut ByteScan<'_>>) -> Result<(BlobId, bool, bool)> {
+/// Bytes a record already knows (`expected`, the placed hash) need no
+/// classification — the record's class stands — so a whole-read file
+/// hashing to it returns before the scan runs (both flags false, which
+/// the caller never reads on that path); a streamed file's scan is
+/// interleaved with the read and simply runs.
+fn digest(
+    path: &Path,
+    size: u64,
+    scan: Option<&mut ByteScan<'_>>,
+    expected: Option<BlobId>,
+) -> Result<(BlobId, bool, bool)> {
     if size <= WHOLE_READ_LIMIT as u64 {
         let data = fs::read(path)?;
         let blob = BlobId(*blake3::hash(&data).as_bytes());
+        if expected == Some(blob) {
+            return Ok((blob, false, false));
+        }
         let (mentions, foreign) = match scan {
             None => (false, false),
             Some(scan) => {
@@ -1038,8 +1224,8 @@ mod tests {
             fs::set_permissions(app, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         let summary: Vec<(&str, RewriteKind, bool)> = scanned
             .files
             .iter()
@@ -1099,8 +1285,8 @@ mod tests {
         write(&hash_dir.join("straddle.stamp"), &straddle);
         write(&hash_dir.join("plain.d"), &plain);
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         let summary: Vec<(&str, RewriteKind, BlobId)> = scanned
             .files
             .iter()
@@ -1128,6 +1314,7 @@ mod tests {
             },
             None,
             None,
+            true,
             &|_| true,
         )
         .expect_err("relative");
@@ -1416,15 +1603,23 @@ mod tests {
         }
     }
 
-    /// One placed-file record, as the materializer hands it to POST.
-    fn placed_file(path: &str, stamp: FileStamp, blob: BlobId, verbatim: bool) -> PlacedFile {
+    /// One placed-file record, as the materializer (or the tree's
+    /// placement record) hands it to POST: `on_disk` is the blob itself
+    /// for a verbatim placement, the placed bytes' hash for a re-rooted
+    /// one, `None` for a rewritten kernel dill.
+    fn placed_file(
+        path: &str,
+        stamp: FileStamp,
+        blob: BlobId,
+        on_disk: Option<BlobId>,
+    ) -> PlacedFile {
         PlacedFile {
             path: PathBuf::from(path),
             stamp,
             blob,
             rewrite: RewriteKind::None,
             foreign_paths: false,
-            verbatim,
+            on_disk,
         }
     }
 
@@ -1439,28 +1634,47 @@ mod tests {
         write(&hash_dir.join("a.stamp"), b"{}");
         write(&hash_dir.join("app.dill"), b"payload");
 
-        let first =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let first = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         assert_eq!(first.sources.len(), 2, "no prior: both files hashed");
         assert!(first.files.iter().all(|file| file.stamp.is_some()));
 
         // The warm re-scan over unchanged files: prior stamps match, no
         // bytes read, manifest references carried verbatim.
         let prior = prior_dir(first.files.clone());
-        let second = scan_entry_files(&hash_dir, &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan");
+        let second = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            true,
+            &|_| true,
+        )
+        .expect("scan");
         assert!(second.sources.is_empty(), "no re-hash, no re-read");
         assert_eq!(
             second.files, first.files,
             "blobs and stamps reused verbatim"
         );
+        assert_eq!(
+            second.record, first.record,
+            "the record view is the same: prior stamps vouch the blob's own bytes"
+        );
+        assert_eq!(second.rerooted, 0);
 
         // A legacy manifest (no stamp) never matches for that file.
         let mut legacy = first.files.clone();
         legacy[0].stamp = None; // "a.stamp", the first of the sorted pair
         let prior = prior_dir(legacy);
-        let third = scan_entry_files(&hash_dir, &anchors_for(root), Some(&prior), None, &|_| true)
-            .expect("scan");
+        let third = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            Some(&prior),
+            None,
+            true,
+            &|_| true,
+        )
+        .expect("scan");
         assert_eq!(third.sources.len(), 1, "only the stamped record can reuse");
         assert_eq!(
             third.files[0].blob, first.files[0].blob,
@@ -1470,8 +1684,9 @@ mod tests {
 
     /// The placed fast path and its honesty rule: a verbatim placement
     /// with a matching stamp re-references its blob; a MISMATCHING
-    /// placed stamp means the run rewrote the file — hashed even when a
-    /// prior-entry stamp from an older ingest also matches.
+    /// placed stamp means the run rewrote the file — read even when a
+    /// prior-entry stamp from an older ingest also matches, and hashed
+    /// to its own content when the bytes moved too.
     #[test]
     fn scan_entry_files_placed_identity_wins_and_suppresses_stale_prior() {
         let project = tempfile::tempdir().expect("tempdir");
@@ -1487,11 +1702,16 @@ mod tests {
             "app.dill",
             on_disk,
             blob(b"placed bytes"),
-            true,
+            Some(blob(b"placed bytes")),
         )];
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| {
-            true
-        })
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            true,
+            &|_| true,
+        )
         .expect("scan");
         assert!(scanned.sources.is_empty());
         assert_eq!(scanned.files[0].blob, blob(b"placed bytes"));
@@ -1500,6 +1720,8 @@ mod tests {
             Some(on_disk),
             "the fresh stamp is recorded"
         );
+        assert_eq!(scanned.record, placed, "the record view is the placement");
+        assert_eq!(scanned.rerooted, 0, "a verbatim placement is frame-free");
 
         // The run rewrote the file after placement: the placed stamp no
         // longer matches. A prior record claiming the CURRENT identity
@@ -1519,13 +1741,14 @@ mod tests {
                 ..on_disk
             },
             blob(b"placed bytes"),
-            true,
+            Some(blob(b"placed bytes")),
         )];
         let scanned = scan_entry_files(
             &hash_dir,
             &anchors_for(root),
             Some(&stale_prior),
             Some(&placed),
+            true,
             &|_| true,
         )
         .expect("scan");
@@ -1535,13 +1758,20 @@ mod tests {
             "a rewritten file hashes despite the colliding prior stamp"
         );
         assert_eq!(scanned.files[0].blob, blob(b"payload v2"));
+        assert_eq!(
+            scanned.record[0].on_disk,
+            Some(blob(b"payload v2")),
+            "the record now knows the new bytes"
+        );
     }
 
-    /// A non-verbatim placement (a cross-tree rewrite changed the bytes)
-    /// and a placement whose blob gc has removed both fall back to
-    /// hashing even on a stamp match.
+    /// A re-rooted placement (a cross-tree rewrite changed the bytes)
+    /// vouches its entry-tree blob only when such references are
+    /// admitted, and is counted as re-rooted; with them off it hashes
+    /// to this tree's bytes. A placement whose blob gc has removed
+    /// always falls back to hashing, stamp match or not.
     #[test]
-    fn scan_entry_files_rehashes_nonverbatim_placed_and_missing_blob() {
+    fn scan_entry_files_vouches_rerooted_placement_only_when_admitted() {
         let project = tempfile::tempdir().expect("tempdir");
         let root = project.path();
         let hash_dir = root.join(HASH_A);
@@ -1549,32 +1779,201 @@ mod tests {
         write(&dill, b"payload");
         let on_disk = stamp_of(&fs::metadata(&dill).expect("metadata"));
 
+        // The bytes on disk are the placed rendering of the entry's
+        // blob (its hash is recorded), not the blob itself.
         let placed = vec![placed_file(
             "app.dill",
             on_disk,
-            blob(b"rewritten bytes"),
-            false,
+            blob(b"entry-tree bytes"),
+            Some(blob(b"payload")),
         )];
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| {
-            true
-        })
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            true,
+            &|_| true,
+        )
+        .expect("scan");
+        assert!(scanned.sources.is_empty(), "admitted: nothing is read");
+        assert_eq!(
+            scanned.files[0].blob,
+            blob(b"entry-tree bytes"),
+            "the entry's blob is referenced"
+        );
+        assert_eq!(scanned.rerooted, 1, "and counted as a cross-tree reference");
+        assert_eq!(scanned.record, placed);
+
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            false,
+            &|_| true,
+        )
         .expect("scan");
         assert_eq!(
             scanned.sources.len(),
             1,
-            "placed bytes are not the blob's bytes: hashed"
+            "not admitted: placed bytes are not the blob's bytes, hashed"
         );
         assert_eq!(scanned.files[0].blob, blob(b"payload"));
+        assert_eq!(scanned.rerooted, 0);
+        assert_eq!(
+            scanned.record[0].on_disk,
+            Some(blob(b"payload")),
+            "the record view is this tree's own bytes now"
+        );
 
-        let placed = vec![placed_file("app.dill", on_disk, blob(b"gc'd bytes"), true)];
-        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, Some(&placed), &|_| {
-            false
-        })
+        let placed = vec![placed_file(
+            "app.dill",
+            on_disk,
+            blob(b"gc'd bytes"),
+            Some(blob(b"gc'd bytes")),
+        )];
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            true,
+            &|_| false,
+        )
         .expect("scan");
         assert_eq!(
             scanned.sources.len(),
             1,
             "a missing recorded blob re-hashes"
+        );
+    }
+
+    /// A recorded file whose stamp moved is read, and still vouched when
+    /// its bytes are the placed ones — flutter's every-build byte-for-byte
+    /// rewrite of bookkeeping — for a verbatim and (when admitted) a
+    /// re-rooted placement alike; a rewritten kernel dill (no on-disk
+    /// hash) and a blob the store lost both hash to new content.
+    #[test]
+    fn scan_entry_files_vouches_byte_identical_rewrite_by_recorded_hash() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let root = project.path();
+        let hash_dir = root.join(HASH_A);
+        let stamp_file = hash_dir.join("k.stamp");
+        write(&stamp_file, br#"{"inputs":[],"outputs":[]}"#);
+        let current = stamp_of(&fs::metadata(&stamp_file).expect("metadata"));
+        let moved = FileStamp {
+            mtime_ns: current.mtime_ns.saturating_sub(1),
+            ..current
+        };
+        let bytes = blob(br#"{"inputs":[],"outputs":[]}"#);
+
+        // Verbatim placement, stamp moved, same bytes: vouched, no source.
+        let placed = vec![placed_file("k.stamp", moved, bytes, Some(bytes))];
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            false,
+            &|_| true,
+        )
+        .expect("scan");
+        assert!(
+            scanned.sources.is_empty(),
+            "the re-read bytes are the placed ones"
+        );
+        assert_eq!(scanned.files[0].blob, bytes);
+        assert_eq!(
+            scanned.record[0].stamp, current,
+            "the record carries the fresh identity"
+        );
+
+        // Re-rooted placement (the entry's blob differs), stamp moved,
+        // same bytes: vouched only when admitted.
+        let placed = vec![placed_file(
+            "k.stamp",
+            moved,
+            blob(b"entry-tree stamp"),
+            Some(bytes),
+        )];
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            true,
+            &|_| true,
+        )
+        .expect("scan");
+        assert!(scanned.sources.is_empty());
+        assert_eq!(scanned.files[0].blob, blob(b"entry-tree stamp"));
+        assert_eq!(scanned.rerooted, 1);
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            false,
+            &|_| true,
+        )
+        .expect("scan");
+        assert_eq!(scanned.sources.len(), 1, "not admitted: this tree's bytes");
+        assert_eq!(scanned.files[0].blob, bytes);
+
+        // No on-disk hash recorded (a rewritten dill): a moved stamp is
+        // a real change, hashed.
+        let placed = vec![placed_file(
+            "k.stamp",
+            moved,
+            blob(b"entry-tree stamp"),
+            None,
+        )];
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            true,
+            &|_| true,
+        )
+        .expect("scan");
+        assert_eq!(scanned.sources.len(), 1);
+        assert_eq!(scanned.files[0].blob, bytes);
+
+        // The recorded blob is gone from the store: the bytes match but
+        // nothing may reference it — re-stored from this tree, and
+        // classified on the way: the refused vouch must not skip the
+        // read's classification, or a path-anchored file would enter
+        // the draft as verbatim.
+        let anchored = format!(r#"{{"inputs":["{}/lib/a.dart"]}}"#, root.display());
+        write(&stamp_file, anchored.as_bytes());
+        let current = stamp_of(&fs::metadata(&stamp_file).expect("metadata"));
+        let moved = FileStamp {
+            mtime_ns: current.mtime_ns.saturating_sub(1),
+            ..current
+        };
+        let anchored_blob = blob(anchored.as_bytes());
+        let placed = vec![placed_file(
+            "k.stamp",
+            moved,
+            anchored_blob,
+            Some(anchored_blob),
+        )];
+        let scanned = scan_entry_files(
+            &hash_dir,
+            &anchors_for(root),
+            None,
+            Some(&placed),
+            true,
+            &|_| false,
+        )
+        .expect("scan");
+        assert_eq!(scanned.sources.len(), 1, "a lost blob is re-sourced");
+        assert_eq!(
+            scanned.files[0].rewrite,
+            RewriteKind::PathText,
+            "and classified by its bytes"
         );
     }
 
@@ -1606,8 +2005,15 @@ mod tests {
             expected.non_utf8_names = 1;
         }
 
-        let scanned = scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
-            .expect("the scan keeps going");
+        let scanned = scan_entry_files(
+            dir.path(),
+            &anchors_for(dir.path()),
+            None,
+            None,
+            true,
+            &|_| true,
+        )
+        .expect("the scan keeps going");
         assert_eq!(scanned.skipped, expected);
         let names: Vec<&str> = scanned
             .files
@@ -1629,8 +2035,15 @@ mod tests {
         huge.resize(crate::materialize::REWRITE_LIMIT + 1, b' ');
         fs::write(dir.path().join("kernel_snapshot_program.d"), &huge).expect("write huge");
 
-        let scanned = scan_entry_files(dir.path(), &anchors_for(dir.path()), None, None, &|_| true)
-            .expect("scan");
+        let scanned = scan_entry_files(
+            dir.path(),
+            &anchors_for(dir.path()),
+            None,
+            None,
+            true,
+            &|_| true,
+        )
+        .expect("scan");
         assert_eq!(scanned.skipped.oversize_rewrite, 1);
         assert_eq!(scanned.skipped.total(), 1);
         let names: Vec<&str> = scanned
@@ -1668,8 +2081,8 @@ mod tests {
             format!(r#"{{"out":["{root_text}/build/app.dill"]}}"#).as_bytes(),
         );
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(&root), None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(&root), None, None, true, &|_| true)
+            .expect("scan");
         let by_name = |name: &str| {
             scanned
                 .files
@@ -1731,8 +2144,8 @@ mod tests {
             b"file:///elsewhere/lib/main.dart file:///path/to/foo",
         );
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         let kind_of = |path: &str| {
             scanned
                 .files
@@ -1879,7 +2292,8 @@ mod tests {
             write(&hash_dir.join(name), text.as_bytes());
         }
 
-        let scanned = scan_entry_files(&hash_dir, &anchors, None, None, &|_| true).expect("scan");
+        let scanned =
+            scan_entry_files(&hash_dir, &anchors, None, None, true, &|_| true).expect("scan");
         let flag = |name: &str| {
             scanned
                 .files
@@ -1901,7 +2315,8 @@ mod tests {
         // root's bytes is not under it.
         let sibling_root = format!("{root_text}X/lib/main.dart");
         write(&hash_dir.join("prefix-trap.stamp"), sibling_root.as_bytes());
-        let scanned = scan_entry_files(&hash_dir, &anchors, None, None, &|_| true).expect("scan");
+        let scanned =
+            scan_entry_files(&hash_dir, &anchors, None, None, true, &|_| true).expect("scan");
         assert!(
             scanned
                 .files
@@ -1928,8 +2343,8 @@ mod tests {
         );
         write(&hash_dir.join("payload.bin"), b"payload");
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         let kind = |name: &str| {
             scanned
                 .files
@@ -1961,14 +2376,14 @@ mod tests {
         data[late..late + anchored.len()].copy_from_slice(anchored.as_bytes());
         write(&hash_dir.join(".filecache"), &data);
 
-        let scanned =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let scanned = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         let file = &scanned.files[0];
         assert!(file.foreign_paths, "the straddling foreign path is found");
         assert_eq!(file.rewrite, RewriteKind::PathText, "the late anchor too");
         // Deterministic: a second pass classifies identically.
-        let again =
-            scan_entry_files(&hash_dir, &anchors_for(root), None, None, &|_| true).expect("scan");
+        let again = scan_entry_files(&hash_dir, &anchors_for(root), None, None, true, &|_| true)
+            .expect("scan");
         assert_eq!(again.files, scanned.files);
     }
 

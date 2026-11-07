@@ -56,14 +56,15 @@ pub struct DartqConfig {
     pub cache: Option<CacheDefaults>,
     /// The package-discovery policy (the `packages` face).
     pub packages: Option<PackagesConfig>,
-    /// The `flutter` shim's build-cache opt-in.
+    /// The Flutter build cache's configuration (on by default).
     pub build_cache: Option<BuildCacheConfig>,
 }
 
-/// The `build_cache:` section — the `flutter` PATH shim's build cache.
-/// Every key is optional; an absent (or all-commented, i.e. null)
-/// section leaves the shim a pure passthrough, which is the
-/// zero-config contract: existing dartq behavior stays byte-identical.
+/// The `build_cache:` section — the Flutter build cache every `dartq
+/// flutter` face runs (the explicit subcommand and the opt-in PATH
+/// shim). Default-on: an absent (or all-commented, i.e. null) section,
+/// like an absent key, runs the cache with the section's defaults —
+/// `enabled: false` is the one spelling that turns it off.
 ///
 /// Unlike the top level (unknown keys ignored for forward
 /// compatibility), unknown keys inside this section are a structured
@@ -72,6 +73,9 @@ pub struct DartqConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildCacheConfig {
+    /// Whether the cache runs at all. `None` (absent) is on; `false`
+    /// passes every flutter face through with no store access.
+    pub enabled: Option<bool>,
     /// The CAS store root; `~` expands at consumption, and the store's
     /// directories sit directly under it (no version segment). Default
     /// `$XDG_CACHE_HOME/dartq/cas`, falling back to
@@ -160,6 +164,11 @@ pub struct CacheDefaults {
     pub size_limit_gib: u64,
 }
 
+/// The config file's name, the same in both tiers: the project tier's up
+/// the directory chain ([`project_config_file`]), the global tier's under
+/// `<home>/.dartq` ([`global_config_file`]).
+pub const FILE_NAME: &str = "dartq.yaml";
+
 /// Loads `dir/dartq.yaml` — the workspace root's config. (the full
 /// lookup order — explicit `--config`, per-pub-project roots — lands with
 /// its consumers; the root file is this round's contract.) `Ok(None)` is
@@ -171,12 +180,38 @@ pub struct CacheDefaults {
 /// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
 /// the file exists but cannot be read.
 pub fn load(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
-    let text = match fs::read_to_string(dir.join("dartq.yaml")) {
+    load_file(&dir.join(FILE_NAME))
+}
+
+/// Reads and parses one config file; `Ok(None)` when it is absent.
+fn load_file(path: &Path) -> Result<Option<DartqConfig>, ConfigError> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     parse(&text).map(Some)
+}
+
+/// The project tier's file governing `dir`: the nearest `dartq.yaml` up
+/// the chain from `dir` to the filesystem root, `None` when no directory on
+/// the chain holds one. A candidate counts unless it is provably absent
+/// (`fs::exists` answering `Ok(false)`): a file whose existence cannot be
+/// checked still governs, so its loader surfaces the error instead of
+/// silently falling through to a farther file. The one walk every
+/// project-tier consumer shares — the loader below and the daemon's watch
+/// on the governing file — so the two cannot drift.
+#[must_use]
+pub fn project_config_file(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .map(|dir| dir.join(FILE_NAME))
+        .find(|candidate| !matches!(fs::exists(candidate), Ok(false)))
+}
+
+/// The global tier's file: `<home>/.dartq/dartq.yaml`.
+#[must_use]
+pub fn global_config_file(home: &Path) -> PathBuf {
+    home.join(".dartq").join(FILE_NAME)
 }
 
 /// Finds the `dartq.yaml` governing `dir`: the nearest file up the chain
@@ -209,45 +244,30 @@ pub(crate) fn discover_with(
     Ok(overlay(global, project))
 }
 
-/// The project tier on its own: the nearest `dartq.yaml` up the chain from
-/// `dir` to the filesystem root. Faces that must resolve paths against the
-/// file's own directory (context `path:` locators) still want this root.
+/// The project tier on its own: the file [`project_config_file`] finds
+/// from `dir`, loaded — `Ok(None)` when the walk finds none, or when the
+/// file it found vanishes before the read. Faces that must resolve paths
+/// against the file's own directory (context `path:` locators) still want
+/// this root.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
 /// a file exists but cannot be read.
 fn discover_project(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
-    let mut current = dir;
-    loop {
-        if let Some(config) = load(current)? {
-            return Ok(Some(config));
-        }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => return Ok(None),
-        }
-    }
+    project_config_file(dir).map_or(Ok(None), |path| load_file(&path))
 }
 
-/// Loads the global tier, `<home>/.dartq/dartq.yaml` — machine-level
-/// defaults (store budgets, memory caps) a project file overrides key by
-/// key. `Ok(None)` when the file or the home directory does not exist.
+/// Loads the global tier, [`global_config_file`] — machine-level defaults
+/// (store budgets, memory caps) a project file overrides key by key.
+/// `Ok(None)` when the file or the home directory does not exist.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Invalid`] on a malformed file; [`ConfigError::Io`] when
 /// the file exists but cannot be read.
 fn load_global_at(home: Option<&Path>) -> Result<Option<DartqConfig>, ConfigError> {
-    let Some(home) = home else {
-        return Ok(None);
-    };
-    let text = match fs::read_to_string(home.join(".dartq").join("dartq.yaml")) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    parse(&text).map(Some)
+    home.map_or(Ok(None), |home| load_file(&global_config_file(home)))
 }
 
 /// Two tiers folded into one governing config: every key the project tier
@@ -294,6 +314,9 @@ fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<
         (None, project) => project,
         (global, None) => global,
         (Some(mut global), Some(project)) => {
+            if project.enabled.is_some() {
+                global.enabled = project.enabled;
+            }
             if project.root.is_some() {
                 global.root = project.root;
             }
@@ -606,10 +629,7 @@ mod tests {
         let (home, project) = tiered(Some(
             "version: 1\nbuild_cache:\n  budget_gb: 8\nmemory:\n  limit_mib: 2048\n",
         ));
-        write_config(
-            project.path(),
-            "version: 1\nbuild_cache:\n  root: /store\n",
-        );
+        write_config(project.path(), "version: 1\nbuild_cache:\n  root: /store\n");
         let config = discover_with(project.path(), Some(home.path()))
             .expect("discover")
             .expect("config");
@@ -672,6 +692,41 @@ mod tests {
         assert!(discover_with(project.path(), Some(home.path())).is_err());
     }
 
+    /// The project tier's walk ([`project_config_file`], shared with the
+    /// daemon's watch): the nearest file up the chain governs and a nearer
+    /// one shadows a farther one — and a candidate that exists but cannot
+    /// be read still governs, so the loader reports it instead of falling
+    /// through to the farther file.
+    #[test]
+    fn project_config_file_takes_the_nearest_up_the_chain() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        let package = root.join("pkg");
+        let nested = package.join("lib");
+        fs::create_dir_all(&nested).expect("dirs");
+        write_config(root, "version: 1\n");
+        assert_eq!(
+            project_config_file(&nested),
+            Some(root.join(FILE_NAME)),
+            "the nearest file up the chain governs"
+        );
+        write_config(&package, "version: 1\n");
+        assert_eq!(
+            project_config_file(&nested),
+            Some(package.join(FILE_NAME)),
+            "a nearer file shadows a farther one"
+        );
+        // A directory in the nearer file's place exists but cannot be read
+        // as a config: it still governs, and the loader says so.
+        fs::remove_file(package.join(FILE_NAME)).expect("remove the nearer file");
+        fs::create_dir(package.join(FILE_NAME)).expect("a directory in its place");
+        assert_eq!(project_config_file(&nested), Some(package.join(FILE_NAME)));
+        assert!(
+            matches!(discover_project(&nested), Err(ConfigError::Io(_))),
+            "an unreadable governing file is loud, never skipped"
+        );
+    }
+
     #[test]
     fn contexts_and_packages_replace_the_whole_section() {
         let (home, project) = tiered(Some(
@@ -685,9 +740,16 @@ mod tests {
             .expect("discover")
             .expect("config");
         let labels: Vec<_> = config.contexts.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(labels, ["local"], "the project's contexts replace the global's");
+        assert_eq!(
+            labels,
+            ["local"],
+            "the project's contexts replace the global's"
+        );
         let packages = config.packages.expect("packages");
-        assert!(packages.include.is_empty(), "section replacement, not a merge");
+        assert!(
+            packages.include.is_empty(),
+            "section replacement, not a merge"
+        );
         assert_eq!(packages.exclude, ["fixtures/*"]);
     }
 
@@ -842,10 +904,11 @@ mod tests {
         let root = fixture("bcache");
         write_config(
             &root,
-            "build_cache:\n  root: ~/cas-root\n  budget_gb: 5\n  grace_secs: 60\n  flutter: /opt/flutter/bin/flutter\n",
+            "build_cache:\n  enabled: false\n  root: ~/cas-root\n  budget_gb: 5\n  grace_secs: 60\n  flutter: /opt/flutter/bin/flutter\n",
         );
         let config = load(&root).expect("config").expect("some");
         let section = config.build_cache.expect("build_cache");
+        assert_eq!(section.enabled, Some(false));
         assert_eq!(section.root, Some(PathBuf::from("~/cas-root")));
         assert_eq!(section.budget_gb, Some(5));
         assert_eq!(section.grace_secs, Some(60));
@@ -856,8 +919,63 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// Default-on at the parse tier: an absent section and a section
+    /// without `enabled` both leave the key unset — the consumer treats
+    /// that as on, so only an explicit `false` opts out.
+    #[test]
+    fn build_cache_enabled_key_defaults_to_unset() {
+        let root = fixture("benabled");
+        write_config(&root, "build_cache:\n  budget_gb: 5\n");
+        let section = load(&root)
+            .expect("config")
+            .expect("some")
+            .build_cache
+            .expect("build_cache");
+        assert_eq!(section.enabled, None, "absent key is on-by-default");
+        write_config(&root, "build_cache:\n  enabled: true\n");
+        let section = load(&root)
+            .expect("config")
+            .expect("some")
+            .build_cache
+            .expect("build_cache");
+        assert_eq!(section.enabled, Some(true));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `enabled` merges like every other `build_cache` key: a global
+    /// opt-out survives a project section that pins only its store, and
+    /// a project opt-out wins over a global that leaves the key unset.
+    #[test]
+    fn build_cache_enabled_merges_key_by_key() {
+        let (home, project) = tiered(Some(
+            "version: 1\nbuild_cache:\n  enabled: false\n  budget_gb: 8\n",
+        ));
+        write_config(project.path(), "version: 1\nbuild_cache:\n  root: /store\n");
+        let build = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config")
+            .build_cache
+            .expect("build_cache");
+        assert_eq!(build.enabled, Some(false));
+        assert_eq!(build.root, Some(PathBuf::from("/store")));
+
+        let (home, project) = tiered(Some("version: 1\nbuild_cache:\n  root: /global\n"));
+        write_config(
+            project.path(),
+            "version: 1\nbuild_cache:\n  enabled: false\n",
+        );
+        let build = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config")
+            .build_cache
+            .expect("build_cache");
+        assert_eq!(build.enabled, Some(false));
+        assert_eq!(build.root, Some(PathBuf::from("/global")));
+    }
+
     /// Absent file, absent section, and an all-commented (null) section
-    /// all read as `None`: the zero-config passthrough contract.
+    /// all read as `None` — which the consumer resolves to the
+    /// default-on store, not to a passthrough.
     #[test]
     fn build_cache_absent_or_null_section_is_none() {
         let root = fixture("babsent");
