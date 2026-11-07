@@ -381,7 +381,6 @@ dependencies = [
  "dartq-snapshot",
  "dartq-source",
  "filetime",
- "libc",
  "lon",
  "rayon",
  "rustc-hash",
