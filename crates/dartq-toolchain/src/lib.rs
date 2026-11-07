@@ -18,10 +18,17 @@
 //! another at ~210 processes/second (the build-cache fork-bomb audit, A10).
 //! Only the binary is excluded, never its directory: excluding the whole
 //! directory also hid a real SDK flutter installed beside the shim.
+//!
+//! The second shared face is `run_queue` (unix): the machine-wide queue
+//! every test execution joins before it spawns those binaries.
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// Unix-only: off unix there is no `flock`, and callers run unqueued.
+#[cfg(unix)]
+pub mod run_queue;
 
 /// One executable's resolution facts: its file name, the environment
 /// override, and the refusal's fix hint naming every way a user can point

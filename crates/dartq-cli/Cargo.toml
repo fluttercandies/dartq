@@ -42,6 +42,11 @@ dartq-source = { workspace = true }
 # The `dartq test` face's substrate (result cache, grouped runner, host
 # memory leases, reporters).
 dartq-test = { workspace = true }
+# The `dartq test` run queue (the machine-wide ticket queue every run
+# joins before executing) and the orphan reaper it runs when it finds a
+# run that died holding its place.
+dartq-toolchain = { workspace = true }
+dartq-bcache = { workspace = true }
 # The `dartq test` face replays cached results in parallel (one entry file
 # per suite).
 rayon = { workspace = true }

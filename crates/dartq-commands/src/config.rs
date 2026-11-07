@@ -54,10 +54,39 @@ pub struct DartqConfig {
     pub memory: Option<MemoryDefaults>,
     /// The cache defaults.
     pub cache: Option<CacheDefaults>,
+    /// The `dartq test` face's machine-level knobs.
+    pub test: Option<TestConfig>,
     /// The package-discovery policy (the `packages` face).
     pub packages: Option<PackagesConfig>,
     /// The Flutter build cache's configuration (on by default).
     pub build_cache: Option<BuildCacheConfig>,
+}
+
+impl DartqConfig {
+    /// How many `dartq test` executions may run at once machine-wide:
+    /// `test.max_concurrent`, 1 when unset, and never below 1 — there is
+    /// no fewer than one at a time, so a lower value clamps.
+    #[must_use]
+    pub fn test_max_concurrent(&self) -> usize {
+        let declared = self
+            .test
+            .and_then(|test| test.max_concurrent)
+            .unwrap_or(1);
+        usize::try_from(declared.max(1)).unwrap_or(usize::MAX)
+    }
+}
+
+/// The `test:` section — the `dartq test` face's machine-level knobs.
+/// Unknown keys inside it are a structured [`ConfigError::Invalid`], as in
+/// `build_cache`: a typo here must not silently fall back to a default.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestConfig {
+    /// How many test executions run at once: every worktree sharing the
+    /// build cache's store root joins one first-come-first-served queue
+    /// before its execution phase (resolved by
+    /// [`DartqConfig::test_max_concurrent`]).
+    pub max_concurrent: Option<i64>,
 }
 
 /// The `build_cache:` section — the Flutter build cache every `dartq
@@ -272,7 +301,7 @@ fn load_global_at(home: Option<&Path>) -> Result<Option<DartqConfig>, ConfigErro
 
 /// Two tiers folded into one governing config: every key the project tier
 /// declares wins; the global tier fills the keys it leaves unset. Scalar
-/// sections (`memory`, `cache`) and list-shaped ones (`contexts`,
+/// sections (`memory`, `cache`, `test`) and list-shaped ones (`contexts`,
 /// `packages`) are whole-section — the project tier replaces the global's
 /// section when present. `build_cache` and `generated` merge key by key
 /// inside the section, so a machine-wide `budget_gb` survives a project
@@ -306,6 +335,9 @@ fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<
     }
     if project.cache.is_some() {
         governing.cache = project.cache;
+    }
+    if project.test.is_some() {
+        governing.test = project.test;
     }
     if project.packages.is_some() {
         governing.packages = project.packages;
@@ -524,6 +556,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         generated: raw.generated,
         memory: raw.memory,
         cache: raw.cache,
+        test: raw.test,
         packages: raw.packages,
         build_cache: raw.build_cache,
     })
@@ -537,6 +570,7 @@ struct RawConfig {
     generated: Option<GeneratedPolicy>,
     memory: Option<MemoryDefaults>,
     cache: Option<CacheDefaults>,
+    test: Option<TestConfig>,
     packages: Option<PackagesConfig>,
     build_cache: Option<BuildCacheConfig>,
 }
@@ -1004,5 +1038,55 @@ mod tests {
             "structured: {error}"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// `test.max_concurrent` resolves through both tiers (the project's
+    /// section replaces the global's), is 1 when unset anywhere, clamps
+    /// below 1, and a typo inside the section is loud.
+    #[test]
+    fn test_max_concurrent_resolves_tiers_defaults_and_clamps() {
+        let resolve = |project: &Path, home: &Path| {
+            discover_with(project, Some(home))
+                .expect("discover")
+                .expect("config")
+                .test_max_concurrent()
+        };
+        let (home, project) = tiered(Some("version: 1\ntest:\n  max_concurrent: 2\n"));
+        write_config(project.path(), "version: 1\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            2,
+            "the global tier fills a section the project omits"
+        );
+        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: 3\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            3,
+            "the project tier wins"
+        );
+        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: 0\n");
+        assert_eq!(resolve(project.path(), home.path()), 1, "0 clamps to 1");
+        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: -4\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            1,
+            "a negative cap clamps to 1"
+        );
+
+        let (home, project) = tiered(None);
+        write_config(project.path(), "version: 1\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            1,
+            "unset in every tier is 1"
+        );
+        write_config(project.path(), "version: 1\ntest:\n  max_concurent: 2\n");
+        assert!(
+            matches!(
+                discover_with(project.path(), Some(home.path())),
+                Err(ConfigError::Invalid(ref message)) if message.contains("max_concurent")
+            ),
+            "an unknown key inside the section is a structured error"
+        );
     }
 }

@@ -21,6 +21,10 @@
 //!   launched, runs under the stock runner, which then reports it.
 //! - **Admission.** Every run leases its memory from one host-wide pool
 //!   shared by all dartq processes of the user (see `dartq_test::host`).
+//! - **Run queue.** Before anything runs, the run joins a machine-wide
+//!   first-come-first-served queue (see `dartq_toolchain::run_queue`):
+//!   every worktree sharing the build cache's store root waits its turn,
+//!   at most `test.max_concurrent` (default 1) executions at once.
 //!
 //! Anything this command cannot reproduce exactly runs as plain
 //! `dart test` with the same arguments and the terminal attached: `--help`,
@@ -36,7 +40,8 @@
 //! dartq's own options: `--no-cache` (run everything, store nothing),
 //! `--impacted[=REF]` (run only the suites the changes since REF can reach;
 //! default `HEAD` — a delegated run gets those suites as its selection),
-//! `--stats` (one line on stderr saying where suites ran).
+//! `--stats` (one line on stderr saying where suites ran), `--no-queue`
+//! (skip the run queue).
 
 use std::borrow::Cow;
 use std::ffi::OsString;
@@ -52,6 +57,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use dartq_test::event::Json;
 use dartq_test::report::{self, Kind};
 use dartq_test::{ExecConfig, Settled, SuiteBlock};
+#[cfg(unix)]
+use dartq_toolchain::run_queue::{self, Event, RunGuard};
 
 use crate::exit;
 
@@ -69,8 +76,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 #[derive(Args)]
 #[command(disable_help_flag = true)]
 pub(crate) struct TestArgs {
-    /// `dart test` arguments, plus `--no-cache`, `--impacted[=REF]` and
-    /// `--stats`.
+    /// `dart test` arguments, plus `--no-cache`, `--impacted[=REF]`,
+    /// `--stats` and `--no-queue`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub(crate) args: Vec<String>,
 }
@@ -109,6 +116,7 @@ enum Role {
     DelegateWhenOn,
     ImpactedExtra,
     NoCacheExtra,
+    NoQueueExtra,
     StatsExtra,
     FlutterExtra,
     /// Passed, and the run is never stored nor replayed (it writes files
@@ -184,6 +192,7 @@ const OPTIONS: &[(&str, Option<char>, Shape, Role)] = &[
     // dartq's own.
     ("impacted", None, Shape::Flag(false), Role::ImpactedExtra),
     ("no-cache", None, Shape::Flag(false), Role::NoCacheExtra),
+    ("no-queue", None, Shape::Flag(false), Role::NoQueueExtra),
     ("stats", None, Shape::Flag(false), Role::StatsExtra),
     ("flutter", None, Shape::Flag(false), Role::FlutterExtra),
 ];
@@ -297,6 +306,7 @@ const FLUTTER_OPTIONS: &[(&str, Option<char>, Shape, Role)] = &[
     // dartq's own.
     ("impacted", None, Shape::Flag(false), Role::ImpactedExtra),
     ("no-cache", None, Shape::Flag(false), Role::NoCacheExtra),
+    ("no-queue", None, Shape::Flag(false), Role::NoQueueExtra),
     ("stats", None, Shape::Flag(false), Role::StatsExtra),
     ("flutter", None, Shape::Flag(false), Role::FlutterExtra),
 ];
@@ -387,6 +397,8 @@ struct Invocation {
     /// `--impacted[=REF]`.
     impacted: Option<String>,
     no_cache: bool,
+    /// `--no-queue`: run without joining the run queue.
+    no_queue: bool,
     stats: bool,
     /// `flutter test --machine`.
     machine: bool,
@@ -564,6 +576,7 @@ fn apply(
         }
         Role::ImpactedExtra => inv.impacted = Some("HEAD".to_owned()),
         Role::NoCacheExtra => inv.no_cache = true,
+        Role::NoQueueExtra => inv.no_queue = true,
         Role::StatsExtra => inv.stats = true,
         Role::FlutterExtra => inv.flutter = true,
         Role::PassUncached => {
@@ -598,7 +611,7 @@ fn runner_args(args: &[String]) -> Vec<String> {
                 positional = true;
             } else if matches!(
                 arg.as_str(),
-                "--no-cache" | "--stats" | "--flutter" | "--impacted"
+                "--no-cache" | "--no-queue" | "--stats" | "--flutter" | "--impacted"
             ) || arg.starts_with("--impacted=")
             {
                 continue;
@@ -718,6 +731,102 @@ fn delegate(args: &[String], flutter: bool) -> u8 {
             exit::INTERNAL_ERROR
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Run queue
+// ---------------------------------------------------------------------------
+
+/// This run's place in the machine-wide run queue: the build cache's store
+/// root lends the queue its directory, so every worktree sharing a store
+/// waits in one first-come-first-served line, and `test.max_concurrent`
+/// (default 1) caps the executions that run at once. A waiting run says
+/// so on stderr — when it starts waiting, every ten minutes after, and
+/// when admitted; an uncontended run prints nothing. `None` when
+/// `--no-queue` skips the queue, or when the queue cannot be entered: the
+/// queue never fails a run — one line says so and the run goes on
+/// unqueued.
+#[cfg(unix)]
+fn run_guard(dir: &Path, inv: &Invocation) -> Option<RunGuard> {
+    if inv.no_queue {
+        return None;
+    }
+    let mut queued = false;
+    let entered = queue_setup(dir).and_then(|(root, max)| {
+        run_queue::acquire_with("test", &root, max, |event| match event {
+            Event::Queued { ahead } => {
+                queued = true;
+                eprintln!(
+                    "dartq test: {ahead} other run(s) in the queue — waiting \
+                     (first come, first served; --no-queue skips)"
+                );
+            }
+            Event::Still { active, waited } => eprintln!(
+                "dartq test: still waiting — {active} run(s) ahead (waited {}m)",
+                waited.as_secs() / 60
+            ),
+            Event::Dead { created } => sweep_orphans(created),
+        })
+    });
+    match entered {
+        Ok(guard) => {
+            if queued {
+                eprintln!(
+                    "dartq test: admitted (waited {:.1}s)",
+                    guard.waited().as_secs_f64()
+                );
+            }
+            Some(guard)
+        }
+        Err(error) => {
+            eprintln!("dartq test: run queue unavailable ({error}) — running unqueued");
+            None
+        }
+    }
+}
+
+/// Off unix there is no `flock`, so nothing queues: the queue is
+/// best-effort there.
+#[cfg(not(unix))]
+fn run_guard(_dir: &Path, _inv: &Invocation) -> Option<()> {
+    None
+}
+
+/// Where the run queues and how many run at once: the build cache's store
+/// root — the cache on or off, the queue only borrows it — and the
+/// governing `test.max_concurrent`. A store root that is not absolute (no
+/// home to resolve the default under) is refused rather than let the
+/// queue land in the working tree.
+#[cfg(unix)]
+fn queue_setup(dir: &Path) -> io::Result<(PathBuf, usize)> {
+    let max = dartq_commands::config::discover(dir)
+        .map_err(io::Error::other)?
+        .map_or(1, |config| config.test_max_concurrent());
+    let root = dartq_commands::bcache::discover_store_config(dir)
+        .map_err(io::Error::other)?
+        .store_root;
+    if !root.is_absolute() {
+        return Err(io::Error::other(format!(
+            "store root {} is not absolute",
+            root.display()
+        )));
+    }
+    Ok((root, max))
+}
+
+/// A dead ticket is a run that exited without leaving the queue — a
+/// SIGKILL, an OOM kill — and the toolchain processes it spawned outlive
+/// it, reparented to pid 1 and still holding their memory. Before this
+/// run starts beside them, the build cache's reaper sweeps the orphaned
+/// `frontend_server`s younger than the dead ticket (`created`). Gated out
+/// under the test harness like the reaper's post-run call: a sweep fired
+/// from a unit test would reap another test's fixture.
+#[cfg(unix)]
+fn sweep_orphans(created: std::time::SystemTime) {
+    #[cfg(not(test))]
+    dartq_bcache::reaper::reap_orphaned_frontend_servers(created);
+    #[cfg(test)]
+    let _ = created;
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1424,13 @@ fn run(args: &[String]) -> u8 {
             .any(|arg| arg == "--stats");
         return delegate_requested(args, flutter, stats, "unrecognized arguments");
     };
+    // The run queue: one admission per process, taken before every branch
+    // that runs anything — the flutter route, each delegation, the
+    // executor — and held until `run` returns, so concurrent `dartq test`
+    // executions serialize machine-wide. A second acquire anywhere below
+    // would wait on this run's own ticket. Only a line the runner rejects
+    // (above) runs unqueued: the runner prints its usage and exits.
+    let _queue = run_guard(&dir, &inv);
     if inv.flutter {
         return flutter::run(args, inv);
     }
@@ -2347,6 +2463,34 @@ mod tests {
         ] {
             assert!(parse(&args(line), false).is_err(), "{line:?}");
         }
+    }
+
+    /// `--no-queue` is off by default — a plain run joins the run queue —
+    /// is set by the flag in both grammars, and never reaches the runner.
+    #[test]
+    fn no_queue_flag_skips_the_queue_and_defaults_off() {
+        assert!(
+            !parse(&args(&["test/a_test.dart"]), false)
+                .expect("parse")
+                .no_queue,
+            "the default run joins the queue"
+        );
+        assert!(
+            parse(&args(&["--no-queue", "test/a_test.dart"]), false)
+                .expect("parse")
+                .no_queue
+        );
+        assert!(
+            parse(&args(&["--flutter", "--no-queue"]), true)
+                .expect("parse")
+                .no_queue,
+            "the flutter grammar knows the flag too"
+        );
+        assert_eq!(
+            runner_args(&args(&["--no-queue", "-r", "json", "--", "--no-queue"])),
+            ["-r", "json", "--", "--no-queue"],
+            "dropped as an option, kept as a positional"
+        );
     }
 
     /// A delegation after `--impacted` bounded the run hands the runner the

@@ -330,6 +330,7 @@ name = "dartq-cli"
 version = "0.1.11"
 dependencies = [
  "clap",
+ "dartq-bcache",
  "dartq-commands",
  "dartq-daemon",
  "dartq-diagnostics",
@@ -340,6 +341,7 @@ dependencies = [
  "dartq-snapshot",
  "dartq-source",
  "dartq-test",
+ "dartq-toolchain",
  "filetime",
  "libc",
  "lon",
@@ -715,6 +717,9 @@ dependencies = [
 [[package]]
 name = "dartq-toolchain"
 version = "0.1.11"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "dartq-types"
