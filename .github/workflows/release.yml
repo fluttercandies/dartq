@@ -89,7 +89,23 @@ jobs:
         env:
           RUSTC_WRAPPER: ''
           CARGO_BUILD_JOBS: default
-        run: cargo build --release -p dartq-cli --locked
+        # On a --locked failure, surface exactly what cargo wants to change
+        # in the lock before dying: an unlocked metadata pass rewrites
+        # Cargo.lock on the runner, and the git diff IS the drift the
+        # resolver disagreed with (empty diff = the build wanted something
+        # metadata does not; the dry-run update probe covers that case).
+        run: |
+          cargo build --release -p dartq-cli --locked || {
+            code=$?
+            echo '::group::lock drift cargo wanted (--locked diagnosis)'
+            cargo metadata --format-version 1 > /dev/null || true
+            git --no-pager diff --stat -- Cargo.lock || true
+            git --no-pager diff -- Cargo.lock | head -200 || true
+            echo '--- resolver dry-run probe:'
+            cargo update --workspace --dry-run 2>&1 | head -40 || true
+            echo '::endgroup'
+            exit $code
+          }
       - name: Package tarball + sha256 sidecar
         run: >
           scripts/release/package.sh target/release/dartq
