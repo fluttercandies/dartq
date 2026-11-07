@@ -28,7 +28,10 @@
 //! runner's own), `--debug`, `--pause-after-load`, coverage, `--fail-fast`,
 //! a randomized test order, `--configuration`, non-VM platforms, and a
 //! `dart_test.yaml` that names a reporter. `--flutter` takes `flutter
-//! test`'s arguments instead (see `flutter`).
+//! test`'s arguments instead (see `flutter`), and so does a plain `dartq
+//! test` in a package whose pubspec declares `flutter_test` among its dev
+//! dependencies — those suites cannot run under `dart test` at all, so the
+//! run routes itself and says so on stderr.
 //!
 //! dartq's own options: `--no-cache` (run everything, store nothing),
 //! `--impacted[=REF]` (run only the suites the changes since REF can reach;
@@ -305,11 +308,64 @@ fn wants_flutter(args: &[String]) -> bool {
         .any(|arg| arg == "--flutter")
 }
 
+/// Whether `root`'s pubspec declares `flutter_test` among its
+/// `dev_dependencies`: the tight signal that the package's suites are
+/// `flutter_test` suites, which `dart test` cannot even load
+/// (`flutter_test` depends on `test_api`, never on `test`). A bare
+/// `dependencies.flutter` is not the signal — a package can depend on
+/// Flutter and still run pure `dart test` suites — and a missing,
+/// unreadable or unparseable pubspec routes nothing.
+fn flutter_test_package(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("pubspec.yaml")) else {
+        return false;
+    };
+    let Ok(pubspec) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return false;
+    };
+    pubspec
+        .get("dev_dependencies")
+        .is_some_and(|deps| deps.get("flutter_test").is_some())
+}
+
+/// Why a run takes the `flutter test` grammar, when it does.
+#[derive(Debug, PartialEq, Eq)]
+enum FlutterRoute {
+    /// `--flutter` on the line.
+    Flag,
+    /// The project's pubspec routed the run there — the one route that
+    /// announces itself with [`FLUTTER_ROUTE_LINE`].
+    Pubspec,
+}
+
+/// The grammar a command line runs, chosen before anything is parsed: the
+/// line's own `--flutter`, or the pubspec of the project in `root` (the
+/// runner's own directory — no option moves it, so the current directory
+/// is the project). A `flutter_test` dev dependency routes the run to the
+/// tool that can run its suites; `--flutter` spells the same route by
+/// hand.
+fn flutter_route(args: &[String], root: &Path) -> Option<FlutterRoute> {
+    if wants_flutter(args) {
+        Some(FlutterRoute::Flag)
+    } else if flutter_test_package(root) {
+        Some(FlutterRoute::Pubspec)
+    } else {
+        None
+    }
+}
+
+/// The one line a pubspec-routed run prints on stderr: the run took the
+/// `flutter test` grammar by itself, and the explicit spelling is right
+/// there to be learned.
+const FLUTTER_ROUTE_LINE: &str =
+    "dartq test: flutter_test is a dev dependency — running as `dartq test --flutter`";
+
 /// A parsed command line.
 #[derive(Debug, Default, PartialEq)]
 struct Invocation {
     /// Something only plain `dart test` reproduces was asked for.
     delegate: bool,
+    /// The run is the flutter one: `--flutter` asked for it, or the
+    /// project's pubspec routed it there.
     flutter: bool,
     /// Positional selections, as typed.
     paths: Vec<String>,
@@ -340,16 +396,17 @@ struct Invocation {
 
 /// Parse `args` the way `package:args` parses the runner's grammar
 /// (options anywhere, `--` ends them, `--name=value` or `--name value`,
-/// `-x value`/`-xvalue`, `--no-` negation). `Err` when the line is not one
-/// the runner would accept: the caller hands it to `dart test`, which
-/// reports the error in its own words.
-fn parse(args: &[String]) -> Result<Invocation, ()> {
-    let table = if wants_flutter(args) {
-        FLUTTER_OPTIONS
-    } else {
-        OPTIONS
+/// `-x value`/`-xvalue`, `--no-` negation). `flutter` names whose grammar
+/// the line is parsed with — and whose run it is ([`flutter_route`]
+/// decided). `Err` when the line is not one the runner would accept: the
+/// caller hands it to `dart test` (or `flutter test`), which reports the
+/// error in its own words.
+fn parse(args: &[String], flutter: bool) -> Result<Invocation, ()> {
+    let table = if flutter { FLUTTER_OPTIONS } else { OPTIONS };
+    let mut inv = Invocation {
+        flutter,
+        ..Invocation::default()
     };
-    let mut inv = Invocation::default();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1239,13 +1296,24 @@ fn record_impacted_inputs(root: &Path) {
 }
 
 fn run(args: &[String]) -> u8 {
-    let Ok(inv) = parse(args) else {
+    // The grammar is chosen before anything is parsed, off the line and
+    // the project: `--flutter`, or the pubspec of the runner's own
+    // directory — a `flutter_test` dev dependency cannot run under
+    // `dart test` at all, so the run routes itself to the tool that can
+    // run its suites, saying so once on stderr.
+    let dir = std::env::current_dir().unwrap_or_default();
+    let route = flutter_route(args, &dir);
+    if route == Some(FlutterRoute::Pubspec) {
+        eprintln!("{FLUTTER_ROUTE_LINE}");
+    }
+    let flutter = route.is_some();
+    let Ok(inv) = parse(args, flutter) else {
         // No `Invocation`, so `--stats` is read off the line itself.
         let stats = args
             .iter()
             .take_while(|arg| *arg != "--")
             .any(|arg| arg == "--stats");
-        return delegate_requested(args, false, stats, "unrecognized arguments");
+        return delegate_requested(args, flutter, stats, "unrecognized arguments");
     };
     if inv.flutter {
         return flutter::run(args, inv);
@@ -2165,19 +2233,22 @@ mod tests {
     /// options are recognized and kept from the runner.
     #[test]
     fn grammar_matches_the_runner() {
-        let inv = parse(&args(&[
-            "test/a_test.dart",
-            "-r",
-            "expanded",
-            "-j4",
-            "--name=foo",
-            "-N",
-            "bar baz",
-            "--no-color",
-            "--chain-stack-traces",
-            "--",
-            "-weird_test.dart",
-        ]))
+        let inv = parse(
+            &args(&[
+                "test/a_test.dart",
+                "-r",
+                "expanded",
+                "-j4",
+                "--name=foo",
+                "-N",
+                "bar baz",
+                "--no-color",
+                "--chain-stack-traces",
+                "--",
+                "-weird_test.dart",
+            ]),
+            false,
+        )
         .expect("parse");
         assert_eq!(inv.paths, ["test/a_test.dart", "-weird_test.dart"]);
         assert_eq!(inv.reporter, Some(Kind::Expanded));
@@ -2192,17 +2263,20 @@ mod tests {
         );
         assert!(!inv.delegate);
 
-        let inv = parse(&args(&[
-            "-t",
-            "slow",
-            "--exclude-tags=flaky",
-            "--timeout",
-            "2x",
-            "--total-shards=3",
-            "--shard-index=1",
-            "--file-reporter",
-            "json:out/r.json",
-        ]))
+        let inv = parse(
+            &args(&[
+                "-t",
+                "slow",
+                "--exclude-tags=flaky",
+                "--timeout",
+                "2x",
+                "--total-shards=3",
+                "--shard-index=1",
+                "--file-reporter",
+                "json:out/r.json",
+            ]),
+            false,
+        )
         .expect("parse");
         assert_eq!(
             inv.pass,
@@ -2219,11 +2293,11 @@ mod tests {
             Some((Kind::Json, PathBuf::from("out/r.json")))
         );
 
-        let inv = parse(&args(&["--impacted", "--no-cache", "--stats"])).expect("parse");
+        let inv = parse(&args(&["--impacted", "--no-cache", "--stats"]), false).expect("parse");
         assert_eq!(inv.impacted.as_deref(), Some("HEAD"));
         assert!(inv.no_cache && inv.stats);
         assert_eq!(
-            parse(&args(&["--impacted=main"]))
+            parse(&args(&["--impacted=main"]), false)
                 .expect("parse")
                 .impacted
                 .as_deref(),
@@ -2254,10 +2328,10 @@ mod tests {
             &["-j", "0"],
             &["--pause-after-load"],
         ] {
-            assert!(parse(&args(line)).expect("parse").delegate, "{line:?}");
+            assert!(parse(&args(line), false).expect("parse").delegate, "{line:?}");
         }
         assert!(
-            !parse(&args(&["--no-fail-fast", "-p", "vm"]))
+            !parse(&args(&["--no-fail-fast", "-p", "vm"]), false)
                 .expect("parse")
                 .delegate
         );
@@ -2271,7 +2345,7 @@ mod tests {
             &["--file-reporter", "json"],
             &["--no-name"],
         ] {
-            assert!(parse(&args(line)).is_err(), "{line:?}");
+            assert!(parse(&args(line), false).is_err(), "{line:?}");
         }
     }
 
@@ -2291,7 +2365,7 @@ mod tests {
             "--",
             "-weird_test.dart",
         ]);
-        let inv = parse(&line).expect("parse");
+        let inv = parse(&line, false).expect("parse");
         assert_eq!(inv.paths, ["test", "-weird_test.dart"]);
         let bounded = with_selection(&line, &inv, ["test/a_test.dart".to_owned()]);
         assert_eq!(
@@ -2300,7 +2374,7 @@ mod tests {
         );
 
         let line = args(&["--flutter", "--impacted=main", "test", "--no-pub"]);
-        let inv = parse(&line).expect("parse");
+        let inv = parse(&line, true).expect("parse");
         let suites = ["/p/test/a_test.dart", "/p/test/b_test.dart"].map(str::to_owned);
         assert_eq!(
             runner_args(&with_selection(&line, &inv, suites)),
@@ -2397,16 +2471,19 @@ mod tests {
     /// here.
     #[test]
     fn flutter_grammar_matches_the_tool() {
-        let inv = parse(&args(&[
-            "--flutter",
-            "--no-pub",
-            "--machine",
-            "-j",
-            "4",
-            "--dart-define=A=1",
-            "--update-goldens",
-            "test/widget_test.dart",
-        ]))
+        let inv = parse(
+            &args(&[
+                "--flutter",
+                "--no-pub",
+                "--machine",
+                "-j",
+                "4",
+                "--dart-define=A=1",
+                "--update-goldens",
+                "test/widget_test.dart",
+            ]),
+            true,
+        )
         .expect("parse");
         assert!(inv.flutter && inv.no_pub && inv.machine && !inv.delegate);
         assert_eq!(inv.concurrency, Some(4));
@@ -2416,23 +2493,26 @@ mod tests {
 
         // The tester platform runs here (the tool's default, so it is not
         // re-passed); anything else is the tool's.
-        let tester = parse(&args(&["--flutter", "--platform", "tester"])).expect("parse");
+        let tester = parse(&args(&["--flutter", "--platform", "tester"]), true).expect("parse");
         assert!(!tester.delegate && tester.pass.is_empty());
         assert!(
-            parse(&args(&["--flutter", "--platform", "chrome"]))
+            parse(&args(&["--flutter", "--platform", "chrome"]), true)
                 .expect("parse")
                 .delegate
         );
 
         // The tool's own lenient parse: junk leaves the default and the
         // run stays dartq's.
-        let junk = parse(&args(&["--flutter", "-j", "x"])).expect("parse");
+        let junk = parse(&args(&["--flutter", "-j", "x"]), true).expect("parse");
         assert!(!junk.delegate && junk.concurrency.is_none());
 
         // Tag options accumulate; debugging, verbose logging and coverage
         // delegate.
-        let tags =
-            parse(&args(&["--flutter", "-t", "slow", "--exclude-tags=flaky"])).expect("parse");
+        let tags = parse(
+            &args(&["--flutter", "-t", "slow", "--exclude-tags=flaky"]),
+            true,
+        )
+        .expect("parse");
         assert_eq!(tags.include_tags, ["slow"]);
         assert_eq!(tags.exclude_tags, ["flaky"]);
         for line in [
@@ -2441,11 +2521,73 @@ mod tests {
             &["--flutter", "--start-paused"],
             &["--flutter", "--coverage"],
         ] {
-            assert!(parse(&args(line)).expect("parse").delegate, "{line:?}");
+            assert!(parse(&args(line), true).expect("parse").delegate, "{line:?}");
         }
         // After `--` the options ended: `--flutter` is a selection.
-        let after = parse(&args(&["--", "--flutter"])).expect("parse");
+        let after = parse(&args(&["--", "--flutter"]), false).expect("parse");
         assert!(!after.flutter && after.paths == ["--flutter"]);
+    }
+
+    /// A `flutter_test` dev dependency routes a plain line to the flutter
+    /// grammar and announces the route with exactly one stderr line.
+    #[test]
+    fn routes_a_flutter_test_package_to_the_flutter_grammar() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        fs::write(
+            root.join("pubspec.yaml"),
+            "name: p\nenvironment:\n  sdk: ^3.5.0\ndev_dependencies:\n  flutter_test:\n    sdk: flutter\n",
+        )
+        .expect("write");
+        assert!(flutter_test_package(root));
+        assert_eq!(
+            flutter_route(&args(&[]), root),
+            Some(FlutterRoute::Pubspec)
+        );
+        // The grammar the route chooses: an option only the tool's table
+        // knows parses, and the invocation is the flutter one.
+        let inv = parse(&args(&["--machine"]), true).expect("parse");
+        assert!(inv.flutter && inv.machine);
+        assert_eq!(
+            FLUTTER_ROUTE_LINE,
+            "dartq test: flutter_test is a dev dependency — running as `dartq test --flutter`"
+        );
+    }
+
+    /// A bare `dependencies.flutter` is not the signal: such a package can
+    /// still run pure `dart test` suites, so the dart grammar stays.
+    #[test]
+    fn a_flutter_dependency_alone_keeps_the_dart_grammar() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        fs::write(
+            root.join("pubspec.yaml"),
+            "name: p\ndependencies:\n  flutter:\n    sdk: flutter\ndev_dependencies:\n  test: ^1.0.0\n",
+        )
+        .expect("write");
+        assert!(!flutter_test_package(root));
+        assert_eq!(flutter_route(&args(&[]), root), None);
+        // The dart grammar: `--machine` is not a `dart test` option.
+        assert!(parse(&args(&["--machine"]), false).is_err());
+    }
+
+    /// `--flutter` on a `flutter_test` package is the flag's own route: the
+    /// flutter grammar, and no advisory line (the pubspec never routed it).
+    #[test]
+    fn explicit_flutter_flag_prints_no_advisory() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        fs::write(
+            root.join("pubspec.yaml"),
+            "name: p\ndev_dependencies:\n  flutter_test:\n    sdk: flutter\n",
+        )
+        .expect("write");
+        assert_eq!(
+            flutter_route(&args(&["--flutter"]), root),
+            Some(FlutterRoute::Flag)
+        );
+        let inv = parse(&args(&["--flutter"]), true).expect("parse");
+        assert!(inv.flutter);
     }
 
     /// The runner's `NoTestsFoundException` message: name patterns first,
