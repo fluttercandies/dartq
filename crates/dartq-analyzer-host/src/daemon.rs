@@ -313,7 +313,18 @@ impl Host {
             Ok(()) => {
                 let _ = std::fs::remove_file(&self.files.failed);
                 let server = self.server.as_ref().expect("a live server");
-                dartq_toolchain::ledger::record_peak(&self.peak_key, server.peak());
+                // The measured peak sizes this resident's own lease at
+                // once: it leaves the first-run slot, and a peer analyzer
+                // waiting there borrows the figure.
+                let peak = server.peak();
+                match self.lease.as_mut() {
+                    Some(lease) => lease.record_peak(&self.peak_key, peak),
+                    None => dartq_toolchain::ledger::record_peak(
+                        &self.peak_key,
+                        dartq_toolchain::ledger::Face::AnalysisServer,
+                        peak,
+                    ),
+                }
                 Answer::Report(server.report())
             }
             Err(fault @ Fault::Budget { .. }) => Answer::Budget(fault.to_string()),
@@ -361,6 +372,7 @@ impl Host {
             slot: true,
             cap: ledger::cap(self.max_concurrent),
             sized,
+            peak_key: Some(self.peak_key.clone()),
         };
         let deadline = Instant::now() + MEMORY_WAIT;
         match ledger::acquire(request, bytes, self.max_percent, deadline, |text| {

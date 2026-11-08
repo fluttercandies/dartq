@@ -899,7 +899,11 @@ pub fn run_shim(
     let run = runner.run(argv, &cwd);
     #[cfg(all(unix, not(test)))]
     if let Some(gate) = &gate {
-        dartq_toolchain::ledger::record_peak(&gate.key, dartq_toolchain::proc::children_peak_rss());
+        dartq_toolchain::ledger::record_peak(
+            &gate.key,
+            dartq_toolchain::ledger::Face::Build,
+            dartq_toolchain::proc::children_peak_rss(),
+        );
     }
     let observed = observer.finish();
     let run_started = marker
@@ -2344,6 +2348,7 @@ fn gate(
         slot: batch,
         cap: ledger::cap(config.memory_max_concurrent),
         sized,
+        peak_key: Some(key.clone()),
     };
     if !batch {
         return Ok(ledger::book(request).map(|lease| Gate { _lease: lease, key }));
@@ -2629,6 +2634,7 @@ mod tests {
                 slot: true,
                 cap: 1,
                 sized: true,
+                peak_key: None,
             },
             1 << 20,
             90,

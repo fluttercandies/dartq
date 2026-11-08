@@ -1817,6 +1817,7 @@ pub(crate) fn job_slot(
         slot: true,
         cap: job_cap(dir),
         sized,
+        peak_key: Some(peak_key.to_owned()),
     };
     let deadline = std::time::Instant::now() + JOB_WAIT;
     match ledger::acquire(request, bytes, max_percent, deadline, |note| {
@@ -1825,6 +1826,7 @@ pub(crate) fn job_slot(
         Ok(lease) => Ok(lease.map(|lease| JobSlot {
             _lease: lease,
             peak_key: peak_key.to_owned(),
+            face,
         })),
         Err(error @ ledger::Error::Timeout { .. }) => Err(error.to_string()),
         Err(ledger::Error::Io(_) | ledger::Error::Stopped) => Ok(None),
@@ -1843,6 +1845,8 @@ pub(crate) struct JobSlot {
     #[cfg(unix)]
     _lease: dartq_toolchain::ledger::Lease,
     peak_key: String,
+    #[cfg(unix)]
+    face: dartq_toolchain::ledger::Face,
 }
 
 impl Drop for JobSlot {
@@ -1850,6 +1854,7 @@ impl Drop for JobSlot {
         #[cfg(unix)]
         dartq_toolchain::ledger::record_peak(
             &self.peak_key,
+            self.face,
             dartq_toolchain::proc::self_peak_rss().max(dartq_toolchain::proc::children_peak_rss()),
         );
     }

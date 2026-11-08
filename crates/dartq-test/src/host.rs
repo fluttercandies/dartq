@@ -278,6 +278,7 @@ pub fn lease_processes(
             slot: false,
             cap: 0,
             sized: true,
+            peak_key: None,
         };
         let granted = ledger::acquire(request, min as u64 * UNIT, max_percent, deadline, |note| {
             eprintln!("{note}");

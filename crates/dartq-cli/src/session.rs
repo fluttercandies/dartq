@@ -580,7 +580,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
             );
         }
     };
-    let _peak = PeakOnExit(peak_key);
+    let _peak = PeakOnExit(peak_key.clone());
     loop {
         if signalled.load(std::sync::atomic::Ordering::Relaxed) {
             stop_accepting(listener, &layout);
@@ -602,9 +602,13 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 let _ = stream.set_nonblocking(false);
                 let _ = events.append("session", "client_attached", serde_json::json!({}));
                 busy.hold(true);
-                serve_client(stream, &mut session, &signalled);
+                serve_client(stream, &mut session, &signalled, &mut || {
+                    if let Some(lease) = lease.as_mut() {
+                        size_after_load(lease, &peak_key, &trace);
+                    }
+                });
                 busy.hold(hosting(&session) > 0);
-                if let Some(lease) = &lease {
+                if let Some(lease) = lease.as_ref() {
                     lease.touch();
                 }
                 let _ = events.append("session", "client_detached", serde_json::json!({}));
@@ -720,7 +724,11 @@ struct PeakOnExit(String);
 
 impl Drop for PeakOnExit {
     fn drop(&mut self) {
-        dartq_toolchain::ledger::record_peak(&self.0, dartq_toolchain::proc::self_peak_rss());
+        dartq_toolchain::ledger::record_peak(
+            &self.0,
+            dartq_toolchain::ledger::Face::Session,
+            dartq_toolchain::proc::self_peak_rss(),
+        );
     }
 }
 
@@ -758,6 +766,20 @@ fn settle_slot(
     lease.retake_slot().unwrap_or(true)
 }
 
+/// Books the daemon's measured peak in its lease once its first analysis
+/// has run (the engine trace names an analyzed library), checked after
+/// every served turn while the client is still attached: an unsized
+/// daemon then leaves the first-run slot at once, and the daemon of
+/// another worktree waiting there borrows the figure. Once sized, the
+/// check is a field read; the exit records the final peak
+/// ([`PeakOnExit`]).
+fn size_after_load(lease: &mut dartq_toolchain::ledger::Lease, peak_key: &str, trace: &Path) {
+    if lease.sized() || dartq_session::Progress::from_trace(trace).files_scanned == 0 {
+        return;
+    }
+    lease.record_peak(peak_key, dartq_toolchain::proc::self_peak_rss());
+}
+
 /// How long a session daemon waits at the job gate before it gives up.
 const SESSION_MEMORY_WAIT: Duration = Duration::from_secs(30 * 60);
 
@@ -790,6 +812,7 @@ fn lease_session(
         slot: true,
         cap: crate::job_cap(root),
         sized,
+        peak_key: Some(peak_key.to_owned()),
     };
     let deadline = Instant::now() + SESSION_MEMORY_WAIT;
     let max_percent = crate::memory_max_percent(root);
@@ -872,6 +895,7 @@ fn serve_client(
     stream: UnixStream,
     session: &mut dartq_daemon::Session,
     signalled: &std::sync::atomic::AtomicBool,
+    on_turn: &mut dyn FnMut(),
 ) {
     let Ok(read) = stream.try_clone() else {
         return;
@@ -879,7 +903,7 @@ fn serve_client(
     // The read half is the clone; the original stream stays the write
     // half. run owns both and returns at the client's disconnect or the
     // exit signal.
-    let _ = dartq_daemon::run_with_signal(read, stream, session, None, Some(signalled));
+    let _ = dartq_daemon::run_with_signal(read, stream, session, None, Some(signalled), on_turn);
 }
 
 /// Binds the socket, unlinking a leftover file once (a crashed server's
@@ -1017,7 +1041,12 @@ pub(crate) mod tests {
     /// One framed request over the socket; returns the first response
     /// body.
     fn roundtrip(socket: &Path, request: &str) -> String {
-        let mut stream = UnixStream::connect(socket).expect("connect");
+        exchange(&mut UnixStream::connect(socket).expect("connect"), request)
+    }
+
+    /// One framed request over a held connection; returns the first
+    /// response body.
+    fn exchange(stream: &mut UnixStream, request: &str) -> String {
         let body = request.as_bytes();
         write!(stream, "Content-Length: {}\r\n\r\n", body.len()).expect("write frame");
         stream.write_all(body).expect("write body");
@@ -1212,6 +1241,7 @@ pub(crate) mod tests {
             slot: true,
             cap: 1,
             sized: true,
+            peak_key: None,
         };
         let deadline = || Instant::now() + Duration::from_secs(5);
         let mut daemon =
@@ -1252,9 +1282,10 @@ pub(crate) mod tests {
 
     /// The stand-in for the `dartq test` child a `dartq/test/run` spawns:
     /// a no-op unless [`PROBE_ENV`] names its report file. It makes the
-    /// slot request a nested `dartq test` makes, writes the outcome
-    /// (`joined`, `slot`, or the error) to the report, and lives until
-    /// the report's `.release` sibling appears.
+    /// slot request a nested `dartq test` with no recorded peak makes (a
+    /// first run), writes the outcome (`joined`, `slot`, or the error) to
+    /// the report, and lives until the report's `.release` sibling
+    /// appears.
     #[test]
     fn test_run_gate_probe() {
         use dartq_toolchain::ledger::{self, Face, Request};
@@ -1268,8 +1299,9 @@ pub(crate) mod tests {
             pid: None,
             release: None,
             slot: true,
-            cap: 1,
-            sized: true,
+            cap: ledger::cap(0),
+            sized: false,
+            peak_key: None,
         };
         let deadline = Instant::now() + Duration::from_secs(3);
         let outcome = match ledger::acquire(request, 1 << 20, 90, deadline, |_| {}) {
@@ -1371,6 +1403,88 @@ pub(crate) mod tests {
 
     fn ledger_cap_env() -> &'static str {
         dartq_toolchain::ledger::CAP_ENV
+    }
+
+    /// An unsized session daemon (no recorded peak, no peer to borrow
+    /// from) holds the first-run slot only until its first analysis: while
+    /// the long-lived client that triggered it stays attached (the MCP
+    /// proxy's shape), its lease record is sized with its measured peak,
+    /// the peak is recorded, and another worktree's unsized first run is
+    /// admitted at once.
+    #[test]
+    fn a_session_daemon_is_sized_after_its_first_load() {
+        use dartq_toolchain::ledger::{self, Face};
+        if crate::tests::isolated("session::tests::a_session_daemon_is_sized_after_its_first_load")
+        {
+            return;
+        }
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_fixture("sized");
+        let (dir, sdk) = (root.clone(), root.join("sdk"));
+        let server = std::thread::spawn(move || {
+            serve_loop_for_tests_with(&dir, &sdk, Duration::from_secs(3))
+        });
+        let layout = Layout::new(&root);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dartq_session::socket_open(&layout) {
+            assert!(Instant::now() < deadline, "the serve loop never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let key = format!("session:{}", root.canonicalize().expect("canon").display());
+        assert!(
+            !ledger::sizing(&key, Face::Session).1,
+            "an unsized first run"
+        );
+        let mut client = UnixStream::connect(&layout.socket).expect("connect");
+        let answer = exchange(
+            &mut client,
+            r#"{"jsonrpc":"2.0","id":1,"method":"dartq/analyze","params":{}}"#,
+        );
+        assert!(answer.contains("\"id\":1"), "answered: {answer}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (bytes, sized) = ledger::sizing("session:another-worktree", Face::Session);
+            if sized {
+                assert!(bytes > 0, "the borrowed figure is the measured peak");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon's lease never turned sized"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            ledger::peak(&key).is_some(),
+            "the peak is recorded once loaded"
+        );
+        // Still attached: another worktree's first run (a test run, a face
+        // with no peak anywhere, in a process of its own) takes a slot at
+        // once.
+        let report = root.join("probe.out");
+        let mut probe = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "session::tests::test_run_gate_probe",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(PROBE_ENV, &report)
+            .spawn()
+            .expect("the probe");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !report.exists() {
+            assert!(Instant::now() < deadline, "the probe never reported");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(std::fs::read_to_string(&report).expect("report"), "slot");
+        std::fs::write(report.with_extension("release"), "").expect("release the probe");
+        assert!(probe.wait().expect("probe").success());
+        drop(client);
+        assert_eq!(server.join().expect("server thread"), exit::CLEAN);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

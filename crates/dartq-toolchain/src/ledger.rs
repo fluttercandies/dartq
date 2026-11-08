@@ -21,6 +21,17 @@
 //!   that declares 1 never runs beside anything. A job without a recorded
 //!   peak (nor a peer's to borrow) is *unsized*; one unsized job runs at a
 //!   time, so first runs on a fresh machine serialize until peaks exist.
+//!   A holder that measures its peak marks its own record sized at once
+//!   ([`Lease::record_peak`]), which frees the first-run slot, and a
+//!   waiting request re-reads its sizing on every poll, so it borrows that
+//!   peak as soon as it is recorded. Only a first run under way occupies
+//!   the slot: an unsized resident that sits idle (releasable, busy lock
+//!   free) does not. The first-run slot never releases anyone: it only
+//!   waits.
+//! * **Peaks.** Each face records its peaks under `peaks/`, one file per
+//!   key holding the face and the bytes. A job without a peak of its own
+//!   borrows the largest of its face: a live sized holder's or a recorded
+//!   one under any key.
 //! * **Accounting.** A holder counts `max(lease, live tree RSS)`, so one
 //!   that grew past its lease is not undercounted. Trees nest (a debug
 //!   app inside a session daemon's tree): a tree stops at another
@@ -36,9 +47,10 @@
 //!   figure skips the check.
 //! * **Admission.** Under one gate lock. Slot requests wait in arrival
 //!   order (waiter tickets `w-<seq>-<pid>.lock`, locked by their waiter).
-//!   On a shortfall, idle releasable holders are released least recently
-//!   used first, only as far as the shortfall needs, never one whose busy
-//!   lock is held; otherwise the requester waits — one note, polling,
+//!   On a memory or count shortfall, idle releasable holders are released
+//!   least recently used first, only as far as the shortfall needs, never
+//!   one whose busy lock is held; otherwise (and always for the first-run
+//!   slot) the requester waits — one note, polling,
 //!   bounded by its deadline. A wait that times out names the holders.
 //! * **Nesting.** A slot holder passes its token to its descendants
 //!   ([`TOKEN_ENV`]); a request carrying a live holder's token joins that
@@ -140,6 +152,10 @@ pub struct Request {
     pub cap: u32,
     /// Whether `bytes` is a measured peak ([`sizing`]).
     pub sized: bool,
+    /// The key whose sizing an unsized slot request re-reads on every poll
+    /// of its wait ([`sizing`]): it is admitted sized as soon as a peak of
+    /// its own or of a peer of its face is recorded.
+    pub peak_key: Option<String>,
 }
 
 /// One holder file's record.
@@ -279,11 +295,13 @@ pub(crate) enum Decision {
 /// left after the counted holders and — with an available figure —
 /// available memory minus the reserve minus the growth the holders still
 /// owe. A slot ask also needs a free slot under the strictest cap, and an
-/// unsized one no other unsized slot holder. While short, the least
-/// recently used idle releasable holder that would help goes: any for
-/// memory (it frees what it counts and what it holds now plus what it
-/// owed), a slot holder for the count, an unsized one for the first-run
-/// slot. A busy or non-releasable holder always stays.
+/// unsized one no first run under way (an unsized slot holder other than
+/// an idle resident). While short, the least recently used idle
+/// releasable holder that would help goes: any for memory (it frees what
+/// it counts and what it holds now plus what it owed), a slot holder for
+/// the count. The first-run slot releases no one: the first run under way
+/// ends by recording its peak or by exiting. A busy or non-releasable
+/// holder always stays.
 pub(crate) fn decide(holders: &[Holder], ask: Ask, figures: Figures) -> Decision {
     let budget = figures.budget();
     let room = figures
@@ -326,7 +344,7 @@ pub(crate) fn decide(holders: &[Holder], ask: Ask, figures: Figures) -> Decision
         let helps = |holder: &Holder| match shortfall {
             Shortfall::Memory => true,
             Shortfall::Count { .. } => holder.slot,
-            Shortfall::FirstRun => holder.slot && !holder.sized,
+            Shortfall::FirstRun => false,
         };
         let Some(at) = idle
             .iter()
@@ -358,10 +376,17 @@ fn slot_shortfall<'a>(live: impl Iterator<Item = &'a Holder>, ask: Ask) -> Optio
             cap,
         });
     }
-    if !ask.sized && slots.iter().any(|holder| !holder.sized) {
+    if !ask.sized && slots.iter().any(|holder| first_run(holder)) {
         return Some(Shortfall::FirstRun);
     }
     None
+}
+
+/// Whether `holder` occupies the first-run slot: unsized and running — a
+/// non-releasable job, or a resident whose busy lock is held. An idle
+/// unsized resident has no first run under way.
+fn first_run(holder: &Holder) -> bool {
+    !holder.sized && holder.idle != Some(true)
 }
 
 /// Physical memory: [`TOTAL_ENV`] when set, else the OS figure. `0` when
@@ -453,22 +478,60 @@ fn ledger_dir() -> Option<PathBuf> {
 /// target, a worktree), in bytes.
 #[must_use]
 pub fn peak(key: &str) -> Option<u64> {
-    let path = ledger_dir()?.join("peaks").join(peak_file(key));
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+    peak_in(&ledger_dir()?, key)
 }
 
-/// Records `bytes` as the peak of `key` (the latest run's, so a project
-/// that shrank books less next time).
-pub fn record_peak(key: &str, bytes: u64) {
+fn peak_in(dir: &Path, key: &str) -> Option<u64> {
+    read_peak(&dir.join("peaks").join(peak_file(key))).map(|(_, bytes)| bytes)
+}
+
+/// One recorded peak file: its face and bytes. A bare number (the format
+/// of an older dartq) has no face: it still sizes its own key.
+fn read_peak(path: &Path) -> Option<(Option<Face>, u64)> {
+    let text = fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<Peak>(&text) {
+        Ok(peak) => Some((Some(peak.face), peak.bytes)),
+        Err(_) => Some((None, text.trim().parse().ok()?)),
+    }
+}
+
+/// The recorded peaks of `face`, under any key.
+fn face_peaks(dir: &Path, face: Face) -> impl Iterator<Item = u64> {
+    fs::read_dir(dir.join("peaks"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(move |entry| match read_peak(&entry.path())? {
+            (Some(of), bytes) if of == face => Some(bytes),
+            _ => None,
+        })
+}
+
+/// A peaks-store file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Peak {
+    face: Face,
+    bytes: u64,
+}
+
+/// Records `bytes` as the peak of `key`, a job of `face` (the latest
+/// run's, so a project that shrank books less next time).
+pub fn record_peak(key: &str, face: Face, bytes: u64) {
+    if let Some(dir) = ledger_dir() {
+        record_peak_in(&dir, key, face, bytes);
+    }
+}
+
+fn record_peak_in(dir: &Path, key: &str, face: Face, bytes: u64) {
     if bytes == 0 {
         return;
     }
-    let Some(dir) = ledger_dir().map(|dir| dir.join("peaks")) else {
-        return;
-    };
+    let dir = dir.join("peaks");
+    let text = serde_json::to_string(&Peak { face, bytes }).expect("a peak serializes");
     if fs::create_dir_all(&dir).is_ok() {
         let temp = dir.join(format!(".{}.{}", peak_file(key), std::process::id()));
-        if fs::write(&temp, bytes.to_string()).is_ok() {
+        if fs::write(&temp, text).is_ok() {
             let _ = fs::rename(&temp, dir.join(peak_file(key)));
         }
     }
@@ -494,22 +557,31 @@ fn peak_file(key: &str) -> String {
 }
 
 /// The lease to book for `key` and whether it is a measurement: its
-/// recorded peak, else the largest live sized holder of `face` (a peer's
-/// peak), else [`DEFAULT_LEASE`], unsized — a first run, which admission
-/// serializes with every other first run.
+/// recorded peak, else the largest peak of `face` — a live sized holder's
+/// or one recorded under any key — else [`DEFAULT_LEASE`], unsized: a
+/// first run, which admission serializes with every other first run. An
+/// unsized request names `key` as its [`Request::peak_key`] to be sized
+/// while it waits.
 #[must_use]
 pub fn sizing(key: &str, face: Face) -> (u64, bool) {
-    if let Some(bytes) = peak(key) {
-        return (bytes, true);
-    }
-    ledger_dir()
-        .map(|dir| scan(&dir))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, holder)| holder.face == face && holder.sized && holder.lease > 0)
-        .map(|(_, holder)| holder.lease)
-        .max()
-        .map_or((DEFAULT_LEASE, false), |bytes| (bytes, true))
+    let Some(dir) = ledger_dir() else {
+        return (DEFAULT_LEASE, false);
+    };
+    let holders: Vec<Holder> = scan(&dir).into_iter().map(|(_, holder)| holder).collect();
+    sized_in(&dir, Some(key), face, &holders).map_or((DEFAULT_LEASE, false), |bytes| (bytes, true))
+}
+
+/// The measured lease of a job: `key`'s recorded peak under `dir`, else
+/// the largest peak of `face`, live or recorded (a peer's).
+fn sized_in(dir: &Path, key: Option<&str>, face: Face, holders: &[Holder]) -> Option<u64> {
+    key.and_then(|key| peak_in(dir, key)).or_else(|| {
+        holders
+            .iter()
+            .filter(|holder| holder.face == face && holder.sized && holder.lease > 0)
+            .map(|holder| holder.lease)
+            .chain(face_peaks(dir, face))
+            .max()
+    })
 }
 
 /// The live leases: face, label and bytes of each holder (the view
@@ -711,6 +783,31 @@ impl Lease {
         self.record.slot
     }
 
+    /// Whether the lease books a measured peak.
+    #[must_use]
+    pub fn sized(&self) -> bool {
+        self.record.sized
+    }
+
+    /// Records `peak` as `key`'s peak ([`record_peak`], under the lease's
+    /// face) and books it in
+    /// this lease at once: the record turns sized with `max(lease, peak)`
+    /// bytes, so the holder leaves the first-run slot and a peer of its
+    /// face can borrow the figure while it still runs.
+    pub fn record_peak(&mut self, key: &str, peak: u64) {
+        record_peak_in(&self.dir, key, self.record.face, peak);
+        if peak == 0 || (self.record.sized && self.record.bytes >= peak) {
+            return;
+        }
+        // Rewritten under the gate lock: an admission scan never reads
+        // the record between its truncation and its write.
+        let gate = open_gate(&self.dir).and_then(|gate| gate.lock().map(|()| gate));
+        self.record.sized = true;
+        self.record.bytes = self.record.bytes.max(peak);
+        self.write();
+        drop(gate);
+    }
+
     /// Names the process tree this lease accounts for, once spawned.
     pub fn track(&mut self, pid: u32) {
         self.record.pid = Some(pid);
@@ -735,7 +832,8 @@ impl Lease {
 
     /// Takes the slot [`Lease::leave_slot`] gave up back without waiting (a
     /// session daemon whose last debug session ended): `false` when every
-    /// slot is taken — the strictest cap, or the first-run slot — and the
+    /// slot is taken — the strictest cap, or the first-run slot of an
+    /// unsized lease — and the
     /// lease stays slotless. A lease that left no slot has nothing to
     /// retake: `true`.
     ///
@@ -926,8 +1024,8 @@ fn open_gate(dir: &Path) -> io::Result<File> {
 /// seam).
 fn acquire_in(
     dir: &Path,
-    request: Request,
-    min: u64,
+    mut request: Request,
+    mut min: u64,
     deadline: Instant,
     stop: &dyn Fn() -> bool,
     mut on_note: impl FnMut(&str),
@@ -943,6 +1041,25 @@ fn acquire_in(
         if request.slot && ticket.is_none() {
             ticket = Some(Ticket::join(dir)?);
         }
+        // A holder just released keeps its file until it exits; within the
+        // grace it counts as gone (its memory is on the way out).
+        released.retain(|(path, at)| path.exists() && at.elapsed() < RELEASE_GRACE);
+        let holders: Vec<(PathBuf, Holder)> = scan(dir)
+            .into_iter()
+            .filter(|(path, _)| !released.iter().any(|(gone, _)| gone == path))
+            .collect();
+        let snapshot: Vec<Holder> = holders.iter().map(|(_, holder)| holder.clone()).collect();
+        // An unsized slot request takes a peak recorded while it waited
+        // (its own key's, or a peer's of its face) and leaves the
+        // first-run line.
+        if request.slot
+            && !request.sized
+            && let Some(bytes) = sized_in(dir, request.peak_key.as_deref(), request.face, &snapshot)
+        {
+            request.sized = true;
+            request.bytes = bytes;
+            min = min.min(bytes);
+        }
         let figures = figures();
         let budget = figures.budget();
         // The clamp: a request past the whole budget runs alone.
@@ -953,14 +1070,6 @@ fn acquire_in(
             cap: request.cap,
             sized: request.sized,
         };
-        // A holder just released keeps its file until it exits; within the
-        // grace it counts as gone (its memory is on the way out).
-        released.retain(|(path, at)| path.exists() && at.elapsed() < RELEASE_GRACE);
-        let holders: Vec<(PathBuf, Holder)> = scan(dir)
-            .into_iter()
-            .filter(|(path, _)| !released.iter().any(|(gone, _)| gone == path))
-            .collect();
-        let snapshot: Vec<Holder> = holders.iter().map(|(_, holder)| holder.clone()).collect();
         let ahead = ticket.as_ref().map_or(0, |ticket| ticket.ahead(dir));
         let decision = if ahead > 0 {
             None
@@ -1250,6 +1359,7 @@ mod tests {
             slot: true,
             cap,
             sized,
+            peak_key: None,
         }
     }
 
@@ -1271,6 +1381,15 @@ mod tests {
             roomy,
         );
         (result, notes)
+    }
+
+    /// An unsized slot request of `face` that re-reads `key`'s sizing
+    /// while it waits.
+    fn first(face: Face, label: &str, key: &str) -> Request {
+        Request {
+            peak_key: Some(key.into()),
+            ..slot(face, label, 0, false)
+        }
     }
 
     fn held(dir: &Path, request: Request) -> Lease {
@@ -1480,6 +1599,243 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(result.expect("a sized job runs beside it").is_some());
+    }
+
+    /// A releasable resident of `face` that never measured a peak: an
+    /// unsized slot holder, its pid a live `sleep` (the child to signal if
+    /// it were released), and its busy lock file — held by the returned
+    /// handle (a first run under way) unless `idle`.
+    fn unsized_resident(
+        dir: &Path,
+        face: Face,
+        label: &str,
+        idle: bool,
+    ) -> (Lease, std::process::Child, File) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let busy = dir.join(format!("{label}.busy"));
+        let lock = File::create(&busy).expect("busy lock");
+        if !idle {
+            lock.lock().expect("hold the busy lock");
+        }
+        let lease = held(
+            dir,
+            Request {
+                pid: Some(child.id()),
+                release: Some(Releasable {
+                    pid: child.id(),
+                    busy,
+                }),
+                ..slot(face, label, 0, false)
+            },
+        );
+        (lease, child, lock)
+    }
+
+    /// The first-run slot only waits: a busy unsized resident is a first
+    /// run under way, never released to make room for another one.
+    #[test]
+    fn a_first_run_wait_never_releases_a_resident() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let (resident, mut child, _busy) =
+            unsized_resident(dir.path(), Face::AnalysisServer, "wt1", false);
+        let (result, notes) = admit(
+            dir.path(),
+            slot(Face::Analyze, "wt2", 0, false),
+            Duration::from_millis(600),
+        );
+        match result {
+            Err(Error::Timeout { what, .. }) => assert_eq!(what, "the first-run slot"),
+            other => panic!("expected a first-run wait, got {other:?}"),
+        }
+        assert!(
+            !notes.iter().any(|note| note.contains("released")),
+            "no one is released for the first-run slot: {notes:?}"
+        );
+        assert!(
+            child.try_wait().expect("child").is_none(),
+            "the resident lives"
+        );
+        drop(resident);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// An idle unsized resident (no peak, busy lock free) has no first run
+    /// under way: another first run is admitted beside it at once, and the
+    /// resident is not released.
+    #[test]
+    fn an_idle_unsized_resident_leaves_the_first_run_slot_free() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let (resident, mut child, _busy) =
+            unsized_resident(dir.path(), Face::AnalysisServer, "wt1", true);
+        let started = Instant::now();
+        let (result, notes) = admit(
+            dir.path(),
+            slot(Face::Analyze, "wt2", 0, false),
+            Duration::from_secs(5),
+        );
+        let lease = result.expect("admitted").expect("a lease");
+        assert!(!lease.sized(), "admitted as a first run");
+        assert!(started.elapsed() < Duration::from_secs(1), "{notes:?}");
+        assert!(notes.is_empty(), "no wait and no release: {notes:?}");
+        assert!(
+            child.try_wait().expect("child").is_none(),
+            "the resident lives"
+        );
+        drop(lease);
+        drop(resident);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Three worktrees' first runs at once under the default config: the
+    /// second and third wait (no one is released) and are admitted as soon
+    /// as the first resident records its peak; every resident stays alive
+    /// and sized, and the waiters borrow the recorded peak.
+    #[test]
+    fn concurrent_first_runs_keep_every_resident_alive() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let (mut resident, mut child, busy) =
+            unsized_resident(dir.path(), Face::AnalysisServer, "wt1", false);
+        let waiter = |label: &'static str| {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let (result, notes) = admit(
+                    &dir,
+                    first(Face::AnalysisServer, label, label),
+                    Duration::from_secs(10),
+                );
+                (result, notes, started.elapsed())
+            })
+        };
+        let second = waiter("wt2");
+        let third = waiter("wt3");
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            !second.is_finished() && !third.is_finished(),
+            "first runs wait their turn"
+        );
+        resident.record_peak("wt1", 3 * GIB);
+        assert!(resident.sized() && resident.holds_slot());
+        drop(busy);
+        for handle in [second, third] {
+            let (result, notes, waited) = handle.join().expect("waiter");
+            let lease = result.expect("admitted").expect("a lease");
+            assert!(lease.sized(), "the waiter borrowed the recorded peak");
+            assert_eq!(lease.bytes(), 3 * GIB);
+            assert!(
+                waited < Duration::from_secs(5),
+                "admitted once the peak landed"
+            );
+            assert!(
+                !notes.iter().any(|note| note.contains("released")),
+                "no resident is released: {notes:?}"
+            );
+            drop(lease);
+        }
+        assert!(
+            child.try_wait().expect("child").is_none(),
+            "the first resident lives"
+        );
+        drop(resident);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A waiting first run re-reads its sizing on every poll: a peer peak
+    /// of its face recorded during the wait admits it, sized with the
+    /// peer's figure; its own key's recorded peak does the same.
+    #[test]
+    fn a_waiting_request_borrows_a_peak_recorded_during_its_wait() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let mut peer = held(dir.path(), slot(Face::Session, "wt1", 0, false));
+        let dir_path = dir.path().to_path_buf();
+        let waiting = std::thread::spawn(move || {
+            admit(
+                &dir_path,
+                first(Face::Session, "wt2", "session:wt2"),
+                Duration::from_secs(10),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!waiting.is_finished(), "the first-run slot is taken");
+        peer.record_peak("session:wt1", 2 * GIB);
+        let (result, _) = waiting.join().expect("waiter");
+        let lease = result.expect("admitted").expect("a lease");
+        assert!(lease.sized());
+        assert_eq!(lease.bytes(), 2 * GIB, "the peer's peak is borrowed");
+        drop(lease);
+        drop(peer);
+        // Its own key's peak, recorded while it waits, sizes it the same.
+        let _blocker = held(dir.path(), slot(Face::Test, "other", 0, false));
+        let dir_path = dir.path().to_path_buf();
+        let waiting = std::thread::spawn(move || {
+            admit(
+                &dir_path,
+                first(Face::Analyze, "wt3", "analyze:wt3"),
+                Duration::from_secs(10),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!waiting.is_finished(), "the first-run slot is taken");
+        record_peak_in(dir.path(), "analyze:wt3", Face::Analyze, GIB / 2);
+        let (result, _) = waiting.join().expect("waiter");
+        let lease = result.expect("admitted").expect("a lease");
+        assert!(lease.sized());
+        assert_eq!(lease.bytes(), GIB / 2, "its own recorded peak");
+    }
+
+    /// With no live peer, a peak recorded under another key sizes a
+    /// request of the same face (the largest such), and only of that face;
+    /// an older bare-number file still sizes its own key.
+    #[test]
+    fn a_recorded_peak_of_the_face_under_another_key_sizes_a_request() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        record_peak_in(dir.path(), "session:wt1", Face::Session, 2 * GIB);
+        record_peak_in(dir.path(), "session:wt2", Face::Session, 3 * GIB);
+        record_peak_in(dir.path(), "build:wt1", Face::Build, 7 * GIB);
+        assert_eq!(
+            sized_in(dir.path(), Some("session:wt3"), Face::Session, &[]),
+            Some(3 * GIB),
+            "the largest recorded peak of the face"
+        );
+        assert_eq!(
+            sized_in(dir.path(), Some("test:wt3"), Face::Test, &[]),
+            None
+        );
+        let lease = held(dir.path(), first(Face::Session, "wt3", "session:wt3"));
+        assert!(lease.sized(), "admitted sized");
+        assert_eq!(lease.bytes(), 3 * GIB);
+        fs::write(dir.path().join("peaks").join(peak_file("legacy")), "5").expect("legacy");
+        assert_eq!(peak_in(dir.path(), "legacy"), Some(5));
+        assert_eq!(
+            sized_in(dir.path(), None, Face::Test, &[]),
+            None,
+            "a faceless peak lends to no one"
+        );
+    }
+
+    /// Recording a peak sizes the holder's own record at once, keeping the
+    /// larger of its lease and the peak.
+    #[test]
+    fn recording_a_peak_sizes_the_lease_record() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let mut lease = held(dir.path(), slot(Face::AnalysisServer, "wt", 0, false));
+        assert!(!lease.sized());
+        lease.record_peak("wt", 1 << 10);
+        let record: Record =
+            serde_json::from_slice(&fs::read(&lease.path).expect("record")).expect("json");
+        assert!(record.sized, "the record is sized");
+        assert_eq!(record.bytes, 1 << 20, "max(lease, peak)");
+        assert_eq!(peak_in(dir.path(), "wt"), Some(1 << 10));
+        lease.record_peak("wt", 3 << 20);
+        let record: Record =
+            serde_json::from_slice(&fs::read(&lease.path).expect("record")).expect("json");
+        assert_eq!(record.bytes, 3 << 20, "a larger peak grows the booking");
     }
 
     #[test]

@@ -142,7 +142,7 @@ where
     R: Read + Send + 'static,
     W: Write + 'static,
 {
-    run_with_signal(input, output, session, watch, None)
+    run_with_signal(input, output, session, watch, None, &mut || {})
 }
 
 /// [`run`] with an exit-signal flag (#2632): the serve loop's own
@@ -172,6 +172,11 @@ where
 ///
 /// Writing to the client failed (peer vanished mid-answer).
 ///
+/// `on_turn` runs after each turn that handled client frames, once its
+/// drain answered them: the caller's view of the session's progress while
+/// the client stays attached (the session daemon books its measured peak
+/// there once the first analysis ran).
+///
 /// # Panics
 ///
 /// Only if the session's fix mailbox is disconnected while the session
@@ -183,6 +188,7 @@ pub fn run_with_signal<R, W>(
     mut session: &mut Session,
     watch: Option<WatchOptions>,
     signal: Option<&AtomicBool>,
+    on_turn: &mut dyn FnMut(),
 ) -> io::Result<u8>
 where
     R: Read + Send + 'static,
@@ -413,6 +419,7 @@ where
         // dispatch the next staged fix through the same drain).
         write_turn(&mut output, session.service())?;
         write_turn(&mut output, session.complete_fix(None))?;
+        on_turn();
     }
 
     // #306: the clean-shutdown write, window or no window.
@@ -2116,6 +2123,7 @@ mod tests {
                 &mut { session },
                 None,
                 Some(&*run_flag),
+                &mut || {},
             )
         });
         let baseline = dirty_analyze(&workspace, PARTS, &client, &output);
@@ -2163,6 +2171,7 @@ mod tests {
                 &mut { session },
                 None,
                 Some(&*run_flag),
+                &mut || {},
             )
         });
         let answer = dirty_analyze(&workspace, PARTS, &client, &output);
