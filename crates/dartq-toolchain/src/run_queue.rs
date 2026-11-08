@@ -386,7 +386,9 @@ mod tests {
             held.recv().expect("hold until released");
             drop(guard);
         });
-        holder_in.recv_timeout(BOUND).expect("the holder is admitted");
+        holder_in
+            .recv_timeout(BOUND)
+            .expect("the holder is admitted");
         let (waiter_admitted, waiter_in) = mpsc::channel();
         let path = root.path().to_path_buf();
         let waiter = thread::spawn(move || {
@@ -554,7 +556,8 @@ mod tests {
         // The holder dies: its lock goes with its descriptor, its file stays.
         drop(holder);
         assert_eq!(
-            seen.recv_timeout(BOUND).expect("the dead holder is reported"),
+            seen.recv_timeout(BOUND)
+                .expect("the dead holder is reported"),
             Event::Dead { created }
         );
         admissions

@@ -23,6 +23,7 @@ members = [
     "crates/dartq-plugin",
     "crates/dartq-engine",
     "crates/dartq-commands",
+    "crates/dartq-analyzer-host",
     "crates/dartq-daemon",
     "crates/dartq-ai",
     "crates/dartq-cli",
@@ -91,6 +92,7 @@ tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # `dartq-xxx = { workspace = true }` (cargo publish requires a version on
 # every path dependency).
 dartq-ai = { path = "crates/dartq-ai", version = "0.1.0" }
+dartq-analyzer-host = { path = "crates/dartq-analyzer-host", version = "0.1.0" }
 dartq-ast = { path = "crates/dartq-ast", version = "0.1.0" }
 dartq-bcache = { path = "crates/dartq-bcache", version = "0.1.0" }
 dartq-commands = { path = "crates/dartq-commands", version = "0.1.0" }

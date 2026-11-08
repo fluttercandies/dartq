@@ -572,6 +572,49 @@ fn encode_segment(segment: &str) -> String {
     out
 }
 
+/// Minimum suites a group compile must serve to be worth its fixed cost.
+///
+/// Compiling the shared program is a flat kernel build — seconds on a cold
+/// `.dart_tool` (no `group.dill` to initialize from), near-nothing warm —
+/// independent of how many suites it hosts, while the stock runner's
+/// per-suite path costs each suite only its own load. Measured on small
+/// fixtures (2–32 trivial suites, 10-core host): the cold compile is a
+/// ~2 s constant at every suite count, so below this many served suites
+/// the compile costs more than the shared program ever saves. Suites under
+/// the threshold take the stock path refused and launch-observing suites
+/// already take; at or above it the compile is never skipped, which keeps
+/// the large-package win intact.
+pub const GROUP_MIN_SUITES: usize = 4;
+
+/// Whether a group compile serving `served` suites pays for itself. The
+/// caller computes `served` as the suites the shared program would
+/// actually host (the groupable subset of the run), so a run whose suites
+/// mostly observe their launch or cannot be placed never pays the compile.
+#[must_use]
+pub fn compile_pays(served: usize) -> bool {
+    served >= GROUP_MIN_SUITES
+}
+
+/// Whether a `flutter test` run of `suites` files, `keyed` of which the
+/// result cache can key, is predicted to run mostly under the stock tool —
+/// so dartq hands the command line to the tool verbatim instead.
+///
+/// A refused suite never replays, and the suites a closure refuses for
+/// (native code, processes, sockets, the wall clock) are the ones that
+/// most often stay unproven in a shared tester too and rerun stock. Below
+/// a fifth of the suites cacheable, what dartq can save (the replays of
+/// that fifth) is smaller than what it adds before the first suite runs:
+/// the recipe probe (one `flutter test` of its own, a full tool start and
+/// asset preparation), the closure placement, the chunk compile, and
+/// splitting the stock work into leased processes that each pay their own
+/// tool start and preparation. Measured on four packages whose suites the
+/// cache refused 91–96 % of (198/158/47/50 files): dartq ran 2–36 % slower
+/// than the tool alone. The tool's own run is then the fastest form.
+#[must_use]
+pub fn predicts_native(suites: usize, keyed: usize) -> bool {
+    suites > 0 && keyed.saturating_mul(5) < suites
+}
+
 /// Split `suites` into `shards` groups of near-equal predicted cost,
 /// longest first (LPT): `cost` gives each suite's expected run time,
 /// unknown suites cost the mean of the known ones. Shards run as separate
@@ -789,6 +832,41 @@ mod tests {
         std::fs::write(Durations::path(&root), b"{").expect("write");
         Durations::load(&root).record(&root, &[]);
         assert_eq!(Durations::load(&root).get(&root, &a), None);
+    }
+
+    /// The group-compile predictor: below [`GROUP_MIN_SUITES`] served
+    /// suites the fixed kernel build costs more than the shared program
+    /// saves, so those suites take the stock path; at or above it the
+    /// compile always runs — the large-package win is never skipped.
+    #[test]
+    fn compile_pays_only_at_or_above_the_served_floor() {
+        assert!(!compile_pays(0));
+        assert!(!compile_pays(1));
+        assert!(!compile_pays(2));
+        assert!(!compile_pays(3));
+        assert!(compile_pays(GROUP_MIN_SUITES));
+        assert!(compile_pays(GROUP_MIN_SUITES + 1));
+        assert!(compile_pays(usize::MAX));
+    }
+
+    /// The mostly-native predictor: under a fifth of the suites cacheable
+    /// hands the run to the tool; a fifth or more keeps dartq's path.
+    #[test]
+    fn predicts_native_below_a_fifth_cacheable() {
+        // The measured packages: 17/198, 8/158, 2/47, 2/50 cacheable.
+        assert!(predicts_native(198, 17));
+        assert!(predicts_native(158, 8));
+        assert!(predicts_native(47, 2));
+        assert!(predicts_native(50, 2));
+        assert!(predicts_native(3, 0));
+        // At the boundary a fifth is enough to stay.
+        assert!(predicts_native(10, 1));
+        assert!(!predicts_native(10, 2));
+        assert!(!predicts_native(5, 1));
+        assert!(!predicts_native(1, 1));
+        // No suites, nothing to predict.
+        assert!(!predicts_native(0, 0));
+        assert!(!predicts_native(usize::MAX, usize::MAX));
     }
 
     /// The command line that starts a compiled runner: asserts on, the

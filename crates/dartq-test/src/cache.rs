@@ -51,10 +51,23 @@
 //! cache refuses (the suite always runs) whenever that cannot be shown:
 //!
 //! - the closure reads drifting state no input covers
-//!   ([`FileFacts::nondeterministic`]: the wall clock, the network, child
-//!   processes, standard input, the host name, native code, or a package
-//!   whose purpose is one of those) — unless the reading file attests
+//!   ([`FileFacts::nondeterministic`]: sockets, servers, child processes,
+//!   standard input, the host name, native code, or a package whose
+//!   purpose is one of those) — unless the reading file attests
 //!   `// dartq: deterministic`;
+//! - a suite-side file (outside every package's `lib/`) reads the wall
+//!   clock ([`FileFacts::time_read`], `package:clock` included). A `lib/`
+//!   file reads it on its caller's behalf, like a path literal: the caller
+//!   decides whether the value reaches a verdict;
+//! - the closure builds an HTTP client ([`FileFacts::http_read`]: an
+//!   `HttpClient()`, `package:http`, `package:dio`) — unless this is a
+//!   flutter run whose suite installs the flutter test binding before
+//!   running code of its own and no closure file can take the binding's
+//!   mock away ([`FileFacts::test_binding`], [`FileFacts::http_overrides`]).
+//!   The binding sets `HttpOverrides.global` to a client that answers
+//!   every request with an empty 400, and `HttpClient()` — which both
+//!   packages build their default clients through — consults it, so no
+//!   request leaves the process;
 //! - the closure spells an absolute path naming an existing directory
 //!   (whose listing no key covers). An absolute path naming a file, or
 //!   nothing, is an input like any other — its bytes or its absence —
@@ -66,11 +79,12 @@
 //!   outside the resolution, or a non-`file:` package root.
 //!
 //! Drift is checked over every package-local file of the closure — the
-//! suite, its helpers, and the package's own `lib/`. Hosted dependencies
-//! are immutable per pinned version and are not entered; a direct import
-//! of a package whose purpose is drift (`clock`, HTTP clients and servers,
-//! process spawning — [`crate::deps::DRIFT_PACKAGES`]) counts as a drifting
-//! read. Measured on a 171-suite package, extending the check into every
+//! suite, its helpers, the package's own `lib/` and path dependencies.
+//! Hosted dependencies are immutable per pinned version and are not
+//! entered; a direct import of a package whose purpose is drift
+//! ([`crate::deps::DRIFT_PACKAGES`], [`crate::deps::HTTP_PACKAGES`],
+//! `clock`) counts as the matching read. `dartq test --explain-cache`
+//! prints each refusal's evidence and import chain. Measured on a 171-suite package, extending the check into every
 //! hosted file would refuse 159 suites, nearly all through the analyzer's
 //! internal modification stamps, which never reach a test verdict; the
 //! `// dartq: no-cache` marker covers a dependency that does drift a
@@ -85,7 +99,7 @@
 //! or was skipped are stored — failures always rerun, so a flaky failure
 //! is never frozen into a cached verdict.
 
-use crate::deps::FileFacts;
+use crate::deps::{FileFacts, Trigger, TriggerKind};
 use crate::stamp::{Stamps, package_files, write_atomic};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -95,7 +109,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Cache layout version: bump on any key or entry format change.
-const FORMAT: &str = "dartq-test-cache-v11";
+const FORMAT: &str = "dartq-test-cache-v12";
 
 /// Stored outcomes kept in the shared store; the least recently used are
 /// pruned past it. Every revision of every suite of every checkout is one
@@ -322,6 +336,9 @@ pub struct Cache {
     /// call, aligned to that call's suite order (`None` where the suite
     /// keyed). Empty before the first call.
     refusals: Vec<Option<Refusal>>,
+    /// Per-suite [`RefusalDetail`] of the same call: the refusal kind
+    /// plus the closure file and reads that decided it.
+    refusal_details: Vec<Option<RefusalDetail>>,
 }
 
 impl Cache {
@@ -350,6 +367,7 @@ impl Cache {
             staging: store.join(format!(".staging-{}", std::process::id())),
             staged: FxHashSet::default(),
             refusals: Vec::new(),
+            refusal_details: Vec::new(),
         }
     }
 
@@ -368,7 +386,9 @@ impl Cache {
         // A resolution-level failure refuses every suite at once, with the
         // same reason recorded for each.
         let none = |cache: &mut Self| {
+            let detail = RefusalDetail::at(Refusal::Resolution, None, Vec::new());
             cache.refusals = vec![Some(Refusal::Resolution); suites.len()];
+            cache.refusal_details = vec![Some(detail); suites.len()];
             vec![None; suites.len()]
         };
         let config_path = package_config_path(&self.root);
@@ -485,33 +505,47 @@ impl Cache {
         let mut paths = Interner::default();
         let package_ids: Vec<u32> = package.iter().map(|path| paths.intern(path)).collect();
         let mut memo = FxHashMap::default();
-        let dense = Dense::new(&self.root, &graph, &toolchain, &own, &mut paths);
+        let libs: FxHashSet<&Path> = lib_dirs.values().copied().collect();
+        let dense = Dense::new(&self.root, &graph, &toolchain, &own, &libs, &mut paths);
         let asset_ids: Vec<u32> = assets.iter().map(|path| paths.intern(path)).collect();
-        let mut inputs: Vec<Result<SuiteInputs, Refusal>> = suites
+        let mut inputs: Vec<Result<SuiteInputs, RefusalDetail>> = suites
             .iter()
             .enumerate()
             .map(|(index_in_run, suite)| {
+                // Wrappers first: one runs before the suite's `main`
+                // installs its binding (so its own HTTP reads are never
+                // shielded), and one that can take the binding's mock away
+                // unshields the suite too.
+                let mut wrapped_ids = Vec::new();
+                let mut pinned = false;
+                let mut shield = runner.flutter;
+                let wrapper = wrappers.get(index_in_run);
+                for config in wrapper.iter().flat_map(|(configs, _)| configs) {
+                    let wrapped = dense.suite_inputs(
+                        &self.root,
+                        config,
+                        false,
+                        &package_ids,
+                        &index,
+                        &mut paths,
+                        &mut memo,
+                    )?;
+                    wrapped_ids.extend(wrapped.ids);
+                    pinned |= wrapped.pinned;
+                    shield &= !wrapped.overrides;
+                }
                 let mut inputs = dense.suite_inputs(
                     &self.root,
                     suite,
+                    shield,
                     &package_ids,
                     &index,
                     &mut paths,
                     &mut memo,
                 )?;
-                if let Some((configs, absent)) = wrappers.get(index_in_run) {
-                    for config in configs {
-                        let wrapped = dense.suite_inputs(
-                            &self.root,
-                            config,
-                            &package_ids,
-                            &index,
-                            &mut paths,
-                            &mut memo,
-                        )?;
-                        inputs.ids.extend(wrapped.ids);
-                        inputs.pinned |= wrapped.pinned;
-                    }
+                inputs.ids.extend(wrapped_ids);
+                inputs.pinned |= pinned;
+                if let Some((_, absent)) = wrapper {
                     inputs
                         .ids
                         .extend(absent.iter().map(|path| paths.intern(path)));
@@ -523,6 +557,7 @@ impl Cache {
         self.stamps.stamp(paths.paths.clone())?;
         self.follow_data_refs(&mut inputs, &index, &package_ids, &mut paths, &mut memo)?;
         let rank = paths.byte_order_ranks();
+        let interned_paths = &paths.paths;
 
         // One leaf per input: its portable spelling and digest, hashed once
         // and shared by every suite that reaches it. An absent candidate
@@ -543,11 +578,13 @@ impl Cache {
             .collect();
         let root = &self.root;
         let env_digest = LazyDigest::new();
-        let keys: Vec<Result<String, Refusal>> = inputs
+        let keys: Vec<Result<String, RefusalDetail>> = inputs
             .into_par_iter()
             .zip(suites.par_iter())
             .map(|(inputs, suite)| {
-                let SuiteInputs { mut ids, pinned } = inputs?;
+                let SuiteInputs {
+                    mut ids, pinned, ..
+                } = inputs?;
                 ids.sort_unstable_by_key(|&id| rank[id as usize]);
                 ids.dedup();
                 // The environment's suite half: the names this suite's
@@ -566,6 +603,7 @@ impl Cache {
                 // closure.
                 let mut env_names: Vec<&str> = Vec::new();
                 let mut env_opaque_own = false;
+                let mut env_opaque_file = None;
                 let mut env_opaque_dep = false;
                 for &id in &ids {
                     let Some((file_facts, tier)) = dense.env_facts(id) else {
@@ -573,13 +611,26 @@ impl Cache {
                     };
                     match tier {
                         Tier::Toolchain => {}
-                        Tier::Own => env_opaque_own |= file_facts.env_opaque,
-                        Tier::Dependency => env_opaque_dep |= file_facts.env_opaque,
+                        Tier::Own => {
+                            env_opaque_own |= file_facts.env_opaque();
+                            if env_opaque_file.is_none() && file_facts.env_opaque() {
+                                env_opaque_file = Some(id);
+                            }
+                        }
+                        Tier::Dependency => env_opaque_dep |= file_facts.env_opaque(),
                     }
                     env_names.extend(file_facts.env_reads.iter().map(String::as_str));
                 }
+                // The closure walk refuses an own-package opaque read it
+                // reaches through imports, with its chain; this catches the
+                // rest (a graph file the suite names only by path literal).
                 if env_opaque_own {
-                    return Err(Refusal::EnvOpaque);
+                    let file = env_opaque_file.map(|id| interned_paths[id as usize].clone());
+                    return Err(RefusalDetail::at(
+                        Refusal::EnvOpaque,
+                        file,
+                        vec!["Platform.environment (unnamed key)".to_owned()],
+                    ));
                 }
                 env_names.sort_unstable();
                 env_names.dedup();
@@ -618,7 +669,11 @@ impl Cache {
                 Ok(hasher.finalize().to_hex().to_string())
             })
             .collect();
-        self.refusals = keys.iter().map(|key| key.as_ref().err().copied()).collect();
+        self.refusals = keys
+            .iter()
+            .map(|key| key.as_ref().err().map(|detail| detail.refusal))
+            .collect();
+        self.refusal_details = keys.iter().map(|key| key.as_ref().err().cloned()).collect();
         Ok(keys.into_iter().map(Result::ok).collect())
     }
 
@@ -628,6 +683,15 @@ impl Cache {
     #[must_use]
     pub fn refusals(&self) -> &[Option<Refusal>] {
         &self.refusals
+    }
+
+    /// Why each suite of the last [`Self::keys`]/[`Self::rekey`] call had
+    /// no key, with the closure file and reads that decided it (`None`
+    /// where it did), in that call's suite order. Empty before the first
+    /// call.
+    #[must_use]
+    pub fn refusal_details(&self) -> &[Option<RefusalDetail>] {
+        &self.refusal_details
     }
 }
 
@@ -704,8 +768,9 @@ enum Node {
         facts: Option<Arc<FileFacts>>,
     },
     /// The file's edges cannot be established: an opaque header or a URI
-    /// the resolution cannot map.
-    Untrusted,
+    /// the resolution cannot map. The string names the evidence, for
+    /// `--stats=verbose`.
+    Untrusted(String),
 }
 
 impl Cache {
@@ -848,7 +913,7 @@ impl Cache {
     /// the finite package (or absent candidates, which name nothing).
     fn follow_data_refs(
         &mut self,
-        inputs: &mut [Result<SuiteInputs, Refusal>],
+        inputs: &mut [Result<SuiteInputs, RefusalDetail>],
         index: &PathIndex,
         package: &[u32],
         paths: &mut Interner,
@@ -952,7 +1017,9 @@ impl Cache {
             for path in frontier.drain(..) {
                 let facts = self.stamps.get(&path).and_then(|entry| entry.facts.clone());
                 let node = match &facts {
-                    Some(facts) if facts.opaque => Node::Untrusted,
+                    Some(facts) if facts.opaque => {
+                        Node::Untrusted("opaque directive header".to_owned())
+                    }
                     Some(facts) => {
                         // Outer `None` (untrusted URI) poisons the file;
                         // inner `None` (`dart:`) contributes no edge.
@@ -975,7 +1042,18 @@ impl Cache {
                                     facts: Some(facts.clone()),
                                 }
                             }
-                            None => Node::Untrusted,
+                            None => Node::Untrusted(
+                                facts
+                                    .uris
+                                    .iter()
+                                    .find(|uri| {
+                                        resolve_uri(&path, uri.as_str(), lib_dirs).is_none()
+                                    })
+                                    .map_or_else(
+                                        || "unresolvable import URI".to_owned(),
+                                        |uri| format!("unresolvable import {uri}"),
+                                    ),
+                            ),
                         }
                     }
                     None => Node::File {
@@ -1131,12 +1209,55 @@ impl Refusal {
     }
 }
 
+/// Why a suite has no key, with the first closure witness that decided
+/// it: the file whose facts refused, what in it matched and where, and the
+/// import chain that reaches it. `--stats=verbose` and `--explain-cache`
+/// print it per suite; [`Cache::refusals`] reports only the kind.
+#[derive(Debug, Clone)]
+pub struct RefusalDetail {
+    /// The refusal kind (the same value [`Cache::refusals`] reports).
+    pub refusal: Refusal,
+    /// The closure file whose facts decided the refusal: the suite's own
+    /// file for suite-level refusals, a dependency's file for a drift or
+    /// marker read inside it, `None` for a resolution failure.
+    pub file: Option<PathBuf>,
+    /// What in that file decided it: the drifting read, wall-clock read or
+    /// HTTP client as spelled, the marker text for `NoCache`, the
+    /// unresolvable URI or opaque header for `Untrusted`, the directory for
+    /// `AbsoluteDirectory`. Empty when the refusal names no narrower
+    /// evidence.
+    pub triggers: Vec<String>,
+    /// 1-based line of the first trigger in [`Self::file`], when the
+    /// evidence is a source read or marker.
+    pub line: Option<u32>,
+    /// The import edges from the walked root (the suite, or the
+    /// `flutter_test_config.dart` wrapping it) to [`Self::file`], both
+    /// ends included; empty when the refusal is not a closure walk's.
+    pub chain: Vec<PathBuf>,
+}
+
+impl RefusalDetail {
+    /// A refusal decided by `file`'s facts; `triggers` names what matched.
+    fn at(refusal: Refusal, file: Option<PathBuf>, triggers: Vec<String>) -> Self {
+        Self {
+            refusal,
+            file,
+            triggers,
+            line: None,
+            chain: Vec::new(),
+        }
+    }
+}
+
 /// Everything one suite's outcome can depend on.
 struct SuiteInputs {
     /// Interned input paths, in discovery order, possibly repeated.
     ids: Vec<u32>,
     /// The outcome may differ between checkouts of the same content.
     pinned: bool,
+    /// A closure file can take the flutter test binding's mock
+    /// `HttpClient` away ([`FileFacts::http_overrides`]).
+    overrides: bool,
 }
 
 /// The import graph over dense ids: each file is interned once and its
@@ -1151,7 +1272,13 @@ struct Dense {
     facts: Vec<Option<Arc<FileFacts>>>,
     /// `None` = untrusted (opaque header, unmappable URI).
     trusted: Vec<bool>,
-    /// The node is library code of the package (`lib/`).
+    /// Why an untrusted node is untrusted, aligned with `trusted`
+    /// (`Some` exactly where `trusted` is `false`): the evidence a
+    /// refusal detail reports.
+    untrusted_why: Vec<Option<String>>,
+    /// The node is library code: under the `lib/` directory of a package
+    /// the resolution names (the package under test or a path
+    /// dependency).
     in_lib: Vec<bool>,
     /// The node's package tier for the environment rules.
     tier: Vec<Tier>,
@@ -1165,9 +1292,9 @@ impl Dense {
         graph: &FxHashMap<PathBuf, Node>,
         toolchain: &[PathBuf],
         own: &[PathBuf],
+        libs: &FxHashSet<&Path>,
         paths: &mut Interner,
     ) -> Self {
-        let lib = root.join("lib");
         let mut ordered: Vec<(&PathBuf, &Node)> = graph.iter().collect();
         ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let path_of: Vec<u32> = ordered.iter().map(|(path, _)| paths.intern(path)).collect();
@@ -1185,10 +1312,12 @@ impl Dense {
         let mut deps = Vec::with_capacity(ordered.len());
         let mut facts = Vec::with_capacity(ordered.len());
         let mut trusted = Vec::with_capacity(ordered.len());
+        let mut untrusted_why = Vec::with_capacity(ordered.len());
         let mut in_lib = Vec::with_capacity(ordered.len());
         let mut tier = Vec::with_capacity(ordered.len());
         for (path, node) in &ordered {
-            in_lib.push(path.starts_with(&lib));
+            // One hash probe per ancestor: path depth, not package count.
+            in_lib.push(path.ancestors().skip(1).any(|dir| libs.contains(dir)));
             // The toolchain wins over the workspace: a path dependency
             // pointed inside the Flutter SDK is still the tool's own code.
             tier.push(if toolchain.iter().any(|dir| path.starts_with(dir)) {
@@ -1207,11 +1336,13 @@ impl Dense {
                     deps.push(edges.iter().filter_map(|dep| node_id(dep, paths)).collect());
                     facts.push(file_facts.clone());
                     trusted.push(true);
+                    untrusted_why.push(None);
                 }
-                Node::Untrusted => {
+                Node::Untrusted(reason) => {
                     deps.push(Vec::new());
                     facts.push(None);
                     trusted.push(false);
+                    untrusted_why.push(Some(reason.clone()));
                 }
             }
         }
@@ -1244,6 +1375,7 @@ impl Dense {
             deps,
             facts,
             trusted,
+            untrusted_why,
             in_lib,
             tier,
             base_inputs,
@@ -1265,61 +1397,140 @@ impl Dense {
             .map(|facts| (facts, self.tier[node as usize]))
     }
 
-    /// The inputs of one suite, or the [`Refusal`] its import closure met
-    /// first (a stack walk's order is deterministic, so two runs of the
-    /// same closure name the same reason).
+    /// The refusal `node` decided, with `trigger` as its evidence and the
+    /// import chain `parent` pointers spell from the walk's root.
+    fn witness(
+        &self,
+        node: u32,
+        parent: &[u32],
+        refusal: Refusal,
+        trigger: Option<&Trigger>,
+        paths: &Interner,
+    ) -> RefusalDetail {
+        let mut chain = Vec::new();
+        let mut at = node;
+        while at != u32::MAX {
+            chain.push(paths.paths[self.path_of[at as usize] as usize].clone());
+            at = parent[at as usize];
+        }
+        chain.reverse();
+        RefusalDetail {
+            refusal,
+            file: chain.last().cloned(),
+            triggers: trigger.map(|t| vec![t.label.clone()]).unwrap_or_default(),
+            line: trigger.map(|t| t.line),
+            chain,
+        }
+    }
+
+    /// The inputs of one suite, or the [`RefusalDetail`] its import closure
+    /// met first (a stack walk's order is deterministic, so two runs of the
+    /// same closure name the same reason and the same evidence).
+    ///
+    /// `shield`: the caller allows the flutter test binding to vouch for
+    /// HTTP reads (a flutter run, with no wrapper able to take the mock
+    /// away). It does when the walked file installs the binding before
+    /// running code of its own ([`FileFacts::test_binding`]), so every
+    /// HTTP client its closure builds gets the binding's fixed-response
+    /// mock — unless a closure file can take the mock away
+    /// ([`FileFacts::http_overrides`]). HTTP reads are therefore decided
+    /// only once the whole closure is walked.
+    ///
+    /// The chain behind a refusal comes from one parent pointer per node,
+    /// written when the walk first pushes it: O(closure) `u32`s, no path
+    /// copies until a refusal is reported.
     fn suite_inputs(
         &self,
         root: &Path,
         suite: &Path,
+        shield: bool,
         package: &[u32],
         index: &PathIndex,
         paths: &mut Interner,
         memo: &mut FxHashMap<String, Vec<u32>>,
-    ) -> Result<SuiteInputs, Refusal> {
+    ) -> Result<SuiteInputs, RefusalDetail> {
+        let unknown =
+            || RefusalDetail::at(Refusal::SuiteUnknown, Some(suite.to_path_buf()), Vec::new());
         let start = *self
             .node_of
-            .get(*paths.ids.get(suite).ok_or(Refusal::SuiteUnknown)? as usize)
-            .ok_or(Refusal::SuiteUnknown)?;
+            .get(*paths.ids.get(suite).ok_or_else(|| unknown())? as usize)
+            .ok_or_else(|| unknown())?;
         if start == u32::MAX {
-            return Err(Refusal::SuiteUnknown);
+            return Err(unknown());
         }
+        let nodes = self.path_of.len();
         let mut inputs = self.base_inputs.clone();
-        let mut seen = vec![false; self.path_of.len()];
+        let mut seen = vec![false; nodes];
+        // `parent[n]` = the node whose import first queued `n`.
+        let mut parent = vec![u32::MAX; nodes];
         let mut stack = vec![start];
+        // HTTP reads stay deferred until the whole closure is known to
+        // leave the binding's mock in place: the first one seen is the
+        // witness if it does not.
+        let binding = shield
+            && self.facts[start as usize]
+                .as_ref()
+                .is_some_and(|facts| facts.test_binding);
+        let mut overrides = false;
+        let mut deferred_http: Option<u32> = None;
         let mut whole_package = false;
         let mut pinned = false;
         while let Some(node) = stack.pop() {
+            let at = node;
             let node = node as usize;
             if std::mem::replace(&mut seen[node], true) {
                 continue;
             }
             if !self.trusted[node] {
-                return Err(Refusal::Untrusted);
+                let mut detail = self.witness(at, &parent, Refusal::Untrusted, None, paths);
+                detail.triggers = self.untrusted_why[node].clone().into_iter().collect();
+                return Err(detail);
             }
             inputs.push(self.path_of[node]);
-            stack.extend(
-                self.deps[node]
-                    .iter()
-                    .copied()
-                    .filter(|&dep| !seen[dep as usize]),
-            );
+            for &dep in &self.deps[node] {
+                if !seen[dep as usize] {
+                    if parent[dep as usize] == u32::MAX && dep != start {
+                        parent[dep as usize] = at;
+                    }
+                    stack.push(dep);
+                }
+            }
             let Some(facts) = &self.facts[node] else {
                 continue;
             };
             if self.tier[node] == Tier::Toolchain {
                 continue;
             }
-            if facts.no_cache {
-                return Err(Refusal::NoCache);
+            if let Some(trigger) = facts.first(TriggerKind::NoCache) {
+                return Err(self.witness(at, &parent, Refusal::NoCache, Some(trigger), paths));
             }
-            if facts.nondeterministic && !facts.attested {
-                return Err(Refusal::Nondeterministic);
+            if self.tier[node] == Tier::Own
+                && let Some(trigger) = facts.first(TriggerKind::EnvOpaque)
+            {
+                return Err(self.witness(at, &parent, Refusal::EnvOpaque, Some(trigger), paths));
+            }
+            overrides |= facts.http_overrides;
+            if !facts.attested {
+                if let Some(trigger) = facts.first(TriggerKind::Drift) {
+                    return Err(self.witness(
+                        at,
+                        &parent,
+                        Refusal::Nondeterministic,
+                        Some(trigger),
+                        paths,
+                    ));
+                }
+                if facts.http_read() && deferred_http.is_none() {
+                    deferred_http = Some(at);
+                }
             }
             for absolute in &facts.absolute_paths {
                 let path = Path::new(absolute);
                 if path.is_dir() {
-                    return Err(Refusal::AbsoluteDirectory);
+                    let mut detail =
+                        self.witness(at, &parent, Refusal::AbsoluteDirectory, None, paths);
+                    detail.triggers = vec![format!("absolute path {absolute}")];
+                    return Err(detail);
                 }
                 inputs.push(paths.intern(path));
             }
@@ -1332,14 +1543,22 @@ impl Dense {
             // where fixture paths are spelled and where a location can reach
             // an assertion. Its wall-clock reads are the same shape: a
             // caller-supplied input the library consumes on the caller's
-            // behalf (`DatePicker(initialDate: …)`), so a `lib/` file's
-            // `DateTime.now()` does not refuse a suite whose own file has
-            // no drifting reads of its own.
+            // behalf (`DatePicker(initialDate: …)`, `clock.now()` behind
+            // `withClock`), so a library file's clock read does not refuse
+            // a suite whose own side has no clock read of its own.
             if self.in_lib[node] {
                 continue;
             }
-            if facts.time_read && !facts.attested {
-                return Err(Refusal::Nondeterministic);
+            if !facts.attested
+                && let Some(trigger) = facts.first(TriggerKind::Clock)
+            {
+                return Err(self.witness(
+                    at,
+                    &parent,
+                    Refusal::Nondeterministic,
+                    Some(trigger),
+                    paths,
+                ));
             }
             pinned |= facts.located && !facts.portable;
             for literal in &facts.path_literals {
@@ -1353,12 +1572,21 @@ impl Dense {
                 inputs.extend_from_slice(named);
             }
         }
+        if let Some(node) = deferred_http
+            && !(binding && !overrides)
+        {
+            let trigger = self.facts[node as usize]
+                .as_deref()
+                .and_then(|facts| facts.first(TriggerKind::Http));
+            return Err(self.witness(node, &parent, Refusal::Nondeterministic, trigger, paths));
+        }
         if whole_package {
             inputs.extend_from_slice(package);
         }
         Ok(SuiteInputs {
             ids: inputs,
             pinned,
+            overrides,
         })
     }
 }
@@ -1705,6 +1933,43 @@ mod tests {
         assert!(reopened.lookup("other").is_none());
     }
 
+    /// `refusal_details` names the closure file and reads that decided
+    /// each refusal — the evidence `--stats=verbose` prints.
+    #[test]
+    fn refusal_details_name_the_deciding_file() {
+        let (tmp, root) = fixture();
+        let drift = root.join("test/drift_test.dart");
+        std::fs::write(&drift, "void main() { Process.run('ls', []); }\n").expect("write");
+        let bad = root.join("test/bad_test.dart");
+        let suites = vec![drift.clone(), bad.clone()];
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let keys = cache
+            .keys(&suites, runner(&root.join("pubspec.yaml")))
+            .expect("keys");
+        assert!(keys.iter().all(Option::is_none));
+        let details = cache.refusal_details();
+        assert_eq!(details.len(), 2);
+        let drift_detail = details[0].as_ref().expect("drift detail");
+        assert_eq!(drift_detail.refusal, Refusal::Nondeterministic);
+        assert_eq!(drift_detail.file.as_deref(), Some(drift.as_path()));
+        assert_eq!(drift_detail.triggers, ["Process.run"]);
+        assert_eq!(drift_detail.line, Some(1));
+        assert_eq!(drift_detail.chain, [drift.clone()]);
+        let bad_detail = details[1].as_ref().expect("bad detail");
+        assert_eq!(bad_detail.refusal, Refusal::Untrusted);
+        assert_eq!(bad_detail.file.as_deref(), Some(bad.as_path()));
+        assert_eq!(bad_detail.triggers, ["opaque directive header"]);
+        // The kind-only view stays aligned with the details.
+        assert_eq!(
+            cache
+                .refusals()
+                .iter()
+                .map(|refusal| refusal.map(|kind| kind.label()))
+                .collect::<Vec<_>>(),
+            [Some("nondeterministic"), Some("untrusted")]
+        );
+    }
+
     /// Two checkouts of the same content key alike, so one checkout's
     /// green outcome replays in the other — except for a suite that
     /// observes its absolute location, which stays pinned to its checkout.
@@ -1927,6 +2192,161 @@ mod tests {
             "the suite's own file still refuses on time_read"
         );
         assert_eq!(keys[2], None, "a no-cache marker in lib still refuses");
+    }
+
+    /// The refusal witness follows the import edges from the suite to the
+    /// deciding file and names the read's line.
+    #[test]
+    fn refusal_chain_follows_import_edges() {
+        let (tmp, root) = fixture();
+        std::fs::write(
+            root.join("lib/b.dart"),
+            "import 'dart:io';\n\nint b() => 1;\nvoid run() { Process.run('ls', []); }\n",
+        )
+        .expect("write");
+        let suite = root.join("test/a_test.dart");
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let keys = cache
+            .keys(
+                std::slice::from_ref(&suite),
+                runner(&root.join("pubspec.yaml")),
+            )
+            .expect("keys");
+        assert_eq!(keys[0], None, "lib-side process spawning still refuses");
+        let detail = cache.refusal_details()[0].clone().expect("detail");
+        assert_eq!(detail.refusal, Refusal::Nondeterministic);
+        assert_eq!(detail.triggers, ["Process.run"]);
+        assert_eq!(detail.line, Some(4));
+        assert_eq!(
+            detail.chain,
+            [suite, root.join("lib/a.dart"), root.join("lib/b.dart")]
+        );
+    }
+
+    /// Transitive-only wall-clock reads key: `package:clock` in `lib/`,
+    /// and `DateTime.now()` in a path dependency's `lib/`. The suite's own
+    /// `package:clock` import still refuses.
+    #[test]
+    fn transitive_clock_reads_key() {
+        let (tmp, root) = fixture();
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, body).expect("write");
+        };
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion":2,"packages":[{"name":"fx","rootUri":"../","packageUri":"lib/","languageVersion":"3.5"},{"name":"dep","rootUri":"../dep/","packageUri":"lib/","languageVersion":"3.5"},{"name":"clock","rootUri":"../clock/","packageUri":"lib/","languageVersion":"3.5"}]}"#,
+        );
+        write("dep/pubspec.yaml", "name: dep\n");
+        write("clock/lib/clock.dart", "int get now => 0;\n");
+        write(
+            "dep/lib/dep.dart",
+            "int stamp() => DateTime.now().millisecond;\n",
+        );
+        write(
+            "lib/clocked.dart",
+            "import 'package:clock/clock.dart';\nint now() => clock.now().hour;\n",
+        );
+        write(
+            "test/via_lib_test.dart",
+            "import 'package:fx/clocked.dart';\nvoid main() {}\n",
+        );
+        write(
+            "test/via_dep_test.dart",
+            "import 'package:dep/dep.dart';\nvoid main() {}\n",
+        );
+        write(
+            "test/own_test.dart",
+            "import 'package:clock/clock.dart';\nvoid main() { clock.now(); }\n",
+        );
+        let suites: Vec<PathBuf> = [
+            "test/via_lib_test.dart",
+            "test/via_dep_test.dart",
+            "test/own_test.dart",
+        ]
+        .map(|rel| root.join(rel))
+        .to_vec();
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let keys = cache
+            .keys(&suites, runner(&root.join("pubspec.yaml")))
+            .expect("keys");
+        assert!(keys[0].is_some(), "package:clock in lib/ keys");
+        assert!(
+            keys[1].is_some(),
+            "a path dependency's lib/ clock read keys"
+        );
+        assert_eq!(keys[2], None, "the suite's own clock import refuses");
+        let detail = cache.refusal_details()[2].clone().expect("detail");
+        assert_eq!(detail.triggers, ["import package:clock/clock.dart"]);
+    }
+
+    /// A flutter suite that installs the test binding before running code
+    /// of its own keys through a lib-side HTTP client; a plain run, a suite
+    /// running code before the binding, or a closure that can take the
+    /// binding's mock away still refuses.
+    #[test]
+    fn test_binding_shields_http_reads() {
+        let (tmp, root) = fixture();
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, body).expect("write");
+        };
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion":2,"packages":[{"name":"fx","rootUri":"../","packageUri":"lib/","languageVersion":"3.5"},{"name":"http","rootUri":"../http/","packageUri":"lib/","languageVersion":"3.5"}]}"#,
+        );
+        write("http/lib/http.dart", "int get stub => 0;\n");
+        write(
+            "lib/api.dart",
+            "import 'dart:io';\nimport 'package:http/http.dart';\nFuture<void> get() async { HttpClient(); }\n",
+        );
+        write(
+            "lib/escape.dart",
+            "import 'dart:io';\nvoid escape() { HttpOverrides.global = null; }\n",
+        );
+        write(
+            "test/bound_test.dart",
+            "import 'package:fx/api.dart';\nvoid main() { testWidgets('x', (t) async { await get(); }); }\n",
+        );
+        write(
+            "test/early_test.dart",
+            "import 'package:fx/api.dart';\nvoid main() { get(); testWidgets('x', (t) async {}); }\n",
+        );
+        write(
+            "test/escape_test.dart",
+            "import 'package:fx/api.dart';\nimport 'package:fx/escape.dart';\nvoid main() { testWidgets('x', (t) async { escape(); await get(); }); }\n",
+        );
+        let suites: Vec<PathBuf> = [
+            "test/bound_test.dart",
+            "test/early_test.dart",
+            "test/escape_test.dart",
+        ]
+        .map(|rel| root.join(rel))
+        .to_vec();
+        let bin = root.join("pubspec.yaml");
+        let flutter = Runner {
+            bin: &bin,
+            args: &[],
+            flutter: true,
+        };
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let keys = cache.keys(&suites, flutter).expect("keys");
+        assert!(
+            keys[0].is_some(),
+            "the binding's mock answers every request"
+        );
+        assert_eq!(keys[1], None, "code before the binding reaches the network");
+        assert_eq!(keys[2], None, "a closure that can remove the mock refuses");
+        let detail = cache.refusal_details()[1].clone().expect("detail");
+        assert_eq!(detail.refusal, Refusal::Nondeterministic);
+        assert_eq!(
+            detail.file.as_deref(),
+            Some(root.join("lib/api.dart").as_path())
+        );
+        let plain = cache.rekey(&suites, runner(&bin)).expect("keys");
+        assert_eq!(plain[0], None, "a plain dart run installs no binding");
     }
 
     /// The prune pass keeps the most recently used entries.

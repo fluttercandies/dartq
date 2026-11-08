@@ -5146,6 +5146,158 @@ mod tests {
         }
     }
 
+    /// flutter's `link_hooks_result.json` as `LinkHooks` writes it into
+    /// `dir`: two timestamps and the hook's dependencies.
+    fn write_link_hooks_result(dir: &Path, timestamp: &str, dependency: &str) {
+        let result = format!(
+            r#"{{"build_start":"{timestamp}","build_end":"{timestamp}","dependencies":["{dependency}"],"code_assets":[],"data_assets":[]}}"#
+        );
+        write(&dir.join("link_hooks_result.json"), result.as_bytes());
+    }
+
+    /// The FileStore record of a dir holding a hook result: the result's
+    /// md5 (which moves with every timestamp rewrite) and the payload's.
+    fn write_file_store_with_hook(dir: &Path, hook_md5: &str) {
+        let record = serde_json::json!({
+            "version": 2,
+            "files": [
+                {"path": format!("{}/link_hooks_result.json", dir.display()), "hash": hook_md5},
+                {"path": format!("{}/app.dill", dir.display()), "hash": "22222222222222222222222222222222"},
+            ],
+        });
+        write(
+            &dir.join(".filecache"),
+            &serde_json::to_vec(&record).expect("encode record"),
+        );
+    }
+
+    /// Moves a file's mtime a second on: flutter's rewrite as the
+    /// post-run scan sees it, whatever the clock resolution.
+    fn move_mtime(path: &Path) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(SystemTime::now() + Duration::from_secs(1))
+            .expect("move mtime");
+    }
+
+    /// #4136: an Android hit's rerun rewrites `link_hooks_result.json`
+    /// with fresh `build_start`/`build_end` (flutter_tools 3.47
+    /// `LinkHooks.build`) and `.filecache` with the result's new md5 —
+    /// live, every same-tree hit re-ingested those two files. A rewrite
+    /// whose only change is the timestamps stores nothing, on a
+    /// same-tree hit and on a wiped tree's hit alike; a rewrite that
+    /// changed a real field stores the result AND the record, so the
+    /// entry never pairs a fresh result with a record naming an older
+    /// one.
+    #[test]
+    fn hook_result_timestamp_rewrite_after_a_hit_stores_nothing() {
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let store_root = tmp.join("cas");
+        let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "a");
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(|cwd| {
+                let dir = build_fixture_large(cwd, DIR_MAIN);
+                write_link_hooks_result(
+                    &dir,
+                    "2026-11-06T03:20:58.393988",
+                    "file:///pub/hook.dart",
+                );
+                write_file_store_with_hook(&dir, "11111111111111111111111111111111");
+            })),
+        };
+        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        assert_eq!(seeded.ingest_files, 5, "the cold run stores the whole dir");
+        let key = seeded.key.expect("post key");
+        let store = CasStore::open(&store_root).expect("open store");
+        let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let seed_blobs = store.stats().expect("stats").blobs;
+
+        // A rerun's rewrite of the pair: new timestamps (and so a new
+        // md5 in the record) over `dependency`.
+        let rerun =
+            |tree: &Path, timestamp: &'static str, dependency: &'static str, md5: &'static str| {
+                let mut runner = FakeRunner {
+                    code: 0,
+                    argv: Vec::new(),
+                    effect: Some(Box::new(move |cwd: &Path| {
+                        let dir = cwd.join(".dart_tool").join("flutter_build").join(DIR_MAIN);
+                        write_link_hooks_result(&dir, timestamp, dependency);
+                        write_file_store_with_hook(&dir, md5);
+                        move_mtime(&dir.join("link_hooks_result.json"));
+                        move_mtime(&dir.join(".filecache"));
+                    })),
+                };
+                run_shim(&raw_argv(&BUNDLE_ARGV), tree, &config, &mut runner)
+            };
+
+        let same_tree = rerun(
+            &tree,
+            "2026-11-07T09:01:02.000001",
+            "file:///pub/hook.dart",
+            "33333333333333333333333333333333",
+        );
+        assert_eq!(same_tree.action, Action::PreHitMaterialized);
+        assert!(same_tree.materialize.as_ref().is_some_and(|m| m.intact));
+        assert_eq!(
+            same_tree.ingest_files, 0,
+            "a timestamp-only rewrite is no new content"
+        );
+
+        fs::remove_dir_all(tree.join(".dart_tool").join("flutter_build")).expect("wipe");
+        let wiped = rerun(
+            &tree,
+            "2026-11-07T09:05:00.000002",
+            "file:///pub/hook.dart",
+            "44444444444444444444444444444444",
+        );
+        assert_eq!(wiped.action, Action::PreHitMaterialized);
+        assert_eq!(
+            wiped.ingest_files, 0,
+            "the placed pair is recognized under its rewrite too"
+        );
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        assert_eq!(manifest.dirs, seed_manifest.dirs, "never republished");
+        assert_eq!(store.stats().expect("stats").blobs, seed_blobs);
+
+        let changed = rerun(
+            &tree,
+            "2026-11-07T09:10:00.000003",
+            "file:///pub/other_hook.dart",
+            "55555555555555555555555555555555",
+        );
+        assert_eq!(
+            changed.ingest_files, 2,
+            "a real change stores the result and the record naming it"
+        );
+        let manifest = store.lookup(&key).expect("lookup").expect("entry");
+        let blob_of = |manifest: &EntryManifest, path: &str| {
+            manifest.dirs[0]
+                .files
+                .iter()
+                .find(|file| file.path == Path::new(path))
+                .unwrap_or_else(|| panic!("no {path} in the manifest"))
+                .blob
+        };
+        for path in ["link_hooks_result.json", ".filecache"] {
+            assert_ne!(
+                blob_of(&manifest, path),
+                blob_of(&seed_manifest, path),
+                "{path} was republished"
+            );
+        }
+        assert_eq!(
+            blob_of(&manifest, "app.dill"),
+            blob_of(&seed_manifest, "app.dill"),
+            "the payload is still referenced unread"
+        );
+    }
+
     /// A record is keyed: a run under another key (a provenance change)
     /// finds no record of its own and hashes the whole dir, however
     /// well the other key's record would have matched the same files.

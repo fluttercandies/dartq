@@ -46,13 +46,19 @@
 //! one consumer that needs tokens (the clause-tree capture) re-scans the
 //! retained text on demand.
 
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dartq_index::{FileCapture, Postings, distinct_decl_names};
 use dartq_language::LanguageVersion;
-use dartq_resolution::{DirectiveKind as UriDirectiveKind, ResolvedTarget, UriResolver};
-use dartq_source::{FileId, SourceText};
+use dartq_resolution::{
+    DirectiveKind as UriDirectiveKind, PackageTable as UriPackageTable, ResolvedTarget, UriResolver,
+};
+use dartq_scanner::{ScanConfig, scan};
+use dartq_sdk::SdkSnapshot;
+use dartq_source::{FileId, FileTable, SourceText, StringTable};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::l1;
@@ -66,18 +72,6 @@ use crate::state::{DirectiveKind, EngineState, UnitFacts};
 /// keeps the layer a bounded slice of memory however wide the import graph
 /// is.
 pub(crate) const DEP_FILE_CAP: usize = 4096;
-
-/// The cap in force: the constant, or the `DARTQ_DEP_FILE_CAP` override a
-/// test lowers to reach saturation without materializing thousands of dep
-/// files. A non-numeric or zero override keeps the constant — the env face
-/// exists for tests only and never weakens the production bound.
-pub(crate) fn dep_file_cap() -> usize {
-    std::env::var("DARTQ_DEP_FILE_CAP")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|cap| *cap > 0)
-        .unwrap_or(DEP_FILE_CAP)
-}
 
 /// One indexed dependency file: the interface facts (its diagnostics are
 /// dead weight — the file is never an engine library and never folds), the
@@ -210,13 +204,12 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
         if state.deps.units.contains_key(&file) || state.residency.contains_key(&file) {
             continue;
         }
-        if state.deps.units.len() - state.deps.sdk_file_count >= dep_file_cap() {
+        if state.deps.units.len() - state.deps.sdk_file_count >= DEP_FILE_CAP {
             if !state.deps.cap_noted {
                 state.deps.cap_noted = true;
                 eprintln!(
-                    "dartq: dependency interface index capped at {} files; \
-                     further dependency files are skipped",
-                    dep_file_cap()
+                    "dartq: dependency interface index capped at {DEP_FILE_CAP} files; \
+                     further dependency files are skipped"
                 );
             }
             continue;
@@ -350,4 +343,315 @@ fn load_dep_unit(state: &mut EngineState, file: FileId) -> Vec<FileId> {
         },
     );
     next
+}
+
+/// The `--impacted` selection's directive graph: which of `entries` (the
+/// suites a test run could execute) reach any of `seeds` (the changed
+/// files) through `import`/`export`/`part` edges. Test selection needs
+/// import reachability, not element models: Dart code can only use what a
+/// directive brings in, so a suite whose directive closure misses every
+/// changed file cannot observe the change. This is the selection most
+/// test-impact tools run, and it needs no semantic analysis — one scan and
+/// one directive walk per visited file, nothing retained but the edges.
+///
+/// # Walk
+///
+/// Forward BFS from the entries, level-synchronous: each frontier's files
+/// read, scan, and extract their directives in parallel (the pure per-file
+/// half, shared read-only state); the URIs then resolve on the calling
+/// thread through the engine's own [`UriResolver`] (the same resolution
+/// the analysis runs: package universes, relative composition, generated
+/// faces). A conditional import/export contributes every branch, so the
+/// graph holds for any `-D` environment. Only files of **transparent**
+/// packages are walked (see [`transparent_packages`]); a target in an
+/// opaque package is an edge sink, never read. The reverse pass then
+/// floods from the seeds over the inverted edges (CSR, `u32` ids), and the
+/// entries it marks are the answer.
+///
+/// # Soundness of the opaque tier
+///
+/// A pub-cache or SDK-provided package is immutable for one resolution
+/// (its identity — version, content hash, ref — rides the lock and the
+/// package config, which the selection's resolution stamp witnesses), so
+/// nothing inside it can change without the whole run going unbounded.
+/// What it *could* do is relay a change: a cache package whose code imports
+/// an editable package (a `dependency_overrides` path override is the one
+/// way pub lets that happen). Such a package declares the editable one in
+/// its pubspec, so it is transparent, and so is every package declaring a
+/// transparent one — the fixpoint keeps every relay walked.
+///
+/// # Cost
+///
+/// Memory: the local path table (one interned path per visited or targeted
+/// file), one `(u32, u32)` per directive edge, and the per-node bit sets;
+/// file texts live only for their own scan. Time: one read + scan per
+/// walked file, parallel per level; dependency closures never load.
+///
+/// # Errors
+///
+/// [`crate::EngineError::PackageConfig`] when the package config cannot
+/// back the URI-resolution table (the same refusal engine construction
+/// raises).
+pub fn import_reach(
+    config: &crate::EngineConfig,
+    entries: &[PathBuf],
+    seeds: &[PathBuf],
+) -> Result<ImportReach, crate::EngineError> {
+    let uri_packages = UriPackageTable::new_with_context_roots(
+        &config.pub_config,
+        &config.config_dir,
+        &config.context_roots,
+    )?;
+    Ok(walk_reach(
+        &config.packages,
+        &uri_packages,
+        &config.sdk,
+        entries,
+        seeds,
+    ))
+}
+
+/// The answer of [`import_reach`].
+#[derive(Debug)]
+pub struct ImportReach {
+    /// The entries whose directive closure reaches a seed, in entry order.
+    pub reached: Vec<PathBuf>,
+    /// How many files the walk read and scanned — the work bound: local
+    /// (transparent) files only, never a dependency package's.
+    pub scanned: usize,
+}
+
+/// [`import_reach`] over the assembled resolution tables.
+fn walk_reach(
+    packages: &dartq_package::PackageTable,
+    uri_packages: &UriPackageTable,
+    sdk: &SdkSnapshot,
+    entries: &[PathBuf],
+    seeds: &[PathBuf],
+) -> ImportReach {
+    let transparent = transparent_packages(packages, seeds);
+    let walked = |path: &Path| {
+        packages
+            .containing(path)
+            .is_none_or(|identity| transparent.contains(identity.name.as_str()))
+    };
+    let mut files = FileTable::new();
+    let strings = StringTable::new();
+    let declared = FxHashMap::default();
+    let entry_ids: Vec<FileId> = entries.iter().map(|path| files.intern(path)).collect();
+    let mut visited: Vec<bool> = Vec::new();
+    let mark = |visited: &mut Vec<bool>, file: FileId| -> bool {
+        let index = file.index() as usize;
+        if index >= visited.len() {
+            visited.resize(index + 1, false);
+        }
+        !std::mem::replace(&mut visited[index], true)
+    };
+    let mut frontier: Vec<FileId> = entry_ids
+        .iter()
+        .copied()
+        .filter(|&file| mark(&mut visited, file))
+        .collect();
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    let mut scanned = 0usize;
+    while !frontier.is_empty() {
+        scanned += frontier.len();
+        let table = &files;
+        let uris: Vec<Vec<Box<str>>> = frontier
+            .par_iter()
+            .map(|&file| directive_uris(table, &strings, file))
+            .collect();
+        let resident = |_: FileId| false;
+        let mut resolver = UriResolver::new(uri_packages, sdk, &declared, &mut files, &resident);
+        let mut next = Vec::new();
+        for (&file, uris) in frontier.iter().zip(&uris) {
+            for uri in uris {
+                let ResolvedTarget::Resolved(target) = resolver
+                    .resolve(file, Some(&**uri), UriDirectiveKind::ImportExport)
+                    .target
+                else {
+                    continue;
+                };
+                edges.push((file.index(), target.index()));
+                if resolver.file_table().path(target).is_some_and(&walked)
+                    && mark(&mut visited, target)
+                {
+                    next.push(target);
+                }
+            }
+        }
+        frontier = next;
+    }
+    let seeds = seeds.iter().filter_map(|seed| files.try_file_id(seed));
+    let hit = flood_reverse(files.len(), &edges, seeds);
+    let reached = entries
+        .iter()
+        .zip(&entry_ids)
+        .filter(|(_, id)| hit[id.index() as usize])
+        .map(|(path, _)| path.clone())
+        .collect();
+    ImportReach { reached, scanned }
+}
+
+/// The import/export/part URIs of `file`, every conditional branch
+/// included (interpolated URIs resolve nowhere and are skipped). An
+/// unreadable or missing file — a deleted seed's dangling target — has no
+/// directives: it is a sink in the graph, its importers' edges still
+/// point at it.
+fn directive_uris(files: &FileTable, strings: &StringTable, file: FileId) -> Vec<Box<str>> {
+    let Some(bytes) = files.path(file).and_then(|path| std::fs::read(path).ok()) else {
+        return Vec::new();
+    };
+    let source = String::from_utf8_lossy(&bytes);
+    let text: &str = source.strip_prefix('\u{feff}').unwrap_or(&*source);
+    // Directive extraction reads keyword/string/punctuation tokens only;
+    // neither lexical gate changes them.
+    let config = ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: false,
+    };
+    let tokens = scan(text, config, file).tokens;
+    let mut ignored = Vec::new();
+    let (directives, ..) = l1::extract_directives(text, &tokens, strings, file, &mut ignored);
+    let mut uris = Vec::new();
+    for directive in directives {
+        if !matches!(
+            directive.kind,
+            DirectiveKind::Import | DirectiveKind::Export | DirectiveKind::Part
+        ) {
+            continue;
+        }
+        uris.extend(directive.uri);
+        for (index, branch) in directive.configurations.into_vec().into_iter().enumerate() {
+            if !directive
+                .interpolated_configurations
+                .contains(&(index as u32))
+            {
+                uris.push(branch.uri);
+            }
+        }
+    }
+    uris
+}
+
+/// Marks every node that reaches a seed: the seeds themselves, then their
+/// importers over the inverted `(from, to)` edges, flooded once. The
+/// inversion is a CSR (counting sort over `to`): `node_count + 1` offsets
+/// and one `u32` per edge.
+fn flood_reverse(
+    node_count: usize,
+    edges: &[(u32, u32)],
+    seeds: impl Iterator<Item = FileId>,
+) -> Vec<bool> {
+    let mut offsets = vec![0u32; node_count + 1];
+    for &(_, to) in edges {
+        offsets[to as usize + 1] += 1;
+    }
+    for index in 0..node_count {
+        offsets[index + 1] += offsets[index];
+    }
+    let mut cursor = offsets.clone();
+    let mut importers = vec![0u32; edges.len()];
+    for &(from, to) in edges {
+        let slot = &mut cursor[to as usize];
+        importers[*slot as usize] = from;
+        *slot += 1;
+    }
+    let mut hit = vec![false; node_count];
+    let mut stack: Vec<u32> = Vec::new();
+    for seed in seeds {
+        if !std::mem::replace(&mut hit[seed.index() as usize], true) {
+            stack.push(seed.index());
+        }
+    }
+    while let Some(node) = stack.pop() {
+        let range = offsets[node as usize] as usize..offsets[node as usize + 1] as usize;
+        for &importer in &importers[range] {
+            if !std::mem::replace(&mut hit[importer as usize], true) {
+                stack.push(importer);
+            }
+        }
+    }
+    hit
+}
+
+/// The packages whose files the reach walks: every local (`Path`-category)
+/// package, every package owning a seed, and — to a fixpoint — every other
+/// package whose pubspec declares (`dependencies` / `dev_dependencies`) a
+/// package already in the set: the only shape in which an immutable
+/// package's code can import an editable one. A pubspec that cannot be
+/// read or parsed counts as declaring a transparent dependency — an
+/// unknown relay is walked, never assumed away. Pubspecs read in parallel,
+/// once each.
+fn transparent_packages<'a>(
+    packages: &'a dartq_package::PackageTable,
+    seeds: &[PathBuf],
+) -> rustc_hash::FxHashSet<&'a str> {
+    use dartq_package::SourceCategory;
+    let mut transparent: rustc_hash::FxHashSet<&str> = packages
+        .iter()
+        .filter(|identity| identity.category == SourceCategory::Path)
+        .map(|identity| identity.name.as_str())
+        .collect();
+    transparent.extend(
+        seeds
+            .iter()
+            .filter_map(|seed| packages.containing(seed))
+            .map(|identity| identity.name.as_str()),
+    );
+    // `None` = unreadable: a relay of unknown shape.
+    let mut opaque: Vec<(&str, Option<Vec<String>>)> = packages
+        .iter()
+        .filter(|identity| !transparent.contains(identity.name.as_str()))
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&identity: &&'a dartq_package::PackageIdentity| {
+            (
+                identity.name.as_str(),
+                declared_dependencies(&identity.root.join("pubspec.yaml")).ok(),
+            )
+        })
+        .collect();
+    loop {
+        let before = opaque.len();
+        opaque.retain(|(name, declared)| {
+            let relays = declared.as_ref().is_none_or(|declared| {
+                declared
+                    .iter()
+                    .any(|dependency| transparent.contains(dependency.as_str()))
+            });
+            if relays {
+                transparent.insert(*name);
+            }
+            !relays
+        });
+        if opaque.len() == before {
+            return transparent;
+        }
+    }
+}
+
+/// The dependency names a pubspec declares (`dependencies` and
+/// `dev_dependencies` keys) — the only fact the transparency fixpoint
+/// reads, so the full pubspec model (constraints, environment) is never
+/// built.
+fn declared_dependencies(pubspec: &Path) -> io::Result<Vec<String>> {
+    let text = std::fs::read_to_string(pubspec)?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&text).map_err(io::Error::other)?;
+    let mut names = Vec::new();
+    for section in ["dependencies", "dev_dependencies"] {
+        match yaml.get(section) {
+            None | Some(serde_yaml::Value::Null) => {}
+            Some(serde_yaml::Value::Mapping(map)) => {
+                for key in map.keys() {
+                    let name = key
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("non-string dependency name"))?;
+                    names.push(name.to_owned());
+                }
+            }
+            Some(_) => return Err(io::Error::other("malformed dependency section")),
+        }
+    }
+    Ok(names)
 }

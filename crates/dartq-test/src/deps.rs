@@ -63,41 +63,11 @@ pub struct FileFacts {
     /// own bootstrap kernel, and dartq's shared isolate group, so such a
     /// suite always runs under the stock loader.
     pub launch: bool,
-    /// Reads state that drifts between runs with no file, argument or
-    /// environment change: the outside world (the
-    /// network: `Socket`, `ServerSocket`, `RawSocket`, `SecureSocket`,
-    /// `RawDatagramSocket`, `WebSocket`, `HttpClient`, `HttpServer`,
-    /// `InternetAddress`, `NetworkInterface`; child processes:
-    /// `Process.run`/`runSync`/`start`; standard input), the host's
-    /// identity (`Platform.localHostname`), native code (`dart:ffi`), or
-    /// imports a package whose purpose is one of those
-    /// ([`DRIFT_PACKAGES`]). A suite whose closure reads one is never
-    /// cached. Wall-clock reads (`DateTime.now`/`timestamp`) live in
-    /// [`Self::time_read`]: lib files skip them (caller-supplied, like a
-    /// path literal) while suite-side files still refuse.
-    ///
-    /// Stationary randomness (`Random`, `Stopwatch` durations, `pid`) is not
-    /// listed: a replayed outcome is then one sample of the same
-    /// distribution a fresh run draws from, so replay cannot observe
-    /// anything a rerun could not.
-    pub nondeterministic: bool,
-    /// Reads the wall clock (`DateTime.now`, `DateTime.timestamp`) — a
-    /// caller-controlled input like a path literal: a widget library that
-    /// defaults `initialDate` to the current date is reading what its
-    /// caller could have supplied, and whether the read reaches a verdict
-    /// is the suite's business (its own file's reads still refuse, and an
-    /// attestation marker vouches where the lib cannot). Split from
-    /// [`Self::nondeterministic`] so `lib/` files do not refuse on time
-    /// alone.
-    pub time_read: bool,
     /// Carries the `// dartq: deterministic` attestation: the author vouches
-    /// that this file's drifting reads ([`Self::nondeterministic`]) never
-    /// reach a test verdict (a log timestamp, an analyzer modification
-    /// stamp). Only this file's own reads are vouched for.
+    /// that this file's drifting, HTTP and wall-clock reads never reach a
+    /// test verdict (a log timestamp, an analyzer modification stamp).
+    /// Only this file's own reads are vouched for.
     pub attested: bool,
-    /// Carries the `// dartq: no-cache` opt-out marker: the suite reaching
-    /// this file always runs.
-    pub no_cache: bool,
     /// String literals (or literal prefixes of interpolations) shaped like
     /// a relative path: `'lib'`, `'test/resources/x.dart'`, `'.'`.
     pub path_literals: Vec<String>,
@@ -130,36 +100,142 @@ pub struct FileFacts {
     /// default, like `engine_shared`: a pre-existing stamp index fails to
     /// load and is rebuilt rather than vouching an empty read set.)
     pub env_reads: Vec<String>,
-    /// Reads the process environment through a shape the extractor cannot
-    /// name — iterating `Platform.environment`, indexing it with a computed
-    /// key, aliasing the map into a variable. What a suite reaching one
-    /// does depends on which package tier the reading file belongs to: the
-    /// suite's own package refuses caching (any variable could reach a
-    /// verdict), a dependency package folds the whole environment's digest
-    /// into the suite's key, and the toolchain tier is exempt — a
-    /// first-party flutter binding aliasing the whole map as its default
-    /// is the tool's plumbing, not a suite author's read; its named reads
-    /// still join the key.
+    /// The file's top-level `main` installs a flutter test binding
+    /// ([`TEST_BINDINGS`]`.ensureInitialized()`, or the first
+    /// `testWidgets(…)` declaration) before running any code of its own:
+    /// everything it runs first is the declaration skeleton (`group`,
+    /// `test`, `setUp`… calls whose arguments are literals and closures).
+    /// The binding replaces dart:io's `HttpClient` factory with a client
+    /// answering every request with an empty 400, and every closure the
+    /// skeleton declares runs after it, so no HTTP client the suite builds
+    /// reaches the network (see [`TriggerKind::Http`]). Only the suite's
+    /// own file is consulted. (No serde default, like `engine_shared`.)
+    pub test_binding: bool,
+    /// Names what can take the binding's mock away: `HttpOverrides` (a
+    /// client factory of its own), `overrideHttpClient` (a binding
+    /// subclass opting out), `IntegrationTestWidgetsFlutterBinding` (the
+    /// binding that keeps real networking), or a new isolate (`compute(…)`,
+    /// `Isolate.spawn`/`spawnUri`/`run` — the binding's override is
+    /// per-isolate). A suite whose closure carries one keeps no HTTP
+    /// exemption. (No serde default, like `engine_shared`.)
+    pub http_overrides: bool,
+    /// The reads and markers that can refuse a suite reaching this file,
+    /// one per label at its first line, in line order. They are both the
+    /// verdict ([`Self::nondeterministic`], [`Self::time_read`],
+    /// [`Self::http_read`], [`Self::no_cache`], [`Self::env_opaque`]) and
+    /// the evidence a refused suite reports. Stationary randomness
+    /// (`Random`, `Stopwatch` durations, `pid`) is never one: a replayed
+    /// outcome is then one sample of the same distribution a fresh run
+    /// draws from. (No serde default, like `engine_shared`: a stamp index
+    /// written before this shape fails to load and is rebuilt.)
     ///
     /// Dot-shorthand `.environment['X']` accesses (Dart 3.10's inferred
     /// static invocation, no `Platform` receiver spelled) are not tracked;
     /// a suite relying on one opts out with `// dartq: no-cache`.
-    pub env_opaque: bool,
+    pub triggers: Vec<Trigger>,
+}
+
+/// One read or marker that can refuse a suite (see [`FileFacts::triggers`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trigger {
+    pub kind: TriggerKind,
+    /// What matched, as spelled: `Process.run`, `HttpClient()`,
+    /// `DateTime.now`, `import package:http/http.dart`, `// dartq: no-cache`.
+    pub label: String,
+    /// 1-based line of the first match.
+    pub line: u32,
+}
+
+/// What a [`Trigger`] reads, which decides who may vouch for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TriggerKind {
+    /// State that drifts between runs with no file, argument or
+    /// environment change, and that no seam covers: sockets and network
+    /// lookups (`Socket`, `ServerSocket`, `RawSocket`, `SecureSocket`,
+    /// `RawDatagramSocket`, `WebSocket`, `HttpServer`, `InternetAddress`,
+    /// `NetworkInterface`), child processes (`Process.run`/`runSync`/
+    /// `start`), standard input, the host name, native code (`dart:ffi`),
+    /// or a package whose purpose is one of those ([`DRIFT_PACKAGES`]).
+    /// Refuses wherever the closure reaches it, unless the file attests
+    /// `// dartq: deterministic`.
+    Drift,
+    /// An HTTP client: `HttpClient()`, `package:http`, `package:dio`. On
+    /// the VM every request of these goes through dart:io's `HttpClient`
+    /// factory, which the flutter test binding overrides with a client
+    /// answering every request with an empty 400 — so a flutter suite that
+    /// installs the binding ([`FileFacts::test_binding`]) observes a fixed
+    /// response, and only a suite without it refuses.
+    Http,
+    /// The wall clock: `DateTime.now`/`timestamp`, `package:clock` (whose
+    /// `clock` reads the zone's clock, the real one by default). Library
+    /// code reads it on its caller's behalf (`DatePicker(initialDate: …)`,
+    /// `withClock`/`fakeAsync` swap it), so only suite-side files refuse.
+    Clock,
+    /// The process environment read through a shape no literal name
+    /// covers — iterating `Platform.environment`, a computed key, an alias
+    /// of the map. What a suite reaching one does depends on the reading
+    /// file's package tier: the suite's own package refuses caching, a
+    /// dependency package folds the whole environment's digest into the
+    /// key, and the toolchain tier (a first-party flutter binding aliasing
+    /// the whole map as its default) is exempt.
+    EnvOpaque,
+    /// The `// dartq: no-cache` opt-out marker: the suite reaching this
+    /// file always runs.
+    NoCache,
+}
+
+impl FileFacts {
+    fn has(&self, kind: TriggerKind) -> bool {
+        self.triggers.iter().any(|trigger| trigger.kind == kind)
+    }
+
+    /// The first [`Trigger`] of `kind`, in line order.
+    #[must_use]
+    pub fn first(&self, kind: TriggerKind) -> Option<&Trigger> {
+        self.triggers.iter().find(|trigger| trigger.kind == kind)
+    }
+
+    /// Reads drifting state no seam covers ([`TriggerKind::Drift`]).
+    #[must_use]
+    pub fn nondeterministic(&self) -> bool {
+        self.has(TriggerKind::Drift)
+    }
+
+    /// Reads the wall clock ([`TriggerKind::Clock`]).
+    #[must_use]
+    pub fn time_read(&self) -> bool {
+        self.has(TriggerKind::Clock)
+    }
+
+    /// Builds an HTTP client ([`TriggerKind::Http`]).
+    #[must_use]
+    pub fn http_read(&self) -> bool {
+        self.has(TriggerKind::Http)
+    }
+
+    /// Carries the `// dartq: no-cache` marker.
+    #[must_use]
+    pub fn no_cache(&self) -> bool {
+        self.has(TriggerKind::NoCache)
+    }
+
+    /// Reads the environment through an unnamable shape
+    /// ([`TriggerKind::EnvOpaque`]).
+    #[must_use]
+    pub fn env_opaque(&self) -> bool {
+        self.has(TriggerKind::EnvOpaque)
+    }
 }
 
 /// Longest literal still considered a candidate path.
 const MAX_PATH_LITERAL: usize = 255;
 
-/// Packages whose API is a drifting source: `clock` (the wall clock
-/// behind an injectable seam), HTTP/WebSocket/RPC clients and servers, and
-/// process spawning. Importing one from package code marks the file
-/// [`FileFacts::nondeterministic`]: the drift happens inside the
-/// dependency, where the cache does not look.
+/// Packages whose API is a drifting source no seam covers: WebSocket and
+/// RPC clients, servers, raw HTTP/2 sockets, and process spawning.
+/// Importing one marks the file [`TriggerKind::Drift`]: the drift happens
+/// inside the dependency, where the cache does not look.
 pub const DRIFT_PACKAGES: &[&str] = &[
-    "clock",
-    "dio",
     "grpc",
-    "http",
     "http2",
     "io",
     "process",
@@ -167,6 +243,18 @@ pub const DRIFT_PACKAGES: &[&str] = &[
     "shelf",
     "web_socket",
     "web_socket_channel",
+];
+
+/// Packages whose every request goes through dart:io's `HttpClient`
+/// factory on the VM ([`TriggerKind::Http`]).
+pub const HTTP_PACKAGES: &[&str] = &["dio", "http"];
+
+/// The receivers whose `ensureInitialized` installs the flutter test
+/// binding (and with it the mock `HttpClient` factory).
+pub const TEST_BINDINGS: &[&str] = &[
+    "TestWidgetsFlutterBinding",
+    "AutomatedTestWidgetsFlutterBinding",
+    "LiveTestWidgetsFlutterBinding",
 ];
 
 /// Extract the facts of one Dart file's bytes. A leading BOM is skipped,
@@ -189,25 +277,53 @@ pub fn facts(bytes: &[u8]) -> FileFacts {
         },
         files.intern(Path::new("source.dart")),
     );
+    let lines = &scanned.line_index;
+    let line = |offset: usize| lines.byte_to_line_col(offset as u32).0;
     let mut out = FileFacts::default();
-    out.opaque = read_directives(source, &scanned.tokens, &mut out.uris).is_none();
-    read_runtime_inputs(source, &scanned.tokens, &mut out);
-    out.nondeterministic |= out.uris.iter().any(|uri| {
-        uri == "dart:ffi"
-            || uri
-                .strip_prefix("package:")
-                .and_then(|rest| rest.split_once('/'))
-                .is_some_and(|(package, _)| DRIFT_PACKAGES.contains(&package))
-    });
+    let mut uri_offsets = Vec::new();
+    out.opaque =
+        read_directives(source, &scanned.tokens, &mut out.uris, &mut uri_offsets).is_none();
+    read_runtime_inputs(source, &scanned.tokens, &line, &mut out);
+    for (uri, &offset) in out.uris.iter().zip(&uri_offsets) {
+        let package = uri
+            .strip_prefix("package:")
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(package, _)| package);
+        let kind = match package {
+            _ if uri == "dart:ffi" => TriggerKind::Drift,
+            Some(package) if DRIFT_PACKAGES.contains(&package) => TriggerKind::Drift,
+            Some(package) if HTTP_PACKAGES.contains(&package) => TriggerKind::Http,
+            Some("clock") => TriggerKind::Clock,
+            _ => continue,
+        };
+        out.triggers.push(Trigger {
+            kind,
+            label: format!("import {uri}"),
+            line: line(offset),
+        });
+    }
     out.engine_shared |= out
         .uris
         .iter()
         .any(|uri| uri == "dart:ffi" || uri.starts_with("package:ffi/"));
+    out.test_binding = binding_first(source, &scanned.tokens);
     let [no_cache, attested, portable, shardable] = markers(source, &scanned.tokens);
-    out.no_cache = no_cache;
-    out.attested = attested;
-    out.portable = portable;
-    out.shardable = shardable;
+    if let Some(offset) = no_cache {
+        out.triggers.push(Trigger {
+            kind: TriggerKind::NoCache,
+            label: format!("// {NO_CACHE_MARKER}"),
+            line: line(offset),
+        });
+    }
+    out.attested = attested.is_some();
+    out.portable = portable.is_some();
+    out.shardable = shardable.is_some();
+    // One trigger per label, at its first line, in line order.
+    out.triggers
+        .sort_unstable_by(|a, b| a.label.cmp(&b.label).then(a.line.cmp(&b.line)));
+    out.triggers
+        .dedup_by(|later, first| later.label == first.label);
+    out.triggers.sort_by_key(|trigger| trigger.line);
     out
 }
 
@@ -230,17 +346,21 @@ pub const PORTABLE_MARKER: &str = "dartq: portable";
 /// [`FileFacts::shardable`]). Only the suite's own file is consulted.
 pub const SHARDABLE_MARKER: &str = "dartq: shardable";
 
-/// Which of [`NO_CACHE_MARKER`], [`DETERMINISTIC_MARKER`],
-/// [`PORTABLE_MARKER`] and [`SHARDABLE_MARKER`] a `//` comment line of the
-/// source carries (text after the marker is a free reason). The scanner
-/// emits no tokens for comments, so comment text is what lies between
-/// tokens; a marker spelled inside a string literal is a token and never
-/// counts.
-fn markers(source: &str, tokens: &TokenTable) -> [bool; 4] {
+/// Where the first `//` comment line carrying each of [`NO_CACHE_MARKER`],
+/// [`DETERMINISTIC_MARKER`], [`PORTABLE_MARKER`] and [`SHARDABLE_MARKER`]
+/// starts, as a byte offset (text after the marker is a free reason). The
+/// scanner emits no tokens for comments, so comment text is what lies
+/// between tokens; a marker spelled inside a string literal is a token and
+/// never counts.
+fn markers(source: &str, tokens: &TokenTable) -> [Option<usize>; 4] {
     let mut gap_start = 0usize;
-    let mut found = [false; 4];
-    let mut scan_gap = |gap: &str| {
-        for line in gap.lines() {
+    let mut found = [None; 4];
+    let mut scan_gap = |gap_offset: usize, gap: &str| {
+        let mut offset = gap_offset;
+        for raw in gap.split_inclusive('\n') {
+            let line_offset = offset;
+            offset += raw.len();
+            let line = raw.trim_end_matches(['\n', '\r']);
             if let Some(rest) = line.trim_start().strip_prefix("//") {
                 let rest = rest.trim_start_matches('/').trim();
                 for (slot, marker) in [
@@ -255,7 +375,7 @@ fn markers(source: &str, tokens: &TokenTable) -> [bool; 4] {
                     if let Some(tail) = rest.strip_prefix(marker)
                         && (tail.is_empty() || tail.starts_with(char::is_whitespace))
                     {
-                        found[slot] = true;
+                        found[slot].get_or_insert(line_offset);
                     }
                 }
             }
@@ -264,20 +384,187 @@ fn markers(source: &str, tokens: &TokenTable) -> [bool; 4] {
     for token in tokens.as_slice() {
         let range = token.byte_range();
         if range.start > gap_start {
-            scan_gap(&source[gap_start..range.start]);
+            scan_gap(gap_start, &source[gap_start..range.start]);
         }
         gap_start = gap_start.max(range.end);
     }
     if gap_start < source.len() {
-        scan_gap(&source[gap_start..]);
+        scan_gap(gap_start, &source[gap_start..]);
     }
     found
 }
 
+/// [`FileFacts::test_binding`]: the top-level `main(…) [async] { … }`
+/// reaches a binding install through declaration skeleton alone.
+fn binding_first(source: &str, tokens: &TokenTable) -> bool {
+    let slice = tokens.as_slice();
+    let kind = |index: usize| slice.get(index).map(|token| token.kind);
+    let mut index = 0;
+    while index < slice.len() {
+        match slice[index].kind {
+            // Class, extension and initializer bodies are not top level.
+            TokenKind::OpenCurly | TokenKind::OpenParen | TokenKind::OpenSquare => {
+                match tokens.matching_end(index) {
+                    Some(end) => index = end + 1,
+                    None => return false,
+                }
+            }
+            TokenKind::Identifier
+                if tokens.lexeme(source, index) == "main"
+                    && kind(index + 1) == Some(TokenKind::OpenParen) =>
+            {
+                let Some(params_end) = tokens.matching_end(index + 1) else {
+                    return false;
+                };
+                let mut body = params_end + 1;
+                if kind(body) == Some(TokenKind::Keyword(Keyword::Async)) {
+                    body += 1;
+                }
+                if kind(body) != Some(TokenKind::OpenCurly) {
+                    return false;
+                }
+                let Some(end) = tokens.matching_end(body) else {
+                    return false;
+                };
+                return Skeleton { source, tokens }.block(body + 1, end) == Some(true);
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// The declaration skeleton of a test `main` (see [`binding_first`]).
+/// `Some(true)`: a binding install was reached; `Some(false)`: the span
+/// ended without one; `None`: code that is not skeleton runs first.
+struct Skeleton<'a> {
+    source: &'a str,
+    tokens: &'a TokenTable,
+}
+
+impl Skeleton<'_> {
+    fn kind(&self, index: usize) -> Option<TokenKind> {
+        self.tokens.as_slice().get(index).map(|token| token.kind)
+    }
+
+    /// Statements `from..end` of a block.
+    fn block(&self, mut index: usize, end: usize) -> Option<bool> {
+        while index < end {
+            match self.kind(index)? {
+                TokenKind::Semicolon => index += 1,
+                TokenKind::Identifier => {
+                    let name = self.tokens.lexeme(self.source, index);
+                    if TEST_BINDINGS.contains(&name)
+                        && self.kind(index + 1) == Some(TokenKind::Period)
+                        && self.kind(index + 2) == Some(TokenKind::Identifier)
+                        && self.tokens.lexeme(self.source, index + 2) == "ensureInitialized"
+                        && self.kind(index + 3) == Some(TokenKind::OpenParen)
+                        && self.kind(index + 4) == Some(TokenKind::CloseParen)
+                    {
+                        return Some(true);
+                    }
+                    if self.kind(index + 1) != Some(TokenKind::OpenParen) {
+                        return None;
+                    }
+                    let close = self.tokens.matching_end(index + 1)?;
+                    match name {
+                        // Its arguments are evaluated before it installs
+                        // the binding.
+                        "testWidgets" => {
+                            self.arguments(index + 2, close, false)?;
+                            return Some(true);
+                        }
+                        // A group body runs while the suite declares.
+                        "group" => {
+                            if self.arguments(index + 2, close, true)? {
+                                return Some(true);
+                            }
+                        }
+                        // Their closures run after every declaration.
+                        "test" | "setUp" | "setUpAll" | "tearDown" | "tearDownAll" => {
+                            self.arguments(index + 2, close, false)?;
+                        }
+                        _ => return None,
+                    }
+                    index = close + 1;
+                }
+                _ => return None,
+            }
+        }
+        Some(false)
+    }
+
+    /// Call arguments `from..end`: string literals, literal named
+    /// arguments, and closures — whose bodies are walked as blocks when
+    /// `run_now` (a `group` body), skipped otherwise.
+    fn arguments(&self, mut index: usize, end: usize, run_now: bool) -> Option<bool> {
+        while index < end {
+            match self.kind(index)? {
+                TokenKind::String | TokenKind::Comma => index += 1,
+                TokenKind::Identifier
+                    if self.kind(index + 1) == Some(TokenKind::Colon)
+                        && matches!(
+                            self.kind(index + 2),
+                            Some(
+                                TokenKind::String
+                                    | TokenKind::Int
+                                    | TokenKind::Keyword(
+                                        Keyword::True | Keyword::False | Keyword::Null
+                                    )
+                            )
+                        )
+                        && matches!(
+                            self.kind(index + 3),
+                            Some(TokenKind::Comma | TokenKind::CloseParen)
+                        ) =>
+                {
+                    index += 3;
+                }
+                TokenKind::OpenParen => {
+                    let mut body = self.tokens.matching_end(index)? + 1;
+                    if self.kind(body) == Some(TokenKind::Keyword(Keyword::Async)) {
+                        body += 1;
+                    }
+                    match self.kind(body)? {
+                        TokenKind::OpenCurly => {
+                            let body_end = self.tokens.matching_end(body)?;
+                            if run_now && self.block(body + 1, body_end)? {
+                                return Some(true);
+                            }
+                            index = body_end + 1;
+                        }
+                        // An arrow body runs later; skip to the next
+                        // argument.
+                        TokenKind::Function if !run_now => {
+                            index = body + 1;
+                            while index < end && self.kind(index) != Some(TokenKind::Comma) {
+                                index = if self.kind(index)?.is_begin_group() {
+                                    self.tokens.matching_end(index)? + 1
+                                } else {
+                                    index + 1
+                                };
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(false)
+    }
+}
+
 /// Walk the directive header: optional script tag, annotations, `library`,
-/// then `import`/`export`/`part` until the first declaration. `None` when
-/// a directive is unreadable.
-fn read_directives(source: &str, tokens: &TokenTable, uris: &mut Vec<String>) -> Option<()> {
+/// then `import`/`export`/`part` until the first declaration, each URI's
+/// byte offset pushed to `offsets` alongside it. `None` when a directive
+/// is unreadable.
+fn read_directives(
+    source: &str,
+    tokens: &TokenTable,
+    uris: &mut Vec<String>,
+    offsets: &mut Vec<usize>,
+) -> Option<()> {
     let slice = tokens.as_slice();
     let mut index = 0;
     while index < slice.len() {
@@ -286,7 +573,7 @@ fn read_directives(source: &str, tokens: &TokenTable, uris: &mut Vec<String>) ->
             TokenKind::At => skip_annotation(tokens, index),
             TokenKind::Keyword(Keyword::Library) => skip_to_semicolon(tokens, index)?,
             TokenKind::Keyword(Keyword::Import | Keyword::Export | Keyword::Part) => {
-                read_directive(source, tokens, index, uris)?
+                read_directive(source, tokens, index, uris, offsets)?
             }
             _ => return Some(()),
         };
@@ -340,6 +627,7 @@ fn read_directive(
     tokens: &TokenTable,
     at: usize,
     uris: &mut Vec<String>,
+    offsets: &mut Vec<usize>,
 ) -> Option<usize> {
     let slice = tokens.as_slice();
     let kind = |index: usize| slice.get(index).map(|token| token.kind);
@@ -359,6 +647,7 @@ fn read_directive(
             TokenKind::OpenParen => index = tokens.matching_end(index)? + 1,
             TokenKind::String => {
                 // Adjacent literals concatenate (`'src/' 'a.dart'`).
+                offsets.push(slice[index].byte_range().start);
                 let mut uri = String::new();
                 while kind(index) == Some(TokenKind::String) {
                     uri.push_str(unquote(tokens.lexeme(source, index))?);
@@ -395,17 +684,44 @@ fn unquote(lexeme: &str) -> Option<&str> {
     Some(body)
 }
 
-/// Record the run-time inputs: ambient accessors, path literals, and
-/// environment reads.
-fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
+/// Record the run-time inputs: ambient accessors, path literals,
+/// environment reads, and the drifting reads ([`FileFacts::triggers`]);
+/// `line` maps a byte offset to its 1-based line.
+fn read_runtime_inputs(
+    source: &str,
+    tokens: &TokenTable,
+    line: &impl Fn(usize) -> u32,
+    out: &mut FileFacts,
+) {
     let slice = tokens.as_slice();
     let kind = |index: usize| slice.get(index).map(|token| token.kind);
     let path_imports = path_imports(source, tokens);
+    let mut found: Vec<Trigger> = Vec::new();
     for (index, token) in slice.iter().enumerate() {
+        let mut trigger = |kind: TriggerKind, label: String| {
+            found.push(Trigger {
+                kind,
+                label,
+                line: line(token.byte_range().start),
+            });
+        };
         match token.kind {
             TokenKind::Identifier => {
                 let lexeme = tokens.lexeme(source, index);
                 let after_period = index.checked_sub(1).and_then(kind) == Some(TokenKind::Period);
+                out.http_overrides |= matches!(
+                    lexeme,
+                    "HttpOverrides" | "overrideHttpClient" | "IntegrationTestWidgetsFlutterBinding"
+                ) || (lexeme == "compute"
+                    && !after_period
+                    && kind(index + 1) == Some(TokenKind::OpenParen))
+                    || (lexeme == "Isolate"
+                        && kind(index + 1) == Some(TokenKind::Period)
+                        && kind(index + 2) == Some(TokenKind::Identifier)
+                        && matches!(
+                            tokens.lexeme(source, index + 2),
+                            "spawn" | "spawnUri" | "run"
+                        ));
                 out.engine_shared |= matches!(
                     lexeme,
                     "FontLoader" | "loadFontFromList" | "IsolateNameServer"
@@ -414,26 +730,41 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                 // (`HttpClient()`, dart:io's `stdin` getter). A named
                 // argument or a declaration of the same name is not a read.
                 if !after_period {
-                    out.nondeterministic |= match lexeme {
-                        "HttpClient" | "HttpServer" => matches!(
-                            kind(index + 1),
-                            Some(TokenKind::OpenParen | TokenKind::Period)
-                        ),
+                    let constructed = matches!(
+                        kind(index + 1),
+                        Some(TokenKind::OpenParen | TokenKind::Period)
+                    );
+                    let read = match lexeme {
+                        "HttpClient" if constructed => Some(TriggerKind::Http),
+                        "HttpServer" if constructed => Some(TriggerKind::Drift),
                         // Not a named argument, a declaration's name
                         // (`Object? stdin`), or an assignment target.
-                        "stdin" => {
-                            !matches!(kind(index + 1), Some(TokenKind::Colon | TokenKind::Eq))
-                                && !matches!(
-                                    index.checked_sub(1).and_then(kind),
-                                    Some(
-                                        TokenKind::Identifier
-                                            | TokenKind::Keyword(_)
-                                            | TokenKind::Question
-                                    )
+                        "stdin"
+                            if !matches!(
+                                kind(index + 1),
+                                Some(TokenKind::Colon | TokenKind::Eq)
+                            ) && !matches!(
+                                index.checked_sub(1).and_then(kind),
+                                Some(
+                                    TokenKind::Identifier
+                                        | TokenKind::Keyword(_)
+                                        | TokenKind::Question
                                 )
+                            ) =>
+                        {
+                            Some(TriggerKind::Drift)
                         }
-                        _ => false,
+                        _ => None,
                     };
+                    if let Some(read) = read {
+                        trigger(
+                            read,
+                            match lexeme {
+                                "stdin" => "stdin".to_owned(),
+                                _ => format!("{lexeme}()"),
+                            },
+                        );
+                    }
                 }
                 if after_period
                     && matches!(
@@ -444,11 +775,14 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                     out.located = true;
                 }
                 // `io.stdin` through a prefixed `dart:io` import.
-                out.nondeterministic |= after_period
+                if after_period
                     && lexeme == "stdin"
                     && index >= 2
                     && kind(index - 2) == Some(TokenKind::Identifier)
-                    && kind(index + 1) == Some(TokenKind::Period);
+                    && kind(index + 1) == Some(TokenKind::Period)
+                {
+                    trigger(TriggerKind::Drift, "stdin".to_owned());
+                }
                 // package:path's top-level functions, unprefixed.
                 if path_imports.unprefixed && !after_period {
                     match lexeme {
@@ -474,11 +808,18 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                     continue;
                 }
                 let member = tokens.lexeme(source, index + 2);
-                if (lexeme, member) == ("Platform", "environment") {
-                    read_environment_access(source, tokens, index + 3, out);
+                if (lexeme, member) == ("Platform", "environment")
+                    && !read_environment_access(source, tokens, index + 3, out)
+                {
+                    trigger(
+                        TriggerKind::EnvOpaque,
+                        "Platform.environment (unnamed key)".to_owned(),
+                    );
                 }
-                out.time_read |= matches!((lexeme, member), ("DateTime", "now" | "timestamp"));
-                out.nondeterministic |= matches!(
+                if matches!((lexeme, member), ("DateTime", "now" | "timestamp")) {
+                    trigger(TriggerKind::Clock, format!("DateTime.{member}"));
+                }
+                if matches!(
                     (lexeme, member),
                     ("Process", "run" | "runSync" | "start")
                         | ("Platform", "localHostname")
@@ -495,7 +836,9 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                                 | "NetworkInterface",
                             _
                         )
-                );
+                ) {
+                    trigger(TriggerKind::Drift, format!("{lexeme}.{member}"));
+                }
                 // `Directory.current = …` moves every engine's directory.
                 out.engine_shared |= (lexeme, member) == ("Directory", "current")
                     && kind(index + 3) == Some(TokenKind::Eq);
@@ -550,6 +893,7 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
             _ => {}
         }
     }
+    out.triggers.extend(found);
     out.located |= out.ambient;
     out.path_literals.sort_unstable();
     out.path_literals.dedup();
@@ -562,9 +906,14 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
 /// One `Platform.environment` access at `at` (the token index just past the
 /// `environment` identifier): a literal index or `containsKey` names the
 /// variable read; every other shape — iteration, `.length`, an aliased map,
-/// a computed key — leaves the read unnamable and the file
-/// [`FileFacts::env_opaque`].
-fn read_environment_access(source: &str, tokens: &TokenTable, at: usize, out: &mut FileFacts) {
+/// a computed key — leaves the read unnamable and returns `false` (the
+/// caller records a [`TriggerKind::EnvOpaque`] trigger).
+fn read_environment_access(
+    source: &str,
+    tokens: &TokenTable,
+    at: usize,
+    out: &mut FileFacts,
+) -> bool {
     let slice = tokens.as_slice();
     let kind = |index: usize| slice.get(index).map(|token| token.kind);
     match kind(at) {
@@ -575,10 +924,10 @@ fn read_environment_access(source: &str, tokens: &TokenTable, at: usize, out: &m
             if let Some(name) = string_literal_run(source, tokens, at + 1) {
                 if kind(at + 1 + name.1) == Some(TokenKind::CloseSquare) {
                     out.env_reads.push(name.0);
-                    return;
+                    return true;
                 }
             }
-            out.env_opaque = true;
+            false
         }
         // `Platform.environment.containsKey('NAME')`.
         Some(TokenKind::Period)
@@ -589,11 +938,12 @@ fn read_environment_access(source: &str, tokens: &TokenTable, at: usize, out: &m
                 && kind(at + 3 + name.1) == Some(TokenKind::CloseParen)
             {
                 out.env_reads.push(name.0);
+                true
             } else {
-                out.env_opaque = true;
+                false
             }
         }
-        _ => out.env_opaque = true,
+        _ => false,
     }
 }
 
@@ -845,21 +1195,21 @@ void main() {
     /// its inputs; every ambient read observes the location too.
     #[test]
     fn drift_markers_and_launch() {
-        let drift = |source: &str| of(source).nondeterministic;
-        let time = |source: &str| of(source).time_read;
+        let drift = |source: &str| of(source).nondeterministic();
+        let time = |source: &str| of(source).time_read();
         assert!(time("void main() { DateTime.now(); }"));
         assert!(time("void main() { DateTime.timestamp(); }"));
         assert!(!drift("void main() { DateTime.now(); }"));
         assert!(drift("void main() { Process.run('ls', []); }"));
         assert!(drift("void main() { Socket.connect('h', 1); }"));
-        assert!(drift("void main() { HttpClient(); }"));
+        assert!(!drift("void main() { HttpClient(); }"));
+        assert!(of("void main() { HttpClient(); }").http_read());
         assert!(drift("void main() { stdin.readLineSync(); }"));
         assert!(drift("void main() { Platform.localHostname; }"));
         assert!(drift("import 'dart:ffi';\nvoid main() {}"));
-        assert!(drift("import 'package:clock/clock.dart';\nvoid main() {}"));
-        assert!(drift(
-            "import 'package:http/http.dart' as http;\nvoid main() {}"
-        ));
+        assert!(time("import 'package:clock/clock.dart';\nvoid main() {}"));
+        assert!(of("import 'package:http/http.dart' as http;\nvoid main() {}").http_read());
+        assert!(drift("import 'package:grpc/grpc.dart';\nvoid main() {}"));
         // Stationary randomness, a `stdin:` named argument, a field named
         // `stdin`, and a `DateTime` constructed from a literal do not drift.
         assert!(!drift(
@@ -919,13 +1269,13 @@ void main() {
         let marked = of(
             "// dartq: no-cache talks to a local daemon\n// dartq: deterministic\n// dartq: portable\n// dartq: shardable\nvoid main() {}",
         );
-        assert!(marked.no_cache && marked.attested && marked.portable && marked.shardable);
+        assert!(marked.no_cache() && marked.attested && marked.portable && marked.shardable);
         // A marker inside a string, a longer word, or a block comment does not count.
         let unmarked = of(
             "/* dartq: no-cache */\n// dartq: no-cacheable\n// dartq: shardablex\nvoid main() { print('// dartq: no-cache'); }",
         );
         assert!(
-            !unmarked.no_cache && !unmarked.attested && !unmarked.portable && !unmarked.shardable
+            !unmarked.no_cache() && !unmarked.attested && !unmarked.portable && !unmarked.shardable
         );
     }
 
@@ -983,15 +1333,15 @@ void main() {
     #[test]
     fn markers_match_one_spelling() {
         assert!(
-            !of("// dartq:no-cache\nvoid main() {}").no_cache,
+            !of("// dartq:no-cache\nvoid main() {}").no_cache(),
             "no space after the colon"
         );
         assert!(
-            !of("// dartq: no-cacheable\nvoid main() {}").no_cache,
+            !of("// dartq: no-cacheable\nvoid main() {}").no_cache(),
             "a longer word"
         );
         assert!(
-            of("/// dartq: no-cache why\nvoid main() {}").no_cache,
+            of("/// dartq: no-cache why\nvoid main() {}").no_cache(),
             "extra slashes and a reason"
         );
         assert!(
@@ -1017,7 +1367,7 @@ void main() {
         let named = of(
             "void main() {\n  print(Platform.environment['HOME']);\n  print(Platform.environment['A' 'B']);\n  if (Platform.environment.containsKey(\"CI\")) {}\n}\n",
         );
-        assert!(!named.env_opaque);
+        assert!(!named.env_opaque());
         assert_eq!(named.env_reads, ["AB", "CI", "HOME"]);
 
         for source in [
@@ -1035,7 +1385,7 @@ void main() {
             "void main() { print(Platform.environment); }",
         ] {
             let facts = of(source);
-            assert!(facts.env_opaque, "opaque: {source}");
+            assert!(facts.env_opaque(), "opaque: {source}");
             assert!(facts.env_reads.is_empty(), "no names: {source}");
         }
 
@@ -1043,7 +1393,7 @@ void main() {
         let none = of(
             "// Platform.environment['HOME']\nvoid main() { const s = 'Platform.environment[\"X\"]'; }",
         );
-        assert!(!none.env_opaque && none.env_reads.is_empty());
+        assert!(!none.env_opaque() && none.env_reads.is_empty());
     }
 
     /// Dot-shorthand `.environment['X']` (Dart 3.10's inferred static
@@ -1055,11 +1405,88 @@ void main() {
     fn dot_shorthand_environment_access_is_not_tracked() {
         let shorthand = of("void main() { print(.environment['HOME']); }");
         assert!(
-            !shorthand.env_opaque,
+            !shorthand.env_opaque(),
             "documented: dot-shorthand is neither named nor opaque"
         );
         assert!(shorthand.env_reads.is_empty());
         let other_receiver = of("void main() { print(other.environment['HOME']); }");
-        assert!(!other_receiver.env_opaque && other_receiver.env_reads.is_empty());
+        assert!(!other_receiver.env_opaque() && other_receiver.env_reads.is_empty());
+    }
+
+    /// Every trigger carries its kind, its label as spelled and its first
+    /// line; one per label, in line order.
+    #[test]
+    fn triggers_carry_kind_label_and_line() {
+        let facts = of("import 'package:http/http.dart';\n\
+             // dartq: no-cache flaky daemon\n\
+             void main() {\n\
+               Process.run('ls', []);\n\
+               DateTime.now();\n\
+               DateTime.now();\n\
+               print(Platform.environment[name]);\n\
+             }\n");
+        let seen: Vec<(TriggerKind, &str, u32)> = facts
+            .triggers
+            .iter()
+            .map(|t| (t.kind, t.label.as_str(), t.line))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (TriggerKind::Http, "import package:http/http.dart", 1),
+                (TriggerKind::NoCache, "// dartq: no-cache", 2),
+                (TriggerKind::Drift, "Process.run", 4),
+                (TriggerKind::Clock, "DateTime.now", 5),
+                (
+                    TriggerKind::EnvOpaque,
+                    "Platform.environment (unnamed key)",
+                    7
+                ),
+            ]
+        );
+        // Stationary reads and marker-free files carry no evidence.
+        assert!(
+            of("void main() { Random(1).nextInt(3); }")
+                .triggers
+                .is_empty()
+        );
+        assert!(of("void main() {}").triggers.is_empty());
+    }
+
+    /// The flutter test binding counts only when `main` installs it before
+    /// running code of its own; the overrides that take its mock
+    /// `HttpClient` away are recorded.
+    #[test]
+    fn test_binding_and_http_overrides() {
+        let bound = |source: &str| of(source).test_binding;
+        assert!(bound("void main() { testWidgets('x', (t) async {}); }"));
+        assert!(bound(
+            "void main() { TestWidgetsFlutterBinding.ensureInitialized(); foo(); }"
+        ));
+        assert!(bound(
+            "void main() async {\n  group('g', () {\n    setUp(() => api.reset());\n    test('t', () {}, skip: true);\n    testWidgets('w', (t) async { HttpClient(); });\n  });\n}"
+        ));
+        // No binding at all, a declaration of the same name, code that
+        // runs before the binding, a computed description.
+        assert!(!bound("void main() { test('x', () {}); }"));
+        assert!(!bound("void testWidgets() {}"));
+        assert!(!bound(
+            "void main() { final api = Api(); testWidgets('x', (t) async {}); }"
+        ));
+        assert!(!bound("void main() { testWidgets(name(), (t) async {}); }"));
+        assert!(!bound(
+            "void main() { group('g', () => testWidgets('x', (t) async {})); }"
+        ));
+        // A nested `main` is not the entry point.
+        assert!(!bound(
+            "class A { void main() { testWidgets('x', (t) async {}); } }"
+        ));
+        assert!(of("void main() { HttpOverrides.global = null; }").http_overrides);
+        assert!(
+            of("void main() { IntegrationTestWidgetsFlutterBinding.ensureInitialized(); }")
+                .http_overrides
+        );
+        assert!(of("void main() { compute(f, 1); Isolate.run(g); }").http_overrides);
+        assert!(!of("void main() { testWidgets('x', (t) async {}); }").http_overrides);
     }
 }

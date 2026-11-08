@@ -21,6 +21,8 @@ path = "src/main.rs"
 clap = { workspace = true }
 mimalloc = { workspace = true }
 dartq-commands = { workspace = true }
+# The official engine's resident analysis server (client and daemon).
+dartq-analyzer-host = { workspace = true }
 dartq-daemon = { workspace = true }
 dartq-session = { workspace = true }
 dartq-diagnostics = { workspace = true }

@@ -56,6 +56,8 @@ pub struct DartqConfig {
     pub cache: Option<CacheDefaults>,
     /// The `dartq test` face's machine-level knobs.
     pub test: Option<TestConfig>,
+    /// The analyze face's engine choice and official-engine knobs.
+    pub analyzer: Option<AnalyzerConfig>,
     /// The package-discovery policy (the `packages` face).
     pub packages: Option<PackagesConfig>,
     /// The Flutter build cache's configuration (on by default).
@@ -68,11 +70,30 @@ impl DartqConfig {
     /// no fewer than one at a time, so a lower value clamps.
     #[must_use]
     pub fn test_max_concurrent(&self) -> usize {
-        let declared = self
-            .test
-            .and_then(|test| test.max_concurrent)
-            .unwrap_or(1);
+        let declared = self.test.and_then(|test| test.max_concurrent).unwrap_or(1);
         usize::try_from(declared.max(1)).unwrap_or(usize::MAX)
+    }
+
+    /// The `analyzer.official` knobs, defaults filled in.
+    #[must_use]
+    pub fn official(&self) -> OfficialSettings {
+        let official = self
+            .analyzer
+            .and_then(|analyzer| analyzer.official)
+            .unwrap_or_default();
+        OfficialSettings {
+            memory_budget_bytes: official
+                .memory_budget_gb
+                .map_or(0, |gb| gb.saturating_mul(1 << 30)),
+            resident: official.resident.unwrap_or(true),
+            idle_minutes: official.idle_minutes.unwrap_or(15),
+        }
+    }
+
+    /// The `analyzer.engine` choice, when the config makes one.
+    #[must_use]
+    pub fn engine(&self) -> Option<Engine> {
+        self.analyzer.and_then(|analyzer| analyzer.engine)
     }
 }
 
@@ -87,6 +108,52 @@ pub struct TestConfig {
     /// before its execution phase (resolved by
     /// [`DartqConfig::test_max_concurrent`]).
     pub max_concurrent: Option<i64>,
+}
+
+/// Which analyzer `dartq analyze` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    /// The official Dart analyzer (the default).
+    Official,
+    /// The in-process dartq engine.
+    Dartq,
+}
+
+/// The `analyzer:` section. Unknown keys inside it are a structured
+/// [`ConfigError::Invalid`] (a typo must not silently fall back to a
+/// default).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzerConfig {
+    /// `official` or `dartq`; a `--engine` flag overrides it.
+    pub engine: Option<Engine>,
+    /// The official engine's knobs.
+    pub official: Option<OfficialConfig>,
+}
+
+/// The `analyzer.official:` section.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfficialConfig {
+    /// The RSS budget of the official analyzer's process tree, in GiB.
+    /// Unset or `0` is unlimited, as `dart analyze` itself is: a large
+    /// workspace legitimately needs tens of GiB, and a kill near the end
+    /// of a long analysis turns a slow success into a failure.
+    pub memory_budget_gb: Option<u64>,
+    /// Keep an analysis server resident between runs (default true).
+    pub resident: Option<bool>,
+    /// Minutes an unused resident server stays up (default 15).
+    pub idle_minutes: Option<u64>,
+}
+
+/// [`OfficialConfig`] with its defaults filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfficialSettings {
+    /// `0` is unlimited.
+    pub memory_budget_bytes: u64,
+    pub resident: bool,
+    pub idle_minutes: u64,
 }
 
 /// The `build_cache:` section — the Flutter build cache every `dartq
@@ -339,6 +406,9 @@ fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<
     if project.test.is_some() {
         governing.test = project.test;
     }
+    if project.analyzer.is_some() {
+        governing.analyzer = project.analyzer;
+    }
     if project.packages.is_some() {
         governing.packages = project.packages;
     }
@@ -557,6 +627,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         memory: raw.memory,
         cache: raw.cache,
         test: raw.test,
+        analyzer: raw.analyzer,
         packages: raw.packages,
         build_cache: raw.build_cache,
     })
@@ -571,6 +642,7 @@ struct RawConfig {
     memory: Option<MemoryDefaults>,
     cache: Option<CacheDefaults>,
     test: Option<TestConfig>,
+    analyzer: Option<AnalyzerConfig>,
     packages: Option<PackagesConfig>,
     build_cache: Option<BuildCacheConfig>,
 }
@@ -1088,5 +1160,73 @@ mod tests {
             ),
             "an unknown key inside the section is a structured error"
         );
+    }
+
+    /// The `analyzer:` section: the engine choice and the official knobs
+    /// resolve through both tiers (the project section governs whole),
+    /// defaults fill unset keys, `0` is the unlimited budget, and a typo is
+    /// loud.
+    #[test]
+    fn analyzer_section_resolves_engine_and_official_knobs() {
+        const GIB: u64 = 1 << 30;
+        let resolve = |project: &Path, home: &Path| {
+            discover_with(project, Some(home))
+                .expect("discover")
+                .expect("config")
+        };
+        let defaults = OfficialSettings {
+            memory_budget_bytes: 0,
+            resident: true,
+            idle_minutes: 15,
+        };
+        let (home, project) = tiered(Some(
+            "version: 1\nanalyzer:\n  engine: dartq\n  official:\n    memory_budget_gb: 4\n",
+        ));
+        write_config(project.path(), "version: 1\n");
+        let config = resolve(project.path(), home.path());
+        assert_eq!(
+            config.engine(),
+            Some(Engine::Dartq),
+            "the global tier fills the gap"
+        );
+        assert_eq!(config.official().memory_budget_bytes, 4 * GIB);
+
+        write_config(
+            project.path(),
+            "version: 1\nanalyzer:\n  engine: official\n  official:\n    memory_budget_gb: 0\n    resident: false\n    idle_minutes: 3\n",
+        );
+        let config = resolve(project.path(), home.path());
+        assert_eq!(
+            config.engine(),
+            Some(Engine::Official),
+            "the project tier wins"
+        );
+        assert_eq!(
+            config.official(),
+            OfficialSettings {
+                memory_budget_bytes: 0,
+                resident: false,
+                idle_minutes: 3
+            }
+        );
+
+        let (home, project) = tiered(None);
+        write_config(project.path(), "version: 1\n");
+        let config = resolve(project.path(), home.path());
+        assert_eq!((config.engine(), config.official()), (None, defaults));
+
+        for bad in [
+            "version: 1\nanalyzer:\n  engine: rust\n",
+            "version: 1\nanalyzer:\n  official:\n    residnet: true\n",
+        ] {
+            write_config(project.path(), bad);
+            assert!(
+                matches!(
+                    discover_with(project.path(), Some(home.path())),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "{bad:?} is a structured error"
+            );
+        }
     }
 }

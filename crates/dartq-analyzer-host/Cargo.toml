@@ -1,0 +1,34 @@
+[package]
+name = "dartq-analyzer-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hosts the official Dart analysis server for dartq analyze: one resident server per SDK and analysis roots, kept fresh by a stat-diff sync and shared by concurrent clients."
+repository.workspace = true
+keywords = ["dart", "analyzer"]
+categories = ["development-tools"]
+
+[dependencies]
+# Process-tree RSS and kill for the server's memory budget.
+dartq-toolchain = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+# One lock + condvar pair carries the server state between the stdout
+# reader and the request threads.
+parking_lot = { workspace = true }
+# The freshness walk stats a workspace's files in parallel.
+rayon = { workspace = true }
+# The daemon map of per-file error lists.
+rustc-hash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1467,9 +1467,32 @@ impl Recipe {
     }
 }
 
+/// How many `flutter test` processes may share the package at once, given
+/// the `wanted` count and whether any resolved package ships build hooks.
+///
+/// Before it loads a suite, every `flutter test` prepares the package's
+/// shared `build/native_assets/<os>/` (`testCompilerBuildNativeAssets`):
+/// it reruns the build hooks, empties the directory, then installs every
+/// code asset into it — on macOS through `lipo`, `install_name_tool` and
+/// `codesign`, whose `*.cstemp` scratch file sits beside the dylib — and
+/// it does so on every run, warm or cold, with no lock. Staggered starts
+/// (each tool once the one before it reported a suite) keep two
+/// preparations apart, but with hooks a later tool's reinstall still
+/// deletes and rewrites dylibs an earlier tool's testers are loading. So a
+/// package with hooks runs its stock suites in one tool, exactly the
+/// stock layout: one preparation, then testers only. Without hooks the
+/// preparation rewrites only the (empty) manifest, which the stagger
+/// already serializes, and the processes multiply freely.
+#[must_use]
+pub fn tool_processes(wanted: usize, hooks: bool) -> usize {
+    if hooks { 1 } else { wanted.max(1) }
+}
+
 /// Any resolved package ships a `hook/build.dart`: the tool runs its
-/// native-asset build before every run.
-fn has_build_hooks(root: &Path) -> bool {
+/// native-asset build before every run. An unreadable resolution counts as
+/// hooks present — the side that never races.
+#[must_use]
+pub fn has_build_hooks(root: &Path) -> bool {
     let config_path = crate::cache::package_config_path(root);
     let Ok(text) = std::fs::read_to_string(&config_path) else {
         return true;
@@ -1497,6 +1520,41 @@ mod tests {
 [        ] test 0: Starting flutter_tester process with command=[/sdk/bin/cache/artifacts/engine/darwin-x64/flutter_tester, --disable-vm-service, --enable-checked-mode, --non-interactive, --packages=/p/.dart_tool/package_config.json, --flutter-assets-dir=/p/build/unit_test_assets, /t/listener.dart.dill], environment={FLUTTER_TEST: true, FONTCONFIG_FILE: /t/fonts.conf, SERVER_PORT: 1, APP_NAME: p}
 {"testID":3,"messageType":"print","message":"dartq.environment {\"FLUTTER_TEST\":\"true\",\"FONTCONFIG_FILE\":\"/t/fonts.conf\",\"SERVER_PORT\":\"1\",\"APP_NAME\":\"p\",\"HOME\":\"/h\"}","type":"print","time":10}
 "#;
+
+    /// Build hooks keep a run to one `flutter test`: every tool reinstalls
+    /// the package's native assets before loading a suite. Without hooks
+    /// the processes multiply as wanted (at least one).
+    #[test]
+    fn tool_processes_serialize_under_build_hooks() {
+        assert_eq!(tool_processes(4, true), 1);
+        assert_eq!(tool_processes(1, true), 1);
+        assert_eq!(tool_processes(0, true), 1);
+        assert_eq!(tool_processes(4, false), 4);
+        assert_eq!(tool_processes(0, false), 1);
+    }
+
+    /// A package that resolves a dependency with `hook/build.dart` has
+    /// hooks; one without has none; an unreadable resolution counts as
+    /// hooks (the side that never races).
+    #[test]
+    fn build_hooks_follow_the_resolution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let dep = root.join("dep");
+        std::fs::create_dir_all(dep.join("lib")).expect("mkdir");
+        std::fs::create_dir_all(root.join(".dart_tool")).expect("mkdir");
+        std::fs::write(root.join("pubspec.yaml"), "name: app\n").expect("write");
+        assert!(has_build_hooks(root));
+        std::fs::write(
+            root.join(".dart_tool").join("package_config.json"),
+            r#"{"configVersion":2,"packages":[{"name":"dep","rootUri":"../dep","packageUri":"lib/","languageVersion":"3.0"}]}"#,
+        )
+        .expect("write");
+        assert!(!has_build_hooks(root));
+        std::fs::create_dir_all(dep.join("hook")).expect("mkdir");
+        std::fs::write(dep.join("hook").join("build.dart"), "void main() {}\n").expect("write");
+        assert!(has_build_hooks(root));
+    }
 
     #[test]
     fn recipe_follows_the_tools_trace() {

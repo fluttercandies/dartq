@@ -62,6 +62,7 @@ use dartq_toolchain::run_queue::{self, Event, RunGuard};
 
 use crate::exit;
 
+mod explain;
 mod flutter;
 
 /// `package:test`'s exit codes (`exit_codes.dart`).
@@ -77,7 +78,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 #[command(disable_help_flag = true)]
 pub(crate) struct TestArgs {
     /// `dart test` arguments, plus `--no-cache`, `--impacted[=REF]`,
-    /// `--stats` and `--no-queue`.
+    /// `--stats`, `--no-queue` and `--explain-cache[=json]`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub(crate) args: Vec<String>,
 }
@@ -400,6 +401,9 @@ struct Invocation {
     /// `--no-queue`: run without joining the run queue.
     no_queue: bool,
     stats: bool,
+    /// `--stats=verbose`: the per-suite verdict lines and trigger summary
+    /// after the usual `--stats` line.
+    stats_verbose: bool,
     /// `flutter test --machine`.
     machine: bool,
     /// `flutter test --no-pub`.
@@ -435,6 +439,19 @@ fn parse(args: &[String], flutter: bool) -> Result<Invocation, ()> {
             };
             if name == "impacted" {
                 inv.impacted = Some(inline.unwrap_or_else(|| "HEAD".to_owned()));
+                continue;
+            }
+            // `--stats[=verbose]` is dartq's own; `run` rejects any other
+            // value before parsing, so only these two shapes arrive here.
+            if name == "stats" {
+                match inline.as_deref() {
+                    None => inv.stats = true,
+                    Some("verbose") => {
+                        inv.stats = true;
+                        inv.stats_verbose = true;
+                    }
+                    Some(_) => return Err(()),
+                }
                 continue;
             }
             match table.iter().find(|option| option.0 == name) {
@@ -601,6 +618,16 @@ fn apply(
     Ok(())
 }
 
+/// The value of a `--stats=<value>` option dartq does not know (`verbose`
+/// is the only value it takes), when the line carries one before `--`.
+/// Options after `--` belong to the runner.
+fn stats_value_error(args: &[String]) -> Option<&str> {
+    args.iter()
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| arg.strip_prefix("--stats="))
+        .find(|value| *value != "verbose")
+}
+
 /// The command line without dartq's own options, for plain `dart test`.
 fn runner_args(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
@@ -613,6 +640,7 @@ fn runner_args(args: &[String]) -> Vec<String> {
                 arg.as_str(),
                 "--no-cache" | "--no-queue" | "--stats" | "--flutter" | "--impacted"
             ) || arg.starts_with("--impacted=")
+                || arg.starts_with("--stats=")
             {
                 continue;
             }
@@ -1405,6 +1433,10 @@ fn record_impacted_inputs(root: &Path) {
 }
 
 fn run(args: &[String]) -> u8 {
+    // `--explain-cache` reports the cache's refusals and runs nothing.
+    if let Some(code) = explain::run(args) {
+        return code;
+    }
     // The grammar is chosen before anything is parsed, off the line and
     // the project: `--flutter`, or the pubspec of the runner's own
     // directory — a `flutter_test` dev dependency cannot run under
@@ -1416,6 +1448,10 @@ fn run(args: &[String]) -> u8 {
         eprintln!("{FLUTTER_ROUTE_LINE}");
     }
     let flutter = route.is_some();
+    if let Some(value) = stats_value_error(args) {
+        eprintln!("dartq test: --stats takes no value or 'verbose' (got '{value}')");
+        return exit::USAGE;
+    }
     let Ok(inv) = parse(args, flutter) else {
         // No `Invocation`, so `--stats` is read off the line itself.
         let stats = args
@@ -1599,6 +1635,97 @@ fn refusal_summary(refusals: &[Option<dartq_test::Refusal>]) -> String {
         .join(", ")
 }
 
+/// Where one suite's reported events came from, for `--stats=verbose`.
+/// A suite the cache refused keeps its run verdict too, but the verbose
+/// line names the refusal: that is the actionable half.
+#[derive(Clone, Copy)]
+enum SuiteVerdict {
+    /// Replayed from the result cache.
+    Cached,
+    /// Proven by the grouped runner.
+    Grouped,
+    /// Run under the stock runner (or its shards).
+    Stock,
+}
+
+/// `path` relative to `root` when it lives inside it, else absolute.
+fn display_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).map_or_else(
+        |_| path.display().to_string(),
+        |rel| rel.display().to_string(),
+    )
+}
+
+/// The `--stats=verbose` block: one line per suite — where its events
+/// came from, and for a suite the cache refused, the closure file and
+/// reads that decided it — then the triggers that refused the most
+/// suites, most frequent first. `suites` pairs each suite's display path
+/// with its absolute path (the refusal's deciding file is suppressed
+/// when it is the suite itself).
+fn stats_verbose_text(
+    suites: &[(String, PathBuf)],
+    verdicts: &[Option<SuiteVerdict>],
+    details: &[Option<dartq_test::RefusalDetail>],
+    root: &Path,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut trigger_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for (index, (display, abs)) in suites.iter().enumerate() {
+        let line = match details.get(index).and_then(Option::as_ref) {
+            Some(detail) => {
+                let mut evidence: Vec<String> = Vec::new();
+                if let Some(file) = &detail.file
+                    && file != abs
+                {
+                    evidence.push(display_path(root, file));
+                }
+                evidence.extend(detail.triggers.iter().cloned());
+                if detail.triggers.is_empty() {
+                    *trigger_counts
+                        .entry(detail.refusal.label().to_owned())
+                        .or_default() += 1;
+                } else {
+                    for trigger in &detail.triggers {
+                        *trigger_counts.entry(trigger.clone()).or_default() += 1;
+                    }
+                }
+                let evidence = evidence.join("; ");
+                if evidence.is_empty() {
+                    format!("{display} → uncertain: {}", detail.refusal.label())
+                } else {
+                    format!(
+                        "{display} → uncertain: {} — {evidence}",
+                        detail.refusal.label()
+                    )
+                }
+            }
+            None => {
+                let verdict = match verdicts.get(index).copied().flatten() {
+                    Some(SuiteVerdict::Cached) => "cached",
+                    Some(SuiteVerdict::Grouped) => "grouped",
+                    Some(SuiteVerdict::Stock) => "stock",
+                    None => "ran",
+                };
+                format!("{display} → {verdict}")
+            }
+        };
+        let _ = writeln!(out, "{line}");
+    }
+    if !trigger_counts.is_empty() {
+        let mut ranked: Vec<(String, usize)> = trigger_counts.into_iter().collect();
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let _ = writeln!(out, "top triggers:");
+        for (trigger, count) in ranked.iter().take(10) {
+            let _ = writeln!(out, "  {count} {trigger}");
+        }
+        if ranked.len() > 10 {
+            let _ = writeln!(out, "  … and {} more", ranked.len() - 10);
+        }
+    }
+    out
+}
+
 /// Run the plan: replay what the cache proves, run the rest grouped, rerun
 /// whatever a grouped run did not prove green under the stock runner, and
 /// emit every suite's events in selection order as soon as every suite
@@ -1628,6 +1755,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let refusals: Vec<Option<dartq_test::Refusal>> = cache
         .as_ref()
         .map(|cache| cache.refusals().to_vec())
+        .unwrap_or_default();
+    let refusal_details: Vec<Option<dartq_test::RefusalDetail>> = cache
+        .as_ref()
+        .map(|cache| cache.refusal_details().to_vec())
         .unwrap_or_default();
 
     // The output side.
@@ -1685,6 +1816,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let mut clock = 0u64;
     let mut totals = Tally::default();
     let mut stats = Stats::default();
+    let mut verdicts: Vec<Option<SuiteVerdict>> = vec![None; plan.suites.len()];
     let mut rerun: Vec<usize> = Vec::new();
     let mut to_run: Vec<usize> = Vec::new();
     // A warm run parses every replayed entry's events: thousands of files,
@@ -1701,6 +1833,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             Some(events) => {
                 slots[index] = Some(events);
                 stats.replayed += 1;
+                verdicts[index] = Some(SuiteVerdict::Cached);
             }
             None => to_run.push(index),
         }
@@ -1781,7 +1914,20 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         Ok(())
     };
 
-    if grouped.len() > 1 {
+    // The group compile is a fixed kernel build (seconds cold, near-nothing
+    // warm) that only pays once it serves enough suites; below that floor
+    // every suite takes the stock path refused and launch-observing suites
+    // already take. The skip is observable on stderr only when it diverts a
+    // compile the suite count alone would have run (two or more served).
+    let skip_group = !dartq_test::group::compile_pays(grouped.len());
+    if skip_group && grouped.len() > 1 {
+        eprintln!(
+            "dartq test: {} of {} suites served by the group — skipping group compile",
+            grouped.len(),
+            plan.suites.len()
+        );
+    }
+    if !skip_group {
         let out_dir = root.join(".dart_tool").join("dartq").join("group");
         let files: Vec<PathBuf> = grouped
             .iter()
@@ -1827,6 +1973,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                         let proven = complete(&block) && tally(&block.events).green;
                         if proven {
                             stats.grouped += 1;
+                            verdicts[index] = Some(SuiteVerdict::Grouped);
                             settle(index, block, true, &mut slots, &mut cache)?;
                             emit(&mut slots, &mut outputs, &mut totals)
                         } else {
@@ -1838,6 +1985,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                 rerun.extend(leftover);
                 for index in filtered {
                     stats.grouped += 1;
+                    verdicts[index] = Some(SuiteVerdict::Grouped);
                     let block = SuiteBlock {
                         path: plan.suites[index].spelling.clone(),
                         events: Vec::new(),
@@ -1860,6 +2008,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     if !stock.is_empty() {
         let leftover = run_stock(plan, &stock, &index_of, &mut |index, block| {
             stats.stock += 1;
+            verdicts[index] = Some(SuiteVerdict::Stock);
             let proven = complete(&block) && tally(&block.events).green;
             settle(index, block, proven, &mut slots, &mut cache)?;
             emit(&mut slots, &mut outputs, &mut totals)
@@ -1868,6 +2017,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         stock_stderr = spoke;
         for (index, events) in lost {
             stats.stock += 1;
+            verdicts[index] = Some(SuiteVerdict::Stock);
             if events.is_empty() {
                 let block = SuiteBlock {
                     path: plan.suites[index].spelling.clone(),
@@ -1933,6 +2083,17 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             stats.stock,
             refusals,
             started.elapsed().as_secs_f64()
+        );
+    }
+    if plan.inv.stats_verbose {
+        let suites: Vec<(String, PathBuf)> = plan
+            .suites
+            .iter()
+            .map(|suite| (suite.spelling.clone(), suite.abs.clone()))
+            .collect();
+        eprint!(
+            "{}",
+            stats_verbose_text(&suites, &verdicts, &refusal_details, &plan.root)
         );
     }
     if totals.passed + totals.skipped + totals.failed == 0 && !totals.incomplete {
@@ -2444,7 +2605,10 @@ mod tests {
             &["-j", "0"],
             &["--pause-after-load"],
         ] {
-            assert!(parse(&args(line), false).expect("parse").delegate, "{line:?}");
+            assert!(
+                parse(&args(line), false).expect("parse").delegate,
+                "{line:?}"
+            );
         }
         assert!(
             !parse(&args(&["--no-fail-fast", "-p", "vm"]), false)
@@ -2609,6 +2773,108 @@ mod tests {
         assert_eq!(refusal_summary(&tied), "1 no-cache, 1 untrusted");
     }
 
+    /// `--stats=verbose` is the only valued form `--stats` takes; any
+    /// other value is a usage error `run` reports itself, and a `--stats=`
+    /// after `--` belongs to the runner.
+    #[test]
+    fn stats_verbose_is_the_only_valued_form() {
+        let plain = parse(&args(&["--stats"]), false).expect("parse");
+        assert!(plain.stats && !plain.stats_verbose);
+        let verbose = parse(&args(&["--stats=verbose"]), false).expect("parse");
+        assert!(verbose.stats && verbose.stats_verbose);
+        let flutter_verbose = parse(&args(&["--flutter", "--stats=verbose"]), true).expect("parse");
+        assert!(flutter_verbose.stats && flutter_verbose.stats_verbose);
+        assert!(parse(&args(&["--stats=bogus"]), false).is_err());
+        assert!(parse(&args(&["--stats="]), false).is_err());
+        assert_eq!(stats_value_error(&args(&["--stats=bogus"])), Some("bogus"));
+        assert_eq!(stats_value_error(&args(&["--stats=verbose"])), None);
+        assert_eq!(stats_value_error(&args(&["--stats"])), None);
+        // After `--` the option is the runner's own argument.
+        assert_eq!(stats_value_error(&args(&["--", "--stats=x"])), None);
+        // A delegated run never hands `--stats=<value>` to the runner.
+        assert_eq!(
+            runner_args(&args(&["-r", "json", "--stats=verbose", "--", "--stats=x"])),
+            ["-r", "json", "--", "--stats=x"]
+        );
+    }
+
+    /// The verbose block names every suite's verdict and, for a refused
+    /// suite, the closure file and reads that decided it; the trigger
+    /// summary ranks what refused the most suites.
+    #[test]
+    fn stats_verbose_names_the_trigger() {
+        use dartq_test::{Refusal, RefusalDetail};
+        let root = Path::new("/pkg");
+        let suites = [
+            (
+                "test/a_test.dart".to_owned(),
+                PathBuf::from("/pkg/test/a_test.dart"),
+            ),
+            (
+                "test/b_test.dart".to_owned(),
+                PathBuf::from("/pkg/test/b_test.dart"),
+            ),
+            (
+                "test/c_test.dart".to_owned(),
+                PathBuf::from("/pkg/test/c_test.dart"),
+            ),
+            (
+                "test/d_test.dart".to_owned(),
+                PathBuf::from("/pkg/test/d_test.dart"),
+            ),
+        ];
+        let verdicts = [
+            Some(SuiteVerdict::Cached),
+            Some(SuiteVerdict::Grouped),
+            Some(SuiteVerdict::Stock),
+            Some(SuiteVerdict::Stock),
+        ];
+        let details = [
+            None,
+            // The deciding file is a dependency's: it prints, relative
+            // when inside the root.
+            Some(RefusalDetail {
+                refusal: Refusal::Nondeterministic,
+                file: Some(PathBuf::from("/pkg/lib/client.dart")),
+                triggers: vec![
+                    "Process.run".to_owned(),
+                    "import package:http/http.dart".to_owned(),
+                ],
+                line: None,
+                chain: Vec::new(),
+            }),
+            // The deciding file is the suite itself: it is not repeated.
+            Some(RefusalDetail {
+                refusal: Refusal::Nondeterministic,
+                file: Some(PathBuf::from("/pkg/test/c_test.dart")),
+                triggers: vec!["DateTime.now".to_owned()],
+                line: None,
+                chain: Vec::new(),
+            }),
+            None,
+        ];
+        let text = stats_verbose_text(&suites, &verdicts, &details, root);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "test/a_test.dart → cached");
+        // A refusal names its kind, the deciding file and the reads.
+        assert_eq!(
+            lines[1],
+            "test/b_test.dart → uncertain: nondeterministic — lib/client.dart; Process.run; import package:http/http.dart"
+        );
+        // The suite's own file is not repeated as evidence.
+        assert_eq!(
+            lines[2],
+            "test/c_test.dart → uncertain: nondeterministic — DateTime.now"
+        );
+        assert_eq!(lines[3], "test/d_test.dart → stock");
+        // The trigger summary counts every trigger a refused suite
+        // carries, most frequent first.
+        assert_eq!(lines[4], "top triggers:");
+        assert_eq!(lines[5], "  1 DateTime.now");
+        assert_eq!(lines[6], "  1 Process.run");
+        assert_eq!(lines[7], "  1 import package:http/http.dart");
+    }
+
     /// `flutter test`'s own grammar: the tool's shaping options pass,
     /// dartq's `--no-pub`/`--machine` are recognized, `-j` follows the
     /// tool's lenient `int.tryParse`, and only the tester platform runs
@@ -2665,7 +2931,10 @@ mod tests {
             &["--flutter", "--start-paused"],
             &["--flutter", "--coverage"],
         ] {
-            assert!(parse(&args(line), true).expect("parse").delegate, "{line:?}");
+            assert!(
+                parse(&args(line), true).expect("parse").delegate,
+                "{line:?}"
+            );
         }
         // After `--` the options ended: `--flutter` is a selection.
         let after = parse(&args(&["--", "--flutter"]), false).expect("parse");
@@ -2684,10 +2953,7 @@ mod tests {
         )
         .expect("write");
         assert!(flutter_test_package(root));
-        assert_eq!(
-            flutter_route(&args(&[]), root),
-            Some(FlutterRoute::Pubspec)
-        );
+        assert_eq!(flutter_route(&args(&[]), root), Some(FlutterRoute::Pubspec));
         // The grammar the route chooses: an option only the tool's table
         // knows parses, and the invocation is the flutter one.
         let inv = parse(&args(&["--machine"]), true).expect("parse");

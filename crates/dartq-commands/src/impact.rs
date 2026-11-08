@@ -422,8 +422,9 @@ pub fn impact_after_analysis_with_symbols(
 /// The `dartq test --impacted` selection — the one implementation the CLI's
 /// test faces and the daemon's `dartq/test/run` share (the daemon spawns a
 /// `dartq test` child, whose selection this is): the changed `_test.dart`
-/// files plus every suite the semantic impact graph reports for the changed
-/// libraries, as root-relative `/`-joined spellings.
+/// files plus every suite under `root` whose directive closure
+/// (`import`/`export`/`part`, every conditional branch) reaches a changed
+/// file, as root-relative `/`-joined spellings.
 ///
 /// The changes are collected worktree-wide (`changed_since`) and
 /// classified by ownership, not location: a pub workspace (or a `path:`
@@ -462,31 +463,37 @@ pub fn impact_after_analysis_with_symbols(
 /// executed ([`record_resolution_stamp`]).
 ///
 /// The resolution table is built once, SDK-free, for the stamp check and
-/// the ownership verdict; the engine opens only when a seed needs the
-/// graph, and the analysis pass runs only for seeds.
+/// the ownership verdict; the directive reach
+/// ([`dartq_engine::import_reach`]) runs only for seeds. It reads local
+/// files only — no semantic analysis, no dependency closure: a pub-cache
+/// or SDK package is immutable for one resolution (the stamp witnesses
+/// its identity), so it is an opaque sink of the graph, however many files
+/// its closure holds. A deleted seed keeps its importers' edges (the
+/// resolver lands the dangling target), so they are selected.
 ///
 /// `Err(reason)` is the conservative fallback — run the full selection —
 /// taken when the change cannot be bounded: no record of the ignored
 /// resolution inputs (or one that differs), no repository (or `base` does
 /// not resolve), a change whose blast radius no selection can approximate
 /// (a pubspec or its overrides, an options file, generated code), or a
-/// workspace whose semantic graph cannot assemble. The reason is the
+/// workspace whose resolution tables cannot assemble (an unusable SDK root
+/// or package config). The reason is the
 /// diagnostic the caller prints (the CLI's `dartq test: {reason} — running
 /// everything` line); there is no narrower heuristic to fall back to — the
 /// retired same-package-tests guess is gone, and the fallback is the full
 /// run, never a guess.
 ///
-/// `sdk` is the SDK root override ([`open_engine`]'s `None` = discovery);
+/// `sdk` is the SDK root override ([`engine_config`]'s `None` = discovery);
 /// production callers pass `None` — the parameter exists so a pinned
 /// assembly is possible (and testable).
 ///
-/// A failure inside the selection itself takes the same fallback: the
-/// analysis pass's structured error, or a panic anywhere in the selection
+/// A failure inside the selection itself takes the same fallback: a panic
+/// anywhere in the selection
 /// (on this thread or a rayon worker it fans out to), answers
 /// `Err("impact analysis failed (<reason>)")` — the bounds are lost, the
 /// run is not (see `contain_panics`).
 ///
-/// [`open_engine`]: crate::workspace::open_engine
+/// [`engine_config`]: crate::workspace::engine_config
 /// [`PackageTable::containing`]: dartq_package::PackageTable::containing
 pub fn impacted_tests(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<String>, String> {
     contain_panics(|| select_impacted(root, sdk, base))
@@ -628,44 +635,18 @@ fn select_impacted(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<St
         // run.
         return Ok(Vec::new());
     }
-    let (mut engine, _dir) = crate::workspace::open_engine(root, sdk)
+    // The directive reach answers the selection: test impact is import
+    // reachability, so no element model, no semantic pass, and no
+    // dependency closure is built — only the local files a suite's
+    // directives reach are read (see `dartq_engine::import_reach`). The
+    // engine config is assembled for its resolution tables alone (the SDK
+    // snapshot resolves `dart:` targets as opaque sinks).
+    let (config, _dir) = crate::workspace::engine_config(root, sdk)
         .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
-    crate::analyze::run_overlaid(&mut engine, &[], &[])
-        .map_err(|error| format!("impact analysis failed ({error})"))?;
-    // A dependency closure that hit the interface index's file cap cannot
-    // see every dependency's faces: a change inside the skipped tail could
-    // hide the suites it reaches, so the selection is unbounded — the same
-    // conservative outcome as every other "cannot determine" boundary. The
-    // engine already named the cap on stderr at the moment it tripped; the
-    // reason here names it for the `dartq test: {reason} — running
-    // everything` line.
-    if engine.dep_index_capped() {
-        return Err(format!(
-            "dependency index capped at {} files — impact scope unknown",
-            engine.dep_index_cap()
-        ));
-    }
-    // The report's test paths spell through the file locator (root-relative
-    // inside the analysis root, absolute outside), so a relative tail
-    // resolves back against the root that stripped it — the engine's own
-    // workspace root, the one base every row's spelling was derived from.
-    let analysis_root = engine.packages().workspace_root().to_path_buf();
-    for seed in &seeds {
-        let report = impact_after_analysis(&engine, seed).map_err(|error| {
-            format!(
-                "{} is outside the analyzed workspace: {error}",
-                seed.display()
-            )
-        })?;
-        selected.extend(report.affected_tests.into_iter().map(|test| {
-            let path = PathBuf::from(test.path);
-            if path.is_absolute() {
-                path
-            } else {
-                analysis_root.join(path)
-            }
-        }));
-    }
+    let entries = test_suites(root);
+    let reach = dartq_engine::import_reach(&config, &entries, &seeds)
+        .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
+    selected.extend(reach.reached);
     Ok(selected
         .into_iter()
         .filter_map(|path| {
@@ -675,6 +656,40 @@ fn select_impacted(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<St
         })
         .filter(|rel| rel.ends_with("_test.dart"))
         .collect())
+}
+
+/// Every `_test.dart` file under `root` — the suites a run could execute,
+/// the reach's entry set. A directory walk with no reads; dot-prefixed
+/// entries are skipped (the discovery walk's rule: `.dart_tool`, `.git`,
+/// hidden files), and symlinked directories are never descended (no
+/// cycles). Sorted, so the reach's entry order is deterministic.
+fn test_suites(root: &Path) -> Vec<PathBuf> {
+    let mut suites = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if name.ends_with("_test.dart") {
+                suites.push(entry.path());
+            }
+        }
+    }
+    suites.sort_unstable();
+    suites
 }
 
 /// The ignored resolution inputs of one `--impacted` run: `pubspec.lock`,
@@ -837,7 +852,7 @@ fn relative_input(root: &Path, path: &Path) -> String {
 /// `root` and the package table carry. A rename lists as its deleted
 /// original plus the added file (`--no-renames`, overriding any
 /// `diff.renames`), so the old path's importers never drop out: the
-/// caller's seed for a missing file is the full run. A single-package
+/// missing file still seeds its importers. A single-package
 /// repository (toplevel = `root`) yields the package-local set. `None` when
 /// there is no repository, `base` does not resolve, or the toplevel cannot
 /// be canonicalized.
@@ -1944,11 +1959,12 @@ mod tests {
     }
 
     /// A staged rename lists as the deleted original plus the added file:
-    /// the original seeds and, missing, refuses — the full run. Under
-    /// rename detection only `c.dart` would list, reaching nothing, while
-    /// `a.dart`'s `package:b/b.dart` import now dangles.
+    /// the original seeds, and the resolver still lands `a.dart`'s
+    /// now-dangling `package:b/b.dart` import on it, so the suite whose
+    /// closure breaks is selected. Under rename detection only `c.dart`
+    /// would list, reaching nothing.
     #[test]
-    fn impacted_tests_run_everything_when_a_library_is_renamed() {
+    fn impacted_tests_select_the_importers_of_a_renamed_library() {
         let top = git_pub_workspace("impact_sel_ws_rename");
         let root = top.join("ws/packages/a");
         record_resolution_stamp(&root).expect("record the inputs");
@@ -1956,15 +1972,12 @@ mod tests {
             &top,
             &["mv", "ws/packages/b/lib/b.dart", "ws/packages/b/lib/c.dart"],
         );
-        let reason = impacted_tests(&root, Some(&top.join("sdk")), "HEAD")
-            .expect_err("the full-run fallback");
-        let original = top.join("ws/packages/b/lib/b.dart");
-        assert!(
-            reason.starts_with(&format!(
-                "{} is outside the analyzed workspace",
-                original.display()
-            )),
-            "the deleted original refuses: {reason}"
+        let selected =
+            impacted_tests(&root, Some(&top.join("sdk")), "HEAD").expect("bounded selection");
+        assert_eq!(
+            selected,
+            vec!["test/a_test.dart".to_owned()],
+            "the deleted original's importer chain"
         );
         fs::remove_dir_all(&top).ok();
     }
@@ -3134,39 +3147,80 @@ mod tests {
     /// import, clean of every other diagnostic face.
     const UI_IMPORT: &str = "import 'dart:ui';\nvoid main() {}\n";
 
-    /// The dependency-index cap is a selection boundary: with
-    /// `DARTQ_DEP_FILE_CAP=1` the lazy closure loads one dep file and the
-    /// next `package:` target trips the cap, so `select_impacted` must
-    /// answer the unbounded reason — never a reach computed over a
-    /// truncated closure. The same fixture at the production cap bounds
-    /// the change to the one suite whose import reaches it. One test owns
-    /// both arms: the cap rides a process-global env var, and two
-    /// concurrent tests mutating it would race.
+    /// #4144: the selection never builds a dependency closure. The fixture's
+    /// `package:dep1` chain (dep1 → dep2 → dep3, hosted in the lock, so
+    /// immutable for the resolution) is an opaque sink: the reach reads
+    /// only the two local files on the suite's path (`a_test.dart`,
+    /// `a.dart`) however large the closure behind them, so a repository
+    /// whose dependency closure dwarfs any interface-index cap still
+    /// narrows — and no engine opens (the reach runs over the assembled
+    /// resolution tables alone).
     #[test]
-    fn impacted_tests_dep_cap_truncation_degrades_to_unbounded() {
-        let prev = std::env::var("DARTQ_DEP_FILE_CAP").ok();
-        let root = dep_cap_fixture();
-        let sdk = root.parent().expect("toplevel").join("sdk");
-        unsafe { std::env::set_var("DARTQ_DEP_FILE_CAP", "1") };
-        let capped = impacted_tests(&root, Some(&sdk), "HEAD");
-        match prev {
-            Some(value) => unsafe { std::env::set_var("DARTQ_DEP_FILE_CAP", value) },
-            None => unsafe { std::env::remove_var("DARTQ_DEP_FILE_CAP") },
-        }
-        let reason = capped.expect_err("the capped closure cannot bound the change");
-        assert!(
-            reason.starts_with("dependency index capped at "),
-            "names the cap: {reason}"
-        );
+    fn impacted_tests_narrow_without_reading_the_dependency_closure() {
+        let root = dep_cap_fixture("narrow");
+        let top = root.parent().expect("toplevel").to_path_buf();
+        let sdk = top.join("sdk");
+        let selected = impacted_tests(&root, Some(&sdk), "HEAD").expect("bounded selection");
+        assert_eq!(selected, vec!["test/a_test.dart".to_owned()]);
 
+        let (config, _) = crate::workspace::engine_config(&root, Some(&sdk)).expect("config");
+        let reach = dartq_engine::import_reach(
+            &config,
+            &[root.join("test/a_test.dart")],
+            &[root.join("lib/a.dart")],
+        )
+        .expect("reach");
+        assert_eq!(reach.reached, vec![root.join("test/a_test.dart")]);
+        assert_eq!(reach.scanned, 2, "the suite and a.dart only, no dep file");
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// The one way an immutable package relays a local change: a hosted
+    /// package whose code imports an editable one (here `relay` imports
+    /// the local path package `loc`, the `dependency_overrides` shape).
+    /// `relay`'s pubspec declares `loc`, so the transparency fixpoint walks
+    /// it, and an edit to `loc` selects the suite reaching it only through
+    /// `relay`. The unrelated hosted chain stays unread.
+    #[test]
+    fn impacted_tests_follow_a_dependency_that_relays_a_local_package() {
+        let root = dep_cap_fixture("relay");
+        let top = root.parent().expect("toplevel").to_path_buf();
+        fs::write(top.join("loc/lib/l.dart"), "class L2 {}\n").expect("modify l.dart");
         let selected =
-            impacted_tests(&root, Some(&sdk), "HEAD").expect("bounded selection");
+            impacted_tests(&root, Some(&top.join("sdk")), "HEAD").expect("bounded selection");
         assert_eq!(
             selected,
-            vec!["test/a_test.dart".to_owned()],
-            "under the production cap the same change bounds to its reach"
+            vec![
+                "test/a_test.dart".to_owned(),
+                "test/relay_test.dart".to_owned()
+            ],
+            "a.dart's suite plus the suite reached through the relaying dependency"
         );
-        std::fs::remove_dir_all(root.parent().expect("toplevel")).ok();
+        fs::remove_dir_all(&top).ok();
+    }
+
+    /// A tracked `pubspec.lock` edit is a resolution change: the full run,
+    /// before any graph work (the unusable SDK root proves no assembly
+    /// beyond the package table ran).
+    #[test]
+    fn impacted_tests_run_everything_when_the_lock_changes() {
+        let root = dep_cap_fixture("lock");
+        let top = root.parent().expect("toplevel").to_path_buf();
+        let lock = root.join("pubspec.lock");
+        let text = fs::read_to_string(&lock).expect("lock");
+        fs::write(
+            &lock,
+            text.replace("version: \"0.1.0\"", "version: \"0.2.0\""),
+        )
+        .expect("bump");
+        let reason = impacted_tests(&root, Some(&top.join("no-such-sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert!(
+            reason == format!("{} changed", lock.display())
+                || reason.ends_with("changed since the last impacted run (ignored by git)"),
+            "a resolution change: {reason}"
+        );
+        fs::remove_dir_all(&top).ok();
     }
 
     /// Builds the dep-cap fixture and returns the package root (`ws/`)
@@ -3177,11 +3231,14 @@ mod tests {
     /// is what `dep_candidate` keys on (an in-bound package root becomes a
     /// discovery context root and its files arrive resident, never
     /// through the lazy index, so the cap could never trip). `ws/lib/a.dart`
-    /// imports `package:dep1/d1.dart`, which chains dep2 → dep3; the stub
-    /// SDK sits beside both at `sdk/`.
-    fn dep_cap_fixture() -> PathBuf {
+    /// imports `package:dep1/d1.dart`, which chains dep2 → dep3. Beside
+    /// them: `loc`, a local path package, and `relay`, a hosted package
+    /// whose pubspec declares `loc` and whose `r.dart` imports it;
+    /// `ws/test/relay_test.dart` imports `package:relay/r.dart`. The stub
+    /// SDK sits beside all of them at `sdk/`.
+    fn dep_cap_fixture(tag: &str) -> PathBuf {
         let top = std::env::temp_dir().join(format!(
-            "dq_cmd_impact_dep_cap_{}",
+            "dq_cmd_impact_dep_cap_{tag}_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&top);
@@ -3200,7 +3257,7 @@ mod tests {
         );
         write(
             "ws/pubspec.lock",
-            "packages:\n  dep1:\n    dependency: \"direct main\"\n    description:\n      name: dep1\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  dep2:\n    dependency: transitive\n    description:\n      name: dep2\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  dep3:\n    dependency: transitive\n    description:\n      name: dep3\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+            "packages:\n  dep1:\n    dependency: \"direct main\"\n    description:\n      name: dep1\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  dep2:\n    dependency: transitive\n    description:\n      name: dep2\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  dep3:\n    dependency: transitive\n    description:\n      name: dep3\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\n  relay:\n    dependency: \"direct main\"\n    description:\n      name: relay\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"0.1.0\"\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
         );
         // `package:depN` maps at the sibling `deps/` roots: `rootUri` is
         // relative to `ws/.dart_tool/`, so two `..` climb to the toplevel.
@@ -3210,13 +3267,32 @@ mod tests {
                 {"name": "ws", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"},
                 {"name": "dep1", "rootUri": "../../deps/dep1", "packageUri": "lib/", "languageVersion": "3.5"},
                 {"name": "dep2", "rootUri": "../../deps/dep2", "packageUri": "lib/", "languageVersion": "3.5"},
-                {"name": "dep3", "rootUri": "../../deps/dep3", "packageUri": "lib/", "languageVersion": "3.5"}
+                {"name": "dep3", "rootUri": "../../deps/dep3", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "relay", "rootUri": "../../deps/relay", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "loc", "rootUri": "../../loc", "packageUri": "lib/", "languageVersion": "3.5"}
             ], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         );
-        write("ws/lib/a.dart", "import 'package:dep1/d1.dart';\nclass A {}\n");
+        write(
+            "ws/lib/a.dart",
+            "import 'package:dep1/d1.dart';\nclass A {}\n",
+        );
         write(
             "ws/test/a_test.dart",
             "import 'package:ws/a.dart';\nvoid main() {}\n",
+        );
+        write(
+            "ws/test/relay_test.dart",
+            "import 'package:relay/r.dart';\nvoid main() {}\n",
+        );
+        write("loc/pubspec.yaml", "name: loc\nversion: 0.1.0\n");
+        write("loc/lib/l.dart", "class L {}\n");
+        write(
+            "deps/relay/pubspec.yaml",
+            "name: relay\nversion: 0.1.0\ndependencies:\n  loc:\n    path: ../../loc\n",
+        );
+        write(
+            "deps/relay/lib/r.dart",
+            "import 'package:loc/l.dart';\nclass R {}\n",
         );
         for (name, imports, file) in [
             ("dep1", "import 'package:dep2/d2.dart';", "d1.dart"),

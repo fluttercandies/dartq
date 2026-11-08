@@ -94,6 +94,8 @@ use dartq_commands::workspace::{
 use dartq_diagnostics::{AnalysisOutput, Diagnostic, Severity, write_json};
 use dartq_engine::EngineConfig;
 use dartq_sdk::SdkSnapshot;
+#[cfg(unix)]
+use dartq_toolchain::run_queue::{self, Event, RunGuard};
 
 mod compat;
 mod debug;
@@ -153,6 +155,18 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() -> ExitCode {
     let mut raw_args = std::env::args_os();
     let argv0 = raw_args.next();
+    // The `dart` PATH shim: when argv0 names this binary `dart` (the
+    // symlink `dartq shim install dart` puts on PATH) or DARTQ_SHIM=dart,
+    // the process IS the dart shim — `dart analyze` routes through the
+    // run queue and the analyzer RSS budget, every other dart
+    // subcommand execs the real SDK dart. Checked before the flutter
+    // shim: `DARTQ_SHIM=dart` is the one env spelling that must not fall
+    // into the flutter face.
+    if dartq_toolchain::shim::is_dart_shim_invocation(argv0.as_deref()) {
+        let raw: Vec<std::ffi::OsString> = raw_args.collect();
+        let code = dart_shim(&raw);
+        return ExitCode::from(u8::try_from(code).unwrap_or(exit::INTERNAL_ERROR));
+    }
     // `flutter` PATH shim: when argv0 names this binary `flutter` (the
     // symlink `dartq shim install` puts on PATH) or DARTQ_SHIM is set,
     // the process IS the shim — config discovery, cache logic, and the
@@ -196,7 +210,52 @@ fn flutter_face_argv(argv: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString
     }
 }
 
+/// The `dart` shim face: `dart analyze …` is dartq's analyze command
+/// verbatim (the argv after the `dart` token IS the subcommand line —
+/// `analyze` plus its flags and targets), so it re-enters the normal CLI
+/// parse and inherits the run queue and the analyzer RSS budget. Every
+/// other dart invocation passes through to the real SDK dart, argv
+/// untouched.
+fn dart_shim(raw: &[std::ffi::OsString]) -> i32 {
+    let is_analyze = raw
+        .first()
+        .is_some_and(|token| token == std::ffi::OsStr::new("analyze"));
+    if is_analyze {
+        let args: Vec<String> = raw
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        return i32::from(run(&args));
+    }
+    dartq_toolchain::shim::dart_passthrough(raw)
+}
+
+/// `--engine official` and `--engine dartq` spelled with a space, rewritten
+/// to the `=` form clap requires: with an optional value, clap would
+/// otherwise read the bare 0.1.12 spelling `--engine <target>` as an engine
+/// value. Everything after `--` is left alone.
+fn engine_spelling(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut tokens = args.iter().peekable();
+    while let Some(arg) = tokens.next() {
+        if arg == "--" {
+            out.push(arg.clone());
+            out.extend(tokens.cloned());
+            break;
+        }
+        match tokens.peek() {
+            Some(value) if arg == "--engine" && matches!(value.as_str(), "official" | "dartq") => {
+                out.push(format!("--engine={value}"));
+                tokens.next();
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
 fn run(args: &[String]) -> u8 {
+    let args = engine_spelling(args);
     match Cli::try_parse_from(std::iter::once("dartq").chain(args.iter().map(String::as_str))) {
         Ok(Cli {
             command: Some(Command::Check(check_args)),
@@ -264,7 +323,7 @@ fn run(args: &[String]) -> u8 {
         }) => shim(&shim_args),
         Ok(Cli {
             command: Some(Command::Test(test_args)),
-        }) => test::run_entry(&test_args),
+        }) => test::run_entry(&queue_bypass(test_args)),
         Ok(Cli {
             command: Some(Command::ResolveAt(resolve_args)),
         }) => resolve::resolve_at_entry(&resolve_args),
@@ -384,10 +443,13 @@ enum Command {
     /// prints the machine-readable edit set; `--write` applies it in
     /// place, refusing any file outside the workspace.
     Rename(rename::RenameArgs),
-    /// Manage the `flutter` PATH shim: `install` links
-    /// `~/.dartq/bin/flutter` at this executable (the opt-in
-    /// interception — `dartq flutter` needs no shim), `remove` unlinks
-    /// it. A real file at the path is never touched.
+    /// Manage the SDK PATH shims: `install [flutter|dart]` links
+    /// `~/.dartq/bin/<tool>` at this executable (the opt-in
+    /// interception — `dartq flutter`/`dartq analyze` need no shim),
+    /// `remove [flutter|dart]` unlinks it. `flutter` intercepts the
+    /// build cache; `dart` routes only `dart analyze` through the run
+    /// queue and analyzer memory budget — every other dart subcommand
+    /// passes through verbatim. A real file at the path is never touched.
     Shim(ShimArgs),
     /// `dart test` (or, with `--flutter`, `flutter test`) with the same
     /// arguments and output, plus a result cache shared across worktrees,
@@ -420,11 +482,11 @@ enum Command {
 /// options-free.
 #[derive(Args)]
 struct CheckArgs {
-    /// Run the in-process scan + parse pass instead of the official
-    /// analyzer (experimental, not diagnostic-parity yet; one stderr line
-    /// says so).
-    #[arg(long)]
-    engine: bool,
+    /// The analyzer: `official` (the default) or `dartq`, the in-process
+    /// scan + parse pass (experimental, not diagnostic-parity yet; one
+    /// stderr line says so). A bare `--engine` is `dartq`.
+    #[arg(long, value_enum, num_args = 0..=1, require_equals = true, default_missing_value = "dartq")]
+    engine: Option<EngineArg>,
     #[arg(long, value_enum, default_value_t = CheckFormat::Lon)]
     format: CheckFormat,
     /// Write one metrics JSON object to PATH at exit. Requires `--engine`.
@@ -457,6 +519,10 @@ struct CheckArgs {
     /// engine serves the plain face.
     #[arg(long)]
     cold: bool,
+    /// Skip the machine-wide analyze run queue (see
+    /// [`AnalyzeArgs::no_queue`]).
+    #[arg(long, hide = true)]
+    no_queue: bool,
     /// The dartdev global flags — see [`DartdevGlobals`].
     #[command(flatten)]
     dartdev_globals: DartdevGlobals,
@@ -483,12 +549,28 @@ struct AnalyzeArgs {
     /// directory (the oracle's `Directory.current` fallback).
     #[arg(default_value = ".")]
     targets: Vec<PathBuf>,
-    /// Run the in-process dartq engine instead of delegating to the
-    /// official `dart analyze` (experimental, not diagnostic-parity yet;
-    /// one stderr line says so). The flags marked `Requires --engine` are
-    /// usage errors without it.
+    /// The analyzer: `official` runs the Dart analyzer (resident server
+    /// or one `dart analyze` per run), `dartq` the in-process dartq engine
+    /// (experimental, not diagnostic-parity yet; one stderr line says so).
+    /// Unset, `analyzer.engine` in `dartq.yaml` decides, else `official`. A
+    /// bare `--engine` is `dartq`. The flags marked `Requires --engine
+    /// dartq` are usage errors on `official`.
+    #[arg(long, value_enum, num_args = 0..=1, require_equals = true, default_missing_value = "dartq")]
+    engine: Option<EngineArg>,
+    /// Run `dart analyze` once for this run instead of asking the resident
+    /// analysis server (`analyzer.official.resident: false` sets it for
+    /// good). Official engine only.
     #[arg(long)]
-    engine: bool,
+    no_resident: bool,
+    /// Print one stderr line naming the engine that answered (and, for
+    /// `official`, the SDK version and whether the resident server or a
+    /// per-run `dart analyze` did).
+    #[arg(long)]
+    stats: bool,
+    /// Serve the resident analysis server of the key directory DIR (the
+    /// daemon entry the client starts; not for direct use).
+    #[arg(long = "resident-serve", value_name = "DIR", hide = true)]
+    resident_serve: Option<PathBuf>,
     /// Output format: the constant default is `lon` (canonical LON over
     /// the short vocabulary — never the terminal's shape, so a piped run
     /// and a TTY run print the same bytes); `json` is the frozen
@@ -568,6 +650,13 @@ struct AnalyzeArgs {
     /// `--engine`.
     #[arg(long, value_name = "MiB")]
     memory_limit: Option<u64>,
+    /// Skip the machine-wide analyze run queue: by default every official
+    /// `dart analyze` child waits its turn (queue name `analyze`,
+    /// serialized against other dartq analyzes — never against
+    /// `dartq test`). dartq's own flag — the official analyzer has no
+    /// such spelling.
+    #[arg(long, hide = true)]
+    no_queue: bool,
     /// Print each workspace engine's memory posture to stderr after the
     /// run (requires `--engine`) — one `dartq-memory` line per engine
     /// carrying the budget ladder's state (the armed limit, descended
@@ -719,6 +808,30 @@ impl AnalyzeArgs {
         ]));
         argv.extend(self.targets.iter().map(OsString::from));
         argv
+    }
+
+    /// The resident request, or `None` when a flag needs the per-run child:
+    /// `--no-resident`, `--sdk-path` (another SDK), `--cache` (the user's
+    /// cache), `--enable-experiment`, `--[no-]plugins` (the server flag is
+    /// newer than the oldest served SDK; dartdev answers it per SDK), the
+    /// snapshot flavor, and the dartdev globals whose effect the resident
+    /// path does not reproduce.
+    fn resident_request(&self) -> Option<ResidentAsk> {
+        let per_run = self.no_resident
+            || self.sdk_path.is_some()
+            || self.cache.is_some()
+            || !self.enable_experiments.is_empty()
+            || self.plugins
+            || self.no_plugins
+            || self.use_aot_snapshot
+            || self.no_use_aot_snapshot
+            || self.dartdev_globals.verbose
+            || self.dartdev_globals.version;
+        (!per_run).then(|| ResidentAsk {
+            packages: self.packages.clone(),
+            fatal_warnings: !self.no_fatal_warnings,
+            fatal_infos: self.fatal_infos,
+        })
     }
 }
 
@@ -951,6 +1064,7 @@ fn check_from_analyze(args: &AnalyzeArgs) -> CheckArgs {
         no_fatal_warnings: args.no_fatal_warnings,
         fatal_infos: args.fatal_infos,
         cold: args.cold,
+        no_queue: args.no_queue,
         dartdev_globals: args.dartdev_globals,
         paths: args.targets.clone(),
     }
@@ -1285,19 +1399,51 @@ enum Backend {
     Engine,
 }
 
+/// The `--engine` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum EngineArg {
+    Official,
+    Dartq,
+}
+
 impl Backend {
-    const fn of(engine: bool) -> Self {
-        if engine { Self::Engine } else { Self::Official }
+    /// The flag, then `analyzer.engine` in `dartq.yaml`, then `official`.
+    fn of(flag: Option<EngineArg>, config: Option<dartq_commands::config::Engine>) -> Self {
+        use dartq_commands::config::Engine;
+        match (flag, config) {
+            (Some(EngineArg::Dartq), _) | (None, Some(Engine::Dartq)) => Self::Engine,
+            (Some(EngineArg::Official), _) | (None, Some(Engine::Official) | None) => {
+                Self::Official
+            }
+        }
+    }
+
+    /// [`Backend::of`] over the cwd's `dartq.yaml`. An unreadable config
+    /// leaves the choice to the flag and the default: the analyze face never
+    /// failed on `dartq.yaml` and must not start now.
+    fn resolve(flag: Option<EngineArg>) -> Self {
+        let config = flag
+            .is_none()
+            .then(|| std::env::current_dir().ok())
+            .flatten()
+            .and_then(|cwd| dartq_commands::config::discover(&cwd).ok().flatten())
+            .and_then(|config| config.engine());
+        Self::of(flag, config)
     }
 }
 
-/// The `--engine` path's one stderr line; the default path prints none.
+/// The dartq engine's one stderr line; the official engine prints none.
 const ENGINE_NOTE: &str =
     "dartq analyze: using the dartq engine (experimental, not diagnostic-parity yet)";
 
 /// The usage error of an engine-only flag on the official backend.
 fn engine_only_message(flag: &str) -> String {
-    format!("error: {flag} requires --engine: only the in-process dartq engine reads it")
+    format!("error: {flag} requires --engine dartq: only the in-process dartq engine reads it")
+}
+
+/// The usage error of an official-only flag on the dartq engine.
+fn official_only_message(flag: &str) -> String {
+    format!("error: {flag} requires --engine official: only the official analyzer reads it")
 }
 
 /// Routes one analyze or check invocation to its backend. `engine_only` is
@@ -1306,16 +1452,21 @@ fn engine_only_message(flag: &str) -> String {
 fn dispatch(
     backend: Backend,
     engine_only: Option<&str>,
+    official_only: Option<&str>,
     official: impl FnOnce() -> u8,
     engine: impl FnOnce() -> u8,
 ) -> u8 {
-    match (backend, engine_only) {
-        (Backend::Official, None) => official(),
-        (Backend::Official, Some(flag)) => {
+    match (backend, engine_only, official_only) {
+        (Backend::Official, None, _) => official(),
+        (Backend::Official, Some(flag), _) => {
             eprintln!("{}", engine_only_message(flag));
             exit::USAGE
         }
-        (Backend::Engine, _) => {
+        (Backend::Engine, _, Some(flag)) => {
+            eprintln!("{}", official_only_message(flag));
+            exit::USAGE
+        }
+        (Backend::Engine, _, None) => {
             eprintln!("{ENGINE_NOTE}");
             engine()
         }
@@ -1324,15 +1475,25 @@ fn dispatch(
 
 /// `dartq analyze`.
 fn analyze(args: &AnalyzeArgs) -> u8 {
+    #[cfg(unix)]
+    if let Some(dir) = &args.resident_serve {
+        return dartq_analyzer_host::daemon::serve(dir);
+    }
     dispatch(
-        Backend::of(args.engine),
+        Backend::resolve(args.engine),
         args.engine_only_flag(),
+        args.no_resident.then_some("--no-resident"),
         || {
             official_face(
-                args.format,
-                args.memory,
-                &args.official_args(),
+                &OfficialFace {
+                    format: args.format,
+                    memory: args.memory,
+                    argv: args.official_args(),
+                    resident: args.resident_request(),
+                    stats: args.stats,
+                },
                 &args.targets,
+                args.no_queue,
             )
         },
         || analyze_engine(args),
@@ -1343,18 +1504,54 @@ fn analyze(args: &AnalyzeArgs) -> u8 {
 /// [`check`] the engine face.
 fn check_entry(args: &CheckArgs) -> u8 {
     dispatch(
-        Backend::of(args.engine),
+        Backend::resolve(args.engine),
         args.engine_only_flag(),
+        None,
         || {
             official_face(
-                args.format.into(),
-                false,
-                &args.official_args(),
+                &OfficialFace {
+                    format: args.format.into(),
+                    memory: false,
+                    argv: args.official_args(),
+                    resident: None,
+                    stats: false,
+                },
                 &args.paths,
+                args.no_queue,
             )
         },
         || check(args),
     )
+}
+
+/// One official analysis's invocation facts.
+struct OfficialFace {
+    format: AnalyzeFormat,
+    memory: bool,
+    argv: Vec<OsString>,
+    /// The resident request, when the invocation allows the resident
+    /// server; `None` runs `dart analyze` per run.
+    resident: Option<ResidentAsk>,
+    stats: bool,
+}
+
+/// What the resident server needs beyond the targets: the forwarded
+/// flags it honors.
+struct ResidentAsk {
+    packages: Option<PathBuf>,
+    fatal_warnings: bool,
+    fatal_infos: bool,
+}
+
+/// A `dartq test` line that only asks for help or the version skips the
+/// run queue: it runs no tests, so it must not wait behind a long run.
+fn queue_bypass(args: test::TestArgs) -> test::TestArgs {
+    if dartq_toolchain::zero_execution(&args.args) {
+        let mut args = args;
+        args.args.push("--no-queue".to_owned());
+        return args;
+    }
+    args
 }
 
 /// One official analysis, crash tier included: the targets classify the way
@@ -1362,29 +1559,80 @@ fn check_entry(args: &CheckArgs) -> u8 {
 /// with the same wording), `dart` resolves through the shared toolchain
 /// resolver, and a resolver miss or a binary that does not start is the
 /// usage tier — the environment failed, like the engine path's missing SDK.
-fn official_face(
-    format: AnalyzeFormat,
-    memory: bool,
-    argv: &[OsString],
-    targets: &[PathBuf],
-) -> u8 {
+fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8 {
     let outcome = crash_tier(|| {
-        let targets = match resolve_targets(targets) {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let settings = official_settings(&cwd);
+        let resolved = match resolve_targets(targets) {
             Ok(targets) => targets,
             Err(path) => {
                 eprintln!("error: Directory or file doesn't exist: {}", path.display());
                 return exit::USAGE;
             }
         };
+        let root = analysis_root(&resolved);
         let dart = dartq_toolchain::find_dart(None);
-        match official::run(dart.as_deref(), argv, analysis_root(&targets)) {
-            Ok(run) => official_finish(
-                &run,
-                format,
-                memory,
-                &mut BufWriter::new(io::stdout().lock()),
-                &mut io::stderr().lock(),
-            ),
+        let out = &mut BufWriter::new(io::stdout().lock());
+        let err = &mut io::stderr().lock();
+        // The resident server first: it shares one server between clients,
+        // so a client never holds a queue ticket; the daemon takes one only
+        // for a server start (a full analysis). Any failure falls through
+        // to the per-run child below.
+        let mut sdk = None;
+        if let (Some(ask), Some(dart), true) = (&face.resident, &dart, settings.resident) {
+            let request = dartq_analyzer_host::Request {
+                dart: dart.clone(),
+                targets: targets.to_vec(),
+                packages: ask.packages.clone(),
+                budget: settings.memory_budget_bytes,
+                idle: Duration::from_secs(settings.idle_minutes.max(1) * 60),
+                queue: resident_queue_root(&cwd, no_queue),
+            };
+            match dartq_analyzer_host::analyze(&request) {
+                dartq_analyzer_host::Outcome::Report { report, sdk } => {
+                    if face.stats {
+                        eprintln!(
+                            "dartq analyze: engine official (Dart {}, resident)",
+                            sdk.version
+                        );
+                    }
+                    let run =
+                        OfficialRun::of_report(report, ask.fatal_warnings, ask.fatal_infos, root);
+                    return official_finish(&run, face.format, face.memory, out, err);
+                }
+                dartq_analyzer_host::Outcome::Budget(message) => {
+                    eprintln!("error: {message}");
+                    return exit::USAGE;
+                }
+                dartq_analyzer_host::Outcome::PerRun { reason, sdk: found } => {
+                    if let Some(reason) = reason {
+                        eprintln!("{reason}");
+                    }
+                    sdk = found;
+                }
+            }
+        }
+        // The analyze run queue: one admission per process, held until this
+        // face returns, so concurrent per-run analyses serialize
+        // machine-wide — queue name `analyze`, never blocked behind
+        // `dartq test`. `--no-queue` bypasses; a queue that cannot be
+        // entered runs unqueued with one line, never a failed run.
+        let _queue = analyze_queue_guard(&cwd, no_queue);
+        if face.stats {
+            let version = sdk
+                .or_else(|| dart.as_deref().and_then(dartq_analyzer_host::Sdk::of_dart))
+                .map_or_else(|| "unknown".to_owned(), |sdk| sdk.version.to_string());
+            eprintln!("dartq analyze: engine official (Dart {version}, per-run)");
+        }
+        // The child's RSS budget (`analyzer.official.memory_budget_gb`,
+        // unbounded unless set): the watchdog kills an over-budget tree.
+        match official::run_with_budget(
+            dart.as_deref(),
+            &face.argv,
+            root,
+            Some(settings.memory_budget_bytes),
+        ) {
+            Ok(run) => official_finish(&run, face.format, face.memory, out, err),
             Err(error) => {
                 eprintln!("error: {error}");
                 exit::USAGE
@@ -1437,11 +1685,25 @@ fn official_finish(
     if code == exit::ERRORS && severity_exit(&run.diagnostics, false, false) != exit::ERRORS {
         let _ = writeln!(
             err,
-            "note: dart analyze found errors its machine format omits (pubspec.yaml or \
-             analysis_options.yaml); run dart analyze to see them"
+            "note: dart analyze found errors its machine and json formats omit \
+             (pubspec.yaml or analysis_options.yaml); run dart analyze to see them"
         );
     }
-    let written = emit_diagnostics(format, memory, &run.output(), out);
+    let written = match format {
+        // The official rows' own envelope: correction, context messages and
+        // documentation exactly as the analyzer reported them.
+        AnalyzeFormat::Json => {
+            let mut line = Vec::new();
+            run.write_json(&mut line).and_then(|()| {
+                let mut line = String::from_utf8(line).expect("the writer emits UTF-8");
+                if memory {
+                    splice_memory_key(&mut line);
+                }
+                out.write_all(line.as_bytes())
+            })
+        }
+        _ => emit_diagnostics(format, memory, &run.output(), out),
+    };
     if let Err(error) = written.and_then(|()| out.flush()) {
         let _ = writeln!(
             err,
@@ -1450,6 +1712,121 @@ fn official_finish(
         return exit::INTERNAL_ERROR;
     }
     code
+}
+
+// ---------------------------------------------------------------------------
+// Analyze run queue + analyzer memory budget
+// ---------------------------------------------------------------------------
+
+/// This analyze run's place in the machine-wide run queue, name `analyze`:
+/// the build cache's store root lends the queue its directory (every
+/// worktree sharing a store waits in one line), and analyzes serialize —
+/// one at a time, never blocked behind `dartq test`'s own `test` queue.
+/// A waiting run says so on stderr — when it starts waiting, every ten
+/// minutes after, and when admitted; an uncontended run prints nothing.
+/// `None` when `--no-queue` skips the queue, or when the queue cannot be
+/// entered: the queue never fails a run — one line says so and the run
+/// goes on unqueued.
+#[cfg(unix)]
+fn analyze_queue_guard(dir: &Path, no_queue: bool) -> Option<RunGuard> {
+    if no_queue {
+        return None;
+    }
+    let mut queued = false;
+    let entered = analyze_queue_root(dir).and_then(|root| {
+        run_queue::acquire_with("analyze", &root, 1, |event| match event {
+            Event::Queued { ahead } => {
+                queued = true;
+                eprintln!(
+                    "dartq analyze: {ahead} other analyze(s) in the queue — waiting \
+                     (first come, first served; --no-queue skips)"
+                );
+            }
+            Event::Still { active, waited } => eprintln!(
+                "dartq analyze: still waiting — {active} analyze(s) ahead (waited {}m)",
+                waited.as_secs() / 60
+            ),
+            // A dead analyze ticket is a run that exited without leaving
+            // the queue; its orphaned analyzer children are not the
+            // frontend_server class the build-cache reaper sweeps, so the
+            // event only lets the queue collect the ticket.
+            Event::Dead { .. } => {}
+        })
+    });
+    match entered {
+        Ok(guard) => {
+            if queued {
+                eprintln!(
+                    "dartq analyze: admitted (waited {:.1}s)",
+                    guard.waited().as_secs_f64()
+                );
+            }
+            Some(guard)
+        }
+        Err(error) => {
+            eprintln!("dartq analyze: run queue unavailable ({error}) — running unqueued");
+            None
+        }
+    }
+}
+
+/// The queue root a resident server start waits in: the per-run queue's
+/// root, so a full analysis in one worktree and a per-run one in another
+/// never run at once. `None` under `--no-queue` or when the root is
+/// unusable (the start runs unqueued, as a per-run analysis would).
+#[cfg(unix)]
+fn resident_queue_root(dir: &Path, no_queue: bool) -> Option<PathBuf> {
+    if no_queue {
+        return None;
+    }
+    analyze_queue_root(dir).ok()
+}
+
+#[cfg(not(unix))]
+fn resident_queue_root(_dir: &Path, _no_queue: bool) -> Option<PathBuf> {
+    None
+}
+
+/// Off unix there is no `flock`, so nothing queues: the queue is
+/// best-effort there.
+#[cfg(not(unix))]
+fn analyze_queue_guard(_dir: &Path, _no_queue: bool) -> Option<()> {
+    None
+}
+
+/// Where the analyze queue lives: the build cache's store root — the same
+/// root `dartq test`'s queue borrows, so every worktree of one monorepo
+/// shares both queues' directories under `<root>/queue/`. A store root
+/// that is not absolute is refused rather than let the queue land in the
+/// working tree.
+#[cfg(unix)]
+fn analyze_queue_root(dir: &Path) -> io::Result<PathBuf> {
+    let root = dartq_commands::bcache::discover_store_config(dir)
+        .map_err(io::Error::other)?
+        .store_root;
+    if !root.is_absolute() {
+        return Err(io::Error::other(format!(
+            "store root {} is not absolute",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+/// The `analyzer.official` settings of `dartq.yaml` (memory budget,
+/// resident server, idle timeout). Fail-open like the queue: an absent
+/// config is the defaults, a malformed one warns once and keeps them — the
+/// analyze face never failed on `dartq.yaml` before and must not start now.
+fn official_settings(dir: &Path) -> dartq_commands::config::OfficialSettings {
+    match dartq_commands::config::discover(dir) {
+        Ok(config) => config.unwrap_or_default().official(),
+        Err(error) => {
+            eprintln!(
+                "dartq analyze: dartq.yaml unreadable ({error}) — using the analyzer defaults"
+            );
+            dartq_commands::config::DartqConfig::default().official()
+        }
+    }
 }
 
 /// `dartq analyze --engine` — crash tier like [`check`]: a
@@ -2989,14 +3366,35 @@ struct ShimArgs {
     cmd: ShimFace,
 }
 
+/// Which SDK tool a shim verb installs or removes: `flutter` routes the
+/// flutter build-cache face (the default, the only tool before `dart`
+/// existed), `dart` routes `dart analyze` through the run queue and the
+/// analyzer RSS budget.
+#[derive(Clone, Copy, ValueEnum)]
+enum ShimTool {
+    /// `~/.dartq/bin/flutter` → `dart analyze` stays official.
+    Flutter,
+    /// `~/.dartq/bin/dart` → only `dart analyze` is intercepted; every
+    /// other dart subcommand execs the real SDK dart.
+    Dart,
+}
+
 #[derive(Subcommand)]
 enum ShimFace {
-    /// Link `~/.dartq/bin/flutter` at this executable (idempotent; a
+    /// Link `~/.dartq/bin/<tool>` at this executable (idempotent; a
     /// real file at the path is never clobbered).
-    Install,
-    /// Remove the `~/.dartq/bin/flutter` link — only the link; a real
+    Install {
+        /// Which tool to intercept (default `flutter`).
+        #[arg(value_enum, default_value_t = ShimTool::Flutter)]
+        tool: ShimTool,
+    },
+    /// Remove the `~/.dartq/bin/<tool>` link — only the link; a real
     /// file is never deleted.
-    Remove,
+    Remove {
+        /// Which tool's link to remove (default `flutter`).
+        #[arg(value_enum, default_value_t = ShimTool::Flutter)]
+        tool: ShimTool,
+    },
 }
 
 /// `dartq init`: project scaffolding. The report is human-facing prose
@@ -3018,7 +3416,7 @@ fn init() -> u8 {
             }
             println!(
                 "flutter cache: `dartq flutter <args>` (or `dartq shim install` for PATH \
-                 interception)"
+                 interception); `dart analyze` interception: `dartq shim install dart`"
             );
             exit::CLEAN
         }
@@ -3034,9 +3432,25 @@ fn init() -> u8 {
 /// refused removal over a real file — reports and exits clean: the
 /// outcome is the answer, not a failure.
 fn shim(args: &ShimArgs) -> u8 {
+    // The dart shim lives in dartq-toolchain (the flutter shim's sibling,
+    // not its dependency — bcache stays untouched). Its report prints
+    // through the same outcome lines.
+    match args.cmd {
+        ShimFace::Install {
+            tool: ShimTool::Dart,
+        } => {
+            return dart_shim_report(dartq_toolchain::shim::dart_shim_install());
+        }
+        ShimFace::Remove {
+            tool: ShimTool::Dart,
+        } => {
+            return dart_shim_report(dartq_toolchain::shim::dart_shim_remove());
+        }
+        _ => {}
+    }
     let result = match args.cmd {
-        ShimFace::Install => dartq_commands::bcache::shim_install(),
-        ShimFace::Remove => dartq_commands::bcache::shim_remove(),
+        ShimFace::Install { .. } => dartq_commands::bcache::shim_install(),
+        ShimFace::Remove { .. } => dartq_commands::bcache::shim_remove(),
     };
     match result {
         Ok(report) => {
@@ -3048,6 +3462,38 @@ fn shim(args: &ShimArgs) -> u8 {
                 ShimOutcome::Removed => println!("removed shim: {path}"),
                 ShimOutcome::NotInstalled => println!("no shim at {path}"),
                 ShimOutcome::Blocked => {
+                    println!("{path} occupied by a non-symlink; left untouched")
+                }
+            }
+            if let Some(export) = report.path_missing {
+                println!("{export}");
+            }
+            exit::CLEAN
+        }
+        Err(err) => {
+            eprintln!("dartq: {err}");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// Print a dart-shim setup report — the same prose the flutter shim
+/// face prints, over `dartq_toolchain::shim`'s report type.
+fn dart_shim_report(
+    result: Result<dartq_toolchain::shim::DartShimReport, dartq_toolchain::shim::DartShimError>,
+) -> u8 {
+    use dartq_toolchain::shim::DartShimOutcome;
+    match result {
+        Ok(report) => {
+            let path = report.shim_path.display();
+            match report.outcome {
+                DartShimOutcome::Installed => println!("installed shim: {path}"),
+                DartShimOutcome::AlreadyPresent => {
+                    println!("shim already installed: {path}")
+                }
+                DartShimOutcome::Removed => println!("removed shim: {path}"),
+                DartShimOutcome::NotInstalled => println!("no shim at {path}"),
+                DartShimOutcome::Blocked => {
                     println!("{path} occupied by a non-symlink; left untouched")
                 }
             }
@@ -3170,7 +3616,8 @@ mod tests {
     /// Parses `args` (without the program name) into a subcommand; `None`
     /// means the bare-`dartq`/version fallback.
     fn parse_args_of(args: &[&str]) -> Result<Option<Command>, clap::Error> {
-        Cli::try_parse_from(std::iter::once("dartq").chain(args.iter().copied()))
+        let args = engine_spelling(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+        Cli::try_parse_from(std::iter::once("dartq").chain(args.iter().map(String::as_str)))
             .map(|cli| cli.command)
     }
 
@@ -3220,7 +3667,11 @@ mod tests {
         let fast = analyze_args(&["analyze", "--engine", "--fast", "/pkg"]);
         assert!(fast.fast);
         let mapped = check_from_analyze(&fast);
-        assert!(mapped.engine, "the pipeline stays on the engine face");
+        assert_eq!(
+            mapped.engine,
+            Some(EngineArg::Dartq),
+            "the pipeline stays on the engine face"
+        );
         assert!(matches!(mapped.format, CheckFormat::Lon), "lon default");
         assert_eq!(mapped.paths, vec![PathBuf::from("/pkg")]);
         assert!(!mapped.no_fatal_warnings, "fatal warnings stay on");
@@ -3234,7 +3685,7 @@ mod tests {
     #[test]
     fn check_defaults() {
         let check = check_args(&["check"]);
-        assert!(!check.engine, "the official backend is the default");
+        assert_eq!(check.engine, None, "the official backend is the default");
         assert!(matches!(check.format, CheckFormat::Lon), "lon default");
         assert!(!check.no_fatal_warnings, "fatal-warnings default on");
         assert!(
@@ -3742,13 +4193,14 @@ mod tests {
         fs::write(root.join("override.dart"), "// @dart = 99.9\nvar ok = 1;\n").expect("write");
 
         let args = CheckArgs {
-            engine: true,
+            engine: Some(EngineArg::Dartq),
             format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
             cold: true,
+            no_queue: false,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
@@ -3776,13 +4228,14 @@ mod tests {
         fs::write(root.join(".dart_tool/skipme.dart"), "var no = 0;\n").expect("write");
 
         let args = CheckArgs {
-            engine: true,
+            engine: Some(EngineArg::Dartq),
             format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
             cold: true,
+            no_queue: false,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
@@ -3820,7 +4273,7 @@ mod tests {
         let canonical = root.canonicalize().expect("root");
 
         let args = CheckArgs {
-            engine: true,
+            engine: Some(EngineArg::Dartq),
             paths: vec![root.clone()],
             format: CheckFormat::Lon,
             metrics_json: None,
@@ -3828,6 +4281,7 @@ mod tests {
             no_fatal_warnings: false,
             fatal_infos: false,
             cold: true,
+            no_queue: false,
             dartdev_globals: DartdevGlobals::default(),
         };
         let mut out: Vec<u8> = Vec::new();
@@ -3872,13 +4326,14 @@ mod tests {
 
         let metrics_path = root.join("metrics.json");
         let args = CheckArgs {
-            engine: true,
+            engine: Some(EngineArg::Dartq),
             format: CheckFormat::Lon,
             metrics_json: Some(metrics_path.clone()),
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
             cold: true,
+            no_queue: false,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
@@ -3977,13 +4432,14 @@ mod tests {
 
         // End to end: the ignored arg parses nothing → empty set, exit 0.
         let args = CheckArgs {
-            engine: true,
+            engine: Some(EngineArg::Dartq),
             format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
             cold: true,
+            no_queue: false,
             dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.join("notes.txt")],
         };
@@ -4003,29 +4459,133 @@ mod tests {
         }
     }
 
-    /// `--engine` parses on both faces and selects the engine; absent, both
-    /// faces take the official backend — `check` flips with `analyze`.
+    /// The engine selection pins: a bare `--engine` is `dartq` (the 0.1.12
+    /// spelling), both values parse, an unknown value is the usage tier, and
+    /// the flag beats `analyzer.engine` in `dartq.yaml`, which beats the
+    /// `official` default.
     #[test]
-    fn engine_flag_selects_the_backend_on_both_faces() {
-        let analyze = |argv: &[&str]| Backend::of(analyze_face(argv).engine);
-        assert_eq!(analyze(&["analyze", "/p"]), Backend::Official);
-        assert_eq!(analyze(&["analyze", "--engine", "/p"]), Backend::Engine);
-        let check = |argv: &[&str]| Backend::of(check_args(argv).engine);
-        assert_eq!(check(&["check", "/p"]), Backend::Official);
-        assert_eq!(check(&["check", "--engine", "/p"]), Backend::Engine);
+    fn engine_flag_values_and_config_precedence() {
+        use dartq_commands::config::Engine;
+        let flag = |argv: &[&str]| analyze_face(argv).engine;
+        assert_eq!(flag(&["analyze", "/p"]), None);
+        assert_eq!(flag(&["analyze", "--engine", "/p"]), Some(EngineArg::Dartq));
+        assert_eq!(
+            flag(&["analyze", "--engine", "dartq", "/p"]),
+            Some(EngineArg::Dartq)
+        );
+        assert_eq!(
+            flag(&["analyze", "--engine=official", "/p"]),
+            Some(EngineArg::Official)
+        );
+        assert_eq!(
+            flag(&["analyze", "--engine", "official", "/p"]),
+            Some(EngineArg::Official)
+        );
+        assert_eq!(
+            analyze_face(&["analyze", "--engine", "/p"]).targets,
+            [PathBuf::from("/p")]
+        );
+        assert_eq!(
+            check_args(&["check", "--engine", "/p"]).engine,
+            Some(EngineArg::Dartq)
+        );
+        let owned = |argv: &[&str]| argv.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            run(&owned(&["analyze", "--engine=rust", "/p"])),
+            exit::USAGE
+        );
+
+        assert_eq!(Backend::of(None, None), Backend::Official);
+        assert_eq!(Backend::of(None, Some(Engine::Dartq)), Backend::Engine);
+        assert_eq!(Backend::of(None, Some(Engine::Official)), Backend::Official);
+        assert_eq!(
+            Backend::of(Some(EngineArg::Official), Some(Engine::Dartq)),
+            Backend::Official
+        );
+        assert_eq!(
+            Backend::of(Some(EngineArg::Dartq), Some(Engine::Official)),
+            Backend::Engine
+        );
     }
 
-    /// The one dispatch point: each backend runs alone, an engine-only flag
-    /// rides with `--engine` and is the usage tier without it.
+    /// `--cold` requires `--engine dartq` and `--no-resident` requires the
+    /// official engine: each is the usage tier on the other, by name.
+    #[test]
+    fn engine_specific_flags_are_usage_errors_on_the_other_engine() {
+        let owned = |argv: &[&str]| argv.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            run(&owned(&["analyze", "--engine=official", "--cold", "/p"])),
+            exit::USAGE
+        );
+        assert!(engine_only_message("--cold").contains("--engine dartq"));
+        assert_eq!(
+            run(&owned(&[
+                "analyze",
+                "--engine=dartq",
+                "--no-resident",
+                "/p"
+            ])),
+            exit::USAGE
+        );
+        assert!(official_only_message("--no-resident").contains("--engine official"));
+    }
+
+    /// The flags the resident server cannot honor send the run per-run.
+    #[test]
+    fn resident_requests_skip_flags_the_server_cannot_honor() {
+        let ask = |argv: &[&str]| analyze_face(argv).resident_request();
+        let plain =
+            ask(&["analyze", "--no-fatal-warnings", "--fatal-infos", "/p"]).expect("resident");
+        assert!(!plain.fatal_warnings && plain.fatal_infos);
+        for argv in [
+            &["analyze", "--no-resident", "/p"][..],
+            &["analyze", "--sdk-path", "/sdk", "/p"][..],
+            &["analyze", "--cache", "/c", "/p"][..],
+            &["analyze", "--enable-experiment=x", "/p"][..],
+            &["analyze", "--no-use-aot-snapshot", "/p"][..],
+            &["analyze", "--no-plugins", "/p"][..],
+        ] {
+            assert!(ask(argv).is_none(), "{argv:?}");
+        }
+    }
+
+    /// The #4116 call site: help and version lines gain `--no-queue`.
+    #[test]
+    fn help_and_version_test_lines_bypass_the_queue() {
+        let line = |args: &[&str]| test::TestArgs {
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+        };
+        assert_eq!(
+            queue_bypass(line(&["--help"])).args,
+            ["--help", "--no-queue"]
+        );
+        assert_eq!(
+            queue_bypass(line(&["test/a_test.dart"])).args,
+            ["test/a_test.dart"]
+        );
+    }
+
+    /// The one dispatch point: each backend runs alone, and a flag of the
+    /// other engine is the usage tier.
     #[test]
     fn dispatch_routes_one_backend_and_refuses_engine_flags_on_the_official_one() {
         const OFFICIAL: u8 = 11;
         const ENGINE: u8 = 22;
-        let route = |backend, flag| dispatch(backend, flag, || OFFICIAL, || ENGINE);
-        assert_eq!(route(Backend::Official, None), OFFICIAL);
-        assert_eq!(route(Backend::Engine, None), ENGINE);
-        assert_eq!(route(Backend::Engine, Some("--cold")), ENGINE);
-        assert_eq!(route(Backend::Official, Some("--cold")), exit::USAGE);
+        let route = |backend, flag, official_flag| {
+            dispatch(backend, flag, official_flag, || OFFICIAL, || ENGINE)
+        };
+        assert_eq!(route(Backend::Official, None, None), OFFICIAL);
+        assert_eq!(
+            route(Backend::Official, None, Some("--no-resident")),
+            OFFICIAL
+        );
+        assert_eq!(route(Backend::Engine, None, None), ENGINE);
+        assert_eq!(route(Backend::Engine, Some("--cold"), None), ENGINE);
+        assert_eq!(route(Backend::Official, Some("--cold"), None), exit::USAGE);
+        assert_eq!(
+            route(Backend::Engine, None, Some("--no-resident")),
+            exit::USAGE
+        );
     }
 
     /// Every engine-only flag on both faces: the classification names it,
@@ -4038,7 +4598,7 @@ mod tests {
             assert_eq!(run(&owned), exit::USAGE, "{argv:?}");
             let message = engine_only_message(flag);
             assert!(
-                message.contains(flag) && message.contains("--engine"),
+                message.contains(flag) && message.contains("--engine dartq"),
                 "{message}"
             );
         };
@@ -4171,13 +4731,48 @@ mod tests {
     const ERROR_ROW: &str = "ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{file}|2|5|1|m\n";
 
     /// A canned official run over one source file (`{file}` in `rows` is its
-    /// path), rooted at the file's directory. No child runs.
+    /// path), rooted at the file's directory. The rows are spelled in the
+    /// machine grammar for brevity and reach the run as the `--format json`
+    /// envelope the child prints; other lines pass through. No child runs.
     fn canned_run(rows: &str, code: Option<i32>, stderr: &str) -> (tempfile::TempDir, OfficialRun) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical root");
         let file = root.join("a.dart");
         fs::write(&file, "var a;\nvar b;\n").expect("write");
-        let stdout = rows.replace("{file}", &file.display().to_string());
+        let mut parsed = Vec::new();
+        let mut stdout = String::new();
+        for line in rows.replace("{file}", &file.display().to_string()).lines() {
+            let fields: Vec<&str> = line.split('|').collect();
+            let [severity, kind, code, path, row, column, length, message] = fields[..] else {
+                stdout.push_str(line);
+                stdout.push('\n');
+                continue;
+            };
+            let num = |text: &str| text.parse::<u32>().expect("number");
+            let (row, column, length) = (num(row), num(column), num(length));
+            let offset = (row - 1) * 7 + column - 1;
+            parsed.push(dartq_analyzer_host::Row {
+                severity: severity.into(),
+                kind: kind.into(),
+                location: dartq_analyzer_host::report::Location {
+                    file: path.into(),
+                    offset,
+                    length,
+                    start_line: Some(row),
+                    start_column: Some(column),
+                    end_line: Some(row),
+                    end_column: Some(column + length),
+                },
+                message: message.into(),
+                correction: None,
+                code: code.to_ascii_lowercase(),
+                url: None,
+                context_messages: Vec::new(),
+            });
+        }
+        let mut envelope = Vec::new();
+        dartq_analyzer_host::report::write_json(&mut envelope, &parsed).expect("write");
+        stdout.push_str(&String::from_utf8(envelope).expect("UTF-8"));
         let run = OfficialRun::parse(
             stdout.as_bytes(),
             stderr.as_bytes().to_vec(),
@@ -4395,7 +4990,7 @@ mod tests {
             matches!(args.format, AnalyzeFormat::Lon),
             "lon is the constant default"
         );
-        assert!(!args.engine, "the official backend is the default");
+        assert_eq!(args.engine, None, "the official backend is the default");
         assert!(args.metrics_json.is_none() && args.sdk_path.is_none());
         assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
@@ -4557,19 +5152,40 @@ mod tests {
     }
 
     /// `shim` carries the opt-in interception pair and needs one of
-    /// them — `dartq init` no longer installs anything.
+    /// them — `dartq init` no longer installs anything. `flutter` is the
+    /// default tool; `dart` selects the analyze-shim face.
     #[test]
     fn shim_parses_its_install_and_remove_faces() {
         assert!(matches!(
             parse_args_of(&["shim", "install"]),
             Ok(Some(Command::Shim(ShimArgs {
-                cmd: ShimFace::Install
+                cmd: ShimFace::Install {
+                    tool: ShimTool::Flutter
+                }
             })))
         ));
         assert!(matches!(
             parse_args_of(&["shim", "remove"]),
             Ok(Some(Command::Shim(ShimArgs {
-                cmd: ShimFace::Remove
+                cmd: ShimFace::Remove {
+                    tool: ShimTool::Flutter
+                }
+            })))
+        ));
+        assert!(matches!(
+            parse_args_of(&["shim", "install", "dart"]),
+            Ok(Some(Command::Shim(ShimArgs {
+                cmd: ShimFace::Install {
+                    tool: ShimTool::Dart
+                }
+            })))
+        ));
+        assert!(matches!(
+            parse_args_of(&["shim", "remove", "dart"]),
+            Ok(Some(Command::Shim(ShimArgs {
+                cmd: ShimFace::Remove {
+                    tool: ShimTool::Dart
+                }
             })))
         ));
         assert!(parse_args_of(&["shim"]).is_err());
@@ -4600,6 +5216,103 @@ mod tests {
         assert!(flutter_face_argv(&argv(&["analyze", "flutter"])).is_none());
         assert!(flutter_face_argv(&argv(&["fluttertest"])).is_none());
         assert!(flutter_face_argv(&[]).is_none());
+    }
+
+    /// The dart shim face dispatches on the first raw token: `analyze`
+    /// re-enters the CLI parse (the argv after `dart` IS the analyze
+    /// line), every other dart subcommand passes through to the real SDK
+    /// dart — the passthrough itself is exercised in dartq-toolchain's
+    /// own tests; here the routing decision is pinned.
+    #[test]
+    fn dart_shim_face_dispatches_analyze_and_passes_the_rest() {
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        // `dart analyze …` selects the analyze face: the tokens after
+        // `analyze` are the analyze argv verbatim.
+        let analyze_argv = argv(&["analyze", "--format", "json", "pkg/"]);
+        assert_eq!(
+            analyze_argv.first().map(|t| t.as_os_str()),
+            Some(std::ffi::OsStr::new("analyze")),
+            "the first token is the analyze subcommand"
+        );
+        // Anything else is passthrough territory — `dart run`, `dart
+        // test`, `dart --version` must never reach the analyze parse.
+        for passthrough in [
+            argv(&["run", "bin/main.dart"]),
+            argv(&["test"]),
+            argv(&["--version"]),
+            argv(&["pub", "get"]),
+        ] {
+            assert_ne!(
+                passthrough.first().map(|t| t.as_os_str()),
+                Some(std::ffi::OsStr::new("analyze")),
+                "{:?} must not route to analyze",
+                passthrough
+            );
+        }
+    }
+
+    /// The analyze run queue admits a contender under a configured store
+    /// root and refuses one under `--no-queue` — the ticket file appears
+    /// under `<store>/queue/analyze/tickets/` while the guard lives.
+    #[cfg(unix)]
+    #[test]
+    fn analyze_queue_guard_takes_a_ticket_unless_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("store");
+        fs::write(
+            dir.path().join("dartq.yaml"),
+            format!("version: 1\nbuild_cache:\n  root: {}\n", store.display()),
+        )
+        .expect("dartq.yaml");
+
+        // --no-queue: no guard, no ticket directory.
+        assert!(analyze_queue_guard(dir.path(), true).is_none());
+        assert!(
+            !store.join("queue").join("analyze").exists(),
+            "--no-queue must not even create the queue directory"
+        );
+
+        // Default: the guard holds a ticket under the analyze queue.
+        let guard = analyze_queue_guard(dir.path(), false)
+            .expect("an uncontended queue admits immediately");
+        let tickets = store.join("queue").join("analyze").join("tickets");
+        let count = fs::read_dir(&tickets).expect("tickets dir").count();
+        assert_eq!(count, 1, "exactly one live ticket while the guard lives");
+        drop(guard);
+        assert_eq!(
+            fs::read_dir(&tickets).expect("tickets dir").count(),
+            0,
+            "dropping the guard releases the ticket"
+        );
+    }
+
+    /// The official settings resolve from `dartq.yaml`'s `analyzer.official`
+    /// section: unbounded / resident / 15 minutes unset, a set budget in
+    /// GiB.
+    #[test]
+    fn official_settings_read_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = official_settings(dir.path());
+        assert_eq!(
+            (
+                settings.memory_budget_bytes,
+                settings.resident,
+                settings.idle_minutes
+            ),
+            (0, true, 15)
+        );
+        fs::write(
+            dir.path().join("dartq.yaml"),
+            "version: 1\nanalyzer:\n  official:\n    memory_budget_gb: 20\n    resident: false\n",
+        )
+        .expect("dartq.yaml");
+        let settings = official_settings(dir.path());
+        assert_eq!(
+            (settings.memory_budget_bytes, settings.resident),
+            (20 << 30, false)
+        );
     }
 
     /// The `--cache-size-limit` grammar rides the engine's
@@ -4692,7 +5405,10 @@ mod tests {
         metrics_json: Option<PathBuf>,
     ) -> AnalyzeArgs {
         AnalyzeArgs {
-            engine: true,
+            engine: Some(EngineArg::Dartq),
+            no_resident: false,
+            stats: false,
+            resident_serve: None,
             targets: vec![root.to_path_buf()],
             format,
             fast: false,
@@ -4707,6 +5423,7 @@ mod tests {
             no_fatal_warnings: false,
             fatal_infos: false,
             cold: true,
+            no_queue: false,
             memory_limit: None,
             memory_report: false,
             trace_events: None,

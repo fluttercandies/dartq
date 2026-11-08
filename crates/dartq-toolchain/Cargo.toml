@@ -9,6 +9,10 @@ repository.workspace = true
 categories = ["development-tools"]
 keywords = ["dart", "flutter", "toolchain"]
 
+# The process-tree budget signals analyzer trees (kill(2) per pid).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 # The run-queue tests build their ticket directories in self-cleaning
 # temporary roots.
 [dev-dependencies]

@@ -20,7 +20,9 @@
 //! directory also hid a real SDK flutter installed beside the shim.
 //!
 //! The second shared face is `run_queue` (unix): the machine-wide queue
-//! every test execution joins before it spawns those binaries.
+//! every test execution joins before it spawns those binaries. The third is
+//! `proc` (unix): the process-tree RSS sum and kill that bound an analyzer's
+//! memory.
 
 use std::ffi::OsString;
 use std::fs;
@@ -29,6 +31,14 @@ use std::path::{Path, PathBuf};
 // Unix-only: off unix there is no `flock`, and callers run unqueued.
 #[cfg(unix)]
 pub mod run_queue;
+
+/// Process-tree RSS and kill (unix): the analyzer memory budget's substrate.
+#[cfg(unix)]
+pub mod proc;
+
+/// The `dart` PATH shim: install/remove of `~/.dartq/bin/dart` and the
+/// passthrough spawn for every non-`analyze` invocation.
+pub mod shim;
 
 /// One executable's resolution facts: its file name, the environment
 /// override, and the refusal's fix hint naming every way a user can point
@@ -171,9 +181,56 @@ fn own_binary() -> Option<PathBuf> {
         .ok()
 }
 
+/// Whether a runner command line asks for nothing but an answer that runs
+/// no tests: help and version, alone or beside dartq's own switches
+/// (`--no-cache`, `--no-queue`, `--stats`, `--flutter`). Such a line must
+/// not wait behind an hours-long run in the run queue — the runner prints
+/// its text and exits. Any other token (a path, a filter, a runner flag,
+/// anything past `--`) is execution intent and keeps the queue.
+#[must_use]
+pub fn zero_execution(args: &[String]) -> bool {
+    let mut asks = false;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" | "--version" => asks = true,
+            "--no-cache" | "--no-queue" | "--stats" | "--flutter" => {}
+            _ => return false,
+        }
+    }
+    asks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Help and version lines skip the queue; any execution token keeps it.
+    #[test]
+    fn zero_execution_lines_are_help_and_version_only() {
+        let line =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|a| (*a).to_owned()).collect() };
+        assert!(zero_execution(&line(&["--help"])));
+        assert!(zero_execution(&line(&["-h"])));
+        assert!(zero_execution(&line(&["--version"])));
+        assert!(zero_execution(&line(&[
+            "--flutter",
+            "--help",
+            "--no-cache",
+            "--stats"
+        ])));
+        assert!(
+            !zero_execution(&line(&[])),
+            "an empty line runs every suite"
+        );
+        assert!(
+            !zero_execution(&line(&["--no-cache"])),
+            "switches alone still run"
+        );
+        assert!(!zero_execution(&line(&["--help", "test/a_test.dart"])));
+        assert!(!zero_execution(&line(&["--help", "-n", "x"])));
+        assert!(!zero_execution(&line(&["--", "--help"])));
+        assert!(!zero_execution(&line(&["--stats=verbose", "--help"])));
+    }
 
     /// A scratch directory under the system temp root, removed on drop (std
     /// only — the crate carries no dependencies, test-side either).

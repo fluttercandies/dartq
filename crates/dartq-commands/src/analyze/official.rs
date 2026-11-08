@@ -1,42 +1,32 @@
-//! The official analyzer backend: one `dart analyze --format machine` child
-//! whose rows parse into the [`Diagnostic`] model the engine also produces,
-//! so the two backends print through one set of writers and one exit table.
-//! The CLI selects the backend, resolves the `dart` binary, and owns the
-//! printing and the exit tier; this module owns the spawn and the parse.
+//! The official analyzer engine: the Dart analysis server's own rows,
+//! reached either through the resident server (`dartq-analyzer-host`) or
+//! through one `dart analyze --format json` child per run, and shaped into
+//! the [`Diagnostic`] model the dartq engine also produces, so both engines
+//! print through one set of writers and one exit table.
 //!
-//! The row grammar is upstream's `emitMachineFormat` (upstream Dart SDK
-//! source, `pkg/dartdev/lib/src/commands/analyze.dart`):
-//!
-//! ```text
-//! SEVERITY|TYPE|CODE|FILE_PATH|LINE|COLUMN|LENGTH|MESSAGE
-//! ```
-//!
-//! `FILE_PATH` and `MESSAGE` backslash-escape `\`, `|`, newline, and carriage
-//! return. Rows arrive sorted by upstream's own comparator (severity, path,
-//! offset, message — the order [`super::oracle_order`] reproduces for the
-//! engine), so their arrival order stands and nothing re-sorts them.
-//!
-//! The format carries less than the json face prints. A row has no offset:
-//! [`OfficialRun::parse`] recovers it from the row's source file, so offsets
-//! and end positions stay exact. A row has no correction or context messages,
-//! so those json keys are absent on this backend. And upstream leaves ERROR
-//! rows of `pubspec.yaml` and `analysis_options.yaml` out of the format while
-//! still counting them in its exit code, which is why the exit code comes
-//! from the child and is never recomputed from the rows.
+//! Both paths carry the server's `AnalysisError` rows whole
+//! ([`dartq_analyzer_host::Row`]): positions come from the server (no
+//! source re-read), and the json face re-emits `dart analyze`'s envelope
+//! from the rows ([`OfficialRun::write_json`]), `correctionMessage`,
+//! `contextMessages` and `documentation` included. Upstream leaves ERROR
+//! rows of `pubspec.yaml` and `analysis_options.yaml` out of its machine
+//! and json faces while counting them in its exit code, so the exit code is
+//! the child's (per run) or dartdev's tiers over the full report
+//! (resident), never recomputed from the printed rows.
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use dartq_analyzer_host::{Report, Row, report};
 use dartq_diagnostics::{
-    AnalysisOutput, CodeInfo, Diagnostic, DiagnosticType, FileLayoutProvider, Severity,
+    AnalysisOutput, CodeInfo, ContextMessage, Diagnostic, DiagnosticType, FileLayoutProvider,
+    Severity,
 };
-use dartq_source::{FileId, SourceRange, utf16_len_of};
+use dartq_source::{FileId, FileTable, SourceRange};
 use rustc_hash::FxHashMap;
 use thiserror::Error;
-
-use crate::check::{FileSet, read_source};
 
 /// Why no official analysis ran: the environment failed, not the analysis
 /// (the CLI's usage tier). A child that started and failed is an
@@ -44,52 +34,103 @@ use crate::check::{FileSet, read_source};
 #[derive(Debug, Error)]
 pub enum OfficialError {
     /// The toolchain resolver found no `dart` binary.
-    #[error("no dart binary found (DARTQ_DART, then PATH); install the Dart SDK or pass --engine")]
+    #[error(
+        "no dart binary found (DARTQ_DART, then PATH); install the Dart SDK or pass --engine dartq"
+    )]
     NoDart,
     /// The resolved binary did not start.
     #[error("cannot run {}: {source}", .dart.display())]
     Spawn { dart: PathBuf, source: io::Error },
+    /// The analyzer's process tree crossed the memory budget and was
+    /// killed — retryable, never a freeze.
+    #[error(
+        "analyzer exceeded the memory budget ({budget_gb} GB configured; measured {measured_gb:.1} GB) — killed; raise analyzer.official.memory_budget_gb in dartq.yaml or retry"
+    )]
+    BudgetKilled { budget_gb: u64, measured_gb: f64 },
 }
 
-/// One finished `dart analyze` child, shaped for the writers: the same
-/// diagnostic rows the engine path yields, plus the streams and the exit code
-/// the CLI relays.
+/// The RSS poll cadence of the per-run budget watchdog.
+#[cfg(unix)]
+const RSS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One finished official analysis, shaped for the writers.
 pub struct OfficialRun {
-    /// The rows that parsed, in the official display order.
+    /// The rows in the official display order, as diagnostics.
     pub diagnostics: Vec<Diagnostic>,
-    /// Stdout lines that are not rows, verbatim and in order:
-    /// `diagnostics.len() + unparsed.len()` is the child's non-empty stdout
-    /// line count.
+    /// The same rows as the server reported them (the json face's source).
+    rows: Vec<Row>,
+    /// Stdout lines that are not the envelope, verbatim and in order.
     pub unparsed: Vec<String>,
-    /// The child's stderr, verbatim.
+    /// The child's stderr, verbatim (empty on the resident path).
     pub stderr: Vec<u8>,
-    /// The child's exit code; `None` when a signal ended it.
+    /// The exit code; `None` when a signal ended the child.
     pub code: Option<i32>,
-    files: FileSet,
+    layout: Layout,
     root: Option<PathBuf>,
 }
 
 impl OfficialRun {
-    /// Shapes one child's captured streams. `root` is the run's analysis root
-    /// (the lon/text file locator's base); `None` keeps absolute spellings.
+    /// Shapes one `dart analyze --format json` child's captured streams.
+    /// `root` is the run's analysis root (the lon/text file locator's
+    /// base); `None` keeps absolute spellings.
     #[must_use]
     pub fn parse(stdout: &[u8], stderr: Vec<u8>, code: Option<i32>, root: Option<PathBuf>) -> Self {
         let stdout = String::from_utf8_lossy(stdout);
-        let mut rows = Rows::default();
-        let mut diagnostics = Vec::new();
+        let mut rows = None;
         let mut unparsed = Vec::new();
         for line in stdout.lines().filter(|line| !line.is_empty()) {
-            match rows.parse(line) {
-                Some(row) => diagnostics.push(row),
+            match rows
+                .is_none()
+                .then(|| report::parse_envelope(line))
+                .flatten()
+            {
+                Some(parsed) => rows = Some(parsed),
                 None => unparsed.push(line.to_owned()),
+            }
+        }
+        Self::of_rows(rows.unwrap_or_default(), unparsed, stderr, code, root)
+    }
+
+    /// Shapes a resident server's report: the exit code is dartdev's tiers
+    /// under the forwarded fatal flags.
+    #[must_use]
+    pub fn of_report(
+        report: Report,
+        fatal_warnings: bool,
+        fatal_infos: bool,
+        root: Option<PathBuf>,
+    ) -> Self {
+        let code = i32::from(report.exit_code(fatal_warnings, fatal_infos));
+        Self::of_rows(report.rows, Vec::new(), Vec::new(), Some(code), root)
+    }
+
+    fn of_rows(
+        rows: Vec<Row>,
+        mut unparsed: Vec<String>,
+        stderr: Vec<u8>,
+        code: Option<i32>,
+        root: Option<PathBuf>,
+    ) -> Self {
+        let mut layout = Layout::default();
+        let mut codes = FxHashMap::default();
+        let mut diagnostics = Vec::with_capacity(rows.len());
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            match layout.diagnostic(&row, &mut codes) {
+                Some(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    kept.push(row);
+                }
+                None => unparsed.push(serde_json::to_string(&row).expect("a row serializes")),
             }
         }
         Self {
             diagnostics,
+            rows: kept,
             unparsed,
             stderr,
             code,
-            files: rows.files,
+            layout,
             root,
         }
     }
@@ -102,11 +143,21 @@ impl OfficialRun {
             files: self,
         }
     }
+
+    /// `dart analyze --format json`'s envelope over this run's rows,
+    /// without the `memory` key.
+    ///
+    /// # Errors
+    ///
+    /// The writer's error.
+    pub fn write_json(&self, out: &mut impl Write) -> io::Result<()> {
+        report::write_json(out, &self.rows)
+    }
 }
 
 impl FileLayoutProvider for OfficialRun {
     fn file_path(&self, file: FileId) -> &Path {
-        self.files.file_path(file)
+        self.layout.files.path(file).expect("a row's file")
     }
 
     fn analysis_root(&self) -> Option<&Path> {
@@ -114,18 +165,120 @@ impl FileLayoutProvider for OfficialRun {
     }
 
     fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
-        self.files.line_col(file, utf16_offset)
+        self.layout
+            .positions
+            .get(&(file, utf16_offset))
+            .copied()
+            .unwrap_or((0, 0))
     }
 }
 
-/// The child's command line: `<dart> analyze --format machine <args>`, run in
-/// the invocation directory. The format is fixed: dartq parses machine rows
-/// and re-emits the face the user chose. `args` ends with the positional
-/// targets.
+/// The files the rows name and the positions the server reported for
+/// them: every offset a writer asks about is a row's start or end.
+#[derive(Default)]
+struct Layout {
+    files: FileTable,
+    positions: FxHashMap<(FileId, u32), (u32, u32)>,
+}
+
+impl Layout {
+    fn locate(&mut self, location: &report::Location) -> (FileId, SourceRange) {
+        // The server spells canonical paths already: no realpath per file.
+        let path = Path::new(&location.file);
+        let file = self.files.intern_normalized(path, path.to_path_buf());
+        let range = SourceRange {
+            offset: location.offset,
+            length: location.length,
+        };
+        let position =
+            |line: Option<u32>, column: Option<u32>| (line.unwrap_or(0), column.unwrap_or(0));
+        self.positions.insert(
+            (file, range.offset),
+            position(location.start_line, location.start_column),
+        );
+        self.positions
+            .entry((file, range.end()))
+            .or_insert_with(|| position(location.end_line, location.end_column));
+        (file, range)
+    }
+
+    /// The row as a diagnostic; `None` for a severity or type dartq does
+    /// not model.
+    fn diagnostic(
+        &mut self,
+        row: &Row,
+        codes: &mut FxHashMap<(String, DiagnosticType), CodeInfo>,
+    ) -> Option<Diagnostic> {
+        let severity = match row.severity.as_str() {
+            "ERROR" => Severity::Error,
+            "WARNING" => Severity::Warning,
+            "INFO" => Severity::Info,
+            _ => return None,
+        };
+        let dtype = diagnostic_type(&row.kind)?;
+        let code = *codes.entry((row.code.clone(), dtype)).or_insert_with(|| {
+            // Official, lint and plugin codes alike are leaked once per
+            // distinct code and reclaimed at the one-shot process's exit.
+            CodeInfo::new(
+                Box::leak(row.code.clone().into_boxed_str()),
+                Box::leak(row.code.to_ascii_uppercase().into_boxed_str()),
+                dtype,
+                false,
+            )
+        });
+        let (file, range) = self.locate(&row.location);
+        let context = row
+            .context_messages
+            .iter()
+            .map(|context| {
+                let (file, range) = self.locate(&context.location);
+                ContextMessage {
+                    message: context.message.clone().into(),
+                    file,
+                    range,
+                }
+            })
+            .collect();
+        Some(
+            Diagnostic::new(
+                severity,
+                code,
+                row.message.clone(),
+                file,
+                range,
+                row.correction.clone(),
+            )
+            .with_context(context),
+        )
+    }
+}
+
+/// The `type` family. `CHECKED_MODE_COMPILE_TIME_ERROR` and
+/// `STATIC_TYPE_WARNING` exist only in the plugin protocol's type
+/// vocabulary; they fold onto the family dartq models, which changes only
+/// the lon/text faces (the json face prints the row's own type).
+fn diagnostic_type(kind: &str) -> Option<DiagnosticType> {
+    Some(match kind {
+        "SYNTACTIC_ERROR" => DiagnosticType::SyntacticError,
+        "COMPILE_TIME_ERROR" | "CHECKED_MODE_COMPILE_TIME_ERROR" => {
+            DiagnosticType::CompileTimeError
+        }
+        "STATIC_WARNING" | "STATIC_TYPE_WARNING" => DiagnosticType::StaticWarning,
+        "LINT" => DiagnosticType::Lint,
+        "HINT" => DiagnosticType::Hint,
+        "TODO" => DiagnosticType::Todo,
+        _ => return None,
+    })
+}
+
+/// The child's command line: `<dart> analyze --format json <args>`, run in
+/// the invocation directory. The format is fixed: the envelope carries
+/// every row field, and dartq re-emits the face the user chose. `args` ends
+/// with the positional targets.
 #[must_use]
 pub fn command(dart: &Path, args: &[OsString]) -> Command {
     let mut command = Command::new(dart);
-    command.args(["analyze", "--format", "machine"]).args(args);
+    command.args(["analyze", "--format", "json"]).args(args);
     command
 }
 
@@ -140,164 +293,108 @@ pub fn run(
     args: &[OsString],
     root: Option<PathBuf>,
 ) -> Result<OfficialRun, OfficialError> {
+    run_with_budget(dart, args, root, None)
+}
+
+/// [`run`] with an RSS budget on the child's whole process tree: `None` or
+/// `0` leaves it unbounded, a positive budget polls the tree once per
+/// [`RSS_POLL`] and kills it the first time it is over.
+///
+/// # Errors
+///
+/// [`OfficialError`] as [`run`], plus [`OfficialError::BudgetKilled`].
+pub fn run_with_budget(
+    dart: Option<&Path>,
+    args: &[OsString],
+    root: Option<PathBuf>,
+    budget_bytes: Option<u64>,
+) -> Result<OfficialRun, OfficialError> {
     let dart = dart.ok_or(OfficialError::NoDart)?;
-    let output = command(dart, args)
-        .output()
-        .map_err(|source| OfficialError::Spawn {
-            dart: dart.to_path_buf(),
-            source,
-        })?;
-    Ok(OfficialRun::parse(
-        &output.stdout,
-        output.stderr,
-        output.status.code(),
-        root,
-    ))
-}
-
-/// One parse pass's interning state, keyed by raw column text: each distinct
-/// file reads once, each distinct code interns once.
-#[derive(Default)]
-struct Rows<'a> {
-    files: FileSet,
-    /// `FILE_PATH` column → file id and UTF-16 length; `None` when it does
-    /// not read.
-    opened: FxHashMap<&'a str, Option<(FileId, u32)>>,
-    codes: FxHashMap<(&'a str, DiagnosticType), CodeInfo>,
-}
-
-impl<'a> Rows<'a> {
-    /// The diagnostic `line` spells, or `None` when it is no row: wrong
-    /// shape, an unknown severity or type, or a position its file does not
-    /// hold (the file changed or vanished after the analyzer read it).
-    fn parse(&mut self, line: &'a str) -> Option<Diagnostic> {
-        let [severity, dtype, code, path, row, column, length, message] = columns(line)?;
-        let severity = match severity {
-            "ERROR" => Severity::Error,
-            "WARNING" => Severity::Warning,
-            "INFO" => Severity::Info,
-            _ => return None,
-        };
-        let dtype = diagnostic_type(dtype)?;
-        let position = (row.parse().ok()?, column.parse().ok()?);
-        let length = length.parse().ok()?;
-        let (file, offset) = self.locate(path, position)?;
-        Some(Diagnostic::new(
-            severity,
-            self.code(code, dtype),
-            unescape(message),
-            file,
-            SourceRange { offset, length },
-            None,
+    #[cfg(unix)]
+    {
+        run_watchdog(dart, args, root, budget_bytes.filter(|&bytes| bytes > 0))
+    }
+    #[cfg(not(unix))]
+    {
+        // No process-tree surface off unix: the budget is unenforceable.
+        let _ = budget_bytes;
+        let output = command(dart, args)
+            .env_remove("DARTQ_SHIM")
+            .output()
+            .map_err(|source| OfficialError::Spawn {
+                dart: dart.to_path_buf(),
+                source,
+            })?;
+        Ok(OfficialRun::parse(
+            &output.stdout,
+            output.stderr,
+            output.status.code(),
+            root,
         ))
     }
+}
 
-    /// The row's file and the UTF-16 offset of its 1-based position.
-    fn locate(&mut self, path: &'a str, position: (u32, u32)) -> Option<(FileId, u32)> {
-        let files = &mut self.files;
-        let (file, len) = (*self.opened.entry(path).or_insert_with(|| {
-            let (canonical, source) = read_source(Path::new(&unescape(path))).ok()?;
-            let file = files
-                .file_id(&canonical)
-                .unwrap_or_else(|| files.push(&source, &canonical));
-            Some((file, utf16_len_of(&source)))
-        }))?;
-        Some((file, offset_of(&self.files, file, len, position)?))
-    }
+#[cfg(unix)]
+fn run_watchdog(
+    dart: &Path,
+    args: &[OsString],
+    root: Option<PathBuf>,
+    budget: Option<u64>,
+) -> Result<OfficialRun, OfficialError> {
+    use std::io::Read as _;
+    use std::process::Stdio;
 
-    /// The row's code as a `'static` [`CodeInfo`]: official, lint, and plugin
-    /// codes alike, leaked once per distinct code and reclaimed at the
-    /// one-shot process's exit (the plugin face's interning posture). The
-    /// row's own type stands; `name` is the lowercase form the machine
-    /// format uppercased.
-    fn code(&mut self, machine: &'a str, dtype: DiagnosticType) -> CodeInfo {
-        *self.codes.entry((machine, dtype)).or_insert_with(|| {
-            let name = Box::leak(machine.to_ascii_lowercase().into_boxed_str());
-            CodeInfo::new(
-                name,
-                Box::leak(machine.to_owned().into_boxed_str()),
-                dtype,
-                false,
-            )
+    let spawn_error = |source| OfficialError::Spawn {
+        dart: dart.to_path_buf(),
+        source,
+    };
+    let mut child = command(dart, args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A nested `dartq` the child spawns must not take itself for the
+        // PATH shim.
+        .env_remove("DARTQ_SHIM")
+        .spawn()
+        .map_err(spawn_error)?;
+    let drain = |mut pipe: Box<dyn io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
         })
-    }
-}
-
-/// Splits one row at its first seven unescaped `|`: the eighth column, the
-/// message, keeps every later `|`. `None` when the line has fewer columns.
-fn columns(line: &str) -> Option<[&str; 8]> {
-    let mut columns = [""; 8];
-    let mut bytes = line.bytes().enumerate();
-    let mut start = 0;
-    let mut filled = 0;
-    while filled < 7 {
-        match bytes.next()? {
-            (_, b'\\') => {
-                bytes.next();
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("piped stdout")));
+    let stderr = drain(Box::new(child.stderr.take().expect("piped stderr")));
+    let mut peak = 0;
+    let killed = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout.join().unwrap_or_default();
+                let stderr = stderr.join().unwrap_or_default();
+                return Ok(OfficialRun::parse(&stdout, stderr, status.code(), root));
             }
-            (at, b'|') => {
-                columns[filled] = &line[start..at];
-                start = at + 1;
-                filled += 1;
+            Ok(None) => {}
+            Err(source) => break Err(spawn_error(source)),
+        }
+        if let Some(budget) = budget {
+            let measured = dartq_toolchain::proc::tree_rss_bytes(child.id());
+            peak = peak.max(measured);
+            if measured > budget {
+                break Ok(budget);
             }
-            _ => {}
         }
-    }
-    columns[7] = &line[start..];
-    Some(columns)
-}
-
-/// Inverts upstream's `_escapeForMachineMode`.
-fn unescape(field: &str) -> String {
-    let mut text = String::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            text.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => text.push('\n'),
-            Some('r') => text.push('\r'),
-            Some(escaped) => text.push(escaped),
-            None => text.push('\\'),
-        }
-    }
-    text
-}
-
-/// The `TYPE` column's family. `CHECKED_MODE_COMPILE_TIME_ERROR` and
-/// `STATIC_TYPE_WARNING` exist only in the plugin protocol's type vocabulary;
-/// they fold onto the family dartq models, which keeps the row on every face
-/// and changes only the json `type` spelling.
-fn diagnostic_type(column: &str) -> Option<DiagnosticType> {
-    Some(match column {
-        "SYNTACTIC_ERROR" => DiagnosticType::SyntacticError,
-        "COMPILE_TIME_ERROR" | "CHECKED_MODE_COMPILE_TIME_ERROR" => {
-            DiagnosticType::CompileTimeError
-        }
-        "STATIC_WARNING" | "STATIC_TYPE_WARNING" => DiagnosticType::StaticWarning,
-        "LINT" => DiagnosticType::Lint,
-        "HINT" => DiagnosticType::Hint,
-        "TODO" => DiagnosticType::Todo,
-        _ => return None,
+        std::thread::sleep(RSS_POLL);
+    };
+    dartq_toolchain::proc::kill_tree(child.id());
+    let _ = child.wait();
+    let _ = stdout.join();
+    let _ = stderr.join();
+    let budget = killed?;
+    Err(OfficialError::BudgetKilled {
+        budget_gb: budget >> 30,
+        measured_gb: peak as f64 / f64::from(1u32 << 30),
     })
-}
-
-/// The UTF-16 offset in `0..=len` at 1-based `position`: a binary search over
-/// the layout's own offset → position conversion, which is strictly monotone,
-/// so the writers' `line_col` answers the row's position by construction.
-fn offset_of(files: &FileSet, file: FileId, len: u32, position: (u32, u32)) -> Option<u32> {
-    let (mut low, mut high) = (0, len);
-    while low < high {
-        let middle = low + (high - low) / 2;
-        if files.line_col(file, middle) < position {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    (files.line_col(file, low) == position).then_some(low)
 }
 
 #[cfg(test)]
@@ -308,131 +405,90 @@ mod tests {
 
     use super::*;
 
-    /// A canonical temp root (the path spelling official rows carry) holding
-    /// one file with `source`, and that file's row spelling.
-    fn fixture(source: &str) -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir
-            .path()
-            .canonicalize()
-            .expect("canonical root")
-            .join("a.dart");
-        fs::write(&path, source).expect("write");
-        (dir, path.display().to_string())
-    }
+    /// One envelope row with a correction, a documentation url and a
+    /// context message — the fields the old machine-format parse lost.
+    const ENVELOPE: &str = concat!(
+        r#"{"version":1,"diagnostics":[{"code":"duplicate_definition","severity":"ERROR","#,
+        r#""type":"COMPILE_TIME_ERROR","location":{"file":"/p/lib/a.dart","range":{"#,
+        r#""start":{"offset":20,"line":2,"column":5},"end":{"offset":23,"line":2,"column":8}}},"#,
+        r#""problemMessage":"The name 'foo' is already defined.","#,
+        r#""correctionMessage":"Try renaming one of the declarations.","#,
+        r#""contextMessages":[{"location":{"file":"/p/lib/a.dart","range":{"#,
+        r#""start":{"offset":4,"line":1,"column":5},"end":{"offset":7,"line":1,"column":8}}},"#,
+        r#""message":"The first definition of this name."}],"#,
+        r#""documentation":"https://dart.dev/diagnostics/duplicate_definition"},"#,
+        r#"{"code":"avoid_print","severity":"INFO","type":"LINT","location":{"file":"/p/lib/a.dart","range":{"#,
+        r#""start":{"offset":30,"line":3,"column":1},"end":{"offset":35,"line":3,"column":6}}},"#,
+        r#""problemMessage":"Don't invoke 'print' in production code.","#,
+        r#""correctionMessage":"Try using a logging framework.","#,
+        r#""documentation":"https://dart.dev/diagnostics/avoid_print"}]}"#
+    );
 
     fn parse(stdout: &str) -> OfficialRun {
-        OfficialRun::parse(stdout.as_bytes(), Vec::new(), Some(0), None)
+        OfficialRun::parse(stdout.as_bytes(), Vec::new(), Some(3), None)
     }
 
-    /// All three severities, and every escape in the message column, parse
-    /// into the row model and re-emit byte-for-byte through the machine
-    /// writer, in arrival order. Positions cross a UTF-16 surrogate pair, a
-    /// BMP wide character, and a CRLF break.
+    /// The #4122 pin: the per-run json face re-emits the child's envelope
+    /// byte for byte — correctionMessage, contextMessages and documentation
+    /// included — and the rows reach the diagnostic model whole.
     #[test]
-    fn rows_reemit_byte_exact() {
-        let (_dir, path) = fixture("var a = '😀é'; x\r\nvar b = 1;\n");
-        let stdout = format!(
-            "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{path}|1|16|1|Expected to find ';'.\n\
-             WARNING|STATIC_WARNING|DEAD_CODE|{path}|2|5|1|Dead \\| code \\\\ here\\nnext\\rend.\n\
-             INFO|LINT|AVOID_PRINT|{path}|2|1|3|Don't invoke 'print'.\n"
-        );
-        let run = parse(&stdout);
+    fn the_json_face_keeps_correction_context_and_documentation() {
+        let run = parse(&format!("{ENVELOPE}\n"));
         assert_eq!(run.unparsed, Vec::<String>::new());
-
         let mut emitted = Vec::new();
-        write_machine(&mut emitted, &run.output()).expect("write");
-        assert_eq!(String::from_utf8(emitted).expect("UTF-8"), stdout);
-
-        let [error, warning, info] = run.diagnostics.as_slice() else {
-            panic!("three rows: {:?}", run.diagnostics);
-        };
-        assert_eq!(error.severity, Severity::Error);
-        assert_eq!(error.code.name, "expected_token");
-        assert_eq!(error.code.machine, "EXPECTED_TOKEN");
-        assert_eq!(error.code.dtype, DiagnosticType::SyntacticError);
-        assert_eq!(error.range.offset, 15, "the surrogate pair counts as two");
-        assert_eq!(error.range.length, 1);
-
-        assert_eq!(warning.severity, Severity::Warning);
-        assert_eq!(warning.message, "Dead | code \\ here\nnext\rend.");
-        assert_eq!(warning.range.offset, 22, "CRLF is one line break");
-
-        assert_eq!(info.severity, Severity::Info);
-        assert_eq!(info.code.dtype, DiagnosticType::Lint);
-        assert_eq!(info.range.offset, 18);
-    }
-
-    /// The first seven separators delimit; every later `|` is message text.
-    #[test]
-    fn a_raw_pipe_stays_in_the_message_column() {
-        let (_dir, path) = fixture("var a;\n");
-        let run = parse(&format!(
-            "INFO|HINT|SOME_HINT|{path}|1|1|3|left | right || end\n"
-        ));
-        assert_eq!(run.unparsed, Vec::<String>::new());
-        assert_eq!(run.diagnostics[0].message, "left | right || end");
-    }
-
-    /// An escaped separator in the path column stays in the path.
-    #[cfg(unix)]
-    #[test]
-    fn an_escaped_pipe_stays_in_the_path_column() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().canonicalize().expect("root").join("a|b.dart");
-        fs::write(&path, "var a;\n").expect("write");
-        let spelled = path.display().to_string().replace('|', "\\|");
-        let run = parse(&format!("INFO|LINT|X|{spelled}|1|1|3|m\n"));
-        assert_eq!(run.unparsed, Vec::<String>::new());
-        assert_eq!(run.file_path(run.diagnostics[0].file), path);
-    }
-
-    /// A stdout line that is no row rides `unparsed` verbatim, in order, and
-    /// no line is lost: the two lists add up to the child's output.
-    #[test]
-    fn unparseable_lines_keep_their_count() {
-        let (dir, path) = fixture("var a;\n");
-        let missing = dir.path().join("gone.dart").display().to_string();
-        let junk = [
-            "Please report this at dartbug.com.".to_owned(),
-            format!("FATAL|LINT|X|{path}|1|1|3|unknown severity"),
-            format!("INFO|NEW_TYPE|X|{path}|1|1|3|unknown type"),
-            format!("INFO|LINT|X|{path}|one|1|3|non-numeric line"),
-            format!("INFO|LINT|X|{path}|1|1"),
-            format!("INFO|LINT|X|{missing}|1|1|3|file gone"),
-            format!("INFO|LINT|X|{path}|9|1|3|position past the file"),
-        ];
-        let good = format!("INFO|LINT|X|{path}|1|1|3|fine");
-        let stdout = format!("{}\n\n{good}\n", junk.join("\n"));
-
-        let run = parse(&stdout);
-        assert_eq!(run.unparsed, junk);
-        assert_eq!(run.diagnostics.len(), 1, "the good row still parses");
-    }
-
-    /// The json writer over a parsed row: the offset and end position come
-    /// from the source, and the key set is the machine format's (no
-    /// correction, no context). A leading BOM is outside the offsets, as in
-    /// the analyzer's read layer.
-    #[test]
-    fn the_json_face_recovers_offsets_from_the_source() {
-        let (_dir, path) = fixture("\u{FEFF}void f() {}\nvoid g() { x }\n");
-        let run = parse(&format!(
-            "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{path}|2|12|1|Expected to find ';'.\n"
-        ));
-        let mut emitted = Vec::new();
-        write_json(&mut emitted, &run.output()).expect("write");
+        run.write_json(&mut emitted).expect("write");
         assert_eq!(
             String::from_utf8(emitted).expect("UTF-8"),
-            format!(
-                "{{\"version\":1,\"diagnostics\":[{{\"code\":\"expected_token\",\
-                 \"severity\":\"ERROR\",\"type\":\"SYNTACTIC_ERROR\",\"location\":{{\
-                 \"file\":\"{path}\",\"range\":{{\
-                 \"start\":{{\"offset\":23,\"line\":2,\"column\":12}},\
-                 \"end\":{{\"offset\":24,\"line\":2,\"column\":13}}}}}},\
-                 \"problemMessage\":\"Expected to find ';'.\"}}]}}\n"
-            )
+            format!("{ENVELOPE}\n")
         );
+
+        let [error, lint] = run.diagnostics.as_slice() else {
+            panic!("two rows: {:?}", run.diagnostics);
+        };
+        assert_eq!(error.code.name, "duplicate_definition");
+        assert_eq!(error.code.machine, "DUPLICATE_DEFINITION");
+        assert_eq!(
+            error.correction.as_deref(),
+            Some("Try renaming one of the declarations.")
+        );
+        let context = error.context.as_deref().expect("one context message");
+        assert_eq!(
+            context[0].range,
+            SourceRange {
+                offset: 4,
+                length: 3
+            }
+        );
+        assert_eq!(run.line_col(error.file, 20), (2, 5));
+        assert_eq!(run.line_col(error.file, 23), (2, 8));
+        assert_eq!(lint.code.dtype, DiagnosticType::Lint);
+
+        // The shared writers over the same rows: machine positions come
+        // from the server, the engine-side json writer agrees on locations.
+        let mut machine = Vec::new();
+        write_machine(&mut machine, &run.output()).expect("write");
+        assert_eq!(
+            String::from_utf8(machine).expect("UTF-8"),
+            "ERROR|COMPILE_TIME_ERROR|DUPLICATE_DEFINITION|/p/lib/a.dart|2|5|3|The name 'foo' is already defined.\n\
+             INFO|LINT|AVOID_PRINT|/p/lib/a.dart|3|1|5|Don't invoke 'print' in production code.\n"
+        );
+        let mut engine_json = Vec::new();
+        write_json(&mut engine_json, &run.output()).expect("write");
+        assert!(String::from_utf8(engine_json).expect("UTF-8").contains(
+            r#""range":{"start":{"offset":20,"line":2,"column":5},"end":{"offset":23,"line":2,"column":8}}"#
+        ));
+    }
+
+    /// Lines around the envelope ride `unparsed` verbatim; a row of an
+    /// unknown severity or type is kept as one unparsed line, not lost.
+    #[test]
+    fn non_envelope_lines_and_unknown_rows_are_kept_unparsed() {
+        let odd = ENVELOPE.replace(r#""severity":"INFO""#, r#""severity":"FATAL""#);
+        let run = parse(&format!("Please report this at dartbug.com.\n{odd}\n"));
+        assert_eq!(run.diagnostics.len(), 1);
+        assert_eq!(run.unparsed.len(), 2);
+        assert_eq!(run.unparsed[0], "Please report this at dartbug.com.");
+        assert!(run.unparsed[1].contains("FATAL"), "{:?}", run.unparsed);
     }
 
     /// The plugin protocol's two extra type spellings fold onto a modeled
@@ -449,16 +505,16 @@ mod tests {
         );
     }
 
-    /// The child always runs the machine format, ahead of the forwarded
+    /// The child always runs the json format, ahead of the forwarded
     /// arguments; nothing here starts a process.
     #[test]
-    fn the_command_fixes_the_machine_format() {
+    fn the_command_fixes_the_json_format() {
         let args = [OsString::from("--fatal-infos"), OsString::from("lib")];
         let command = command(Path::new("/sdk/bin/dart"), &args);
         assert_eq!(command.get_program(), "/sdk/bin/dart");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["analyze", "--format", "machine", "--fatal-infos", "lib"]
+            ["analyze", "--format", "json", "--fatal-infos", "lib"]
         );
     }
 
@@ -474,5 +530,53 @@ mod tests {
             error.to_string().contains(&absent.display().to_string()),
             "{error}"
         );
+    }
+
+    /// The RSS watchdog kills an over-budget child on its first poll.
+    #[cfg(unix)]
+    #[test]
+    fn an_over_budget_analyzer_is_killed_and_reaped() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_dart = dir.path().join("dart");
+        fs::write(&fake_dart, "#!/bin/sh\nexec sleep 30\n").expect("write fake dart");
+        fs::set_permissions(&fake_dart, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let started = std::time::Instant::now();
+        let error = run_with_budget(Some(&fake_dart), &[], None, Some(1))
+            .err()
+            .expect("the budget trips");
+        let OfficialError::BudgetKilled {
+            budget_gb,
+            measured_gb,
+        } = error
+        else {
+            panic!("expected BudgetKilled, got {error:?}");
+        };
+        assert_eq!(budget_gb, 0, "1 byte is 0 GiB — the configured figure");
+        assert!(measured_gb > 0.0, "the watchdog measured a live tree");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            error
+                .to_string()
+                .contains("analyzer.official.memory_budget_gb")
+        );
+    }
+
+    /// An unlimited budget (`0` or `None`) never kills.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlimited_budget_lets_the_child_finish() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_dart = dir.path().join("dart");
+        fs::write(&fake_dart, "#!/bin/sh\nexit 0\n").expect("write fake dart");
+        fs::set_permissions(&fake_dart, fs::Permissions::from_mode(0o755)).expect("chmod");
+        for budget in [None, Some(0)] {
+            let run = run_with_budget(Some(&fake_dart), &[], None, budget).expect("finishes");
+            assert_eq!(run.code, Some(0));
+            assert!(run.diagnostics.is_empty());
+        }
     }
 }

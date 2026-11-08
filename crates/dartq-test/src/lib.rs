@@ -30,7 +30,7 @@ pub mod report;
 pub mod select;
 pub mod stamp;
 
-pub use cache::{Cache, Refusal, Runner};
+pub use cache::{Cache, Refusal, RefusalDetail, Runner};
 pub use exec::{
     ExecConfig, ExecError, Execution, Loose, Settled, Streamed, SuiteBlock, execute,
     execute_flutter, execute_grouped,

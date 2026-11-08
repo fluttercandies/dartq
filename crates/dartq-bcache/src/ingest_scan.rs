@@ -501,6 +501,10 @@ struct Scanned {
     source: Option<(PathBuf, BlobId)>,
     record: PlacedFile,
     rerooted: bool,
+    /// For a file vouched by its normalized content only: the outcome
+    /// had it been hashed, which replaces the vouch when a member of
+    /// its consistency group changed (see [`keep_content_vouches_paired`]).
+    demoted: Option<Box<Scanned>>,
 }
 
 impl Scanned {
@@ -519,6 +523,7 @@ impl Scanned {
             },
             source: None,
             rerooted: vouched.rerooted(),
+            demoted: None,
             record: PlacedFile {
                 path,
                 stamp: file.stamp,
@@ -553,6 +558,7 @@ impl Scanned {
             },
             source: Some((file.absolute, blob)),
             rerooted: false,
+            demoted: None,
             record: PlacedFile {
                 path,
                 stamp: file.stamp,
@@ -717,10 +723,11 @@ fn vouched_by_bytes(
     })
 }
 
-/// The vouch a recorded FileStore record earns by what it records when
-/// its bytes moved: flutter rewrote it in another order, but every
-/// tracked path still carries the md5 the placement left (see
-/// [`PlacedFile::content`]), so the recorded blob still renders it.
+/// The vouch a recorded file earns by what it records when its bytes
+/// moved: flutter rewrote its FileStore record in another order, or a
+/// hook result with fresh timestamps, and the normalized content still
+/// equals the placement's (see [`PlacedFile::content`]), so the
+/// recorded blob still renders it.
 /// Gated like [`expected_bytes`]: a re-rooted rendering vouches only
 /// while `rerooted_ok`, and only while the store holds the blob.
 fn vouched_by_content(
@@ -962,10 +969,23 @@ pub fn scan_entry_files(
     };
     skipped.oversize_rewrite += scanned.iter().filter(|file| oversize(file)).count() as u64;
     scanned.retain(|file| !oversize(file));
-    let scanned: Vec<Scanned> = scanned
+    let mut scanned: Vec<Scanned> = scanned
         .into_par_iter()
         .map(|file| {
-            if let Some(vouched) = reused_identity(&file, prior, placed, rerooted_ok, blob_exists) {
+            if let Some(mut vouched) =
+                reused_identity(&file, prior, placed, rerooted_ok, blob_exists)
+            {
+                // A stamp vouch from a record that never learned the
+                // file's normalized identity (a prior-manifest stamp, a
+                // record written before the identity existed) learns it
+                // now, from the KB-scale bytes the stamp proves
+                // unchanged: without it flutter's next noise-only
+                // rewrite of the file would read as new content.
+                let relative = Path::new(&file.relative);
+                if vouched.content.is_none() && crate::materialize::has_content_identity(relative) {
+                    vouched.content =
+                        crate::materialize::content_identity(relative, &fs::read(&file.absolute)?);
+                }
                 return Ok(Scanned::vouched(&file, vouched));
             }
             let recorded = recorded_placement(placed, &file);
@@ -991,17 +1011,34 @@ pub fn scan_entry_files(
             if let Some(vouched) = vouched_by_bytes(recorded, blob, expected, blob_exists) {
                 return Ok(Scanned::vouched(&file, vouched));
             }
-            // flutter's FileStore record is rewritten on every build in
-            // hash-map order: what it records, not its byte order, says
-            // whether the run changed it. Bounded by the oversize rule
-            // above (a record past REWRITE_LIMIT never gets here).
-            let content = if crate::materialize::is_file_store_record(&file.relative) {
-                crate::materialize::file_store_content(&fs::read(&file.absolute)?)
+            // flutter rewrites its FileStore record on every build in
+            // hash-map order, and a hook result on every run of its
+            // target with fresh timestamps: what such a file records,
+            // not its bytes, says whether the run changed it. Both are
+            // KB-scale and bounded by the oversize rule above (a
+            // bookkeeping file past REWRITE_LIMIT never gets here); the
+            // re-read only happens once the stamp and the bytes both
+            // moved.
+            let relative = Path::new(&file.relative);
+            let content = if crate::materialize::has_content_identity(relative) {
+                crate::materialize::content_identity(relative, &fs::read(&file.absolute)?)
             } else {
                 None
             };
             if let Some(vouched) = vouched_by_content(recorded, content, rerooted_ok, blob_exists) {
-                return Ok(Scanned::vouched(&file, vouched));
+                // The record and the hook results it hashes stand or
+                // fall together (see `keep_content_vouches_paired`), so
+                // the hashed outcome rides along for that verdict.
+                let mut scanned = Scanned::vouched(&file, vouched);
+                let (rewrite, foreign_paths) = classify(&file, mentions, foreign);
+                scanned.demoted = Some(Box::new(Scanned::hashed(
+                    file,
+                    blob,
+                    rewrite,
+                    foreign_paths,
+                    content,
+                )));
+                return Ok(scanned);
             }
             // A payload dill rewrites cross-tree when the worktree root
             // URI occurs. The test face's foreign veto is deliberately
@@ -1012,18 +1049,50 @@ pub fn scan_entry_files(
             // — one literal must not cost the dill its rewriter. Without
             // the root URI it stays the verbatim clone it always was —
             // never a dir-refusing foreign record.
-            let rewrite = if file.bookkeeping && mentions {
-                RewriteKind::PathText
-            } else if file.payload_dill && mentions {
-                RewriteKind::DillUris
-            } else {
-                RewriteKind::None
-            };
-            let foreign_paths = file.bookkeeping && foreign;
+            let (rewrite, foreign_paths) = classify(&file, mentions, foreign);
             Ok(Scanned::hashed(file, blob, rewrite, foreign_paths, content))
         })
         .collect::<Result<Vec<_>>>()?;
+    keep_content_vouches_paired(&mut scanned);
     Ok(collect_scan(scanned, skipped))
+}
+
+/// The rewrite class and foreign flag of a file hashed to new content.
+fn classify(file: &ScannedFile, mentions: bool, foreign: bool) -> (RewriteKind, bool) {
+    let rewrite = if file.bookkeeping && mentions {
+        RewriteKind::PathText
+    } else if file.payload_dill && mentions {
+        RewriteKind::DillUris
+    } else {
+        RewriteKind::None
+    };
+    (rewrite, file.bookkeeping && foreign)
+}
+
+/// Keeps the content-vouched files of one dir — the FileStore record and
+/// the hook results it hashes — one consistent recorded build. The
+/// record's identity ignores the hook results' md5s and a hook result's
+/// ignores its timestamps (see [`crate::materialize::content_identity`]),
+/// so a vouch keeps the STORED bytes of both: a pair, as long as every
+/// member is vouched. Once any member was hashed to new content, a
+/// vouched member beside it would pair stale bytes with fresh ones — a
+/// fresh record naming the md5 of a result the entry stores in an older
+/// rendering, or the reverse — and flutter would rerun every target
+/// downstream of that result on each replay. Then every member is
+/// published as hashed. One linear pass, no I/O: each hashed outcome
+/// was built while its bytes were in hand.
+fn keep_content_vouches_paired(scanned: &mut [Scanned]) {
+    let member_changed = scanned.iter().any(|file| {
+        file.source.is_some() && crate::materialize::has_content_identity(&file.manifest.path)
+    });
+    if !member_changed {
+        return;
+    }
+    for file in scanned {
+        if let Some(demoted) = file.demoted.take() {
+            *file = *demoted;
+        }
+    }
 }
 
 /// Whether a file name is a payload dill whose embedded `file://` URIs

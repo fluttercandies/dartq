@@ -680,7 +680,16 @@ fn materialize_one(
         rewrite: file.rewrite,
         foreign_paths: file.foreign_paths,
         on_disk,
-        content: None,
+        // A hook result's timestamp-free identity (KBs, read back from
+        // what landed): flutter rewrites the file with fresh timestamps
+        // whenever its target runs, and the post-run scan recognizes
+        // such a rewrite as this placement by it. The FileStore record
+        // gets its identity once its patch landed (see `materialize`).
+        content: if is_hook_result(&file.path) {
+            content_identity(&file.path, &fs::read(&dst)?)
+        } else {
+            None
+        },
     };
     Ok(Some((placed_file, md5)))
 }
@@ -711,10 +720,77 @@ fn is_file_store(path: &Path) -> bool {
     path == Path::new(FILE_STORE)
 }
 
-/// Whether a dir-relative path names a FileStore record (the post-run
-/// scan's test for [`file_store_content`]).
-pub(crate) fn is_file_store_record(relative: &str) -> bool {
-    is_file_store(Path::new(relative))
+/// The hook-result files flutter_tools rewrites on every run of their
+/// target with fresh `build_start`/`build_end` timestamps
+/// (`DartHooksResult.toJson`, isolated/native_assets/dart_hook_result.dart):
+/// `link_hooks_result.json` (3.47, `LinkHooks.resultFilename`) and
+/// `dart_build_result.json` (3.38–3.44, `DartBuild.dartHookResultFilename`;
+/// on earlier lines the same name carries no timestamps and
+/// [`hook_result_content`] declines it). `build_hooks_result.json` is
+/// absent on purpose: it carries no timestamps and flutter only writes it
+/// when its encoding changed.
+const HOOK_RESULTS: [&str; 2] = ["link_hooks_result.json", "dart_build_result.json"];
+
+/// The keys of a hook result that record WHEN it was built, not WHAT.
+const HOOK_RESULT_VOLATILE: [&str; 2] = ["build_start", "build_end"];
+
+/// Whether a path (dir-relative or absolute) names a hook result.
+pub(crate) fn is_hook_result(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| HOOK_RESULTS.contains(&name))
+}
+
+/// Whether files at `relative` carry a [`content_identity`] — the formats
+/// flutter rewrites with noise that is not content.
+pub(crate) fn has_content_identity(relative: &Path) -> bool {
+    is_file_store(relative) || is_hook_result(relative)
+}
+
+/// The normalized identity of a bookkeeping file whose bytes move on
+/// every flutter run without its content moving (see
+/// [`PlacedFile::content`]): the FileStore record up to its order and
+/// its hook-result md5s ([`file_store_content`]), a hook result up to
+/// its timestamps ([`hook_result_content`]). `None` for every other
+/// file, and for bytes that do not parse as the expected format — those
+/// keep byte identity only.
+pub(crate) fn content_identity(relative: &Path, bytes: &[u8]) -> Option<BlobId> {
+    if is_file_store(relative) {
+        file_store_content(bytes)
+    } else if is_hook_result(relative) {
+        hook_result_content(bytes)
+    } else {
+        None
+    }
+}
+
+/// A hook result's identity without its timestamps: the blake3 of the
+/// JSON object re-encoded with `build_start`/`build_end` removed, every
+/// other key in flutter's own order (the workspace's serde_json keeps
+/// insertion order). `None` unless the bytes are an object carrying both
+/// timestamps as strings — a result without them has nothing volatile
+/// and keeps byte identity.
+///
+/// Dropping the timestamps is sound for the replay: flutter only reads
+/// them back as the "modified since" bounds of
+/// `FlutterHookResult.hasAnyModifiedFiles` and `isOutputDirty`
+/// (flutter_tools lib/src/asset.dart), so an entry that keeps an OLDER
+/// rendering of an otherwise equal result can only make flutter see more
+/// files as modified — a rebuild, never a wrong skip.
+fn hook_result_content(bytes: &[u8]) -> Option<BlobId> {
+    let serde_json::Value::Object(mut object) = serde_json::from_slice(bytes).ok()? else {
+        return None;
+    };
+    for key in HOOK_RESULT_VOLATILE {
+        if !object.shift_remove(key)?.is_string() {
+            return None;
+        }
+    }
+    let rest = serde_json::to_vec(&object).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"hook-result\0");
+    hasher.update(&rest);
+    Some(BlobId(*hasher.finalize().as_bytes()))
 }
 
 /// The order-free identity of a FileStore record's content: the blake3
@@ -727,6 +803,14 @@ pub(crate) fn is_file_store_record(relative: &str) -> bool {
 /// unchanged record are not a function of what it records. `None` for
 /// bytes that do not parse as a format-2 record — those keep byte
 /// identity only.
+///
+/// A hook result's md5 is left out (its path stays): flutter rewrites
+/// the result with fresh timestamps on every run of its target, so the
+/// record's md5 of it moves while nothing it describes did. The scan
+/// only trusts this identity while every hook result beside the record
+/// is itself unchanged up to its timestamps (see
+/// [`crate::ingest_scan::scan_entry_files`]), which keeps the stored
+/// record and the stored result one consistent pair.
 pub(crate) fn file_store_content(bytes: &[u8]) -> Option<BlobId> {
     let storage = serde_json::from_slice::<FileStorage>(bytes).ok()?;
     if storage.version != FILE_STORE_VERSION {
@@ -735,7 +819,14 @@ pub(crate) fn file_store_content(bytes: &[u8]) -> Option<BlobId> {
     let mut records: Vec<(&str, &str)> = storage
         .files
         .iter()
-        .map(|file| (file.path.as_str(), file.hash.as_str()))
+        .map(|file| {
+            let hash = if is_hook_result(Path::new(&file.path)) {
+                ""
+            } else {
+                file.hash.as_str()
+            };
+            (file.path.as_str(), hash)
+        })
         .collect();
     records.sort_unstable();
     let mut hasher = blake3::Hasher::new();
@@ -2762,5 +2853,74 @@ mod tests {
         assert_ne!(file_store_content(&changed), placed.content);
         assert_eq!(file_store_content(br#"{"version":1,"files":[]}"#), None);
         assert_eq!(file_store_content(b"not a record"), None);
+    }
+
+    /// #4136: a hook result's identity drops exactly its two timestamps,
+    /// and the FileStore record's drops exactly the hook results' md5s;
+    /// every other byte of content still counts, and anything that is
+    /// not the expected shape keeps byte identity only.
+    #[test]
+    fn hook_result_identity_ignores_only_its_timestamps() {
+        let link = Path::new("link_hooks_result.json");
+        let result = |start: &str, deps: &str| {
+            format!(
+                r#"{{"build_start":"{start}","build_end":"{start}","dependencies":["{deps}"],"code_assets":[],"data_assets":[]}}"#
+            )
+            .into_bytes()
+        };
+        let first = result("2026-11-06T03:20:58.393988", "file:///a/pubspec.yaml");
+        let identity = content_identity(link, &first);
+        assert!(identity.is_some());
+        assert_eq!(
+            content_identity(
+                link,
+                &result("2026-11-07T09:01:02.000001", "file:///a/pubspec.yaml")
+            ),
+            identity,
+            "a timestamp-only rewrite is the same content"
+        );
+        assert_ne!(
+            content_identity(
+                link,
+                &result("2026-11-06T03:20:58.393988", "file:///a/pubspec.lock")
+            ),
+            identity,
+            "a dependency change is content"
+        );
+        assert_eq!(
+            content_identity(Path::new("dart_build_result.json"), &first),
+            identity,
+            "the 3.38-3.44 name normalizes the same way"
+        );
+        assert_eq!(
+            content_identity(Path::new("build_hooks_result.json"), &first),
+            None,
+            "a file flutter never rewrites with timestamps keeps byte identity"
+        );
+        assert_eq!(
+            content_identity(link, br#"{"dependencies":[],"code_assets":[]}"#),
+            None,
+            "a result without timestamps has nothing volatile"
+        );
+        assert_eq!(content_identity(link, b"[]"), None);
+
+        let record = |hook_md5: &str, dill_md5: &str| {
+            format!(
+                r#"{{"version":2,"files":[{{"path":"/a/.dart_tool/flutter_build/h/link_hooks_result.json","hash":"{hook_md5}"}},{{"path":"/a/.dart_tool/flutter_build/h/app.dill","hash":"{dill_md5}"}}]}}"#
+            )
+            .into_bytes()
+        };
+        let record_identity = content_identity(Path::new(FILE_STORE), &record("11", "22"));
+        assert!(record_identity.is_some());
+        assert_eq!(
+            content_identity(Path::new(FILE_STORE), &record("33", "22")),
+            record_identity,
+            "the hook result's md5 moves with its timestamps"
+        );
+        assert_ne!(
+            content_identity(Path::new(FILE_STORE), &record("11", "44")),
+            record_identity,
+            "any other md5 is content"
+        );
     }
 }
