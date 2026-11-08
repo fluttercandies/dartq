@@ -43,8 +43,8 @@ const RSS_POLL: Duration = Duration::from_secs(1);
 /// How long `server.shutdown` may take before the tree is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Why a server cannot answer. Every variant but [`Fault::Budget`] sends
-/// the caller to a per-run analysis.
+/// Why a server cannot answer. Every variant but [`Fault::Budget`] and
+/// [`Fault::Memory`] sends the caller to a per-run analysis.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fault {
     /// The server did not start, crashed, answered a request with an
@@ -52,12 +52,15 @@ pub enum Fault {
     Server(String),
     /// The server's process tree crossed the RSS budget and was killed.
     Budget { budget: u64, measured: u64 },
+    /// The server never got its memory lease: the machine-wide ledger's
+    /// wait timed out (the message names the holders).
+    Memory(String),
 }
 
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Server(message) => f.write_str(message),
+            Self::Server(message) | Self::Memory(message) => f.write_str(message),
             Self::Budget { budget, measured } => write!(
                 f,
                 "analyzer exceeded the memory budget ({} GB configured; measured {:.1} GB) — \

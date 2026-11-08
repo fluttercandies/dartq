@@ -2412,6 +2412,13 @@ impl Session {
             .map(|dispatch| dispatch.completions())
     }
 
+    /// How many `dartq/test/run` children are still running: while any
+    /// lives the daemon is busy (never released, never idle).
+    #[must_use]
+    pub fn test_runs_live(&self) -> usize {
+        self.test.live()
+    }
+
     /// The `dartq/test/*` faces' run registry (the server answers those
     /// requests at intake against it).
     pub(crate) fn test_registry(&mut self) -> &mut crate::test::TestManager {

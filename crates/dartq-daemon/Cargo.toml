@@ -57,6 +57,8 @@ thiserror = { workspace = true }
 
 # A cancelled test run's process group is signalled.
 [target.'cfg(unix)'.dependencies]
+# A test run joins the daemon's job slot (the machine-wide job gate).
+dartq-toolchain = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

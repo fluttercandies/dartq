@@ -95,8 +95,6 @@ use dartq_diagnostics::{AnalysisOutput, Diagnostic, Severity, write_json};
 use dartq_engine::EngineConfig;
 use dartq_sdk::SdkSnapshot;
 #[cfg(unix)]
-use dartq_toolchain::run_queue::{self, Event, RunGuard};
-
 mod compat;
 mod debug;
 mod events;
@@ -158,7 +156,7 @@ fn main() -> ExitCode {
     // The `dart` PATH shim: when argv0 names this binary `dart` (the
     // symlink `dartq shim install dart` puts on PATH) or DARTQ_SHIM=dart,
     // the process IS the dart shim — `dart analyze` routes through the
-    // run queue and the analyzer RSS budget, every other dart
+    // job gate and the analyzer RSS budget, every other dart
     // subcommand execs the real SDK dart. Checked before the flutter
     // shim: `DARTQ_SHIM=dart` is the one env spelling that must not fall
     // into the flutter face.
@@ -213,7 +211,7 @@ fn flutter_face_argv(argv: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString
 /// The `dart` shim face: `dart analyze …` is dartq's analyze command
 /// verbatim (the argv after the `dart` token IS the subcommand line —
 /// `analyze` plus its flags and targets), so it re-enters the normal CLI
-/// parse and inherits the run queue and the analyzer RSS budget. Every
+/// parse and inherits the job gate and the analyzer RSS budget. Every
 /// other dart invocation passes through to the real SDK dart, argv
 /// untouched.
 fn dart_shim(raw: &[std::ffi::OsString]) -> i32 {
@@ -519,7 +517,7 @@ struct CheckArgs {
     /// engine serves the plain face.
     #[arg(long)]
     cold: bool,
-    /// Skip the machine-wide analyze run queue (see
+    /// Run outside the machine-wide job gate (see
     /// [`AnalyzeArgs::no_queue`]).
     #[arg(long, hide = true)]
     no_queue: bool,
@@ -650,11 +648,10 @@ struct AnalyzeArgs {
     /// `--engine`.
     #[arg(long, value_name = "MiB")]
     memory_limit: Option<u64>,
-    /// Skip the machine-wide analyze run queue: by default every official
-    /// `dart analyze` child waits its turn (queue name `analyze`,
-    /// serialized against other dartq analyzes — never against
-    /// `dartq test`). dartq's own flag — the official analyzer has no
-    /// such spelling.
+    /// Run outside the machine-wide job gate: by default every heavy
+    /// analysis (an official `dart analyze` child, an in-process engine
+    /// run) takes a job slot under `memory.max_concurrent`. dartq's own
+    /// flag: the official analyzer has no such spelling.
     #[arg(long, hide = true)]
     no_queue: bool,
     /// Print each workspace engine's memory posture to stderr after the
@@ -1544,7 +1541,7 @@ struct ResidentAsk {
 }
 
 /// A `dartq test` line that only asks for help or the version skips the
-/// run queue: it runs no tests, so it must not wait behind a long run.
+/// job gate: it runs no tests, so it must not wait behind a long run.
 fn queue_bypass(args: test::TestArgs) -> test::TestArgs {
     if dartq_toolchain::zero_execution(&args.args) {
         let mut args = args;
@@ -1563,6 +1560,7 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
     let outcome = crash_tier(|| {
         let cwd = std::env::current_dir().unwrap_or_default();
         let settings = official_settings(&cwd);
+        let max_percent = memory_max_percent(&cwd);
         let resolved = match resolve_targets(targets) {
             Ok(targets) => targets,
             Err(path) => {
@@ -1579,14 +1577,24 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
         // for a server start (a full analysis). Any failure falls through
         // to the per-run child below.
         let mut sdk = None;
-        if let (Some(ask), Some(dart), true) = (&face.resident, &dart, settings.resident) {
+        // `--no-queue` bypasses the job gate for this whole process.
+        if no_queue {
+            gate_bypass();
+        }
+        // A run nested inside another dartq job's slot (a test, a build)
+        // must not start a detached resident server: it would outlive the
+        // slot. It analyzes per run under its holder's slot instead.
+        if let (Some(ask), Some(dart), true, false) =
+            (&face.resident, &dart, settings.resident, gate_nested())
+        {
             let request = dartq_analyzer_host::Request {
                 dart: dart.clone(),
                 targets: targets.to_vec(),
                 packages: ask.packages.clone(),
                 budget: settings.memory_budget_bytes,
                 idle: Duration::from_secs(settings.idle_minutes.max(1) * 60),
-                queue: resident_queue_root(&cwd, no_queue),
+                max_percent,
+                max_concurrent: job_cap(&cwd),
             };
             match dartq_analyzer_host::analyze(&request) {
                 dartq_analyzer_host::Outcome::Report { report, sdk } => {
@@ -1612,12 +1620,17 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
                 }
             }
         }
-        // The analyze run queue: one admission per process, held until this
-        // face returns, so concurrent per-run analyses serialize
-        // machine-wide — queue name `analyze`, never blocked behind
-        // `dartq test`. `--no-queue` bypasses; a queue that cannot be
-        // entered runs unqueued with one line, never a failed run.
-        let _queue = analyze_queue_guard(&cwd, no_queue);
+        // The machine-wide job gate: one slot and the run's last recorded
+        // peak (`analyze:<cwd>`) for the run's life, the `dart analyze`
+        // child included.
+        let peak_key = format!("analyze:{}", cwd.display());
+        let _slot = match job_slot(Job::Analyze, &peak_key, &cwd, max_percent) {
+            Ok(slot) => slot,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return exit::USAGE;
+            }
+        };
         if face.stats {
             let version = sdk
                 .or_else(|| dart.as_deref().and_then(dartq_analyzer_host::Sdk::of_dart))
@@ -1626,12 +1639,13 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
         }
         // The child's RSS budget (`analyzer.official.memory_budget_gb`,
         // unbounded unless set): the watchdog kills an over-budget tree.
-        match official::run_with_budget(
+        let run = official::run_with_budget(
             dart.as_deref(),
             &face.argv,
             root,
             Some(settings.memory_budget_bytes),
-        ) {
+        );
+        match run {
             Ok(run) => official_finish(&run, face.format, face.memory, out, err),
             Err(error) => {
                 eprintln!("error: {error}");
@@ -1715,108 +1729,150 @@ fn official_finish(
 }
 
 // ---------------------------------------------------------------------------
-// Analyze run queue + analyzer memory budget
+// Job gate + analyzer memory budget
 // ---------------------------------------------------------------------------
 
-/// This analyze run's place in the machine-wide run queue, name `analyze`:
-/// the build cache's store root lends the queue its directory (every
-/// worktree sharing a store waits in one line), and analyzes serialize —
-/// one at a time, never blocked behind `dartq test`'s own `test` queue.
-/// A waiting run says so on stderr — when it starts waiting, every ten
-/// minutes after, and when admitted; an uncontended run prints nothing.
-/// `None` when `--no-queue` skips the queue, or when the queue cannot be
-/// entered: the queue never fails a run — one line says so and the run
-/// goes on unqueued.
-#[cfg(unix)]
-fn analyze_queue_guard(dir: &Path, no_queue: bool) -> Option<RunGuard> {
-    if no_queue {
-        return None;
-    }
-    let mut queued = false;
-    let entered = analyze_queue_root(dir).and_then(|root| {
-        run_queue::acquire_with("analyze", &root, 1, |event| match event {
-            Event::Queued { ahead } => {
-                queued = true;
-                eprintln!(
-                    "dartq analyze: {ahead} other analyze(s) in the queue — waiting \
-                     (first come, first served; --no-queue skips)"
-                );
-            }
-            Event::Still { active, waited } => eprintln!(
-                "dartq analyze: still waiting — {active} analyze(s) ahead (waited {}m)",
-                waited.as_secs() / 60
-            ),
-            // A dead analyze ticket is a run that exited without leaving
-            // the queue; its orphaned analyzer children are not the
-            // frontend_server class the build-cache reaper sweeps, so the
-            // event only lets the queue collect the ticket.
-            Event::Dead { .. } => {}
-        })
-    });
-    match entered {
-        Ok(guard) => {
-            if queued {
-                eprintln!(
-                    "dartq analyze: admitted (waited {:.1}s)",
-                    guard.waited().as_secs_f64()
-                );
-            }
-            Some(guard)
-        }
-        Err(error) => {
-            eprintln!("dartq analyze: run queue unavailable ({error}) — running unqueued");
-            None
-        }
-    }
-}
-
-/// The queue root a resident server start waits in: the per-run queue's
-/// root, so a full analysis in one worktree and a per-run one in another
-/// never run at once. `None` under `--no-queue` or when the root is
-/// unusable (the start runs unqueued, as a per-run analysis would).
-#[cfg(unix)]
-fn resident_queue_root(dir: &Path, no_queue: bool) -> Option<PathBuf> {
-    if no_queue {
-        return None;
-    }
-    analyze_queue_root(dir).ok()
-}
-
-#[cfg(not(unix))]
-fn resident_queue_root(_dir: &Path, _no_queue: bool) -> Option<PathBuf> {
-    None
-}
-
-/// Off unix there is no `flock`, so nothing queues: the queue is
-/// best-effort there.
-#[cfg(not(unix))]
-fn analyze_queue_guard(_dir: &Path, _no_queue: bool) -> Option<()> {
-    None
-}
-
-/// Where the analyze queue lives: the build cache's store root — the same
-/// root `dartq test`'s queue borrows, so every worktree of one monorepo
-/// shares both queues' directories under `<root>/queue/`. A store root
-/// that is not absolute is refused rather than let the queue land in the
-/// working tree.
-#[cfg(unix)]
-fn analyze_queue_root(dir: &Path) -> io::Result<PathBuf> {
-    let root = dartq_commands::bcache::discover_store_config(dir)
-        .map_err(io::Error::other)?
-        .store_root;
-    if !root.is_absolute() {
-        return Err(io::Error::other(format!(
-            "store root {} is not absolute",
-            root.display()
-        )));
-    }
-    Ok(root)
-}
-
 /// The `analyzer.official` settings of `dartq.yaml` (memory budget,
-/// resident server, idle timeout). Fail-open like the queue: an absent
+/// resident server, idle timeout). Fail-open like the gate: an absent
 /// config is the defaults, a malformed one warns once and keeps them — the
 /// analyze face never failed on `dartq.yaml` before and must not start now.
+/// The governing `memory.max_percent` (the default when dartq.yaml is
+/// unreadable: [`official_settings`] already said so).
+pub(crate) fn memory_max_percent(dir: &Path) -> u8 {
+    dartq_commands::config::discover(dir).ok().flatten().map_or(
+        dartq_commands::config::DEFAULT_MEMORY_MAX_PERCENT,
+        |config| config.memory_max_percent(),
+    )
+}
+
+/// The governing `memory.max_concurrent` (unlimited when dartq.yaml is
+/// unreadable), under the `DARTQ_MAX_CONCURRENT` override.
+pub(crate) fn job_cap(dir: &Path) -> u32 {
+    let configured = dartq_commands::config::discover(dir)
+        .ok()
+        .flatten()
+        .map_or(0, |config| config.memory_max_concurrent());
+    #[cfg(unix)]
+    {
+        dartq_toolchain::ledger::cap(configured)
+    }
+    #[cfg(not(unix))]
+    {
+        configured
+    }
+}
+
+/// How long a job waits at the machine-wide gate before it fails.
+pub(crate) const JOB_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// The jobs this binary takes slots for.
+#[derive(Clone, Copy)]
+pub(crate) enum Job {
+    /// A per-run official analysis (`dart analyze` under dartq).
+    Analyze,
+    /// An in-process dartq engine run (a standalone engine face).
+    Engine,
+    /// One `dartq test` invocation, whatever its shard count.
+    Test,
+}
+
+#[cfg(unix)]
+impl Job {
+    fn face(self) -> dartq_toolchain::ledger::Face {
+        use dartq_toolchain::ledger::Face;
+        match self {
+            Self::Analyze => Face::Analyze,
+            Self::Engine => Face::Engine,
+            Self::Test => Face::Test,
+        }
+    }
+}
+
+/// One job slot of the machine-wide gate for this process's tree: the
+/// governing `memory.max_concurrent`, and the recorded peak of `peak_key`
+/// (else a live peer's of `face`, else the default, unsized) as its
+/// memory. Waits with notes on stderr; a run nested inside another dartq
+/// job's slot joins it. `Ok(None)` runs ungated (`--no-queue`, no
+/// ledger); the error is a wait that timed out, naming the holders.
+#[cfg(unix)]
+pub(crate) fn job_slot(
+    job: Job,
+    peak_key: &str,
+    dir: &Path,
+    max_percent: u8,
+) -> Result<Option<JobSlot>, String> {
+    use dartq_toolchain::ledger::{self, Request};
+    #[cfg(test)]
+    if !tests::gate_under_test() {
+        return Ok(None);
+    }
+    let face = job.face();
+    let (bytes, sized) = ledger::sizing(peak_key, face);
+    let request = Request {
+        face,
+        label: dir.display().to_string(),
+        bytes,
+        pid: Some(std::process::id()),
+        release: None,
+        slot: true,
+        cap: job_cap(dir),
+        sized,
+    };
+    let deadline = std::time::Instant::now() + JOB_WAIT;
+    match ledger::acquire(request, bytes, max_percent, deadline, |note| {
+        eprintln!("{note}");
+    }) {
+        Ok(lease) => Ok(lease.map(|lease| JobSlot {
+            _lease: lease,
+            peak_key: peak_key.to_owned(),
+        })),
+        Err(error @ ledger::Error::Timeout { .. }) => Err(error.to_string()),
+        Err(ledger::Error::Io(_) | ledger::Error::Stopped) => Ok(None),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn job_slot(_: Job, _: &str, _: &Path, _: u8) -> Result<Option<JobSlot>, String> {
+    Ok(None)
+}
+
+/// A held job slot. Dropping it records the process tree's peak RSS
+/// (this process and its waited-for children) under its key, for the
+/// next run's lease.
+pub(crate) struct JobSlot {
+    #[cfg(unix)]
+    _lease: dartq_toolchain::ledger::Lease,
+    peak_key: String,
+}
+
+impl Drop for JobSlot {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        dartq_toolchain::ledger::record_peak(
+            &self.peak_key,
+            dartq_toolchain::proc::self_peak_rss().max(dartq_toolchain::proc::children_peak_rss()),
+        );
+    }
+}
+
+/// `--no-queue`: every later gate of this process runs ungated.
+pub(crate) fn gate_bypass() {
+    #[cfg(unix)]
+    dartq_toolchain::ledger::bypass();
+}
+
+/// Whether this process runs inside another dartq job's slot.
+pub(crate) fn gate_nested() -> bool {
+    #[cfg(unix)]
+    {
+        dartq_toolchain::ledger::nested()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn official_settings(dir: &Path) -> dartq_commands::config::OfficialSettings {
     match dartq_commands::config::discover(dir) {
         Ok(config) => config.unwrap_or_default().official(),
@@ -2000,6 +2056,27 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
     // decides before any discovery probe — a `no-plugins` run is the exact
     // pre-plugin shape (no options read, no convention scan).
     let plugins_enabled = !args.no_plugins;
+    // The in-process engine is a heavy job: it holds a job slot of the
+    // machine-wide gate for the run, sized by the first root's recorded
+    // peak (one per worktree).
+    if args.no_queue {
+        gate_bypass();
+    }
+    let gate_root = groups
+        .first()
+        .map_or_else(PathBuf::new, |(root, _)| root.clone());
+    let _slot = match job_slot(
+        Job::Engine,
+        &format!("engine:{}", gate_root.display()),
+        &gate_root,
+        memory_max_percent(&gate_root),
+    ) {
+        Ok(slot) => slot,
+        Err(reason) => {
+            eprintln!("dartq: {reason}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
     // The cross-process facts cache (#2630): the one-shot face opens the
     // same XDG-rooted store the daemon flushes. An unreadable store warns
     // once and leaves every engine cold — the accelerator posture, never a
@@ -2581,6 +2658,20 @@ fn daemon(args: &DaemonArgs) -> u8 {
     // replace the standing defaults only when passed; the sink's file is
     // created here — the analyze face's posture (create or usage error) —
     // so a bad `--trace-events` path fails before the session serves.
+    // The stdio daemon is a heavy job for its whole life: one slot of the
+    // machine-wide gate, sized by its worktree's recorded peak.
+    let _slot = match job_slot(
+        Job::Engine,
+        &format!("engine:{}", args.dir.display()),
+        &args.dir,
+        memory_max_percent(&args.dir),
+    ) {
+        Ok(slot) => slot,
+        Err(reason) => {
+            eprintln!("dartq: {reason}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
     let mut runtime = dartq_daemon::SessionRuntime::default();
     if let Some(limit) = args.memory_limit {
         runtime.memory_limit_mib = limit;
@@ -3368,7 +3459,7 @@ struct ShimArgs {
 
 /// Which SDK tool a shim verb installs or removes: `flutter` routes the
 /// flutter build-cache face (the default, the only tool before `dart`
-/// existed), `dart` routes `dart analyze` through the run queue and the
+/// existed), `dart` routes `dart analyze` through the job gate and the
 /// analyzer RSS budget.
 #[derive(Clone, Copy, ValueEnum)]
 enum ShimTool {
@@ -5253,38 +5344,101 @@ mod tests {
         }
     }
 
-    /// The analyze run queue admits a contender under a configured store
-    /// root and refuses one under `--no-queue` — the ticket file appears
-    /// under `<store>/queue/analyze/tickets/` while the guard lives.
+    /// A job slot is a ledger lease labelled with its worktree for the
+    /// slot's life; dropping it returns the slot and records the peak.
     #[cfg(unix)]
     #[test]
-    fn analyze_queue_guard_takes_a_ticket_unless_skipped() {
+    fn a_job_slot_holds_a_ledger_slot_until_dropped() {
+        use dartq_toolchain::ledger::{self, Face};
+        if isolated("tests::a_job_slot_holds_a_ledger_slot_until_dropped") {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("worktree");
+        let key = format!("analyze:{}", dir.path().display());
+        let label = dir.path().display().to_string();
+        let held = || {
+            ledger::leases()
+                .into_iter()
+                .filter(|(face, held, _)| *face == Face::Analyze && *held == label)
+                .count()
+        };
+        let slot = job_slot(Job::Analyze, &key, dir.path(), 90).expect("admitted");
+        assert_eq!(held(), usize::from(slot.is_some()));
+        drop(slot);
+        assert_eq!(held(), 0);
+        assert!(ledger::peak(&key).is_some(), "the peak is recorded");
+    }
+
+    /// Set in the child [`isolated`] starts: the test runs its body there.
+    const ISOLATED_ENV: &str = "DARTQ_TEST_ISOLATED";
+
+    /// Whether this test process exercises the machine-wide job gate: only
+    /// inside an [`isolated`] child, which has a private ledger. Everywhere
+    /// else in this binary the in-process gate entry points run ungated, so
+    /// parallel tests never queue behind each other or behind the user's
+    /// real dartq jobs, and never release the user's idle residents.
+    pub(crate) fn gate_under_test() -> bool {
+        std::env::var_os(ISOLATED_ENV).is_some()
+    }
+
+    /// Runs test `name` of this binary alone in a fresh child process and
+    /// panics with its output unless it passed. Process-global state is
+    /// then the test's own: the environment, which it may set, and the
+    /// ledger's record of the slots this process holds, which turns a
+    /// second slot request into a memory-only booking whenever any other
+    /// in-process test holds a slot. The child starts with a private
+    /// ledger (a fresh directory and room to spare), no inherited job
+    /// token or cap override, and no `DART_SDK`. `true` in the parent (the
+    /// caller returns); `false` in the child (the caller runs its body).
+    #[cfg(unix)]
+    pub(crate) fn isolated(name: &str) -> bool {
+        use dartq_toolchain::ledger;
+        if std::env::var_os(ISOLATED_ENV).is_some() {
+            return false;
+        }
+        let ledger_dir = tempfile::tempdir().expect("ledger dir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([name, "--exact", "--test-threads", "1", "--nocapture"])
+            .env(ISOLATED_ENV, "1")
+            .env(ledger::DIR_ENV, ledger_dir.path())
+            .env(ledger::AVAILABLE_ENV, (1u64 << 40).to_string())
+            .env_remove(ledger::TOKEN_ENV)
+            .env_remove(ledger::CAP_ENV)
+            .env_remove("DART_SDK")
+            .output()
+            .expect("run the isolated test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test {name} failed ({}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// `memory.max_percent` reaches the analyze face from `dartq.yaml`,
+    /// 90 when unset or unreadable.
+    #[test]
+    fn memory_max_percent_reads_the_config() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = dir.path().join("store");
+        fs::write(dir.path().join("dartq.yaml"), "version: 1\n").expect("dartq.yaml");
+        assert_eq!(memory_max_percent(dir.path()), 90);
         fs::write(
             dir.path().join("dartq.yaml"),
-            format!("version: 1\nbuild_cache:\n  root: {}\n", store.display()),
+            "version: 1\nmemory:\n  max_percent: 60\n",
         )
         .expect("dartq.yaml");
-
-        // --no-queue: no guard, no ticket directory.
-        assert!(analyze_queue_guard(dir.path(), true).is_none());
-        assert!(
-            !store.join("queue").join("analyze").exists(),
-            "--no-queue must not even create the queue directory"
-        );
-
-        // Default: the guard holds a ticket under the analyze queue.
-        let guard = analyze_queue_guard(dir.path(), false)
-            .expect("an uncontended queue admits immediately");
-        let tickets = store.join("queue").join("analyze").join("tickets");
-        let count = fs::read_dir(&tickets).expect("tickets dir").count();
-        assert_eq!(count, 1, "exactly one live ticket while the guard lives");
-        drop(guard);
+        assert_eq!(memory_max_percent(dir.path()), 60);
+        fs::write(
+            dir.path().join("dartq.yaml"),
+            "version: 1\nmemory:\n  max_percent: 0\n",
+        )
+        .expect("dartq.yaml");
         assert_eq!(
-            fs::read_dir(&tickets).expect("tickets dir").count(),
-            0,
-            "dropping the guard releases the ticket"
+            memory_max_percent(dir.path()),
+            90,
+            "a config error falls back"
         );
     }
 

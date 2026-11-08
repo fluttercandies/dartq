@@ -541,6 +541,12 @@ pub struct DebugSession {
     /// Whether the launched child is `flutter run` (drives the
     /// teardown ladder in [`DebugSession::terminate`]).
     flutter_child: bool,
+    /// The launched app's memory lease, held for the app's life and
+    /// never released by the ledger (a paused app must not be killed to
+    /// make room); its tree is the app's, so a session daemon hosting
+    /// the session does not count it twice.
+    #[cfg(unix)]
+    memory: Option<dartq_toolchain::ledger::Lease>,
 }
 
 impl DebugSession {
@@ -576,6 +582,10 @@ impl DebugSession {
             LaunchKind::Dart => dart_argv(&config),
             LaunchKind::Flutter => flutter_argv(&config)?,
         };
+        // Booked before the spawn, without waiting: debugging is never
+        // held at the job gate, but every other admission sees the app.
+        #[cfg(unix)]
+        let mut memory = book_app(&config);
         let mut command = Command::new(&program);
         command
             .args(&argv)
@@ -634,7 +644,15 @@ impl DebugSession {
                 return Err(error);
             }
         };
+        #[cfg(unix)]
+        if let Some(lease) = memory.as_mut() {
+            lease.track(child.id());
+        }
         let mut session = Self::new(client, Some(child), settings);
+        #[cfg(unix)]
+        {
+            session.memory = memory;
+        }
         session.ws_uri = ws_uri;
         session.pipe_feed = Some(rx);
         session.pipe_drops = Some(drops);
@@ -724,6 +742,8 @@ impl DebugSession {
             ws_uri: String::new(),
             flutter_tool: None,
             flutter_child: false,
+            #[cfg(unix)]
+            memory: None,
         }
     }
 
@@ -1905,6 +1925,11 @@ impl DebugSession {
             }
             child.wait()?;
         }
+        // The app is gone: its memory goes back to the ledger.
+        #[cfg(unix)]
+        {
+            self.memory = None;
+        }
         Ok(())
     }
 
@@ -2352,6 +2377,34 @@ impl DebugSession {
             at_async_suspension: event.at_async_suspension,
         })
     }
+}
+
+/// The memory booking of one launch: the peak recorded for its working
+/// directory and entrypoint, else the largest live debug app's, else the
+/// ledger default. Booked at once — a debug launch never waits at the job
+/// gate, holds no job slot and is never released — so the booking only
+/// makes the app visible to every other admission. `None` without a
+/// ledger.
+#[cfg(unix)]
+fn book_app(config: &LaunchConfig) -> Option<dartq_toolchain::ledger::Lease> {
+    use dartq_toolchain::ledger::{self, Face, Request};
+    let cwd = config
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let key = format!("debug:{}:{}", cwd.display(), config.script.display());
+    let (bytes, sized) = ledger::sizing(&key, Face::Debug);
+    ledger::book(Request {
+        face: Face::Debug,
+        label: cwd.join(&config.script).display().to_string(),
+        bytes,
+        pid: None,
+        release: None,
+        slot: false,
+        cap: 0,
+        sized,
+    })
 }
 
 impl Drop for DebugSession {
@@ -3115,6 +3168,78 @@ http://127.0.0.1:9002/A=/\r"
             flutter_target(&outside),
             PathBuf::from("/elsewhere/lib/main.dart")
         );
+    }
+
+    /// A launch books its memory at once under a job cap of 1 whose slot
+    /// another job holds: debugging never waits at the gate, takes no
+    /// slot, and its booking is visible to every other admission.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_books_memory_at_once_while_the_only_slot_is_held() {
+        use dartq_toolchain::ledger::{self, Face, Request, leases};
+        // The ledger directory is process-wide environment and the slots a
+        // process holds are process-wide state, so the body runs alone in
+        // a child process with a private ledger.
+        const ISOLATED_ENV: &str = "DARTQ_TEST_ISOLATED";
+        let name = "session::tests::a_launch_books_memory_at_once_while_the_only_slot_is_held";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            let ledger_dir =
+                std::env::temp_dir().join(format!("dartq-debug-ledger-{}", std::process::id()));
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([name, "--exact", "--test-threads", "1"])
+                .env(ISOLATED_ENV, "1")
+                .env(ledger::DIR_ENV, &ledger_dir)
+                .env(ledger::AVAILABLE_ENV, (1u64 << 40).to_string())
+                .env_remove(ledger::TOKEN_ENV)
+                .env_remove(ledger::CAP_ENV)
+                .output()
+                .expect("run the isolated test");
+            let _ = std::fs::remove_dir_all(&ledger_dir);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated test {name} failed ({}):\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let slot = ledger::acquire(
+            Request {
+                face: Face::Test,
+                label: "other".into(),
+                bytes: 1 << 20,
+                pid: None,
+                release: None,
+                slot: true,
+                cap: 1,
+                sized: true,
+            },
+            1 << 20,
+            90,
+            Instant::now() + Duration::from_secs(5),
+            |_| {},
+        )
+        .expect("the slot is free")
+        .expect("a ledger");
+        let dir = std::env::temp_dir().join(format!("dartq-debug-lease-{}", std::process::id()));
+        let config = LaunchConfig {
+            cwd: Some(dir.clone()),
+            ..LaunchConfig::new("bin/main.dart")
+        };
+        let started = Instant::now();
+        let booking = crate::session::book_app(&config).expect("booked");
+        assert!(started.elapsed() < Duration::from_secs(1), "no wait");
+        assert!(!booking.holds_slot());
+        let label = dir.join("bin/main.dart").display().to_string();
+        assert!(
+            leases()
+                .iter()
+                .any(|(face, held, _)| *face == Face::Debug && *held == label),
+            "the booking is visible"
+        );
+        drop(booking);
+        drop(slot);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::process::Command;
 
 /// `(pid, ppid, rss KiB)` for every process, from one `ps` snapshot.
 /// Empty when `ps` cannot answer.
-fn table() -> Vec<(u32, u32, u64)> {
+pub(crate) fn table() -> Vec<(u32, u32, u64)> {
     let Ok(output) = Command::new("ps")
         .args(["-axo", "pid=,ppid=,rss="])
         .output()
@@ -38,17 +38,32 @@ fn table() -> Vec<(u32, u32, u64)> {
 
 /// `root` followed by every descendant in `rows`, breadth first.
 fn tree(rows: &[(u32, u32, u64)], root: u32) -> Vec<u32> {
+    tree_excluding(rows, root, &[])
+}
+
+/// [`tree`], not descending into any pid of `stop` other than `root`: the
+/// subtree of another accounted root is that root's to count.
+pub(crate) fn tree_excluding(rows: &[(u32, u32, u64)], root: u32, stop: &[u32]) -> Vec<u32> {
     let mut members = vec![root];
     let mut next = 0;
     while let Some(&pid) = members.get(next) {
         next += 1;
         members.extend(
             rows.iter()
-                .filter(|&&(child, ppid, _)| ppid == pid && child != pid)
+                .filter(|&&(child, ppid, _)| ppid == pid && child != pid && !stop.contains(&child))
                 .map(|&(child, _, _)| child),
         );
     }
     members
+}
+
+/// The summed RSS in bytes of `members` in `rows`.
+pub(crate) fn rss_of(rows: &[(u32, u32, u64)], members: &[u32]) -> u64 {
+    members
+        .iter()
+        .filter_map(|pid| rows.iter().find(|row| row.0 == *pid))
+        .map(|&(_, _, rss)| rss.saturating_mul(1024))
+        .sum()
 }
 
 /// The summed RSS in bytes of `root` and every descendant. `0` when `ps`
@@ -57,11 +72,7 @@ fn tree(rows: &[(u32, u32, u64)], root: u32) -> Vec<u32> {
 #[must_use]
 pub fn tree_rss_bytes(root: u32) -> u64 {
     let rows = table();
-    tree(&rows, root)
-        .into_iter()
-        .filter_map(|pid| rows.iter().find(|row| row.0 == pid))
-        .map(|&(_, _, rss)| rss.saturating_mul(1024))
-        .sum()
+    rss_of(&rows, &tree(&rows, root))
 }
 
 /// SIGKILLs every descendant of `root`, then `root`. Best effort: a pid
@@ -101,6 +112,40 @@ pub fn physical_memory() -> u64 {
         (Ok(pages), Ok(page)) => pages.saturating_mul(page),
         _ => 0,
     }
+}
+
+/// The peak RSS in bytes of the heaviest child process this process has
+/// waited for (descendants its children waited for included):
+/// `getrusage(RUSAGE_CHILDREN)`. A peak of one process, not of a tree, at
+/// no sampling cost; `0` when the host does not say.
+#[must_use]
+pub fn children_peak_rss() -> u64 {
+    rusage_peak(libc::RUSAGE_CHILDREN)
+}
+
+fn rusage_peak(who: libc::c_int) -> u64 {
+    // SAFETY: getrusage fills the zeroed struct it is handed.
+    let usage = unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        if libc::getrusage(who, &raw mut usage) != 0 {
+            return 0;
+        }
+        usage
+    };
+    let max = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    // Bytes on macOS, KiB elsewhere.
+    if cfg!(target_os = "macos") {
+        max
+    } else {
+        max.saturating_mul(1024)
+    }
+}
+
+/// The peak RSS in bytes of this process itself:
+/// `getrusage(RUSAGE_SELF)`; `0` when the host does not say.
+#[must_use]
+pub fn self_peak_rss() -> u64 {
+    rusage_peak(libc::RUSAGE_SELF)
 }
 
 /// Whether `pid` names a live process (`kill(pid, 0)`); pid 0 and pids

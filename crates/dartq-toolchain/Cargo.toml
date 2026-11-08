@@ -9,6 +9,12 @@ repository.workspace = true
 categories = ["development-tools"]
 keywords = ["dart", "flutter", "toolchain"]
 
+# The memory ledger's holder records.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
 # The process-tree budget signals analyzer trees (kill(2) per pid).
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

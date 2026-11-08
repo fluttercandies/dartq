@@ -54,8 +54,6 @@ pub struct DartqConfig {
     pub memory: Option<MemoryDefaults>,
     /// The cache defaults.
     pub cache: Option<CacheDefaults>,
-    /// The `dartq test` face's machine-level knobs.
-    pub test: Option<TestConfig>,
     /// The analyze face's engine choice and official-engine knobs.
     pub analyzer: Option<AnalyzerConfig>,
     /// The package-discovery policy (the `packages` face).
@@ -65,13 +63,27 @@ pub struct DartqConfig {
 }
 
 impl DartqConfig {
-    /// How many `dartq test` executions may run at once machine-wide:
-    /// `test.max_concurrent`, 1 when unset, and never below 1 — there is
-    /// no fewer than one at a time, so a lower value clamps.
+    /// How many heavy jobs may run at once machine-wide, across every
+    /// worktree and kind: `memory.max_concurrent`, else `0`, unlimited.
+    /// Validated to an integer ≥ 0 at parse. The `DARTQ_MAX_CONCURRENT`
+    /// override is the gate's (`dartq_toolchain::ledger::cap`).
     #[must_use]
-    pub fn test_max_concurrent(&self) -> usize {
-        let declared = self.test.and_then(|test| test.max_concurrent).unwrap_or(1);
-        usize::try_from(declared.max(1)).unwrap_or(usize::MAX)
+    pub fn memory_max_concurrent(&self) -> u32 {
+        self.memory
+            .and_then(|memory| memory.max_concurrent)
+            .and_then(|cap| u32::try_from(cap).ok())
+            .unwrap_or(0)
+    }
+
+    /// The machine-wide memory share every heavy dartq face together may
+    /// hold, in percent: `memory.max_percent`, 90 when unset (validated to
+    /// 1–100 at parse).
+    #[must_use]
+    pub fn memory_max_percent(&self) -> u8 {
+        self.memory
+            .and_then(|memory| memory.max_percent)
+            .and_then(|percent| u8::try_from(percent).ok())
+            .unwrap_or(DEFAULT_MEMORY_MAX_PERCENT)
     }
 
     /// The `analyzer.official` knobs, defaults filled in.
@@ -95,19 +107,6 @@ impl DartqConfig {
     pub fn engine(&self) -> Option<Engine> {
         self.analyzer.and_then(|analyzer| analyzer.engine)
     }
-}
-
-/// The `test:` section — the `dartq test` face's machine-level knobs.
-/// Unknown keys inside it are a structured [`ConfigError::Invalid`], as in
-/// `build_cache`: a typo here must not silently fall back to a default.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestConfig {
-    /// How many test executions run at once: every worktree sharing the
-    /// build cache's store root joins one first-come-first-served queue
-    /// before its execution phase (resolved by
-    /// [`DartqConfig::test_max_concurrent`]).
-    pub max_concurrent: Option<i64>,
 }
 
 /// Which analyzer `dartq analyze` runs.
@@ -247,11 +246,25 @@ pub struct GeneratedPolicy {
 }
 
 /// The memory defaults.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub struct MemoryDefaults {
     /// The memory budget in MiB.
-    pub limit_mib: u64,
+    pub limit_mib: Option<u64>,
+    /// The share of the machine's memory, in percent (1–100), every heavy
+    /// dartq face together may hold: resident analyzers, analyze and test
+    /// runs, session daemons, Flutter builds and debug apps (resolved by
+    /// [`DartqConfig::memory_max_percent`]). Any other value is a
+    /// [`ConfigError::Invalid`].
+    pub max_percent: Option<i64>,
+    /// How many heavy jobs run at once machine-wide, across every worktree
+    /// and kind (resolved by [`DartqConfig::memory_max_concurrent`]): `0`
+    /// or unset is unlimited; anything but an integer ≥ 0 is a
+    /// [`ConfigError::Invalid`].
+    pub max_concurrent: Option<i64>,
 }
+
+/// The `memory.max_percent` default.
+pub const DEFAULT_MEMORY_MAX_PERCENT: u8 = 90;
 
 /// The cache defaults.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -368,9 +381,9 @@ fn load_global_at(home: Option<&Path>) -> Result<Option<DartqConfig>, ConfigErro
 
 /// Two tiers folded into one governing config: every key the project tier
 /// declares wins; the global tier fills the keys it leaves unset. Scalar
-/// sections (`memory`, `cache`, `test`) and list-shaped ones (`contexts`,
+/// sections (`cache`, `analyzer`) and list-shaped ones (`contexts`,
 /// `packages`) are whole-section — the project tier replaces the global's
-/// section when present. `build_cache` and `generated` merge key by key
+/// section when present. `build_cache`, `generated` and `memory` merge key by key
 /// inside the section, so a machine-wide `budget_gb` survives a project
 /// that only pins `root`.
 fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<DartqConfig> {
@@ -397,14 +410,24 @@ fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<
             Some(global)
         }
     };
-    if project.memory.is_some() {
-        governing.memory = project.memory;
-    }
+    governing.memory = match (governing.memory, project.memory) {
+        (None, project) => project,
+        (global, None) => global,
+        (Some(mut global), Some(project)) => {
+            if project.limit_mib.is_some() {
+                global.limit_mib = project.limit_mib;
+            }
+            if project.max_percent.is_some() {
+                global.max_percent = project.max_percent;
+            }
+            if project.max_concurrent.is_some() {
+                global.max_concurrent = project.max_concurrent;
+            }
+            Some(global)
+        }
+    };
     if project.cache.is_some() {
         governing.cache = project.cache;
-    }
-    if project.test.is_some() {
-        governing.test = project.test;
     }
     if project.analyzer.is_some() {
         governing.analyzer = project.analyzer;
@@ -585,6 +608,32 @@ fn push_unique(axes: &mut Vec<PathBuf>, root: PathBuf) {
 fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
     let value: serde_yaml::Value = serde_yaml::from_str(text)
         .map_err(|error| ConfigError::Invalid(format!("invalid dartq.yaml: {error}")))?;
+    if let Some(percent) = value
+        .get("memory")
+        .and_then(|memory| memory.get("max_percent"))
+        .filter(|percent| !percent.is_null())
+        && !percent
+            .as_i64()
+            .is_some_and(|percent| (1..=100).contains(&percent))
+    {
+        let shown = serde_yaml::to_string(percent).unwrap_or_default();
+        return Err(ConfigError::Invalid(format!(
+            "dartq.yaml: `memory.max_percent` must be an integer from 1 to 100, got {}",
+            shown.trim()
+        )));
+    }
+    if let Some(cap) = value
+        .get("memory")
+        .and_then(|memory| memory.get("max_concurrent"))
+        .filter(|cap| !cap.is_null())
+        && !cap.as_i64().is_some_and(|cap| cap >= 0)
+    {
+        let shown = serde_yaml::to_string(cap).unwrap_or_default();
+        return Err(ConfigError::Invalid(format!(
+            "dartq.yaml: `memory.max_concurrent` must be an integer of 0 or more (0 is unlimited), got {}",
+            shown.trim()
+        )));
+    }
     let raw: RawConfig = serde_yaml::from_value(value.clone())
         .map_err(|error| ConfigError::Invalid(format!("invalid dartq.yaml: {error}")))?;
     if raw.version.is_some_and(|version| version != 1) {
@@ -626,7 +675,6 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         generated: raw.generated,
         memory: raw.memory,
         cache: raw.cache,
-        test: raw.test,
         analyzer: raw.analyzer,
         packages: raw.packages,
         build_cache: raw.build_cache,
@@ -641,7 +689,6 @@ struct RawConfig {
     generated: Option<GeneratedPolicy>,
     memory: Option<MemoryDefaults>,
     cache: Option<CacheDefaults>,
-    test: Option<TestConfig>,
     analyzer: Option<AnalyzerConfig>,
     packages: Option<PackagesConfig>,
     build_cache: Option<BuildCacheConfig>,
@@ -743,7 +790,7 @@ mod tests {
         assert_eq!(build.root, Some(PathBuf::from("/store")));
         assert_eq!(build.budget_gb, Some(8));
         assert_eq!(
-            config.memory.expect("memory").limit_mib,
+            config.memory.expect("memory").limit_mib.expect("limit_mib"),
             2048,
             "a project section the project omits falls through to the global"
         );
@@ -917,7 +964,7 @@ mod tests {
         // The defaults parsed through, and the axis selection stays empty.
         let config = load(&root).expect("config").expect("some");
         assert!(config.contexts.is_empty());
-        assert_eq!(config.memory.expect("memory").limit_mib, 2048);
+        assert_eq!(config.memory.expect("memory").limit_mib, Some(2048));
         assert_eq!(config.cache.expect("cache").size_limit_gib, 10);
         assert_eq!(
             config.generated.expect("generated").patterns,
@@ -1112,54 +1159,100 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// `test.max_concurrent` resolves through both tiers (the project's
-    /// section replaces the global's), is 1 when unset anywhere, clamps
-    /// below 1, and a typo inside the section is loud.
+    /// `memory.max_concurrent` resolves key by key through both tiers, is
+    /// 0 (unlimited) when unset anywhere, and anything but an integer of 0
+    /// or more is a structured error. `test.max_concurrent` has no effect.
     #[test]
-    fn test_max_concurrent_resolves_tiers_defaults_and_clamps() {
+    fn memory_max_concurrent_resolves_tiers_and_validates() {
         let resolve = |project: &Path, home: &Path| {
             discover_with(project, Some(home))
                 .expect("discover")
                 .expect("config")
-                .test_max_concurrent()
+                .memory_max_concurrent()
         };
-        let (home, project) = tiered(Some("version: 1\ntest:\n  max_concurrent: 2\n"));
-        write_config(project.path(), "version: 1\n");
+        let (home, project) = tiered(Some("version: 1\nmemory:\n  max_concurrent: 2\n"));
+        write_config(project.path(), "version: 1\nmemory:\n  max_percent: 80\n");
         assert_eq!(
             resolve(project.path(), home.path()),
             2,
-            "the global tier fills a section the project omits"
+            "the global tier fills a key the project omits"
         );
-        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: 3\n");
-        assert_eq!(
-            resolve(project.path(), home.path()),
-            3,
-            "the project tier wins"
-        );
-        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: 0\n");
-        assert_eq!(resolve(project.path(), home.path()), 1, "0 clamps to 1");
-        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: -4\n");
+        write_config(project.path(), "version: 1\nmemory:\n  max_concurrent: 1\n");
         assert_eq!(
             resolve(project.path(), home.path()),
             1,
-            "a negative cap clamps to 1"
+            "the project tier wins"
         );
 
         let (home, project) = tiered(None);
         write_config(project.path(), "version: 1\n");
         assert_eq!(
             resolve(project.path(), home.path()),
-            1,
-            "unset in every tier is 1"
+            0,
+            "unset is unlimited"
         );
-        write_config(project.path(), "version: 1\ntest:\n  max_concurent: 2\n");
-        assert!(
-            matches!(
-                discover_with(project.path(), Some(home.path())),
-                Err(ConfigError::Invalid(ref message)) if message.contains("max_concurent")
-            ),
-            "an unknown key inside the section is a structured error"
+        write_config(project.path(), "version: 1\ntest:\n  max_concurrent: 3\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            0,
+            "`test.max_concurrent` is not read"
         );
+        for bad in ["-1", "1.5", "two"] {
+            write_config(
+                project.path(),
+                &format!("version: 1\nmemory:\n  max_concurrent: {bad}\n"),
+            );
+            assert!(
+                matches!(
+                    discover_with(project.path(), Some(home.path())),
+                    Err(ConfigError::Invalid(ref message)) if message.contains("memory.max_concurrent")
+                ),
+                "memory.max_concurrent {bad} is a config error"
+            );
+        }
+    }
+
+    /// `memory.max_percent` resolves key by key through both tiers, is 90
+    /// when unset anywhere, and anything but an integer from 1 to 100 is a
+    /// structured error.
+    #[test]
+    fn memory_max_percent_resolves_tiers_defaults_and_validates() {
+        let resolve = |project: &Path, home: &Path| {
+            discover_with(project, Some(home))
+                .expect("discover")
+                .expect("config")
+                .memory_max_percent()
+        };
+        let (home, project) = tiered(Some("version: 1\nmemory:\n  max_percent: 70\n"));
+        write_config(project.path(), "version: 1\nmemory:\n  limit_mib: 2048\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            70,
+            "the global tier fills a key the project omits"
+        );
+        write_config(project.path(), "version: 1\nmemory:\n  max_percent: 100\n");
+        assert_eq!(
+            resolve(project.path(), home.path()),
+            100,
+            "the project tier wins"
+        );
+
+        let (home, project) = tiered(None);
+        write_config(project.path(), "version: 1\n");
+        assert_eq!(resolve(project.path(), home.path()), 90, "unset is 90");
+        for bad in ["0", "101", "-5", "50.5", "half"] {
+            write_config(
+                project.path(),
+                &format!("version: 1\nmemory:\n  max_percent: {bad}\n"),
+            );
+            assert!(
+                matches!(
+                    discover_with(project.path(), Some(home.path())),
+                    Err(ConfigError::Invalid(ref message)) if message.contains("max_percent")
+                ),
+                "max_percent {bad} is a config error"
+            );
+        }
     }
 
     /// The `analyzer:` section: the engine choice and the official knobs

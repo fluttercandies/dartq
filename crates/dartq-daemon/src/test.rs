@@ -322,6 +322,10 @@ impl TestManager {
         // daemon's, and a cancel reaches the child and its compiler.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        // The run joins the daemon's job slot: it never waits behind its
+        // own parent, and while it lives the daemon counts as busy.
+        #[cfg(unix)]
+        dartq_toolchain::ledger::inherit(&mut command);
         let mut child = command.spawn().map_err(|error| {
             TestError::Domain(format!("cannot start {}: {error}", bin.display()))
         })?;
@@ -382,6 +386,14 @@ impl TestManager {
         );
         self.evict();
         Ok(self.next_id)
+    }
+
+    /// The runs whose `dartq test` has not exited yet.
+    pub(crate) fn live(&self) -> usize {
+        self.runs
+            .values()
+            .filter(|run| run.progress.lock().exit.is_none())
+            .count()
     }
 
     /// Keep the newest [`MAX_FINISHED`] finished runs.

@@ -430,6 +430,7 @@ dependencies = [
  "dartq-snapshot",
  "dartq-source",
  "dartq-test",
+ "dartq-toolchain",
  "libc",
  "notify",
  "parking_lot",
@@ -738,7 +739,10 @@ name = "dartq-toolchain"
 version = "0.1.13"
 dependencies = [
  "libc",
+ "serde",
+ "serde_json",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

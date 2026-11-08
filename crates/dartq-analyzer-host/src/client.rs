@@ -28,9 +28,10 @@ pub struct Request {
     /// The server tree's RSS budget in bytes; `0` is unbounded.
     pub budget: u64,
     pub idle: Duration,
-    /// The machine-wide run queue root server starts wait in; `None`
-    /// starts unqueued.
-    pub queue: Option<PathBuf>,
+    /// `memory.max_percent`, the memory ledger's share.
+    pub max_percent: u8,
+    /// `memory.max_concurrent`, the job cap the server's slot declares.
+    pub max_concurrent: u32,
 }
 
 /// The answer of the resident path.
@@ -38,8 +39,9 @@ pub struct Request {
 pub enum Outcome {
     /// dartdev's report, with the SDK version that produced it.
     Report { report: Report, sdk: Sdk },
-    /// The server was killed over the RSS budget: the error the caller
-    /// prints, with no per-run retry (it would hit the same budget).
+    /// The server was killed over the RSS budget, or never got its memory
+    /// lease: the error the caller prints, with no per-run retry (it would
+    /// hit the same budget, or wait for the same memory).
     Budget(String),
     /// Run `dart analyze` per run; `reason` is the one stderr line, `None`
     /// when the SDK is simply not served (no line).
@@ -80,7 +82,8 @@ pub fn analyze(request: &Request) -> Outcome {
         packages: request.packages.as_deref().map(absolute),
         budget: request.budget,
         idle_secs: request.idle.as_secs(),
-        queue: request.queue.clone(),
+        max_percent: request.max_percent,
+        max_concurrent: request.max_concurrent,
     };
     #[cfg(unix)]
     {
@@ -205,7 +208,10 @@ fn start(spec: &Spec, dir: &Path, files: &Files) -> Result<std::os::unix::net::U
     std::fs::write(&files.spec, spec_bytes)
         .map_err(|error| format!("cannot write the spec: {error}"))?;
     let exe = std::env::current_exe().map_err(|error| format!("cannot locate dartq: {error}"))?;
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    // The daemon outlives this client: it takes its own job slot.
+    dartq_toolchain::ledger::detach(&mut command);
+    command
         .args(["analyze", SERVE_FLAG])
         .arg(dir)
         .stdin(Stdio::null())

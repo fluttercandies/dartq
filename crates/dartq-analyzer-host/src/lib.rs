@@ -53,9 +53,11 @@ pub struct Spec {
     /// The server tree's RSS budget in bytes; `0` is unbounded.
     pub budget: u64,
     pub idle_secs: u64,
-    /// The run queue root (`dartq analyze`'s machine-wide queue): server
-    /// starts take a ticket there. `None` starts unqueued.
-    pub queue: Option<PathBuf>,
+    /// `memory.max_percent`: the machine-wide memory ledger's share.
+    pub max_percent: u8,
+    /// `memory.max_concurrent`: the job cap the server's slot declares
+    /// (`0` unlimited).
+    pub max_concurrent: u32,
 }
 
 impl Spec {
@@ -63,8 +65,8 @@ impl Spec {
     /// `<cache>/dartq/analyzer/daemons/<key>`. The key is the answer's
     /// key ([`Spec::cache_dir`]'s) plus the dartq binary: a rebuilt or
     /// upgraded dartq gets a fresh daemon over the same server cache. The
-    /// budget, idle timeout and queue are the starter's and do not split
-    /// daemons.
+    /// budget, idle timeout, memory share and job cap are the starter's and
+    /// do not split daemons.
     #[must_use]
     pub fn dir(&self) -> PathBuf {
         let mut hasher = self.answer_key();
@@ -191,22 +193,6 @@ pub(crate) fn sweep(own: &Path) {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-}
-
-/// The live daemons other than `own`: directory, pid and last answer.
-#[cfg(unix)]
-pub(crate) fn peers(own: &Path) -> Vec<(PathBuf, u32, std::time::SystemTime)> {
-    entries(&cache_root().join(DAEMONS))
-        .into_iter()
-        .filter(|dir| dir != own)
-        .filter_map(|dir| {
-            let pid = daemon_pid(&dir)?;
-            let used = std::fs::metadata(Files::of(&dir).state)
-                .and_then(|meta| meta.modified())
-                .ok()?;
-            Some((dir, pid, used))
-        })
-        .collect()
 }
 
 /// The pid of the live daemon of `dir`.

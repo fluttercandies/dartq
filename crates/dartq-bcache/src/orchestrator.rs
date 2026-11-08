@@ -290,6 +290,12 @@ pub struct ShimConfig {
     /// The resolved flutter binary this invocation keys and spawns.
     /// `None` (discovery failed upstream) is a passthrough.
     pub flutter_bin: Option<PathBuf>,
+    /// `memory.max_percent`: the machine-wide memory ledger's share the
+    /// build's lease draws from.
+    pub memory_max_percent: u8,
+    /// `memory.max_concurrent`: the job cap a batch command's slot
+    /// declares (`0` unlimited).
+    pub memory_max_concurrent: u32,
 }
 
 /// What one shim invocation did.
@@ -387,6 +393,9 @@ impl FlutterRunner for CommandRunner {
             let forwarders = forward::install();
             let mut command = Command::new(&self.flutter);
             command.args(argv).current_dir(cwd).env_remove(SHIM_ENV);
+            // The platform builds flutter spawns run `flutter assemble`
+            // back through the shim: they join this invocation's slot.
+            dartq_toolchain::ledger::inherit(&mut command);
             let result = (|| -> io::Result<i32> {
                 let mut child = forward::spawn_blocked(&mut command)?;
                 let status = child.wait()?;
@@ -576,6 +585,26 @@ pub fn run_shim(
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    // The machine-wide job gate, for the invocation's whole life: a batch
+    // command waits for its slot and memory; an interactive one books its
+    // memory and never waits. Taken before anything else runs, so a
+    // passthrough is gated exactly like a cached build.
+    let gate = match gate(&lossy, cwd, config) {
+        Ok(gate) => gate,
+        Err(message) => {
+            note(&message);
+            return ShimReport {
+                action: Action::Passthrough,
+                exit_code: Some(1),
+                key: None,
+                materialize: None,
+                ingest_files: 0,
+                skipped_dirs: 0,
+                reason: "gate_timeout",
+            };
+        }
+    };
+    let gated = gate.is_some();
     let parsed = match parse_flutter_args(&lossy) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -584,31 +613,31 @@ pub fn run_shim(
             } else {
                 "unmodeled_command"
             };
-            return run_passthrough(argv, cwd, runner, reason);
+            return run_passthrough(argv, cwd, runner, reason, gated);
         }
     };
 
     let Some(flutter_bin) = config.flutter_bin.clone() else {
-        return run_passthrough(argv, cwd, runner, "flutter_unresolved");
+        return run_passthrough(argv, cwd, runner, "flutter_unresolved", gated);
     };
     let root = match key::flutter_root(&flutter_bin) {
         Ok(root) => root,
-        Err(_) => return run_passthrough(argv, cwd, runner, "flutter_root_unreadable"),
+        Err(_) => return run_passthrough(argv, cwd, runner, "flutter_root_unreadable", gated),
     };
     let toolchain = match cached_fingerprint(&root, &config.store_root) {
         Ok(toolchain) => toolchain,
-        Err(_) => return run_passthrough(argv, cwd, runner, "toolchain_unreadable"),
+        Err(_) => return run_passthrough(argv, cwd, runner, "toolchain_unreadable", gated),
     };
     // The record lands before the gate refuses, so an unsupported SDK
     // pays its one rehash and never another: the negative record serves
     // every later invocation of the same SDK state.
     store_fingerprint_cache(&config.store_root, &root, &toolchain);
     if !supported_flutter_version(&toolchain.flutter_version) {
-        return run_passthrough(argv, cwd, runner, "unsupported_flutter_version");
+        return run_passthrough(argv, cwd, runner, "unsupported_flutter_version", gated);
     }
 
     let Some(cwd) = fs::canonicalize(cwd).ok() else {
-        return run_passthrough(argv, cwd, runner, "cwd_unreadable");
+        return run_passthrough(argv, cwd, runner, "cwd_unreadable", gated);
     };
 
     // The replay anchors of THIS tree: the worktree root (git toplevel
@@ -868,6 +897,10 @@ pub fn run_shim(
     let observer = CaptureObserver::start(cwd.clone(), toolchain.engine_revision.clone());
     let marker = RunMarker::create(&cwd);
     let run = runner.run(argv, &cwd);
+    #[cfg(all(unix, not(test)))]
+    if let Some(gate) = &gate {
+        dartq_toolchain::ledger::record_peak(&gate.key, dartq_toolchain::proc::children_peak_rss());
+    }
     let observed = observer.finish();
     let run_started = marker
         .as_ref()
@@ -1231,6 +1264,7 @@ fn run_passthrough(
     cwd: &Path,
     runner: &mut dyn FlutterRunner,
     reason: &'static str,
+    gated: bool,
 ) -> ShimReport {
     let mut report = ShimReport {
         action: Action::Passthrough,
@@ -1241,7 +1275,15 @@ fn run_passthrough(
         skipped_dirs: 0,
         reason,
     };
-    match runner.exec(argv, cwd) {
+    // A gate lease is a locked file of this process: an exec would close
+    // it (close-on-exec) and free the slot while flutter still runs, so a
+    // gated passthrough spawns and waits instead.
+    let run = if gated {
+        runner.run(argv, cwd)
+    } else {
+        runner.exec(argv, cwd)
+    };
+    match run {
         Ok(code) => report.exit_code = Some(code),
         Err(err) => note(&format!("flutter spawn failed: {err}")),
     }
@@ -2223,6 +2265,110 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
+/// How long a batch command waits at the job gate before it fails.
+const GATE_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// The flutter command `argv` runs and whether it is batch work: the
+/// first non-option token (`build` with its target), walking pre-command
+/// options as `package:args` would. `None` for a line without one.
+fn shim_command(argv: &[String]) -> Option<(String, bool)> {
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < argv.len() && words.len() < 2 {
+        let token = argv[i].as_str();
+        if token == "--" {
+            break;
+        }
+        if token.starts_with('-') {
+            let consumes_next = matches!(token, "-d" | "-P" | "--device-id" | "--local-engine")
+                || token == "--local-engine-src-path"
+                || token == "--local-engine-host"
+                || token == "--local-web-sdk";
+            i += usize::from(consumes_next) + 1;
+            continue;
+        }
+        words.push(token);
+        if words[0] != "build" {
+            break;
+        }
+        i += 1;
+    }
+    let verb = *words.first()?;
+    let batch = matches!(verb, "build" | "assemble" | "test" | "drive");
+    Some((words.join(" "), batch))
+}
+
+/// A gate lease and the peak key it records under.
+struct Gate {
+    #[cfg(unix)]
+    _lease: dartq_toolchain::ledger::Lease,
+    #[cfg_attr(not(all(unix, not(test))), allow(dead_code))]
+    key: String,
+}
+
+/// The job gate of one shim invocation over this process's tree (the
+/// flutter child and everything it spawns):
+///
+/// * a batch command (`build *`, `assemble`, `test`, `drive`) takes a
+///   slot and its memory — the recorded peak of its project and command,
+///   else the largest live build's, else the default — waiting as the
+///   gate decides; a batch command spawned under another dartq job's slot
+///   (an `assemble` behind `flutter build`) joins that slot;
+/// * an interactive command (`run`) books its memory at once and never
+///   waits: debug work is never held behind analysis or tests;
+/// * anything else (`attach`, `pub`, `doctor`, …) runs ungated.
+///
+/// `None` runs ungated; the error is a batch wait that timed out.
+#[cfg(unix)]
+fn gate(
+    argv: &[String],
+    cwd: &Path,
+    config: &ShimConfig,
+) -> std::result::Result<Option<Gate>, String> {
+    use dartq_toolchain::ledger::{self, Face, Request};
+    let Some((command, batch)) = shim_command(argv) else {
+        return Ok(None);
+    };
+    if !batch && command != "run" {
+        return Ok(None);
+    }
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let key = format!("build:{}:{command}", cwd.display());
+    let (bytes, sized) = ledger::sizing(&key, Face::Build);
+    let request = Request {
+        face: if batch { Face::Build } else { Face::Debug },
+        label: cwd.display().to_string(),
+        bytes,
+        pid: Some(std::process::id()),
+        release: None,
+        slot: batch,
+        cap: ledger::cap(config.memory_max_concurrent),
+        sized,
+    };
+    if !batch {
+        return Ok(ledger::book(request).map(|lease| Gate { _lease: lease, key }));
+    }
+    let deadline = std::time::Instant::now() + GATE_WAIT;
+    match ledger::acquire(
+        request,
+        bytes,
+        config.memory_max_percent,
+        deadline,
+        |message| {
+            eprintln!("{message}");
+        },
+    ) {
+        Ok(lease) => Ok(lease.map(|lease| Gate { _lease: lease, key })),
+        Err(error @ ledger::Error::Timeout { .. }) => Err(error.to_string()),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(not(unix))]
+fn gate(_: &[String], _: &Path, _: &ShimConfig) -> std::result::Result<Option<Gate>, String> {
+    Ok(None)
+}
+
 /// One stderr diagnostic line; stdout stays the child's.
 fn note(message: &(impl Display + ?Sized)) {
     eprintln!("dartq-bcache: {message}");
@@ -2378,6 +2524,8 @@ mod tests {
             budget_bytes: 20 << 30,
             grace_secs: 3600,
             flutter_bin: Some(flutter_bin.to_path_buf()),
+            memory_max_percent: 90,
+            memory_max_concurrent: 0,
         }
     }
 
@@ -2390,6 +2538,135 @@ mod tests {
     /// A second arbitrary name: the contention test's dir that only a
     /// PRE materialization could ever place.
     const DIR_ALT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Set in the child [`isolated`] starts: the test runs its body there.
+    const ISOLATED_ENV: &str = "DARTQ_TEST_ISOLATED";
+
+    /// Runs test `name` of this binary alone in a fresh child process with
+    /// a private ledger (a fresh directory, room to spare, no inherited
+    /// job token or cap override), and panics with its output unless it
+    /// passed. In-process, the ledger directory is process-wide
+    /// environment and the slots a process holds are process-wide state:
+    /// any other test's batch build would share both. `true` in the
+    /// parent (the caller returns); `false` in the child.
+    #[cfg(unix)]
+    fn isolated(name: &str) -> bool {
+        use dartq_toolchain::ledger;
+        if std::env::var_os(ISOLATED_ENV).is_some() {
+            return false;
+        }
+        let ledger_dir = tempfile::tempdir().expect("ledger dir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([name, "--exact", "--test-threads", "1", "--nocapture"])
+            .env(ISOLATED_ENV, "1")
+            .env(ledger::DIR_ENV, ledger_dir.path())
+            .env(ledger::AVAILABLE_ENV, (1u64 << 40).to_string())
+            .env_remove(ledger::TOKEN_ENV)
+            .env_remove(ledger::CAP_ENV)
+            .output()
+            .expect("run the isolated test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test {name} failed ({}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// A build holds a memory lease labelled with its tree for exactly the
+    /// child's run: present while the runner runs, gone once it returned.
+    #[cfg(unix)]
+    #[test]
+    fn a_build_holds_its_memory_lease_while_flutter_runs() {
+        use dartq_toolchain::ledger::{Face, leases};
+        if isolated("orchestrator::tests::a_build_holds_its_memory_lease_while_flutter_runs") {
+            return;
+        }
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let config = config_for(&tmp.join("cas"), &sdk.join("bin").join("flutter"));
+        let tree = synthetic_project(&tmp, "lease");
+        let label = tree.display().to_string();
+        let mine = move || {
+            leases()
+                .into_iter()
+                .filter(|(face, held, _)| *face == Face::Build && *held == label)
+                .count()
+        };
+        let during = std::rc::Rc::new(std::cell::Cell::new(usize::MAX));
+        let seen = std::rc::Rc::clone(&during);
+        let probe = mine.clone();
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |_| seen.set(probe()))),
+        };
+        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(during.get(), 1, "one lease while flutter runs");
+        assert_eq!(mine(), 0, "released once flutter exited");
+    }
+
+    /// `flutter run` through the shim is debug work: under cap 1 with the
+    /// only slot held elsewhere it starts at once, booking its memory
+    /// without a slot.
+    #[cfg(unix)]
+    #[test]
+    fn flutter_run_never_waits_for_a_job_slot() {
+        use dartq_toolchain::ledger::{self, Face, Request, leases};
+        if isolated("orchestrator::tests::flutter_run_never_waits_for_a_job_slot") {
+            return;
+        }
+        let _slot = ledger::acquire(
+            Request {
+                face: Face::Test,
+                label: "other".into(),
+                bytes: 1 << 20,
+                pid: None,
+                release: None,
+                slot: true,
+                cap: 1,
+                sized: true,
+            },
+            1 << 20,
+            90,
+            std::time::Instant::now() + Duration::from_secs(5),
+            |_| {},
+        )
+        .expect("the slot is free")
+        .expect("a ledger");
+        let (_guard, tmp) = tempdir();
+        let sdk = fake_flutter_sdk(&tmp, "3.47.1");
+        let mut config = config_for(&tmp.join("cas"), &sdk.join("bin").join("flutter"));
+        config.memory_max_concurrent = 1;
+        let tree = synthetic_project(&tmp, "run");
+        let label = tree.display().to_string();
+        let during = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = std::rc::Rc::clone(&during);
+        let mut runner = FakeRunner {
+            code: 0,
+            argv: Vec::new(),
+            effect: Some(Box::new(move |_| {
+                seen.set(
+                    leases()
+                        .iter()
+                        .any(|(face, held, _)| *face == Face::Debug && *held == label),
+                );
+            })),
+        };
+        let started = std::time::Instant::now();
+        let report = run_shim(
+            &raw_argv(&["run", "-d", "macos"]),
+            &tree,
+            &config,
+            &mut runner,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "no wait");
+        assert_eq!(report.exit_code, Some(0));
+        assert!(during.get(), "the app's memory is booked while it runs");
+    }
 
     #[test]
     fn fresh_tree_pre_hit_materializes_recorded_dirs() {

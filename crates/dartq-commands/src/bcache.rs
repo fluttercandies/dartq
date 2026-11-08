@@ -88,6 +88,8 @@ pub fn shim_config(section: &BuildCacheConfig) -> ShimConfig {
             .saturating_mul(1024 * 1024 * 1024),
         grace_secs: section.grace_secs.unwrap_or(DEFAULT_GRACE_SECS),
         flutter_bin: section.flutter.as_ref().map(|bin| expand_home(bin)),
+        memory_max_percent: crate::config::DEFAULT_MEMORY_MAX_PERCENT,
+        memory_max_concurrent: 0,
     }
 }
 
@@ -124,10 +126,30 @@ pub fn default_shim_config() -> ShimConfig {
 /// default-on means "no section" and "section without keys" resolve
 /// identically.
 fn governing_build_cache(dir: &Path, home: Option<&Path>) -> Result<BuildCacheConfig, ConfigError> {
+    Ok(governing_with(dir, home)?.0)
+}
+
+/// The governing `build_cache` section plus `memory.max_percent` and
+/// `memory.max_concurrent`.
+fn governing_with(
+    dir: &Path,
+    home: Option<&Path>,
+) -> Result<(BuildCacheConfig, u8, u32), ConfigError> {
     let governing = crate::config::discover_with(dir, home)?;
-    Ok(governing
-        .and_then(|config| config.build_cache)
-        .unwrap_or_default())
+    let max_percent = governing.as_ref().map_or(
+        crate::config::DEFAULT_MEMORY_MAX_PERCENT,
+        crate::config::DartqConfig::memory_max_percent,
+    );
+    let max_concurrent = governing
+        .as_ref()
+        .map_or(0, crate::config::DartqConfig::memory_max_concurrent);
+    Ok((
+        governing
+            .and_then(|config| config.build_cache)
+            .unwrap_or_default(),
+        max_percent,
+        max_concurrent,
+    ))
 }
 
 /// Resolves the store config the flutter faces run: the governing
@@ -152,8 +174,12 @@ fn discover_shim_config_with(
     dir: &Path,
     home: Option<&Path>,
 ) -> Result<Option<ShimConfig>, ConfigError> {
-    let section = governing_build_cache(dir, home)?;
-    Ok((section.enabled != Some(false)).then(|| shim_config(&section)))
+    let (section, max_percent, max_concurrent) = governing_with(dir, home)?;
+    Ok((section.enabled != Some(false)).then(|| ShimConfig {
+        memory_max_percent: max_percent,
+        memory_max_concurrent: max_concurrent,
+        ..shim_config(&section)
+    }))
 }
 
 /// Resolves the store the `bcache stats|gc` maintenance faces maintain:
@@ -872,6 +898,8 @@ mod tests {
             budget_bytes: 0,
             grace_secs: 0,
             flutter_bin: None,
+            memory_max_percent: crate::config::DEFAULT_MEMORY_MAX_PERCENT,
+            memory_max_concurrent: 0,
         };
         let stats = bcache_stats(&config).expect("empty stats");
         assert_eq!(stats, StoreStats::default());

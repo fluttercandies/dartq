@@ -311,7 +311,7 @@ fn join(dir: &Path) -> io::Result<Ticket> {
 /// Eight bytes of the system's entropy pool; without `/dev/urandom`, the
 /// process id and the clock — still distinct for every contender that
 /// could race this one.
-fn random_u64() -> u64 {
+pub(crate) fn random_u64() -> u64 {
     let mut bytes = [0; 8];
     if File::open("/dev/urandom")
         .and_then(|mut source| source.read_exact(&mut bytes))

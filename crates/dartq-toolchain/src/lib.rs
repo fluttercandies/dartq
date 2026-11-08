@@ -36,6 +36,10 @@ pub mod run_queue;
 #[cfg(unix)]
 pub mod proc;
 
+/// The machine-wide memory ledger every heavy face leases from (unix).
+#[cfg(unix)]
+pub mod ledger;
+
 /// The `dart` PATH shim: install/remove of `~/.dartq/bin/dart` and the
 /// passthrough spawn for every non-`analyze` invocation.
 pub mod shim;
@@ -184,7 +188,7 @@ fn own_binary() -> Option<PathBuf> {
 /// Whether a runner command line asks for nothing but an answer that runs
 /// no tests: help and version, alone or beside dartq's own switches
 /// (`--no-cache`, `--no-queue`, `--stats`, `--flutter`). Such a line must
-/// not wait behind an hours-long run in the run queue — the runner prints
+/// not wait behind an hours-long run at the job gate — the runner prints
 /// its text and exits. Any other token (a path, a filter, a runner flag,
 /// anything past `--`) is execution intent and keeps the queue.
 #[must_use]

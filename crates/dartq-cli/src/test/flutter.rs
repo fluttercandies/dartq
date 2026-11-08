@@ -1007,10 +1007,13 @@ fn run_shards(
     // split the concurrency into processes of up to SUITES_PER_SHARD each.
     let wanted = dartq_test::flutter::tool_processes(target.div_ceil(SUITES_PER_SHARD), hooks);
     let deadline = Instant::now() + idle_timeout();
-    let (lease, workers) = dartq_test::lease_processes(profile, target, wanted, deadline)?
-        .ok_or_else(|| {
-            io::Error::other("timed out waiting for host memory held by other dartq runs")
-        })?;
+    let (lease, workers) = dartq_test::lease_processes(
+        profile,
+        target,
+        wanted,
+        crate::memory_max_percent(root),
+        deadline,
+    )?;
     let (shards, workers) = match &lease {
         Some(lease) => dartq_test::split(profile, lease.units(), target, wanted),
         None => (wanted.min(workers).max(1), workers),
@@ -1419,9 +1422,12 @@ fn grouped_pass(
         .map(|hosted| hosted.shard_total as usize)
         .sum();
     let target = plan.workers.min(rows).max(1);
-    let (lease, workers) = dartq_test::lease(profile, target, deadline)?.ok_or_else(|| {
-        io::Error::other("timed out waiting for host memory held by other dartq runs")
-    })?;
+    let (lease, workers) = dartq_test::lease(
+        profile,
+        target,
+        crate::memory_max_percent(&plan.root),
+        deadline,
+    )?;
     let index_of: FxHashMap<&Path, usize> = hosted
         .iter()
         .zip(&hosted_index)

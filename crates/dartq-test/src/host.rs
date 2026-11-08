@@ -11,15 +11,14 @@
 //!   compiler and the runner VM ([`RUN_UNITS`]) plus a share per concurrent
 //!   suite ([`WORKER_UNITS`]). A per-process scheduler only sees its own
 //!   children, so N agents starting together would each size themselves
-//!   against the same free memory. The lease draws from one host-wide pool
-//!   of [`UNIT`]-sized slots instead: slots are lock files under the cache
-//!   directory held with `flock`, so the kernel releases them when a
-//!   process exits, crashed or not.
+//!   against the same free memory. The lease is booked in the machine-wide
+//!   memory ledger (`dartq_toolchain::ledger`) every heavy dartq face
+//!   shares, in [`UNIT`]s: a test run waits for the analyzers, builds and
+//!   other runs already holding memory, and they for it.
 
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// One lease slot: the resident memory one test isolate host needs.
 pub const UNIT: u64 = 512 * 1024 * 1024;
@@ -32,12 +31,6 @@ pub const RUN_UNITS: usize = 6;
 
 /// Slots per concurrent suite (see [`RUN_UNITS`] for the measurement).
 pub const WORKER_UNITS: usize = 2;
-
-/// Share of physical memory the lease pool may hand out.
-const POOL_SHARE: (u64, u64) = (6, 10);
-
-/// Pause between attempts while the pool is exhausted.
-const RETRY: Duration = Duration::from_millis(250);
 
 /// The per-user dartq cache directory: `$DARTQ_CACHE_DIR`, else the
 /// platform cache location (`$XDG_CACHE_HOME/dartq`, `~/Library/Caches/dartq`
@@ -65,52 +58,6 @@ pub fn cache_dir() -> Option<PathBuf> {
     } else {
         home.join(".cache").join("dartq")
     })
-}
-
-/// Physical memory of the host.
-#[must_use]
-pub fn total_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut bytes: u64 = 0;
-        let mut len = std::mem::size_of::<u64>();
-        // SAFETY: `hw.memsize` is a u64; the out-pointer and length match it.
-        let rc = unsafe {
-            libc::sysctlbyname(
-                c"hw.memsize".as_ptr(),
-                (&raw mut bytes).cast(),
-                &raw mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (rc == 0 && bytes > 0).then_some(bytes)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix("MemTotal:"))?;
-        let kib: u64 = line.trim().trim_end_matches("kB").trim().parse().ok()?;
-        Some(kib * 1024)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
-}
-
-/// Slots in the host-wide pool: [`POOL_SHARE`] of physical memory, never
-/// fewer than one run with one worker. On an 8 GB host that is 9 slots:
-/// one stock run with one worker (8), or one grouped shard with up to seven
-/// concurrent suites; a second run waits.
-#[must_use]
-pub fn capacity_units() -> usize {
-    let pool = total_memory_bytes().map_or(16, |total| {
-        usize::try_from(total / POOL_SHARE.1 * POOL_SHARE.0 / UNIT).unwrap_or(usize::MAX)
-    });
-    pool.max(RUN_UNITS + WORKER_UNITS)
 }
 
 /// The memory profile of one kind of run: what a runner invocation holds
@@ -263,72 +210,113 @@ impl Profile {
 }
 
 /// Lease one runner invocation of up to `workers` concurrent suites from
-/// the host-wide pool, waiting until at least one suite fits. Returns the
-/// lease and the concurrency it covers; `Ok(None)` when `deadline` passes
-/// first. Without a cache directory there is no pool to share: the run
-/// gets `workers` unleased.
+/// the machine-wide memory ledger, waiting until at least one suite fits.
+/// Returns the lease and the concurrency it covers. `max_percent` is the
+/// governing `memory.max_percent`. Without a ledger (no cache directory,
+/// a non-unix host) the run gets `workers` unleased.
 ///
 /// # Errors
 ///
-/// I/O failures on the slot files.
-pub fn lease_run(workers: usize, deadline: Instant) -> io::Result<Option<(Option<Lease>, usize)>> {
-    lease(Profile::STOCK, workers, deadline)
+/// A timeout naming the holders when `deadline` passes first; I/O
+/// failures on the ledger.
+pub fn lease_run(
+    workers: usize,
+    max_percent: u8,
+    deadline: Instant,
+) -> io::Result<(Option<Lease>, usize)> {
+    lease(Profile::STOCK, workers, max_percent, deadline)
 }
 
 /// [`lease_run`] for an explicit memory profile.
 ///
-/// The request is capped by memory free right now as well as by the pool:
-/// the pool accounts for dartq runs, free memory for everything else on
-/// the host (an IDE, a browser, another test runner). Free memory is read
-/// once, when the lease is taken; the pool bound holds for the whole run.
-///
 /// # Errors
 ///
-/// I/O failures on the slot files.
+/// As [`lease_run`].
 pub fn lease(
     profile: Profile,
     workers: usize,
+    max_percent: u8,
     deadline: Instant,
-) -> io::Result<Option<(Option<Lease>, usize)>> {
-    lease_processes(profile, workers, 1, deadline)
+) -> io::Result<(Option<Lease>, usize)> {
+    lease_processes(profile, workers, 1, max_percent, deadline)
 }
 
 /// [`lease`] for a run spread over up to `processes` processes, each paying
 /// `profile.base` once: the request covers every process's base, the grant
-/// at least one process with one suite. The caller sizes its process count
-/// from [`Lease::units`].
+/// at least one process with one suite. The ledger grants as much of the
+/// request as fits (it also checks the memory the OS reports available,
+/// which accounts for everything outside dartq). The caller sizes its
+/// process count from [`Lease::units`].
 ///
 /// # Errors
 ///
-/// I/O failures on the slot files.
+/// As [`lease_run`].
 pub fn lease_processes(
     profile: Profile,
     workers: usize,
     processes: usize,
+    max_percent: u8,
     deadline: Instant,
-) -> io::Result<Option<(Option<Lease>, usize)>> {
+) -> io::Result<(Option<Lease>, usize)> {
     let workers = workers.max(1);
     let processes = processes.clamp(1, workers);
-    let Some(dir) = cache_dir() else {
-        return Ok(Some((None, workers)));
-    };
-    let free = free_memory_bytes().map(|free| usize::try_from(free / UNIT).unwrap_or(usize::MAX));
-    let fit = free
-        .map_or(workers, |units| {
-            units.saturating_sub(profile.base) / profile.per_worker
+    let (want, min) = request_units(profile, workers, processes);
+    #[cfg(unix)]
+    {
+        use dartq_toolchain::ledger;
+        let label = std::env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        // Memory only: the run's job slot is the invocation's, taken once
+        // at its start; a shard's memory books beside it.
+        let request = ledger::Request {
+            face: ledger::Face::Test,
+            label,
+            bytes: want as u64 * UNIT,
+            pid: Some(std::process::id()),
+            release: None,
+            slot: false,
+            cap: 0,
+            sized: true,
+        };
+        let granted = ledger::acquire(request, min as u64 * UNIT, max_percent, deadline, |note| {
+            eprintln!("{note}");
         })
-        .clamp(1, workers);
-    let want = (profile.base * processes + fit * profile.per_worker).min(
-        free.unwrap_or(usize::MAX)
-            .max(profile.base + profile.per_worker),
-    );
-    let min = profile.base + profile.per_worker;
-    Ok(
-        Lease::acquire(&dir.join("test"), want, min, capacity_units(), deadline)?.map(|lease| {
-            let (_, granted) = split(profile, lease.units(), workers, processes);
-            (Some(lease), granted)
-        }),
+        .map_err(io::Error::other)?;
+        Ok(match granted {
+            Some(inner) => {
+                let units = units_of(inner.bytes());
+                let (_, suites) = split(profile, units, workers, processes);
+                (
+                    Some(Lease {
+                        _inner: inner,
+                        units,
+                    }),
+                    suites,
+                )
+            }
+            None => (None, workers),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (want, min, max_percent, deadline);
+        Ok((None, workers))
+    }
+}
+
+/// The units a run of `workers` suites over `processes` processes asks
+/// for, and the least it runs with (one process with one suite).
+fn request_units(profile: Profile, workers: usize, processes: usize) -> (usize, usize) {
+    (
+        profile.base * processes + workers * profile.per_worker,
+        profile.base + profile.per_worker,
     )
+}
+
+/// Whole units in a granted byte count.
+fn units_of(bytes: u64) -> usize {
+    usize::try_from(bytes / UNIT).unwrap_or(usize::MAX).max(1)
 }
 
 /// How `units` lease units divide into processes and concurrent suites
@@ -347,113 +335,20 @@ pub fn split(profile: Profile, units: usize, workers: usize, processes: usize) -
     (shards, suites)
 }
 
-/// Slots held by this process. Dropping the lease closes the lock files,
-/// which returns the slots to the pool.
+/// Memory booked in the ledger by this process. Dropping the lease
+/// returns it.
 #[derive(Debug)]
 pub struct Lease {
-    /// Held only for their locks; closing them releases the slots.
     #[cfg(unix)]
-    _slots: Vec<File>,
+    _inner: dartq_toolchain::ledger::Lease,
     units: usize,
 }
 
 impl Lease {
-    /// The slots held.
+    /// The [`UNIT`]s held.
     #[must_use]
     pub fn units(&self) -> usize {
         self.units
-    }
-
-    /// Take between `min` and `want` slots from the pool under `dir`
-    /// (`capacity` slots in total), waiting while fewer than `min` are free.
-    /// `Ok(None)` when `deadline` passes first.
-    ///
-    /// Taking is serialized by a gate lock, so two processes never split
-    /// the last free slots between them and both come up short. Without
-    /// `flock` (non-unix hosts) the lease is granted unbounded at once.
-    ///
-    /// # Errors
-    ///
-    /// I/O failures creating or locking the slot files.
-    pub fn acquire(
-        dir: &Path,
-        want: usize,
-        min: usize,
-        capacity: usize,
-        deadline: Instant,
-    ) -> io::Result<Option<Self>> {
-        let want = want.min(capacity).max(min.min(capacity));
-        let min = min.min(want);
-        #[cfg(unix)]
-        {
-            let dir = dir.join("slots");
-            std::fs::create_dir_all(&dir)?;
-            loop {
-                let gate = open_lock(&dir.join("gate.lock"))?;
-                lock(&gate, false)?;
-                let mut slots = Vec::with_capacity(want);
-                for index in 0..capacity {
-                    if slots.len() == want {
-                        break;
-                    }
-                    let slot = open_lock(&dir.join(format!("slot-{index}.lock")))?;
-                    if lock(&slot, true)? {
-                        slots.push(slot);
-                    }
-                }
-                drop(gate);
-                if slots.len() >= min {
-                    let units = slots.len();
-                    return Ok(Some(Self {
-                        _slots: slots,
-                        units,
-                    }));
-                }
-                drop(slots);
-                if Instant::now() + RETRY > deadline {
-                    return Ok(None);
-                }
-                std::thread::sleep(RETRY);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (dir, deadline);
-            Ok(Some(Self { units: want }))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn open_lock(path: &Path) -> io::Result<File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-}
-
-/// `flock(LOCK_EX)`; with `try_only`, `Ok(false)` when another process
-/// holds it.
-#[cfg(unix)]
-fn lock(file: &File, try_only: bool) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    let operation = if try_only {
-        libc::LOCK_EX | libc::LOCK_NB
-    } else {
-        libc::LOCK_EX
-    };
-    loop {
-        // SAFETY: plain syscall on a descriptor this function borrows.
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        match error.kind() {
-            io::ErrorKind::Interrupted => {}
-            io::ErrorKind::WouldBlock => return Ok(false),
-            _ => return Err(error),
-        }
     }
 }
 
@@ -479,52 +374,6 @@ pub fn find_flutter(explicit: Option<&Path>) -> Option<PathBuf> {
 #[must_use]
 pub fn find_dart(explicit: Option<&Path>) -> Option<PathBuf> {
     dartq_toolchain::find_dart(explicit)
-}
-
-/// Memory the host can hand out now: available memory on Linux
-/// (`MemAvailable`), free plus inactive plus speculative pages on macOS
-/// (what Activity Monitor calls available).
-#[must_use]
-pub fn free_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
-        let kib: u64 = line.trim().trim_end_matches("kB").trim().parse().ok()?;
-        Some(kib * 1024)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("vm_stat")
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let page: u64 = text
-            .lines()
-            .next()?
-            .split("page size of")
-            .nth(1)?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()?;
-        let pages = |label: &str| -> u64 {
-            text.lines()
-                .find_map(|line| line.strip_prefix(label))
-                .and_then(|count| count.trim().trim_end_matches('.').parse().ok())
-                .unwrap_or(0)
-        };
-        let bytes =
-            (pages("Pages free:") + pages("Pages inactive:") + pages("Pages speculative:")) * page;
-        (bytes > 0).then_some(bytes)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,34 +479,17 @@ mod tests {
         assert_eq!(split(grouped, 1, 7, 3), (1, 1));
     }
 
-    /// Leases from one pool never overlap, a short pool times out, and a
-    /// dropped lease returns its slots.
+    /// A run asks for every process's base plus every suite's share, runs
+    /// with one process and one suite at least, and a grant converts back
+    /// to whole units that size it.
     #[test]
-    fn lease_pool_is_shared_and_bounded() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let far = Instant::now() + Duration::from_secs(5);
-        let first = Lease::acquire(tmp.path(), 6, 2, 8, far)
-            .expect("io")
-            .expect("granted");
-        assert_eq!(first.units(), 6);
-        // Two slots left: granted at the minimum, not the request.
-        let second = Lease::acquire(tmp.path(), 6, 2, 8, far)
-            .expect("io")
-            .expect("granted");
-        assert_eq!(second.units(), 2);
-        // Pool empty: waits, then gives up at the deadline.
-        let soon = Instant::now() + Duration::from_millis(300);
-        assert!(
-            Lease::acquire(tmp.path(), 1, 1, 8, soon)
-                .expect("io")
-                .is_none()
-        );
-        drop(first);
-        let third = Lease::acquire(tmp.path(), 6, 1, 8, far)
-            .expect("io")
-            .expect("granted");
-        assert_eq!(third.units(), 6, "released slots return to the pool");
-        drop(second);
+    fn requests_and_grants_convert_through_units() {
+        let grouped = Profile::GROUPED;
+        assert_eq!(request_units(grouped, 7, 3), (2 * 3 + 7, 3));
+        assert_eq!(request_units(Profile::STOCK, 4, 1), (6 + 4 * 2, 8));
+        assert_eq!(units_of(9 * UNIT + UNIT / 2), 9);
+        assert_eq!(units_of(1), 1, "a grant never sizes below one unit");
+        assert_eq!(split(grouped, units_of(13 * UNIT), 7, 3), (3, 7));
     }
 
     /// The grouped Flutter booking covers the measured peaks: the base

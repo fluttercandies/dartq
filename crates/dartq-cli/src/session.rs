@@ -155,6 +155,8 @@ pub(crate) fn spawn_server(layout: &Layout, triple: &SessionTriple) -> io::Resul
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
+        // The daemon outlives the starter's job slot and takes its own.
+        dartq_toolchain::ledger::detach(&mut command);
     }
     command.spawn().map(|child| {
         // Reaped by init when the serve loop exits; the starter does
@@ -553,6 +555,32 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     if !signals_ready {
         eprintln!("dartq: session serve: signal handling unavailable; exit signals kill in place");
     }
+    // The machine-wide job gate: the daemon holds a job slot and books its
+    // last recorded peak for its life. It is a resident the gate may
+    // release (SIGTERM, the graceful ladder) only while its busy lock is
+    // free: no client is being served and no debug session is held. While
+    // it hosts a debug session it gives the slot up (debugging is never
+    // restricted) and keeps the memory booked.
+    let peak_key = format!("session:{}", root.display());
+    let mut busy = Busy::open(&layout.dir.join("busy.lock"));
+    let mut lease = match lease_session(&peak_key, &root, &layout, &signalled) {
+        Ok(lease) => lease,
+        Err(message) => {
+            eprintln!("dartq: session serve: {message}");
+            stop_accepting(listener, &layout);
+            return serve_shutdown(
+                &mut session,
+                &events,
+                &layout,
+                &root,
+                &beating,
+                beater,
+                "gate",
+                exit::SOFTWARE,
+            );
+        }
+    };
+    let _peak = PeakOnExit(peak_key);
     loop {
         if signalled.load(std::sync::atomic::Ordering::Relaxed) {
             stop_accepting(listener, &layout);
@@ -573,7 +601,12 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 last_client = Instant::now();
                 let _ = stream.set_nonblocking(false);
                 let _ = events.append("session", "client_attached", serde_json::json!({}));
+                busy.hold(true);
                 serve_client(stream, &mut session, &signalled);
+                busy.hold(hosting(&session) > 0);
+                if let Some(lease) = &lease {
+                    lease.touch();
+                }
                 let _ = events.append("session", "client_detached", serde_json::json!({}));
                 heartbeat(
                     &layout,
@@ -582,7 +615,9 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                     held_sessions.load(std::sync::atomic::Ordering::Relaxed),
                 );
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                busy.hold(hosting(&session) > 0);
+            }
             Err(error) => {
                 accept_failures += 1;
                 if accept_failures == 1 || accept_failures % 20 == 0 {
@@ -606,7 +641,28 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 }
             }
         }
-        if idle_elapsed(last_client, Instant::now(), session.debug_sessions_len()) > idle_timeout {
+        if !settle_slot(
+            lease.as_mut(),
+            session.debug_sessions_len(),
+            session.test_runs_live(),
+        ) {
+            eprintln!(
+                "dartq: session serve: the last debug session ended and no job slot is free; \
+                 shutting down"
+            );
+            stop_accepting(listener, &layout);
+            return serve_shutdown(
+                &mut session,
+                &events,
+                &layout,
+                &root,
+                &beating,
+                beater,
+                "no_slot",
+                exit::CLEAN,
+            );
+        }
+        if idle_elapsed(last_client, Instant::now(), hosting(&session)) > idle_timeout {
             stop_accepting(listener, &layout);
             return serve_shutdown(
                 &mut session,
@@ -623,6 +679,131 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     }
 }
 
+/// The session daemon's busy lock: held while a client is served or a
+/// debug session is held, so the memory ledger never releases a daemon
+/// mid-request or with a paused app behind it. A lock file that cannot be
+/// opened holds nothing (the daemon is then never seen idle either: the
+/// ledger releases a resident only when it can take the lock itself).
+struct Busy {
+    file: Option<std::fs::File>,
+    held: bool,
+}
+
+impl Busy {
+    fn open(path: &Path) -> Self {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .ok();
+        Self { file, held: false }
+    }
+
+    fn hold(&mut self, held: bool) {
+        let Some(file) = &self.file else {
+            return;
+        };
+        if held == self.held {
+            return;
+        }
+        let changed = if held { file.lock() } else { file.unlock() };
+        if changed.is_ok() {
+            self.held = held;
+        }
+    }
+}
+
+/// Records this daemon's peak RSS under its key when the serve ends, for
+/// the next start's lease.
+struct PeakOnExit(String);
+
+impl Drop for PeakOnExit {
+    fn drop(&mut self) {
+        dartq_toolchain::ledger::record_peak(&self.0, dartq_toolchain::proc::self_peak_rss());
+    }
+}
+
+/// What the daemon hosts beyond its clients: debug sessions and running
+/// `dartq/test/run` children. While it hosts anything it is busy (never
+/// released by the gate) and never idle.
+fn hosting(session: &dartq_daemon::Session) -> usize {
+    session.debug_sessions_len() + session.test_runs_live()
+}
+
+/// Keeps the daemon's job slot in step with what it hosts: given up while
+/// it hosts a debug session, retaken without waiting when the last one
+/// ends. While a test run lives the slot stays as it is: the run either
+/// sits in the daemon's slot (and leaving it would let the run escape the
+/// count cap) or, spawned while the slot was given up, holds its own (and
+/// a failed retake would end the daemon under it). `false` when the slot
+/// cannot be retaken (every slot is taken): the daemon then exits rather
+/// than run outside the cap.
+fn settle_slot(
+    lease: Option<&mut dartq_toolchain::ledger::Lease>,
+    debug_sessions: usize,
+    test_runs: usize,
+) -> bool {
+    let Some(lease) = lease else {
+        return true;
+    };
+    if test_runs > 0 {
+        return true;
+    }
+    if debug_sessions > 0 {
+        lease.leave_slot();
+        return true;
+    }
+    // A gate that cannot be read keeps the daemon serving, as at start.
+    lease.retake_slot().unwrap_or(true)
+}
+
+/// How long a session daemon waits at the job gate before it gives up.
+const SESSION_MEMORY_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// The session daemon's lease: its recorded peak (else the largest live
+/// session daemon's, else the ledger default) over its own tree, analyzer
+/// plugin children included (a debug app holds its own lease and is not
+/// counted twice). A ledger that cannot be used serves unleased; the error
+/// is a wait that timed out. An exit signal ends the wait.
+fn lease_session(
+    peak_key: &str,
+    root: &Path,
+    layout: &Layout,
+    signalled: &std::sync::atomic::AtomicBool,
+) -> Result<Option<dartq_toolchain::ledger::Lease>, String> {
+    use dartq_toolchain::ledger::{self, Face, Releasable, Request};
+    #[cfg(test)]
+    if !crate::tests::gate_under_test() {
+        return Ok(None);
+    }
+    let (bytes, sized) = ledger::sizing(peak_key, Face::Session);
+    let request = Request {
+        face: Face::Session,
+        label: root.display().to_string(),
+        bytes,
+        pid: Some(std::process::id()),
+        release: Some(Releasable {
+            pid: std::process::id(),
+            busy: layout.dir.join("busy.lock"),
+        }),
+        slot: true,
+        cap: crate::job_cap(root),
+        sized,
+    };
+    let deadline = Instant::now() + SESSION_MEMORY_WAIT;
+    let max_percent = crate::memory_max_percent(root);
+    match ledger::acquire_or_stop(request, bytes, max_percent, deadline, signalled, |note| {
+        eprintln!("{note}");
+    }) {
+        Ok(lease) => Ok(lease),
+        Err(error @ (ledger::Error::Timeout { .. } | ledger::Error::Stopped)) => {
+            Err(error.to_string())
+        }
+        Err(ledger::Error::Io(_)) => Ok(None),
+    }
+}
+
 /// Ends the accept face at ladder entry (#2675): the socket path unlinks
 /// and the listener drops BEFORE the — possibly seconds-long — detach
 /// ladder runs, so a client connecting during the ladder is refused at
@@ -634,12 +815,12 @@ fn stop_accepting(listener: UnixListener, layout: &Layout) {
     drop(listener);
 }
 
-/// The idle clock (#2619): client silence, frozen at zero while any
-/// debug session is attached — a held debug session is never idle (a
+/// The idle clock (#2619): client silence, frozen at zero while the
+/// daemon hosts anything ([`hosting`]: a debug session, a test run) — a held debug session is never idle (a
 /// paused app must not outlive its daemon by reaper fiat), and on
 /// detach a full fresh idle window runs.
-fn idle_elapsed(last_client: Instant, now: Instant, debug_sessions: usize) -> Duration {
-    if debug_sessions > 0 {
+fn idle_elapsed(last_client: Instant, now: Instant, hosted: usize) -> Duration {
+    if hosted > 0 {
         Duration::ZERO
     } else {
         now.saturating_duration_since(last_client)
@@ -776,6 +957,32 @@ pub(crate) mod tests {
     /// out from under its assertions). Shared with the mcp module's
     /// serve test via `serve_loop_for_tests`.
     pub(crate) static SIGNAL_SERIALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The session daemon's busy lock is held exactly while it serves or
+    /// holds a debug session: the memory ledger, which may release an
+    /// idle daemon, can take the lock only when it is free.
+    #[test]
+    fn the_busy_lock_marks_a_session_daemon_unreleasable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("busy.lock");
+        let mut busy = Busy::open(&path);
+        let free = || {
+            std::fs::File::open(&path)
+                .expect("busy lock")
+                .try_lock()
+                .is_ok()
+        };
+        assert!(free(), "an idle daemon is releasable");
+        busy.hold(true);
+        assert!(!free(), "a serving daemon is not");
+        busy.hold(true);
+        assert!(!free(), "holding twice is still held");
+        busy.hold(false);
+        assert!(
+            free(),
+            "idle again once the client and debug sessions are gone"
+        );
+    }
 
     /// A short-rooted fixture (unix sockets cap at ~104 path bytes): a
     /// package with a stub SDK — the shape the daemon session assembles
@@ -984,6 +1191,188 @@ pub(crate) mod tests {
     /// #2619: the idle clock — client silence, frozen at zero while any
     /// debug session is attached. A held session is never idle however
     /// long the silence, and on detach a full fresh idle window runs.
+    /// Debugging is never restricted: a daemon hosting a debug session
+    /// gives its job slot up; when the last one ends with every slot
+    /// taken, it cannot retake one and the serve loop exits.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_whose_last_debug_session_ends_with_no_free_slot_exits() {
+        use dartq_toolchain::ledger::{self, Face, Request};
+        if crate::tests::isolated(
+            "session::tests::a_daemon_whose_last_debug_session_ends_with_no_free_slot_exits",
+        ) {
+            return;
+        }
+        let request = |face, label: &str| Request {
+            face,
+            label: label.into(),
+            bytes: 1 << 20,
+            pid: None,
+            release: None,
+            slot: true,
+            cap: 1,
+            sized: true,
+        };
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        let mut daemon =
+            ledger::acquire(request(Face::Session, "a"), 1 << 20, 90, deadline(), |_| {})
+                .expect("admitted")
+                .expect("a ledger");
+        assert!(
+            settle_slot(Some(&mut daemon), 1, 0),
+            "debugging keeps it serving"
+        );
+        assert!(!daemon.holds_slot(), "the slot is given up while debugging");
+        // A test run is admitted at once beside the live debug session.
+        let started = Instant::now();
+        let test = ledger::acquire(request(Face::Test, "b"), 1 << 20, 90, deadline(), |_| {})
+            .expect("admitted")
+            .expect("a ledger");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "admitted at once"
+        );
+        assert!(test.holds_slot(), "the test run takes the only slot");
+        assert!(
+            settle_slot(Some(&mut daemon), 0, 1),
+            "a live test run keeps the daemon serving without a retake"
+        );
+        assert!(!daemon.holds_slot(), "the slot stays the test run's");
+        assert!(
+            !settle_slot(Some(&mut daemon), 0, 0),
+            "no free slot: the daemon exits"
+        );
+        drop(test);
+        assert!(
+            settle_slot(Some(&mut daemon), 0, 0),
+            "a free slot is retaken"
+        );
+        assert!(daemon.holds_slot());
+    }
+
+    /// The stand-in for the `dartq test` child a `dartq/test/run` spawns:
+    /// a no-op unless [`PROBE_ENV`] names its report file. It makes the
+    /// slot request a nested `dartq test` makes, writes the outcome
+    /// (`joined`, `slot`, or the error) to the report, and lives until
+    /// the report's `.release` sibling appears.
+    #[test]
+    fn test_run_gate_probe() {
+        use dartq_toolchain::ledger::{self, Face, Request};
+        let Some(report) = std::env::var_os(PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let request = Request {
+            face: Face::Test,
+            label: "probe".into(),
+            bytes: 1 << 20,
+            pid: None,
+            release: None,
+            slot: true,
+            cap: 1,
+            sized: true,
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let outcome = match ledger::acquire(request, 1 << 20, 90, deadline, |_| {}) {
+            Ok(None) => "joined".to_owned(),
+            Ok(Some(lease)) if lease.holds_slot() => "slot".to_owned(),
+            Ok(Some(_)) => "memory".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        std::fs::write(&report, outcome).expect("report");
+        let release = report.with_extension("release");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !release.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    const PROBE_ENV: &str = "DARTQ_TEST_GATE_PROBE";
+
+    /// Under cap 1 the session daemon holds the only job slot, and a
+    /// `dartq/test/run` child joins it: it is admitted at once with no
+    /// slot of its own (it never waits on its own parent). While the run
+    /// lives the daemon stays busy (the gate never releases it) and never
+    /// idles out, even with no client attached; once it ends the daemon
+    /// is releasable and reaps itself.
+    #[test]
+    fn a_daemon_test_run_joins_its_slot_and_keeps_it_busy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if crate::tests::isolated(
+            "session::tests::a_daemon_test_run_joins_its_slot_and_keeps_it_busy",
+        ) {
+            return;
+        }
+        let root = test_fixture("testrun");
+        let report = root.join("probe.out");
+        let release = report.with_extension("release");
+        let probe = root.join("dartq-probe");
+        let binary = std::env::current_exe().expect("test binary");
+        std::fs::write(
+            &probe,
+            format!(
+                "#!/bin/sh\nexec '{}' session::tests::test_run_gate_probe --exact --nocapture\n",
+                binary.display()
+            ),
+        )
+        .expect("probe script");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))
+            .expect("probe mode");
+        // SAFETY: this child process runs this test alone.
+        unsafe {
+            std::env::set_var(ledger_cap_env(), "1");
+            std::env::set_var("DARTQ_BIN", &probe);
+            std::env::set_var(PROBE_ENV, &report);
+        }
+        let (dir, sdk) = (root.clone(), root.join("sdk"));
+        let server = std::thread::spawn(move || {
+            serve_loop_for_tests_with(&dir, &sdk, Duration::from_secs(1))
+        });
+        let layout = Layout::new(&root);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dartq_session::socket_open(&layout) {
+            assert!(Instant::now() < deadline, "the serve loop never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let started = Instant::now();
+        let answer = roundtrip(
+            &layout.socket,
+            r#"{"jsonrpc":"2.0","id":1,"method":"dartq/test/run","params":{"args":[]}}"#,
+        );
+        assert!(answer.contains("run_id"), "the run started: {answer}");
+        while !report.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the probe never reported"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(std::fs::read_to_string(&report).expect("report"), "joined");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "admitted without waiting for a slot"
+        );
+        // No client is attached, yet the daemon is busy and outlives its
+        // idle window while the run lives.
+        std::thread::sleep(Duration::from_secs(2));
+        let busy = std::fs::File::open(layout.dir.join("busy.lock")).expect("busy lock");
+        assert!(
+            matches!(busy.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a live test run keeps the daemon unreleasable"
+        );
+        assert!(
+            dartq_session::socket_open(&layout),
+            "a live test run is never idle"
+        );
+        std::fs::write(&release, "").expect("release the probe");
+        assert_eq!(server.join().expect("server thread"), exit::CLEAN);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn ledger_cap_env() -> &'static str {
+        dartq_toolchain::ledger::CAP_ENV
+    }
+
     #[test]
     fn the_idle_clock_freezes_while_debug_sessions_are_attached() {
         let start = Instant::now();
@@ -1402,13 +1791,14 @@ pub(crate) mod tests {
     /// #4105: the SDK root order a face that attaches resolves by — the
     /// flag wins, `$DART_SDK` next, then the live resident session's own
     /// triple, and only then the navigation error, which names all three
-    /// ways. One test owns `$DART_SDK` throughout: the environment is
-    /// process-wide and the binary's tests run in parallel.
+    /// ways. It sets `$DART_SDK`, so it runs alone in its own process
+    /// ([`crate::tests::isolated`]), which starts with the variable unset.
     #[test]
     fn sdk_root_order_flag_then_env_then_resident_then_error() {
-        let saved = std::env::var_os("DART_SDK");
-        unsafe {
-            std::env::remove_var("DART_SDK");
+        if crate::tests::isolated(
+            "session::tests::sdk_root_order_flag_then_env_then_resident_then_error",
+        ) {
+            return;
         }
         // A live session fixture: a listening socket plus the state file
         // naming this process with a fresh heartbeat — the same technique
@@ -1446,6 +1836,7 @@ pub(crate) mod tests {
             "the live session answers its own sdk root"
         );
         // The env outranks the resident session; the flag outranks both.
+        // SAFETY: the test runs alone in its own process (`isolated`).
         unsafe {
             std::env::set_var("DART_SDK", "/env/sdk");
         }
@@ -1455,6 +1846,7 @@ pub(crate) mod tests {
             Ok(PathBuf::from("/flag")),
             "the flag still wins over the environment and the session"
         );
+        // SAFETY: as above.
         unsafe {
             std::env::remove_var("DART_SDK");
         }
@@ -1470,11 +1862,6 @@ pub(crate) mod tests {
              `dartq session start --sdk PATH`)"
         );
 
-        if let Some(saved) = saved {
-            unsafe {
-                std::env::set_var("DART_SDK", saved);
-            }
-        }
         std::fs::remove_dir_all(&home).ok();
     }
 
