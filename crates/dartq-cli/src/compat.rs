@@ -97,6 +97,11 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
     } else {
         axes
     };
+    // One slot for the whole invocation: the axes' engines run in turn.
+    let _slot = match crate::engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (report, notices) = match query_compat(&args.dir, &args.path, &roots) {
         Ok(faces) => faces,
         Err(CompatError::Usage(message)) => {

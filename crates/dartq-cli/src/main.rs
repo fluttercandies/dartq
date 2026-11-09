@@ -1860,6 +1860,44 @@ impl Drop for JobSlot {
     }
 }
 
+/// The workspace root an in-process engine assembled from `target` (a
+/// directory, or a file whose parent seeds the assembly) projects against:
+/// the root `analyze --engine dartq` keys its `engine:` peak on, so every
+/// engine face of one worktree shares that peak.
+pub(crate) fn engine_root(target: &Path) -> PathBuf {
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let dir = if target.is_file() {
+        target.parent().map_or_else(PathBuf::new, Path::to_path_buf)
+    } else {
+        target
+    };
+    workspace_root_of(&dir)
+}
+
+/// The job slot of a one-shot face that assembles the engine in-process
+/// (no live session answered): the `analyze --engine dartq` slot, keyed
+/// on [`engine_root`]. The error is a wait that timed out.
+pub(crate) fn engine_slot(target: &Path) -> Result<Option<JobSlot>, String> {
+    let root = engine_root(target);
+    job_slot(
+        Job::Engine,
+        &format!("engine:{}", root.display()),
+        &root,
+        memory_max_percent(&root),
+    )
+}
+
+/// [`engine_slot`] for a CLI face: a timed-out wait is reported on stderr
+/// and answers the internal tier, as in [`analyze_targets`].
+pub(crate) fn engine_gate(target: &Path) -> Result<Option<JobSlot>, u8> {
+    engine_slot(target).map_err(|reason| {
+        eprintln!("dartq: {reason}");
+        exit::INTERNAL_ERROR
+    })
+}
+
 /// `--no-queue`: every later gate of this process runs ungated.
 pub(crate) fn gate_bypass() {
     #[cfg(unix)]
@@ -2959,6 +2997,10 @@ fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = resident::route_query(args, QueryKind::Callers, out) {
         return code;
     }
+    let _slot = match engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -3011,6 +3053,10 @@ fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = resident::route_query(args, QueryKind::Implementations, out) {
         return code;
     }
+    let _slot = match engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -3064,6 +3110,10 @@ fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = resident::route_query(args, QueryKind::Dependencies, out) {
         return code;
     }
+    let _slot = match engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -3121,6 +3171,10 @@ fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = resident::route_query_batch(args, out) {
         return code;
     }
+    let _slot = match engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let kinds = if args.kinds.is_empty() {
         vec![QueryKind::Symbol]
     } else {
@@ -3199,6 +3253,10 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = resident::route_query(args, QueryKind::Symbol, out) {
         return code;
     }
+    let _slot = match engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -3283,6 +3341,10 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
                 }
                 None => None,
             };
+            let _slot = match engine_gate(&dir) {
+                Ok(slot) => slot,
+                Err(code) => return code,
+            };
             match dartq_commands::explain::explain_diagnostic(
                 &dir,
                 args.sdk.as_deref(),
@@ -3313,6 +3375,10 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
             if let Some(code) = resident::route_explain(args, symbol, out) {
                 return code;
             }
+            let _slot = match engine_gate(&args.dir) {
+                Ok(slot) => slot,
+                Err(code) => return code,
+            };
             match dartq_commands::explain::explain(
                 &args.dir,
                 args.sdk.as_deref(),
@@ -5397,9 +5463,16 @@ mod tests {
     /// caller returns); `false` in the child (the caller runs its body).
     #[cfg(unix)]
     pub(crate) fn isolated(name: &str) -> bool {
+        isolated_stderr(name).is_some()
+    }
+
+    /// [`isolated`], answering the passed child's stderr in the parent
+    /// (`None` in the child).
+    #[cfg(unix)]
+    fn isolated_stderr(name: &str) -> Option<String> {
         use dartq_toolchain::ledger;
         if std::env::var_os(ISOLATED_ENV).is_some() {
-            return false;
+            return None;
         }
         let ledger_dir = tempfile::tempdir().expect("ledger dir");
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -5419,7 +5492,249 @@ mod tests {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
-        true
+        Some(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+
+    /// Names the report file of [`gate_holder_probe`].
+    #[cfg(unix)]
+    const HOLDER_ENV: &str = "DARTQ_TEST_GATE_HOLDER";
+
+    /// Another dartq job holding one slot, in a process of its own: a
+    /// no-op unless [`HOLDER_ENV`] names its report. It takes one sized
+    /// slot under the governing cap, writes the token it passes its
+    /// children to the report, and holds the slot until the report's
+    /// `.release` sibling appears.
+    #[cfg(unix)]
+    #[test]
+    fn gate_holder_probe() {
+        use dartq_toolchain::ledger::{self, Face, Request};
+        let Some(report) = std::env::var_os(HOLDER_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let request = Request {
+            face: Face::Analyze,
+            label: "holder".into(),
+            bytes: 1 << 20,
+            pid: Some(std::process::id()),
+            release: None,
+            slot: true,
+            cap: ledger::cap(0),
+            sized: true,
+            peak_key: None,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let lease = ledger::acquire(request, 1 << 20, 90, deadline, |_| {})
+            .expect("admitted")
+            .expect("a ledger");
+        let mut child = std::process::Command::new("true");
+        ledger::inherit(&mut child);
+        let token = child
+            .get_envs()
+            .find(|(key, _)| *key == ledger::TOKEN_ENV)
+            .and_then(|(_, value)| value)
+            .expect("the holder's token")
+            .to_owned();
+        let staged = report.with_extension("tmp");
+        fs::write(&staged, token.as_encoded_bytes()).expect("report");
+        fs::rename(&staged, &report).expect("report");
+        let release = report.with_extension("release");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(lease);
+    }
+
+    /// A live [`gate_holder_probe`] process and the token it passes on.
+    #[cfg(unix)]
+    struct Holder {
+        child: std::process::Child,
+        release: PathBuf,
+        token: String,
+    }
+
+    #[cfg(unix)]
+    impl Holder {
+        fn start(dir: &Path) -> Self {
+            let report = dir.join("holder.out");
+            let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "tests::gate_holder_probe",
+                    "--exact",
+                    "--test-threads",
+                    "1",
+                    "--nocapture",
+                ])
+                .env(HOLDER_ENV, &report)
+                .env_remove(ISOLATED_ENV)
+                .env_remove(dartq_toolchain::ledger::TOKEN_ENV)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("start the holder");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !report.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the holder never reported"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Self {
+                child,
+                release: report.with_extension("release"),
+                token: fs::read_to_string(&report).expect("token"),
+            }
+        }
+
+        /// Releases the slot after `delay`, from another thread.
+        fn release_after(&self, delay: Duration) {
+            let release = self.release.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let _ = fs::write(release, "");
+            });
+        }
+
+        fn finish(mut self) {
+            let _ = fs::write(&self.release, "");
+            assert!(self.child.wait().expect("the holder exits").success());
+        }
+    }
+
+    /// The fixture the cold engine faces answer over.
+    #[cfg(unix)]
+    fn engine_gate_fixture(tag: &str) -> PathBuf {
+        analyze_fixture(
+            tag,
+            &[(
+                "lib/a.dart",
+                "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n",
+            )],
+        )
+    }
+
+    #[cfg(unix)]
+    fn cold_symbol_query(root: &Path) -> u8 {
+        let args = SymbolArgs {
+            name: "foo".into(),
+            dir: root.to_path_buf(),
+            format: OutputFormat::Lon,
+            verbosity: Verbosity::Compact,
+            sdk: Some(root.join("sdk")),
+            fuzzy: false,
+        };
+        query_symbol_run(&args, &mut Vec::new())
+    }
+
+    #[cfg(unix)]
+    const SLOT_WAIT_NOTE: &str = "dartq: waiting for a job slot";
+
+    /// Under cap 1 with another live job holding the only slot, a cold
+    /// `query symbol` waits with the note and runs once the slot is free.
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_query_waits_for_the_only_slot() {
+        let name = "tests::a_cold_query_waits_for_the_only_slot";
+        if let Some(stderr) = isolated_stderr(name) {
+            assert!(stderr.contains(SLOT_WAIT_NOTE), "{stderr}");
+            assert!(stderr.contains("dartq: admitted"), "{stderr}");
+            return;
+        }
+        let root = engine_gate_fixture("gate-query-waits");
+        // SAFETY: this child process runs this test alone.
+        unsafe { std::env::set_var(dartq_toolchain::ledger::CAP_ENV, "1") };
+        let holder = Holder::start(&root);
+        let delay = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        holder.release_after(delay);
+        assert_eq!(cold_symbol_query(&root), exit::CLEAN);
+        assert!(started.elapsed() >= delay, "ran beside the holder");
+        holder.finish();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Under cap 1, a cold verb carrying a live holder's token (a child
+    /// of that job) joins its slot instead of waiting behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_query_inside_a_holders_slot_joins_it() {
+        let name = "tests::a_cold_query_inside_a_holders_slot_joins_it";
+        if let Some(stderr) = isolated_stderr(name) {
+            assert!(!stderr.contains("dartq: waiting"), "{stderr}");
+            return;
+        }
+        let root = engine_gate_fixture("gate-query-joins");
+        let holder = Holder::start(&root);
+        // SAFETY: this child process runs this test alone.
+        unsafe {
+            std::env::set_var(dartq_toolchain::ledger::CAP_ENV, "1");
+            std::env::set_var(dartq_toolchain::ledger::TOKEN_ENV, &holder.token);
+        }
+        // The fallback release keeps a wrongful wait from hanging the run.
+        let fallback = Duration::from_secs(30);
+        holder.release_after(fallback);
+        let started = std::time::Instant::now();
+        assert_eq!(cold_symbol_query(&root), exit::CLEAN);
+        assert!(started.elapsed() < fallback, "waited behind its own holder");
+        holder.finish();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// With no cap, a cold verb whose `engine:<root>` peak is recorded is
+    /// sized and runs beside another sized job at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_sized_cold_query_runs_beside_a_sized_holder() {
+        use dartq_toolchain::ledger::{self, Face};
+        let name = "tests::a_sized_cold_query_runs_beside_a_sized_holder";
+        if let Some(stderr) = isolated_stderr(name) {
+            assert!(!stderr.contains("dartq: waiting"), "{stderr}");
+            return;
+        }
+        let root = engine_gate_fixture("gate-query-sized");
+        let key = format!("engine:{}", engine_root(&root).display());
+        ledger::record_peak(&key, Face::Engine, 64 << 20);
+        assert!(ledger::peak(&key).is_some(), "the peak is recorded");
+        let holder = Holder::start(&root);
+        let fallback = Duration::from_secs(30);
+        holder.release_after(fallback);
+        let started = std::time::Instant::now();
+        assert_eq!(cold_symbol_query(&root), exit::CLEAN);
+        assert!(started.elapsed() < fallback, "waited beside a sized holder");
+        holder.finish();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The gate covers the explain face too: under cap 1 a cold explain
+    /// waits for the only slot.
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_explain_waits_for_the_only_slot() {
+        let name = "tests::a_cold_explain_waits_for_the_only_slot";
+        if let Some(stderr) = isolated_stderr(name) {
+            assert!(stderr.contains(SLOT_WAIT_NOTE), "{stderr}");
+            return;
+        }
+        let root = engine_gate_fixture("gate-explain-waits");
+        // SAFETY: this child process runs this test alone.
+        unsafe { std::env::set_var(dartq_toolchain::ledger::CAP_ENV, "1") };
+        let holder = Holder::start(&root);
+        let delay = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        holder.release_after(delay);
+        let args = ExplainArgs {
+            symbol: Some("Foo".into()),
+            diagnostic: None,
+            file: None,
+            dir: root.clone(),
+            format: OutputFormat::Lon,
+            sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
+        };
+        assert_eq!(explain_run(&args, &mut Vec::new()), exit::CLEAN);
+        assert!(started.elapsed() >= delay, "ran beside the holder");
+        holder.finish();
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// `memory.max_percent` reaches the analyze face from `dartq.yaml`,

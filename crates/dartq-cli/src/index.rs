@@ -71,6 +71,10 @@ fn run(args: &IndexArgs, out: &mut impl Write) -> u8 {
 }
 
 fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
+    let _slot = match crate::engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     if args.full {
         return export_checked(args, out);
     }

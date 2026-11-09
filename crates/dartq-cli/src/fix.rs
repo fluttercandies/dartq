@@ -344,6 +344,13 @@ fn report_errors(hosts: &mut PluginHosts) {
 /// environment) and the plugin hosts' proposals, then the apply + report
 /// stages.
 fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
+    // One slot for the in-process engine passes (the semantic fix pass
+    // assembles the workspace of the first target).
+    let _slot =
+        match crate::engine_gate(args.paths.first().map_or(Path::new("."), PathBuf::as_path)) {
+            Ok(slot) => slot,
+            Err(code) => return code,
+        };
     let mut hosts = launch_hosts();
     let collected = fix::collect_set(&args.paths, &mut hosts, None);
     let per_file: Vec<FileFixSet> = match collected {
@@ -382,6 +389,10 @@ fn run_assists(args: &AssistsArgs, out: &mut impl Write) -> u8 {
         );
         return exit::USAGE;
     }
+    let _slot = match crate::engine_gate(&args.path) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let mut hosts = launch_hosts();
     let collected = fix::assists(&args.path, args.offset, args.length, &mut hosts, None);
     let answer = match collected {

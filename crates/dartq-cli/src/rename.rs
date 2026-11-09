@@ -131,6 +131,10 @@ pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     {
         return code;
     }
+    let _slot = match crate::engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {

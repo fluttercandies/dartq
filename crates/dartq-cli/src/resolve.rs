@@ -92,6 +92,10 @@ pub(crate) fn resolve_at_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
     {
         return code;
     }
+    let _slot = match crate::engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -128,6 +132,10 @@ pub(crate) fn completion_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
     {
         return code;
     }
+    let _slot = match crate::engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {

@@ -428,29 +428,16 @@ pub fn dependencies<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<
 /// path (see [`symbol_after_analysis`]). Declaration rows stay for target
 /// identity; the references array is empty.
 ///
-/// # Panics
-///
-/// Panics when the primary declaration's library or surface is missing —
-/// an internal invariant breach (the primary's file is analyzed and
-/// resident).
+/// The primary is the first declaration, in the rows' path-then-offset
+/// order, whose file belongs to an analyzed workspace library: the
+/// by-name join also answers dependency-tier rows (the SDK, a package
+/// checkout), and those carry no library node or reference surface. A
+/// name declared only outside the workspace answers its declaration rows
+/// with no dependency rows.
 #[must_use]
 pub fn dependencies_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
     let mut run = symbol_after_analysis(engine, name);
     run.refs = Vec::new();
-    let Some(primary) = run.decls.first() else {
-        return run;
-    };
-
-    // The shared graph substrate (`impact`'s): one CSR projection per
-    // call — the same per-query posture the import faces keep. The
-    // forward edges are the substrate's own neighbor lists; no reverse
-    // build is needed.
-    let libraries = engine.libraries();
-    let substrate = impact_substrate(engine, &libraries);
-    let library = engine
-        .library_of(primary.file)
-        .expect("analyzed member")
-        .index();
 
     // The declaring library's own reference surface: every resolved use
     // site, with the target's declaring file and name. A use lands on a
@@ -462,7 +449,19 @@ pub fn dependencies_after_analysis<'a>(engine: &'a Engine, name: &str) -> Symbol
         .library_surfaces()
         .map(|(library, surface)| (library.index(), surface))
         .collect();
-    let surface = surfaces.get(&library).expect("live library surface");
+    let Some((library, surface)) = run.decls.iter().find_map(|decl| {
+        let library = engine.library_of(decl.file)?.index();
+        surfaces.get(&library).map(|&surface| (library, surface))
+    }) else {
+        return run;
+    };
+
+    // The shared graph substrate (`impact`'s): one CSR projection per
+    // call — the same per-query posture the import faces keep. The
+    // forward edges are the substrate's own neighbor lists; no reverse
+    // build is needed.
+    let libraries = engine.libraries();
+    let substrate = impact_substrate(engine, &libraries);
     let mut file_library: FxHashMap<FileId, u32> = FxHashMap::default();
     for (library, files) in &libraries {
         for &file in files {
@@ -1305,8 +1304,9 @@ mod tests {
     /// one mixed-answer shape (a workspace row beside a checkout row) the
     /// package-form grammar could not spell without a second convention.
     /// The dependency declares `Widget`; the app's use site references it.
-    /// Returns the app root; the dependency sits at `<parent>/dep`.
-    fn foreign_package_fixture(tag: &str) -> PathBuf {
+    /// Returns the app root; the dependency sits at `<parent>/<dep_dir>`
+    /// (the directory name steers whether its rows sort before the app's).
+    fn foreign_package_fixture(tag: &str, dep_dir: &str) -> PathBuf {
         let parent = std::env::temp_dir().join(format!("dq_cmd_{tag}_pair_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&parent);
         let write = |dir: &std::path::Path, relative: &str, content: &str| {
@@ -1330,7 +1330,9 @@ mod tests {
             ".dart_tool/package_config.json",
             // `dep`'s rootUri escapes the app root — the checked-out
             // dependency beside the workspace, never under it.
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "dep", "rootUri": "../../dep", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+            &format!(
+                r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, {{"name": "dep", "rootUri": "../../{dep_dir}", "packageUri": "lib/", "languageVersion": "3.5"}}], "generator": "pub", "generatorVersion": "3.13.1"}}"#
+            ),
         );
         write(&app, "sdk/version", "3.13.1\n");
         write(
@@ -1348,8 +1350,81 @@ mod tests {
             "lib/use.dart",
             "import 'package:dep/decl.dart';\nvoid use() {\n  var w = Widget();\n}\n",
         );
-        write(&parent.join("dep"), "lib/decl.dart", "class Widget {}\n");
+        write(
+            &app,
+            "lib/own.dart",
+            "import 'use.dart';\nvoid log() {\n  use();\n}\n",
+        );
+        write(
+            &parent.join(dep_dir),
+            "lib/decl.dart",
+            "class Widget {}\nvoid log() {}\n",
+        );
         app
+    }
+
+    /// `dependencies` over a name the dependency tier also declares, its
+    /// row sorting first (`<parent>/aaa` before `<parent>/app`): the
+    /// primary is the workspace declaration, not the first row — the
+    /// dependency-tier file has no library node and must not be probed
+    /// as one. Both declaration rows stay.
+    #[test]
+    fn dependencies_primary_is_the_first_workspace_declaration() {
+        let app = foreign_package_fixture("deps_mixed", "aaa");
+        let (mut engine, _) = open_engine(&app, Some(&app.join("sdk"))).expect("engine");
+
+        let run = dependencies(&mut engine, "log").expect("query");
+        assert_eq!(
+            run.decls.len(),
+            2,
+            "the dependency row and the workspace row"
+        );
+        assert!(
+            engine_library_of(&run, 0).is_none() && engine_library_of(&run, 1).is_some(),
+            "the dependency-tier row sorts first"
+        );
+        let rows: Vec<(&str, Option<&str>)> = run
+            .dependencies
+            .iter()
+            .map(|row| (row.path.as_str(), row.name.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("lib/use.dart", Some("use"))],
+            "own.dart's import edge plus the consumed symbol"
+        );
+        let json = to_json(&run, "log");
+        dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
+            .expect("schema-valid");
+
+        let canonical = app.canonicalize().expect("root");
+        fs_remove(canonical.parent().expect("parent"));
+    }
+
+    /// `dependencies` over a name declared only outside the workspace:
+    /// the declaration rows stay, no dependency rows, the envelope the
+    /// symbol face's own.
+    #[test]
+    fn dependencies_of_a_non_workspace_name_is_the_bare_answer() {
+        let app = foreign_package_fixture("deps_foreign", "aaa");
+        let (mut engine, _) = open_engine(&app, Some(&app.join("sdk"))).expect("engine");
+
+        let run = dependencies(&mut engine, "Widget").expect("query");
+        assert_eq!(run.decls.len(), 1, "the dependency-tier declaration stays");
+        assert!(engine_library_of(&run, 0).is_none());
+        assert!(run.dependencies.is_empty());
+        let json = to_json(&run, "Widget");
+        assert!(json.get("deps").is_none());
+        dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
+            .expect("schema-valid");
+
+        let canonical = app.canonicalize().expect("root");
+        fs_remove(canonical.parent().expect("parent"));
+    }
+
+    /// The owning workspace library of the run's `index`-th declaration.
+    fn engine_library_of(run: &SymbolRun<'_>, index: usize) -> Option<dartq_engine::LibraryId> {
+        run.layout.engine().library_of(run.decls[index].file)
     }
 
     /// The locator policy on the answer rows: the declaration sits outside
@@ -1360,7 +1435,7 @@ mod tests {
     /// included.
     #[test]
     fn rows_spell_through_the_locator_with_the_root_envelope() {
-        let app = foreign_package_fixture("locator");
+        let app = foreign_package_fixture("locator", "dep");
         let (mut engine, _) = open_engine(&app, Some(&app.join("sdk"))).expect("engine");
         let canonical = app.canonicalize().expect("root");
         let dep_decl = canonical

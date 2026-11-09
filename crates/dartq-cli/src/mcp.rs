@@ -1157,6 +1157,9 @@ fn rename_call(params: &Value, mcp: &Mcp) -> Result<String, String> {
     let path = path
         .canonicalize()
         .map_err(|_| format!("Directory or file doesn't exist: {target}"))?;
+    // The cold engine is a heavy job: the server holds no slot of its own
+    // (its engine faces ride the session), so the rename takes one.
+    let _slot = crate::engine_slot(&mcp.root)?;
     let (mut engine, _dir) = dartq_commands::workspace::open_engine(
         &mcp.root,
         std::env::var_os("DART_SDK").map(PathBuf::from).as_deref(),

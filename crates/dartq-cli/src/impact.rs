@@ -97,6 +97,10 @@ pub(crate) fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = crate::resident::route_impact(args, out) {
         return code;
     }
+    let _slot = match crate::engine_gate(&args.dir) {
+        Ok(slot) => slot,
+        Err(code) => return code,
+    };
     let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
