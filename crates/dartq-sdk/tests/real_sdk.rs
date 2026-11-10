@@ -196,3 +196,33 @@ fn real_sdk_identity_is_stable_and_embedder_face_is_structured() {
         other => panic!("expected MissingFile, got {other:?}"),
     }
 }
+
+#[test]
+fn the_fvm_flutter_root_loads_to_the_embedded_snapshot() {
+    // fvm's `default` is a FLUTTER root, not a dart-sdk root: loading it
+    // directly must land on the embedded `bin/cache/dart-sdk` (the layout
+    // `dartq session serve --sdk <fvm default>` ships), under the same
+    // canonical spelling a direct load of the embedded root produces.
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("skipped: no HOME");
+        return;
+    };
+    let home = std::path::Path::new(&home);
+    let flutter = [home.join("fvm").join("default"), home.join(".fvm").join("default")]
+        .into_iter()
+        .find(|root| root.join("bin").join("cache").join("dart-sdk").is_dir());
+    let Some(flutter) = flutter else {
+        eprintln!("skipped: no fvm default flutter root");
+        return;
+    };
+    let through_flutter = SdkSnapshot::load(&flutter, None).expect("the fvm flutter root loads");
+    let direct =
+        SdkSnapshot::load(&flutter.join("bin").join("cache").join("dart-sdk"), None)
+            .expect("the embedded root loads");
+    assert_eq!(through_flutter.id, direct.id, "one SDK however spelled");
+    assert_eq!(
+        through_flutter.dart_sdk_root(),
+        direct.dart_sdk_root(),
+        "the canonical spelling is the embedded root"
+    );
+}

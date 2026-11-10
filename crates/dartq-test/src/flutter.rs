@@ -1314,7 +1314,9 @@ pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Ve
 
     // Forward-reachable set per suite, then a digest over that set's file
     // bytes. Suites in one chunk share most of the closure, so per-file
-    // digests are computed once across all suites.
+    // digests are computed once across all suites. A Dart file signs by
+    // its significant content (`crate::tokensig`): a comment-only or
+    // format-only edit recompiles nothing.
     let suite_ids: Vec<u32> = suites.iter().map(|suite| ids[suite]).collect();
     let mut needed: FxHashSet<u32> = FxHashSet::default();
     {
@@ -1328,9 +1330,17 @@ pub fn closure_digests(root: &Path, sdk: &Path, suites: &[PathBuf]) -> Option<Ve
     let mut digest_of: FxHashMap<u32, [u8; 32]> = FxHashMap::default();
     for id in needed {
         let path = &file_of[id as usize];
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let content = if path.extension().is_some_and(|ext| ext == "dart") {
+            // A source that cannot decode never compiles; key its bytes.
+            crate::tokensig::dart_signature(&bytes)
+                .unwrap_or_else(|| *blake3::hash(&bytes).as_bytes())
+        } else {
+            *blake3::hash(&bytes).as_bytes()
+        };
         let mut leaf = blake3::Hasher::new();
         leaf.update(path.as_os_str().as_encoded_bytes());
-        leaf.update(&std::fs::read(path).unwrap_or_default());
+        leaf.update(&content);
         digest_of.insert(id, *leaf.finalize().as_bytes());
     }
 

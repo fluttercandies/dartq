@@ -1,8 +1,8 @@
 use super::*;
 
 /// The engine sources' check pass: one throwaway engine over the
-/// discovered targets (`sdk` assembles it; `None` falls back to the
-/// `DART_SDK` environment), one discover + analyze run — no lint stage,
+/// discovered targets (`sdk` assembles it; `None` resolves through the
+/// shared discovery chain), one discover + analyze run — no lint stage,
 /// [`collect_set`] runs the lint face itself — and the semantic drop-family
 /// and parser-face diagnostics grouped under the discovery spelling of
 /// each target file. Files the engine's context never interned (targets

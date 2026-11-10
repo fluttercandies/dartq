@@ -5,7 +5,9 @@
 //!   import closure, run-time inputs, resolution, toolchain, arguments and
 //!   environment hash to an earlier green run's key replays that run's
 //!   reporter events. [`deps`] and [`stamp`] are its substrate (directive
-//!   extraction on the dartq scanner, stat-indexed blake3 content stamps).
+//!   extraction on the dartq scanner, stat-indexed blake3 content stamps),
+//!   and [`tokensig`] signs Dart sources by their significant content, so
+//!   comment-only and format-only edits re-key nothing.
 //! - [`group`] — the grouped runner: every suite compiled into one program
 //!   and started as an isolate of its group under the stock runner.
 //! - [`flutter`] — the grouped pass of `dartq test --flutter`: suites
@@ -29,6 +31,7 @@ pub mod host;
 pub mod report;
 pub mod select;
 pub mod stamp;
+pub mod tokensig;
 
 pub use cache::{Cache, Refusal, RefusalDetail, Runner};
 pub use exec::{

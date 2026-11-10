@@ -12,7 +12,8 @@ use serde::Serialize;
 
 use crate::code::CodeInfo;
 use crate::model::{
-    AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, SourceRange,
+    AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, FindingOrigin,
+    SourceRange,
 };
 
 /// Writes diagnostics in the oracle machine format, one line per diagnostic:
@@ -71,7 +72,10 @@ pub fn write_machine(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::R
 /// analyzer registry — `errors.dart` `url` getter) as
 /// `https://dart.dev/diagnostics/<code>`; unpublished analyzer codes
 /// (e.g. `expected_token`), plugin lint codes, and `dartq/`-namespace
-/// codes omit the key. The envelope is always emitted, even with no
+/// codes omit the key — and a row of any name contributed by a plugin
+/// ([`FindingOrigin::Plugin`]) omits it too, whatever the name-keyed
+/// tables say (#4189: the URL rides the row's own code upstream, and a
+/// plugin code carries none). The envelope is always emitted, even with no
 /// diagnostics, and the output always ends with a newline — the oracle
 /// routes every format through `writeln` (measured: empty set → exactly
 /// `{"version":1,"diagnostics":[]}\n`).
@@ -171,7 +175,7 @@ fn write_json_diagnostic(
                 .map(|m| json_context_message(output, m))
                 .collect()
         }),
-        documentation: documentation_url(d.code, url),
+        documentation: documentation_url(d.code, d.origin, url),
     };
     serde_json::to_writer(out, &diagnostic)
 }
@@ -220,6 +224,15 @@ fn json_context_message<'a>(
 /// The oracle emits `documentation` straight from the code's URL
 /// (`analyze.dart` `emitJsonFormat`: `'documentation': ?url`):
 ///
+/// * a plugin-contributed row ([`FindingOrigin::Plugin`]) never carries
+///   the key: the URL rides the row's own code, and an upstream plugin
+///   code has none — `LintCode` has no `url` member (upstream Dart SDK
+///   source, `pkg/analyzer/lib/src/dart/error/lint_codes.dart`: "Add a
+///   'url' parameter for plugin authors" is an open TODO). The name-keyed
+///   decision below cannot see this (a plugin row may re-report a
+///   published builtin name — the #4189 repro: a plugin re-reporting
+///   `unused_import` yields the server row WITH `documentation` and the
+///   plugin row WITHOUT), so the origin gate leads (#4189);
 /// * analyzer codes — `errors.dart`'s `url` getter: `null` unless the
 ///   registry marks the code `hasPublishedDocs: true`, then
 ///   `https://dart.dev/diagnostics/<name>`. The published bit is read
@@ -243,7 +256,10 @@ fn json_context_message<'a>(
 /// The URL is built in the caller's reused buffer and returned borrowed;
 /// the decision itself is [`crate::doc_prefix`], the one table
 /// [`crate::documentation_url`] serves every other face through.
-fn documentation_url(code: CodeInfo, buf: &mut String) -> Option<&str> {
+fn documentation_url(code: CodeInfo, origin: FindingOrigin, buf: &mut String) -> Option<&str> {
+    if origin == FindingOrigin::Plugin {
+        return None;
+    }
     let prefix = crate::doc_prefix(code.name, matches!(code.dtype, DiagnosticType::Lint))?;
     buf.clear();
     buf.push_str(prefix);
@@ -390,6 +406,75 @@ mod tests {
         assert_eq!(
             rows[5]["documentation"], "https://dart.dev/diagnostics/uri_does_not_exist",
             "published analyzer code"
+        );
+    }
+
+    /// The #4189 parity pin: a plugin-contributed row omits `documentation`
+    /// even when its code name is a published builtin — the oracle's merged
+    /// server + plugin output carries the same finding twice with the
+    /// server row's `documentation` present and the plugin row's absent
+    /// (live 3.13.7 capture: a plugin re-reporting `unused_import`).
+    /// The name-keyed tables cannot see this; only the row's origin can.
+    #[test]
+    fn json_documentation_omits_the_key_for_plugin_origin_rows() {
+        struct OneFile;
+        impl FileLayoutProvider for OneFile {
+            fn file_path(&self, _file: FileId) -> &Path {
+                Path::new("/w/lib/a.dart")
+            }
+            fn line_col(&self, _file: FileId, _offset: u32) -> (u32, u32) {
+                (1, 1)
+            }
+        }
+        let files = OneFile;
+        let mut table = dartq_source::FileTable::new();
+        let id = table.intern(Path::new("/w/lib/a.dart"));
+        let code = CodeInfo::new(
+            "unused_import",
+            "UNUSED_IMPORT",
+            DiagnosticType::StaticWarning,
+            true,
+        );
+        let row = |origin: FindingOrigin| {
+            Diagnostic::new(
+                code.dtype.severity(),
+                code,
+                "Unused import: 'dart:io'.",
+                id,
+                SourceRange {
+                    offset: 7,
+                    length: 9,
+                },
+                None,
+            )
+            .with_origin(origin)
+        };
+        let diagnostics = [row(FindingOrigin::Engine), row(FindingOrigin::Plugin)];
+        let output = AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &files,
+        };
+        let mut out = Vec::new();
+        write_json(&mut out, &output).expect("write");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&out).expect("one JSON object");
+        let rows = envelope["diagnostics"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "both rows survive: multiplicity is the row set");
+        assert_eq!(
+            rows[0]["documentation"], "https://dart.dev/diagnostics/unused_import",
+            "the engine row keeps the published page"
+        );
+        assert!(
+            rows[1].get("documentation").is_none(),
+            "the plugin row omits the key regardless of the name"
+        );
+        assert_eq!(rows[0]["problemMessage"], rows[1]["problemMessage"]);
+        // The byte face: exactly one `documentation` key over both rows.
+        let line = String::from_utf8(out).expect("UTF-8");
+        assert_eq!(
+            line.matches("\"documentation\"").count(),
+            1,
+            "one documentation key across the merged pair"
         );
     }
 }

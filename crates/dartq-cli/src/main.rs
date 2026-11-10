@@ -572,7 +572,8 @@ struct AnalyzeArgs {
     no_resident: bool,
     /// Print one stderr line naming the engine that answered (and, for
     /// `official`, the SDK version and whether the resident server or a
-    /// per-run `dart analyze` did).
+    /// per-run `dart analyze` did; for `dartq`, whether the resident
+    /// session or the in-process engine did).
     #[arg(long)]
     stats: bool,
     /// Serve the resident analysis server of the key directory DIR (the
@@ -599,9 +600,11 @@ struct AnalyzeArgs {
     /// only — `check` has no engine to overlay.
     #[arg(long = "overlay", value_name = "PATH=FILE")]
     overlays: Vec<String>,
-    /// Dart SDK root; defaults to `$DART_SDK`. The oracle's spelling
-    /// `--sdk-path` is the documented one; `--sdk` stays as a hidden compat
-    /// alias.
+    /// Dart SDK root; unset, resolves through the shared discovery chain
+    /// (`$DART_SDK`, then `dartq.yaml`'s `sdk:`, then the `dart` on PATH,
+    /// then the fvm default), and a Flutter SDK root resolves onto its
+    /// embedded `bin/cache/dart-sdk`. The oracle's spelling `--sdk-path`
+    /// is the documented one; `--sdk` stays as a hidden compat alias.
     #[arg(long = "sdk-path", alias = "sdk", value_name = "PATH")]
     sdk_path: Option<PathBuf>,
     /// Package resolution configuration file (the dartdev `--packages`):
@@ -2115,7 +2118,13 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     if !args.cold
         && let Some(code) = resident::route_analyze(args, &targets, out, &session::spawn_server)
     {
+        if args.stats {
+            eprintln!("dartq analyze: engine dartq (resident)");
+        }
         return code;
+    }
+    if args.stats {
+        eprintln!("dartq analyze: engine dartq (in-process)");
     }
     analyze_targets(args, &targets, out)
 }

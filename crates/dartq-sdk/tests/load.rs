@@ -55,6 +55,12 @@ impl TempTree {
         for (relative, content) in files {
             Self::write(&root, relative, content);
         }
+        // Canonical from birth: `SdkSnapshot::load` canonicalizes the SDK
+        // root it is handed (the load contract's realpath posture), so the
+        // fixture's paths must carry the canonical spelling for the
+        // path-equality assertions below (macOS spells the temp root
+        // `/var/...`, its realpath `/private/var/...`).
+        let root = std::fs::canonicalize(&root).expect("temp root canonicalizes");
         Self { root }
     }
 
@@ -601,4 +607,76 @@ fn experiment_whitelist_maps_to_feature_sets() {
     assert!(granted.is_enabled(Feature::Macros));
     assert!(granted.is_enabled(Feature::EnhancedParts));
     assert!(!baseline.is_enabled(Feature::Macros));
+}
+
+/// The standard fixture reparented under a Flutter root: the same SDK
+/// content shipped the way fvm and the flutter tool ship it, at
+/// `<flutter>/bin/cache/dart-sdk`.
+fn flutter_files() -> Vec<(String, String)> {
+    standard_files()
+        .into_iter()
+        .map(|(path, content)| {
+            (
+                format!("flutter/bin/cache/{path}"),
+                content.to_string(),
+            )
+        })
+        .collect::<Vec<_>>()
+}
+
+#[test]
+fn a_flutter_root_loads_through_its_embedded_dart_sdk() {
+    let files = flutter_files();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let tree = TempTree::new(&borrowed);
+    let flutter = tree.root.join("flutter");
+    let embedded = flutter.join("bin").join("cache").join("dart-sdk");
+
+    let sdk = SdkSnapshot::load(&flutter, None).expect("the Flutter root loads");
+    // The snapshot anchors at the embedded SDK: metadata, uri resolution,
+    // and the root path itself — never the Flutter checkout.
+    assert_eq!(sdk.dart.version, "3.13.1");
+    assert_eq!(sdk.dart_sdk_root(), embedded.as_path());
+    assert_eq!(
+        sdk.uri_to_path("vm", "dart:core").expect("core resolves"),
+        embedded.join("lib/core/core.dart")
+    );
+
+    // The same content under the plain spelling shares the id: the content
+    // fingerprint is layout-blind, so one SDK is one SDK however shipped.
+    let plain = TempTree::new(&standard_files());
+    assert_eq!(sdk.id, plain.load().id);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_root_loads_under_the_canonical_spelling() {
+    let tree = TempTree::new(&standard_files());
+    let link = tree.root.join("linked-sdk");
+    std::os::unix::fs::symlink(tree.dart_sdk(), &link).expect("symlink");
+    let sdk = SdkSnapshot::load(&link, None).expect("the link loads");
+    assert_eq!(sdk.dart_sdk_root(), tree.dart_sdk().as_path());
+    assert!(
+        sdk.dart_sdk_root().starts_with(&tree.root),
+        "the canonical root stays inside the fixture"
+    );
+}
+
+#[test]
+fn a_root_without_sdk_metadata_is_not_an_sdk_root() {
+    let tree = TempTree::new(&[]);
+    match SdkSnapshot::load(&tree.root, None) {
+        Err(SdkError::NotASdkRoot { path }) => assert_eq!(path, tree.root),
+        other => panic!("expected NotASdkRoot, got {other:?}"),
+    }
+    // The message names both layouts — the fvm failure's one-line diagnosis.
+    let message = SdkError::NotASdkRoot {
+        path: tree.root.clone(),
+    }
+    .to_string();
+    assert!(message.contains("lib/libraries.json"));
+    assert!(message.contains("bin/cache/dart-sdk"));
 }

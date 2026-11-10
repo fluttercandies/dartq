@@ -33,6 +33,10 @@ struct Stamp {
     /// The stamp was taken safely after the last modification.
     trusted: bool,
     digest: String,
+    /// Hex of [`Entry::sig`]. (No serde default, like `facts`: an index
+    /// written before signatures existed fails to load and is rebuilt,
+    /// rather than vouching "no signature" for files it stamped raw.)
+    sig: Option<String>,
     facts: Option<Arc<FileFacts>>,
     /// Path-shaped words of a non-Dart text file ([`data_paths`]).
     refs: Option<Arc<Vec<String>>>,
@@ -42,6 +46,13 @@ struct Stamp {
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub digest: [u8; 32],
+    /// The significant-content signature of a `.dart` file
+    /// ([`crate::tokensig::dart_signature`]): its token stream, comments
+    /// and non-semantic whitespace stripped, strings verbatim. `None` for
+    /// every other file and for a non-UTF-8 source; a cache key that
+    /// hashes the file as compiled code uses this when present, and one
+    /// that hashes it as data a suite reads uses the raw digest.
+    pub sig: Option<[u8; 32]>,
     /// Present for `.dart` files.
     pub facts: Option<Arc<FileFacts>>,
     /// Present for other text files up to [`MAX_DATA_FILE`] bytes: the
@@ -185,6 +196,7 @@ fn stamp_file(
     {
         let entry = Entry {
             digest,
+            sig: old.sig.as_deref().and_then(parse_digest),
             facts: old.facts.clone(),
             refs: old.refs.clone(),
         };
@@ -197,6 +209,11 @@ fn stamp_file(
     };
     let digest = *blake3::hash(&bytes).as_bytes();
     let dart = path.extension().is_some_and(|ext| ext == "dart");
+    let sig = if dart {
+        crate::tokensig::dart_signature(&bytes)
+    } else {
+        None
+    };
     let facts = dart.then(|| Arc::new(facts(&bytes)));
     let refs = (!dart && len <= MAX_DATA_FILE).then(|| Arc::new(data_paths(&bytes)));
     let trusted = meta
@@ -211,11 +228,13 @@ fn stamp_file(
         ino,
         trusted,
         digest: hex::encode(digest),
+        sig: sig.map(hex::encode),
         facts: facts.clone(),
         refs: refs.clone(),
     };
     let entry = Entry {
         digest,
+        sig,
         facts,
         refs,
     };

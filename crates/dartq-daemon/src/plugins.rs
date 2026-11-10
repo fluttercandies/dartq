@@ -964,7 +964,11 @@ fn dedup_key(file: FileId, diagnostic: &wire::Diagnostic) -> DedupKey {
 /// `(file, range.start, code, message)` key already appeared is dropped —
 /// a plugin row never duplicates a built-in finding (the built-in row,
 /// seeded first, wins), and a plugin re-emitting per cycle cannot churn
-/// publishes.
+/// publishes. (The one-shot analyze face's merge — dartq-commands' — keeps
+/// duplicates per the oracle's plugin-merge contract; this streaming face
+/// deduplicates because its rows accumulate across cycles: without the
+/// key, every re-emitted finding would append to the baseline again, and
+/// `published` would grow without bound.)
 #[must_use]
 pub fn merge(
     engine_rows: impl IntoIterator<Item = (FileId, wire::Diagnostic)>,

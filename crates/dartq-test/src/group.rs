@@ -40,6 +40,23 @@
 //!   its whole shard down. The shard's reporter never completes, and the
 //!   caller reruns that shard's suites stock.
 //!
+//! ## Why per-suite replay stays sound across recompiles
+//!
+//! The program is rebuilt whenever any hosted suite's content changes, but
+//! that rebuild never invalidates another suite's cached outcome: each
+//! suite still runs in its own isolate, whose static fields, zones and
+//! microtask queues are its own — exactly the isolation
+//! `Isolate.spawnUri` gives the stock runner — so a suite's verdict is a
+//! function of its keyed inputs, not of its suite-mates. What the mates
+//! contribute to the shared kernel is code the suite cannot even name
+//! without an import (which would place that file in its keyed closure);
+//! the two observable holes — launch observers above, and a shared-heap
+//! death, which leaves the suite unproven and rerun stock — are already
+//! carved out. The result cache therefore keys, stages and replays per
+//! suite: editing one suite re-keys and reruns that suite alone, while its
+//! group-mates replay their stored outcomes instead of re-executing inside
+//! the recompiled program.
+//!
 //! The caller treats the grouped run as a fast first pass: green suites are
 //! final; every suite not provably green reruns under the stock runner, so
 //! each failure is reported exactly as `dart test` reports it.

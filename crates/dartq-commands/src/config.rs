@@ -48,6 +48,11 @@ pub enum ConfigError {
 pub struct DartqConfig {
     /// The declared SDK contexts, in file order.
     pub contexts: Vec<ContextConfig>,
+    /// The workspace's SDK locator — the engine faces' third resolution
+    /// step, after the `--sdk` flag and `$DART_SDK` (see
+    /// [`workspace::resolve_sdk_root`](crate::workspace::resolve_sdk_root)).
+    /// Forms: [`sdk_locator_root`]'s grammar.
+    pub sdk: Option<String>,
     /// The generated-file policy.
     pub generated: Option<GeneratedPolicy>,
     /// The memory defaults.
@@ -424,6 +429,9 @@ fn overlay(global: Option<DartqConfig>, project: Option<DartqConfig>) -> Option<
     if !project.contexts.is_empty() {
         governing.contexts = project.contexts;
     }
+    if project.sdk.is_some() {
+        governing.sdk = project.sdk;
+    }
     governing.generated = match (governing.generated, project.generated) {
         (None, project) => project,
         (global, None) => global,
@@ -569,27 +577,72 @@ pub fn resolve_locator(
     locator: &str,
     config_dir: &Path,
 ) -> Result<PathBuf, ConfigError> {
+    locator_root(locator, config_dir, &format!("context `{label}`"))
+}
+
+/// Resolves the top-level `sdk:` locator to a root directory: the context
+/// forms (`fvm:<version>`, `path:<dir>`, `system` — `system` resolving
+/// through `$DART_SDK` exactly like a context) plus a bare path (absolute,
+/// or relative to `config_root`, the dir the governing config was
+/// discovered from). Unresolved here: whether the root holds a usable SDK
+/// is the resolution chain's probe ([`crate::workspace::resolve_sdk_root`]).
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] for an empty locator or the locator forms'
+/// own refusals (empty version/dir, `system` without `$DART_SDK`, no HOME
+/// for `fvm:`).
+pub fn sdk_locator_root(locator: &str, config_root: &Path) -> Result<PathBuf, ConfigError> {
+    if locator == "system"
+        || locator.starts_with("fvm:")
+        || locator.starts_with("path:")
+    {
+        return locator_root(locator, config_root, "`sdk`");
+    }
+    if locator.is_empty() {
+        return Err(ConfigError::Invalid(
+            "dartq.yaml: `sdk` locator is empty".into(),
+        ));
+    }
+    let root = Path::new(locator);
+    Ok(if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        config_root.join(root)
+    })
+}
+
+/// The locator grammar's core, shared by the context and top-level
+/// spellings; `what` names the declaring site in every error.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] for an unsupported form, an empty version or
+/// dir, `system` without `$DART_SDK`, or no HOME for `fvm:`.
+fn locator_root(
+    locator: &str,
+    config_dir: &Path,
+    what: &str,
+) -> Result<PathBuf, ConfigError> {
     if locator == "system" {
         return match std::env::var_os("DART_SDK") {
             Some(root) if !root.is_empty() => Ok(PathBuf::from(root)),
             _ => Err(ConfigError::Invalid(format!(
-                "context `{label}`: the `system` locator needs DART_SDK set"
+                "{what}: the `system` locator needs DART_SDK set"
             ))),
         };
     }
     if let Some(version) = locator.strip_prefix("fvm:") {
         if version.is_empty() {
             return Err(ConfigError::Invalid(format!(
-                "context `{label}`: empty fvm version"
+                "{what}: empty fvm version"
             )));
         }
         return fvm_version_root(version);
     }
     if let Some(dir) = locator.strip_prefix("path:") {
         if dir.is_empty() {
-            return Err(ConfigError::Invalid(format!(
-                "context `{label}`: empty path locator"
-            )));
+            return Err(ConfigError::Invalid(format!("{what}: empty path locator")));
         }
         let root = Path::new(dir);
         return Ok(if root.is_absolute() {
@@ -599,7 +652,7 @@ pub fn resolve_locator(
         });
     }
     Err(ConfigError::Invalid(format!(
-        "context `{label}`: unsupported sdk locator `{locator}` \
+        "{what}: unsupported sdk locator `{locator}` \
          (expected fvm:<version> | path:<dir> | system)"
     )))
 }
@@ -621,6 +674,22 @@ fn fvm_version_root(version: &str) -> Result<PathBuf, ConfigError> {
     let modern = home.join(".fvm").join("versions").join(version);
     let legacy = home.join("fvm").join("versions").join(version);
     Ok(if legacy.is_dir() && !modern.is_dir() {
+        legacy
+    } else {
+        modern
+    })
+}
+
+/// The FVM default's root — a FLUTTER SDK root whose embedded
+/// `bin/cache/dart-sdk` is the engine's last-resolution SDK: `$HOME/.fvm/
+/// default` (FVM 3's layout), or the pre-3.0 `$HOME/fvm/default` when that
+/// is the one on disk. `None` without a home directory. Whether the root
+/// holds a usable SDK is the resolution chain's probe, not this lookup.
+pub(crate) fn fvm_default_root(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    let modern = home.join(".fvm").join("default");
+    let legacy = home.join("fvm").join("default");
+    Some(if legacy.is_dir() && !modern.is_dir() {
         legacy
     } else {
         modern
@@ -702,6 +771,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
     }
     Ok(DartqConfig {
         contexts,
+        sdk: raw.sdk,
         generated: raw.generated,
         memory: raw.memory,
         cache: raw.cache,
@@ -716,6 +786,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
 #[derive(Deserialize)]
 struct RawConfig {
     version: Option<u32>,
+    sdk: Option<String>,
     generated: Option<GeneratedPolicy>,
     memory: Option<MemoryDefaults>,
     cache: Option<CacheDefaults>,
@@ -1351,5 +1422,91 @@ mod tests {
                 "{bad:?} is a structured error"
             );
         }
+    }
+
+    /// The top-level `sdk:` key: parsed through both tiers — the project
+    /// declaration wins, the global tier fills an unset project, absent by
+    /// default.
+    #[test]
+    fn sdk_key_parses_through_both_tiers() {
+        let (home, project) = tiered(Some("version: 1\nsdk: fvm:3.24.0\n"));
+        write_config(project.path(), "version: 1\n");
+        let config = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config");
+        assert_eq!(
+            config.sdk.as_deref(),
+            Some("fvm:3.24.0"),
+            "the global tier fills a project that leaves the key unset"
+        );
+
+        write_config(project.path(), "version: 1\nsdk: path:sdks/pinned\n");
+        let config = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config");
+        assert_eq!(
+            config.sdk.as_deref(),
+            Some("path:sdks/pinned"),
+            "the project tier wins"
+        );
+
+        let (home, project) = tiered(None);
+        write_config(project.path(), "version: 1\n");
+        let config = discover_with(project.path(), Some(home.path()))
+            .expect("discover")
+            .expect("config");
+        assert_eq!(config.sdk, None, "no declaration anywhere");
+    }
+
+    /// The `sdk:` locator grammar: the context forms, the bare-path form,
+    /// and the structured refusals — contexts keep their stricter
+    /// prefix-only grammar.
+    #[test]
+    fn sdk_locator_roots_resolve_their_forms() {
+        let dir = Path::new("/w");
+        assert_eq!(
+            sdk_locator_root("path:sdks/pinned", dir).expect("path form"),
+            dir.join("sdks/pinned")
+        );
+        assert_eq!(
+            sdk_locator_root("/abs/sdk", dir).expect("bare absolute"),
+            PathBuf::from("/abs/sdk")
+        );
+        assert_eq!(
+            sdk_locator_root("sdks/rel", dir).expect("bare relative"),
+            dir.join("sdks/rel")
+        );
+        assert_eq!(
+            sdk_locator_root("fvm:3.24.0", dir).expect("fvm form"),
+            fvm_version_root("3.24.0").expect("the context resolution"),
+            "the fvm form shares the context resolution"
+        );
+        assert!(matches!(
+            sdk_locator_root("", dir),
+            Err(ConfigError::Invalid(ref message)) if message.contains("empty")
+        ));
+        // A bare path is NOT accepted as a context locator — the two
+        // grammars stay as documented.
+        assert!(resolve_locator("ci", "/abs/sdk", dir).is_err());
+    }
+
+    /// The fvm default root: the modern layout unless only the legacy one
+    /// is on disk, and nothing without a home.
+    #[test]
+    fn fvm_default_root_picks_the_layout_on_disk() {
+        let home = tempfile::tempdir().expect("home");
+        let modern = home.path().join(".fvm").join("default");
+        assert_eq!(
+            fvm_default_root(Some(home.path())),
+            Some(modern),
+            "the modern layout is the default guess"
+        );
+        fs::create_dir_all(home.path().join("fvm").join("default")).expect("legacy dir");
+        assert_eq!(
+            fvm_default_root(Some(home.path())),
+            Some(home.path().join("fvm").join("default")),
+            "the legacy layout wins when it is the one on disk"
+        );
+        assert_eq!(fvm_default_root(None), None);
     }
 }

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-11
+
+### Fixed
+
+- `dartq analyze --engine` now converges on the worktree's resident
+  session (elect-or-attach, the same machinery `session start`, MCP and
+  debug ride): warm runs answer from the resident engine instead of
+  paying the full in-process cost every run. On a 100k-file corpus the
+  warm full-tree JSON went from ~30s per run to ~3s (byte-identical
+  output, `--stats` says which path answered); edits and reverts return
+  to the baseline output byte-identically. The in-process path remains
+  as the explicit fallback (`--cold`).
+- One SDK discovery chain everywhere (`--sdk` > `$DART_SDK` >
+  `dartq.yaml`'s `sdk:` > the `dart` on PATH > the fvm default): engine
+  faces no longer error `no Dart SDK root` on a machine whose `dart`
+  comes from PATH, and a Flutter SDK root (fvm default, `<flutter>/bin/
+  dart`) resolves onto its embedded `bin/cache/dart-sdk` instead of
+  failing `Invalid Dart SDK path`. `dartq.yaml` gains a top-level `sdk:`
+  locator (`fvm:<v>`, `path:<dir>`, `system`, or a bare path).
+- `dartq analyze --format=json` no longer deduplicates a plugin's
+  re-report of a built-in finding: the oracle's plugin merge
+  (`result_merger.dart`) keeps duplicates, and the engine face now
+  matches it — plugin rows also omit the `documentation` key exactly
+  like the oracle's plugin-contributed rows.
+- `dartq test` cache keys are comment- and format-insensitive: a lib
+  file whose edit only rewords comments or reflows whitespace no longer
+  invalidates every suite's cached results (keys hash the scanner's
+  token stream — strings kept verbatim — while files a suite reads as
+  data keep their raw-byte key). Suites re-key once after this upgrade;
+  results then replay as before. Editing one test suite still reruns
+  only that suite — its unchanged groupmates replay from cache.
+
+
 ## [0.1.19] - 2026-11-10
 
 ### Fixed

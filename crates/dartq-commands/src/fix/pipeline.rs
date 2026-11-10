@@ -12,8 +12,8 @@ use super::*;
 ///
 /// The semantic source rides the same stage: one engine check pass over
 /// the discovered targets (`semantic_fix_diagnostics`, assembled with
-/// `sdk` — the CLI passes none and falls back to the `DART_SDK`
-/// environment, the daemon passes its session's resolved root) contributes
+/// `sdk` — the CLI passes none and the assembly resolves through the
+/// shared discovery chain, the daemon passes its session's resolved root) contributes
 /// the drop-family rows, merged into each file's set. A pass that cannot
 /// run degrades to no rows and the run answers from the other sources.
 ///
@@ -678,8 +678,9 @@ pub fn from_plugin(
 /// library's member files under-report to this file), the semantic
 /// tier's established isolated-context stance — cross-file names
 /// under-report `None` and the producers decline. `sdk` is the engine's
-/// SDK root: the callers without one pass `None` and the assembly falls
-/// back to `DART_SDK` discovery; the resolved tests pin the fixture SDK.
+/// SDK root: the callers without one pass `None` and the assembly
+/// resolves through the shared discovery chain; the resolved tests pin
+/// the fixture SDK.
 pub(crate) fn resolved_assist_rows(
     text: &str,
     path: &Path,
@@ -731,8 +732,8 @@ pub(crate) fn resolved_assist_rows(
 /// request.
 ///
 /// `sdk` backs the resolved-light assist mount's engine assembly — the
-/// CLI passes none and falls back to the `DART_SDK` environment, the
-/// daemon passes its session's resolved root.
+/// CLI passes none and the assembly resolves through the shared
+/// discovery chain, the daemon passes its session's resolved root.
 ///
 /// # Errors
 ///

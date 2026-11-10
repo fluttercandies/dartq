@@ -509,8 +509,8 @@ pub fn run_targets<'a>(
                 .is_some_and(|path| covered(path, targets))
         });
         // Crash rows ride beside the findings (engine `Diagnostic`s already);
-        // the merge's dedup seeds from the engine rows so a plugin row never
-        // duplicates a built-in finding.
+        // the merge concatenates after the engine rows, duplicates kept (the
+        // upstream plugin-merge contract).
         let plugin_rows = crate::plugins::merge(
             std::mem::take(&mut diagnostics),
             cycle.crashes.into_iter().chain(findings).collect(),

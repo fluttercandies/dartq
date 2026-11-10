@@ -36,7 +36,7 @@ mod writer;
 pub use code::*;
 pub use model::{
     AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, FileLayoutProvider,
-    Severity, SharedStr, SourceRange,
+    FindingOrigin, Severity, SharedStr, SourceRange,
 };
 pub use writer::{write_json, write_machine};
 

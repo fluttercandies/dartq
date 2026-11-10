@@ -25,7 +25,14 @@ use crate::metadata::{
 impl SdkSnapshot {
     /// Loads an SDK snapshot from `dart_sdk_root` (a provisioned Dart SDK
     /// containing `version`, `lib/libraries.json`, … — not a source
-    /// checkout).
+    /// checkout, and not a Flutter checkout: a Flutter root resolves to
+    /// its embedded `bin/cache/dart-sdk` first, see
+    /// [`locate`](crate::locate)).
+    ///
+    /// The root resolves through [`crate::locate::dart_sdk_root`] before
+    /// anything is read, so a symlinked root (an fvm `default` link), a
+    /// Flutter root, and the embedded dart-sdk itself all load with one
+    /// canonical `dart_sdk_root`.
     ///
     /// All metadata is read eagerly; `dart:` source bodies are resolved
     /// lazily via [`uri_to_path`](SdkSnapshot::uri_to_path).
@@ -53,6 +60,9 @@ impl SdkSnapshot {
         dart_sdk_root: &Path,
         embedder_lib_dir: Option<&Path>,
     ) -> Result<SdkSnapshot, SdkError> {
+        let named = dart_sdk_root.to_path_buf();
+        let dart_sdk_root = crate::locate::dart_sdk_root(dart_sdk_root)
+            .ok_or_else(|| SdkError::NotASdkRoot { path: named })?;
         let version_path = dart_sdk_root.join("version");
         let version_text = read_required(&version_path)?;
         let version = version_text.trim();
@@ -153,6 +163,13 @@ pub enum SdkError {
     /// `allowed_experiments.json`).
     #[error("required SDK file missing: {path}")]
     MissingFile { path: std::path::PathBuf },
+    /// The path names neither a Dart SDK root (`lib/libraries.json`) nor a
+    /// Flutter SDK root (which embeds one at `bin/cache/dart-sdk`).
+    #[error(
+        "not a Dart SDK root: {path} (a Dart SDK root holds `lib/libraries.json`; a Flutter \
+         root resolves through `bin/cache/dart-sdk`)"
+    )]
+    NotASdkRoot { path: std::path::PathBuf },
     /// A required metadata file exists but could not be read (permissions,
     /// non-UTF-8 content, …).
     #[error("cannot read SDK file {path}: {source}")]

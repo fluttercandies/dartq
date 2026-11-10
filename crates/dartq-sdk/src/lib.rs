@@ -16,7 +16,10 @@
 //!   `lib/_internal/allowed_experiments.json`. An embedder directory (a
 //!   `sky_engine` package's `lib/`, carrying `_embedder.yaml`) additionally
 //!   installs the analyzer `EmbedderSdk` full-replacement table;
-//!   `None` is fully self-sufficient.
+//!   `None` is fully self-sufficient. The root resolves through
+//!   [`dart_sdk_root`] first: a Flutter checkout's embedded
+//!   `bin/cache/dart-sdk` and a symlinked root load under one canonical
+//!   spelling.
 //! - [`SdkSnapshot::id`] is the blake3 content hash of the *parsed*
 //!   metadata in canonical form, so two SDKs whose metadata parses the same
 //!   share one id regardless of JSON layout; raw-file hashes live only in
@@ -47,12 +50,14 @@ mod extension_faces;
 mod flat_libraries;
 mod identity;
 mod loader;
+mod locate;
 mod metadata;
 mod query;
 
 pub use extension_faces::EXTENSION_FACE_SOURCES;
 pub use flat_libraries::FLAT_LIBRARIES;
 pub use loader::SdkError;
+pub use locate::{dart_sdk_root, dart_sdk_root_of_dart};
 pub use metadata::{
     AllowedExperiments, DEPRECATED_SDK_LIBRARIES, EmbedderLibraries, IMPLICITLY_IMPORTED_LIBRARIES,
     Importability, SdkIdentity, SdkLibraries, SdkLibrary, SdkSnapshot, TargetLibraries,

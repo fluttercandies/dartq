@@ -264,6 +264,29 @@ pub struct ContextMessage {
     pub range: SourceRange,
 }
 
+/// Who contributed a diagnostic row — the provenance the output faces that
+/// are per-row upstream (not per-code-name) key on.
+///
+/// The parity fact (#4189): the oracle's `--format=json` `documentation`
+/// key rides the row's own code URL, and a plugin-contributed row can never
+/// carry one — upstream `LintCode` has no `url` at all (upstream Dart SDK
+/// source, `pkg/analyzer/lib/src/dart/error/lint_codes.dart`: "Add a 'url'
+/// parameter for plugin authors" is an open TODO) — so the merged server +
+/// plugin output shows the same finding twice with the server row's
+/// `documentation` present and the plugin row's absent, even when both rows
+/// spell the same code name (live 3.13.7 capture: a plugin re-reporting
+/// `unused_import`). The JSON writer consumes this marker exactly there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FindingOrigin {
+    /// The analyzer surface itself reported the row (scanner, parser,
+    /// resolver, lints, options) — the default every builtin emit path
+    /// builds.
+    #[default]
+    Engine,
+    /// A plugin contributed the row through the plugin weave.
+    Plugin,
+}
+
 /// One diagnostic: severity, stable code, message, and location.
 ///
 /// The row is clone-heavy by design — the engine stores hold it behind
@@ -273,6 +296,11 @@ pub struct ContextMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub severity: Severity,
+    /// The row's contributor ([`Diagnostic::new`] defaults to
+    /// [`FindingOrigin::Engine`]; the plugin weave marks its rows with
+    /// [`Diagnostic::with_origin`]). Sits beside `severity` so the byte
+    /// lands in its padding — the marker costs no row size.
+    pub origin: FindingOrigin,
     /// Stable code identifying the diagnostic.
     pub code: CodeInfo,
     /// problemMessage text. Static code-table templates are stored verbatim
@@ -320,6 +348,7 @@ impl Diagnostic {
     ) -> Self {
         Self {
             severity,
+            origin: FindingOrigin::Engine,
             code,
             message: message.into(),
             file,
@@ -327,6 +356,15 @@ impl Diagnostic {
             correction: correction.map(Arc::from),
             context: None,
         }
+    }
+
+    /// Marks the row's contributor. The plugin weave's conversion sets
+    /// [`FindingOrigin::Plugin`] on every finding a plugin contributed; the
+    /// per-row output faces (the JSON `documentation` key) consume it.
+    #[must_use]
+    pub fn with_origin(mut self, origin: FindingOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Attaches the `contextMessages` rows. An empty slice degrades to

@@ -283,6 +283,102 @@ pub fn engine_config_with_overrides(
         .map(|(config, dir, advisory, _phases)| (config, dir, advisory))
 }
 
+/// Why the SDK root could not be resolved — the two tiers the callers
+/// distinguish: a root the invocation named that is not a usable SDK (the
+/// oracle's usage tier, the message names the path), and nothing named
+/// anywhere (the navigation text).
+#[derive(Debug, Error)]
+pub enum ResolveSdkError {
+    /// A root the invocation named — the `--sdk` flag, `$DART_SDK`, or the
+    /// `dartq.yaml` `sdk:` locator — holds no usable SDK.
+    #[error("Invalid Dart SDK path: {}", .0.display())]
+    Named(PathBuf),
+    /// The `dartq.yaml` step failed: the config exists but cannot be read
+    /// or its `sdk:` locator is unusable; the message is the config tier's
+    /// own.
+    #[error("{0}")]
+    Config(String),
+    /// Nothing named an SDK and no default resolved.
+    #[error(
+        "no Dart SDK root (pass --sdk PATH, set DART_SDK, declare `sdk:` in dartq.yaml, or \
+         put dart on PATH)"
+    )]
+    NotFound,
+}
+
+/// Resolves the one SDK root every engine-backed face runs on — the single
+/// discovery chain (#4187 folded the former flag-or-`$DART_SDK`-or-error
+/// arm and the official face's PATH lookup into one):
+///
+/// 1. the explicit `--sdk`/`--sdk-path` flag;
+/// 2. `$DART_SDK` (an empty value reads as unset);
+/// 3. the governing `dartq.yaml`'s top-level `sdk:` locator;
+/// 4. the `dart` on `PATH` — the same
+///    [`dartq_toolchain::find_dart`] lookup the official face spawns —
+///    through either binary layout (`<sdk>/bin/dart`, or Flutter's
+///    `<flutter>/bin/dart` whose SDK sits embedded at
+///    `<flutter>/bin/cache/dart-sdk`);
+/// 5. the fvm default (`~/.fvm/default`, or the pre-3.0 `~/fvm/default`) —
+///    a Flutter root, resolved through its embedded SDK.
+///
+/// A root the first three steps name must hold a usable SDK ([`Named`] on
+/// anything else — a pinned root is honored, never silently swapped); the
+/// discovery steps simply miss. Every accepted root is canonicalized
+/// through [`dartq_sdk::dart_sdk_root`] — the loader's own probe — so the
+/// fvm `default` symlink, its version directory, the Flutter root, and the
+/// embedded dart-sdk itself all resolve to one path, and what resolves
+/// here is exactly what [`SdkSnapshot::load`] can read.
+///
+/// # Errors
+///
+/// [`ResolveSdkError`] — see the variants.
+pub fn resolve_sdk_root(dir: &Path, explicit: Option<&Path>) -> Result<PathBuf, ResolveSdkError> {
+    let named = explicit.map(Path::to_path_buf).or_else(|| {
+        env::var_os("DART_SDK")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(named) = named {
+        return named_sdk_root(&named);
+    }
+    if let Some(named) = config_sdk_root(dir)? {
+        return named_sdk_root(&named);
+    }
+    if let Some(dart) = dartq_toolchain::find_dart(None)
+        && let Some(root) = dartq_sdk::dart_sdk_root_of_dart(&dart)
+    {
+        return Ok(root);
+    }
+    if let Some(default) = crate::config::fvm_default_root(env::home_dir().as_deref())
+        && let Some(root) = dartq_sdk::dart_sdk_root(&default)
+    {
+        return Ok(root);
+    }
+    Err(ResolveSdkError::NotFound)
+}
+
+/// One named root through the canonicalizer: [`ResolveSdkError::Named`]
+/// when it holds no SDK of either layout.
+fn named_sdk_root(named: &Path) -> Result<PathBuf, ResolveSdkError> {
+    dartq_sdk::dart_sdk_root(named).ok_or_else(|| ResolveSdkError::Named(named.to_path_buf()))
+}
+
+/// The `dartq.yaml` step: the governing config's `sdk:` locator, resolved
+/// to a candidate root (`None` when no config or no declaration).
+fn config_sdk_root(dir: &Path) -> Result<Option<PathBuf>, ResolveSdkError> {
+    let Some(config) = crate::config::discover(dir).map_err(|error| {
+        ResolveSdkError::Config(format!("dartq.yaml unreadable: {error}"))
+    })? else {
+        return Ok(None);
+    };
+    match config.sdk {
+        Some(locator) => crate::config::sdk_locator_root(&locator, dir)
+            .map(Some)
+            .map_err(|error| ResolveSdkError::Config(error.to_string())),
+        None => Ok(None),
+    }
+}
+
 /// [`engine_config_with_overrides`] plus the assembly's phase clocks
 /// ([`AssemblyPhases`]) — the analyze face's `--metrics-json` attribution;
 /// every other caller takes the unphased spelling.
@@ -305,21 +401,21 @@ pub fn engine_config_with_overrides_phased(
     WorkspaceError,
 > {
     validate_experiments(&overrides.experiments)?;
-    let sdk_root = sdk
-        .map(Path::to_path_buf)
-        .or_else(|| env::var_os("DART_SDK").map(PathBuf::from));
-    let Some(sdk_root) = sdk_root else {
-        return Err(WorkspaceError(
-            "no Dart SDK root (pass --sdk PATH or set DART_SDK)".into(),
-        ));
-    };
-    // The SDK loads before the assembly: the freshness face observes the
-    // snapshot's Dart version against the config's `generatorVersion`. The
-    // message is the oracle's usage text for the unusable-SDK tier,
-    // verbatim (upstream Dart SDK source, pkg/dartdev — analyze.dart:208).
     let sdk_at = Instant::now();
-    let sdk_snapshot = SdkSnapshot::load(&sdk_root, None)
-        .map_err(|_| WorkspaceError(format!("Invalid Dart SDK path: {}", sdk_root.display())))?;
+    // The SDK resolves and loads before the assembly: the freshness face
+    // observes the snapshot's Dart version against the config's
+    // `generatorVersion`. A root that resolves but does not load carries
+    // the loader's own reason beside the oracle's usage text for the
+    // unusable-SDK tier (upstream Dart SDK source, pkg/dartdev —
+    // analyze.dart:208) — the fvm serve failure taught the generic line's
+    // cost.
+    let sdk_root = resolve_sdk_root(dir, sdk).map_err(|error| WorkspaceError(error.to_string()))?;
+    let sdk_snapshot = SdkSnapshot::load(&sdk_root, None).map_err(|error| {
+        WorkspaceError(format!(
+            "Invalid Dart SDK path: {} ({error})",
+            sdk_root.display()
+        ))
+    })?;
     let mut phases = AssemblyPhases {
         sdk: sdk_at.elapsed(),
     };
@@ -2905,5 +3001,107 @@ mod tests {
             r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "sky_engine", "rootUri": "../sky_engine", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         )
         .expect("config");
+    }
+
+    /// A Flutter-root-shaped SDK tree at `root/<tag>`: the fixture SDK's
+    /// three metadata files under `bin/cache/dart-sdk`, plus the `bin/dart`
+    /// wrapper — the fvm layout `session serve --sdk <fvm default>` ships.
+    fn write_flutter_sdk(root: &Path, tag: &str) -> PathBuf {
+        let flutter = root.join(tag);
+        let embedded = flutter.join("bin").join("cache").join("dart-sdk");
+        fs::create_dir_all(embedded.join("lib/_internal")).expect("embedded dirs");
+        fs::write(embedded.join("version"), "3.13.1\n").expect("version");
+        fs::write(
+            embedded.join("lib/libraries.json"),
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        )
+        .expect("libraries");
+        fs::write(
+            embedded.join("lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        )
+        .expect("experiments");
+        fs::write(flutter.join("bin/dart"), "#!/bin/sh\n").expect("dart wrapper");
+        flutter
+    }
+
+    /// The resolution chain's named arms: a plain SDK root and a Flutter
+    /// root both canonicalize onto the concrete dart-sdk path — one path
+    /// per SDK however spelled — and a root with no SDK is the usage tier
+    /// naming that root.
+    #[test]
+    fn named_sdk_roots_resolve_canonically_or_refuse() {
+        let root = workspace("ws_sdk_named", &[]).canonicalize().expect("root");
+        let sdk = root.join("sdk");
+        assert_eq!(named_sdk_root(&sdk).expect("the plain root"), sdk);
+
+        let flutter = write_flutter_sdk(&root, "flutter");
+        assert_eq!(
+            named_sdk_root(&flutter).expect("the Flutter root"),
+            flutter.join("bin").join("cache").join("dart-sdk"),
+            "a Flutter root resolves onto its embedded dart-sdk"
+        );
+
+        let garbage = root.join("no-such-sdk");
+        assert!(
+            matches!(
+                named_sdk_root(&garbage),
+                Err(ResolveSdkError::Named(ref named)) if named == &garbage
+            ),
+            "a named root with no SDK is refused, never swapped"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The #4187 serve failure's shape, end to end in miniature: the
+    /// assembly over a Flutter-root `--sdk` loads the embedded SDK's
+    /// metadata — the version the freshness face observes — instead of
+    /// dying with "Invalid Dart SDK path".
+    #[test]
+    fn a_flutter_root_sdk_loads_through_the_assembly() {
+        let root = workspace("ws_sdk_flutter", &[]).canonicalize().expect("root");
+        let flutter = write_flutter_sdk(&root, "flutter");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&flutter))
+            .expect("the Flutter root assembles");
+        assert_eq!(config.sdk.dart.version, "3.13.1");
+        assert_eq!(
+            config.sdk.dart_sdk_root(),
+            flutter.join("bin").join("cache").join("dart-sdk").as_path()
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `dartq.yaml` step: the governing config's `sdk:` locator names
+    /// the root (project-declared, so the machine's global tier cannot
+    /// interfere), and an unusable locator is the config tier's own error.
+    #[test]
+    fn the_config_sdk_step_resolves_the_declared_locator() {
+        let root = workspace("ws_sdk_config", &[]);
+        fs::write(root.join("dartq.yaml"), "version: 1\nsdk: path:sdk\n").expect("config");
+        assert_eq!(
+            config_sdk_root(&root).expect("the config step"),
+            Some(root.join("sdk"))
+        );
+
+        fs::write(root.join("dartq.yaml"), "version: 1\nsdk: \"fvm:\"\n").expect("bad locator");
+        match config_sdk_root(&root) {
+            Err(ResolveSdkError::Config(message)) => {
+                assert!(message.contains("empty fvm version"), "{message}")
+            }
+            other => panic!("the bad locator is the config tier, got {other:?}"),
+        }
+
+        // The explicit flag short-circuits ahead of every step: the flag's
+        // root answers whatever the config declares.
+        let explicit = resolve_sdk_root(&root, Some(&root.join("sdk")));
+        assert_eq!(
+            explicit.expect("the flag arm"),
+            root.canonicalize().expect("root").join("sdk"),
+            "the flag wins without reading the config"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

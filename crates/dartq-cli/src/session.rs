@@ -62,7 +62,9 @@ struct StartArgs {
     /// The worktree; defaults to the current directory.
     #[arg(default_value = ".")]
     dir: PathBuf,
-    /// Dart SDK root; defaults to `$DART_SDK`.
+    /// Dart SDK root; defaults to the shared discovery chain (`$DART_SDK`,
+    /// then `dartq.yaml`'s `sdk:`, then the `dart` on PATH, then the fvm
+    /// default).
     #[arg(long)]
     sdk: Option<PathBuf>,
     /// Output format: `lon` (the default), `json`, or `text` (the
@@ -114,31 +116,23 @@ pub fn run_entry(args: &SessionArgs) -> u8 {
     }
 }
 
-/// The pure flag/env step of [`sdk_root_for`]: the flag, else
-/// `$DART_SDK` — the engine assembly's own resolution order, surfaced
-/// here because the triple needs the concrete root. Its error is the
-/// navigation text `sdk_root_for` answers when no live session fills in
-/// either, so it names the session way too.
-fn resolved_sdk_root(sdk: Option<&Path>) -> Result<PathBuf, String> {
-    sdk.map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("DART_SDK").map(PathBuf::from))
-        .ok_or_else(|| {
-            "no Dart SDK root (pass --sdk PATH, set DART_SDK, or start a session with \
-             `dartq session start --sdk PATH`)"
-                .to_owned()
-        })
-}
-
-/// The SDK root a face that attaches to `root`'s session keys on: the
-/// flag, else `$DART_SDK`, else the live resident session's own triple
-/// (the state file is keyed by root alone, so a live session names the
-/// one SDK to attach under — `session start` without a flag attaches to
-/// it, and the debug/MCP/answer faces inherit it silently). No live
-/// session answers the navigation error, which names all three ways.
+/// The SDK root a face that attaches to `root`'s session keys on: the one
+/// discovery chain every engine face shares
+/// ([`dartq_commands::workspace::resolve_sdk_root`] — the `--sdk` flag,
+/// `$DART_SDK`, the `dartq.yaml` `sdk:` locator, the `dart` on PATH, the
+/// fvm default), else — only when nothing named an SDK — the live
+/// resident session's own triple (the state file is keyed by root alone,
+/// so a live session names the one SDK to attach under: `session start`
+/// without a flag attaches to it, and the debug/MCP/answer faces inherit
+/// it silently). A root the invocation NAMED that is not a usable SDK
+/// stays the usage error, never a silent swap onto the session's SDK.
 pub(crate) fn sdk_root_for(root: &Path, sdk: Option<&Path>) -> Result<PathBuf, String> {
-    match resolved_sdk_root(sdk) {
+    use dartq_commands::workspace::ResolveSdkError;
+    match dartq_commands::workspace::resolve_sdk_root(root, sdk) {
         Ok(sdk_root) => Ok(sdk_root),
-        Err(navigation) => dartq_session::resident_sdk_root(root).ok_or(navigation),
+        Err(ResolveSdkError::NotFound) => dartq_session::resident_sdk_root(root)
+            .ok_or_else(|| ResolveSdkError::NotFound.to_string()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -435,15 +429,28 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         eprintln!("dartq: session serve: {reason}");
         return exit::SOFTWARE;
     }
-    let (config, _dir, advisory) = match crate::engine_config_with_advisory(&root, Some(&args.sdk))
-    {
-        Ok(faces) => faces,
+    // One canonical SDK root for the engine AND the triple: the election
+    // spawned this serve with the resolver's output, and a manual
+    // invocation resolves the same way here — an fvm `default` symlink,
+    // its version directory, a Flutter root, and the embedded dart-sdk
+    // itself all name one session identity.
+    let sdk_root = match dartq_commands::workspace::resolve_sdk_root(&root, Some(&args.sdk)) {
+        Ok(sdk_root) => sdk_root,
         Err(error) => {
             eprintln!("dartq: session serve: {error}");
             cleanup(&layout, &root);
             return exit::USAGE;
         }
     };
+    let (config, _dir, advisory) =
+        match crate::engine_config_with_advisory(&root, Some(&sdk_root)) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("dartq: session serve: {error}");
+                cleanup(&layout, &root);
+                return exit::USAGE;
+            }
+        };
     // The engine trace — the cold-analysis progress substrate
     // (`dartq events progress` reads it; the file truncates per serve, so
     // each resident generation's sweep starts at zero).
@@ -462,7 +469,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 return exit::SOFTWARE;
             }
         };
-    let triple = SessionTriple::compute(&root, &args.sdk);
+    let triple = SessionTriple::compute(&root, &sdk_root);
     let events = EventLog::new(&layout);
     let _ = events.append(
         "session",
@@ -1984,11 +1991,16 @@ pub(crate) mod tests {
         assert!(parse(&["bogus"]).is_err());
     }
 
-    /// #4105: the SDK root order a face that attaches resolves by — the
-    /// flag wins, `$DART_SDK` next, then the live resident session's own
-    /// triple, and only then the navigation error, which names all three
-    /// ways. It sets `$DART_SDK`, so it runs alone in its own process
-    /// ([`crate::tests::isolated`]), which starts with the variable unset.
+    /// #4105 → #4187: the shared SDK chain every face resolves by — a
+    /// root the invocation names (the flag, then `$DART_SDK`, then the
+    /// `dartq.yaml` `sdk:` locator) must BE an SDK root, an error on
+    /// anything else; discovery (`PATH` dart, then the fvm default)
+    /// answers only when nothing named one; the live session's own triple
+    /// fills the miss; and only then the navigation error, which names
+    /// every way. It rewrites `PATH` and `HOME` to switch discovery off
+    /// and sets `$DART_SDK`, so it runs alone in its own process
+    /// ([`crate::tests::isolated`]), which starts with the variable
+    /// unset.
     #[test]
     fn sdk_root_order_flag_then_env_then_resident_then_error() {
         if crate::tests::isolated(
@@ -1998,13 +2010,18 @@ pub(crate) mod tests {
         }
         // A live session fixture: a listening socket plus the state file
         // naming this process with a fresh heartbeat — the same technique
-        // the serve tests build placeholders with.
+        // the serve tests build placeholders with. Its SDK, like the
+        // second one, is a minimal layout the resolver accepts.
         let home = PathBuf::from("/tmp").join(format!("dqs-sdkorder-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let root = home.join("w");
         std::fs::create_dir_all(&root).expect("root dir");
         let sdk = root.join("sdk");
-        std::fs::create_dir_all(&sdk).expect("sdk dir");
+        minimal_sdk_root(&sdk);
+        let other = home.join("other-sdk");
+        minimal_sdk_root(&other);
+        let not_sdk = home.join("not-sdk");
+        std::fs::create_dir_all(&not_sdk).expect("not-sdk dir");
         let layout = Layout::new(&root);
         layout.create().expect("layout");
         let triple = SessionTriple::compute(&root, &sdk);
@@ -2026,22 +2043,51 @@ pub(crate) mod tests {
         .write(&layout)
         .expect("state");
 
-        // No flag, no env: the live session's SDK.
+        // Discovery off: no dart on that PATH, no fvm under that HOME —
+        // the chain's last two steps miss deterministically.
+        // SAFETY: the test runs alone in its own process (`isolated`).
+        unsafe {
+            std::env::set_var("PATH", home.join("empty-path"));
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("DARTQ_DART");
+        }
+
+        // No flag, no env, nothing to discover: the live session's SDK.
         assert_eq!(
             sdk_root_for(&root, None),
             Ok(sdk.canonicalize().expect("canonical sdk")),
             "the live session answers its own sdk root"
         );
-        // The env outranks the resident session; the flag outranks both.
-        // SAFETY: the test runs alone in its own process (`isolated`).
+        // A named root is honored only when it holds an SDK — it is an
+        // error, never a silent skip past the session — and the env and
+        // the flag outrank the session.
+        // SAFETY: as above.
         unsafe {
-            std::env::set_var("DART_SDK", "/env/sdk");
+            std::env::set_var("DART_SDK", &not_sdk);
         }
-        assert_eq!(sdk_root_for(&root, None), Ok(PathBuf::from("/env/sdk")));
         assert_eq!(
-            sdk_root_for(&root, Some(Path::new("/flag"))),
-            Ok(PathBuf::from("/flag")),
-            "the flag still wins over the environment and the session"
+            sdk_root_for(&root, None),
+            Err(format!("Invalid Dart SDK path: {}", not_sdk.display())),
+            "a named root that holds no SDK is an error, not a skip"
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("DART_SDK", &other);
+        }
+        assert_eq!(
+            sdk_root_for(&root, None),
+            Ok(other.canonicalize().expect("canonical other")),
+            "the env wins over the session"
+        );
+        assert_eq!(
+            sdk_root_for(&root, Some(&other)),
+            Ok(other.canonicalize().expect("canonical other")),
+            "the flag wins over the environment and the session"
+        );
+        assert_eq!(
+            sdk_root_for(&root, Some(&not_sdk)),
+            Err(format!("Invalid Dart SDK path: {}", not_sdk.display())),
+            "the flag is validated the same way"
         );
         // SAFETY: as above.
         unsafe {
@@ -2049,17 +2095,26 @@ pub(crate) mod tests {
         }
 
         // No flag, no env, no live session: the navigation error names
-        // all three ways.
+        // every way.
         let bare = home.join("bare");
         std::fs::create_dir_all(&bare).expect("bare dir");
         let error = sdk_root_for(&bare, None).expect_err("no sdk source");
         assert_eq!(
             error,
-            "no Dart SDK root (pass --sdk PATH, set DART_SDK, or start a session with \
-             `dartq session start --sdk PATH`)"
+            "no Dart SDK root (pass --sdk PATH, set DART_SDK, declare `sdk:` in dartq.yaml, \
+             or put dart on PATH)"
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A directory the SDK resolver accepts as a root — the layout probe
+    /// (`lib/libraries.json`) it shares with the loader. The loader's
+    /// content checks are dartq-sdk's own tests; resolution is the topic
+    /// here.
+    fn minimal_sdk_root(dir: &Path) {
+        std::fs::create_dir_all(dir.join("lib")).expect("sdk lib dir");
+        std::fs::write(dir.join("lib").join("libraries.json"), "{}").expect("libraries.json");
     }
 
     /// One `stop` of a live record: the process dies, the socket, the

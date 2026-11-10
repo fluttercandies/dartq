@@ -21,13 +21,21 @@
 //!   `.dart_tool/package_config.json`, and `dart_test.yaml`;
 //! - the suite's **import closure**: every Dart file transitively reached
 //!   through `import`/`export`/`part` edges, resolved through the package
-//!   config (a missing target is an input too);
+//!   config (a missing target is an input too). A Dart file of the closure
+//!   is keyed by its **significant-content signature**
+//!   ([`crate::tokensig`]): the token stream with comments and
+//!   non-semantic whitespace stripped and strings kept verbatim, so a
+//!   comment-only or format-only edit re-keys nothing;
 //! - its **run-time inputs**: every package file a path-shaped literal in
 //!   the suite-side closure names (a directory literal covers its subtree;
 //!   the package's own `lib/` is library code reading caller-supplied
 //!   paths, so its literals are not inputs), and — when any file of the
 //!   closure reads the process location (`Directory.current`, `Process.*`,
-//!   `Uri.base`, …) — every file of the package.
+//!   `Uri.base`, …) — every file of the package. A file this names is
+//!   **data the suite reads**, not code it compiles: it keys on its raw
+//!   bytes (a `.dart` fixture analyzed or compared by content observes
+//!   exactly what the signature strips), and a file both imported and
+//!   read keys raw.
 //!
 //! ## Sharing across checkouts
 //!
@@ -111,7 +119,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Cache layout version: bump on any key or entry format change.
-const FORMAT: &str = "dartq-test-cache-v12";
+const FORMAT: &str = "dartq-test-cache-v13";
 
 /// Stored outcomes kept in the shared store; the least recently used are
 /// pruned past it. Every revision of every suite of every checkout is one
@@ -519,6 +527,7 @@ impl Cache {
                 // shielded), and one that can take the binding's mock away
                 // unshields the suite too.
                 let mut wrapped_ids = Vec::new();
+                let mut wrapped_data = FxHashSet::default();
                 let mut pinned = false;
                 let mut shield = runner.flutter;
                 let wrapper = wrappers.get(index_in_run);
@@ -533,6 +542,7 @@ impl Cache {
                         &mut memo,
                     )?;
                     wrapped_ids.extend(wrapped.ids);
+                    wrapped_data.extend(wrapped.data);
                     pinned |= wrapped.pinned;
                     shield &= !wrapped.overrides;
                 }
@@ -546,11 +556,19 @@ impl Cache {
                     &mut memo,
                 )?;
                 inputs.ids.extend(wrapped_ids);
+                inputs.data.extend(wrapped_data);
                 inputs.pinned |= pinned;
                 if let Some((_, absent)) = wrapper {
+                    // A wrapper candidate's absence and the pubspec's
+                    // bundled assets are files the tool reads, not code it
+                    // compiles into the suite's closure.
                     inputs
                         .ids
                         .extend(absent.iter().map(|path| paths.intern(path)));
+                    inputs
+                        .data
+                        .extend(absent.iter().map(|path| paths.intern(path)));
+                    inputs.data.extend(asset_ids.iter().copied());
                     inputs.ids.extend_from_slice(&asset_ids);
                 }
                 Ok(inputs)
@@ -561,13 +579,17 @@ impl Cache {
         let rank = paths.byte_order_ranks();
         let interned_paths = &paths.paths;
 
-        // One leaf per input: its portable spelling and digest, hashed once
-        // and shared by every suite that reaches it. An absent candidate
+        // One leaf per input in each of the two roles a suite can reach a
+        // file in, hashed once and shared by every suite: **code** — the
+        // significant-content signature of a Dart source
+        // ([`crate::tokensig`]), falling back to the raw digest — and
+        // **data** — the raw digest, for the files a suite reads by bytes.
+        // A non-Dart file signs alike in both roles. An absent candidate
         // has no leaf: every run derives the same candidate set, so creating
         // the file still changes the key, while checkouts at different
         // depths (whose ancestor `analysis_options.yaml` candidates differ
         // in count) still key alike.
-        let leaves: Vec<Option<[u8; 32]>> = paths
+        let leaves: Vec<Option<([u8; 32], [u8; 32])>> = paths
             .paths
             .par_iter()
             .map(|path| {
@@ -575,7 +597,11 @@ impl Cache {
                 let mut leaf = blake3::Hasher::new();
                 hash_path(&mut leaf, &portable(&self.root, path));
                 leaf.update(&entry.digest);
-                Some(*leaf.finalize().as_bytes())
+                let data = *leaf.finalize().as_bytes();
+                leaf.reset();
+                hash_path(&mut leaf, &portable(&self.root, path));
+                leaf.update(entry.sig.as_ref().unwrap_or(&entry.digest));
+                Some((*leaf.finalize().as_bytes(), data))
             })
             .collect();
         let root = &self.root;
@@ -585,7 +611,10 @@ impl Cache {
             .zip(suites.par_iter())
             .map(|(inputs, suite)| {
                 let SuiteInputs {
-                    mut ids, pinned, ..
+                    mut ids,
+                    data,
+                    pinned,
+                    ..
                 } = inputs?;
                 ids.sort_unstable_by_key(|&id| rank[id as usize]);
                 ids.dedup();
@@ -644,8 +673,15 @@ impl Cache {
                 }
                 hash_path(&mut hasher, &portable(root, suite));
                 for id in ids {
-                    if let Some(leaf) = &leaves[id as usize] {
-                        hasher.update(leaf);
+                    if let Some((code, data_leaf)) = &leaves[id as usize] {
+                        // A file the suite reads as data keys on its raw
+                        // bytes; everything else on the significant content
+                        // a Dart source signs.
+                        hasher.update(if data.contains(&id) {
+                            data_leaf
+                        } else {
+                            code
+                        });
                     }
                 }
                 hasher.update(&(env_names.len() as u64).to_le_bytes());
@@ -991,6 +1027,8 @@ impl Cache {
                         .collect();
                     self.stamps.stamp(fresh)?;
                     suite.ids.extend_from_slice(&next);
+                    // A file a data file names is data in turn.
+                    suite.data.extend(next.iter().copied());
                 }
                 frontier = next;
             }
@@ -1257,6 +1295,13 @@ impl RefusalDetail {
 struct SuiteInputs {
     /// Interned input paths, in discovery order, possibly repeated.
     ids: Vec<u32>,
+    /// The ids of [`Self::ids`] the suite reaches as **data it reads**
+    /// (a path literal, a manifest entry, an absolute-path input, the
+    /// whole-package widening) rather than as code it compiles: they key
+    /// on raw bytes, while the rest key on the significant-content
+    /// signature a Dart source signs ([`crate::tokensig`]). A file in
+    /// both roles keys raw — data is the conservative one.
+    data: FxHashSet<u32>,
     /// The outcome may differ between checkouts of the same content.
     pinned: bool,
     /// A closure file can take the flutter test binding's mock
@@ -1464,6 +1509,7 @@ impl Dense {
         }
         let nodes = self.path_of.len();
         let mut inputs = self.base_inputs.clone();
+        let mut data: FxHashSet<u32> = FxHashSet::default();
         let mut seen = vec![false; nodes];
         // `parent[n]` = the node whose import first queued `n`.
         let mut parent = vec![u32::MAX; nodes];
@@ -1542,7 +1588,11 @@ impl Dense {
                 }
             }
             for absolute in &facts.absolute_paths {
-                inputs.push(paths.intern(Path::new(absolute)));
+                // An absolute literal names a file the suite reads by
+                // bytes: data, not code.
+                let id = paths.intern(Path::new(absolute));
+                inputs.push(id);
+                data.insert(id);
             }
             whole_package |= facts.ambient;
             // Library code reads the paths its callers hand it; its own
@@ -1580,6 +1630,9 @@ impl Dense {
                 // Empty only for `.`: the package root itself.
                 whole_package |= named.is_empty();
                 inputs.extend_from_slice(named);
+                // A literal-named file is data the suite reads, even when
+                // it is a Dart source.
+                data.extend(named.iter().copied());
             }
         }
         if let Some(node) = deferred_http
@@ -1592,9 +1645,13 @@ impl Dense {
         }
         if whole_package {
             inputs.extend_from_slice(package);
+            // The ambient widening covers files the closure may read at
+            // run time by any path: raw bytes, all of them.
+            data.extend(package.iter().copied());
         }
         Ok(SuiteInputs {
             ids: inputs,
+            data,
             pinned,
             overrides,
         })
@@ -1941,6 +1998,108 @@ mod tests {
         assert!(reopened.lookup(&key).is_some());
         assert!(reopened.lookup(&old).is_some(), "a reverted edit replays");
         assert!(reopened.lookup("other").is_none());
+    }
+
+    /// Comment-only and format-only edits of a closure file keep every
+    /// key: a Dart input reached as code signs by its significant content
+    /// (see [`crate::tokensig`]), so rewording a comment or reflowing
+    /// whitespace re-keys nothing, while a significant edit re-keys the
+    /// suites that import the file and only those. This is the per-suite
+    /// invalidation the grouped runner's replay rides on: editing one
+    /// suite's own file changes that suite's key alone.
+    #[test]
+    fn comment_only_edits_keep_keys() {
+        let (tmp, root) = fixture();
+        let bin = root.join("pubspec.yaml");
+        let suites: Vec<PathBuf> = ["test/a_test.dart", "test/data_test.dart"]
+            .map(|rel| root.join(rel))
+            .to_vec();
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let first = cache.keys(&suites, runner(&bin)).expect("keys");
+
+        // A comment added to the imported library: no token changes.
+        std::fs::write(
+            root.join("lib/b.dart"),
+            "// reworded comment\nint b() => 1; // trailing\n",
+        )
+        .expect("write");
+        assert_eq!(
+            cache.rekey(&suites, runner(&bin)).expect("keys"),
+            first,
+            "a comment-only edit re-keys nothing"
+        );
+
+        // The same tokens with different whitespace.
+        std::fs::write(root.join("lib/b.dart"), "int b() =>\n    1;\n").expect("write");
+        assert_eq!(
+            cache.rekey(&suites, runner(&bin)).expect("keys"),
+            first,
+            "a format-only edit re-keys nothing"
+        );
+
+        // A significant edit of the same file re-keys its importers.
+        std::fs::write(root.join("lib/b.dart"), "int b() => 2;\n").expect("write");
+        let second = cache.rekey(&suites, runner(&bin)).expect("keys");
+        assert_ne!(second[0], first[0]);
+        assert_eq!(second[1], first[1], "an unrelated suite keeps its key");
+    }
+
+    /// A Dart file a suite reaches as data (a path literal covering it)
+    /// keys on its raw bytes: a comment-only edit of the fixture re-keys,
+    /// because the suite observes exactly what the signature strips.
+    #[test]
+    fn dart_fixtures_read_as_data_key_raw() {
+        let (tmp, root) = fixture();
+        let bin = root.join("pubspec.yaml");
+        std::fs::write(root.join("test/data/fix.dart"), "// c\nint x = 1;\n").expect("write");
+        let suites = vec![root.join("test/data_test.dart")];
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let first = cache.keys(&suites, runner(&bin)).expect("keys");
+        std::fs::write(root.join("test/data/fix.dart"), "int x = 1;\n").expect("write");
+        let second = cache.rekey(&suites, runner(&bin)).expect("keys");
+        assert_ne!(second[0], first[0], "a fixture read as data keys raw");
+        // The file both imported and read as data keys raw too: importing
+        // the fixture widens the closure, but the read role keeps the raw
+        // leaf.
+        std::fs::write(root.join("test/data/fix.dart"), "// c\nint x = 1;\n").expect("write");
+        assert_eq!(
+            cache.rekey(&suites, runner(&bin)).expect("keys")[0].as_deref(),
+            first[0].as_deref(),
+            "the raw role returns with the original bytes"
+        );
+    }
+
+    /// A replayed entry is byte-equivalent to the events the run stored:
+    /// the same checkout re-reads its own events verbatim (only a
+    /// cross-checkout replay re-spells the root marks).
+    #[test]
+    fn replayed_events_round_trip_byte_equivalent() {
+        let (tmp, root) = fixture();
+        let bin = root.join("pubspec.yaml");
+        let suite = root.join("test/a_test.dart");
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let key = cache
+            .keys(std::slice::from_ref(&suite), runner(&bin))
+            .expect("keys")[0]
+            .clone()
+            .expect("key");
+        let lines = [
+            r#"{"suite":{"id":0,"platform":"vm","path":"test/a_test.dart"},"type":"suite","time":0}"#,
+            r#"{"test":{"id":1,"name":"a","suiteID":0},"type":"testStart","time":0}"#,
+            r#"{"testID":1,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":3}"#,
+        ];
+        let events: Vec<crate::event::Json> = lines
+            .iter()
+            .map(|line| crate::event::parse(line).expect("event"))
+            .collect();
+        cache.stage(&key, &events).expect("stage");
+        cache
+            .commit(&[key.clone()].into_iter().collect())
+            .expect("commit");
+        let replayed = cache.lookup(&key).expect("hit");
+        let stored: Vec<String> = events.iter().map(|event| event.to_line()).collect();
+        let back: Vec<String> = replayed.iter().map(|event| event.to_line()).collect();
+        assert_eq!(back, stored, "a replay is the stored run, byte for byte");
     }
 
     /// `refusal_details` names the closure file and reads that decided

@@ -55,7 +55,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileId, Severity};
+use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileId, FindingOrigin, Severity};
 use dartq_engine::Engine;
 use dartq_engine::analysis_options::{AnalysisOptions, ConfiguredSeverity};
 use dartq_index::{DeclRow, FileCapture};
@@ -712,7 +712,10 @@ fn intern_code(code: &str, kind: RuleKind, interned: &mut FxHashMap<String, Code
 /// text's UTF-16 length (a stale row survives a shrink edit by degrading to
 /// zero-width at the file end, never tripping the line index's in-range
 /// contract), the code interned by [`intern_code`] against the emitting
-/// batch's census `code → kind` map.
+/// batch's census `code → kind` map. Every converted row is marked
+/// [`FindingOrigin::Plugin`] — the provenance the output writers read (the
+/// oracle omits `documentation` on plugin-contributed rows); crash rows
+/// stay `Engine`, a dartq-own code the registry never publishes docs for.
 fn to_diagnostic(
     batch: &PluginBatch,
     row: &PluginDiagnostic,
@@ -749,39 +752,23 @@ fn to_diagnostic(
         },
         None,
     )
-}
-
-/// The dedup key of the merge: file, range start offset, code name, and
-/// message — the `(file, offset, code, message)` exact-equality in the
-/// merged rows' engine coordinates. `message` (not provenance) is the
-/// discriminator: a plugin row exactly equal to a built-in row is the same
-/// finding twice, and the built-in row wins by seeding `seen` first.
-type DedupKey = (u32, u32, String, String);
-
-fn dedup_key(diagnostic: &Diagnostic) -> DedupKey {
-    (
-        diagnostic.file.index(),
-        diagnostic.range.offset,
-        diagnostic.code.name.to_owned(),
-        diagnostic.message.as_str().to_owned(),
-    )
+    .with_origin(FindingOrigin::Plugin)
 }
 
 /// Merges the run's engine rows (in their existing order) with the resolved
 /// plugin findings into one deterministic sequence: engine rows first, then
 /// the findings in [`resolve_findings`]' (plugin discovery order, offset)
-/// order. A row whose `(file, offset, code, message)` key already appeared
-/// is dropped — a plugin row never duplicates a built-in finding (the
-/// built-in row, seeded first, wins).
+/// order — plain concatenation, duplicates kept. The oracle's plugin merge
+/// (upstream Dart SDK source, `pkg/analysis_server/lib/src/plugin/
+/// result_merger.dart`, `mergeAnalysisErrors`) concatenates every partial
+/// result and keeps same-code-same-spot rows ("If two or more plugins
+/// contribute the same error the resulting list will contain duplications";
+/// their dedupe is an unfinished TODO), so a plugin row re-reporting a
+/// built-in finding publishes twice — engine row first, plugin row after.
 #[must_use]
 pub fn merge(engine_rows: Vec<Diagnostic>, findings: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    let mut seen: FxHashSet<DedupKey> = engine_rows.iter().map(dedup_key).collect();
     let mut merged = engine_rows;
-    for diagnostic in findings {
-        if seen.insert(dedup_key(&diagnostic)) {
-            merged.push(diagnostic);
-        }
-    }
+    merged.extend(findings);
     merged
 }
 
@@ -1100,11 +1087,12 @@ mod tests {
         assert!(augmented.entry("pub_only").is_none());
     }
 
-    /// The merge's dedup seeds from the engine rows: a plugin row exactly
-    /// equal to a built-in finding drops, a differing one appends after the
-    /// engine rows in finding order.
+    /// The merge keeps duplicates: a plugin row exactly equal to a built-in
+    /// finding survives beside it (the oracle's plugin merge concatenates,
+    /// keeping same-error rows from several contributors), engine row first,
+    /// then the findings in order.
     #[test]
-    fn merge_dedups_plugin_rows_against_engine_rows() {
+    fn merge_keeps_plugin_rows_equal_to_engine_rows() {
         let mut table = FileTable::new();
         let file = table.intern(Path::new("/w/lib/a.dart"));
         let engine_row = Diagnostic::new(
@@ -1130,9 +1118,11 @@ mod tests {
             },
             None,
         );
-        let merged = merge(vec![engine_row], vec![dup, fresh.clone()]);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[1], fresh, "the distinct plugin row appends");
+        let merged = merge(vec![engine_row.clone()], vec![dup, fresh.clone()]);
+        assert_eq!(merged.len(), 3, "both rows of the duplicate survive");
+        assert_eq!(merged[0], engine_row, "the engine row comes first");
+        assert_eq!(merged[1], engine_row, "the equal plugin row follows");
+        assert_eq!(merged[2], fresh, "the distinct plugin row appends");
     }
 
     /// A dead plugin's recorded crash publishes once, against the cycle's
