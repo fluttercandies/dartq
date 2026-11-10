@@ -179,7 +179,10 @@ jobs:
             echo "::error::dartq test exited $code (expected 0)"
             exit 1
           fi
-          grep -q "All tests passed" <<<"$out" || {
+          # On CI runners GITHUB_ACTIONS is set, so dartq auto-selects the
+          # GitHub reporter, whose summary reads "N test(s) passed"; the
+          # classic reporter prints "All tests passed!". Accept both.
+          grep -qE "All tests passed!|tests? passed" <<<"$out" || {
             echo "::error::dartq test reported no passing summary"
             exit 1
           }
