@@ -92,12 +92,25 @@ impl std::fmt::Display for Fault {
 #[derive(Clone, Debug)]
 pub struct Launch {
     pub sdk: Sdk,
-    pub cache: PathBuf,
     pub packages: Option<PathBuf>,
 }
 
 impl Launch {
     /// dartdev's argument list (`AnalysisServer._startProcess`).
+    ///
+    /// No `--cache`: dartdev leaves the flag unset, so the server picks
+    /// `PhysicalResourceProvider`'s own state location — `~/.dartServer` on
+    /// POSIX, the same store every `dart`/`flutter` invocation on the host
+    /// already shares. Seeding it once per SDK buys every later analysis —
+    /// stock's and this daemon's alike — the linked-bundle hits that a
+    /// fresh per-worktree `--cache` dir can never serve. On a monorepo the
+    /// difference between a warm `~/.dartServer` and an empty per-worktree
+    /// dir is the full re-link of every package cycle plus the
+    /// `EvictingFileByteStore` write tax (~10× wall on a 50k-file corpus).
+    /// The shared store's URI-keyed context-message caveat is upstream's
+    /// own (`dart analyze` carries it too); per-worktree isolation was a
+    /// nicety, not a correctness requirement, and it priced the cold path
+    /// out of parity with the oracle.
     fn command(&self) -> Command {
         let (runtime, snapshot) = self.sdk.server_command();
         let mut command = Command::new(runtime);
@@ -112,8 +125,7 @@ impl Launch {
                 "--disable-silent-analysis-exceptions",
                 "--sdk",
             ])
-            .arg(&self.sdk.root)
-            .arg(format!("--cache={}", self.cache.display()));
+            .arg(&self.sdk.root);
         if let Some(packages) = &self.packages {
             command.arg(format!("--packages={}", packages.display()));
         }

@@ -819,23 +819,29 @@ fn read_runtime_inputs(
                 if matches!((lexeme, member), ("DateTime", "now" | "timestamp")) {
                     trigger(TriggerKind::Clock, format!("DateTime.{member}"));
                 }
+                // The dart:io members that themselves perform a syscall
+                // — connect/bind/lookup/list and the SecureSocket statics
+                // that start a TLS handshake on a live socket. Configuration
+                // (`SecureSocket.badCertificateCallback`, `setOption`) and
+                // cached properties (`remoteAddress`, `port`) observe no
+                // external state and do not fire.
                 if matches!(
                     (lexeme, member),
                     ("Process", "run" | "runSync" | "start")
                         | ("Platform", "localHostname")
+                        | ("Socket" | "RawSocket", "connect" | "startConnect")
+                        | ("SecureSocket" | "RawSecureSocket", "connect" | "startConnect" | "secure" | "secureServer")
                         | (
-                            "Socket"
-                                | "ServerSocket"
-                                | "RawSocket"
+                            "ServerSocket"
                                 | "RawServerSocket"
-                                | "SecureSocket"
                                 | "SecureServerSocket"
-                                | "RawDatagramSocket"
-                                | "WebSocket"
-                                | "InternetAddress"
-                                | "NetworkInterface",
-                            _
+                                | "RawSecureServerSocket"
+                                | "RawDatagramSocket",
+                            "bind"
                         )
+                        | ("WebSocket", "connect" | "fromUpgradedSocket")
+                        | ("InternetAddress", "lookup")
+                        | ("NetworkInterface", "list")
                 ) {
                     trigger(TriggerKind::Drift, format!("{lexeme}.{member}"));
                 }
@@ -1202,6 +1208,30 @@ void main() {
         assert!(!drift("void main() { DateTime.now(); }"));
         assert!(drift("void main() { Process.run('ls', []); }"));
         assert!(drift("void main() { Socket.connect('h', 1); }"));
+        assert!(drift("void main() { SecureSocket.connect('h', 1); }"));
+        assert!(drift("void main() { SecureSocket.secure(s); }"));
+        assert!(drift("void main() { InternetAddress.lookup('h'); }"));
+        assert!(drift("void main() { WebSocket.connect('wss://h'); }"));
+        assert!(drift("void main() { ServerSocket.bind('h', 1); }"));
+        assert!(drift("void main() { NetworkInterface.list(); }"));
+        // Configuration members of those types perform no IO: pinning a
+        // certificate callback or context, tuning socket options, reading
+        // cached connection fields, renegotiating an open session.
+        assert!(!drift(
+            "void main() { SecureSocket.badCertificateCallback = (c) => true; }"
+        ));
+        assert!(!drift(
+            "void main() { s.setTrustedCertificates('p'); s.setAlpnProtocols(p, false); }"
+        ));
+        assert!(!drift(
+            "void main() { s.setOption(SocketOption.tcpNoDelay, true); s.renegotiate(); }"
+        ));
+        assert!(!drift(
+            "void main() { print(s.remoteAddress); print(s.remotePort); print(s.encoding); }"
+        ));
+        assert!(!drift(
+            "void main() { Socket.direction; SecureSocket.peerCertificate; }"
+        ));
         assert!(!drift("void main() { HttpClient(); }"));
         assert!(of("void main() { HttpClient(); }").http_read());
         assert!(drift("void main() { stdin.readLineSync(); }"));

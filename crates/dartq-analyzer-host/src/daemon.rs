@@ -213,10 +213,7 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
         .and_then(|pid| pid.trim().parse().ok())
         && dartq_toolchain::proc::alive_and_cmdline(
             pid,
-            &[
-                "analysis_server",
-                &format!("--cache={}", spec.cache_dir().display()),
-            ],
+            &["analysis_server", &format!("{}", spec.sdk_root.display())],
         )
     {
         dartq_toolchain::proc::kill_tree(pid);
@@ -357,7 +354,6 @@ impl Host {
                         root: spec.sdk_root.clone(),
                         version: parsed,
                     },
-                    cache: cache.clone(),
                     packages: spec.packages.clone(),
                 })
             }

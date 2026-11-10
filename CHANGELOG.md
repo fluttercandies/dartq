@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-11-10
+
+### Fixed
+
+- `dartq analyze` cold start on large workspaces regressed to ~10x the stock
+  oracle: the resident analysis server launched with `--cache` pointing at a
+  fresh per-worktree directory, so every run re-linked every package cycle
+  into an empty `EvictingFileByteStore`. The flag is dropped; the server
+  shares `~/.dartServer` with every `dart`/`flutter` invocation on the host,
+  the same store the stock oracle uses. Measured on a 49,650-file corpus:
+  798 s -> 82 s (stock warm-cache 80-108 s), warm runs answer in ~0.3-0.5 s,
+  and the JSON report stays byte-identical to `dart analyze --format=json`.
+- `dartq test` cache over-rejection: the dependency scanner marked every
+  member access on dart:io socket types as drift (`TriggerKind::Drift`), so a
+  helper that only configures TLS (`SecureSocket.badCertificateCallback`,
+  `setTrustedCertificates`, `setAlpnProtocols`, `setOption`, `renegotiate`)
+  poisoned every suite reaching it — the "ssl_pinning" pattern. The drift
+  list is narrowed to the members that themselves perform network IO per the
+  dart:io API: `connect`/`startConnect`/`secure`/`secureServer`,
+  `bind`, `WebSocket.connect`/`fromUpgradedSocket`, `InternetAddress.lookup`,
+  `NetworkInterface.list`. Configuration setters and cached connection
+  properties no longer fire.
+
+
 ### Added
 
 - Generated SDK facade tables: `tools/sdk-faces-gen` extracts two checked-in

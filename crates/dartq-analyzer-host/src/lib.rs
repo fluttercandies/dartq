@@ -123,14 +123,14 @@ impl Spec {
             .join(hex::encode(&hasher.finalize().as_bytes()[..8]))
     }
 
-    /// The server's `--cache`: `<cache>/dartq/analyzer/caches/<key>`, keyed
-    /// by the SDK, the roots and the package config. One per worktree: the
-    /// analyzer's result cache keys some entries by package URI, which two
-    /// worktrees share, and on Dart 3.8 a shared cache hands one worktree
-    /// the context-message paths of another. The server bounds each cache
-    /// (`EvictingFileByteStore`, 4 GB); [`sweep`] drops the caches of
-    /// worktrees that no longer exist, and the disk budget bounds them all
-    /// together.
+    /// The daemon's per-key state dir: `<cache>/dartq/analyzer/caches/<key>`,
+    /// keyed by the SDK, the roots and the package config. It no longer feeds
+    /// the server's `--cache` — that flag priced an empty dir into a fresh
+    /// `EvictingFileByteStore` (~10× cold wall on a 50k-file corpus vs the
+    /// shared `~/.dartServer` the stock oracle uses). The dir still carries
+    /// the roots file [`claim_cache`] writes for [`sweep`], the disk-budget
+    /// LRU marker [`crate::disk::used`] refreshes on each answer, and the
+    /// `peak_key` fallback when the worktree's git identity is unreadable.
     #[must_use]
     pub fn cache_dir(&self) -> PathBuf {
         cache_root().join(CACHES).join(self.cache_key())
