@@ -305,6 +305,7 @@ dependencies = [
  "dartq-toolchain",
  "hex",
  "libc",
+ "notify",
  "parking_lot",
  "rayon",
  "rustc-hash",

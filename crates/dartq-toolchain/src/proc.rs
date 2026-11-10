@@ -159,6 +159,31 @@ pub fn alive(pid: u32) -> bool {
     }
 }
 
+/// Whether `pid` is alive AND its command line contains every `needle` —
+/// the pid-reuse guard for every pid-file reaper: a recycled pid that now
+/// names an unrelated process fails the match and is never signaled.
+/// The check reads the process's own arguments, not a recorded hint, so
+/// it cannot be fooled by a stale file. `ps` is the one table the
+/// process table already walks; an unreadable command line is not a
+/// match.
+#[must_use]
+pub fn alive_and_cmdline(pid: u32, needles: &[&str]) -> bool {
+    if needles.is_empty() {
+        return alive(pid);
+    }
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let cmdline = String::from_utf8_lossy(&output.stdout);
+    needles.iter().all(|needle| cmdline.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +201,49 @@ mod tests {
         let mut members = tree(&rows, 10);
         members.sort_unstable();
         assert_eq!(members, [10, 11, 12, 13]);
+    }
+
+    /// The pid-reuse guard: this test's own process is alive and its
+    /// command line contains "dartq" (the test binary), but a nonsense
+    /// needle or a dead pid never matches — a recycled pid naming an
+    /// unrelated process is never the match a reaper kills.
+    #[test]
+    #[cfg(unix)]
+    fn alive_and_cmdline_matches_needles_and_refuses_the_rest() {
+        let me = std::process::id();
+        assert!(alive_and_cmdline(me, &[]));
+        // The cargo test binary's path always names the workspace.
+        assert!(alive_and_cmdline(me, &["dartq"]));
+        assert!(!alive_and_cmdline(me, &["definitely-not-in-this-cmdline"]));
+        assert!(
+            !alive_and_cmdline(me, &["dartq", "and-a-second-needle-that-is-absent"]),
+            "every needle must match"
+        );
+        assert!(!alive_and_cmdline(999_999_999, &["dartq"]));
+    }
+
+    /// A live process whose cmdline matches one needle but not a foreign
+    /// `--cache` path is never matched — a sibling worktree's server
+    /// survives this daemon's stale `server.pid` reap. A live `sleep 30`
+    /// child's cmdline is exactly `sleep 30`: a foreign `--cache` needle
+    /// is absent, both real needles present.
+    #[test]
+    #[cfg(unix)]
+    fn alive_and_cmdline_needs_every_needle() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id();
+        // Present needle matches; the foreign cache needle never does.
+        assert!(alive_and_cmdline(pid, &["sleep"]));
+        assert!(!alive_and_cmdline(
+            pid,
+            &["sleep", "--cache=/totally/other/daemon/cache"]
+        ));
+        // Both needles of THIS daemon's reap match.
+        assert!(alive_and_cmdline(pid, &["sleep", "30"]));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

@@ -14,7 +14,8 @@
 //! * [`server`] drives one server child;
 //! * [`client`] is the `dartq analyze` side: find or start the daemon,
 //!   ask, and fall back to a per-run `dart analyze` on any failure;
-//! * [`daemon`] is the serving side.
+//! * [`daemon`] is the serving side; `disk` keeps the servers' caches
+//!   inside the machine's disk budget.
 //!
 //! One daemon serves one key: the SDK (root and version), the dartq binary,
 //! the analysis roots and the package config override. Plugins are the
@@ -26,22 +27,58 @@
 pub mod client;
 #[cfg(unix)]
 pub mod daemon;
+#[cfg(unix)]
+mod disk;
+pub mod face;
 pub mod report;
 pub mod server;
 pub mod snapshot;
 pub mod support;
+#[cfg(unix)]
+pub(crate) mod watch;
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 pub use client::{Outcome, Request, analyze};
+pub use face::{Face, FaceFormat, FaceMeta, FaceRender, FaceRenderer};
 pub use report::{Report, Row};
 pub use support::{Sdk, Support, Version, support};
 
 /// The hidden `dartq analyze` flag that runs a daemon over the spec in the
 /// directory it names.
 pub const SERVE_FLAG: &str = "--resident-serve";
+
+/// One `dartq analyze` rest argument, resolved to its on-disk kind — the
+/// oracle's target classification (`dart analyze` treats an existing
+/// directory as a directory target, an existing file as a file target).
+/// Paths arrive canonicalized, in the same spelling universe the server's
+/// `analysis.errors` file keys use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Aim {
+    /// A directory target: the report emits every diagnostic whose file
+    /// lies under it.
+    Dir(PathBuf),
+    /// A file target: the report emits only that file's rows (and only
+    /// when it is a `.dart` file — a file aim's context root never
+    /// analyzes anything else).
+    File(PathBuf),
+}
+
+/// Whether `path` is covered by one of the `aims` — under a directory aim
+/// or identical to a `.dart` file aim. This is the emit filter of
+/// `dart analyze <paths>`: the analyzer's context covers the whole roots
+/// set while the oracle prints only the covered files' rows.
+#[must_use]
+pub fn covered(path: &Path, aims: &[Aim]) -> bool {
+    aims.iter().any(|aim| match aim {
+        Aim::Dir(dir) => path.starts_with(dir),
+        Aim::File(file) => {
+            path == file && file.extension().is_some_and(|ext| ext == "dart")
+        }
+    })
+}
 
 /// What a daemon serves, written by the client that starts it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +95,16 @@ pub struct Spec {
     /// `memory.max_concurrent`: the job cap the server's slot declares
     /// (`0` unlimited).
     pub max_concurrent: u32,
+    /// The shared-pool posture: a pooled daemon serves several worktrees'
+    /// roots under one server (`Ask.roots` joins; the directory hash
+    /// drops the roots so every compatible worktree lands on the same
+    /// daemon directory and the same election). `false` is the
+    /// one-worktree daemon.
+    #[serde(default)]
+    pub pool: bool,
+    /// The most worktrees a pooled daemon serves (1–64; `0` defaults 3).
+    #[serde(default)]
+    pub max_roots: u32,
 }
 
 impl Spec {
@@ -81,28 +128,46 @@ impl Spec {
     /// analyzer's result cache keys some entries by package URI, which two
     /// worktrees share, and on Dart 3.8 a shared cache hands one worktree
     /// the context-message paths of another. The server bounds each cache
-    /// (`EvictingFileByteStore`, 4 GB), and [`sweep`] drops the caches of
-    /// worktrees that no longer exist.
+    /// (`EvictingFileByteStore`, 4 GB); [`sweep`] drops the caches of
+    /// worktrees that no longer exist, and the disk budget bounds them all
+    /// together.
     #[must_use]
     pub fn cache_dir(&self) -> PathBuf {
-        cache_root()
-            .join(CACHES)
-            .join(hex::encode(&self.answer_key().finalize().as_bytes()[..8]))
+        cache_root().join(CACHES).join(self.cache_key())
+    }
+
+    /// The cache directory's name.
+    fn cache_key(&self) -> String {
+        hex::encode(&self.answer_key().finalize().as_bytes()[..8])
     }
 
     fn answer_key(&self) -> blake3::Hasher {
         let mut hasher = blake3::Hasher::new();
         add(&mut hasher, self.sdk_root.as_os_str().as_encoded_bytes());
         add(&mut hasher, self.sdk_version.as_bytes());
-        for root in &self.roots {
-            add(&mut hasher, root.as_os_str().as_encoded_bytes());
+        if !self.pool {
+            for root in &self.roots {
+                add(&mut hasher, root.as_os_str().as_encoded_bytes());
+            }
+            add(
+                &mut hasher,
+                self.packages
+                    .as_deref()
+                    .map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()),
+            );
+        } else {
+            // A pooled daemon is one per (SDK, binary, packages
+            // override) — the roots join through `set_roots`, but a
+            // `--packages` override is a server-launch flag: a joiner
+            // with a different override cannot share the founder's
+            // server. `None` pools with `None`; `Some` keys on the
+            // override's bytes so the join lands on a different pool
+            // (and a worktree without the override never sees it).
+            add(&mut hasher, b"pool");
+            if let Some(packages) = self.packages.as_deref() {
+                add(&mut hasher, packages.as_os_str().as_encoded_bytes());
+            }
         }
-        add(
-            &mut hasher,
-            self.packages
-                .as_deref()
-                .map_or(&[][..], |p| p.as_os_str().as_encoded_bytes()),
-        );
         hasher
     }
 
@@ -140,6 +205,10 @@ pub(crate) struct Files {
     pub failed: PathBuf,
     /// Locked while the daemon answers a request.
     pub busy: PathBuf,
+    /// The live analysis server child's pid — the successor daemon's
+    /// orphan reap when a SIGKILL'd predecessor could not take its server
+    /// down with it (the group kill only runs on catchable signals).
+    pub server_pid: PathBuf,
 }
 
 impl Files {
@@ -151,6 +220,7 @@ impl Files {
             elect: dir.join("elect.lock"),
             failed: dir.join("failed"),
             busy: dir.join("busy.lock"),
+            server_pid: dir.join("server.pid"),
         }
     }
 }
@@ -164,13 +234,13 @@ pub(crate) fn claim_cache(cache: &Path, roots: &[PathBuf]) {
     }
 }
 
-/// Removes the server caches whose roots no longer exist (a deleted
-/// worktree's cache is up to 4 GB nobody will read again) and the daemon
-/// directories no daemon owns (an old dartq binary's). A directory whose
-/// start lock is held is a daemon being started and is left alone.
+/// Removes the server caches under `root` whose roots no longer exist (a
+/// deleted worktree's cache is up to 4 GB nobody will read again) and the
+/// daemon directories no daemon owns (an old dartq binary's). A directory
+/// whose start lock is held is a daemon being started and is left alone,
+/// as is `own`, the calling daemon's directory.
 #[cfg(unix)]
-pub(crate) fn sweep(own: &Path) {
-    let root = cache_root();
+pub(crate) fn sweep(root: &Path, own: &Path) {
     for cache in entries(&root.join(CACHES)) {
         let gone = std::fs::read(cache.join(ROOTS_FILE))
             .ok()
@@ -225,6 +295,94 @@ fn cache_root() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("dartq")
         .join("analyzer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The emit filter of `dart analyze <paths>`: directory aims cover
+    /// by prefix (never a same-named sibling — `lib` does not cover
+    /// `lib2`), file aims cover their own `.dart` file only.
+    #[test]
+    fn covered_is_the_oracles_emit_filter() {
+        let dir = Aim::Dir(PathBuf::from("/p/lib"));
+        let file = Aim::File(PathBuf::from("/p/lib/a.dart"));
+        let yaml = Aim::File(PathBuf::from("/p/pubspec.yaml"));
+        assert!(covered(Path::new("/p/lib/a.dart"), &[dir.clone()]));
+        assert!(covered(Path::new("/p/lib/deep/b.dart"), std::slice::from_ref(&dir)));
+        assert!(!covered(Path::new("/p/lib2/c.dart"), &[dir.clone()]));
+        assert!(!covered(Path::new("/p/test/t.dart"), std::slice::from_ref(&dir)));
+        assert!(covered(Path::new("/p/lib/a.dart"), std::slice::from_ref(&file)));
+        assert!(!covered(Path::new("/p/lib/b.dart"), std::slice::from_ref(&file)));
+        assert!(covered(Path::new("/p/pubspec.yaml"), &[Aim::Dir(PathBuf::from("/p"))]));
+        assert!(!covered(Path::new("/p/pubspec.yaml"), std::slice::from_ref(&yaml)));
+    }
+
+    /// The pooled spec's daemon directory is the pool's rendezvous: it
+    /// drops the roots from the key (a `--packages` override stays — it
+    /// is a server-launch flag the shared server satisfies once), so
+    /// every compatible worktree computes the same directory — and the
+    /// SDK or the dartq binary changing lands the pool on a different
+    /// directory, never the same daemon under a stale key.
+    #[test]
+    fn a_pooled_specs_dir_ignores_roots_and_separates_sdks() {
+        let spec = |sdk: &str, roots: &[&str], pool: bool| Spec {
+            sdk_root: PathBuf::from(sdk),
+            sdk_version: "3.13.7".to_owned(),
+            roots: roots.iter().map(PathBuf::from).collect(),
+            packages: None,
+            budget: 0,
+            idle_secs: 60,
+            max_percent: 90,
+            max_concurrent: 0,
+            pool,
+            max_roots: 3,
+        };
+        let a = spec("/sdks/a", &["/w/a"], true);
+        let b = spec("/sdks/a", &["/w/b"], true);
+        let ab = spec("/sdks/a", &["/w/a", "/w/b"], true);
+        // Two worktrees of one SDK pool to one daemon directory.
+        assert_eq!(a.dir(), b.dir());
+        assert_eq!(a.dir(), ab.dir());
+        // Another SDK is another pool — never the same daemon.
+        assert_ne!(a.dir(), spec("/sdks/b", &["/w/a"], true).dir());
+        // Pooled and one-worktree specs of the same roots never collide.
+        assert_ne!(a.dir(), spec("/sdks/a", &["/w/a"], false).dir());
+    }
+
+    /// A pooled spec with an explicit `--packages` override never joins
+    /// a pool founded without it — the override is a server-launch flag
+    /// a shared server cannot satisfy twice, so it keys the pool's
+    /// daemon directory. Same override, same pool.
+    #[test]
+    fn a_pooled_specs_dir_keeps_the_packages_override() {
+        let mut plain = Spec {
+            sdk_root: PathBuf::from("/sdks/a"),
+            sdk_version: "3.13.7".to_owned(),
+            roots: vec![PathBuf::from("/w/a")],
+            packages: None,
+            budget: 0,
+            idle_secs: 60,
+            max_percent: 90,
+            max_concurrent: 0,
+            pool: true,
+            max_roots: 3,
+        };
+        let mut override_1 = plain.clone();
+        override_1.packages = Some(PathBuf::from("/w/a/.dart_tool/package_config.json"));
+        let mut override_2 = plain.clone();
+        override_2.packages = Some(PathBuf::from("/w/b/.dart_tool/package_config.json"));
+        assert_ne!(plain.dir(), override_1.dir());
+        assert_ne!(override_1.dir(), override_2.dir());
+        // The same override on a different worktree's roots still pools
+        // — only roots are dropped, the override stays.
+        let mut joined = override_1.clone();
+        joined.roots = vec![PathBuf::from("/w/b")];
+        assert_eq!(override_1.dir(), joined.dir());
+        plain.packages = Some(PathBuf::from("/w/a/.dart_tool/package_config.json"));
+        assert_eq!(plain.dir(), override_1.dir());
+    }
 }
 
 /// The running binary's identity: path, size and mtime. A rebuilt or

@@ -221,7 +221,7 @@ fn start_session(args: &StartArgs) -> u8 {
     // election runs.
     let registry = Registry::open();
     let triple_probe = SessionTriple::compute(&root, &sdk_root);
-    for swept in registry.sweep_upgrades(&triple_probe.binary_hash) {
+    for swept in registry.sweep_upgrades(&triple_probe.binary_stamp) {
         let row = json!({"type": "swept", "root": swept.display().to_string()});
         print_row(
             args.format,
@@ -253,7 +253,7 @@ fn start_session(args: &StartArgs) -> u8 {
 
 fn session_status(args: &StatusArgs) -> u8 {
     let registry = Registry::open();
-    let binary = SessionTriple::compute(Path::new("."), Path::new(".")).binary_hash;
+    let binary = SessionTriple::compute(Path::new("."), Path::new(".")).binary_stamp;
     // Grouped by checkout: same-root rows adjacent (the most recent
     // heartbeat first inside a group).
     let mut live = registry.list();
@@ -295,9 +295,9 @@ fn session_status(args: &StatusArgs) -> u8 {
             "root": record.state.triple.root.display().to_string(),
             "pid": record.state.pid,
             "sdk": record.state.triple.sdk_root.display().to_string(),
-            "binary": record.state.triple.binary_hash,
+            "binary": record.state.triple.binary_stamp,
             "age_s": age_s,
-            "stale_binary": record.state.triple.binary_hash != binary,
+            "stale_binary": record.state.triple.binary_stamp != binary,
         });
         print_row(args.format, &row, Some(session_text(&row)));
     }
@@ -368,7 +368,7 @@ fn print_state(format: OutputFormat, state: &SessionState, attached: bool) {
         "root": state.triple.root.display().to_string(),
         "pid": state.pid,
         "sdk": state.triple.sdk_root.display().to_string(),
-        "binary": state.triple.binary_hash,
+        "binary": state.triple.binary_stamp,
         "socket": Layout::new(&state.triple.root).socket.display().to_string(),
     });
     let text = if attached {
@@ -477,12 +477,18 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     // #2632: the heartbeat advertises the held debug-session count (the
     // reaper's SIGTERM grace scales by it); the counter's shareable
     // handle feeds the beat thread, which cannot borrow the session.
+    // The last-answer clock rides the same way: the pressure eviction's
+    // LRU sort reads `used_ms` out of every live state's registry copy.
     let held_sessions = session.debug_sessions_counter();
+    let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        u64::try_from(SessionState::now_ms()).unwrap_or(u64::MAX),
+    ));
     heartbeat(
         &layout,
         &registry,
         &triple,
         held_sessions.load(std::sync::atomic::Ordering::Relaxed),
+        u128::from(last_used.load(std::sync::atomic::Ordering::Relaxed)),
     );
 
     // #2591: the heartbeat owns its own thread. Beating between accepts
@@ -498,6 +504,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let beat_registry = Registry::open();
     let beat_flag = std::sync::Arc::clone(&beating);
     let beat_held = std::sync::Arc::clone(&held_sessions);
+    let beat_used = std::sync::Arc::clone(&last_used);
     let beater = std::thread::Builder::new()
         .name("dartq-heartbeat".into())
         .spawn(move || {
@@ -517,6 +524,7 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                         &beat_registry,
                         &beat_triple,
                         beat_held.load(std::sync::atomic::Ordering::Relaxed),
+                        u128::from(beat_used.load(std::sync::atomic::Ordering::Relaxed)),
                     );
                 }
             }
@@ -562,7 +570,9 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     // it hosts a debug session it gives the slot up (debugging is never
     // restricted) and keeps the memory booked.
     let peak_key = format!("session:{}", root.display());
+    let max_percent = crate::memory_max_percent(&root);
     let mut busy = Busy::open(&layout.dir.join("busy.lock"));
+    let mut pressure = dartq_toolchain::ledger::Pressure::default();
     let mut lease = match lease_session(&peak_key, &root, &layout, &signalled) {
         Ok(lease) => lease,
         Err(message) => {
@@ -612,11 +622,16 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                     lease.touch();
                 }
                 let _ = events.append("session", "client_detached", serde_json::json!({}));
+                last_used.store(
+                    u64::try_from(SessionState::now_ms()).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 heartbeat(
                     &layout,
                     &registry,
                     &triple,
                     held_sessions.load(std::sync::atomic::Ordering::Relaxed),
+                    u128::from(last_used.load(std::sync::atomic::Ordering::Relaxed)),
                 );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -666,6 +681,27 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 exit::CLEAN,
             );
         }
+        // Memory pressure evicts an idle peer: while this daemon itself
+        // is idle (no client, nothing hosted) the shared ledger monitor
+        // samples host memory on its own cadence; consecutive lows under
+        // the ledger's reserve line release the least-recently-used idle
+        // ledger holder — a resident analyzer or a peer session, busy
+        // lock free, quiet past its unused window — and the machine-wide
+        // cooldown paces evictions so one pressure episode cannot strip
+        // the fleet in a burst. The monitor complements the job gate:
+        // the gate releases idle residents only when an admission needs
+        // the memory; the monitor gives it back before anyone has to ask.
+        if hosting(&session) == 0 && !busy.held {
+            if let Some(victim) = pressure.tick(std::process::id(), max_percent, true) {
+                let _ = events.append(
+                    "session",
+                    "pressure_evict",
+                    serde_json::json!({ "victim": victim }),
+                );
+            }
+        } else {
+            pressure.reset();
+        }
         if idle_elapsed(last_client, Instant::now(), hosting(&session)) > idle_timeout {
             stop_accepting(listener, &layout);
             return serve_shutdown(
@@ -682,6 +718,13 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         std::thread::sleep(TICK);
     }
 }
+
+/// The shared pressure monitor lives in `dartq_toolchain::ledger`
+/// (`Pressure::tick`): one policy for the session daemon and every
+/// analyzer-host daemon — cadence, consecutive-low arm, the ledger-wide
+/// cooldown, and the LRU-idle releasable victim choice over the ledger's
+/// own holder records (the session's busy lock covers "serving or
+/// hosting", so a debug mount is never evictable there).
 
 /// The session daemon's busy lock: held while a client is served or a
 /// debug session is held, so the memory ledger never releases a daemon
@@ -813,6 +856,7 @@ fn lease_session(
         cap: crate::job_cap(root),
         sized,
         peak_key: Some(peak_key.to_owned()),
+        source_bytes: None,
     };
     let deadline = Instant::now() + SESSION_MEMORY_WAIT;
     let max_percent = crate::memory_max_percent(root);
@@ -918,13 +962,21 @@ fn bind_takeover(layout: &Layout) -> io::Result<UnixListener> {
 /// The liveness rewrite: state.json plus the registry record. `held`
 /// is the live debug-session count (#2632) — the reaper reading either
 /// copy scales its SIGTERM grace by it instead of SIGKILLing a daemon
-/// mid-detach.
-fn heartbeat(layout: &Layout, registry: &Registry, triple: &SessionTriple, held: usize) {
+/// mid-detach. `used_ms` is the last client answer's wall time — the
+/// memory-pressure eviction's LRU fact.
+fn heartbeat(
+    layout: &Layout,
+    registry: &Registry,
+    triple: &SessionTriple,
+    held: usize,
+    used_ms: u128,
+) {
     let state = SessionState {
         pid: std::process::id(),
         heartbeat_ms: SessionState::now_ms(),
         triple: triple.clone(),
         debug_sessions: held,
+        used_ms,
     };
     if state.write(layout).is_ok() {
         let _ = registry.upsert(&Record {
@@ -1242,6 +1294,7 @@ pub(crate) mod tests {
             cap: 1,
             sized: true,
             peak_key: None,
+            source_bytes: None,
         };
         let deadline = || Instant::now() + Duration::from_secs(5);
         let mut daemon =
@@ -1302,6 +1355,7 @@ pub(crate) mod tests {
             cap: ledger::cap(0),
             sized: false,
             peak_key: None,
+            source_bytes: None,
         };
         let deadline = Instant::now() + Duration::from_secs(3);
         let outcome = match ledger::acquire(request, 1 << 20, 90, deadline, |_| {}) {
@@ -1939,6 +1993,7 @@ pub(crate) mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
+            used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -2009,6 +2064,7 @@ pub(crate) mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
+            used_ms: 0,
         };
         state.write(&layout).expect("state");
         let record = Record {
@@ -2057,6 +2113,7 @@ pub(crate) mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: SessionTriple::compute(&root, &root),
             debug_sessions: 0,
+            used_ms: 0,
         }
         .write(&layout)
         .expect("state");

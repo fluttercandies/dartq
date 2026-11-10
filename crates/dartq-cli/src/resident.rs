@@ -558,7 +558,7 @@ fn route_attached(socket: &Path, method: &str, params: &Value, out: &mut impl Wr
 /// path's own, re-derived there whenever the route falls back.
 fn print_answer(out: &mut impl Write, answer: &Value) -> Option<u8> {
     // The answer shape is this binary generation's own (the attach probe
-    // pins the protocol generation by binary hash): a missing field is a
+    // pins the protocol generation by binary stamp): a missing field is a
     // program bug, not a runtime case.
     let stdout = answer["stdout"]
         .as_str()
@@ -800,7 +800,7 @@ fn ladder(
 /// the same resolution root, the same binary generation, live pid,
 /// fresh heartbeat, answering socket — names the session's socket, with
 /// nothing written and nothing spawned. The check pipeline is
-/// SDK-free, so the session identity it consults is root + binary hash
+/// SDK-free, so the session identity it consults is root + binary stamp
 /// (a daemon raised under another SDK serves the same M0 bytes); the
 /// analyze face's full-triple match lives in the election.
 fn attached_socket(root: &Path) -> Option<PathBuf> {
@@ -809,10 +809,10 @@ fn attached_socket(root: &Path) -> Option<PathBuf> {
     let fresh =
         SessionState::now_ms().saturating_sub(state.heartbeat_ms) <= STALE_HEARTBEAT.as_millis();
     // The dummy SDK root never touches the comparison: only the triple's
-    // root and binary hash are read (the hash is the current exe's own).
+    // root and binary stamp are read (the stamp is the current exe's own).
     let here = SessionTriple::compute(root, root);
     (state.triple.root == here.root
-        && state.triple.binary_hash == here.binary_hash
+        && state.triple.binary_stamp == here.binary_stamp
         && state.pid != 0
         && dartq_session::pid_alive(state.pid)
         && fresh
@@ -905,7 +905,7 @@ fn print_routed(
         }
     }
     // The answer shape is this binary generation's own (the election
-    // pins the protocol generation by binary hash): a missing field is a
+    // pins the protocol generation by binary stamp): a missing field is a
     // program bug, not a runtime case.
     let mut stdout = answer["stdout"]
         .as_str()
@@ -1510,6 +1510,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: SessionTriple::compute(&root, &root.join("sdk")),
             debug_sessions: 0,
+            used_ms: 0,
         }
         .write(&layout)
         .expect("the residue writes");
@@ -1560,29 +1561,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A stale binary hash (the recorded generation is not this
+    /// A stale binary stamp (the recorded generation is not this
     /// binary's): the election reaps and takes over — bounded by its
     /// start window, never a hang — and the routed answer over the
     /// taken-over session is still the cold bytes.
     #[test]
-    fn a_stale_binary_hash_is_taken_over_not_hung_on() {
+    fn a_stale_binary_stamp_is_taken_over_not_hung_on() {
         let _serial = SIGNAL_SERIALIZATION
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-stale");
         // The stale generation's state: a live pid (the harness's own —
         // the reaper's self-guard skips it), a fresh heartbeat, and a
-        // foreign binary hash. The triple's other fields stay true so
-        // the takeover is the hash's alone.
+        // foreign binary stamp. The triple's other fields stay true so
+        // the takeover is the stamp's alone.
         let layout = Layout::new(&root);
         std::fs::create_dir_all(&layout.dir).expect("the state dir");
         let mut stale = SessionTriple::compute(&root, &root.join("sdk"));
-        stale.binary_hash = "an-older-generation".into();
+        stale.binary_stamp = "an-older-generation".into();
         SessionState {
             pid: std::process::id(),
             heartbeat_ms: SessionState::now_ms(),
             triple: stale,
             debug_sessions: 0,
+            used_ms: 0,
         }
         .write(&layout)
         .expect("the stale state writes");
@@ -1640,7 +1642,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-coldflag");
         // The live-looking session over a sentinel socket: same root,
-        // same binary hash, live pid, fresh heartbeat — every consult
+        // same binary stamp, live pid, fresh heartbeat — every consult
         // connects to the sentinel, whose acceptor closes each stream
         // unread at once (the transport error's fast path; nothing
         // serves, nothing blocks on the call bound).
@@ -1677,6 +1679,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: SessionTriple::compute(&root, &root.join("sdk")),
             debug_sessions: 0,
+            used_ms: 0,
         };
         live_state().write(&layout).expect("the state writes");
 
@@ -2074,6 +2077,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: SessionTriple::compute(&root, &root.join("sdk")),
             debug_sessions: 0,
+            used_ms: 0,
         };
         live_state().write(&layout).expect("the state writes");
 
@@ -2193,6 +2197,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: SessionTriple::compute(&root, &root.join("sdk")),
             debug_sessions: 0,
+            used_ms: 0,
         }
         .write(&layout)
         .expect("the residue writes");

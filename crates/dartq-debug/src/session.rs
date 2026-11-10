@@ -2405,6 +2405,7 @@ fn book_app(config: &LaunchConfig) -> Option<dartq_toolchain::ledger::Lease> {
         cap: 0,
         sized,
         peak_key: None,
+        source_bytes: None,
     })
 }
 
@@ -3216,6 +3217,7 @@ http://127.0.0.1:9002/A=/\r"
                 cap: 1,
                 sized: true,
                 peak_key: None,
+                source_bytes: None,
             },
             1 << 20,
             90,

@@ -41,10 +41,10 @@
 //!   of waiting forever.
 //! * **Availability.** The request plus the growth current holders still
 //!   owe (`Σ max(0, lease − RSS)`) must also fit in the memory the OS
-//!   reports available, minus a reserve of `100 − max_percent` percent of
-//!   physical memory: what accounts for everything outside the ledger (the
-//!   user's IDE, the Gradle daemons a build leaves behind). An unreadable
-//!   figure skips the check.
+//!   reports available, minus a reserve of `max((100 − max_percent)% of
+//!   physical, 2 GiB)`: what accounts for everything outside the ledger
+//!   (the user's IDE, the Gradle daemons a build leaves behind, the OS
+//!   itself on a small machine). An unreadable figure skips the check.
 //! * **Admission.** Under one gate lock. Slot requests wait in arrival
 //!   order (waiter tickets `w-<seq>-<pid>.lock`, locked by their waiter).
 //!   On a memory or count shortfall, idle releasable holders are released
@@ -83,6 +83,11 @@ pub const TOKEN_ENV: &str = "DARTQ_LEDGER_TOKEN";
 pub const DEFAULT_MAX_PERCENT: u8 = 90;
 /// The lease of a face with no recorded peak and no peer to borrow from.
 pub const DEFAULT_LEASE: u64 = 1 << 30;
+/// The reserve's floor: `max_percent` may describe a big machine's share,
+/// but a host always keeps at least this much for itself — the OS, the
+/// desktop, the editors the ledger does not see. 2 GiB is what keeps a
+/// memory-tight Mac responsive under swap pressure.
+pub const RESERVE_FLOOR: u64 = 2 << 30;
 
 /// How often a waiter re-checks admission.
 const POLL: Duration = Duration::from_millis(250);
@@ -156,6 +161,9 @@ pub struct Request {
     /// of its wait ([`sizing`]): it is admitted sized as soon as a peak of
     /// its own or of a peer of its face is recorded.
     pub peak_key: Option<String>,
+    /// The analyzed Dart source size — [`sizing_with_source`]'s estimate
+    /// input. `None` for callers that don't measure it.
+    pub source_bytes: Option<u64>,
 }
 
 /// One holder file's record.
@@ -224,8 +232,12 @@ impl Figures {
         percent(self.total, self.max_percent)
     }
 
+    /// The memory kept free for everything outside the ledger (the IDE,
+    /// the Gradle daemons a build leaves behind): `(100 − max_percent)%`
+    /// of physical, never below [`RESERVE_FLOOR`] — 90% of a 16 GB machine
+    /// leaves a 1.6 GB reserve, which is under what a frozen desktop needs.
     fn reserve(self) -> u64 {
-        percent(self.total, 100 - self.max_percent)
+        percent(self.total, 100 - self.max_percent).max(RESERVE_FLOOR)
     }
 }
 
@@ -407,36 +419,70 @@ pub fn available_memory() -> Option<u64> {
     if let Some(bytes) = env_number(AVAILABLE_ENV).filter(|&bytes| bytes > 0) {
         return Some(bytes);
     }
-    #[cfg(target_os = "linux")]
-    {
-        let text = fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))?;
-        let kib: u64 = line.trim().trim_end_matches("kB").trim().parse().ok()?;
-        Some(kib.saturating_mul(1024))
-    }
+    available_memory_os()
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory_os() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let kib: u64 = line.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
+#[cfg(target_os = "macos")]
+fn available_memory_os() -> Option<u64> {
+    let mut level: u32 = 0;
+    let mut len = std::mem::size_of::<u32>();
+    // SAFETY: `kern.memorystatus_level` is a u32 percentage; the
+    // out-pointer and length match it.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.memorystatus_level".as_ptr(),
+            (&raw mut level).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    u8::try_from(level)
+        .ok()
+        .filter(|&level| rc == 0 && (1..=100).contains(&level))
+        .map(|level| percent(crate::proc::physical_memory(), level))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn available_memory_os() -> Option<u64> {
+    None
+}
+
+/// The OS's own memory-pressure level — `kern.memorystatus_vm_pressure_level`
+/// on macOS (1 = normal, 2 = warn, 4 = critical), `None` where the counter
+/// does not exist or cannot be read. The kernel computes it from free +
+/// file-backed pages against the memorystatus tables, so it sees pressure
+/// a free-bytes figure misses (compressor churn, cache starvation).
+#[must_use]
+pub fn pressure_level() -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         let mut level: u32 = 0;
         let mut len = std::mem::size_of::<u32>();
-        // SAFETY: `kern.memorystatus_level` is a u32 percentage; the
+        // SAFETY: `kern.memorystatus_vm_pressure_level` is a u32; the
         // out-pointer and length match it.
         let rc = unsafe {
             libc::sysctlbyname(
-                c"kern.memorystatus_level".as_ptr(),
+                c"kern.memorystatus_vm_pressure_level".as_ptr(),
                 (&raw mut level).cast(),
                 &raw mut len,
                 std::ptr::null_mut(),
                 0,
             )
         };
-        u8::try_from(level)
-            .ok()
-            .filter(|&level| rc == 0 && (1..=100).contains(&level))
-            .map(|level| percent(crate::proc::physical_memory(), level))
+        (rc == 0).then_some(level)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         None
     }
@@ -482,29 +528,30 @@ pub fn peak(key: &str) -> Option<u64> {
 }
 
 fn peak_in(dir: &Path, key: &str) -> Option<u64> {
-    read_peak(&dir.join("peaks").join(peak_file(key))).map(|(_, bytes)| bytes)
+    read_peak(&dir.join("peaks").join(peak_file(key))).map(|peak| peak.bytes)
 }
 
-/// One recorded peak file: its face and bytes. A bare number (the format
-/// of an older dartq) has no face: it still sizes its own key.
-fn read_peak(path: &Path) -> Option<(Option<Face>, u64)> {
-    let text = fs::read_to_string(path).ok()?;
-    match serde_json::from_str::<Peak>(&text) {
-        Ok(peak) => Some((Some(peak.face), peak.bytes)),
-        Err(_) => Some((None, text.trim().parse().ok()?)),
-    }
+/// One recorded peak file. A file in any other shape (truncated,
+/// foreign) is not a peak: `None`.
+fn read_peak(path: &Path) -> Option<Peak> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 /// The recorded peaks of `face`, under any key.
 fn face_peaks(dir: &Path, face: Face) -> impl Iterator<Item = u64> {
+    face_peak_entries(dir, face).map(|(bytes, _)| bytes)
+}
+
+/// The recorded peaks of `face`, under any key, with their source sizes.
+fn face_peak_entries(dir: &Path, face: Face) -> impl Iterator<Item = (u64, Option<u64>)> {
     fs::read_dir(dir.join("peaks"))
         .into_iter()
         .flatten()
         .flatten()
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-        .filter_map(move |entry| match read_peak(&entry.path())? {
-            (Some(of), bytes) if of == face => Some(bytes),
-            _ => None,
+        .filter_map(move |entry| {
+            let peak = read_peak(&entry.path())?;
+            (peak.face == face).then_some((peak.bytes, peak.source_bytes))
         })
 }
 
@@ -513,27 +560,88 @@ fn face_peaks(dir: &Path, face: Face) -> impl Iterator<Item = u64> {
 struct Peak {
     face: Face,
     bytes: u64,
+    /// The analyzed Dart source size the peak was measured on, for the
+    /// ratio estimate that sizes unrecorded jobs of the same face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_bytes: Option<u64>,
 }
 
 /// Records `bytes` as the peak of `key`, a job of `face` (the latest
 /// run's, so a project that shrank books less next time).
 pub fn record_peak(key: &str, face: Face, bytes: u64) {
     if let Some(dir) = ledger_dir() {
-        record_peak_in(&dir, key, face, bytes);
+        record_peak_in(&dir, key, face, bytes, None);
     }
 }
 
-fn record_peak_in(dir: &Path, key: &str, face: Face, bytes: u64) {
+/// [`record_peak`] with the analyzed source size the peak was measured
+/// on — the ratio estimate's input for unrecorded jobs of the same face.
+pub fn record_peak_with_source(key: &str, face: Face, bytes: u64, source_bytes: u64) {
+    if let Some(dir) = ledger_dir() {
+        record_peak_in(&dir, key, face, bytes, Some(source_bytes));
+    }
+}
+
+/// [`record_peak_with_source`] that never lowers a recorded peak: the
+/// growth brake's observed figure is a lower bound (the job was still
+/// growing when it yielded), so a re-queued job must be admitted on at
+/// least the earlier full measurement. A normal completion still calls
+/// [`record_peak_with_source`], so a project that shrank books less.
+pub fn record_peak_floor(key: &str, face: Face, bytes: u64, source_bytes: u64) {
+    if let Some(dir) = ledger_dir() {
+        let floor = peak_in(&dir, key).unwrap_or(0).max(bytes);
+        record_peak_in(&dir, key, face, floor, Some(source_bytes));
+    }
+}
+
+/// The peaks store's file cap: unsized waiters re-scan `face_peak_entries`
+/// every poll, so the store stays small. On record, files past
+/// [`PEAK_FILES_MAX`] are deleted oldest-mtime-first down to the cap.
+const PEAK_FILES_MAX: usize = 512;
+
+fn record_peak_in(dir: &Path, key: &str, face: Face, bytes: u64, source_bytes: Option<u64>) {
     if bytes == 0 {
         return;
     }
     let dir = dir.join("peaks");
-    let text = serde_json::to_string(&Peak { face, bytes }).expect("a peak serializes");
+    let text = serde_json::to_string(&Peak {
+        face,
+        bytes,
+        source_bytes,
+    })
+    .expect("a peak serializes");
     if fs::create_dir_all(&dir).is_ok() {
         let temp = dir.join(format!(".{}.{}", peak_file(key), std::process::id()));
         if fs::write(&temp, text).is_ok() {
             let _ = fs::rename(&temp, dir.join(peak_file(key)));
+            trim_peaks(&dir);
         }
+    }
+}
+
+/// Deletes the oldest peak files while more than [`PEAK_FILES_MAX`]
+/// exist — mtime order, so fresh records and the just-written file stay.
+fn trim_peaks(dir: &Path) {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|entry| {
+            entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .map(|mtime| (mtime, entry.path()))
+        })
+        .collect();
+    let excess = entries.len().saturating_sub(PEAK_FILES_MAX);
+    if excess == 0 {
+        return;
+    }
+    entries.sort_by_key(|(mtime, _)| *mtime);
+    for (_, path) in entries.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -562,26 +670,94 @@ fn peak_file(key: &str) -> String {
 /// first run, which admission serializes with every other first run. An
 /// unsized request names `key` as its [`Request::peak_key`] to be sized
 /// while it waits.
+///
+/// For [`Face::AnalysisServer`], when `source_bytes` is `Some`, a peak's
+/// `peak/source_bytes` ratio estimates this job's size. An estimated job
+/// is sized: it runs in parallel with other sized/estimated jobs when
+/// the budget admits, waits FIFO when it doesn't.
 #[must_use]
 pub fn sizing(key: &str, face: Face) -> (u64, bool) {
+    sizing_with_source(key, face, None)
+}
+
+/// [`sizing`] with the analyzed source size for ratio-based estimates.
+#[must_use]
+pub fn sizing_with_source(key: &str, face: Face, source_bytes: Option<u64>) -> (u64, bool) {
     let Some(dir) = ledger_dir() else {
         return (DEFAULT_LEASE, false);
     };
     let holders: Vec<Holder> = scan(&dir).into_iter().map(|(_, holder)| holder).collect();
-    sized_in(&dir, Some(key), face, &holders).map_or((DEFAULT_LEASE, false), |bytes| (bytes, true))
+    sized_in(&dir, Some(key), face, &holders, source_bytes)
+        .map_or((DEFAULT_LEASE, false), |bytes| (bytes, true))
 }
 
 /// The measured lease of a job: `key`'s recorded peak under `dir`, else
-/// the largest peak of `face`, live or recorded (a peer's).
-fn sized_in(dir: &Path, key: Option<&str>, face: Face, holders: &[Holder]) -> Option<u64> {
-    key.and_then(|key| peak_in(dir, key)).or_else(|| {
-        holders
-            .iter()
-            .filter(|holder| holder.face == face && holder.sized && holder.lease > 0)
-            .map(|holder| holder.lease)
-            .chain(face_peaks(dir, face))
-            .max()
-    })
+/// a ratio-based estimate when `source_bytes` is given and analyzer
+/// peaks carry their own source sizes, else the largest peak of `face`,
+/// live or recorded (a peer's). The face-peak borrow is skipped for a
+/// [`Face::AnalysisServer`] job with known source bytes: a big peer's
+/// peak under-estimates a small job's fixed analyzer base, so this job
+/// falls through to `None` — unsized, the first-run slot.
+fn sized_in(
+    dir: &Path,
+    key: Option<&str>,
+    face: Face,
+    holders: &[Holder],
+    source_bytes: Option<u64>,
+) -> Option<u64> {
+    key.and_then(|key| peak_in(dir, key))
+        .or_else(|| estimate(dir, face, source_bytes))
+        .or_else(|| {
+            if face == Face::AnalysisServer && source_bytes.is_some() {
+                return None;
+            }
+            holders
+                .iter()
+                .filter(|holder| holder.face == face && holder.sized && holder.lease > 0)
+                .map(|holder| holder.lease)
+                .chain(face_peaks(dir, face))
+                .max()
+        })
+}
+
+/// The ratio estimate over comparable-scale recorded peaks: only a peak
+/// whose source size is within `[S/4, 4·S]` of this job's `S` counts —
+/// the analyzer's fixed base (SDK summaries) makes a tiny project's
+/// peak/source ratio huge and a huge project's ratio small. Each
+/// comparable peak gives the bound `peak × max(1, S / S_i)`: a bigger
+/// project's peak is never scaled down (the base makes downward scaling
+/// an under-estimate), a smaller one's is scaled up by at most 4×. The
+/// estimate is the largest bound; `None` when no peak is comparable or
+/// the bound could never be admitted (`> total − reserve`, a figure no
+/// machine runs — the job is then unsized, the first-run slot).
+fn estimate(dir: &Path, face: Face, source_bytes: Option<u64>) -> Option<u64> {
+    if face != Face::AnalysisServer {
+        return None;
+    }
+    let my_source = source_bytes?;
+    if my_source == 0 {
+        return None;
+    }
+    let bound = face_peak_entries(dir, face)
+        .filter_map(|(peak, src)| src.map(|src| (peak, src)))
+        .filter(|(_, src)| {
+            *src > 0
+                && *src >= my_source.div_ceil(4)
+                && *src <= my_source.saturating_mul(4)
+        })
+        .map(|(peak, src)| {
+            let scale = (my_source as u128).div_ceil(src as u128);
+            peak as u128 * scale.max(1)
+        })
+        .max()?;
+    let estimate = u64::try_from(bound).unwrap_or(u64::MAX);
+    let cap = total_memory().saturating_sub(Figures {
+        total: total_memory(),
+        available: None,
+        max_percent: DEFAULT_MAX_PERCENT,
+    }
+    .reserve());
+    (estimate <= cap).then_some(estimate)
 }
 
 /// The live leases: face, label and bytes of each holder (the view
@@ -795,7 +971,13 @@ impl Lease {
     /// bytes, so the holder leaves the first-run slot and a peer of its
     /// face can borrow the figure while it still runs.
     pub fn record_peak(&mut self, key: &str, peak: u64) {
-        record_peak_in(&self.dir, key, self.record.face, peak);
+        self.record_peak_with_source(key, peak, None);
+    }
+
+    /// [`record_peak`] with the analyzed source size — the ratio
+    /// estimate's input for unrecorded jobs of the same face.
+    pub fn record_peak_with_source(&mut self, key: &str, peak: u64, source_bytes: Option<u64>) {
+        record_peak_in(&self.dir, key, self.record.face, peak, source_bytes);
         if peak == 0 || (self.record.sized && self.record.bytes >= peak) {
             return;
         }
@@ -1054,7 +1236,13 @@ fn acquire_in(
         // first-run line.
         if request.slot
             && !request.sized
-            && let Some(bytes) = sized_in(dir, request.peak_key.as_deref(), request.face, &snapshot)
+            && let Some(bytes) = sized_in(
+                dir,
+                request.peak_key.as_deref(),
+                request.face,
+                &snapshot,
+                request.source_bytes,
+            )
         {
             request.sized = true;
             request.bytes = bytes;
@@ -1332,6 +1520,294 @@ fn describe(holders: &[Holder]) -> String {
         .join(", ")
 }
 
+// ---------------------------------------------------------------------------
+// Idle-pressure eviction (G1): one shared policy every resident face uses —
+// the session daemon and every analyzer-host daemon run the same monitor so
+// a memory-tight host sheds idle heavy holders before the machine freezes.
+// ---------------------------------------------------------------------------
+
+/// How often an idle resident samples host memory — a caller's event-loop
+/// wake bound (the daemon's recv timeout takes `min(PRESSURE_TICK, …)` so
+/// the monitor never sleeps past its cadence).
+pub const PRESSURE_TICK: Duration = Duration::from_secs(2);
+const PRESSURE_SAMPLE: Duration = PRESSURE_TICK;
+/// Two consecutive low samples arm one eviction — a single blip never does.
+const PRESSURE_LOW_SAMPLES: u8 = 2;
+/// The machine-wide spacing between two evictions (the ledger's file, not
+/// one resident's clock — five daemons may not shed five holders at once).
+const PRESSURE_COOLDOWN: Duration = Duration::from_secs(10);
+/// An idle resident is evictable only after this much silence — an
+/// eviction must never cut a daemon whose next request is mid-flight.
+const PRESSURE_UNUSED: Duration = Duration::from_secs(10);
+/// A macOS pressure level that already counts as low regardless of the
+/// free figure: 2 = warn, 4 = critical.
+#[cfg(target_os = "macos")]
+const PRESSURE_LEVEL_LOW: u32 = 2;
+
+/// One resident's pressure-monitor state (per daemon, cheap to keep).
+#[derive(Default)]
+pub struct Pressure {
+    next_sample: Option<Instant>,
+    lows: u8,
+}
+
+impl Pressure {
+    /// Clears the arm when this resident went busy — a daemon mid-request
+    /// neither evicts nor is evicted.
+    pub fn reset(&mut self) {
+        self.next_sample = None;
+        self.lows = 0;
+    }
+
+    /// The monitor's one tick. On cadence ([`PRESSURE_SAMPLE`]) reads the
+    /// host's pressure; on [`PRESSURE_LOW_SAMPLES`] consecutive lows under
+    /// the cooldown picks the least-recently-used idle releasable ledger
+    /// holder that is not `own_pid` and releases it (SIGTERM — the holder's
+    /// own shutdown ladder). Returns the released holder's label for the
+    /// caller's note/log, `None` while idle or under cooldown.
+    ///
+    /// `max_percent` is the resident's configured `memory.max_percent`.
+    /// `self_evictable` marks the caller's own state: an analyzer daemon
+    /// in its idle loop, or a session daemon hosting no client and not
+    /// busy — pass `true` only then. Under CRITICAL pressure (free below
+    /// [`critical_floor`], or macOS pressure level at 4) with no other
+    /// victim, a self-evictable idle resident releases itself through the
+    /// same graceful path rather than keep the last idle resident warm.
+    pub fn tick(&mut self, own_pid: u32, max_percent: u8, self_evictable: bool) -> Option<String> {
+        let now = Instant::now();
+        let due = self.next_sample.get_or_insert(now + PRESSURE_SAMPLE);
+        if now < *due {
+            return None;
+        }
+        *due = now + PRESSURE_SAMPLE;
+        if !memory_low(max_percent) {
+            self.lows = 0;
+            return None;
+        }
+        self.lows = self.lows.saturating_add(1);
+        if self.lows < PRESSURE_LOW_SAMPLES {
+            return None;
+        }
+        let dir = ledger_dir()?;
+        // The cooldown is machine-wide: any resident's last eviction paces
+        // every other one's next.
+        if under_cooldown(&dir) {
+            return None;
+        }
+        let (path, holder) = pick_victim(&dir, own_pid, self_evictable, critical())?;
+        self.lows = 0;
+        let _ = fs::write(
+            cooldown_file(&dir),
+            unix_secs(SystemTime::now()).to_string(),
+        );
+        if !release_holder(&path) {
+            return None;
+        }
+        Some(format!("{} {}", holder.face.noun(), holder.label))
+    }
+}
+
+/// Whether the host is under the ledger's memory-pressure line: the free
+/// figure under the reserve (`available < reserve`) or, on macOS, the
+/// kernel's own pressure level at warn or worse — the compressor and cache
+/// state a free-bytes figure misses. An unreadable figure is never low.
+fn memory_low(max_percent: u8) -> bool {
+    let total = total_memory();
+    if total == 0 {
+        return false;
+    }
+    let reserve = Figures {
+        total,
+        available: None,
+        max_percent,
+    }
+    .reserve();
+    if let Some(available) = available_memory() {
+        if available < reserve {
+            return true;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(level) = pressure_level()
+        && level >= PRESSURE_LEVEL_LOW
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether the host is at the pressure monitor's critical line: free
+/// memory under [`critical_floor`], or the macOS kernel pressure level at
+/// critical (4) — the point where the last idle resident sheds itself.
+fn critical() -> bool {
+    let total = total_memory();
+    if total == 0 {
+        return false;
+    }
+    let floor = critical_floor(total);
+    if let Some(available) = available_memory()
+        && available < floor
+    {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(level) = pressure_level()
+        && level >= 4
+    {
+        return true;
+    }
+    false
+}
+
+/// The machine-wide cooldown file's path inside the ledger dir.
+fn cooldown_file(dir: &Path) -> PathBuf {
+    dir.join("pressure-eviction.ts")
+}
+
+fn under_cooldown(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(cooldown_file(dir)) else {
+        return false;
+    };
+    let Ok(at) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = unix_secs(SystemTime::now());
+    now.saturating_sub(at) < PRESSURE_COOLDOWN.as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// The active-growth brake (G2): admission protects the machine at the gate;
+// a running job whose growth drives the host under the critical floor is the
+// other half. While a resident's analysis runs it samples every second;
+// `BRAKE_LOW_SAMPLES` consecutive samples under `critical_floor` with this
+// holder the youngest active heavy holder yields the job: the daemon kills
+// its server, books the observed peak, and the client re-queues.
+// ---------------------------------------------------------------------------
+
+/// The brake's critical floor: `max(1 GiB, 4% of physical)` — the level at
+/// which a Mac starts swap-thrashing the desktop, not the ledger's
+/// accounting reserve. Below it, the youngest heavy job stops growing.
+#[must_use]
+pub fn critical_floor(total: u64) -> u64 {
+    (total / 25).max(1 << 30)
+}
+
+/// Consecutive one-second low samples that arm the brake.
+const BRAKE_LOW_SAMPLES: u8 = 3;
+/// The machine-wide spacing between two brakes — one job per incident.
+const BRAKE_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// One resident's growth-brake state. Cheap: three counters the sample
+/// loop flips.
+#[derive(Default)]
+pub struct GrowthBrake {
+    lows: u8,
+}
+
+impl GrowthBrake {
+    /// Clears the arm — a finished analysis leaves no debt behind.
+    pub fn reset(&mut self) {
+        self.lows = 0;
+    }
+
+    /// The one-second sample: `true` when the brake fires — the host sat
+    /// under [`critical_floor`] for [`BRAKE_LOW_SAMPLES`] consecutive
+    /// samples, `own_pid` owns the youngest active heavy holder in the
+    /// ledger, and no brake fired inside [`BRAKE_COOLDOWN`]. A sample the
+    /// OS cannot read is never low (fail-open: the budget path still
+    /// bounds the tree's own RSS).
+    pub fn check(&mut self, own_pid: u32) -> bool {
+        let total = total_memory();
+        let floor = critical_floor(total);
+        let low = total > 0 && available_memory().is_some_and(|available| available < floor);
+        if !low {
+            self.lows = 0;
+            return false;
+        }
+        self.lows = self.lows.saturating_add(1);
+        if self.lows < BRAKE_LOW_SAMPLES {
+            return false;
+        }
+        let Some(dir) = ledger_dir() else {
+            return false;
+        };
+        if under_brake_cooldown(&dir) {
+            return false;
+        }
+        // The youngest active heavy holder brakes — the oldest one
+        // closest to done keeps running; a job not running (an idle
+        // releasable) is the pressure monitor's victim, not the brake's.
+        let youngest = scan(&dir)
+            .into_iter()
+            .filter(|(_, holder)| holder.slot && holder.idle != Some(true))
+            .max_by_key(|(_, holder)| holder.since);
+        let Some((_, holder)) = youngest else {
+            return false;
+        };
+        if holder.owner != own_pid {
+            self.lows = BRAKE_LOW_SAMPLES - 1;
+            return false;
+        }
+        let _ = fs::write(
+            dir.join("growth-brake.ts"),
+            unix_secs(SystemTime::now()).to_string(),
+        );
+        self.lows = 0;
+        true
+    }
+}
+
+fn under_brake_cooldown(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(dir.join("growth-brake.ts")) else {
+        return false;
+    };
+    let Ok(at) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = unix_secs(SystemTime::now());
+    now.saturating_sub(at) < BRAKE_COOLDOWN.as_secs()
+}
+
+/// The monitor's victim: the least-recently-used idle releasable that is
+/// not `own_pid`, else — only under `critical` and only when the caller
+/// declared itself releasable (`self_evictable`: an analyzer daemon in
+/// its idle loop, a session daemon hosting nothing and not busy) — the
+/// caller's own idle record, so the last idle resident sheds itself at
+/// the critical line rather than stay warm. `None` keeps the resident.
+fn pick_victim(
+    dir: &Path,
+    own_pid: u32,
+    self_evictable: bool,
+    critical: bool,
+) -> Option<(PathBuf, Holder)> {
+    if let Some(victim) = evictable_idle(dir, own_pid).into_iter().next() {
+        return Some(victim);
+    }
+    if !(self_evictable && critical) {
+        return None;
+    }
+    scan(dir)
+        .into_iter()
+        .find(|(_, holder)| holder.owner == own_pid && holder.idle == Some(true))
+}
+
+/// The idle releasable ledger holders, least recently used first: a live
+/// record, not `own_pid`, releasable with its busy lock free, quiet for
+/// [`PRESSURE_UNUSED`] on its lease's last-use mtime.
+fn evictable_idle(dir: &Path, own_pid: u32) -> Vec<(PathBuf, Holder)> {
+    let mut holders: Vec<(PathBuf, Holder)> = scan(dir)
+        .into_iter()
+        .filter(|(_, holder)| {
+            holder.owner != own_pid
+                && holder.idle == Some(true)
+                && unix_secs(SystemTime::now()).saturating_sub(unix_secs(holder.used))
+                    >= PRESSURE_UNUSED.as_secs()
+        })
+        .collect();
+    holders.sort_by_key(|(_, holder)| holder.used);
+    holders
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +1836,7 @@ mod tests {
             cap,
             sized,
             peak_key: None,
+            source_bytes: None,
         }
     }
 
@@ -1452,22 +1929,44 @@ mod tests {
     #[test]
     fn the_available_figure_bounds_the_headroom() {
         let figures = Figures {
-            total: 10 * GIB,
-            available: Some(2 * GIB),
+            total: 32 * GIB,
+            available: Some(4 * GIB),
             max_percent: 90,
         };
-        // Available 2 GiB minus the 1 GiB reserve leaves 1 GiB.
+        // Available 4 GiB minus the 3.2 GiB reserve leaves 0.8 GiB.
+        let headroom = 4 * GIB - 32 * GIB / 10;
         assert_eq!(
-            decide(&[], ask(GIB, false, 0, true), figures),
+            decide(&[], ask(headroom, false, 0, true), figures),
             Decision::Admit {
                 release: vec![],
-                headroom: GIB
+                headroom
             }
         );
         assert_eq!(
-            decide(&[], ask(2 * GIB, false, 0, true), figures),
+            decide(&[], ask(headroom + 1, false, 0, true), figures),
             Decision::Wait(Shortfall::Memory)
         );
+    }
+
+    /// The reserve keeps a floor of [`RESERVE_FLOOR`]: `90%` of a small
+    /// machine would leave under 2 GiB for everything outside the ledger,
+    /// which is how a host freezes. On a big machine the percent is
+    /// larger and wins.
+    #[test]
+    fn the_reserve_never_drops_below_its_floor() {
+        let at = |total: u64, max_percent: u8| Figures {
+            total,
+            available: None,
+            max_percent,
+        };
+        // 16 GB at 90% → percent would be 1.6 GiB; the floor binds.
+        assert_eq!(at(16 * GIB, 90).reserve(), RESERVE_FLOOR);
+        // 24 GB at 90% → 2.4 GiB percent beats the floor.
+        assert_eq!(at(24 * GIB, 90).reserve(), 24 * GIB / 10);
+        // 32 GB at 95% → 1.6 GiB → floor.
+        assert_eq!(at(32 * GIB, 95).reserve(), RESERVE_FLOOR);
+        // The budget still follows max_percent.
+        assert_eq!(at(24 * GIB, 90).budget(), 24 * GIB * 9 / 10);
     }
 
     #[test]
@@ -1782,7 +2281,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(600));
         assert!(!waiting.is_finished(), "the first-run slot is taken");
-        record_peak_in(dir.path(), "analyze:wt3", Face::Analyze, GIB / 2);
+        record_peak_in(dir.path(), "analyze:wt3", Face::Analyze, GIB / 2, None);
         let (result, _) = waiting.join().expect("waiter");
         let lease = result.expect("admitted").expect("a lease");
         assert!(lease.sized());
@@ -1790,33 +2289,25 @@ mod tests {
     }
 
     /// With no live peer, a peak recorded under another key sizes a
-    /// request of the same face (the largest such), and only of that face;
-    /// an older bare-number file still sizes its own key.
+    /// request of the same face (the largest such), and only of that face.
     #[test]
     fn a_recorded_peak_of_the_face_under_another_key_sizes_a_request() {
         let dir = tempfile::tempdir().expect("ledger dir");
-        record_peak_in(dir.path(), "session:wt1", Face::Session, 2 * GIB);
-        record_peak_in(dir.path(), "session:wt2", Face::Session, 3 * GIB);
-        record_peak_in(dir.path(), "build:wt1", Face::Build, 7 * GIB);
+        record_peak_in(dir.path(), "session:wt1", Face::Session, 2 * GIB, None);
+        record_peak_in(dir.path(), "session:wt2", Face::Session, 3 * GIB, None);
+        record_peak_in(dir.path(), "build:wt1", Face::Build, 7 * GIB, None);
         assert_eq!(
-            sized_in(dir.path(), Some("session:wt3"), Face::Session, &[]),
+            sized_in(dir.path(), Some("session:wt3"), Face::Session, &[], None),
             Some(3 * GIB),
             "the largest recorded peak of the face"
         );
         assert_eq!(
-            sized_in(dir.path(), Some("test:wt3"), Face::Test, &[]),
+            sized_in(dir.path(), Some("test:wt3"), Face::Test, &[], None),
             None
         );
         let lease = held(dir.path(), first(Face::Session, "wt3", "session:wt3"));
         assert!(lease.sized(), "admitted sized");
         assert_eq!(lease.bytes(), 3 * GIB);
-        fs::write(dir.path().join("peaks").join(peak_file("legacy")), "5").expect("legacy");
-        assert_eq!(peak_in(dir.path(), "legacy"), Some(5));
-        assert_eq!(
-            sized_in(dir.path(), None, Face::Test, &[]),
-            None,
-            "a faceless peak lends to no one"
-        );
     }
 
     /// Recording a peak sizes the holder's own record at once, keeping the
@@ -2045,6 +2536,429 @@ mod tests {
             env_token(dir.path()),
             Some(token),
             "a slot holder shelters again"
+        );
+    }
+
+    /// An analyzer peak that carries a comparable source size bounds an
+    /// unknown job by scale-up only — a bigger project's peak is never
+    /// scaled down, a smaller one's is scaled up by at most 4×.
+    #[test]
+    fn a_source_sized_peak_estimates_an_unknown_job_by_ratio() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        record_peak_in(
+            dir.path(),
+            "repo:small",
+            Face::AnalysisServer,
+            1_200_000_000,   // 1.2 GB peak
+            Some(250_000_000), // on 250 MB of Dart source
+        );
+        // A 500 MB Dart source job: 250 MB is inside [125 MB, 2 GB], the
+        // bound scales up 2x.
+        assert_eq!(
+            sized_in(
+                dir.path(),
+                Some("repo:big"),
+                Face::AnalysisServer,
+                &[],
+                Some(500_000_000),
+            ),
+            Some(2_400_000_000),
+            "2x of the 1.2 GB comparable peak"
+        );
+        // A bigger recorded peak is never scaled down: a 3 GB peak on
+        // 800 MB of source bounds the 500 MB job at 3 GB, not 1.9 GB.
+        record_peak_in(
+            dir.path(),
+            "repo:huge",
+            Face::AnalysisServer,
+            3_000_000_000,
+            Some(800_000_000),
+        );
+        assert_eq!(
+            sized_in(
+                dir.path(),
+                Some("repo:big"),
+                Face::AnalysisServer,
+                &[],
+                Some(500_000_000),
+            ),
+            Some(3_000_000_000),
+            "the larger bound wins, never scaled down"
+        );
+        // Without source bytes the estimate is the raw peak.
+        assert_eq!(
+            sized_in(dir.path(), Some("repo:big"), Face::AnalysisServer, &[], None),
+            Some(3_000_000_000),
+            "the recorded peak itself"
+        );
+    }
+
+    /// A tiny project's ratio is dominated by the analyzer's fixed base:
+    /// 900 MB on 10 KB of source must never estimate a 200 MB-source
+    /// job — it is outside the comparable window, so the job is unsized
+    /// (the first-run slot, never a budget-blocking over-estimate).
+    #[test]
+    fn a_tiny_peak_never_estimates_a_large_job() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        record_peak_in(
+            dir.path(),
+            "repo:tiny",
+            Face::AnalysisServer,
+            900_000_000,
+            Some(10_000), // 10 KB of Dart source
+        );
+        assert_eq!(
+            sized_in(
+                dir.path(),
+                Some("repo:mid"),
+                Face::AnalysisServer,
+                &[],
+                Some(200_000_000),
+            ),
+            None,
+            "outside the comparable window — unsized, not an over-estimate"
+        );
+    }
+
+    /// An estimate the host could never admit — over `total − reserve`
+    /// even alone — is unsized, not a permanent gate-blocker.
+    #[test]
+    fn an_unadmittable_estimate_is_unsized() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        // A comparable peak whose bound clears the whole machine.
+        record_peak_in(
+            dir.path(),
+            "repo:peer",
+            Face::AnalysisServer,
+            u64::MAX / 2,
+            Some(250_000_000),
+        );
+        assert_eq!(
+            sized_in(
+                dir.path(),
+                Some("repo:mid"),
+                Face::AnalysisServer,
+                &[],
+                Some(500_000_000),
+            ),
+            None,
+            "an estimate over total − reserve is unsized"
+        );
+    }
+
+    /// An analyzer job with known source bytes but no comparable peak is
+    /// unsized: the face-peak borrow under-estimates it (the base makes a
+    /// big peer's peak small per byte), so it takes the first-run slot
+    /// rather than a borrowed lease. The borrow still holds for jobs
+    /// whose source size is unknown.
+    #[test]
+    fn a_sourceless_peak_sizes_by_raw_bytes() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        record_peak_in(dir.path(), "repo:old", Face::AnalysisServer, 2 * GIB, None);
+        // Known source, no comparable peak → unsized (no borrow).
+        assert_eq!(
+            sized_in(
+                dir.path(),
+                Some("repo:new"),
+                Face::AnalysisServer,
+                &[],
+                Some(500_000_000),
+            ),
+            None,
+            "known source, incomparable peak — the first-run slot"
+        );
+        // Unknown source → the recorded peak stands in as before.
+        assert_eq!(
+            sized_in(dir.path(), Some("repo:new"), Face::AnalysisServer, &[], None),
+            Some(2 * GIB),
+            "the largest recorded peak"
+        );
+    }
+
+    /// A sibling key's own recorded peak wins over any estimate — the
+    /// measured figure is never displaced by a comparable bound.
+    #[test]
+    fn a_sibling_peak_wins_over_the_estimate() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        record_peak_in(
+            dir.path(),
+            "repo:/common:sibling",
+            Face::AnalysisServer,
+            4 * GIB,
+            Some(300_000_000),
+        );
+        record_peak_in(
+            dir.path(),
+            "repo:peer",
+            Face::AnalysisServer,
+            9 * GIB,
+            Some(300_000_000),
+        );
+        assert_eq!(
+            sized_in(
+                dir.path(),
+                Some("repo:/common:sibling"),
+                Face::AnalysisServer,
+                &[],
+                Some(300_000_000),
+            ),
+            Some(4 * GIB),
+            "the own/sibling peak, not the peer's larger bound"
+        );
+    }
+
+    /// A yield's observed peak never lowers a recorded full measurement:
+    /// the brake's figure is a lower bound, so `record_peak_floor` keeps
+    /// the earlier peak while a normal completion still books the latest.
+    #[test]
+    fn a_yield_never_lowers_a_recorded_peak() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let key = "repo:yield";
+        record_peak_in(dir.path(), key, Face::AnalysisServer, 3 * GIB, Some(GIB));
+        // A yield observed 2.2 GB: the record stays at 3 GB.
+        record_peak_floor_at(dir.path(), key, Face::AnalysisServer, 2_200_000_000, GIB);
+        assert_eq!(peak_in(dir.path(), key), Some(3 * GIB));
+        // A later normal completion at 1.5 GB still books less.
+        record_peak_in(dir.path(), key, Face::AnalysisServer, 3 * GIB / 2, Some(GIB));
+        assert_eq!(peak_in(dir.path(), key), Some(3 * GIB / 2));
+        // A yield above the record books the higher bound.
+        record_peak_floor_at(dir.path(), key, Face::AnalysisServer, 2 * GIB, GIB);
+        assert_eq!(peak_in(dir.path(), key), Some(2 * GIB));
+    }
+
+    /// `record_peak_floor` on a ledger dir (the test twin of the
+    /// env-routed [`record_peak_floor`]).
+    fn record_peak_floor_at(dir: &Path, key: &str, face: Face, bytes: u64, source: u64) {
+        let floor = peak_in(dir, key).unwrap_or(0).max(bytes);
+        record_peak_in(dir, key, face, floor, Some(source));
+    }
+
+    /// The peaks store stays bounded: recording past [`PEAK_FILES_MAX`]
+    /// drops older files so `face_peak_entries` stays cheap for the
+    /// 250 ms unsized-waiter scan.
+    #[test]
+    fn the_peaks_store_is_capped() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        for i in 0..(PEAK_FILES_MAX + 30) {
+            record_peak_in(
+                dir.path(),
+                &format!("repo:key{i:04}"),
+                Face::AnalysisServer,
+                GIB,
+                Some(GIB),
+            );
+        }
+        let count = fs::read_dir(dir.path().join("peaks"))
+            .expect("peaks dir")
+            .flatten()
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(count, PEAK_FILES_MAX, "the store is capped");
+    }
+
+    /// A live holder record on disk: the file locked (the kernel's
+    /// liveness), the JSON the scan reads. `owner`/`since`/`used`-mtime
+    /// are injected so tests control identities the `hold()` path would
+    /// stamp uniformly (one process, one second).
+    fn live_record(
+        dir: &Path,
+        name: &str,
+        owner: u32,
+        since: u64,
+        idle: bool,
+        used: SystemTime,
+    ) -> File {
+        let busy = dir.join(format!("{name}.busy"));
+        let busy_file = File::create(&busy).expect("busy lock");
+        if !idle {
+            busy_file.lock().expect("hold busy");
+        }
+        let path = dir.join(format!("h-{owner}-{name}.json"));
+        let record = Record {
+            face: Face::AnalysisServer,
+            label: name.into(),
+            bytes: 1 << 20,
+            pid: None,
+            release: Some(Releasable {
+                pid: owner,
+                busy,
+            }),
+            slot: true,
+            cap: 0,
+            sized: true,
+            owner,
+            since,
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("holder file");
+        file.lock().expect("live holder lock");
+        use std::os::unix::fs::FileExt as _;
+        file.write_all_at(serde_json::to_vec(&record).expect("json").as_slice(), 0)
+            .expect("record");
+        file.set_modified(used).expect("mtime");
+        // The busy_file must outlive the scan: return both.
+        std::mem::forget(busy_file);
+        file
+    }
+
+    /// The growth brake's election: only an *active* slot holder is the
+    /// youngest heavy holder — an idle releasable (the pressure monitor's
+    /// victim) is not, and the oldest running job never yields to the
+    /// youngest's brake.
+    #[test]
+    fn the_brake_only_fires_for_the_youngest_active_holder() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let now = SystemTime::now();
+        let secs = |ago: u64| unix_secs(now) - ago;
+        // Active running jobs (busy locks held): `older` then `younger`.
+        // `idle` is a releasable with a free busy lock — never active.
+        let _old = live_record(dir.path(), "older", 101, secs(300), false, now);
+        let _idle = live_record(dir.path(), "idle", 102, secs(200), true, now);
+        let _young = live_record(dir.path(), "younger", 103, secs(100), false, now);
+        let active: Vec<Holder> = scan(dir.path())
+            .into_iter()
+            .map(|(_, holder)| holder)
+            .filter(|holder| holder.slot && holder.idle != Some(true))
+            .collect();
+        let youngest = active
+            .iter()
+            .max_by_key(|holder| holder.since)
+            .expect("an active holder");
+        assert_eq!(youngest.label, "younger", "the youngest active holder");
+        let mut labels: Vec<&str> = active
+            .iter()
+            .map(|holder| holder.label.as_str())
+            .collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels, ["older", "younger"],
+            "an idle releasable is never an active holder"
+        );
+    }
+
+    /// The brake's critical floor: `4%` of physical, never under 1 GiB —
+    /// a 64 GB machine floors at 2.56 GiB, a 16 GB machine at 1 GiB.
+    #[test]
+    fn the_critical_floor_scales_with_physical_memory() {
+        assert_eq!(critical_floor(16 * GIB), GIB, "16 GB → the 1 GiB floor");
+        assert_eq!(critical_floor(24 * GIB), GIB, "24 GB → the 1 GiB floor");
+        assert_eq!(critical_floor(64 * GIB), 64 * GIB / 25, "64 GB → 4%");
+        assert_eq!(critical_floor(0), GIB, "a blind host still floors");
+    }
+
+    /// The shared pressure monitor's victim choice over the ledger: a
+    /// live, idle, quiet-enough releasable of ANOTHER owner is the LRU
+    /// victim — never this daemon's own record, never a busy holder,
+    /// never one too fresh.
+    #[test]
+    fn the_pressure_victim_is_the_lru_idle_releasable() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let now = SystemTime::now();
+        let secs = |ago: u64| unix_secs(now) - ago;
+        let old = now - PRESSURE_UNUSED - Duration::from_secs(20);
+        let _own = live_record(dir.path(), "own", 201, secs(300), true, old);
+        let _lru = live_record(dir.path(), "lru", 202, secs(400), true, old);
+        let _fresh = live_record(dir.path(), "fresh", 203, secs(100), true, now);
+        let _busy = live_record(dir.path(), "busy", 204, secs(500), false, old);
+        let victims = evictable_idle(dir.path(), 201);
+        let labels: Vec<&str> = victims
+            .iter()
+            .map(|(_, holder)| holder.label.as_str())
+            .collect();
+        assert_eq!(labels, ["lru"], "the LRU idle releasable only: {labels:?}");
+    }
+
+    /// The last idle resident sheds itself only at the critical line: a
+    /// lone idle self is the victim under critical, never under warn;
+    /// a self that did not declare itself releasable is never the victim.
+    #[test]
+    fn critical_sheds_the_last_idle_resident() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let now = SystemTime::now();
+        let secs = |ago: u64| unix_secs(now) - ago;
+        let old = now - PRESSURE_UNUSED - Duration::from_secs(20);
+        let _own = live_record(dir.path(), "own", 301, secs(300), true, old);
+        // Critical + self-evictable: own idle record is the victim.
+        let victim = pick_victim(dir.path(), 301, true, true);
+        assert_eq!(
+            victim.map(|(_, holder)| holder.label),
+            Some("own".to_string()),
+            "the lone idle self under critical"
+        );
+        // Warn only: self is kept.
+        assert!(
+            pick_victim(dir.path(), 301, true, false).is_none(),
+            "warn never sheds the last idle resident"
+        );
+        // Critical but the caller is busy/hosting: kept.
+        assert!(
+            pick_victim(dir.path(), 301, false, true).is_none(),
+            "a busy self is never evictable"
+        );
+        // Critical on a non-idle self: the busy caller never self-evicts;
+        // another idle holder is still the victim instead.
+        let _busy = live_record(dir.path(), "busy", 302, secs(200), false, old);
+        assert_eq!(
+            pick_victim(dir.path(), 302, true, true).map(|(_, h)| h.label),
+            Some("own".to_string()),
+            "the idle other, never the busy self"
+        );
+    }
+
+    /// The cooldown is machine-wide and time-boxed: a fresh timestamp
+    /// blocks, an aged one frees.
+    #[test]
+    fn the_pressure_cooldown_paces_every_resident() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        assert!(!under_cooldown(dir.path()), "no file, no cooldown");
+        let now = unix_secs(SystemTime::now());
+        fs::write(cooldown_file(dir.path()), now.to_string()).expect("stamp");
+        assert!(under_cooldown(dir.path()), "a fresh stamp blocks");
+        fs::write(
+            cooldown_file(dir.path()),
+            (now - PRESSURE_COOLDOWN.as_secs() - 1).to_string(),
+        )
+        .expect("old stamp");
+        assert!(!under_cooldown(dir.path()), "an aged stamp frees");
+    }
+
+    /// Three estimated sibling worktrees admitted in parallel when the
+    /// estimated total fits the budget — no first-run serialization.
+    #[test]
+    fn three_estimated_siblings_run_in_parallel() {
+        let dir = tempfile::tempdir().expect("ledger dir");
+        // A sibling recorded its peak: 3 GB on 300 MB of source.
+        record_peak_in(
+            dir.path(),
+            "repo:/common:m1",
+            Face::AnalysisServer,
+            3 * GIB,
+            Some(300_000_000),
+        );
+        // Three more sibling worktrees (300 MB source each → 3 GB each).
+        let mut leases = Vec::new();
+        for i in 0..3 {
+            let mut request = slot(Face::AnalysisServer, &format!("wt{i}"), 0, false);
+            request.bytes = sized_in(
+                dir.path(),
+                Some(&format!("repo:/common:wt{i}")),
+                Face::AnalysisServer,
+                &[],
+                Some(300_000_000),
+            )
+            .expect("estimated");
+            request.sized = true;
+            request.source_bytes = Some(300_000_000);
+            leases.push(held(dir.path(), request));
+        }
+        assert_eq!(
+            leases.iter().filter(|lease| lease.sized()).count(),
+            3,
+            "all three estimated and admitted"
         );
     }
 

@@ -48,7 +48,7 @@
 //! least-recently-heartbeat first (an evicted worktree's next call is a
 //! cold restart — its stamp caches under `.dart_tool/dartq/` keep that
 //! restart cheap), and sweeps orphans from a previous binary on every
-//! start and status (a different binary hash means a different protocol
+//! start and status (a different binary stamp means a different protocol
 //! generation: kill, never talk).
 //!
 //! # Windows
@@ -65,6 +65,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+mod identity;
+
+
+pub use identity::{binary_stamp, environment_fingerprint};
 
 /// How often the serve loop rewrites `state.json` (the liveness signal).
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -108,7 +113,7 @@ const POLL: Duration = Duration::from_millis(50);
 // ---------------------------------------------------------------------------
 
 /// One session's identity: (resolution root realpath, SDK identity,
-/// binary content hash).
+/// binary stamp).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTriple {
     /// The resolution root, symlink-resolved.
@@ -120,25 +125,37 @@ pub struct SessionTriple {
     /// The worktree's `.fvmrc` content when present (an FVM switch is a
     /// different session).
     pub fvmrc: Option<String>,
-    /// The running binary's blake3 hash (an upgrade is a different
-    /// protocol generation).
-    pub binary_hash: String,
+    /// The running binary's stamp (an upgrade is a different protocol
+    /// generation).
+    pub binary_stamp: String,
+    /// The environment fingerprint ([`identity`]): a digest over the
+    /// facts a live daemon cannot reconcile in place — the dart
+    /// executable itself. A `pub get`, an options edit, or a package
+    /// config rewrite stays INSIDE the snapshot walk's freshness domain
+    /// and must keep the session; an in-place `bin/dart` swap the other
+    /// legs cannot see is a different session.
+    pub environment_fingerprint: String,
 }
 
 impl SessionTriple {
     /// Computes the triple for `root` and `sdk_root`: the realpath of
-    /// each, the SDK's `version` file, the worktree's `.fvmrc`, and the
-    /// current executable's content hash. Files that cannot be read key
-    /// as empty strings — a missing `version` file is a fact of the SDK,
-    /// not a failure to identify it.
+    /// each, the SDK's `version` file, the worktree's `.fvmrc`, the
+    /// running binary's metadata stamp, and the toolchain's environment
+    /// stamp — all stat-only, no file bytes read (the stamp legs: a
+    /// `bin/dart` swap or a dartq rebuild is a different session, while
+    /// a `pub get` keeps it). Files that cannot be read key as empty
+    /// strings — a missing `version` file is a fact of the SDK, not a
+    /// failure to identify it.
     #[must_use]
     pub fn compute(root: &Path, sdk_root: &Path) -> Self {
+        let root = realpath(root);
         Self {
-            root: realpath(root),
             sdk_root: realpath(sdk_root),
             sdk_version: read_or_empty(&sdk_root.join("version")),
             fvmrc: std::fs::read_to_string(root.join(".fvmrc")).ok(),
-            binary_hash: binary_hash().unwrap_or_default(),
+            binary_stamp: binary_stamp(),
+            environment_fingerprint: environment_fingerprint(&sdk_root),
+            root,
         }
     }
 
@@ -162,26 +179,6 @@ fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// The current executable's content hash — one read of the binary,
-/// memoized on success: the bytes cannot change under a running
-/// process, and the election computes the triple per consult (a plain
-/// analyze consults once, its retry ladder twice, the daemon at
-/// bring-up and every face after) — one read+hash per process, never
-/// one per call. A failed read is not memoized — the next consult
-/// retries it, the pre-memo behavior.
-fn binary_hash() -> io::Result<String> {
-    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    if let Some(hash) = HASH.get() {
-        return Ok(hash.clone());
-    }
-    let bytes = std::fs::read(std::env::current_exe()?)?;
-    let digest: [u8; 8] = blake3::hash(&bytes).as_bytes()[..8]
-        .try_into()
-        .expect("8 bytes");
-    let hash = hex::encode(digest);
-    let _ = HASH.set(hash.clone());
-    Ok(hash)
-}
 
 // ---------------------------------------------------------------------------
 // Layout and state
@@ -348,6 +345,12 @@ pub struct SessionState {
     /// defaults to 0 for older state files and daemons holding none.
     #[serde(default)]
     pub debug_sessions: usize,
+    /// The last client answer's wall time, UNIX milliseconds — the
+    /// memory-pressure eviction's LRU order (heartbeat age would sort
+    /// every live daemon equal). A state file that predates the leg
+    /// reads `0` — the oldest possible mark, evictable first.
+    #[serde(default)]
+    pub used_ms: u128,
 }
 
 impl SessionState {
@@ -564,6 +567,7 @@ fn under_election(
         heartbeat_ms: SessionState::now_ms(),
         triple: triple.clone(),
         debug_sessions: 0,
+        used_ms: 0,
     }
     .write(layout);
     match spawn(layout, triple) {
@@ -855,14 +859,14 @@ impl Registry {
         out
     }
 
-    /// Kills and drops every record whose binary hash is not `binary`:
+    /// Kills and drops every record whose binary stamp is not `binary`:
     /// the upgrade orphan sweep (a different binary speaks a different
     /// protocol generation — kill, never talk). Returns the swept roots.
     #[must_use]
     pub fn sweep_upgrades(&self, binary: &str) -> Vec<PathBuf> {
         let mut swept = Vec::new();
         for record in self.list() {
-            if record.state.triple.binary_hash != binary {
+            if record.state.triple.binary_stamp != binary {
                 terminate(record.state.pid);
                 let _ = std::fs::remove_file(self.dir.join(format!("{}.json", record.id)));
                 swept.push(record.state.triple.root.clone());
@@ -1196,6 +1200,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(layout)
         .expect("state");
@@ -1224,6 +1229,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(layout)
         .expect("state");
@@ -1421,7 +1427,7 @@ mod tests {
         let triple = SessionTriple::compute(&root, &sdk);
         assert_eq!(triple.sdk_version, "", "a missing version file keys empty");
         assert_eq!(triple.fvmrc, None, "no .fvmrc keys None");
-        assert!(!triple.binary_hash.is_empty(), "the binary always hashes");
+        assert!(!triple.binary_stamp.is_empty(), "the binary always hashes");
         assert_eq!(
             triple.identity(),
             SessionTriple::compute(&root, &sdk).identity(),
@@ -1468,6 +1474,7 @@ mod tests {
             heartbeat_ms: 123_456,
             triple: SessionTriple::compute(&root, &root),
             debug_sessions: 2,
+                        used_ms: 0,
         };
         state.write(&layout).expect("write");
         assert_eq!(SessionState::read(&layout).as_ref(), Some(&state));
@@ -1532,6 +1539,7 @@ mod tests {
             heartbeat_ms: 0,
             triple: triple.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1614,7 +1622,7 @@ mod tests {
         layout.create().expect("layout");
         let current = SessionTriple::compute(&root, &root);
         let foreign = SessionTriple {
-            binary_hash: "another-binary".to_owned(),
+            binary_stamp: "another-binary".to_owned(),
             ..current.clone()
         };
         // A socket answers (a live server), but the state names a foreign
@@ -1625,6 +1633,7 @@ mod tests {
             heartbeat_ms: 0,
             triple: foreign,
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1649,6 +1658,7 @@ mod tests {
             heartbeat_ms: 0,
             triple: triple.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1675,7 +1685,7 @@ mod tests {
         layout.create().expect("layout");
         let current = SessionTriple::compute(&root, &root);
         let stale = SessionTriple {
-            binary_hash: "old-binary".to_owned(),
+            binary_stamp: "old-binary".to_owned(),
             ..current.clone()
         };
         let listener = UnixListener::bind(&layout.socket).expect("bind");
@@ -1692,6 +1702,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: stale,
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1747,7 +1758,8 @@ mod tests {
                 sdk_root: root.to_path_buf(),
                 sdk_version: String::new(),
                 fvmrc: None,
-                binary_hash: binary.to_owned(),
+                environment_fingerprint: String::new(),
+                binary_stamp: binary.to_owned(),
             };
             registry
                 .upsert(&Record {
@@ -1757,6 +1769,7 @@ mod tests {
                         heartbeat_ms: SessionState::now_ms(),
                         triple,
                         debug_sessions: 0,
+                        used_ms: 0,
                     },
                 })
                 .expect("upsert");
@@ -1779,7 +1792,8 @@ mod tests {
                 sdk_root: other_root.clone(),
                 sdk_version: String::new(),
                 fvmrc: None,
-                binary_hash: "bin-new".to_owned(),
+                environment_fingerprint: String::new(),
+                binary_stamp: "bin-new".to_owned(),
             },
         );
         record_of(&registry, &other_root, "bin-new", other_pid);
@@ -1836,6 +1850,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1876,6 +1891,7 @@ mod tests {
             heartbeat_ms: spent_heartbeat,
             triple: current.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1900,7 +1916,7 @@ mod tests {
         let layout = Layout::new(&root);
         layout.create().expect("layout");
         let foreign = SessionTriple {
-            binary_hash: "old-binary".to_owned(),
+            binary_stamp: "old-binary".to_owned(),
             ..SessionTriple::compute(&root, &root)
         };
         SessionState {
@@ -1908,6 +1924,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms(),
             triple: foreign,
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1944,6 +1961,7 @@ mod tests {
             heartbeat_ms: SessionState::now_ms().saturating_sub(10 * STALE_HEARTBEAT.as_millis()),
             triple: triple.clone(),
             debug_sessions: 0,
+                        used_ms: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1982,15 +2000,16 @@ mod tests {
         let sdk_root = sdk.canonicalize().expect("canonical sdk");
         assert_eq!(resident_sdk_root(&root), Some(sdk_root.clone()));
 
-        let stamp = |pid: u32, heartbeat_ms: u128, binary_hash: &str| {
+        let stamp = |pid: u32, heartbeat_ms: u128, binary_stamp: &str| {
             SessionState {
                 pid,
                 heartbeat_ms,
                 triple: SessionTriple {
-                    binary_hash: binary_hash.to_owned(),
+                    binary_stamp: binary_stamp.to_owned(),
                     ..triple.clone()
                 },
                 debug_sessions: 0,
+                        used_ms: 0,
             }
             .write(&layout)
             .expect("state");
@@ -2002,17 +2021,17 @@ mod tests {
             Some(sdk_root),
             "liveness, not the caller's triple, decides"
         );
-        stamp(0, SessionState::now_ms(), &triple.binary_hash);
+        stamp(0, SessionState::now_ms(), &triple.binary_stamp);
         assert_eq!(resident_sdk_root(&root), None, "the bring-up placeholder");
-        stamp(u32::MAX - 1, SessionState::now_ms(), &triple.binary_hash);
+        stamp(u32::MAX - 1, SessionState::now_ms(), &triple.binary_stamp);
         assert_eq!(resident_sdk_root(&root), None, "a dead pid");
         stamp(
             live,
             SessionState::now_ms().saturating_sub(10 * STALE_HEARTBEAT.as_millis()),
-            &triple.binary_hash,
+            &triple.binary_stamp,
         );
         assert_eq!(resident_sdk_root(&root), None, "a stale heartbeat");
-        stamp(live, SessionState::now_ms(), &triple.binary_hash);
+        stamp(live, SessionState::now_ms(), &triple.binary_stamp);
         std::fs::remove_file(&layout.socket).expect("unlink the socket");
         assert_eq!(resident_sdk_root(&root), None, "a socket nobody answers");
         std::fs::remove_file(&layout.state).expect("drop the state");
@@ -2358,7 +2377,8 @@ mod tests {
                 sdk_root: root.clone(),
                 sdk_version: String::new(),
                 fvmrc: None,
-                binary_hash: binary.to_owned(),
+                environment_fingerprint: String::new(),
+                    binary_stamp: binary.to_owned(),
             };
             let pid = bring_up_child(&layout, &triple);
             Record {
@@ -2368,6 +2388,7 @@ mod tests {
                     heartbeat_ms: heartbeat,
                     triple,
                     debug_sessions: 0,
+                        used_ms: 0,
                 },
             }
         };
@@ -2395,9 +2416,11 @@ mod tests {
                     sdk_root: PathBuf::new(),
                     sdk_version: String::new(),
                     fvmrc: None,
-                    binary_hash: "bin1".to_owned(),
+                    environment_fingerprint: String::new(),
+                    binary_stamp: "bin1".to_owned(),
                 },
                 debug_sessions: 0,
+                        used_ms: 0,
             },
         };
         registry.upsert(&dead).expect("upsert");
@@ -2448,7 +2471,8 @@ mod tests {
                 sdk_root: root.clone(),
                 sdk_version: String::new(),
                 fvmrc: None,
-                binary_hash: "bin".to_owned(),
+                environment_fingerprint: String::new(),
+                    binary_stamp: "bin".to_owned(),
             };
             let pid = bring_up_child(&layout, &triple);
             Record {
@@ -2458,6 +2482,7 @@ mod tests {
                     heartbeat_ms: heartbeat,
                     triple,
                     debug_sessions: 0,
+                        used_ms: 0,
                 },
             }
         };
@@ -2503,5 +2528,80 @@ mod tests {
         for record in &records[1..] {
             terminate(record.state.pid);
         }
+    }
+
+    /// A dead-pid stale state is reclaimed synchronously — the endpoint
+    /// file exists, its socket refuses connections, and its owner pid is
+    /// gone: the election takes over without waiting out the
+    /// STALE_HEARTBEAT window (that window is for a live pid that merely
+    /// stopped beating; a dead owner needs no grace at all).
+    #[test]
+    fn a_dead_pid_state_is_reclaimed_without_the_stale_window() {
+        let root = temp("dead-pid");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let triple = SessionTriple::compute(&root, &root);
+        // A live pid owns a matching-triple state, then dies: SIGKILL the
+        // child directly so its death is real before the election runs —
+        // a zombie still answers kill(pid, 0), and the test process is the
+        // parent, so the child goes unreaped until try_wait.
+        let listener = UnixListener::bind(&layout.socket).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep child");
+        let pid = child.id();
+        SESSION_CHILDREN.with(|children| children.borrow_mut().push(child));
+        SessionState {
+            pid,
+            // A heartbeat too fresh for STALE_HEARTBEAT: the reclaim must
+            // be the pid's death, not the window.
+            heartbeat_ms: SessionState::now_ms(),
+            triple: triple.clone(),
+            debug_sessions: 0,
+            used_ms: 0,
+        }
+        .write(&layout)
+        .expect("state");
+        drop(std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status());
+        for _ in 0..100 {
+            SESSION_CHILDREN.with(|children| {
+                for c in children.borrow_mut().iter_mut() {
+                    let _ = c.try_wait();
+                }
+            });
+            if !pid_alive(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pid_alive(pid), "the child is really gone");
+
+        let started = std::time::Instant::now();
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            spawns.set(spawns.get() + 1);
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, triple),
+            Ensured::Standalone(reason) => panic!("reclaimed: {reason}"),
+        }
+        assert_eq!(spawns.get(), 1, "the dead session was replaced once");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a dead owner reclaims immediately, not after STALE_HEARTBEAT: {:?}",
+            started.elapsed()
+        );
     }
 }

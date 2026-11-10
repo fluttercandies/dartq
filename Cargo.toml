@@ -78,7 +78,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 # Map key order is observable: machine output (CLI/MCP/schema) must preserve
 # insertion order, so the feature is declared here rather than left to be
 # unified in incidentally by whichever dependency happens to enable it.
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml = "0.9"
 # The session serve loop's exit-signal watchdog (#2619): SIGTERM/SIGINT
 # land in an AtomicBool the loop's tick polls — no threads, no async.

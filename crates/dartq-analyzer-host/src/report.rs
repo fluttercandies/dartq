@@ -36,12 +36,39 @@ pub struct Row {
     pub context_messages: Vec<ContextMessage>,
 }
 
+impl Row {
+    /// Drops every string's spare capacity — a pushed row lives for the
+    /// analysis's life, and serde's growth slack is dead bytes per row
+    /// the resident daemon holds. The `Arc<str>` file paths are shared,
+    /// not shrunk.
+    pub(crate) fn shrink(&mut self) {
+        self.severity.shrink_to_fit();
+        self.kind.shrink_to_fit();
+        self.message.shrink_to_fit();
+        if let Some(correction) = &mut self.correction {
+            correction.shrink_to_fit();
+        }
+        self.code.shrink_to_fit();
+        if let Some(url) = &mut self.url {
+            url.shrink_to_fit();
+        }
+        self.context_messages.shrink_to_fit();
+        for context in &mut self.context_messages {
+            context.message.shrink_to_fit();
+        }
+    }
+}
+
 /// An `AnalysisError` or context-message location. The line and column
 /// fields are optional in the protocol; dartdev prints them as `null`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Location {
-    pub file: String,
+    /// `Arc` so every row of one file shares the map key's allocation —
+    /// a pushed `location.file` names the file the server pushed it
+    /// under, so the daemon holds one path string per file, not one per
+    /// diagnostic.
+    pub file: std::sync::Arc<str>,
     pub offset: u32,
     pub length: u32,
     #[serde(default)]
@@ -112,22 +139,44 @@ impl Report {
     }
 }
 
-fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Whether `path` is a priority file — `pubspec.yaml` or
+/// `analysis_options.yaml`, whose ERROR rows leave the printed report but
+/// still count its exit code.
+pub(crate) fn priority_file(path: &str) -> bool {
+    matches!(basename(path), "analysis_options.yaml" | "pubspec.yaml")
+}
+
+/// dartdev's keep rule over one pushed row: a kept row reaches the report
+/// (`true`); a TODO-info drops, and a priority ERROR splits off to
+/// `priority_errors` instead of the printed rows. The one rule
+/// [`Report::from_files`], the per-file splice and the face render share.
+pub(crate) fn kept(file: &str, row: &Row) -> bool {
+    if row.kind == "TODO" && row.severity == "INFO" {
+        return false;
+    }
+    !(priority_file(file) && row.severity == "ERROR")
+}
+
+/// The severity leg of dartdev's row order (error, warning, info, other).
+pub(crate) fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "ERROR" => 0,
+        "WARNING" => 1,
+        "INFO" => 2,
+        _ => 3,
+    }
 }
 
 /// dartdev's `AnalysisError.compareTo`: severity (error, warning, info,
 /// other), file, offset, message — strings in UTF-16 code-unit order, as
 /// Dart's `String.compareTo` compares them.
 fn compare(a: &Row, b: &Row) -> Ordering {
-    let rank = |row: &Row| match row.severity.as_str() {
-        "ERROR" => 0,
-        "WARNING" => 1,
-        "INFO" => 2,
-        _ => 3,
-    };
-    rank(a)
-        .cmp(&rank(b))
+    severity_rank(&a.severity)
+        .cmp(&severity_rank(&b.severity))
         .then_with(|| utf16_cmp(&a.location.file, &b.location.file))
         .then_with(|| a.location.offset.cmp(&b.location.offset))
         .then_with(|| utf16_cmp(&a.message, &b.message))
@@ -197,7 +246,7 @@ struct JsonPosition {
 impl From<&Location> for JsonLocation {
     fn from(location: &Location) -> Self {
         Self {
-            file: location.file.clone(),
+            file: location.file.to_string(),
             range: JsonRange {
                 start: JsonPosition {
                     offset: location.offset,
@@ -218,7 +267,7 @@ impl From<JsonLocation> for Location {
     fn from(location: JsonLocation) -> Self {
         let JsonRange { start, end } = location.range;
         Self {
-            file: location.file,
+            file: location.file.into(),
             offset: start.offset,
             length: end.offset.saturating_sub(start.offset),
             start_line: start.line,
@@ -376,7 +425,7 @@ mod tests {
         let order: Vec<(&str, &str)> = report
             .rows
             .iter()
-            .map(|row| (row.location.file.as_str(), row.message.as_str()))
+            .map(|row| (&*row.location.file, row.message.as_str()))
             .collect();
         assert_eq!(
             order,

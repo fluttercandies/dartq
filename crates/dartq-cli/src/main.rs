@@ -1474,7 +1474,10 @@ fn dispatch(
 fn analyze(args: &AnalyzeArgs) -> u8 {
     #[cfg(unix)]
     if let Some(dir) = &args.resident_serve {
-        return dartq_analyzer_host::daemon::serve(dir);
+        return dartq_analyzer_host::daemon::serve(
+            dir,
+            dartq_commands::render::render_official_face,
+        );
     }
     dispatch(
         Backend::resolve(args.engine),
@@ -1587,14 +1590,35 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
         if let (Some(ask), Some(dart), true, false) =
             (&face.resident, &dart, settings.resident, gate_nested())
         {
+            // The resident server is keyed on the workspace roots, not the
+            // aims: every `dartq analyze <paths>` over one worktree shares
+            // the daemon and its cache, and the aims scope its report.
             let request = dartq_analyzer_host::Request {
                 dart: dart.clone(),
-                targets: targets.to_vec(),
+                targets: resolved
+                    .iter()
+                    .map(|target| match target {
+                        TargetKind::Dir(dir) | TargetKind::File(dir) => dir.clone(),
+                    })
+                    .collect(),
+                roots: resolved
+                    .iter()
+                    .map(|target| workspace_root_of(target.package_dir()))
+                    .collect(),
                 packages: ask.packages.clone(),
                 budget: settings.memory_budget_bytes,
                 idle: Duration::from_secs(settings.idle_minutes.max(1) * 60),
                 max_percent,
                 max_concurrent: job_cap(&cwd),
+                pool: pool_posture(&cwd),
+                face: Some(dartq_analyzer_host::Face {
+                    format: match face.format {
+                        AnalyzeFormat::Lon => dartq_analyzer_host::FaceFormat::Lon,
+                        AnalyzeFormat::Json => dartq_analyzer_host::FaceFormat::Json,
+                        AnalyzeFormat::Text => dartq_analyzer_host::FaceFormat::Text,
+                    },
+                    root: root.clone(),
+                }),
             };
             match dartq_analyzer_host::analyze(&request) {
                 dartq_analyzer_host::Outcome::Report { report, sdk } => {
@@ -1607,6 +1631,23 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
                     let run =
                         OfficialRun::of_report(report, ask.fatal_warnings, ask.fatal_infos, root);
                     return official_finish(&run, face.format, face.memory, out, err);
+                }
+                dartq_analyzer_host::Outcome::Face { stdout, meta, sdk } => {
+                    if face.stats {
+                        eprintln!(
+                            "dartq analyze: engine official (Dart {}, resident)",
+                            sdk.version
+                        );
+                    }
+                    return face_finish(
+                        &stdout,
+                        &meta,
+                        face,
+                        ask.fatal_warnings,
+                        ask.fatal_infos,
+                        out,
+                        err,
+                    );
                 }
                 dartq_analyzer_host::Outcome::Budget(message) => {
                     eprintln!("error: {message}");
@@ -1703,20 +1744,23 @@ fn official_finish(
              (pubspec.yaml or analysis_options.yaml); run dart analyze to see them"
         );
     }
-    let written = match format {
-        // The official rows' own envelope: correction, context messages and
-        // documentation exactly as the analyzer reported them.
-        AnalyzeFormat::Json => {
-            let mut line = Vec::new();
-            run.write_json(&mut line).and_then(|()| {
-                let mut line = String::from_utf8(line).expect("the writer emits UTF-8");
-                if memory {
-                    splice_memory_key(&mut line);
-                }
-                out.write_all(line.as_bytes())
-            })
-        }
-        _ => emit_diagnostics(format, memory, &run.output(), out),
+    // The one writer (#2627): the same render the resident daemon runs
+    // over the report rows — the cold path asks it of the kept rows, so
+    // routed hits and per-run renders are byte-identical.
+    let rows: Vec<&dartq_analyzer_host::Row> = run.rows().iter().collect();
+    let render = dartq_commands::render::render_official_face(
+        &rows,
+        &dartq_analyzer_host::Face {
+            format: face_format(format),
+            root: run.output().files.analysis_root().map(Path::to_path_buf),
+        },
+    );
+    let written = if memory && matches!(format, AnalyzeFormat::Json) {
+        let mut line = String::from_utf8(render.bytes).expect("the writer emits UTF-8");
+        splice_memory_key(&mut line);
+        out.write_all(line.as_bytes())
+    } else {
+        out.write_all(&render.bytes)
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         let _ = writeln!(
@@ -1726,6 +1770,66 @@ fn official_finish(
         return exit::INTERNAL_ERROR;
     }
     code
+}
+
+/// The resident face path's print: the daemon rendered the final stdout
+/// bytes and shipped them with the counts — the client relays the bytes
+/// (the oracle's `--memory` splice appends client-side, like every run
+/// fact), prints the unmodelable rows as advisories, and answers the
+/// severity ladder over the report's severities — the same tiers dartdev
+/// computes, so `--[no-]fatal-warnings`/`--fatal-infos` behave unchanged.
+fn face_finish(
+    stdout: &[u8],
+    meta: &dartq_analyzer_host::FaceMeta,
+    face: &OfficialFace,
+    fatal_warnings: bool,
+    fatal_infos: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    for line in &meta.unparsed {
+        let _ = writeln!(err, "note: unparsed dart analyze output: {line}");
+    }
+    let code = severity_tier(
+        meta.priority_errors > 0 || meta.has_error,
+        meta.has_warning,
+        meta.has_info,
+        fatal_warnings,
+        fatal_infos,
+    );
+    if code == exit::ERRORS && !meta.has_diag_error {
+        let _ = writeln!(
+            err,
+            "note: dart analyze found errors its machine and json formats omit \
+             (pubspec.yaml or analysis_options.yaml); run dart analyze to see them"
+        );
+    }
+    // The `--memory` splice appends client-side (the RSS is this
+    // process's own); every other byte ships verbatim.
+    let written = if face.memory && matches!(face.format, AnalyzeFormat::Json) {
+        let mut line = String::from_utf8(stdout.to_vec()).expect("the writer emits UTF-8");
+        splice_memory_key(&mut line);
+        out.write_all(line.as_bytes())
+    } else {
+        out.write_all(stdout)
+    };
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        let _ = writeln!(
+            err,
+            "dartq: internal error: writing diagnostics failed: {error}"
+        );
+        return exit::INTERNAL_ERROR;
+    }
+    code
+}
+
+/// The `AnalyzeFormat` → `FaceFormat` spelling of the one format enum.
+fn face_format(format: AnalyzeFormat) -> dartq_analyzer_host::FaceFormat {
+    match format {
+        AnalyzeFormat::Lon => dartq_analyzer_host::FaceFormat::Lon,
+        AnalyzeFormat::Json => dartq_analyzer_host::FaceFormat::Json,
+        AnalyzeFormat::Text => dartq_analyzer_host::FaceFormat::Text,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,6 +1847,27 @@ pub(crate) fn memory_max_percent(dir: &Path) -> u8 {
         dartq_commands::config::DEFAULT_MEMORY_MAX_PERCENT,
         |config| config.memory_max_percent(),
     )
+}
+
+/// The shared-analyzer pool posture: `DARTQ_POOL=1` opts the run in
+/// (with `DARTQ_POOL_MAX_ROOTS`, 1–64, overriding the cap), else
+/// `analyzer.pool` in `dartq.yaml` decides. `None` is the one-daemon-per-
+/// worktree posture.
+fn pool_posture(dir: &Path) -> Option<u32> {
+    let (enabled, max_roots) = dartq_commands::config::discover(dir)
+        .ok()
+        .flatten()
+        .map_or((false, 3), |config| config.pool());
+    let env_on = std::env::var("DARTQ_POOL").is_ok_and(|value| value == "1");
+    if !env_on && !enabled {
+        return None;
+    }
+    let cap = std::env::var("DARTQ_POOL_MAX_ROOTS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(max_roots)
+        .clamp(1, 64);
+    Some(cap)
 }
 
 /// The governing `memory.max_concurrent` (unlimited when dartq.yaml is
@@ -1818,6 +1943,7 @@ pub(crate) fn job_slot(
         cap: job_cap(dir),
         sized,
         peak_key: Some(peak_key.to_owned()),
+        source_bytes: None,
     };
     let deadline = std::time::Instant::now() + JOB_WAIT;
     match ledger::acquire(request, bytes, max_percent, deadline, |note| {
@@ -5521,6 +5647,7 @@ mod tests {
             cap: ledger::cap(0),
             sized: true,
             peak_key: None,
+            source_bytes: None,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let lease = ledger::acquire(request, 1 << 20, 90, deadline, |_| {})

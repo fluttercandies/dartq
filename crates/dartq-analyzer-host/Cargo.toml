@@ -27,6 +27,12 @@ serde_json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# The freshness watcher's substrate off macOS (inotify on Linux) feeding
+# the dirty journal; macOS streams FSEvents through the crate's own
+# binding, and the watcher is unix-only.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

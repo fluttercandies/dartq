@@ -135,6 +135,14 @@ impl OfficialRun {
         }
     }
 
+    /// The kept (modelable) rows in dartdev order — the face writer's
+    /// input (the one render `render_official_face` performs over the
+    /// same set the resident daemon hands it).
+    #[must_use]
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
     /// The writers' input: the rows plus this run as their file layout.
     #[must_use]
     pub fn output(&self) -> AnalysisOutput<'_> {
@@ -184,7 +192,7 @@ struct Layout {
 impl Layout {
     fn locate(&mut self, location: &report::Location) -> (FileId, SourceRange) {
         // The server spells canonical paths already: no realpath per file.
-        let path = Path::new(&location.file);
+        let path = Path::new(&*location.file);
         let file = self.files.intern_normalized(path, path.to_path_buf());
         let range = SourceRange {
             offset: location.offset,

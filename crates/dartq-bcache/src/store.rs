@@ -112,8 +112,8 @@
 //! * `record_hit`: metadata-only — one existence check and one sidecar
 //!   timestamp write; no manifest I/O.
 //! * `used_bytes`: one small counter read — the O(1) budget probe.
-//! * `over_budget`: that counter read plus one `statvfs` — the
-//!   post-ingest gc gate.
+//! * `over_budget`: that counter read plus one volume probe (`statvfs`)
+//!   — the post-ingest gc gate.
 //! * `reclaim_detached`: one listing of the markers — nothing more when
 //!   there are none, the steady state of every face but `flutter test`.
 //!   Otherwise one read of every manifest, searched for the marked ids
@@ -180,10 +180,26 @@ const IN_FLIGHT_SECS: u64 = 60 * 60;
 /// 200 GiB keep 2% of their size instead (see [`eviction_threshold`]).
 const RESERVE_FLOOR_BYTES: u64 = 4 << 30;
 
+/// How a gc decision reads the free space of the store's volume:
+/// [`statvfs_space`] in production, a fixture answer in tests, so no
+/// test's outcome can ride on the host's free space — a near-full
+/// developer disk or CI runner would otherwise evict entries a test
+/// just ingested. `None` is an unmeasurable volume (the plain budget).
+pub(crate) type SpaceProbe = fn(&Path) -> Option<VolumeSpace>;
+
+/// The production [`SpaceProbe`]: one `statvfs(3)` on the store root, a
+/// failed call reading as unknown space.
+pub(crate) fn statvfs_space(root: &Path) -> Option<VolumeSpace> {
+    volume_space(root).ok()
+}
+
 /// A store rooted at a caller-chosen directory.
 #[derive(Debug)]
 pub struct CasStore {
     root: PathBuf,
+    /// Where [`Self::gc`] and [`Self::over_budget`] read the free space
+    /// of the store's volume (see [`SpaceProbe`]).
+    space: SpaceProbe,
 }
 
 /// A shared hold on the store's pin lock (see [`CasStore::pin`]): while
@@ -231,12 +247,20 @@ impl CasStore {
     /// Opens the store at `root`, creating its directories if missing.
     /// Idempotent, and safe against concurrent opens of the same root.
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_space(root, statvfs_space)
+    }
+
+    /// [`Self::open`] with the volume-space source injected: production
+    /// passes [`statvfs_space`]; tests pass a fixture probe so no gc
+    /// decision reads the host's disk.
+    pub(crate) fn open_with_space(root: &Path, space: SpaceProbe) -> Result<Self> {
         for dir in [BLOBS, ENTRIES, TMP] {
             let dir = root.join(dir);
             fs::create_dir_all(&dir).map_err(io_at(&dir))?;
         }
         Ok(Self {
             root: root.to_path_buf(),
+            space,
         })
     }
 
@@ -405,13 +429,14 @@ impl CasStore {
     ///
     /// `budget_bytes` is a ceiling, not a reservation: the pass evicts
     /// down to `min(budget_bytes, used + available − reserve)` — `used`
-    /// the blob bytes it finds, `available` the free space `statvfs`
-    /// reports for the volume holding the store, `reserve` the larger of
-    /// 4 GiB and 2% of that volume — so a filling disk makes the cache
-    /// give space back before the volume runs out, even under budget. A
-    /// shortfall the cache cannot cover drives the threshold to 0: the
-    /// pass yields everything it may evict. An unmeasurable volume (a
-    /// failed `statvfs`, a non-unix host) leaves the plain budget.
+    /// the blob bytes it finds, `available` the free space the store's
+    /// volume probe reports (`statvfs` in production), `reserve` the
+    /// larger of 4 GiB and 2% of that volume — so a filling disk makes
+    /// the cache give space back before the volume runs out, even under
+    /// budget. A shortfall the cache cannot cover drives the threshold
+    /// to 0: the pass yields everything it may evict. An unmeasurable
+    /// volume (a failed `statvfs`, a non-unix host) leaves the plain
+    /// budget.
     ///
     /// Entries are evicted least recently hit first (by the effective hit
     /// time: the newer of the manifest's `last_hit_unix` and the hit
@@ -458,8 +483,7 @@ impl CasStore {
         // down to. A stats failure is not the build's problem: unknown
         // space keeps the plain budget.
         let scanned_bytes: u64 = blobs.iter().map(|blob| blob.len).sum();
-        let threshold =
-            eviction_threshold(budget_bytes, scanned_bytes, volume_space(&self.root).ok());
+        let threshold = eviction_threshold(budget_bytes, scanned_bytes, (self.space)(&self.root));
         let mut report = GcReport {
             entries_before: entries.len() as u64,
             ..reclaim
@@ -618,12 +642,12 @@ impl CasStore {
     /// `budget_bytes` would keep: the usage counter against the same
     /// free-space-tightened threshold the pass enforces, so a filling
     /// volume calls for gc while the store is still under its budget.
-    /// One counter read plus one `statvfs`; an unmeasurable volume
-    /// compares against the plain budget, and only an unreadable
-    /// counter is an error.
+    /// One counter read plus one volume probe (`statvfs` in production);
+    /// an unmeasurable volume compares against the plain budget, and only
+    /// an unreadable counter is an error.
     pub fn over_budget(&self, budget_bytes: u64) -> Result<bool> {
         let used = self.used_bytes()?;
-        Ok(used > eviction_threshold(budget_bytes, used, volume_space(&self.root).ok()))
+        Ok(used > eviction_threshold(budget_bytes, used, (self.space)(&self.root)))
     }
 
     /// Pins the store's blobs against [`Self::reclaim_detached`] for as
@@ -1526,7 +1550,12 @@ mod tests {
         let root = dir.path().join("cas");
         let build = dir.path().join("build");
         fs::create_dir(&build).unwrap();
-        let store = CasStore::open(&root).unwrap();
+        // An unmeasurable volume: these tests assert what the plain
+        // budget does, so the host's free space must not enter (a
+        // near-full disk would collapse gc's threshold and evict more
+        // than the assertions expect). Space-pressure tests open their
+        // own store with a fixed-volume probe.
+        let store = CasStore::open_with_space(&root, |_| None).unwrap();
         Fixture {
             _dir: dir,
             root,
@@ -2229,6 +2258,37 @@ mod tests {
         );
     }
 
+    /// The volume wins over the budget through the store's probe: a
+    /// volume without free space collapses the threshold, so the gate
+    /// trips under an unlimited budget and the pass yields what it may,
+    /// while the same store probed as unmeasurable keeps everything.
+    #[test]
+    fn store_short_volume_drives_gc_past_the_budget() {
+        let f = fixture();
+        let a = source(&f.build, "a", b"kernel bytes");
+        let b = source(&f.build, "b", b"depfile bytes");
+        put(&f, 1, &[a], 100);
+        put(&f, 2, &[b], 100);
+        assert!(
+            !f.store.over_budget(u64::MAX).unwrap(),
+            "an unknown volume compares against the plain budget"
+        );
+        assert_eq!(f.store.gc(u64::MAX, 0, later()).unwrap().entries_evicted, 0);
+
+        // A full 100 GiB volume keeps a 4 GiB reserve out of reach:
+        // used + 0 − reserve saturates to 0, so even an unlimited budget
+        // leaves no entry the pass must spare.
+        let short = CasStore::open_with_space(&f.root, |_| volume(0, 100)).expect("open store");
+        assert!(
+            short.over_budget(u64::MAX).unwrap(),
+            "the short volume is over any budget"
+        );
+        let report = short.gc(u64::MAX, 0, later()).unwrap();
+        assert_eq!(report.entries_evicted, 2, "the threshold collapsed to 0");
+        assert_eq!(report.blobs_removed, 2, "nothing references them any more");
+        assert_eq!(short.stats().expect("stats").entries, 0);
+    }
+
     #[test]
     fn store_stats_on_mixed_store() {
         let f = fixture();
@@ -2792,7 +2852,7 @@ mod tests {
     #[cfg(unix)]
     fn store_gc_never_dangles_a_published_manifest() {
         let f = fixture();
-        let store = Arc::new(CasStore::open(&f.root).unwrap());
+        let store = Arc::new(CasStore::open_with_space(&f.root, |_| None).expect("open store"));
         let pool: Vec<(PathBuf, BlobId)> = (0..12)
             .map(|i| source(&f.build, &format!("pool{i:02}"), &[(i % 251) as u8; 256]))
             .collect();

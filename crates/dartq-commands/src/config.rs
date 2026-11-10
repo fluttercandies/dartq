@@ -107,6 +107,21 @@ impl DartqConfig {
     pub fn engine(&self) -> Option<Engine> {
         self.analyzer.and_then(|analyzer| analyzer.engine)
     }
+
+    /// The shared-analyzer pool posture: `enabled` opts the worktree in
+    /// (default off), `max_roots` the most worktrees one pooled server
+    /// serves (default 3, clamped 1–64 at read).
+    #[must_use]
+    pub fn pool(&self) -> (bool, u32) {
+        let pool = self.analyzer.and_then(|analyzer| analyzer.pool);
+        let enabled = pool.and_then(|pool| pool.enabled).unwrap_or(false);
+        let max_roots = pool
+            .and_then(|pool| pool.max_roots)
+            .and_then(|cap| u32::try_from(cap).ok())
+            .unwrap_or(3)
+            .clamp(1, 64);
+        (enabled, max_roots)
+    }
 }
 
 /// Which analyzer `dartq analyze` runs.
@@ -129,6 +144,21 @@ pub struct AnalyzerConfig {
     pub engine: Option<Engine>,
     /// The official engine's knobs.
     pub official: Option<OfficialConfig>,
+    /// The shared-analyzer pool's knobs.
+    pub pool: Option<PoolConfig>,
+}
+
+/// The `analyzer.pool:` section — the opt-in shared analyzer: one
+/// resident analysis server serves several worktrees instead of one
+/// daemon per worktree.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolConfig {
+    /// Opt the worktree's `dartq analyze` into the shared pool (default
+    /// false — a worktree runs its own resident daemon).
+    pub enabled: Option<bool>,
+    /// The most worktrees one pooled server serves (default 3, 1–64).
+    pub max_roots: Option<u64>,
 }
 
 /// The `analyzer.official:` section.

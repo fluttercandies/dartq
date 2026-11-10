@@ -135,7 +135,7 @@ use crate::key;
 use crate::materialize::{self, DirPlan, MaterializePlan, MaterializeReport};
 use crate::observer::CaptureObserver;
 use crate::placement::{self, PlacedDir, PlacementRecord};
-use crate::store::CasStore;
+use crate::store::{CasStore, SpaceProbe, statvfs_space};
 use crate::types::{
     BlobId, ClosureFile, DirRecord, EntryManifest, FileIdentity, KeyInputs, ManifestFile, NameRule,
     PathAnchors, ToolchainFingerprint,
@@ -581,6 +581,19 @@ pub fn run_shim(
     config: &ShimConfig,
     runner: &mut dyn FlutterRunner,
 ) -> ShimReport {
+    run_shim_with_space(argv, cwd, config, runner, statvfs_space)
+}
+
+/// [`run_shim`] with the stores' volume-space source injected:
+/// production probes the real volume; tests pass a fixture probe so no
+/// gc decision — and no assertion — rides on the host's free space.
+fn run_shim_with_space(
+    argv: &[OsString],
+    cwd: &Path,
+    config: &ShimConfig,
+    runner: &mut dyn FlutterRunner,
+    space: SpaceProbe,
+) -> ShimReport {
     let lossy: Vec<String> = argv
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -703,7 +716,7 @@ pub fn run_shim(
     // run's post-run reclaim cannot take a blob this hit is about to
     // place (see `CasStore::pin`). Released before the run.
     let mut pin = None;
-    if let Ok(store) = CasStore::open(&config.store_root) {
+    if let Ok(store) = CasStore::open_with_space(&config.store_root, space) {
         pin = store.pin();
         match store.lookup(&key) {
             Ok(Some(manifest)) => hit = Some(manifest),
@@ -821,10 +834,11 @@ pub fn run_shim(
             // interleave. Contention past the cap degrades to a clean
             // miss: the build runs, nothing is placed.
             if let Some(_tree_lock) = acquire_tree_lock(&cwd) {
-                let materialized = CasStore::open(&config.store_root).and_then(|store| {
-                    let outcome = materialize::materialize(&store, &plan, &cwd)?;
-                    store.record_hit(&key).map(|()| outcome)
-                });
+                let materialized =
+                    CasStore::open_with_space(&config.store_root, space).and_then(|store| {
+                        let outcome = materialize::materialize(&store, &plan, &cwd)?;
+                        store.record_hit(&key).map(|()| outcome)
+                    });
                 match materialized {
                     Ok(outcome) => {
                         report.action = Action::PreHitMaterialized;
@@ -991,7 +1005,7 @@ pub fn run_shim(
         // replaces the reference, and the post-run reclaim takes the
         // superseded blob (see `maybe_gc`).
         let test_cache = if test_face {
-            match CasStore::open(&config.store_root).and_then(|store| {
+            match CasStore::open_with_space(&config.store_root, space).and_then(|store| {
                 let prior = store.lookup(&post_key)?;
                 let prior_dir = prior.as_ref().and_then(|manifest| {
                     manifest
@@ -1055,28 +1069,29 @@ pub fn run_shim(
                 let asset_dir = asset_dir_rel
                     .as_ref()
                     .map(|rel| (rel.to_string_lossy().into_owned(), cwd.join(rel)));
-                let ingested = CasStore::open(&config.store_root).and_then(|store| {
-                    let count = ingest_observed(
-                        &store,
-                        &build_root,
-                        &touched,
-                        &captures,
-                        &cwd,
-                        &anchors,
-                        &parsed,
-                        &key_defines,
-                        &toolchain,
-                        engine_for_names,
-                        post_key.clone(),
-                        &known,
-                        asset_dir
-                            .as_ref()
-                            .map(|(name, dir)| (name.as_str(), dir.as_path())),
-                        test_scan.as_ref(),
-                    )?;
-                    maybe_gc(&store, config);
-                    Ok(count)
-                });
+                let ingested =
+                    CasStore::open_with_space(&config.store_root, space).and_then(|store| {
+                        let count = ingest_observed(
+                            &store,
+                            &build_root,
+                            &touched,
+                            &captures,
+                            &cwd,
+                            &anchors,
+                            &parsed,
+                            &key_defines,
+                            &toolchain,
+                            engine_for_names,
+                            post_key.clone(),
+                            &known,
+                            asset_dir
+                                .as_ref()
+                                .map(|(name, dir)| (name.as_str(), dir.as_path())),
+                            test_scan.as_ref(),
+                        )?;
+                        maybe_gc(&store, config);
+                        Ok(count)
+                    });
                 match ingested {
                     Ok((count, skips)) => {
                         if report.action != Action::PreHitMaterialized {
@@ -2011,13 +2026,13 @@ fn same_snapshot(prior: &EntryManifest, draft: &EntryManifest, engine_for_names:
 
 /// Post-ingest store upkeep. Over budget — or with the store's volume
 /// short of the free-space reserve; the O(1) running usage counter plus
-/// one `statvfs` decide, see [`CasStore::over_budget`] — the full gc runs
-/// (which reclaims detached blobs first). Under budget, the targeted
-/// [`CasStore::reclaim_detached`] takes the blobs this ingest (or an
-/// earlier one a pin deferred) detached, without walking the blobs — a
-/// warm `flutter test` loop then holds one kernel per entry instead of
-/// one per run. Failures surface as one stderr line and never affect the
-/// build.
+/// one volume probe decide, see [`CasStore::over_budget`] — the full gc
+/// runs (which reclaims detached blobs first). Under budget, the
+/// targeted [`CasStore::reclaim_detached`] takes the blobs this ingest
+/// (or an earlier one a pin deferred) detached, without walking the
+/// blobs — a warm `flutter test` loop then holds one kernel per entry
+/// instead of one per run. Failures surface as one stderr line and never
+/// affect the build.
 fn maybe_gc(store: &CasStore, config: &ShimConfig) {
     match store.over_budget(config.budget_bytes) {
         Ok(true) => {
@@ -2349,6 +2364,7 @@ fn gate(
         cap: ledger::cap(config.memory_max_concurrent),
         sized,
         peak_key: Some(key.clone()),
+        source_bytes: None,
     };
     if !batch {
         return Ok(ledger::book(request).map(|lease| Gate { _lease: lease, key }));
@@ -2534,6 +2550,20 @@ mod tests {
         }
     }
 
+    /// [`run_shim`] against a store that cannot measure its volume: the
+    /// post-run upkeep then gates on the budget alone. gc's free-space
+    /// reserve must never ride on the host disk here — a developer
+    /// machine or CI runner near full would evict the entries a test
+    /// just seeded. Space-pressure behavior has its own store tests.
+    fn run_shim_hermetic(
+        argv: &[OsString],
+        cwd: &Path,
+        config: &ShimConfig,
+        runner: &mut dyn FlutterRunner,
+    ) -> ShimReport {
+        run_shim_with_space(argv, cwd, config, runner, |_| None)
+    }
+
     const BUNDLE_ARGV: [&str; 5] = ["build", "bundle", "--release", "--dart-define", "API=prod"];
     const APK_ARGV: [&str; 3] = ["build", "apk", "--release"];
 
@@ -2608,7 +2638,7 @@ mod tests {
             argv: Vec::new(),
             effect: Some(Box::new(move |_| seen.set(probe()))),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.exit_code, Some(0));
         assert_eq!(during.get(), 1, "one lease while flutter runs");
         assert_eq!(mine(), 0, "released once flutter exited");
@@ -2635,6 +2665,7 @@ mod tests {
                 cap: 1,
                 sized: true,
                 peak_key: None,
+                source_bytes: None,
             },
             1 << 20,
             90,
@@ -2663,7 +2694,7 @@ mod tests {
             })),
         };
         let started = std::time::Instant::now();
-        let report = run_shim(
+        let report = run_shim_hermetic(
             &raw_argv(&["run", "-d", "macos"]),
             &tree,
             &config,
@@ -2691,7 +2722,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         assert_eq!(report.reason, "pre_miss");
         assert_eq!(report.exit_code, Some(0));
@@ -2712,7 +2743,7 @@ mod tests {
         assert!(!tree_b.join(".dart_tool").join("flutter_build").exists());
         let raw = raw_argv(&BUNDLE_ARGV);
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw, &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw, &tree_b, &config, &mut runner);
 
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.reason, "pre_hit");
@@ -2762,7 +2793,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.expect("seed key");
 
@@ -2777,7 +2808,7 @@ mod tests {
             b"void main() { edited(); }\n",
         );
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.key.as_deref(), Some(key.as_str()));
         assert!(
@@ -2822,7 +2853,7 @@ mod tests {
                 write(&dir.join("foreign_input.d"), depfile.as_bytes());
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.expect("seed key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -2837,7 +2868,7 @@ mod tests {
         // dir instead of replaying bookkeeping this tree cannot honor.
         let tree_b = synthetic_project(&tmp, "b");
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.reason, "entry_not_replayable");
         assert_eq!(report.skipped_dirs, 1);
         assert!(
@@ -2852,7 +2883,7 @@ mod tests {
         // Within tree A the hit replays: fill-only-missing finds every
         // file present and leaves the valid dir alone.
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.skipped_dirs, 0);
         assert_eq!(
@@ -2889,7 +2920,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.expect("seed key");
 
@@ -2913,7 +2944,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.key.as_deref(), Some(key.as_str()));
     }
@@ -2939,7 +2970,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.expect("seed key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -2960,7 +2991,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.ingest_files, 1, "the rewritten payload re-stores");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
@@ -3131,7 +3162,7 @@ mod tests {
                 build_fixture(cwd, &effect_template.name);
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_a, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         let key = report.key.clone().expect("post key");
 
@@ -3150,7 +3181,7 @@ mod tests {
         // ingest-tree name, which embeds tree A.
         let tree_b = synthetic_project(&tmp, "b");
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         let output_b = rerooted(
             &template.output_dir,
@@ -3255,7 +3286,7 @@ mod tests {
                 build_fixture(cwd, &effect_name);
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_a, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         let key = report.key.clone().expect("post key");
 
@@ -3273,7 +3304,7 @@ mod tests {
         // A fresh tree replays it under the re-rooted name.
         let tree_b = synthetic_project(&tmp, "b");
         let mut rerun = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut rerun);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_b, &config, &mut rerun);
         assert_eq!(report.action, Action::PreHitMaterialized);
         let output_b = rerooted(&full.output_dir, &manifest.worktree_root_at_ingest, &tree_b);
         let name_b = flutter_build_dir_name(&engine_revision, &full.defines, Path::new(&output_b));
@@ -3316,7 +3347,7 @@ mod tests {
                 build_fixture(cwd, observed);
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         let key = report.key.expect("key");
 
@@ -3334,7 +3365,7 @@ mod tests {
         // so POST deterministically sees no touched dirs.)
         let tree_b = synthetic_project(&tmp, "b");
         let mut rerun = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut rerun);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_b, &config, &mut rerun);
         assert_eq!(report.action, Action::PreMiss);
         assert_eq!(report.reason, "entry_not_replayable");
         assert_eq!(report.key.as_deref(), Some(key.as_str()));
@@ -3373,7 +3404,7 @@ mod tests {
                 build_fixture(cwd, internal);
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_a, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         let key = report.key.expect("key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -3396,7 +3427,7 @@ mod tests {
         // the internal one; the action stays a materialized pre-hit.
         let tree_b = synthetic_project(&tmp, "b");
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.skipped_dirs, 1);
         let output_b = rerooted(
@@ -3437,7 +3468,7 @@ mod tests {
 
         let raw = raw_argv(&["assemble", "-o", "/opt/out", "-dBuildMode=release"]);
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw, &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw, &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Passthrough);
         assert_eq!(report.reason, "unmodeled_command");
         assert_eq!(report.exit_code, Some(0));
@@ -3454,7 +3485,7 @@ mod tests {
         let store_root = tmp.join("cas");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
         let mut runner = FakeRunner::exits(7);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
 
         assert_eq!(report.action, Action::Passthrough);
         assert_eq!(report.reason, "unsupported_flutter_version");
@@ -3484,7 +3515,7 @@ mod tests {
         let tree = synthetic_project(&tmp, "app");
         let config = config_for(&store_root, &sdk.join("bin").join("flutter"));
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.reason, "unsupported_flutter_version");
 
         let record = store_root.join("meta").join("toolchain-unsupported.json");
@@ -3592,7 +3623,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested, "{stamp}");
         assert_eq!(report.reason, "pre_miss", "{stamp}");
         assert!(report.key.is_some(), "the gate admitted {stamp}");
@@ -4131,13 +4162,13 @@ mod tests {
         // A non-zero exit isolates the PRE key (POST never runs), and the
         // coarse key computes with no build dir in the tree at all.
         let mut first = FakeRunner::exits(1);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut first);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut first);
         assert_eq!(report.reason, "pre_miss");
         let key = report.key.expect("pre key");
 
         write(&tree.join("pubspec.yaml"), b"name: app\nversion: 1.0.1\n");
         let mut second = FakeRunner::exits(1);
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut second);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut second);
         assert_ne!(report.key.as_deref(), Some(key.as_str()));
     }
 
@@ -4155,7 +4186,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
 
         assert_eq!(report.action, Action::PreMiss);
         assert_eq!(report.exit_code, Some(1));
@@ -4194,7 +4225,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut runner);
         assert_eq!(report.exit_code, Some(1), "the child's exit code wins");
         assert_eq!(report.action, Action::Ingested);
         assert_eq!(report.ingest_files, 1);
@@ -4232,7 +4263,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut rerun);
+        let report = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut rerun);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(store.stats().expect("stats").entries, 1);
     }
@@ -4260,7 +4291,7 @@ mod tests {
         }
 
         let mut runner = FakeRunner::exits(1);
-        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut runner);
         assert_eq!(report.exit_code, Some(1));
         assert_eq!(report.action, Action::PreMiss);
         assert_eq!(report.ingest_files, 0);
@@ -4294,7 +4325,7 @@ mod tests {
                 write_test_cache(cwd);
             })),
         };
-        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut runner);
         assert_eq!(report.exit_code, Some(137), "128 + SIGKILL propagates");
         assert_eq!(report.action, Action::Ingested);
         assert_eq!(report.ingest_files, 1);
@@ -4378,7 +4409,7 @@ mod tests {
             })),
         };
         let raw = raw_argv(&["test"]);
-        let seeded = run_shim(&raw, &tree_a, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw, &tree_a, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         assert_eq!(seeded.ingest_files, 1);
         let key = seeded.key.clone().expect("post key");
@@ -4437,7 +4468,7 @@ mod tests {
                 write_test_cache_bytes(cwd, &effect_b);
             })),
         };
-        let report = run_shim(&raw, &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw, &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.reason, "pre_hit");
         assert_eq!(report.exit_code, Some(0));
@@ -4492,7 +4523,7 @@ mod tests {
             })),
         };
         let raw = raw_argv(&["test"]);
-        let report = run_shim(&raw, &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw, &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         assert_eq!(report.exit_code, Some(0));
         assert_eq!(report.ingest_files, 1);
@@ -4525,7 +4556,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw, &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw, &tree, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.reason, "pre_hit");
         assert_eq!(report.exit_code, Some(0));
@@ -4565,7 +4596,7 @@ mod tests {
                 write_test_cache(cwd);
             })),
         };
-        let seeded = run_shim(&raw, &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw, &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         assert_eq!(seeded.ingest_files, 1);
         let key = seeded.key.clone().expect("post key");
@@ -4606,7 +4637,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw, &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw, &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested, "pre-miss, post re-ingest");
         assert_eq!(
             report.ingest_files, 0,
@@ -4652,7 +4683,7 @@ mod tests {
                 build_fixture(cwd, &seed_name);
             })),
         };
-        let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         assert!(
             seeded.ingest_files >= 3,
@@ -4686,7 +4717,7 @@ mod tests {
                 fs::remove_file(&transient).expect("remove transient");
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.reason, "pre_hit");
         assert_eq!(report.exit_code, Some(0));
@@ -4744,10 +4775,12 @@ mod tests {
                 build_fixture(cwd, &seed_name);
             })),
         };
-        let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.clone().expect("post key");
-        let store = CasStore::open(&store_root).expect("open store");
+        // The same unmeasurable volume [`run_shim_hermetic`] opens: the
+        // direct gc pass below must not see the host's free space either.
+        let store = CasStore::open_with_space(&store_root, |_| None).expect("open store");
         let seed_manifest = store.lookup(&key).expect("lookup").expect("entry");
 
         // The warm rerun rewrites ONLY the payload dill (the stale-hit
@@ -4770,7 +4803,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.ingest_files, 1, "only the rewritten dill is stored");
 
@@ -4841,7 +4874,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.clone().expect("post key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -4873,7 +4906,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested, "pre-miss, post re-ingest");
         assert_eq!(report.ingest_files, 1, "only the rewritten stamp stores");
 
@@ -4949,7 +4982,7 @@ mod tests {
                 build_fixture_large(cwd, DIR_MAIN);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), tree, config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), tree, config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         assert_eq!(seeded.ingest_files, 3, "the cold run stores the whole dir");
         let key = seeded.key.expect("post key");
@@ -4972,7 +5005,7 @@ mod tests {
                 );
             })),
         };
-        run_shim(&raw_argv(&BUNDLE_ARGV), tree, config, &mut runner)
+        run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), tree, config, &mut runner)
     }
 
     /// The F5 shape, closed: a wiped tree's hit re-places every file
@@ -5175,7 +5208,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.ingest_files, 1, "only the rewritten payload stores");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
@@ -5217,7 +5250,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(
             report.ingest_files, 2,
@@ -5272,7 +5305,7 @@ mod tests {
                 write(&stamp, &bytes);
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.ingest_files, 2, "real new bytes publish");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
         assert_eq!(manifest.worktree_root_at_ingest, tree_b.to_string_lossy());
@@ -5379,7 +5412,7 @@ mod tests {
                 write_file_store(cwd, &dir);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(seeded.ingest_files, 4, "the cold run stores the whole dir");
         let key = seeded.key.expect("post key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -5399,7 +5432,7 @@ mod tests {
                     );
                 })),
             };
-            run_shim(&raw_argv(&BUNDLE_ARGV), tree, &config, &mut runner)
+            run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), tree, &config, &mut runner)
         };
         let tree_b = synthetic_project(&tmp, "b");
         for (tree, label) in [
@@ -5494,7 +5527,7 @@ mod tests {
                 write_file_store_with_hook(&dir, "11111111111111111111111111111111");
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.ingest_files, 5, "the cold run stores the whole dir");
         let key = seeded.key.expect("post key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -5516,7 +5549,7 @@ mod tests {
                         move_mtime(&dir.join(".filecache"));
                     })),
                 };
-                run_shim(&raw_argv(&BUNDLE_ARGV), tree, &config, &mut runner)
+                run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), tree, &config, &mut runner)
             };
 
         let same_tree = rerun(
@@ -5675,7 +5708,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.expect("key");
 
@@ -5701,7 +5734,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
 
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
@@ -5712,12 +5745,12 @@ mod tests {
         );
     }
 
-    /// An older test entry that predates the kernel-cache face (no
-    /// test dir in its manifest) passes through sanely: the hit has
+    /// A test entry whose manifest holds no cache dir (a build that
+    /// wrote nothing cacheable) passes through sanely: the hit has
     /// nothing to materialize, the child runs, and POST re-ingests the
     /// entry with the dir restored.
     #[test]
-    fn older_test_entry_without_cache_dir_runs_and_reingests() {
+    fn a_test_entry_without_cache_dir_runs_and_reingests() {
         let (_guard, tmp) = tempdir();
         let sdk = fake_flutter_sdk(&tmp, "3.47.1");
         let store_root = tmp.join("cas");
@@ -5731,7 +5764,7 @@ mod tests {
                 write_test_cache(cwd);
             })),
         };
-        let seeded = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.expect("key");
 
@@ -5750,7 +5783,7 @@ mod tests {
                 write_test_cache(cwd);
             })),
         };
-        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut runner);
         assert_eq!(report.reason, "entry_not_replayable");
         assert_eq!(report.exit_code, Some(0));
         assert_eq!(report.key.as_deref(), Some(key.as_str()));
@@ -6096,10 +6129,12 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::Ingested);
         let key = report.key.expect("key");
-        let store = CasStore::open(&store_root).expect("open store");
+        // An unmeasurable volume: the gate below reads the counter
+        // against the budget, never the host's free space.
+        let store = CasStore::open_with_space(&store_root, |_| None).expect("open store");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
         let blob = manifest.dirs[0].files[0].blob;
         assert!(store.blob_path(&blob).is_file());
@@ -6143,7 +6178,7 @@ mod tests {
                 build_fixture(cwd, DIR_ALT);
             })),
         };
-        let seeded = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_a, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
 
         // A second shim in tree B while tree B's lock is held: the run
@@ -6160,7 +6195,7 @@ mod tests {
                 build_fixture(cwd, DIR_MAIN);
             })),
         };
-        let report = run_shim(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&BUNDLE_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.reason, "tree_lock_busy", "PRE degraded to a miss");
         assert_eq!(report.action, Action::PreMiss);
         assert!(report.materialize.is_none(), "no materialization ran");
@@ -6216,7 +6251,7 @@ mod tests {
         write_test_cache(&tree);
         std::thread::sleep(Duration::from_millis(20));
         let mut runner = FakeRunner::exits(1);
-        let report = run_shim(&raw_argv(&["test"]), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&["test"]), &tree, &config, &mut runner);
         assert_eq!(report.exit_code, Some(1));
         assert_eq!(report.action, Action::PreMiss);
         assert_eq!(report.ingest_files, 0, "a pre-run write is not a touch");
@@ -6258,7 +6293,7 @@ mod tests {
                 build_fixture(cwd, &seed_name);
             })),
         };
-        let seeded = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let seeded = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(seeded.action, Action::Ingested);
         let key = seeded.key.clone().expect("key");
         let store = CasStore::open(&store_root).expect("open store");
@@ -6282,7 +6317,7 @@ mod tests {
                 );
             })),
         };
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         assert_eq!(report.ingest_files, 1, "the rewrite re-stores");
         let manifest = store.lookup(&key).expect("lookup").expect("entry");
@@ -6296,7 +6331,7 @@ mod tests {
         // The entry still serves a fresh tree under the template.
         let tree_b = synthetic_project(&tmp, "b");
         let mut runner = FakeRunner::exits(0);
-        let report = run_shim(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
+        let report = run_shim_hermetic(&raw_argv(&APK_ARGV), &tree_b, &config, &mut runner);
         assert_eq!(report.action, Action::PreHitMaterialized);
         let output_b = rerooted(
             &template.output_dir,
