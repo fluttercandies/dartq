@@ -187,17 +187,21 @@ fn site(root: &Path, (file, line, evidence): Witness<'_>) -> String {
 }
 
 /// What a refusal kind asks the user to do.
-fn remedy(refusal: Refusal) -> &'static str {
+fn remedy(refusal: Refusal) -> String {
     match refusal {
-        Refusal::Resolution => "run `dart pub get`",
-        Refusal::SuiteUnknown => "the suite is outside the resolved package",
-        Refusal::Untrusted => "spell the directive URI as a plain literal",
-        Refusal::NoCache => "remove the marker if the suite is deterministic",
-        Refusal::Nondeterministic => {
-            "inject the source behind a seam, or attest `// dartq: deterministic` in that file"
-        }
-        Refusal::AbsoluteDirectory => "name the files the suite reads, not a directory",
-        Refusal::EnvOpaque => "read environment variables by literal name",
+        Refusal::Resolution => "run `dart pub get`".to_owned(),
+        Refusal::SuiteUnknown => "the suite is outside the resolved package".to_owned(),
+        Refusal::Untrusted => "spell the directive URI as a plain literal".to_owned(),
+        Refusal::NoCache => "remove the marker if the suite is deterministic".to_owned(),
+        // The deciding file's own reads are what refuse — a TLS-pinning
+        // helper legitimately calling socket APIs — so the fix is vouching
+        // for that file, spelled exactly as the marker a user must write.
+        Refusal::Nondeterministic => format!(
+            "inject the source behind a seam, or vouch for the file with a `// {}` comment line",
+            dartq_test::deps::DETERMINISTIC_MARKER
+        ),
+        Refusal::AbsoluteDirectory => "name the files the suite reads, not a directory".to_owned(),
+        Refusal::EnvOpaque => "read environment variables by literal name".to_owned(),
     }
 }
 
@@ -416,6 +420,13 @@ mod tests {
             lines[10]
         );
         assert_eq!(lines[11], "top witnesses (suites refused):");
+        // The nondeterministic remedy teaches the escape hatch a poisoned
+        // helper needs: the exact comment line that vouches for the file.
+        let nondeterministic = format!(
+            "nondeterministic: inject the source behind a seam, or vouch for the file with a `// {}` comment line",
+            dartq_test::deps::DETERMINISTIC_MARKER
+        );
+        assert!(out.contains(&nondeterministic), "{out}");
     }
 
     /// The summary ranks witnesses by the suites each refuses — the

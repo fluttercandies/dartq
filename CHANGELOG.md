@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-10
+
+### Fixed
+
+- `dartq test` cache refused router suites over route-path strings: any
+  absolute literal naming an existing directory read as a directory scan,
+  and on macOS `/home` (an autofs mount) always exists, so a test holding
+  `'/home'` as a route value was rejected with `absolute-directory`. An
+  absolute literal now refuses a suite only when it sits in a file-API
+  argument (`File(...)`, `Directory(...)`, `Link(...)`,
+  `FileSystemEntity.xxx(...)`); every other absolute literal keys as an
+  ordinary input. `--explain-cache`'s nondeterministic remedy now spells
+  the `// dartq: deterministic` attestation a legitimately-drifting
+  helper (e.g. TLS pinning) needs to stop poisoning every suite that
+  reaches it.
+
+### Added
+
+- Watcher-degradation visibility for `dartq analyze`: a resident daemon
+  whose freshness checks fall back to full tree scans — sync files
+  unwritable, the event stream lost events, the watcher unavailable —
+  prints one stderr line naming the reason (once per daemon life, after
+  two consecutive degraded checks). Results stay correct in fallback;
+  the note makes the slowdown diagnosable instead of silently slow.
+
+
 ## [0.1.18] - 2026-11-10
 
 ### Fixed

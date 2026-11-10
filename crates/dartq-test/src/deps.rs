@@ -50,9 +50,20 @@ pub struct FileFacts {
     /// `file:` URI's path), normalized and deduplicated. Each is an input
     /// of every suite reaching the file — its bytes, or its absence — so a
     /// mock path that names nothing on disk keys as absent, and a real one
-    /// keys on its content. A literal naming an existing directory (whose
+    /// keys on its content. A literal in a file-API argument position
+    /// ([`Self::absolute_io_paths`]) naming an existing directory (whose
     /// listing no key covers) makes the suite uncacheable.
     pub absolute_paths: Vec<String>,
+    /// The [`Self::absolute_paths`] entries proven to sit in a file-API
+    /// argument position (`File('/etc/hosts')`, `Directory(path: '/data')`,
+    /// `FileSystemEntity.identicalSync('/a', '/b')`), where the callee —
+    /// or, for a static member call, its receiver — is one of dart:io's
+    /// `File`, `Directory`, `Link` or `FileSystemEntity`. Only one of
+    /// these may refuse a suite as a directory read: a route or URL
+    /// string spelled outside any file API (`expect(homeRoute, '/home')`)
+    /// is a comparison value, not a read, and keys like any other absent
+    /// candidate.
+    pub absolute_io_paths: Vec<String>,
     /// Carries the `// dartq: portable` attestation: the absolute locations
     /// this file derives reach no verdict except relative to the package
     /// root, so the outcome is the same in every checkout of the content.
@@ -885,6 +896,9 @@ fn read_runtime_inputs(
                         && index.checked_sub(2).and_then(kind)
                             == Some(TokenKind::StringInterpolationIdentifier);
                 if !continued && let Some(path) = absolute_path(body) {
+                    if in_file_api_argument(source, tokens, index) {
+                        out.absolute_io_paths.push(path.clone());
+                    }
                     out.absolute_paths.push(path);
                 }
                 let body = if continued {
@@ -905,6 +919,8 @@ fn read_runtime_inputs(
     out.path_literals.dedup();
     out.absolute_paths.sort_unstable();
     out.absolute_paths.dedup();
+    out.absolute_io_paths.sort_unstable();
+    out.absolute_io_paths.dedup();
     out.env_reads.sort_unstable();
     out.env_reads.dedup();
 }
@@ -965,6 +981,46 @@ fn string_literal_run(source: &str, tokens: &TokenTable, index: usize) -> Option
         count += 1;
     }
     (count > 0).then_some((value, count))
+}
+
+/// Whether the string literal at `index` sits in a file-API argument
+/// position: the callee directly before the enclosing call's `(` — or, for
+/// a static member call, its receiver — is one of dart:io's `File`,
+/// `Directory`, `Link` or `FileSystemEntity`. The literal may continue an
+/// adjacent-literal run (`File('/etc' '/hosts')`), follow an earlier
+/// argument past a comma (`FileSystemEntity.identicalSync('/a', …)`), or
+/// sit behind a named argument's `name:` (`Directory(path: …)`). Any other
+/// position — `expect(homeRoute, '/home')`, a bare assignment — is a
+/// comparison value, not a file read.
+fn in_file_api_argument(source: &str, tokens: &TokenTable, index: usize) -> bool {
+    let slice = tokens.as_slice();
+    let kind = |index: usize| slice.get(index).map(|token| token.kind);
+    let mut at = index;
+    while at > 0 {
+        match kind(at - 1) {
+            Some(TokenKind::String | TokenKind::Comma) => at -= 1,
+            Some(TokenKind::Colon) if kind(at - 2) == Some(TokenKind::Identifier) => at -= 2,
+            _ => break,
+        }
+    }
+    if at < 2
+        || kind(at - 1) != Some(TokenKind::OpenParen)
+        || kind(at - 2) != Some(TokenKind::Identifier)
+    {
+        return false;
+    }
+    let api = |index: usize| {
+        matches!(
+            tokens.lexeme(source, index),
+            "File" | "Directory" | "Link" | "FileSystemEntity"
+        )
+    };
+    let callee = at - 2;
+    api(callee)
+        || (callee >= 2
+            && kind(callee - 1) == Some(TokenKind::Period)
+            && kind(callee - 2) == Some(TokenKind::Identifier)
+            && api(callee - 2))
 }
 
 /// How the file imports `package:path`: whose `current` getter (and the
@@ -1271,6 +1327,23 @@ void main() {
             absolute("void main() { s.split('/'); x('// a'); y('/* c */'); print('$a/lib'); }")
                 .is_empty()
         );
+
+        // Only a literal in a file-API argument position is a directory
+        // read: routes and bare assignments key, they never refuse.
+        let io = |source: &str| of(source).absolute_io_paths;
+        assert_eq!(
+            io("void main() { File('/etc/hosts'); Directory('/tmp'); Link('/x'); }"),
+            ["/etc/hosts", "/tmp", "/x"]
+        );
+        assert_eq!(
+            io("void main() { FileSystemEntity.identicalSync('/a', '/b'); }"),
+            ["/a", "/b"]
+        );
+        assert_eq!(io("void main() { Directory(path: '/data'); }"), ["/data"]);
+        assert!(io(
+            "void main() { expect(homeRoute, '/home'); final r = '/home'; print('$base/home'); }"
+        )
+        .is_empty());
 
         assert_eq!(
             data_paths(b"files:\n  - test/resources/a.dart\n  - 'b.yaml'\nname: x\nversion: 1.2\n"),

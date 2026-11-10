@@ -68,11 +68,13 @@
 //!   every request with an empty 400, and `HttpClient()` — which both
 //!   packages build their default clients through — consults it, so no
 //!   request leaves the process;
-//! - the closure spells an absolute path naming an existing directory
-//!   (whose listing no key covers). An absolute path naming a file, or
-//!   nothing, is an input like any other — its bytes or its absence —
-//!   so a mock path in fixture data costs nothing and a real
-//!   `/etc/hosts` read invalidates when the file changes
+//! - the closure passes an absolute path naming an existing directory to
+//!   a file API (`Directory('/tmp')`, whose listing no key covers; see
+//!   [`FileFacts::absolute_io_paths`]). Any other absolute literal —
+//!   naming a file, naming nothing, or a route string like `'/home'`
+//!   compared outside any file API — is an input like any other: its
+//!   bytes or its absence, so a mock path in fixture data costs nothing
+//!   and a real `/etc/hosts` read invalidates when the file changes
 //!   ([`FileFacts::absolute_paths`]);
 //! - any file the suite reaches carries `// dartq: no-cache`;
 //! - a directive the scanner cannot read with certainty, a `package:` URI
@@ -1184,8 +1186,10 @@ pub enum Refusal {
     /// child processes, standard input, the host name, native code) with
     /// no `// dartq: deterministic` attestation.
     Nondeterministic,
-    /// A closure file spells an absolute path naming an existing
-    /// directory, whose listing no key covers.
+    /// A closure file passes an absolute path naming an existing directory
+    /// to a file API (`Directory('/tmp')`), whose listing no key covers.
+    /// A literal spelled outside a file API (a route string like
+    /// `'/home'`) never refuses.
     AbsoluteDirectory,
     /// A file of the suite's own package (or its path dependencies) reads
     /// the environment through a shape no literal name covers — iterating
@@ -1524,15 +1528,21 @@ impl Dense {
                     deferred_http = Some(at);
                 }
             }
-            for absolute in &facts.absolute_paths {
-                let path = Path::new(absolute);
-                if path.is_dir() {
+            // An absolute literal refuses the suite only when it sits in a
+            // file-API argument and names an existing directory, whose
+            // listing no key covers. Every literal — IO-used or not —
+            // stays an input like a mock path: a route string compared in
+            // an assertion (`'/home'`) names no file and keys as absent.
+            for absolute in &facts.absolute_io_paths {
+                if Path::new(absolute).is_dir() {
                     let mut detail =
                         self.witness(at, &parent, Refusal::AbsoluteDirectory, None, paths);
                     detail.triggers = vec![format!("absolute path {absolute}")];
                     return Err(detail);
                 }
-                inputs.push(paths.intern(path));
+            }
+            for absolute in &facts.absolute_paths {
+                inputs.push(paths.intern(Path::new(absolute)));
             }
             whole_package |= facts.ambient;
             // Library code reads the paths its callers hand it; its own
@@ -2085,6 +2095,10 @@ mod tests {
             "test/dir_test.dart",
             &format!("void main() {{ Directory('{}'); }}\n", tmp.path().display()),
         );
+        write(
+            "test/route_test.dart",
+            "void main() { expect(homeRoute, '/home'); }\n",
+        );
         let suites: Vec<PathBuf> = [
             "test/data_test.dart",
             "test/manifest_test.dart",
@@ -2093,6 +2107,7 @@ mod tests {
             "test/marked_test.dart",
             "test/etc_test.dart",
             "test/dir_test.dart",
+            "test/route_test.dart",
         ]
         .map(|rel| root.join(rel))
         .to_vec();
@@ -2112,6 +2127,10 @@ mod tests {
         assert_eq!(
             first[6], None,
             "an absolute directory's listing is not keyed"
+        );
+        assert!(
+            first[7].is_some(),
+            "a route string outside any file API is a comparison value, not a read"
         );
 
         // Deleting the fixture changes the reader's key, not the others'.

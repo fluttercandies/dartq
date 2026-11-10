@@ -188,6 +188,66 @@ enum Sync {
     Blocked,
 }
 
+/// How the last [`Freshness::check`] answered — the observable the
+/// daemon surfaces when a tree's watcher degrades to full-tree scans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CheckDiag {
+    /// journal (streamed events) or walk (full re-stat fallback).
+    pub(crate) mode: CheckMode,
+    /// Why a walk ran; `None` on the journal path.
+    pub(crate) walk_reason: Option<WalkReason>,
+    /// The answering path's duration: the walk's when one ran, else the
+    /// journal pass's (barrier plus merge), milliseconds.
+    pub(crate) elapsed_ms: u32,
+    /// Paths the check handed the server as changed.
+    pub(crate) changed: u32,
+}
+
+/// Which freshness path answered a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CheckMode {
+    /// The journal: streamed events merged behind the sync cookie.
+    #[default]
+    Journal,
+    /// The full stat-walk fallback.
+    Walk,
+}
+
+    /// Why a check took the walk path. `First` and `Rebase` are by design —
+    /// never a degradation; the rest are the shapes that make a daemon walk
+    /// every request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalkReason {
+    /// A by-design covering walk: the construction-time one (the initial
+    /// take predates the stream, so the first request re-walks once), or
+    /// the one a macOS stream restart over a changed watch set flags.
+    First,
+    /// The sync cookie could not be created (an unwritable tree) — an
+    /// environment fact, not watcher evidence.
+    CookieBlocked,
+    /// The sync cookie was not delivered inside the adaptive wait bound.
+    CookieTimeout,
+    /// The stream flagged lost events (a rescan flag, a stream error,
+    /// journal overflow) — the journal can no longer prove completeness.
+    StreamLost,
+    /// The watcher is not armed (never armed, cooled off, or abandoned).
+    Unarmed,
+    /// The served root set changed (pool join/evict) — re-plan and
+    /// re-walk once.
+    Rebase,
+}
+
+/// A duration in whole milliseconds, saturating rather than wrapping past
+/// the u32 range (a 49-day walk reads as the cap, never as zero).
+fn elapsed_ms(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// A diff's changed-path count, saturating rather than wrapping.
+fn count_changed(diff: &Diff) -> u32 {
+    u32::try_from(diff.changed.len()).unwrap_or(u32::MAX)
+}
+
 /// The cookie directory of one watched dir: `<dir>/.dart_tool/dartq/`
 /// when it exists or can be created — a walked `root` creates the tree
 /// outright (every Dart template gitignores `.dart_tool`, and dartq's
@@ -623,6 +683,15 @@ pub(crate) struct Freshness {
     /// How many requests took the full-walk path — the tests' evidence
     /// a fallback fired (and the measurements' walk counter).
     walks: usize,
+    /// How the last `check` answered — one Copy write per request, read
+    /// by the daemon to make a degraded watcher visible.
+    last_check: CheckDiag,
+    /// A by-design covering walk is pending: the arm's own (the initial
+    /// take predates the stream), or a macOS stream restart over a
+    /// changed set (the predecessor's in-flight events die with it). The
+    /// walk-flag fallback it causes reports [`WalkReason::First`] instead
+    /// of [`WalkReason::StreamLost`]. Any full take consumes it.
+    first_walk: bool,
     /// Test hook: the journal's inputs arrive by injection, not by
     /// stream proofs — the sync barrier resolves at once. A saturated
     /// `fseventsd` delays delivery past any barrier bound (seconds were
@@ -693,6 +762,8 @@ impl Freshness {
             last_verify: Instant::now(),
             mismatches: 0,
             walks: 0,
+            last_check: CheckDiag::default(),
+            first_walk: armed,
             #[cfg(test)]
             injected_journal: false,
         }
@@ -790,6 +861,18 @@ impl Freshness {
             self.cool_off = None;
             eprintln!("dartq-analyzer-host: watch: cool-off elapsed — re-arming");
         }
+        // macOS only: the ONE FSEvents stream restarts whenever its path
+        // set moves, and the predecessor's in-flight events die with it
+        // (see `Watcher::apply`) — the walk flag that raises covers a
+        // by-design window, like the arm's own first walk.
+        #[cfg(target_os = "macos")]
+        let before: Vec<PathBuf> = self
+            .shared
+            .watched
+            .lock()
+            .iter()
+            .map(|w| w.dir.clone())
+            .collect();
         let failed = match self.watcher.as_mut() {
             Some(watcher) => watcher.reconcile(&self.plan, &self.shared),
             None => {
@@ -800,6 +883,19 @@ impl Freshness {
                     .unwrap_or(Arm::Failed)
             }
         };
+        #[cfg(target_os = "macos")]
+        if !before.is_empty() && !matches!(failed, Arm::Failed) {
+            let after: Vec<PathBuf> = self
+                .shared
+                .watched
+                .lock()
+                .iter()
+                .map(|w| w.dir.clone())
+                .collect();
+            if after != before {
+                self.first_walk = true;
+            }
+        }
         if matches!(failed, Arm::Failed) {
             self.abandon("a watch call failed");
         }
@@ -862,7 +958,7 @@ impl Freshness {
             // A cooled-off stream whose backoff passed re-arms inside
             // `reconcile` — the walk that follows is its covering walk.
             self.reconcile();
-            self.walk_check()
+            self.walk_check(WalkReason::Unarmed)
         };
         if let Some(previous) = previous {
             self.last_verify = Instant::now();
@@ -916,7 +1012,12 @@ impl Freshness {
     /// dirty so the next request re-covers the window. The take's own
     /// duration feeds the adaptive wait bound, and reaching the walk
     /// proves the daemon alive — the cool-off health clock restarts.
-    fn walk_check(&mut self) -> Diff {
+    /// `reason` names the fallback that chose the walk — recorded in
+    /// [`Freshness::last_check`] so a degraded tree is observable.
+    fn walk_check(&mut self, reason: WalkReason) -> Diff {
+        // Any full take covers the construction window, so the arm's
+        // by-design first walk is spent whatever arm reached here.
+        self.first_walk = false;
         self.walks += 1;
         let before = self.covered();
         {
@@ -929,8 +1030,15 @@ impl Freshness {
         let sdk = self.plan_sdk_home();
         let start = Instant::now();
         let (fresh, plan) = Snapshot::take_with_plan(&roots, packages.as_deref(), &sdk);
-        self.observe_walk(start.elapsed());
+        let elapsed = start.elapsed();
+        self.observe_walk(elapsed);
         let diff = self.snapshot.diff(&fresh);
+        self.last_check = CheckDiag {
+            mode: CheckMode::Walk,
+            walk_reason: Some(reason),
+            elapsed_ms: elapsed_ms(elapsed),
+            changed: count_changed(&diff),
+        };
         self.snapshot = fresh;
         self.plan = plan;
         self.carry_dirs.clear();
@@ -960,9 +1068,10 @@ impl Freshness {
     /// that outlived its barrier keeps listening from `late` — expired
     /// undelivered cookies are the strikes, delivered ones clear them.
     fn journal_check(&mut self) -> Diff {
+        let start = Instant::now();
         self.sweep_late();
         if !self.armed() {
-            return self.walk_check();
+            return self.walk_check(WalkReason::Unarmed);
         }
         let mut retried = false;
         let sync = loop {
@@ -984,14 +1093,14 @@ impl Freshness {
                 // A cookie could not be created: an environment fact,
                 // not watcher evidence — walk this request, keep the
                 // watcher (and the strike count) as it is.
-                return self.walk_check();
+                return self.walk_check(WalkReason::CookieBlocked);
             }
             Sync::Timeout => {
                 // The adaptive bound elapsed — "slow", never a strike:
                 // the request walks, the stragglers keep listening from
                 // `late`, and only their expiry undelivered counts
                 // against the stream.
-                return self.walk_check();
+                return self.walk_check(WalkReason::CookieTimeout);
             }
         }
         let (dirty, walk) = {
@@ -1001,7 +1110,15 @@ impl Freshness {
             (dirty, walk)
         };
         if walk {
-            return self.walk_check();
+            // The stream flagged loss — unless this is the arm's own
+            // covering walk, the one by-design flag a fresh daemon
+            // carries until its first take.
+            let first = std::mem::take(&mut self.first_walk);
+            return self.walk_check(if first {
+                WalkReason::First
+            } else {
+                WalkReason::StreamLost
+            });
         }
         // Dirs the last request merged join the dirty set one more
         // time — a new dir's own watch may not have been armed when its
@@ -1030,6 +1147,12 @@ impl Freshness {
             self.mark_newly_covered(&before);
         }
         self.unwatched = unwatched_of(&self.plan);
+        self.last_check = CheckDiag {
+            mode: CheckMode::Journal,
+            walk_reason: None,
+            elapsed_ms: elapsed_ms(start.elapsed()),
+            changed: count_changed(&diff),
+        };
         diff
     }
 
@@ -1076,8 +1199,20 @@ impl Freshness {
         let sdk = self.plan_sdk_home();
         let start = Instant::now();
         let (fresh, plan) = Snapshot::take_with_plan(roots, packages.as_deref(), &sdk);
-        self.observe_walk(start.elapsed());
+        let elapsed = start.elapsed();
+        self.observe_walk(elapsed);
         let diff = self.snapshot.diff(&fresh);
+        // The full take covers the construction window too — the arm's
+        // pending covering walk is spent even when a rebase reached
+        // first (a stream restart's own covering flag, if any, is
+        // raised by the reconcile further down).
+        self.first_walk = false;
+        self.last_check = CheckDiag {
+            mode: CheckMode::Walk,
+            walk_reason: Some(WalkReason::Rebase),
+            elapsed_ms: elapsed_ms(elapsed),
+            changed: count_changed(&diff),
+        };
         self.snapshot = fresh;
         self.plan = plan;
         self.carry_dirs.clear();
@@ -1231,6 +1366,14 @@ impl Freshness {
 
     fn plan_roots(&self) -> Vec<PathBuf> {
         self.plan.roots().to_vec()
+    }
+
+    /// How the last `check` answered — which path ran, why, and what it
+    /// cost. The daemon reads this to make a degraded watcher (a tree
+    /// whose every request walks) visible instead of silently slow.
+    #[must_use]
+    pub(crate) fn last_check(&self) -> CheckDiag {
+        self.last_check
     }
 
     fn plan_packages(&self) -> Option<PathBuf> {
@@ -2642,6 +2785,95 @@ mod tests {
         let diff = freshness.check(&tree.roots());
         assert_eq!(diff.changed, vec![file], "the journal served the edit");
         fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// The diagnostics of a healthy request: the journal path answers
+    /// with no walk reason and the dirty count it merged. The journal is
+    /// driven by injection (the barrier holds without stream proof), and
+    /// the arm's covering walk is drained first — the second request is
+    /// the journal answer under test.
+    #[test]
+    fn the_diag_reports_the_journal_path() {
+        let _serial = serial();
+        let tree = Tree::build("diag-journal");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        freshness.journal_by_injection();
+        assert!(freshness.armed());
+        // Drain the arm's own events and its covering walk.
+        std::thread::sleep(Duration::from_millis(600));
+        let _ = freshness.check(&tree.roots());
+        freshness.carry_dirs.clear();
+
+        let file = tree.app.join("lib/a.dart");
+        fs::write(&file, "var diag;\n").expect("edit");
+        freshness.inject_dirty(&[file.clone()]);
+        let diff = freshness.check(&tree.roots());
+        let diag = freshness.last_check();
+        assert_eq!(diag.mode, CheckMode::Journal);
+        assert_eq!(diag.walk_reason, None, "the journal path ran no walk");
+        assert_eq!(diag.changed, 1, "one dirty path surfaced; {diff:?}");
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// The construction-time covering walk reports itself as `First` —
+    /// the by-design walk, never a degradation.
+    #[test]
+    fn the_diag_names_the_first_walk() {
+        let _serial = serial();
+        let tree = Tree::build("diag-first");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        assert!(freshness.armed());
+        assert!(freshness.first_walk, "the arm leaves its walk pending");
+        let _ = freshness.check(&tree.roots());
+        let diag = freshness.last_check();
+        assert_eq!(diag.mode, CheckMode::Walk);
+        assert_eq!(diag.walk_reason, Some(WalkReason::First));
+        assert!(!freshness.first_walk, "the walk spent it");
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// The unwritable-cookie fixture (see
+    /// `unwritable_cookie_dir_walks_once_and_stays_armed`) reports
+    /// `CookieBlocked` — a degradation, distinct from the by-design
+    /// walks.
+    #[test]
+    fn the_diag_names_a_blocked_cookie() {
+        let _serial = serial();
+        let tree = Tree::build("diag-blocked");
+        let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
+        generous_wait(&mut freshness);
+        assert!(freshness.armed());
+        let blocked = tree.base.join("blocked");
+        fs::create_dir_all(&blocked).expect("blocked dir");
+        let mut permissions = fs::metadata(&blocked).expect("meta").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&blocked, permissions).expect("readonly");
+        freshness.shared.watched.lock().push(Watch {
+            cookie_dir: blocked.clone(),
+            dir: blocked.clone(),
+            root: false,
+        });
+        let _ = freshness.check(&tree.roots());
+        let diag = freshness.last_check();
+        assert_eq!(diag.mode, CheckMode::Walk);
+        assert_eq!(diag.walk_reason, Some(WalkReason::CookieBlocked));
+        let mut permissions = fs::metadata(&blocked).expect("meta").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&blocked, permissions).expect("writable");
+        fs::remove_dir_all(&tree.base).ok();
+    }
+
+    /// The reasons are distinct values — the daemon's degradation gate
+    /// keys on them, so a by-design walk must never read as a refusal.
+    #[test]
+    fn walk_reasons_are_distinguishable() {
+        assert_ne!(WalkReason::First, WalkReason::CookieBlocked);
+        assert_ne!(WalkReason::Rebase, WalkReason::StreamLost);
+        assert_ne!(WalkReason::CookieBlocked, WalkReason::CookieTimeout);
+        assert_ne!(WalkReason::Unarmed, WalkReason::StreamLost);
     }
 
     /// The root-set change: a pool join rebases — new roots' files are

@@ -48,7 +48,7 @@ use crate::face::{Face, FaceRenderer};
 use crate::report::Report;
 use crate::server::{Fault, Launch, Server};
 use crate::support::{Sdk, Support, Version, support};
-use crate::watch::Freshness;
+use crate::watch::{Freshness, WalkReason};
 use crate::{Files, Spec};
 
 /// One client request line.
@@ -315,6 +315,15 @@ struct Host {
     /// The freshness oracle: the maintained snapshot plus its journaled
     /// watcher (or walk mode when the stream cannot arm).
     freshness: Freshness,
+    /// Consecutive freshness checks that answered with a degradation-
+    /// shaped walk — the note's debounce (see [`degradation_note`]): one
+    /// transient walk under cold-start load (a saturated stream missing
+    /// one cookie bound) never fires it, a persistent shape hits two.
+    degrade_streak: u8,
+    /// Whether the watcher-degradation note already fired — it names the
+    /// reason once per daemon life, and recovery speaks through the
+    /// watch substrate's own cool-off re-arm line.
+    degrade_noted: bool,
     files: Files,
     /// The socket this daemon bound.
     socket: Inode,
@@ -388,6 +397,8 @@ impl Host {
                 spec.packages.as_deref(),
                 &spec.sdk_home(),
             ),
+            degrade_streak: 0,
+            degrade_noted: false,
             files,
             socket,
             lease: None,
@@ -628,6 +639,7 @@ impl Host {
         };
         let roots = self.roots();
         let diff = self.freshness.check(&roots);
+        self.note_degradation(client);
         if diff.rebuild {
             self.stop();
         }
@@ -694,6 +706,36 @@ impl Host {
             Err(Fault::Memory(message)) => Err(Answer::Budget(message)),
             Err(Fault::Server(message)) => Err(self.fail(message)),
         }
+    }
+
+    /// Names a degraded watcher to the user, once per daemon life: a
+    /// tree whose checks keep falling back to full scans stays correct
+    /// but re-checks the whole tree on every run — without this line
+    /// that slowdown is invisible (the client spawns the daemon with its
+    /// stderr discarded, so the note rides the wire instead). The
+    /// decision is [`degradation_note`]'s: debounced to two consecutive
+    /// degraded checks (a cold-start transient never fires it), by-
+    /// design walks never count, and a watcher that recovers speaks
+    /// through the substrate's cool-off re-arm line.
+    fn note_degradation(&mut self, client: &UnixStream) {
+        let (streak, why) = degradation_note(
+            self.degrade_streak,
+            self.freshness.last_check().walk_reason,
+            self.degrade_noted,
+        );
+        self.degrade_streak = streak;
+        let Some(why) = why else {
+            return;
+        };
+        self.degrade_noted = true;
+        let line = format!(
+            "dartq analyze: file watcher degraded to full tree scans ({why}) — \
+             results stay correct, every run re-checks the whole tree"
+        );
+        // The daemon's own copy serves hand-run `--resident-serve` turns;
+        // the wire note is the one the user's client prints.
+        eprintln!("{line}");
+        note(client, line);
     }
 
     /// Starts the server once the job gate admits it. A pooled daemon
@@ -850,6 +892,46 @@ fn send_reply(stream: &UnixStream, reply: Reply) {
 
 fn note(stream: &UnixStream, text: String) {
     send_reply(stream, Reply::Answer(Answer::Note(text)));
+}
+
+/// The degradation note's whole policy, pure: given the streak of
+/// consecutive degradation-shaped checks BEFORE this one, this check's
+/// walk reason, and whether the note already fired, decide the streak to
+/// carry forward and whether this request names the degradation —
+/// `Some(why)` carrying the message's parenthetical. Only the
+/// deterministic, persistent shapes count (an unwritable tree, a lost
+/// stream, an unarmed watcher — each repeats every request, so two
+/// consecutive checks cost at most one silent run). A timed-out sync
+/// confirmation is the designed slow-path fallback, not a degradation:
+/// the adaptive wait bound follows the walk-cost EWMA, so a timeout
+/// regime lengthens the walks, grows the bound, and lets cookies
+/// deliver in bound again — it self-corrects (and clusters at cold-start
+/// tails, where the bound still sits at its pre-cold value under a
+/// saturated stream). Journal answers and by-design walks (`First`,
+/// `Rebase`) are equally evidence against persistence; none of these
+/// count, the streak starts over, and only the second consecutive
+/// counted shape speaks.
+fn degradation_note(
+    streak: u8,
+    reason: Option<WalkReason>,
+    noted: bool,
+) -> (u8, Option<&'static str>) {
+    if noted {
+        return (streak, None);
+    }
+    let why = match reason {
+        Some(WalkReason::CookieBlocked) => "its sync files cannot be written",
+        Some(WalkReason::StreamLost) => "its event stream lost events",
+        Some(WalkReason::Unarmed) => "its watcher is unavailable",
+        // A timed-out confirmation (the slow path working as designed —
+        // see above), a journal answer, or a by-design walk — the
+        // covering walk after an arm or a stream restart, a pool
+        // rebase: none count, the streak starts over.
+        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout)
+        | None => return (0, None),
+    };
+    let streak = streak.saturating_add(1);
+    (streak, (streak >= 2).then_some(why))
 }
 
 /// The per-second sample of a running analysis: the disk budget's
@@ -1103,5 +1185,96 @@ mod tests {
         let text = std::str::from_utf8(&line).expect("utf8");
         assert!(text.contains("\"bytes\":42"), "{text}");
         assert!(line.ends_with(b"\n"));
+    }
+
+    /// The cold-start transient the debounce exists for: timeouts
+    /// cluster at cold-start tails (the wait bound still sits at its
+    /// pre-cold value while the stream is saturated), so even two in a
+    /// row — cold's request, then the first warm one — never note and
+    /// the streak stays flat; a lone counted shape afterwards is still
+    /// only the first.
+    #[test]
+    fn one_transient_degraded_check_never_notes() {
+        // Cold's request: one timed-out confirmation under the load.
+        assert_eq!(
+            degradation_note(0, Some(WalkReason::CookieTimeout), false),
+            (0, None),
+            "a timed-out confirmation never counts"
+        );
+        // The first warm run right after: another timeout — the
+        // spanning shape the old note false-alarmed on.
+        assert_eq!(
+            degradation_note(0, Some(WalkReason::CookieTimeout), false),
+            (0, None),
+            "two in a row still never note"
+        );
+        // A journal answer resets nothing that grew, and a later lone
+        // counted shape is again only the first.
+        assert_eq!(degradation_note(0, None, false), (0, None));
+        assert_eq!(
+            degradation_note(0, Some(WalkReason::StreamLost), false),
+            (1, None)
+        );
+    }
+
+    /// Every counted shape repeats, so the second consecutive check
+    /// notes with its own reason text; the first never does.
+    #[test]
+    fn two_consecutive_degraded_checks_note_the_reason() {
+        let shapes = [
+            (WalkReason::CookieBlocked, "its sync files cannot be written"),
+            (WalkReason::StreamLost, "its event stream lost events"),
+            (WalkReason::Unarmed, "its watcher is unavailable"),
+        ];
+        for (reason, why) in shapes {
+            assert_eq!(
+                degradation_note(0, Some(reason), false),
+                (1, None),
+                "the first {reason:?} stays silent"
+            );
+            assert_eq!(
+                degradation_note(1, Some(reason), false),
+                (2, Some(why)),
+                "the second {reason:?} speaks"
+            );
+        }
+    }
+
+    /// Journal answers, timed-out confirmations, and by-design walks
+    /// (`First`, `Rebase`) never count — they are evidence against
+    /// persistence, so an interrupted streak starts over.
+    #[test]
+    fn journal_and_by_design_answers_reset_the_streak() {
+        assert_eq!(degradation_note(1, None, false), (0, None), "a journal answer");
+        assert_eq!(
+            degradation_note(1, Some(WalkReason::CookieTimeout), false),
+            (0, None),
+            "a timed-out confirmation"
+        );
+        assert_eq!(
+            degradation_note(1, Some(WalkReason::First), false),
+            (0, None),
+            "the covering walk"
+        );
+        assert_eq!(
+            degradation_note(1, Some(WalkReason::Rebase), false),
+            (0, None),
+            "a pool rebase"
+        );
+    }
+
+    /// Once fired, the note never repeats — whatever the checks answer
+    /// afterwards, the daemon stays silent for its life.
+    #[test]
+    fn a_fired_note_never_repeats() {
+        assert_eq!(
+            degradation_note(2, Some(WalkReason::Unarmed), true),
+            (2, None),
+            "degraded checks after the note are silent"
+        );
+        assert_eq!(
+            degradation_note(0, Some(WalkReason::CookieBlocked), true),
+            (0, None)
+        );
     }
 }
