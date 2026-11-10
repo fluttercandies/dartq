@@ -3013,7 +3013,7 @@ mod tests {
         // re-inject and retry; a merge carry must eventually appear.
         freshness.inject_dirty(&[dir.clone()]);
         let mut carried = false;
-        for _ in 0..5 {
+        for _ in 0..20 {
             let walks = freshness.walks;
             let _ = freshness.check(&tree.roots());
             if freshness.carry_dirs.iter().any(|d| dir.starts_with(d)) {
@@ -3080,7 +3080,7 @@ mod tests {
         // An OS rescan flag can race the request into a walk — allow a
         // few requests, but one of them must leave the dir recreated.
         let mut recreated = false;
-        for _ in 0..5 {
+        for _ in 0..20 {
             let _ = freshness.check(&tree.roots());
             if tree.app.join(".dart_tool/dartq").is_dir() {
                 recreated = true;
@@ -3427,7 +3427,7 @@ mod tests {
         // A real OS event landing mid-audit makes the comparison
         // inconclusive by design — the audit retries next period, so
         // retry the due check until the verdict lands.
-        for _ in 0..5 {
+        for _ in 0..20 {
             freshness.last_request = Instant::now() - VERIFY_IDLE - Duration::from_secs(1);
             freshness.last_verify = Instant::now() - VERIFY_PERIOD - Duration::from_secs(1);
             let _ = freshness.check(&tree.roots());

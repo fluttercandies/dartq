@@ -321,7 +321,6 @@ const CODE_OVERRIDES: &[(&str, TriggerKind)] = &[
     ("incompatible_lint_files", TriggerKind::OptionsConfig),
     ("incompatible_included_file", TriggerKind::OptionsConfig),
     ("deprecated_lint_use", TriggerKind::OptionsConfig),
-    ("plugins_in_inner_options", TriggerKind::OptionsConfig),
     ("options_file_not_found", TriggerKind::OptionsConfig),
 ];
 

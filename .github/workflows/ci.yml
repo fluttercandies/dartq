@@ -48,6 +48,10 @@ jobs:
       # surfaces (#945: daemon/plugin/commands/schema). The dart-gated
       # plugin fixture tests self-skip here (no dart on this job) and the
       # #[ignore]d live faces stay opt-in (the DARTQ_M4_LIVE discipline).
+      # The cli unit tests resolve the real bin target (target/debug/dartq)
+      # to spawn starters/engine daemons; cargo test alone never
+      # materializes it, so build the bin first.
+      - run: cargo build -p dartq-cli
       - run: cargo test --workspace
 
   gates:

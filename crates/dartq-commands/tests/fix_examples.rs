@@ -87,6 +87,10 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "silent: augmentation declarations parse to `expected_token` today; this code never emits (probe-verified)",
     ),
     (
+        "prefer_const_constructors_in_immutables",
+        "resolution-gated: firing requires a `package:meta` import to resolve `@immutable` and the bare-file harness resolves nothing — upstream stays silent without the import; coverage lives in the rule's oracle corpus pins",
+    ),
+    (
         "extension_type_declares_member_of_object",
         "silent: the Object-member extension-type trigger produces no diagnostic rows through the engine pass (probe-verified)",
     ),

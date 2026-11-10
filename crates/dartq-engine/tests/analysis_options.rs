@@ -926,13 +926,14 @@ fn included_file_local_problems_wrap_to_the_includer() {
     assert_eq!(near.issues.len(), 1, "{:?}", near.issues);
     let issue = &near.issues[0];
     assert_eq!(issue.code.name, "included_file_warning");
-    // The inner invalid-section row anchors at `linter` (0, 6) in far.yaml —
-    // the inclusive end folds to 5.
+    // The inner invalid-section row anchors at the value node in far.yaml —
+    // the oracle probe (dart analyze over `linter: 42`) reports (8..9), the
+    // section-value span convention pinned 2026-10-29.
     let far = dir.path("far.yaml").display().to_string();
     assert_eq!(
         issue.message,
         format!(
-            "Warning in the included options file {far}(0..5): Invalid format for the 'linter' section."
+            "Warning in the included options file {far}(8..9): Invalid format for the 'linter' section."
         )
     );
     assert_eq!(issue.offset, 9, "the branch's first include directive");
