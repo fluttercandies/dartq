@@ -104,8 +104,10 @@ pub const REAP_GRACE_PER_HELD: Duration = Duration::from_secs(5);
 /// The post-SIGKILL confirmation wait: after the escalation the process
 /// is dead by kernel decree (an unreaped zombie still answers
 /// `kill(pid, 0)` — waiting longer would be waiting for its parent).
+#[cfg(unix)]
 const REAP_CONFIRM: Duration = Duration::from_secs(1);
 /// The reap and attach poll cadence.
+#[cfg(unix)]
 const POLL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
@@ -471,21 +473,14 @@ pub fn ensure(
     sdk_root: &Path,
     spawn: &dyn Fn(&Layout, &SessionTriple) -> io::Result<()>,
 ) -> Ensured {
-    if !cfg!(unix) {
-        return Ensured::Standalone(
-            "resident sessions need the Unix socket substrate; the Windows named-pipe \
-             transport is designed (crate docs) but not wired — running standalone"
-                .into(),
-        );
-    }
-    let layout = Layout::new(root);
-    if let Err(reason) = layout.create() {
-        return Ensured::Standalone(reason);
-    }
-    let triple = SessionTriple::compute(root, sdk_root);
-
     #[cfg(unix)]
     {
+        let layout = Layout::new(root);
+        if let Err(reason) = layout.create() {
+            return Ensured::Standalone(reason);
+        }
+        let triple = SessionTriple::compute(root, sdk_root);
+
         match flock_exclusive(&layout.elect) {
             // The winner: attach what is live, reap what is stale.
             Ok(guard) => {
@@ -506,12 +501,22 @@ pub fn ensure(
             Err(ElectError::Io(error)) => Ensured::Standalone(format!("election failed: {error}")),
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, sdk_root, spawn);
+        Ensured::Standalone(
+            "resident sessions need the Unix socket substrate; the Windows named-pipe \
+             transport is designed (crate docs) but not wired — running standalone"
+                .into(),
+        )
+    }
 }
 
 /// The winner's path, lock held: a live matching server is attached
 /// (after reaping any other daemon recorded on the root); a stale or
 /// foreign one is reaped, reclaimed, and `spawn` brings up the new one
 /// under a bring-up placeholder.
+#[cfg(unix)]
 fn under_election(
     layout: &Layout,
     triple: &SessionTriple,
@@ -589,6 +594,7 @@ fn under_election(
 /// matches a state that is alive. The placeholder's pid 0 is never
 /// alive, so a bring-up in progress is never "attached" before its
 /// first beat.
+#[cfg(unix)]
 fn state_is_live(state: &SessionState, triple: &SessionTriple, layout: &Layout) -> bool {
     state.triple == *triple && state_is_alive(state, layout)
 }
@@ -617,6 +623,7 @@ pub fn resident_sdk_root(root: &Path) -> Option<PathBuf> {
 }
 
 /// How long ago the placeholder was written.
+#[cfg(unix)]
 fn placeholder_age(state: &SessionState) -> Duration {
     Duration::from_millis(
         u64::try_from(SessionState::now_ms().saturating_sub(state.heartbeat_ms))
@@ -644,6 +651,7 @@ pub fn reap_grace(held: usize) -> Duration {
 /// zombie, an uninterruptible sleep) is treated as dead and the
 /// takeover proceeds: its socket inode is unreachable through the path,
 /// so it cannot steal the bind back.
+#[cfg(unix)]
 fn reap(pid: u32, grace: Duration) {
     if !reapable_pid(pid) {
         return;
@@ -665,6 +673,7 @@ fn reap(pid: u32, grace: Duration) {
 }
 
 /// Waits up to `within` for the pid to leave; `true` when it did.
+#[cfg(unix)]
 fn gone(pid: u32, within: Duration) -> bool {
     let deadline = std::time::Instant::now() + within;
     while std::time::Instant::now() < deadline {
@@ -682,6 +691,7 @@ fn gone(pid: u32, within: Duration) -> bool {
 /// socket and are left to their own elections). Unreapable pids
 /// (sentinels, the caller itself) are skipped; dead ones are not
 /// signaled at all.
+#[cfg(unix)]
 fn reap_rivals(registry: &Registry, root: &Path, keep: u32) {
     for record in registry.list() {
         let pid = record.state.pid;
@@ -698,6 +708,7 @@ fn reap_rivals(registry: &Registry, root: &Path, keep: u32) {
 /// dying daemon's socket answers until the reap finishes, and a
 /// placeholder's pid 0 never passes — the serve's first heartbeat is
 /// the attach signal.
+#[cfg(unix)]
 fn wait_attached(
     layout: &Layout,
     triple: &SessionTriple,
@@ -726,11 +737,13 @@ pub fn socket_open(layout: &Layout) -> bool {
     }
     #[cfg(not(unix))]
     {
+        let _ = layout;
         false
     }
 }
 
 /// The election error: `Contended` is the loser's signal.
+#[cfg(unix)]
 enum ElectError {
     Contended,
     Io(io::Error),

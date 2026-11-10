@@ -105,6 +105,11 @@ mod mcp;
 mod output;
 mod packages;
 mod rename;
+// The resident-session routing layer: the transport is the Unix socket
+// (`session_call`/`read_frame` over `UnixStream`), and `dartq_session`'s
+// election only attaches on unix — on other hosts every face degrades to
+// the in-process path, so the whole module is unix-only.
+#[cfg(unix)]
 mod resident;
 mod resolve;
 mod session;
@@ -274,6 +279,7 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Impact(impact_args)),
         }) => impact::run_entry(&impact_args),
+        #[cfg(unix)]
         Ok(Cli {
             command: Some(Command::Compatibility(compat_args)),
         }) => compat::run_entry(&compat_args),
@@ -370,6 +376,10 @@ enum Command {
     Check(CheckArgs),
     /// Assess the workspace under several SDK roots — a per-axis ✓/✗
     /// compatibility matrix. `compatibility` stays as a hidden alias.
+    /// Unix-only: the face rides the resident-compat machinery, which the
+    /// socket-less platforms do not host — the verb is absent there, not
+    /// a usage error.
+    #[cfg(unix)]
     #[command(name = "compat", alias = "compatibility")]
     Compatibility(compat::CompatArgs),
     /// Manage the Flutter build cache — the `flutter` PATH shim's
@@ -1221,6 +1231,7 @@ fn check_run(args: &CheckArgs, out: &mut impl Write) -> u8 {
     // only — never a spawn (see `resident::route_check`). No session
     // here is the check face's normal shape, not a fallback: it proceeds
     // in-process with no advisory.
+    #[cfg(unix)]
     if !args.cold
         && let Some(code) = resident::route_check(args, out)
     {
@@ -1888,6 +1899,7 @@ pub(crate) fn job_cap(dir: &Path) -> u32 {
 }
 
 /// How long a job waits at the machine-wide gate before it fails.
+#[cfg(unix)]
 pub(crate) const JOB_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// The jobs this binary takes slots for.
@@ -1970,6 +1982,9 @@ pub(crate) fn job_slot(_: Job, _: &str, _: &Path, _: u8) -> Result<Option<JobSlo
 pub(crate) struct JobSlot {
     #[cfg(unix)]
     _lease: dartq_toolchain::ledger::Lease,
+    /// Read by the unix Drop's peak record; the field carries nothing on
+    /// hosts without the ledger.
+    #[cfg(unix)]
     peak_key: String,
     #[cfg(unix)]
     face: dartq_toolchain::ledger::Face,
@@ -2096,6 +2111,7 @@ fn analyze_run(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    #[cfg(unix)]
     if !args.cold
         && let Some(code) = resident::route_analyze(args, &targets, out, &session::spawn_server)
     {
@@ -3093,6 +3109,7 @@ fn query_references_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
+    #[cfg(unix)]
     if let Some(code) = resident::route_query(args, QueryKind::References, out) {
         return code;
     }
@@ -3120,6 +3137,7 @@ fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
+    #[cfg(unix)]
     if let Some(code) = resident::route_query(args, QueryKind::Callers, out) {
         return code;
     }
@@ -3176,6 +3194,7 @@ fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
+    #[cfg(unix)]
     if let Some(code) = resident::route_query(args, QueryKind::Implementations, out) {
         return code;
     }
@@ -3233,6 +3252,7 @@ fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
+    #[cfg(unix)]
     if let Some(code) = resident::route_query(args, QueryKind::Dependencies, out) {
         return code;
     }
@@ -3294,6 +3314,7 @@ fn query_batch(args: &BatchArgs) -> u8 {
 /// when no kind came), the shared `dartq_commands::query::batch`
 /// execution, then one JSON line per answer.
 fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
+    #[cfg(unix)]
     if let Some(code) = resident::route_query_batch(args, out) {
         return code;
     }
@@ -3376,6 +3397,7 @@ fn write_query_out(
 /// ranked candidates replace the exact lookup's rows, the envelope is
 /// unchanged.
 fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    #[cfg(unix)]
     if let Some(code) = resident::route_query(args, QueryKind::Symbol, out) {
         return code;
     }
@@ -3498,6 +3520,7 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
             // explain rebuilds the same per-query disk engine and renders
             // through the same writers; no live session falls straight
             // through to the cold report below.
+            #[cfg(unix)]
             if let Some(code) = resident::route_explain(args, symbol, out) {
                 return code;
             }

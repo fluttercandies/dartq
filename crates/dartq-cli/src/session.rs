@@ -7,18 +7,22 @@
 //! client at a time.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
 use dartq_session::{
-    Ensured, EventLog, HEARTBEAT, IDLE_TIMEOUT, Layout, Record, Registry, SessionState,
-    SessionTriple, ensure, pid_alive, terminate,
+    Ensured, Layout, Record, Registry, SessionState, SessionTriple, ensure, pid_alive, terminate,
 };
+#[cfg(unix)]
+use dartq_session::{EventLog, HEARTBEAT, IDLE_TIMEOUT};
 
 use crate::OutputFormat;
 use crate::exit;
@@ -44,7 +48,11 @@ enum SessionCommand {
     /// write operation: `--format text` falls back to the lon record.
     Stop(StopArgs),
     /// The resident serve loop — the detached process `start` spawns.
-    /// Hidden: not a human verb.
+    /// Hidden: not a human verb. Unix-only: the serve binds the session's
+    /// Unix socket and rides the unix-only memory ledger (`ensure` only
+    /// ever spawns it on unix — on other hosts a session is always
+    /// standalone and this verb cannot be reached).
+    #[cfg(unix)]
     #[command(hide = true)]
     Serve(ServeArgs),
 }
@@ -85,6 +93,7 @@ struct StopArgs {
     format: OutputFormat,
 }
 
+#[cfg(unix)]
 #[derive(Args)]
 struct ServeArgs {
     /// The worktree the session serves (the resolution root).
@@ -100,6 +109,7 @@ pub fn run_entry(args: &SessionArgs) -> u8 {
         SessionCommand::Start(start) => start_session(start),
         SessionCommand::Status(status) => session_status(status),
         SessionCommand::Stop(stop) => stop_session(stop),
+        #[cfg(unix)]
         SessionCommand::Serve(serve) => serve_loop(serve, IDLE_TIMEOUT),
     }
 }
@@ -392,6 +402,7 @@ fn print_state(format: OutputFormat, state: &SessionState, attached: bool) {
 /// sleep a whole [`HEARTBEAT`] blind — the shutdown ladder joins it,
 /// and an idle daemon's exit has to land in milliseconds
 /// ([`dartq_session::REAP_GRACE`] covers only the debug-detach ladder).
+#[cfg(unix)]
 const TICK: Duration = Duration::from_millis(250);
 
 /// The resident loop: bind the session socket, announce the state, and
@@ -407,6 +418,7 @@ const TICK: Duration = Duration::from_millis(250);
 /// posture, unix-native). A signal landing while a client is held is
 /// polled at the same granularity inside the client loop (#2632), so
 /// the ladder runs without waiting for that client to disconnect.
+#[cfg(unix)]
 fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let root = match std::fs::canonicalize(&args.dir) {
         Ok(root) => root,
@@ -731,11 +743,13 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
 /// mid-request or with a paused app behind it. A lock file that cannot be
 /// opened holds nothing (the daemon is then never seen idle either: the
 /// ledger releases a resident only when it can take the lock itself).
+#[cfg(unix)]
 struct Busy {
     file: Option<std::fs::File>,
     held: bool,
 }
 
+#[cfg(unix)]
 impl Busy {
     fn open(path: &Path) -> Self {
         let file = std::fs::OpenOptions::new()
@@ -763,8 +777,10 @@ impl Busy {
 
 /// Records this daemon's peak RSS under its key when the serve ends, for
 /// the next start's lease.
+#[cfg(unix)]
 struct PeakOnExit(String);
 
+#[cfg(unix)]
 impl Drop for PeakOnExit {
     fn drop(&mut self) {
         dartq_toolchain::ledger::record_peak(
@@ -778,6 +794,7 @@ impl Drop for PeakOnExit {
 /// What the daemon hosts beyond its clients: debug sessions and running
 /// `dartq/test/run` children. While it hosts anything it is busy (never
 /// released by the gate) and never idle.
+#[cfg(unix)]
 fn hosting(session: &dartq_daemon::Session) -> usize {
     session.debug_sessions_len() + session.test_runs_live()
 }
@@ -790,6 +807,7 @@ fn hosting(session: &dartq_daemon::Session) -> usize {
 /// a failed retake would end the daemon under it). `false` when the slot
 /// cannot be retaken (every slot is taken): the daemon then exits rather
 /// than run outside the cap.
+#[cfg(unix)]
 fn settle_slot(
     lease: Option<&mut dartq_toolchain::ledger::Lease>,
     debug_sessions: usize,
@@ -816,6 +834,7 @@ fn settle_slot(
 /// another worktree waiting there borrows the figure. Once sized, the
 /// check is a field read; the exit records the final peak
 /// ([`PeakOnExit`]).
+#[cfg(unix)]
 fn size_after_load(lease: &mut dartq_toolchain::ledger::Lease, peak_key: &str, trace: &Path) {
     if lease.sized() || dartq_session::Progress::from_trace(trace).files_scanned == 0 {
         return;
@@ -824,6 +843,7 @@ fn size_after_load(lease: &mut dartq_toolchain::ledger::Lease, peak_key: &str, t
 }
 
 /// How long a session daemon waits at the job gate before it gives up.
+#[cfg(unix)]
 const SESSION_MEMORY_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// The session daemon's lease: its recorded peak (else the largest live
@@ -831,6 +851,7 @@ const SESSION_MEMORY_WAIT: Duration = Duration::from_secs(30 * 60);
 /// plugin children included (a debug app holds its own lease and is not
 /// counted twice). A ledger that cannot be used serves unleased; the error
 /// is a wait that timed out. An exit signal ends the wait.
+#[cfg(unix)]
 fn lease_session(
     peak_key: &str,
     root: &Path,
@@ -877,6 +898,7 @@ fn lease_session(
 /// once and re-elects cleanly instead of hanging against a doomed
 /// daemon's backlog, and a takeover during the ladder can never bind a
 /// socket the dying daemon's cleanup would later strip.
+#[cfg(unix)]
 fn stop_accepting(listener: UnixListener, layout: &Layout) {
     let _ = std::fs::remove_file(&layout.socket);
     drop(listener);
@@ -886,6 +908,7 @@ fn stop_accepting(listener: UnixListener, layout: &Layout) {
 /// daemon hosts anything ([`hosting`]: a debug session, a test run) — a held debug session is never idle (a
 /// paused app must not outlive its daemon by reaper fiat), and on
 /// detach a full fresh idle window runs.
+#[cfg(unix)]
 fn idle_elapsed(last_client: Instant, now: Instant, hosted: usize) -> Duration {
     if hosted > 0 {
         Duration::ZERO
@@ -900,6 +923,7 @@ fn idle_elapsed(last_client: Instant, now: Instant, hosted: usize) -> Duration {
 /// grace — then append the `shutdown` event naming what was released,
 /// stop the beat, clean the layout, and exit. A daemon must never die
 /// leaving a paused app frozen behind it.
+#[cfg(unix)]
 fn serve_shutdown(
     session: &mut dartq_daemon::Session,
     events: &EventLog,
@@ -935,6 +959,7 @@ fn serve_shutdown(
 /// cleanly closes, and hands the loop back for the shutdown ladder;
 /// without this the reaper's SIGKILL would land first and every held
 /// debug session died un-resumed).
+#[cfg(unix)]
 fn serve_client(
     stream: UnixStream,
     session: &mut dartq_daemon::Session,
@@ -952,6 +977,7 @@ fn serve_client(
 
 /// Binds the socket, unlinking a leftover file once (a crashed server's
 /// residue — the election normally cleans it, this is the belt).
+#[cfg(unix)]
 fn bind_takeover(layout: &Layout) -> io::Result<UnixListener> {
     UnixListener::bind(&layout.socket).or_else(|first| {
         let _ = std::fs::remove_file(&layout.socket);
@@ -964,6 +990,7 @@ fn bind_takeover(layout: &Layout) -> io::Result<UnixListener> {
 /// copy scales its SIGTERM grace by it instead of SIGKILLing a daemon
 /// mid-detach. `used_ms` is the last client answer's wall time — the
 /// memory-pressure eviction's LRU fact.
+#[cfg(unix)]
 fn heartbeat(
     layout: &Layout,
     registry: &Registry,
@@ -987,6 +1014,7 @@ fn heartbeat(
 }
 
 /// The shutdown residue: socket, state, registry record.
+#[cfg(unix)]
 fn cleanup(layout: &Layout, root: &Path) {
     let _ = std::fs::remove_file(&layout.socket);
     let _ = std::fs::remove_file(&layout.state);

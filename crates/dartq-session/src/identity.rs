@@ -41,6 +41,7 @@ struct Stamp {
 /// so a dangling path and a real file never collide). Follows symlinks:
 /// a `bin/dart` or a brew-installed dartq is commonly a link — the
 /// identity cares about the file it lands on.
+#[cfg(unix)]
 fn stamp(path: &Path) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(path).ok()?;
@@ -52,6 +53,30 @@ fn stamp(path: &Path) -> Option<Stamp> {
         mtime_ns: meta.mtime() as u64,
         ino: meta.ino(),
         dev: meta.dev(),
+    })
+}
+
+/// Windows `Metadata` exposes no inode/device: `len` + `mtime` alone carry
+/// the stamp (a same-path rewrite still moves both), and the record keeps
+/// the same `len:mtime_ns:ino:dev` shape with `0` in the unix-only legs —
+/// the resident session is `Standalone` there anyway, so the lost
+/// discrimination never decides an election.
+#[cfg(not(unix))]
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(Stamp {
+        len: meta.len(),
+        mtime_ns: meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+        ino: 0,
+        dev: 0,
     })
 }
 

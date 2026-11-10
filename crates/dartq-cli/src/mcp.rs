@@ -1104,16 +1104,50 @@ fn fix_text(answer: Value) -> String {
         .join("\n")
 }
 
-/// The daemon-proxy failure face and the transport bound live in
-/// `resident` — the binary's one session transport (the routed one-shot
-/// faces of #2627 proxy through the same machinery).
-pub(crate) use crate::resident::CALL_TIMEOUT as DAEMON_CALL_TIMEOUT;
-pub(crate) use crate::resident::ProxyError;
+/// One daemon round trip's failure: the daemon answered a JSON-RPC error
+/// (a domain failure carrying its machine-code prefix, e.g. the debug
+/// family's `DARTQ/DEBUG/*`), or the transport failed before an answer
+/// (connect refused, no resident session, a wedged engine, a malformed
+/// frame). The MCP face flattens both into its `isError` text; the
+/// routed faces map them onto the fallback ladder. The contract lives
+/// here because `daemon_call` is the proxy's API — the unix socket
+/// transport that produces these errors is `resident::session_call`
+/// (unix-only).
+#[derive(Debug)]
+pub(crate) enum ProxyError {
+    /// A domain failure the daemon answered (constructed by the unix
+    /// transport and the debug faces' tests; the standalone platforms
+    /// only ever see the transport arm).
+    #[cfg_attr(not(unix), expect(dead_code, reason = "the unix socket transport constructs it"))]
+    Daemon(i64, String),
+    Transport(String),
+}
+
+impl ProxyError {
+    /// The one-line reason the fallback advisory carries.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "read by the unix resident-routing faces")
+    )]
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Daemon(code, message) => format!("the session answered error {code}: {message}"),
+            Self::Transport(why) => why.clone(),
+        }
+    }
+}
+
+/// How long one routed round trip may run before the caller hears about
+/// it: the first routed call on a cold resident pays the daemon's whole
+/// workspace analysis inside this window (the MCP face's bound, which
+/// the debug faces share — a wedged engine surfaces as a bounded error,
+/// never a hung one-shot).
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One daemon request over the session socket, bounded by
-/// [`DAEMON_CALL_TIMEOUT`].
+/// [`CALL_TIMEOUT`].
 pub(crate) fn daemon_call(method: &str, params: &Value, mcp: &Mcp) -> Result<Value, ProxyError> {
-    daemon_call_bounded(method, params, mcp, DAEMON_CALL_TIMEOUT)
+    daemon_call_bounded(method, params, mcp, CALL_TIMEOUT)
 }
 
 pub(crate) fn daemon_call_bounded(
@@ -1128,7 +1162,20 @@ pub(crate) fn daemon_call_bounded(
              start it with `dartq session start` in a writable checkout"
         )));
     }
-    crate::resident::session_call(&mcp.layout.socket, method, params, timeout)
+    // `mcp.session` is `Ok` only where `ensure` can attach — unix, where
+    // the socket transport lives. Other platforms never reach this arm
+    // (the session is always standalone there).
+    #[cfg(unix)]
+    {
+        crate::resident::session_call(&mcp.layout.socket, method, params, timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (method, params, timeout);
+        Err(ProxyError::Transport(
+            "the resident session transport is unix-only".to_owned(),
+        ))
+    }
 }
 
 /// The rename face over a cold in-process engine (the rare tool). The

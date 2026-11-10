@@ -126,6 +126,7 @@ pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     // — the write applies through this face's own engine-local splice
     // machinery (the drift gates read the analyzed view), which cannot be
     // remoted.
+    #[cfg(unix)]
     if !args.write
         && let Some(code) = crate::resident::route_rename(args, &path, anchor, out)
     {

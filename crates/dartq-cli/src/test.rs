@@ -54,7 +54,6 @@ use clap::Args;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-#[cfg(unix)]
 use crate::exit;
 use dartq_test::event::Json;
 use dartq_test::report::{self, Kind};

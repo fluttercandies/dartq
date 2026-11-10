@@ -87,6 +87,7 @@ pub(crate) fn resolve_at_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    #[cfg(unix)]
     if let Some(code) =
         crate::resident::route_position(args, "dartq/resolveAt", &file, line, column, out)
     {
@@ -127,6 +128,7 @@ pub(crate) fn completion_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    #[cfg(unix)]
     if let Some(code) =
         crate::resident::route_position(args, "dartq/completion", &file, line, column, out)
     {

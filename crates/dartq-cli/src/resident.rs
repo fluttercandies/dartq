@@ -105,40 +105,15 @@ use serde_json::{Value, json};
 use dartq_session::{Ensured, Layout, STALE_HEARTBEAT, SessionState, SessionTriple, ensure};
 
 use crate::exit;
+use crate::mcp::{CALL_TIMEOUT, ProxyError};
 use crate::session::sdk_root_for;
-/// How long one routed round trip may run before the caller hears about
-/// it: the first routed call on a cold resident pays the daemon's whole
-/// workspace analysis inside this window (the MCP face's bound, which
-/// the debug faces share — a wedged engine surfaces as a bounded error,
-/// never a hung one-shot).
-pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // The shared session transport (the `mcp` and `debug` faces proxy their
-// `dartq/*` requests through the same machinery)
+// `dartq/*` requests through the same machinery — the [`ProxyError`]
+// failure contract and the [`CALL_TIMEOUT`] bound live beside
+// `mcp::daemon_call`, the proxy API they describe)
 // ---------------------------------------------------------------------------
-
-/// One daemon round trip's failure: the daemon answered a JSON-RPC error
-/// (a domain failure carrying its machine-code prefix, e.g. the debug
-/// family's `DARTQ/DEBUG/*`), or the transport failed before an answer
-/// (connect refused, no resident session, a wedged engine, a malformed
-/// frame). The MCP face flattens both into its `isError` text; the
-/// routed faces map them onto the fallback ladder.
-#[derive(Debug)]
-pub(crate) enum ProxyError {
-    Daemon(i64, String),
-    Transport(String),
-}
-
-impl ProxyError {
-    /// The one-line reason the fallback advisory carries.
-    fn reason(&self) -> String {
-        match self {
-            Self::Daemon(code, message) => format!("the session answered error {code}: {message}"),
-            Self::Transport(why) => why.clone(),
-        }
-    }
-}
 
 /// One daemon request over the session socket, bounded by `timeout`.
 pub(crate) fn session_call(

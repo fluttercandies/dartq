@@ -94,6 +94,7 @@ pub(crate) fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
     let _ = args.verbosity;
     // The resident consult (#2629) leads: the session's maintained view
     // answers the same report, rendered through the same writers.
+    #[cfg(unix)]
     if let Some(code) = crate::resident::route_impact(args, out) {
         return code;
     }
