@@ -82,8 +82,7 @@ fn for_in_declared_typed_variable_body_read_stays_silent() {
 /// the pin stays `#[ignore]`d until the flow rider lands.
 #[test]
 fn for_in_declared_head_does_not_leak_scope() {
-    let source =
-        "void f(List<int> x, int i) {\n  for (var i in x) {}\n  i;\n}\n";
+    let source = "void f(List<int> x, int i) {\n  for (var i in x) {}\n  i;\n}\n";
     let rows = not_assigned(source);
     assert!(rows.is_empty(), "{rows:?}");
 }

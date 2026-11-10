@@ -175,9 +175,7 @@ fn bool_literal_initializer_promotes_to_declared_non_null() {
     assert!(
         promoted
             .iter()
-            .any(|(snippet, ty)| *snippet == "o"
-                && ty.base == Base::Name(ids[1])
-                && !ty.nullable),
+            .any(|(snippet, ty)| *snippet == "o" && ty.base == Base::Name(ids[1]) && !ty.nullable),
         "the promotion row stands on `o`: {promoted:?}"
     );
 }

@@ -130,8 +130,12 @@ fn family_of(fixture: &str) -> (Vec<(&'static str, u32, String)>, String) {
 
 /// Offset of `needle` inside the first occurrence of `line` in `source`.
 fn at(source: &str, line: &str, needle: &str) -> u32 {
-    let line_at = source.find(line).unwrap_or_else(|| panic!("fixture has {line:?}"));
-    let needle_at = line.find(needle).unwrap_or_else(|| panic!("{line:?} has {needle:?}"));
+    let line_at = source
+        .find(line)
+        .unwrap_or_else(|| panic!("fixture has {line:?}"));
+    let needle_at = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("{line:?} has {needle:?}"));
     (line_at + needle_at) as u32
 }
 
@@ -148,7 +152,11 @@ fn explicit_const_list_for_element_reports_the_element_alone() {
     let (rows, source) = family_of(fixture);
     assert_eq!(
         rows,
-        [("const_eval_for_element", at(&source, fixture, FOR), FOR.to_string())],
+        [(
+            "const_eval_for_element",
+            at(&source, fixture, FOR),
+            FOR.to_string()
+        )],
         "{rows:#?}"
     );
 }
@@ -168,8 +176,16 @@ fn top_level_const_set_and_map_for_elements_add_the_site_default() {
     assert_eq!(
         rows,
         [
-            ("const_eval_for_element", at(&source, set, FOR), FOR.to_string()),
-            ("const_eval_for_element", at(&source, map, map_for), map_for.to_string()),
+            (
+                "const_eval_for_element",
+                at(&source, set, FOR),
+                FOR.to_string()
+            ),
+            (
+                "const_eval_for_element",
+                at(&source, map, map_for),
+                map_for.to_string()
+            ),
             (
                 "const_initialized_with_non_constant_value",
                 at(&source, set, "{"),
@@ -198,7 +214,11 @@ fn for_element_under_an_if_element_reports_the_for_alone() {
     assert_eq!(
         rows,
         [
-            ("const_eval_for_element", at(&source, fixture, FOR), FOR.to_string()),
+            (
+                "const_eval_for_element",
+                at(&source, fixture, FOR),
+                FOR.to_string()
+            ),
             (
                 "const_initialized_with_non_constant_value",
                 at(&source, fixture, "["),
@@ -222,7 +242,11 @@ fn for_in_element_spans_the_head_through_the_body() {
     assert_eq!(
         rows,
         [
-            ("const_eval_for_element", at(&source, fixture, for_in), for_in.to_string()),
+            (
+                "const_eval_for_element",
+                at(&source, fixture, for_in),
+                for_in.to_string()
+            ),
             (
                 "const_initialized_with_non_constant_value",
                 at(&source, fixture, "[for"),
@@ -250,7 +274,11 @@ fn local_const_for_element_has_no_site_default() {
     let (rows, source) = family_of(fixture);
     assert_eq!(
         rows,
-        [("const_eval_for_element", at(&source, fixture, FOR), FOR.to_string())],
+        [(
+            "const_eval_for_element",
+            at(&source, fixture, FOR),
+            FOR.to_string()
+        )],
         "{rows:#?}"
     );
 }
@@ -270,7 +298,11 @@ fn typed_top_level_literal_site_default_spans_the_type_arguments() {
     assert_eq!(
         rows,
         [
-            ("const_eval_for_element", at(&source, fixture, FOR), FOR.to_string()),
+            (
+                "const_eval_for_element",
+                at(&source, fixture, FOR),
+                FOR.to_string()
+            ),
             (
                 "const_initialized_with_non_constant_value",
                 at(&source, fixture, "<int>["),
@@ -300,7 +332,13 @@ fn stray_expression_in_a_typed_map_reports_expression_in_map() {
     let m5 = "  const m5 = <String, int>{'a', 'b': 2, 'c'};\n";
     let fixture = format!("{m1}{m2}void f() {{\n{m3}{m4}{m5}}}\n");
     let (rows, source) = family_of(&fixture);
-    let a = |line: &str| ("expression_in_map", at(&source, line, "'a'"), "'a'".to_string());
+    let a = |line: &str| {
+        (
+            "expression_in_map",
+            at(&source, line, "'a'"),
+            "'a'".to_string(),
+        )
+    };
     assert_eq!(
         rows,
         [
@@ -309,7 +347,11 @@ fn stray_expression_in_a_typed_map_reports_expression_in_map() {
             a(m3),
             a(m4),
             a(m5),
-            ("expression_in_map", at(&source, m5, "'c'"), "'c'".to_string()),
+            (
+                "expression_in_map",
+                at(&source, m5, "'c'"),
+                "'c'".to_string()
+            ),
         ],
         "{rows:#?}"
     );

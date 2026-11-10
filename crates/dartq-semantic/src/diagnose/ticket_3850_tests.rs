@@ -29,7 +29,11 @@ fn render<'a>(bounds: &Bounds<'a>, strings: &'a StringTable, tree: &TypeTree) ->
 
 /// The rendered per-parameter defaults `itb_default_args` answers for
 /// `head`, in declaration order.
-fn rendered_defaults<'a>(bounds: &Bounds<'a>, strings: &'a StringTable, head: StringId) -> Vec<String> {
+fn rendered_defaults<'a>(
+    bounds: &Bounds<'a>,
+    strings: &'a StringTable,
+    head: StringId,
+) -> Vec<String> {
     bounds
         .itb_default_args(strings, head)
         .expect("the head's defaults answer")
@@ -172,10 +176,7 @@ fn argument_bearing_alias_bound_substitutes_the_peer_default() {
     bounds.end_type_variables();
     bounds.note_container(Some(a), 25, 55, false, false);
 
-    assert_eq!(
-        rendered_defaults(&bounds, &strings, a),
-        ["G<num>", "num"]
-    );
+    assert_eq!(rendered_defaults(&bounds, &strings, a), ["G<num>", "num"]);
 }
 
 /// `class A<X extends List<G>>` — an alias leaf nested inside an

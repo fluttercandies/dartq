@@ -69,15 +69,10 @@ fn method_override_of_a_non_virtual_super_member_reports() {
 /// member stays silent (the negative half of the pin above).
 #[test]
 fn method_override_of_a_plain_super_member_stays_silent() {
-    let fixture = format!(
-        "{NON_VIRTUAL}class A {{ void f() {{}} }} class B extends A {{ void f() {{}} }}"
-    );
+    let fixture =
+        format!("{NON_VIRTUAL}class A {{ void f() {{}} }} class B extends A {{ void f() {{}} }}");
     let report = report_ops(&fixture);
-    assert!(
-        non_virtual_rows(&report).is_empty(),
-        "{:?}",
-        rows(&report)
-    );
+    assert!(non_virtual_rows(&report).is_empty(), "{:?}", rows(&report));
 }
 
 /// `implements` is not inheritance for this face: the oracle reads the
@@ -91,11 +86,7 @@ fn an_interface_member_never_reports() {
          class B implements A {{ void f() {{}} }}"
     );
     let report = report_ops(&fixture);
-    assert!(
-        non_virtual_rows(&report).is_empty(),
-        "{:?}",
-        rows(&report)
-    );
+    assert!(non_virtual_rows(&report).is_empty(), "{:?}", rows(&report));
 }
 
 /// A mixin equal member: the class's `with` face is an inherited concrete

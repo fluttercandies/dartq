@@ -467,10 +467,8 @@ impl<'a> TypeSystem<'a> {
             let (fi, gi) = (f.named.offset() + i, g.named.offset() + i);
             if self.table.named_names_cmp(fi, gi) != Ordering::Equal
                 || self.table.named_required(fi) != self.table.named_required(gi)
-                || !self.is_structurally_equal(
-                    rename(self.table.named_ty(fi)),
-                    self.table.named_ty(gi),
-                )
+                || !self
+                    .is_structurally_equal(rename(self.table.named_ty(fi)), self.table.named_ty(gi))
             {
                 return false;
             }
@@ -1601,7 +1599,6 @@ mod tests {
         assert_eq!(sys.least_upper_bound(never_q, int), int_q);
     }
 
-
     /// The left-type-variable-bound rule (subtype.dart:490-500): a type
     /// variable satisfies a bound its declared bound satisfies — the
     /// F-bounded `type_argument_not_matching_bounds` shape (an argument
@@ -1647,10 +1644,7 @@ mod tests {
         ));
         // F-bounded: `Y extends Iterable<Y>` gives `Y <: Iterable<Y>` —
         // the bound's self-reference resolves through rule 12.
-        assert!(bounded_sys.is_subtype(
-            t_of(f_bounded),
-            itf(&table, ITERABLE, &[t_of(f_bounded)])
-        ));
+        assert!(bounded_sys.is_subtype(t_of(f_bounded), itf(&table, ITERABLE, &[t_of(f_bounded)])));
     }
 
     /// The unregistered-declaration face: a declaration the hierarchy

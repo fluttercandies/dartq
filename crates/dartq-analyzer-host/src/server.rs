@@ -682,9 +682,11 @@ fn scoped_report(files: &FxHashMap<Arc<str>, FileErrors>, aims: &[crate::Aim]) -
             return None;
         }
     }
-    Some(Report::from_files(files.iter().filter_map(|(file, errors)| {
-        crate::covered(Path::new(&**file), aims).then_some((&**file, errors.rows.as_slice()))
-    })))
+    Some(Report::from_files(files.iter().filter_map(
+        |(file, errors)| {
+            crate::covered(Path::new(&**file), aims).then_some((&**file, errors.rows.as_slice()))
+        },
+    )))
 }
 
 impl State {
@@ -719,9 +721,7 @@ impl State {
                 continue;
             }
             let rows = &errors.rows;
-            let seg = errors
-                .segs
-                .get_or_insert_with(|| file_seg(file, rows));
+            let seg = errors.segs.get_or_insert_with(|| file_seg(file, rows));
             priority += seg.priority;
             srows.extend(seg.kept.iter().map(|frag| Srow {
                 rank: frag.rank,
@@ -795,9 +795,7 @@ impl State {
                 continue;
             }
             let rows = &errors.rows;
-            let seg = errors
-                .segs
-                .get_or_insert_with(|| file_seg(file, rows));
+            let seg = errors.segs.get_or_insert_with(|| file_seg(file, rows));
             // Each fragment indexes its own `Row` — the one
             // representation the daemon keeps.
             srows.extend(seg.kept.iter().map(|frag| Srow {
@@ -981,7 +979,10 @@ fn apply(state: &mut State, message: Message, line: &str) {
             // tree, so a file's notification costs only its `Row`s.
             match serde_json::from_str::<ErrorsNote>(line) {
                 Ok(note) => {
-                    let ErrorsParams { file, errors: mut rows } = note.params;
+                    let ErrorsParams {
+                        file,
+                        errors: mut rows,
+                    } = note.params;
                     // The pushed list lives for the analysis's life:
                     // serde's growth slack is dead bytes per file, and
                     // every row's `location.file` names the one path the
@@ -1148,27 +1149,42 @@ mod tests {
 
         let lib = crate::Aim::Dir(PathBuf::from("/p/lib"));
         let scoped = scoped_report(&files, &[lib]).expect("served");
-        let mut names: Vec<&str> = scoped
-            .rows
-            .iter()
-            .map(|row| &*row.location.file)
-            .collect();
+        let mut names: Vec<&str> = scoped.rows.iter().map(|row| &*row.location.file).collect();
         names.sort_unstable();
         assert_eq!(names, ["/p/lib/a.dart", "/p/lib/deep/b.dart"]);
 
         let file_aim = crate::Aim::File(PathBuf::from("/p/test/t.dart"));
-        assert_eq!(scoped_report(&files, &[file_aim]).expect("served").rows.len(), 1);
+        assert_eq!(
+            scoped_report(&files, &[file_aim])
+                .expect("served")
+                .rows
+                .len(),
+            1
+        );
 
         let yaml_aim = crate::Aim::File(PathBuf::from("/p/pubspec.yaml"));
-        assert!(scoped_report(&files, &[yaml_aim]).expect("served").rows.is_empty());
+        assert!(
+            scoped_report(&files, &[yaml_aim])
+                .expect("served")
+                .rows
+                .is_empty()
+        );
 
         let missing = crate::Aim::File(PathBuf::from("/p/lib/gone.dart"));
-        assert!(scoped_report(&files, &[missing]).is_none(), "unanalyzed file aim falls back");
+        assert!(
+            scoped_report(&files, &[missing]).is_none(),
+            "unanalyzed file aim falls back"
+        );
 
         // An excluded file present in no error list is served — its dir
         // aim simply reports the covered files.
         let excluded = crate::Aim::File(PathBuf::from("/p/lib/skip.dart"));
-        assert!(scoped_report(&files, &[excluded]).expect("served").rows.is_empty());
+        assert!(
+            scoped_report(&files, &[excluded])
+                .expect("served")
+                .rows
+                .is_empty()
+        );
     }
 
     /// The rendered answer line is byte-identical to
@@ -1240,7 +1256,13 @@ mod tests {
                 ),
                 (
                     "/p/lib/deep/b.dart",
-                    vec![row("ERROR", "COMPILE_TIME_ERROR", "/p/lib/deep/b.dart", 5, "bad")],
+                    vec![row(
+                        "ERROR",
+                        "COMPILE_TIME_ERROR",
+                        "/p/lib/deep/b.dart",
+                        5,
+                        "bad",
+                    )],
                 ),
                 (
                     "/p/lib/é.dart",
@@ -1249,7 +1271,13 @@ mod tests {
                 (
                     "/p/pubspec.yaml",
                     vec![
-                        row("ERROR", "COMPILE_TIME_ERROR", "/p/pubspec.yaml", 0, "priority"),
+                        row(
+                            "ERROR",
+                            "COMPILE_TIME_ERROR",
+                            "/p/pubspec.yaml",
+                            0,
+                            "priority",
+                        ),
                         row("WARNING", "STATIC_WARNING", "/p/pubspec.yaml", 0, "kept"),
                     ],
                 ),
@@ -1257,7 +1285,11 @@ mod tests {
             ];
             for (file, rows) in files {
                 let line = errors(file, &rows);
-                apply(&mut state, serde_json::from_str(&line).expect("message"), &line);
+                apply(
+                    &mut state,
+                    serde_json::from_str(&line).expect("message"),
+                    &line,
+                );
             }
             state
         }
@@ -1337,7 +1369,16 @@ mod tests {
             // A content change lands in the re-rendered line.
             feed_lines(
                 &mut state,
-                &errors("/p/lib/a.dart", &[row("ERROR", "COMPILE_TIME_ERROR", "/p/lib/a.dart", 99, "new")]),
+                &errors(
+                    "/p/lib/a.dart",
+                    &[row(
+                        "ERROR",
+                        "COMPILE_TIME_ERROR",
+                        "/p/lib/a.dart",
+                        99,
+                        "new",
+                    )],
+                ),
             );
             let third = rendered(&mut state, &aims).expect("rendered");
             assert_ne!(first, third, "changed map, changed line");
@@ -1478,7 +1519,10 @@ mod tests {
 
         /// Parses `Answer::Face`'s header + payload back out of the wire.
         fn face_parts(wire: &[u8]) -> (crate::daemon::Answer, Vec<u8>) {
-            let newline = wire.iter().position(|b| *b == b'\n').expect("header newline");
+            let newline = wire
+                .iter()
+                .position(|b| *b == b'\n')
+                .expect("header newline");
             let header = std::str::from_utf8(&wire[..newline]).expect("header utf8");
             let answer: crate::daemon::Answer =
                 serde_json::from_str(header).expect("header parses");
@@ -1530,10 +1574,16 @@ mod tests {
                 format: crate::face::FaceFormat::Json,
                 root: None,
             };
-            let first = state.render_face(&aims, &lon, stub_render).expect("rendered");
-            let again = state.render_face(&aims, &lon, stub_render).expect("rendered");
+            let first = state
+                .render_face(&aims, &lon, stub_render)
+                .expect("rendered");
+            let again = state
+                .render_face(&aims, &lon, stub_render)
+                .expect("rendered");
             assert_eq!(first, again, "same (aims, face) hits");
-            let other = state.render_face(&aims, &json, stub_render).expect("rendered");
+            let other = state
+                .render_face(&aims, &json, stub_render)
+                .expect("rendered");
             assert_ne!(first, other, "a different face misses");
             // The report line and the faces share the one cache.
             state.render(&aims).expect("rendered");
@@ -1541,7 +1591,9 @@ mod tests {
             // An epoch bump misses every lane.
             let rows = state.files["/p/lib/a.dart"].rows.clone();
             feed_lines(&mut state, &errors("/p/lib/a.dart", &rows));
-            let re = state.render_face(&aims, &lon, stub_render).expect("rendered");
+            let re = state
+                .render_face(&aims, &lon, stub_render)
+                .expect("rendered");
             assert_eq!(re, first, "identical map re-renders identical bytes");
         }
     }

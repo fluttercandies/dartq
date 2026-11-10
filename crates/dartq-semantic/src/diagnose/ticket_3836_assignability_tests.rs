@@ -21,7 +21,7 @@
 //! // main() { applyTakesNull(takesNever); }
 //! ERROR|COMPILE_TIME_ERROR|ARGUMENT_TYPE_NOT_ASSIGNABLE|...|The argument
 //!   type 'void Function(Never)' can't be assigned to the parameter type
-//!   'void Function(Null)'. 
+//!   'void Function(Null)'.
 //! ```
 //!
 //! The residual this arm does NOT reach — `void Function(Null)` against
@@ -80,6 +80,8 @@ fn nullable_formal_still_refuses_the_never_function() {
     );
     assert_eq!(
         argument_rows(&report),
-        ["The argument type 'void Function(Never)' can't be assigned to the parameter type 'void Function(Null)'."],
+        [
+            "The argument type 'void Function(Never)' can't be assigned to the parameter type 'void Function(Null)'."
+        ],
     );
 }

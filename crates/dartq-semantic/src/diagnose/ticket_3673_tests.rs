@@ -216,7 +216,9 @@ fn probe_throw_as_named_type_dead_interval() {
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "dead_code")
-        .map(|d| source[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string())
+        .map(|d| {
+            source[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string()
+        })
         .collect();
     assert_eq!(rows, ["int)"], "{:?}", report.diagnostics);
 }
@@ -240,7 +242,9 @@ fn probe_throw_as_function_type_dead_interval() {
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "dead_code")
-        .map(|d| source[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string())
+        .map(|d| {
+            source[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string()
+        })
         .collect();
     assert_eq!(rows, ["void Function(X1))"], "{:?}", report.diagnostics);
 }
@@ -321,7 +325,9 @@ fn probe_throw_as_generic_named_type_dead_interval() {
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "dead_code")
-        .map(|d| source[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string())
+        .map(|d| {
+            source[d.range.offset as usize..(d.range.offset + d.range.length) as usize].to_string()
+        })
         .collect();
     assert_eq!(rows, ["C1<X1>)"], "{:?}", report.diagnostics);
 }

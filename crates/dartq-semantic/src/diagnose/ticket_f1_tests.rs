@@ -27,8 +27,7 @@ use crate::resolved_ops::{ClauseTrees, LibraryTypes, ResolvedTypeOps};
 use dartq_language::{Feature, FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_resolution::{
-    ClassModifiers, Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder,
-    Namespaces,
+    ClassModifiers, Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces,
 };
 use dartq_scanner::ScanConfig;
 use dartq_source::{FileTable, StringTable};

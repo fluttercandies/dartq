@@ -593,10 +593,7 @@ pub fn resolve_locator(
 /// own refusals (empty version/dir, `system` without `$DART_SDK`, no HOME
 /// for `fvm:`).
 pub fn sdk_locator_root(locator: &str, config_root: &Path) -> Result<PathBuf, ConfigError> {
-    if locator == "system"
-        || locator.starts_with("fvm:")
-        || locator.starts_with("path:")
-    {
+    if locator == "system" || locator.starts_with("fvm:") || locator.starts_with("path:") {
         return locator_root(locator, config_root, "`sdk`");
     }
     if locator.is_empty() {
@@ -619,11 +616,7 @@ pub fn sdk_locator_root(locator: &str, config_root: &Path) -> Result<PathBuf, Co
 ///
 /// [`ConfigError::Invalid`] for an unsupported form, an empty version or
 /// dir, `system` without `$DART_SDK`, or no HOME for `fvm:`.
-fn locator_root(
-    locator: &str,
-    config_dir: &Path,
-    what: &str,
-) -> Result<PathBuf, ConfigError> {
+fn locator_root(locator: &str, config_dir: &Path, what: &str) -> Result<PathBuf, ConfigError> {
     if locator == "system" {
         return match std::env::var_os("DART_SDK") {
             Some(root) if !root.is_empty() => Ok(PathBuf::from(root)),
@@ -634,9 +627,7 @@ fn locator_root(
     }
     if let Some(version) = locator.strip_prefix("fvm:") {
         if version.is_empty() {
-            return Err(ConfigError::Invalid(format!(
-                "{what}: empty fvm version"
-            )));
+            return Err(ConfigError::Invalid(format!("{what}: empty fvm version")));
         }
         return fvm_version_root(version);
     }

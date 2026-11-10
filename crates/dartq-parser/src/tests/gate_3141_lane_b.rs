@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use super::collector::{latest_features, Collector};
+use super::collector::{Collector, latest_features};
 use crate::ParserFeatures;
 use crate::parser::Parser;
 use dartq_scanner::ScanConfig;
@@ -74,10 +74,7 @@ fn list_pattern_unclosed_adopts_synthetic_closer_at_resume() {
     // resumes on `: break;`).
     assert_rows(
         "void f() { switch (y) { case [;: break; } }",
-        &[
-            ("missing_identifier", 30, 31),
-            ("expected_token", 31, 32),
-        ],
+        &[("missing_identifier", 30, 31), ("expected_token", 31, 32)],
     );
 }
 
@@ -104,19 +101,19 @@ fn selector_and_index_missing_faces() {
     // index faces (official :8017-8032), and the missing-argument faces.
     assert_rows("var x = a.;", &[("missing_identifier", 10, 11)]);
     assert_rows("var x = a.();", &[("missing_identifier", 10, 11)]);
-    assert_rows("var x = a[;", &[
-        ("missing_identifier", 10, 11),
-        ("expected_token", 10, 11),
-    ]);
+    assert_rows(
+        "var x = a[;",
+        &[("missing_identifier", 10, 11), ("expected_token", 10, 11)],
+    );
     assert_rows("var x = a[1;", &[("expected_token", 11, 12)]);
-    assert_rows("var x = f(;", &[
-        ("missing_identifier", 10, 11),
-        ("expected_token", 10, 11),
-    ]);
-    assert_rows("var x = f(a,;", &[
-        ("missing_identifier", 12, 13),
-        ("expected_token", 12, 13),
-    ]);
+    assert_rows(
+        "var x = f(;",
+        &[("missing_identifier", 10, 11), ("expected_token", 10, 11)],
+    );
+    assert_rows(
+        "var x = f(a,;",
+        &[("missing_identifier", 12, 13), ("expected_token", 12, 13)],
+    );
 }
 
 #[test]
@@ -124,27 +121,39 @@ fn collection_literal_element_faces() {
     // List/set/map element junk: the missing-comma split, the element
     // identifier recovery, and the closer cascade (official
     // `parseListLiteralAndRest`/`parseSetOrMapLiteral` recovery paths).
-    assert_rows("var x = [1, ;]", &[
-        ("missing_identifier", 12, 13),
-        ("expected_token", 12, 13),
-        ("expected_token", 13, 14),
-    ]);
-    assert_rows("var x = {1, ;}", &[
-        ("missing_identifier", 12, 13),
-        ("expected_token", 12, 13),
-        ("expected_token", 13, 14),
-    ]);
-    assert_rows("var x = {1: ;}", &[
-        ("missing_identifier", 12, 13),
-        ("expected_token", 12, 13),
-        ("expected_token", 13, 14),
-    ]);
-    assert_rows("var x = {:1, ;}", &[
-        ("missing_identifier", 9, 10),
-        ("missing_identifier", 13, 14),
-        ("expected_token", 13, 14),
-        ("expected_token", 14, 15),
-    ]);
+    assert_rows(
+        "var x = [1, ;]",
+        &[
+            ("missing_identifier", 12, 13),
+            ("expected_token", 12, 13),
+            ("expected_token", 13, 14),
+        ],
+    );
+    assert_rows(
+        "var x = {1, ;}",
+        &[
+            ("missing_identifier", 12, 13),
+            ("expected_token", 12, 13),
+            ("expected_token", 13, 14),
+        ],
+    );
+    assert_rows(
+        "var x = {1: ;}",
+        &[
+            ("missing_identifier", 12, 13),
+            ("expected_token", 12, 13),
+            ("expected_token", 13, 14),
+        ],
+    );
+    assert_rows(
+        "var x = {:1, ;}",
+        &[
+            ("missing_identifier", 9, 10),
+            ("missing_identifier", 13, 14),
+            ("expected_token", 13, 14),
+            ("expected_token", 14, 15),
+        ],
+    );
 }
 
 #[test]
@@ -155,10 +164,13 @@ fn record_literal_named_field_faces() {
     // name (oracle `var r = (5: 1);` posture).
     assert_rows("var x = (a:1, :2);", &[("missing_identifier", 14, 15)]);
     assert_rows("var x = (5: 1);", &[("missing_identifier", 9, 10)]);
-    assert_rows("var x = (:);", &[
-        ("missing_identifier", 9, 10),
-        ("missing_identifier", 10, 11),
-    ]);
+    assert_rows(
+        "var x = (:);",
+        &[
+            ("missing_identifier", 9, 10),
+            ("missing_identifier", 10, 11),
+        ],
+    );
 }
 
 #[test]
@@ -180,10 +192,7 @@ fn switch_expression_arm_faces() {
     // and the arm-comma face (official `parseSwitchExpression` recovery).
     assert_rows(
         "var x = switch(y) { 1 => a, => b };",
-        &[
-            ("missing_identifier", 28, 30),
-            ("expected_token", 31, 32),
-        ],
+        &[("missing_identifier", 28, 30), ("expected_token", 31, 32)],
     );
 }
 
@@ -209,32 +218,29 @@ fn metadata_type_arguments_uninstantiated_anchor() {
     // a zero-width synthetic walks back to the last real token
     // (`@A<int,;` → the `;`, type_info_impl.dart:1713-1722 +
     // util.dart:39-53).
-    assert_rows("@A<int> x;", &[
-        (
-            "annotation_with_type_arguments_uninstantiated",
-            6,
-            7,
-        ),
-        ("missing_const_final_var_or_type", 8, 9),
-    ]);
-    assert_rows("@A<int;", &[
-        (
-            "annotation_with_type_arguments_uninstantiated",
-            1,
-            2,
-        ),
-        ("expected_executable", 2, 3),
-        ("missing_const_final_var_or_type", 3, 6),
-    ]);
-    assert_rows("@A<int,;", &[
-        (
-            "annotation_with_type_arguments_uninstantiated",
-            7,
-            8,
-        ),
-        ("expected_type_name", 7, 8),
-        ("unexpected_token", 7, 8),
-    ]);
+    assert_rows(
+        "@A<int> x;",
+        &[
+            ("annotation_with_type_arguments_uninstantiated", 6, 7),
+            ("missing_const_final_var_or_type", 8, 9),
+        ],
+    );
+    assert_rows(
+        "@A<int;",
+        &[
+            ("annotation_with_type_arguments_uninstantiated", 1, 2),
+            ("expected_executable", 2, 3),
+            ("missing_const_final_var_or_type", 3, 6),
+        ],
+    );
+    assert_rows(
+        "@A<int,;",
+        &[
+            ("annotation_with_type_arguments_uninstantiated", 7, 8),
+            ("expected_type_name", 7, 8),
+            ("unexpected_token", 7, 8),
+        ],
+    );
 }
 
 #[test]
@@ -244,11 +250,14 @@ fn metadata_invocation_junk_faces() {
     // is the declaration-loop junk row; `@A<int>.x(;` — the argument
     // position's identifier recovery plus the closer cascade).
     assert_rows("@A();", &[("unexpected_token", 4, 5)]);
-    assert_rows("@A<int>.x(;", &[
-        ("expected_token", 10, 11),
-        ("missing_identifier", 10, 11),
-        ("unexpected_token", 10, 11),
-    ]);
+    assert_rows(
+        "@A<int>.x(;",
+        &[
+            ("expected_token", 10, 11),
+            ("missing_identifier", 10, 11),
+            ("unexpected_token", 10, 11),
+        ],
+    );
 }
 
 #[test]
@@ -279,9 +288,12 @@ fn type_group_closer_faces() {
     // f<T`, `class C<T`, `class C<T,S`) ride the declarations lane's
     // EOF-span convention and are certified on the machine face by the
     // conformance battery, not pinned here.
-    assert_rows("A<int;", &[
-        ("expected_token", 2, 5),
-        ("missing_function_body", 5, 6),
-        ("missing_function_parameters", 0, 1),
-    ]);
+    assert_rows(
+        "A<int;",
+        &[
+            ("expected_token", 2, 5),
+            ("missing_function_body", 5, 6),
+            ("missing_function_parameters", 0, 1),
+        ],
+    );
 }

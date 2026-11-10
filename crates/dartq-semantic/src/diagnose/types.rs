@@ -1141,10 +1141,7 @@ impl<'a> Boundary<'a> {
                     .map(|&(n, t)| (n, self.canonical_dotted_ty(t)))
                     .collect();
                 if new_positional == positional
-                    && new_named
-                        .iter()
-                        .zip(named.iter())
-                        .all(|(a, b)| a == b)
+                    && new_named.iter().zip(named.iter()).all(|(a, b)| a == b)
                 {
                     return ty;
                 }
@@ -1190,10 +1187,7 @@ impl<'a> Boundary<'a> {
                     .collect();
                 if new_return_ty == return_ty
                     && new_positional == positional
-                    && new_named
-                        .iter()
-                        .zip(named.iter())
-                        .all(|(a, b)| a == b)
+                    && new_named.iter().zip(named.iter()).all(|(a, b)| a == b)
                     && new_type_params_named
                         .iter()
                         .zip(type_params_named.iter())
@@ -1390,13 +1384,7 @@ impl<'a> Boundary<'a> {
         nullable: bool,
     ) -> Ty {
         if type_params_named.is_empty() {
-            return self.intern_function_ty(
-                type_params,
-                return_ty,
-                positional,
-                named,
-                nullable,
-            );
+            return self.intern_function_ty(type_params, return_ty, positional, named, nullable);
         }
         self.args.borrow_mut().function_generic(
             type_params_named,
@@ -6133,9 +6121,7 @@ impl<'a> Engine<'a> {
             // scope): any named head failing `resolve_bare`'s
             // declaration face — a scope param, a local read, a prefix,
             // `this`, a miss — keeps the site's parse-time verdict.
-            if self.ty_has_scope_head(operand_ty)
-                || self.ty_args_have_scope_head(checked)
-            {
+            if self.ty_has_scope_head(operand_ty) || self.ty_args_have_scope_head(checked) {
                 continue;
             }
             // The verdict anchors at the whole `is` expression — operand
@@ -6341,9 +6327,10 @@ impl<'a> Engine<'a> {
         let mut nullable = false;
         let last = tokens.get(idx - 1)?;
         let end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
-        if tokens.get(idx).is_some_and(|t| {
-            t.kind == TokenKind::Question && t.utf16_offset == end
-        }) {
+        if tokens
+            .get(idx)
+            .is_some_and(|t| t.kind == TokenKind::Question && t.utf16_offset == end)
+        {
             nullable = true;
             idx += 1;
         }
@@ -6439,12 +6426,8 @@ impl<'a> Engine<'a> {
         if decl.kind != ContainerKind::Class {
             return;
         }
-        if !self.face_has_non_final_field(
-            self.file,
-            self.lib,
-            container,
-            &mut FxHashSet::default(),
-        ) || self.class_mixin_adds_instance_field(decl, container)
+        if !self.face_has_non_final_field(self.file, self.lib, container, &mut FxHashSet::default())
+            || self.class_mixin_adds_instance_field(decl, container)
         {
             return;
         }
@@ -6539,9 +6522,10 @@ impl<'a> Engine<'a> {
         let scope_lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(lib);
         decl.superclass.is_some_and(|superclass| {
             self.face_has_non_final_field(owner, scope_lib, superclass, seen)
-        }) || decl.with_clause.iter().any(|mixin| {
-            self.face_has_non_final_field(owner, scope_lib, *mixin, seen)
-        })
+        }) || decl
+            .with_clause
+            .iter()
+            .any(|mixin| self.face_has_non_final_field(owner, scope_lib, *mixin, seen))
     }
 
     /// Whether one of the class's mixins adds an instance field — the
@@ -6604,9 +6588,14 @@ impl<'a> Engine<'a> {
         let Some(super_name) = decl.superclass else {
             return false;
         };
-        let Some((super_decl, super_file)) =
-            resolve_container(self.graph, self.namespaces, self.index, self.lib, self.file, super_name)
-        else {
+        let Some((super_decl, super_file)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            super_name,
+        ) else {
             return false;
         };
         // An enum's generative constructors are implicitly const.
@@ -6664,7 +6653,9 @@ impl<'a> Engine<'a> {
                                 && tokens.get(index + 3).map(|next| &next.kind)
                                     == Some(&dartq_scanner::TokenKind::OpenParen)
                             {
-                                return Some(self.intern(self.tokens.lexeme(self.source, index + 2)));
+                                return Some(
+                                    self.intern(self.tokens.lexeme(self.source, index + 2)),
+                                );
                             }
                         }
                         _ => {}

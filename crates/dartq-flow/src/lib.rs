@@ -254,8 +254,6 @@ mod ticket_3389_tests;
 #[cfg(test)]
 mod ticket_3397_tests;
 
-
-
 #[cfg(test)]
 mod ticket_3405_tests;
 
@@ -272,9 +270,9 @@ mod ticket_3435_tests;
 mod ticket_3452_tests;
 
 #[cfg(test)]
-mod ticket_3491_tests;
-#[cfg(test)]
 mod ticket_3486_tests;
+#[cfg(test)]
+mod ticket_3491_tests;
 
 #[cfg(test)]
 #[path = "ticket_3518_pins.rs"]

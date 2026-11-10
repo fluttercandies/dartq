@@ -73,4 +73,3 @@ fn bound_position_faces_match_oracle() {
         "oracle: `super` is not a bound type"
     );
 }
-

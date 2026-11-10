@@ -341,7 +341,9 @@ fn dmu_plain_constructor_star_absent() {
     let elements = crate::collector::collect(source, &scanned.tokens, features, &strings);
     let a = strings.intern("A");
     assert!(
-        elements.ctor_annotations(a, strings.intern("named")).is_none(),
+        elements
+            .ctor_annotations(a, strings.intern("named"))
+            .is_none(),
         "{elements:?}"
     );
 }

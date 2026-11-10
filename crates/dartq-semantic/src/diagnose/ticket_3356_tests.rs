@@ -185,10 +185,12 @@ fn prefixed_container_eq_null_reports() {
 /// through the untyped-row face the member walk resolves.
 #[test]
 fn member_read_eq_null_reports() {
-    let report = report_ops("class C {\n\
+    let report = report_ops(
+        "class C {\n\
          \x20 int f = 0;\n\
          \x20 void m() { f == null; }\n\
-         }\n");
+         }\n",
+    );
     assert_eq!(
         count(&report, "unnecessary_null_comparison"),
         1,
@@ -201,10 +203,12 @@ fn member_read_eq_null_reports() {
 /// never-null face.
 #[test]
 fn nullable_member_eq_null_stays_silent() {
-    let report = report_ops("class C {\n\
+    let report = report_ops(
+        "class C {\n\
          \x20 int? f;\n\
          \x20 void m() { f == null; }\n\
-         }\n");
+         }\n",
+    );
     assert!(
         !names(&report).contains(&"unnecessary_null_comparison"),
         "int? f == null is informative: {:?}",

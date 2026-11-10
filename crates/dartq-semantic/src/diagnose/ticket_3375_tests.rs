@@ -95,7 +95,10 @@ fn at(source: &str, needle: &str) -> u32 {
 /// `c.HashSet`).
 fn leaf_at(source: &str, prefixed: &str) -> (u32, u32) {
     let dot = prefixed.find('.').expect("prefixed spelling") + 1;
-    (at(source, prefixed) + dot as u32, (prefixed.len() - dot) as u32)
+    (
+        at(source, prefixed) + dot as u32,
+        (prefixed.len() - dot) as u32,
+    )
 }
 
 /// Diagnoses `main` importing `lib_source` under `prefix` (bare when
@@ -138,7 +141,10 @@ fn diagnose_with_combinators(
         },
         file_m,
     );
-    assert!(scanned_m.diagnostics.is_empty(), "{main:?} scan diagnostics");
+    assert!(
+        scanned_m.diagnostics.is_empty(),
+        "{main:?} scan diagnostics"
+    );
     let elements_a = collect(lib_source, &scanned_a.tokens, features, &strings);
     let elements_m = collect(main, &scanned_m.tokens, features, &strings);
     let mut builder = LibraryGraphBuilder::new(&strings);
@@ -160,8 +166,7 @@ fn diagnose_with_combinators(
     let clauses = clauses
         .iter()
         .map(|&(hide, names)| {
-            let names: Box<[StringId]> =
-                names.iter().map(|n| strings.intern(n)).collect();
+            let names: Box<[StringId]> = names.iter().map(|n| strings.intern(n)).collect();
             if *hide {
                 dartq_resolution::CombinatorClause::Hide(names)
             } else {
@@ -271,12 +276,8 @@ fn t3375_prefixed_show_admits_only_shown() {
 #[test]
 fn t3375_prefixed_hide_drops_only_hidden() {
     let main = "import 'lib.dart' as M hide z; void f() { M.e; M.z; }";
-    let report = diagnose_with_combinators(
-        main,
-        "var e = 0; var z = 0;",
-        Some("M"),
-        &[(&true, &["z"])],
-    );
+    let report =
+        diagnose_with_combinators(main, "var e = 0; var z = 0;", Some("M"), &[(&true, &["z"])]);
     assert_eq!(
         undefined_prefixed_rows(&report),
         vec![leaf_at(main, "M.z")],
@@ -291,8 +292,7 @@ fn t3375_prefixed_hide_drops_only_hidden() {
 /// alone (`Foo;` stays undefined — the oracle's unit-scope rule).
 #[test]
 fn t3375_prefix_show_hide_class_face() {
-    let main =
-        "import 'lib.dart' as p show Foo hide Bar; void f() { p.Foo; p.Bar; p.Baz; Foo; }";
+    let main = "import 'lib.dart' as p show Foo hide Bar; void f() { p.Foo; p.Bar; p.Baz; Foo; }";
     let report = diagnose_with_combinators(
         main,
         "class Foo {} class Bar {} class Baz {}",

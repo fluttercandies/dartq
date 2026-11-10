@@ -238,9 +238,11 @@ fn ticket_3274_no_context_keeps_dynamic() {
         rows(&report)
     );
     assert!(
-        report.diagnostics.iter().any(|diagnostic| diagnostic.code.name
-            == "invalid_assignment"
-            && diagnostic.message.contains("LinkedHashSet<dynamic>")),
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.name == "invalid_assignment"
+                && diagnostic.message.contains("LinkedHashSet<dynamic>")),
         "{:?}",
         rows(&report)
     );

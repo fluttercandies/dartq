@@ -22,9 +22,7 @@
 use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, rows};
 
 /// Every diagnostic's `(name, offset, length)` triple in source order.
-fn triples(
-    report: &crate::diagnose::FileReport,
-) -> Vec<(&'static str, u32, u32)> {
+fn triples(report: &crate::diagnose::FileReport) -> Vec<(&'static str, u32, u32)> {
     report
         .diagnostics
         .iter()
@@ -46,8 +44,7 @@ fn ticket_2272_question_dot_nullable_receiver_lifts_result() {
     let rows = triples(&report);
     assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
     assert_eq!(rows[0].0, "invalid_assignment");
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("a?.b").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("a?.b").unwrap();
     assert_eq!(rows[0].1, offset as u32, "{rows:?}");
 }
 
@@ -62,10 +59,7 @@ fn ticket_2272_question_dot_non_null_receiver_reports_and_lifts() {
                    void f(A a) {\n  B x = a?.b;\n  g(x);\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert!(
-        names.contains(&"invalid_null_aware_operator"),
-        "{names:?}"
-    );
+    assert!(names.contains(&"invalid_null_aware_operator"), "{names:?}");
     assert!(names.contains(&"invalid_assignment"), "{names:?}");
 }
 
@@ -74,8 +68,7 @@ fn ticket_2272_question_dot_non_null_receiver_reports_and_lifts() {
 /// node the `?.` guards), so `C x = a?.b.c` reports.
 #[test]
 fn ticket_2272_question_dot_chained_continuation_lifts() {
-    let fixture =
-        "class A { B b = B(); } class B { C c = C(); } class C {}\n\
+    let fixture = "class A { B b = B(); } class B { C c = C(); } class C {}\n\
          void g(Object? o) {}\n\
          void f(A? a) {\n  C x = a?.b.c;\n  g(x);\n}";
     let report = report_ops(fixture);

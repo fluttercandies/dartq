@@ -26,7 +26,7 @@
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
-use crate::ty::{ArgTy, Base, Classification, Ty, TypeOps, EMPTY_ARGS};
+use crate::ty::{ArgTy, Base, Classification, EMPTY_ARGS, Ty, TypeOps};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -203,7 +203,8 @@ fn unordered_arms_join_to_the_unknown_face_not_the_else_arm() {
         ids: std::cell::RefCell::new(Vec::new()),
         edges: &[(0, 2), (1, 2)],
     };
-    let source = "void f(bool b) {\n  Object? o;\n  o = b ? C1() : N();\n  o;\n}\nclass C1 {}\nclass N {}\n";
+    let source =
+        "void f(bool b) {\n  Object? o;\n  o = b ? C1() : N();\n  o;\n}\nclass C1 {}\nclass N {}\n";
     let (ids, facts) = analyze(source, &["C1", "N", "Object"], Some(&ops));
     let object = ids[2];
     assert_eq!(
@@ -227,8 +228,7 @@ fn else_subtype_of_then_yields_the_then_arm() {
         ids: std::cell::RefCell::new(Vec::new()),
         edges: &[(1, 0)],
     };
-    let source =
-        "void f(bool b, A? a, B? c2) {\n  var x = b ? a : c2;\n  x;\n}\nclass A {}\nclass B extends A {}\n";
+    let source = "void f(bool b, A? a, B? c2) {\n  var x = b ? a : c2;\n  x;\n}\nclass A {}\nclass B extends A {}\n";
     let (ids, facts) = analyze(source, &["A", "B"], Some(&ops));
     let a = ids[0];
     assert_eq!(
@@ -251,8 +251,7 @@ fn then_subtype_of_else_yields_the_else_arm() {
         ids: std::cell::RefCell::new(Vec::new()),
         edges: &[(1, 0)],
     };
-    let source =
-        "void f(bool b, A? a, B? c2) {\n  var x = b ? c2 : a;\n  x;\n}\nclass A {}\nclass B extends A {}\n";
+    let source = "void f(bool b, A? a, B? c2) {\n  var x = b ? c2 : a;\n  x;\n}\nclass A {}\nclass B extends A {}\n";
     let (ids, facts) = analyze(source, &["A", "B"], Some(&ops));
     let a = ids[0];
     assert_eq!(
@@ -343,8 +342,7 @@ fn nullable_arm_widens_the_join() {
         ids: std::cell::RefCell::new(Vec::new()),
         edges: &[],
     };
-    let source =
-        "void f(bool b, A a, A? c2) {\n  var x = b ? a : c2;\n  x;\n}\nclass A {}\n";
+    let source = "void f(bool b, A a, A? c2) {\n  var x = b ? a : c2;\n  x;\n}\nclass A {}\n";
     let (ids, facts) = analyze(source, &["A"], Some(&ops));
     let a = ids[0];
     assert_eq!(

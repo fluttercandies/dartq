@@ -473,13 +473,10 @@ fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
         for &neighbor in &dependents[vertex] {
             if preorder[neighbor] == usize::MAX {
                 visit(
-                    neighbor, dependents, count, preorder, unassigned, candidates, assigned,
-                    result,
+                    neighbor, dependents, count, preorder, unassigned, candidates, assigned, result,
                 );
             } else if !assigned[neighbor] {
-                while preorder[*candidates.last().expect("path is nonempty")]
-                    > preorder[neighbor]
-                {
+                while preorder[*candidates.last().expect("path is nonempty")] > preorder[neighbor] {
                     candidates.pop();
                 }
             }
@@ -556,9 +553,7 @@ impl SelfReferenceState {
         };
         let mut scope: Vec<StringId> = capture.params.iter().map(|(name, _, _)| *name).collect();
         for (_, bound, poisoned) in &capture.params {
-            if !*poisoned
-                && let Some(tree) = bound
-            {
+            if !*poisoned && let Some(tree) = bound {
                 self.tree(index, tree, &scope);
             }
         }
@@ -577,16 +572,17 @@ impl SelfReferenceState {
                     scope.extend(type_params.iter().map(|(name, _, _)| *name));
                 }
                 for (_, bound, poisoned) in type_params {
-                    if !*poisoned
-                        && let Some(tree) = bound
-                    {
+                    if !*poisoned && let Some(tree) = bound {
                         self.tree(index, tree, &scope);
                     }
                 }
                 if let Some(tree) = ret {
                     self.tree(index, tree, &scope);
                 }
-                for tree in positional.iter().chain(named.iter().map(|(_, tree, _)| tree)) {
+                for tree in positional
+                    .iter()
+                    .chain(named.iter().map(|(_, tree, _)| tree))
+                {
                     self.tree(index, tree, &scope);
                 }
             }
@@ -606,9 +602,7 @@ impl SelfReferenceState {
             return;
         }
         for (bound, poisoned) in &capture.bounds {
-            if !*poisoned
-                && let Some(tree) = bound
-            {
+            if !*poisoned && let Some(tree) = bound {
                 self.tree(index, tree, &capture.params);
             }
         }
@@ -2087,7 +2081,9 @@ impl<'a> Bounds<'a> {
         fn fingerprint(window: &[(StringId, Option<TypeTree>, bool)]) -> Vec<(StringId, u32)> {
             window
                 .iter()
-                .map(|(name, bound, _)| (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset)))
+                .map(|(name, bound, _)| {
+                    (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                })
                 .collect()
         }
         let adopted: Vec<Vec<(StringId, u32)>> = self
@@ -2687,11 +2683,7 @@ impl<'a> Bounds<'a> {
                     true,
                 ) {
                     Some(inverted) => inverted,
-                    None => replace_top_bottom_with_facts(
-                        &system,
-                        &merged_facts,
-                        instantiation,
-                    ),
+                    None => replace_top_bottom_with_facts(&system, &merged_facts, instantiation),
                 }
             } else {
                 match Self::invert_instantiation(
@@ -2706,11 +2698,7 @@ impl<'a> Bounds<'a> {
                     false,
                 ) {
                     Some(inverted) => inverted,
-                    None => replace_top_bottom_with_facts(
-                        &system,
-                        &merged_facts,
-                        instantiation,
-                    ),
+                    None => replace_top_bottom_with_facts(&system, &merged_facts, instantiation),
                 }
             };
             let inverted_issues = regular_bounded_issues(&system, &merged_facts, inverted);
@@ -2725,248 +2713,245 @@ impl<'a> Bounds<'a> {
             return Vec::new();
         }
         {
-                // The type-parameter-argument gate (see `check_named`).
-                // An issue on an in-scope parameter argument `X`/`X?`
-                // keeps only when `X <: B` is decided false — the official
-                // left-variable-bound rule `bound(X) <: B`
-                // (subtype.dart:490-500):
-                // * a DECL-scoped id reads its declared bound from `facts`
-                //   (`dynamic`-mapped reads as the implicit `Object?`), so
-                //   `X <: B` is honest both ways;
-                // * a WINDOW-scoped name reads its written bound tree from
-                //   the captured window (an unbounded parameter reads the
-                //   implicit `Object?`, a name the window does not declare
-                //   falls back to the `facts` face);
-                // * a lazy-scope bounded name is unmodelable — non-nullable
-                //   args never reach here (pre-gate), and a nullable `X?`
-                //   keeps only when `Null <: B` fails;
-                // * any other in-scope name is an unbounded parameter —
-                //   the implicit `Object?` bound decides it.
-                // An unsafe declared bound reads as unmodelable and drops
-                // (the under-report direction).
-                let null = snapshot.table.intern(UninternedType::Null, false);
-                let object_q = snapshot.table.intern(
-                    UninternedType::Interface {
-                        decl: snapshot.hierarchy.core().object,
-                        args: Vec::new(),
-                    },
-                    true,
-                );
-                // `None`: the declared bound is unmodelable — drop the
-                // issue (under-report). `Some(None)`: the implicit
-                // `Object?` bound decides. `Some(Some(bound))`: `X <: B`
-                // rides the parameter's own bound.
-                let bound_of = |arg: &TypeTree| -> Option<Option<TypeId>> {
-                    if let ScopeKind::Window(map) = kind
-                        && let Some(bound_tree) = map.get(&arg.head)
-                    {
-                        let Some(tree) = bound_tree else {
-                            return Some(None);
-                        };
-                        return match ctx.map_tree(tree, scope) {
-                            Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
-                            _ => None,
-                        };
-                    }
-                    if !matches!(kind, ScopeKind::Lazy) {
-                        let Some(&id) = scope.get(&arg.head) else {
-                            return Some(None);
-                        };
-                        return match snapshot.facts.get(id).bound {
-                            Some(bound)
-                                if matches!(
-                                    snapshot.table.get(bound).kind(),
-                                    TypeKind::Dynamic
-                                ) =>
-                            {
-                                Some(None)
-                            }
-                            Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
-                            Some(_) => None,
-                            None => Some(None),
-                        };
-                    }
-                    Some(None)
-                };
-                let issues: Vec<_> = issues
-                    .into_iter()
-                    .filter(|issue| {
-                        let Some(arg) = args.get(issue.index) else {
-                            return true;
-                        };
-                        if !scope.contains_key(&arg.head) {
-                            return true;
-                        }
-                        if matches!(kind, ScopeKind::Lazy)
-                            && self.index.bounded_params.contains(&arg.head)
-                        {
-                            return arg.nullable && !system.is_subtype(null, issue.bound);
-                        }
-                        let param_bound = match bound_of(arg) {
-                            Some(Some(bound)) => bound,
-                            Some(None) => object_q,
-                            None => return false,
-                        };
-                        !system.is_subtype(param_bound, issue.bound)
-                            || (arg.nullable && !system.is_subtype(null, issue.bound))
-                    })
-                    .collect();
-                if issues.is_empty() {
-                    return Vec::new();
-                }
-                // The context face (`type_arguments_verifier.dart:427-465`):
-                // where the super-bounded pass ran, every report carries the
-                // inverted type's row — and the issues ARE the inverted
-                // pass's there (`_isSuperBounded` reports those), so the
-                // display re-runs the same inversion. The extension-type
-                // face skips the pass upstream too. A bare head keys the
-                // raw-type context row on the i2b instantiation.
-                // `inverted_ty` is the instantiation the failing pass
-                // checked — the written-level alias-faithful inversion
-                // (`Self::invert_instantiation`), or the expanded
-                // `replace_top_bottom_with_facts` answer where a written
-                // inversion could not be derived. The display reads the
-                // same type the verdict rested on.
-                let inverted = inverted_ty.map(|ty| snapshot.display(ty));
-                let raw_instantiated = raw.then(|| snapshot.display(instantiation));
-                // The message's argument and bound are the WRITTEN
-                // spellings, substituted the way the failing pass
-                // substituted its types (#3510): the oracle's
-                // `getDisplayString` keeps an alias decoration on every
-                // type the alias application built (`'G<Null>'`,
-                // `'Fcov<Object>'`, display_string_builder.dart:379-382),
-                // which the snapshot's fully expanded model drops. The
-                // reporting pass decides the rendering: the regular pass
-                // renders the written arguments resolved, the inverted
-                // pass re-runs the per-position top/bottom flip over the
-                // written trees — the same variance-aware walk the
-                // oracle's alias-preserving visitor applies. The bound's
-                // substitution then renders each substituted leaf through
-                // its written argument's text, so `Fcon<X>` over the
-                // argument `Fcon<Never?>` prints `'Fcon<Fcon<Never?>>'`.
-                // A bare head (no written arguments) substitutes the
-                // expanded instantiation's display instead — read from the
-                // type the REPORTING pass checked: where the super-bounded
-                // pass ran, the issues are the inverted type's and the
-                // official substitutes each bound through the inverted
-                // arguments (`invertedSubstitution = Substitution.fromPairs2(
-                // typeParameters, invertedTypeArguments)`, upstream Dart SDK
-                // source, pkg/analyzer/lib/src/error/
-                // type_arguments_verifier.dart; the alias face reads the same
-                // inverted arguments in well_bounded.dart `_isSuperBounded`
-                // → `_isRegularBounded(invertedType)`). A raw `G` over
-                // `typedef G<X extends A<X>, Y extends A<Y>> = X Function(Y)`
-                // instantiates `G<A<dynamic>, A<Never>>`, inverts to
-                // `G<A<Never>, A<Object?>>`, and reports `'A<Object?>'`
-                // against `'A<A<Object?>>'` — never against the
-                // un-inverted `'A<A<Never>>'`. The regular pass (no super
-                // allowance) keeps the instantiation's own arguments. The
-                // inversion of an interface instantiation is always an
-                // interface of the same declaration (an interface type is
-                // neither top nor a `Never` subtype), so a non-interface
-                // inverted shape can only mean the pass did not run.
-                let written_args: Vec<Option<String>> = (0..head_params.len())
-                    .map(|index| {
-                        args.get(index).and_then(|arg| {
-                            let variance = snapshot
-                                .decl_params
-                                .get(&decl)
-                                .and_then(|params| params.get(index))
-                                .map_or(Variance::Covariant, |&param| {
-                                    snapshot.facts.get(param).variance
-                                });
-                            snapshot.display_written_argument(
-                                arg,
-                                variance,
-                                inverted_ty.is_some(),
-                                scope,
-                            )
-                        })
-                    })
-                    .collect();
-                // A bare head carries no written arguments at all: its
-                // instantiate-to-bounds arguments still display the
-                // WRITTEN bound under the grounding substitution — the
-                // oracle's instantiated type keeps the alias decoration
-                // the bound spelled (`'A<Never>'` for `X extends A<X>`,
-                // never the `Never Function(Never)` expansion
-                // `snapshot.display` reads off the interned answer).
-                // `grounded_args[index]` renders parameter `index`'s
-                // grounded bound tree ([`Snapshot::grounded_bound_trees`])
-                // through the same alias-preserving, per-position-flipped
-                // face the written arguments use; an unmodelable bound
-                // keeps the expanded display's fallback.
-                let grounded_args: Vec<Option<String>> = if args.is_empty() {
-                    let grounded =
-                        snapshot.grounded_bound_trees(decl, &head_params, &head_bounds);
-                    (0..head_params.len())
-                        .map(|index| {
-                            let variance = snapshot
-                                .decl_params
-                                .get(&decl)
-                                .and_then(|params| params.get(index))
-                                .map_or(Variance::Covariant, |&param| {
-                                    snapshot.facts.get(param).variance
-                                });
-                            snapshot.display_written_argument(
-                                &grounded[index],
-                                variance,
-                                inverted_ty.is_some(),
-                                scope,
-                            )
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let argument_text = |index: usize| {
-                    written_args
-                        .get(index)
-                        .cloned()
-                        .flatten()
-                        .or_else(|| grounded_args.get(index).cloned().flatten())
-                };
-                let subst_source = match inverted_ty {
-                    Some(inverted)
-                        if matches!(
-                            snapshot.table.get(inverted).kind(),
-                            TypeKind::Interface { .. }
-                        ) =>
-                    {
-                        inverted
-                    }
-                    _ => instantiation,
-                };
-                let mut subst: FxHashMap<StringId, String> = FxHashMap::default();
-                if let TypeKind::Interface { args: arg_range, .. } =
-                    snapshot.table.get(subst_source).kind()
+            // The type-parameter-argument gate (see `check_named`).
+            // An issue on an in-scope parameter argument `X`/`X?`
+            // keeps only when `X <: B` is decided false — the official
+            // left-variable-bound rule `bound(X) <: B`
+            // (subtype.dart:490-500):
+            // * a DECL-scoped id reads its declared bound from `facts`
+            //   (`dynamic`-mapped reads as the implicit `Object?`), so
+            //   `X <: B` is honest both ways;
+            // * a WINDOW-scoped name reads its written bound tree from
+            //   the captured window (an unbounded parameter reads the
+            //   implicit `Object?`, a name the window does not declare
+            //   falls back to the `facts` face);
+            // * a lazy-scope bounded name is unmodelable — non-nullable
+            //   args never reach here (pre-gate), and a nullable `X?`
+            //   keeps only when `Null <: B` fails;
+            // * any other in-scope name is an unbounded parameter —
+            //   the implicit `Object?` bound decides it.
+            // An unsafe declared bound reads as unmodelable and drops
+            // (the under-report direction).
+            let null = snapshot.table.intern(UninternedType::Null, false);
+            let object_q = snapshot.table.intern(
+                UninternedType::Interface {
+                    decl: snapshot.hierarchy.core().object,
+                    args: Vec::new(),
+                },
+                true,
+            );
+            // `None`: the declared bound is unmodelable — drop the
+            // issue (under-report). `Some(None)`: the implicit
+            // `Object?` bound decides. `Some(Some(bound))`: `X <: B`
+            // rides the parameter's own bound.
+            let bound_of = |arg: &TypeTree| -> Option<Option<TypeId>> {
+                if let ScopeKind::Window(map) = kind
+                    && let Some(bound_tree) = map.get(&arg.head)
                 {
-                    for (index, param) in head_params.iter().enumerate() {
-                        if index < arg_range.len() {
-                            let expanded = snapshot.table.arg(arg_range.offset() + index);
-                            let text = argument_text(index)
-                                .unwrap_or_else(|| snapshot.display(expanded));
-                            subst.insert(*param, text);
-                        }
-                    }
+                    let Some(tree) = bound_tree else {
+                        return Some(None);
+                    };
+                    return match ctx.map_tree(tree, scope) {
+                        Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
+                        _ => None,
+                    };
                 }
-                issues
-                    .into_iter()
-                    .map(|issue| BoundedIssue {
-                        range: args.get(issue.index).map_or(site, |arg| arg.range),
-                        site,
-                        argument: argument_text(issue.index)
-                            .unwrap_or_else(|| snapshot.display(issue.argument)),
-                        parameter: snapshot.param_text(issue.parameter),
-                        bound: head_bounds
-                            .get(issue.index)
-                            .and_then(|(tree, _)| tree.as_ref())
-                            .and_then(|tree| snapshot.display_written_bound(tree, &subst))
-                            .unwrap_or_else(|| snapshot.display(issue.bound)),
-                        inverted_type: inverted.clone(),
-                        raw_instantiated: raw_instantiated.clone(),
+                if !matches!(kind, ScopeKind::Lazy) {
+                    let Some(&id) = scope.get(&arg.head) else {
+                        return Some(None);
+                    };
+                    return match snapshot.facts.get(id).bound {
+                        Some(bound)
+                            if matches!(snapshot.table.get(bound).kind(), TypeKind::Dynamic) =>
+                        {
+                            Some(None)
+                        }
+                        Some(bound) if snapshot.type_is_safe(bound) => Some(Some(bound)),
+                        Some(_) => None,
+                        None => Some(None),
+                    };
+                }
+                Some(None)
+            };
+            let issues: Vec<_> = issues
+                .into_iter()
+                .filter(|issue| {
+                    let Some(arg) = args.get(issue.index) else {
+                        return true;
+                    };
+                    if !scope.contains_key(&arg.head) {
+                        return true;
+                    }
+                    if matches!(kind, ScopeKind::Lazy)
+                        && self.index.bounded_params.contains(&arg.head)
+                    {
+                        return arg.nullable && !system.is_subtype(null, issue.bound);
+                    }
+                    let param_bound = match bound_of(arg) {
+                        Some(Some(bound)) => bound,
+                        Some(None) => object_q,
+                        None => return false,
+                    };
+                    !system.is_subtype(param_bound, issue.bound)
+                        || (arg.nullable && !system.is_subtype(null, issue.bound))
+                })
+                .collect();
+            if issues.is_empty() {
+                return Vec::new();
+            }
+            // The context face (`type_arguments_verifier.dart:427-465`):
+            // where the super-bounded pass ran, every report carries the
+            // inverted type's row — and the issues ARE the inverted
+            // pass's there (`_isSuperBounded` reports those), so the
+            // display re-runs the same inversion. The extension-type
+            // face skips the pass upstream too. A bare head keys the
+            // raw-type context row on the i2b instantiation.
+            // `inverted_ty` is the instantiation the failing pass
+            // checked — the written-level alias-faithful inversion
+            // (`Self::invert_instantiation`), or the expanded
+            // `replace_top_bottom_with_facts` answer where a written
+            // inversion could not be derived. The display reads the
+            // same type the verdict rested on.
+            let inverted = inverted_ty.map(|ty| snapshot.display(ty));
+            let raw_instantiated = raw.then(|| snapshot.display(instantiation));
+            // The message's argument and bound are the WRITTEN
+            // spellings, substituted the way the failing pass
+            // substituted its types (#3510): the oracle's
+            // `getDisplayString` keeps an alias decoration on every
+            // type the alias application built (`'G<Null>'`,
+            // `'Fcov<Object>'`, display_string_builder.dart:379-382),
+            // which the snapshot's fully expanded model drops. The
+            // reporting pass decides the rendering: the regular pass
+            // renders the written arguments resolved, the inverted
+            // pass re-runs the per-position top/bottom flip over the
+            // written trees — the same variance-aware walk the
+            // oracle's alias-preserving visitor applies. The bound's
+            // substitution then renders each substituted leaf through
+            // its written argument's text, so `Fcon<X>` over the
+            // argument `Fcon<Never?>` prints `'Fcon<Fcon<Never?>>'`.
+            // A bare head (no written arguments) substitutes the
+            // expanded instantiation's display instead — read from the
+            // type the REPORTING pass checked: where the super-bounded
+            // pass ran, the issues are the inverted type's and the
+            // official substitutes each bound through the inverted
+            // arguments (`invertedSubstitution = Substitution.fromPairs2(
+            // typeParameters, invertedTypeArguments)`, upstream Dart SDK
+            // source, pkg/analyzer/lib/src/error/
+            // type_arguments_verifier.dart; the alias face reads the same
+            // inverted arguments in well_bounded.dart `_isSuperBounded`
+            // → `_isRegularBounded(invertedType)`). A raw `G` over
+            // `typedef G<X extends A<X>, Y extends A<Y>> = X Function(Y)`
+            // instantiates `G<A<dynamic>, A<Never>>`, inverts to
+            // `G<A<Never>, A<Object?>>`, and reports `'A<Object?>'`
+            // against `'A<A<Object?>>'` — never against the
+            // un-inverted `'A<A<Never>>'`. The regular pass (no super
+            // allowance) keeps the instantiation's own arguments. The
+            // inversion of an interface instantiation is always an
+            // interface of the same declaration (an interface type is
+            // neither top nor a `Never` subtype), so a non-interface
+            // inverted shape can only mean the pass did not run.
+            let written_args: Vec<Option<String>> = (0..head_params.len())
+                .map(|index| {
+                    args.get(index).and_then(|arg| {
+                        let variance = snapshot
+                            .decl_params
+                            .get(&decl)
+                            .and_then(|params| params.get(index))
+                            .map_or(Variance::Covariant, |&param| {
+                                snapshot.facts.get(param).variance
+                            });
+                        snapshot.display_written_argument(
+                            arg,
+                            variance,
+                            inverted_ty.is_some(),
+                            scope,
+                        )
+                    })
+                })
+                .collect();
+            // A bare head carries no written arguments at all: its
+            // instantiate-to-bounds arguments still display the
+            // WRITTEN bound under the grounding substitution — the
+            // oracle's instantiated type keeps the alias decoration
+            // the bound spelled (`'A<Never>'` for `X extends A<X>`,
+            // never the `Never Function(Never)` expansion
+            // `snapshot.display` reads off the interned answer).
+            // `grounded_args[index]` renders parameter `index`'s
+            // grounded bound tree ([`Snapshot::grounded_bound_trees`])
+            // through the same alias-preserving, per-position-flipped
+            // face the written arguments use; an unmodelable bound
+            // keeps the expanded display's fallback.
+            let grounded_args: Vec<Option<String>> = if args.is_empty() {
+                let grounded = snapshot.grounded_bound_trees(decl, &head_params, &head_bounds);
+                (0..head_params.len())
+                    .map(|index| {
+                        let variance = snapshot
+                            .decl_params
+                            .get(&decl)
+                            .and_then(|params| params.get(index))
+                            .map_or(Variance::Covariant, |&param| {
+                                snapshot.facts.get(param).variance
+                            });
+                        snapshot.display_written_argument(
+                            &grounded[index],
+                            variance,
+                            inverted_ty.is_some(),
+                            scope,
+                        )
                     })
                     .collect()
+            } else {
+                Vec::new()
+            };
+            let argument_text = |index: usize| {
+                written_args
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| grounded_args.get(index).cloned().flatten())
+            };
+            let subst_source = match inverted_ty {
+                Some(inverted)
+                    if matches!(
+                        snapshot.table.get(inverted).kind(),
+                        TypeKind::Interface { .. }
+                    ) =>
+                {
+                    inverted
+                }
+                _ => instantiation,
+            };
+            let mut subst: FxHashMap<StringId, String> = FxHashMap::default();
+            if let TypeKind::Interface {
+                args: arg_range, ..
+            } = snapshot.table.get(subst_source).kind()
+            {
+                for (index, param) in head_params.iter().enumerate() {
+                    if index < arg_range.len() {
+                        let expanded = snapshot.table.arg(arg_range.offset() + index);
+                        let text =
+                            argument_text(index).unwrap_or_else(|| snapshot.display(expanded));
+                        subst.insert(*param, text);
+                    }
+                }
+            }
+            issues
+                .into_iter()
+                .map(|issue| BoundedIssue {
+                    range: args.get(issue.index).map_or(site, |arg| arg.range),
+                    site,
+                    argument: argument_text(issue.index)
+                        .unwrap_or_else(|| snapshot.display(issue.argument)),
+                    parameter: snapshot.param_text(issue.parameter),
+                    bound: head_bounds
+                        .get(issue.index)
+                        .and_then(|(tree, _)| tree.as_ref())
+                        .and_then(|tree| snapshot.display_written_bound(tree, &subst))
+                        .unwrap_or_else(|| snapshot.display(issue.bound)),
+                    inverted_type: inverted.clone(),
+                    raw_instantiated: raw_instantiated.clone(),
+                })
+                .collect()
         }
     }
 
@@ -3032,11 +3017,13 @@ impl<'a> Bounds<'a> {
             )?;
             inverted_args.push(ty);
         }
-        Some(
-            snapshot
-                .table
-                .intern(UninternedType::Interface { decl, args: inverted_args }, false),
-        )
+        Some(snapshot.table.intern(
+            UninternedType::Interface {
+                decl,
+                args: inverted_args,
+            },
+            false,
+        ))
     }
 
     /// `ReplaceTopBottomVisitor.process` over one WRITTEN tree
@@ -3131,8 +3118,8 @@ impl<'a> Bounds<'a> {
             return Some(mapped);
         }
         let text = ctx.strings.resolve(tree.head);
-        let shadowed = matches!(text, "Null" | "Never" | "FutureOr")
-            && ctx.registry.contains_key(&tree.head);
+        let shadowed =
+            matches!(text, "Null" | "Never" | "FutureOr") && ctx.registry.contains_key(&tree.head);
         if !shadowed && text == "FutureOr" && tree.args.len() == 1 {
             let base = Self::invert_to_ty(
                 index,
@@ -3187,8 +3174,11 @@ impl<'a> Bounds<'a> {
                 depth + 1,
             )?);
         }
-        let map: Vec<(TypeParamId, TypeId)> =
-            params.iter().copied().zip(inverted_args.iter().copied()).collect();
+        let map: Vec<(TypeParamId, TypeId)> = params
+            .iter()
+            .copied()
+            .zip(inverted_args.iter().copied())
+            .collect();
         if let Some(&expansion) = ctx.alias_expansions.get(&decl) {
             // The alias arm instantiates the decorated type
             // (`aliasElement.instantiateImpl`, :82-85) — the snapshot
@@ -3202,11 +3192,13 @@ impl<'a> Bounds<'a> {
                 substituted
             });
         }
-        Some(
-            snapshot
-                .table
-                .intern(UninternedType::Interface { decl, args: inverted_args }, tree.nullable),
-        )
+        Some(snapshot.table.intern(
+            UninternedType::Interface {
+                decl,
+                args: inverted_args,
+            },
+            tree.nullable,
+        ))
     }
 
     /// The written `(param names, bound faces)` pair of an in-file
@@ -3287,7 +3279,13 @@ impl<'a> Bounds<'a> {
         }
         let ret = match &function.ret {
             Some(tree) => Self::invert_to_ty(
-                index, snapshot, facts, tree, body_scope, variance, depth + 1,
+                index,
+                snapshot,
+                facts,
+                tree,
+                body_scope,
+                variance,
+                depth + 1,
             )?,
             // An unwritten return type reads `dynamic` (a bare
             // `Function(...)` head) — and `dynamic` is a top type, so the
@@ -3473,8 +3471,15 @@ impl<'a> Bounds<'a> {
             let snapshot = self.snapshot(strings);
             snapshot.ctx().param_scope(in_scope_params)
         };
-        let mut issues =
-            self.check_named(strings, head, args, site, &scope, ScopeKind::Lazy, allow_super);
+        let mut issues = self.check_named(
+            strings,
+            head,
+            args,
+            site,
+            &scope,
+            ScopeKind::Lazy,
+            allow_super,
+        );
         self.walk_named_args(strings, args, &scope, ScopeKind::Lazy, true, &mut issues);
         issues
     }
@@ -4098,7 +4103,9 @@ impl<'a> Bounds<'a> {
                 {
                     let merged_facts = snapshot.merged_facts(&snapshot.facts);
                     row.verdict = Some(
-                        snapshot.system_with(&merged_facts).is_subtype(rep_ty, face_ty),
+                        snapshot
+                            .system_with(&merged_facts)
+                            .is_subtype(rep_ty, face_ty),
                     );
                     row.displays = Some((snapshot.display(face_ty), snapshot.display(rep_ty)));
                 }
@@ -4812,8 +4819,12 @@ impl<'a> Snapshot<'a> {
             .values()
             .any(|capture| capture.params.iter().any(|(_, bound, _)| bound.is_some()))
             .then(|| {
-                let mut builder =
-                    TypeHierarchy::builder(CoreDecls { object, future, function, record: None });
+                let mut builder = TypeHierarchy::builder(CoreDecls {
+                    object,
+                    future,
+                    function,
+                    record: None,
+                });
                 for (&decl, params) in &decl_params {
                     builder = builder.decl(decl, params.clone());
                 }
@@ -4893,9 +4904,11 @@ impl<'a> Snapshot<'a> {
                         id,
                         ParamFacts {
                             variance: variances[position],
-                            bound: Some(bound_ty.unwrap_or_else(|| {
-                                table.intern(UninternedType::Dynamic, false)
-                            })),
+                            bound: Some(
+                                bound_ty.unwrap_or_else(|| {
+                                    table.intern(UninternedType::Dynamic, false)
+                                }),
+                            ),
                         },
                     ));
                 }
@@ -5242,8 +5255,7 @@ impl<'a> Snapshot<'a> {
             // of a bare `Function(...)` head.
             TypeKind::Function { signature } => {
                 let sig = self.table.signature(signature);
-                let mut text =
-                    format!("{} Function", self.display_with(sig.return_type, unsolved));
+                let mut text = format!("{} Function", self.display_with(sig.return_type, unsolved));
                 let type_parameters = self.table.function_type_parameters(sig.type_parameters);
                 if !type_parameters.is_empty() {
                     // A binder's declared bound renders beside its name
@@ -5269,7 +5281,9 @@ impl<'a> Snapshot<'a> {
                     text.push_str(&format!("<{}>", names.join(", ")));
                 }
                 let mut formals: Vec<String> = (0..sig.positional.len())
-                    .map(|i| self.display_with(self.table.arg(sig.positional.offset() + i), unsolved))
+                    .map(|i| {
+                        self.display_with(self.table.arg(sig.positional.offset() + i), unsolved)
+                    })
                     .collect();
                 let named: Vec<String> = self
                     .table
@@ -5438,12 +5452,8 @@ impl<'a> Snapshot<'a> {
                 .iter()
                 .map(|(name, bound)| match bound {
                     Some(bound) => {
-                        let rendered = self.display_written_argument(
-                            bound,
-                            Variance::Covariant,
-                            false,
-                            scope,
-                        );
+                        let rendered =
+                            self.display_written_argument(bound, Variance::Covariant, false, scope);
                         match rendered {
                             Some(bound_text) => {
                                 format!("{} extends {}", self.strings.resolve(*name), bound_text)
@@ -5513,8 +5523,7 @@ impl<'a> Snapshot<'a> {
                 }
                 // A bare parameterized argument displays its
                 // instantiate-to-bounds form (`raw_display`'s face).
-                let defaults =
-                    instantiate_type_formals_to_bounds(&self.table, &self.facts, params);
+                let defaults = instantiate_type_formals_to_bounds(&self.table, &self.facts, params);
                 let rendered: Vec<String> = defaults
                     .defaults
                     .iter()
@@ -5578,9 +5587,7 @@ impl<'a> Snapshot<'a> {
             self.decl_params
                 .get(&decl)
                 .and_then(|params| params.get(index))
-                .map_or(Variance::Covariant, |&param| {
-                    self.facts.get(param).variance
-                })
+                .map_or(Variance::Covariant, |&param| self.facts.get(param).variance)
         };
         // Every parameter's bound starts at its written tree — `dynamic`
         // for an unwritten or poisoned one (the implicit bound,
@@ -5594,9 +5601,7 @@ impl<'a> Snapshot<'a> {
             .map(|index| {
                 head_bounds
                     .get(index)
-                    .and_then(|(tree, poisoned)| {
-                        (!*poisoned).then_some(tree.as_ref()).flatten()
-                    })
+                    .and_then(|(tree, poisoned)| (!*poisoned).then_some(tree.as_ref()).flatten())
                     .cloned()
                     .unwrap_or_else(|| dynamic.clone())
             })
@@ -5615,13 +5620,12 @@ impl<'a> Snapshot<'a> {
         // component's own bounds rewrite the member leaves — `dynamic`
         // above, `Never` below — under the bound owner's stored variance.
         for component in strong_components(&dependents) {
-            let is_cycle = component.len() > 1
-                || component.iter().any(|&i| dependents[i].contains(&i));
+            let is_cycle =
+                component.len() > 1 || component.iter().any(|&i| dependents[i].contains(&i));
             if !is_cycle {
                 continue;
             }
-            let members: FxHashSet<StringId> =
-                component.iter().map(|&i| head_params[i]).collect();
+            let members: FxHashSet<StringId> = component.iter().map(|&i| head_params[i]).collect();
             for &i in &component {
                 bounds[i] = self.replace_param_leaves(
                     &bounds[i],
@@ -5640,13 +5644,8 @@ impl<'a> Snapshot<'a> {
             for j in 0..count {
                 let mut single = FxHashSet::default();
                 single.insert(head_params[i]);
-                bounds[j] = self.replace_param_leaves(
-                    &bounds[j],
-                    &single,
-                    &upper,
-                    &never,
-                    variance_of(j),
-                );
+                bounds[j] =
+                    self.replace_param_leaves(&bounds[j], &single, &upper, &never, variance_of(j));
             }
         }
         bounds
@@ -5705,7 +5704,10 @@ impl<'a> Snapshot<'a> {
                             TypeTree::leaf(
                                 self.strings.intern("dynamic"),
                                 false,
-                                SourceRange { offset: 0, length: 0 },
+                                SourceRange {
+                                    offset: 0,
+                                    length: 0,
+                                },
                             )
                         })
                         .collect(),
@@ -5725,7 +5727,10 @@ impl<'a> Snapshot<'a> {
                     *tree = TypeTree::leaf(
                         self.strings.intern("dynamic"),
                         false,
-                        SourceRange { offset: 0, length: 0 },
+                        SourceRange {
+                            offset: 0,
+                            length: 0,
+                        },
                     );
                 }
             }
@@ -5866,7 +5871,10 @@ impl<'a> Snapshot<'a> {
             let named = named
                 .iter()
                 .map(|(name, field)| {
-                    Some((*name, self.fill_written_heads(index, field, visiting, depth + 1)?))
+                    Some((
+                        *name,
+                        self.fill_written_heads(index, field, visiting, depth + 1)?,
+                    ))
                 })
                 .collect::<Option<Vec<_>>>()?;
             let mut out = tree.clone();
@@ -5924,7 +5932,10 @@ impl<'a> Snapshot<'a> {
             return Some(out);
         }
         let text = self.strings.resolve(tree.head);
-        if matches!(text, "dynamic" | "Null" | "Never" | "void" | "Function" | "Record") {
+        if matches!(
+            text,
+            "dynamic" | "Null" | "Never" | "void" | "Function" | "Record"
+        ) {
             return Some(tree.clone());
         }
         // A user declaration shadowing a builtin name resolves through
@@ -5936,7 +5947,10 @@ impl<'a> Snapshot<'a> {
                 out.args = vec![TypeTree::leaf(
                     self.strings.intern("dynamic"),
                     false,
-                    SourceRange { offset: 0, length: 0 },
+                    SourceRange {
+                        offset: 0,
+                        length: 0,
+                    },
                 )];
             } else {
                 out.args = tree
@@ -5971,7 +5985,10 @@ impl<'a> Snapshot<'a> {
             return Some(TypeTree::leaf(
                 self.strings.intern("dynamic"),
                 tree.nullable,
-                SourceRange { offset: 0, length: 0 },
+                SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
             ));
         }
         let args = self.default_trees(index, tree.head, visiting);
@@ -6008,9 +6025,7 @@ impl<'a> Snapshot<'a> {
             out.record = Some((
                 positional
                     .iter()
-                    .map(|field| {
-                        self.replace_param_leaves(field, targets, upper, lower, variance)
-                    })
+                    .map(|field| self.replace_param_leaves(field, targets, upper, lower, variance))
                     .collect(),
                 named
                     .iter()
@@ -6052,9 +6067,7 @@ impl<'a> Snapshot<'a> {
                 positional: function
                     .positional
                     .iter()
-                    .map(|formal| {
-                        self.replace_param_leaves(formal, targets, upper, lower, flipped)
-                    })
+                    .map(|formal| self.replace_param_leaves(formal, targets, upper, lower, flipped))
                     .collect(),
                 named: function
                     .named
@@ -6096,9 +6109,7 @@ impl<'a> Snapshot<'a> {
             .map(|(index, arg)| {
                 let declared = arg_params
                     .and_then(|params| params.get(index))
-                    .map_or(Variance::Covariant, |&param| {
-                        self.facts.get(param).variance
-                    });
+                    .map_or(Variance::Covariant, |&param| self.facts.get(param).variance);
                 self.replace_param_leaves(arg, targets, upper, lower, variance.combine(declared))
             })
             .collect();
@@ -6583,15 +6594,20 @@ mod tests {
         let nested_arg = TypeTree::leaf(string, false, range(42, 6));
         let mut nested = TypeTree::leaf(a, false, range(40, 1));
         nested.args.push(nested_arg.clone());
-        let outer_issues =
-            bounds.check_site(&strings, f, &[nested.clone()], &[], range(38, 12));
+        let outer_issues = bounds.check_site(&strings, f, &[nested.clone()], &[], range(38, 12));
         assert!(outer_issues.is_empty());
         let nested_issues = bounds.check_site(&strings, a, &[nested_arg], &[], range(40, 9));
         assert_eq!(nested_issues.len(), 1);
         assert_eq!(nested_issues[0].argument, "String");
         // A bare (argument-less) captured head never queues — the walk
         // still checks it through the instantiate-to-bounds face.
-        let bare_issues = bounds.check_site(&strings, f, &[TypeTree::leaf(a, false, range(60, 1))], &[], range(58, 5));
+        let bare_issues = bounds.check_site(
+            &strings,
+            f,
+            &[TypeTree::leaf(a, false, range(60, 1))],
+            &[],
+            range(58, 5),
+        );
         assert!(bare_issues.is_empty());
     }
 

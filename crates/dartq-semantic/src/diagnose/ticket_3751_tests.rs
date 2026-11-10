@@ -60,13 +60,7 @@ fn member_callee_anchors_on_receiver_through_selector() {
 fn this_member_callee_anchors_on_this_through_selector() {
     let src = "\nclass C {\n  int Function()? f;\n  void m() {\n    this.f();\n  }\n}\n";
     let report = report_ops(src);
-    assert_row(
-        &report,
-        UNCHECKED,
-        at(src, "this.f"),
-        6,
-        FUNCTION_TEXT,
-    );
+    assert_row(&report, UNCHECKED, at(src, "this.f"), 6, FUNCTION_TEXT);
 }
 
 /// A bare nullable-function read invoked keeps the read's own span — the
@@ -114,7 +108,11 @@ fn this_null_aware_index_question_mark_is_silent() {
         .iter()
         .filter(|d| d.code.name == UNCHECKED)
         .collect();
-    assert!(hits.is_empty(), "expected no unchecked row: {:#?}", rows(&report));
+    assert!(
+        hits.is_empty(),
+        "expected no unchecked row: {:#?}",
+        rows(&report)
+    );
 }
 
 /// `this[0] = v` reports the BASE `'[]'` spelling at the opening `[` —
@@ -138,7 +136,11 @@ fn this_null_aware_index_write_question_mark_is_silent() {
         .iter()
         .filter(|d| d.code.name == UNCHECKED)
         .collect();
-    assert!(hits.is_empty(), "expected no unchecked row: {:#?}", rows(&report));
+    assert!(
+        hits.is_empty(),
+        "expected no unchecked row: {:#?}",
+        rows(&report)
+    );
 }
 
 /// `this + this` inside `extension on A?` reports the OPERATOR face at the
@@ -148,5 +150,11 @@ fn this_binary_operator_reports_operator_face() {
     let src = "\nclass A { A operator +(A o) => this; }\n\
                extension E on A? {\n  void f() {\n    this + this;\n  }\n}\n";
     let report = report_ops(src);
-    assert_row(&report, UNCHECKED, at(src, "+ this;"), 1, OPERATOR_PLUS_TEXT);
+    assert_row(
+        &report,
+        UNCHECKED,
+        at(src, "+ this;"),
+        1,
+        OPERATOR_PLUS_TEXT,
+    );
 }

@@ -213,9 +213,9 @@ pub(crate) enum CheckMode {
     Walk,
 }
 
-    /// Why a check took the walk path. `First` and `Rebase` are by design —
-    /// never a degradation; the rest are the shapes that make a daemon walk
-    /// every request.
+/// Why a check took the walk path. `First` and `Rebase` are by design —
+/// never a degradation; the rest are the shapes that make a daemon walk
+/// every request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WalkReason {
     /// A by-design covering walk: the construction-time one (the initial
@@ -268,7 +268,9 @@ fn cookie_dir(dir: &Path, root: bool) -> PathBuf {
         let stale = std::time::SystemTime::now() - COOKIE_STALE;
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if name.to_str().is_some_and(|name| name.starts_with(COOKIE_PREFIX))
+            if name
+                .to_str()
+                .is_some_and(|name| name.starts_with(COOKIE_PREFIX))
                 && entry
                     .metadata()
                     .and_then(|meta| meta.modified())
@@ -474,7 +476,12 @@ impl Watcher {
         // The dirs the live stream carries now — empty for a fresh
         // watcher (a cool-off's re-arm included: the abandon cleared the
         // lost stream's set).
-        let have: Vec<PathBuf> = shared.watched.lock().iter().map(|w| w.dir.clone()).collect();
+        let have: Vec<PathBuf> = shared
+            .watched
+            .lock()
+            .iter()
+            .map(|w| w.dir.clone())
+            .collect();
         // macOS FSEvents only enrolls directories that exist when the
         // stream starts; a cookie dir created after its root was armed
         // would never report the barrier's writes, timing every sync
@@ -531,13 +538,21 @@ impl Watcher {
     /// complaint, so the check is ours), `None` on a stream failure. An
     /// unchanged set leaves the stream alone.
     #[cfg(target_os = "macos")]
-    fn apply(&mut self, have: &[PathBuf], want: &[PathBuf], shared: &Shared) -> Option<Vec<PathBuf>> {
+    fn apply(
+        &mut self,
+        have: &[PathBuf],
+        want: &[PathBuf],
+        shared: &Shared,
+    ) -> Option<Vec<PathBuf>> {
         let (kept, dropped): (Vec<PathBuf>, Vec<PathBuf>) = want
             .iter()
             .cloned()
             .partition(|dir| have.contains(dir) || dir.exists());
         for dir in &dropped {
-            eprintln!("dartq-analyzer-host: watch: {} vanished — dropping it", dir.display());
+            eprintln!(
+                "dartq-analyzer-host: watch: {} vanished — dropping it",
+                dir.display()
+            );
         }
         if kept.len() == have.len() && kept.iter().all(|dir| have.contains(dir)) {
             return Some(dropped);
@@ -570,7 +585,12 @@ impl Watcher {
     /// vanished before their watch could arm, `None` on a real watch
     /// failure.
     #[cfg(not(target_os = "macos"))]
-    fn apply(&mut self, have: &[PathBuf], want: &[PathBuf], _shared: &Shared) -> Option<Vec<PathBuf>> {
+    fn apply(
+        &mut self,
+        have: &[PathBuf],
+        want: &[PathBuf],
+        _shared: &Shared,
+    ) -> Option<Vec<PathBuf>> {
         use notify::Watcher as _;
         for dir in have.iter().filter(|dir| !want.contains(dir)) {
             if let Err(error) = self.stream.watcher.unwatch(dir) {
@@ -578,12 +598,19 @@ impl Watcher {
                 {
                     self.errors += 1;
                 }
-                eprintln!("dartq-analyzer-host: unwatch {} failed: {error}", dir.display());
+                eprintln!(
+                    "dartq-analyzer-host: unwatch {} failed: {error}",
+                    dir.display()
+                );
             }
         }
         let mut dropped: Vec<PathBuf> = Vec::new();
         for dir in want.iter().filter(|dir| !have.contains(dir)) {
-            if let Err(error) = self.stream.watcher.watch(dir, notify::RecursiveMode::Recursive) {
+            if let Err(error) = self
+                .stream
+                .watcher
+                .watch(dir, notify::RecursiveMode::Recursive)
+            {
                 if !dir.exists() {
                     // The target vanished between the plan and the arm
                     // — not stream evidence. Drop it and keep the rest
@@ -602,7 +629,10 @@ impl Watcher {
                 {
                     self.errors += 1;
                 }
-                eprintln!("dartq-analyzer-host: watch {} failed: {error}", dir.display());
+                eprintln!(
+                    "dartq-analyzer-host: watch {} failed: {error}",
+                    dir.display()
+                );
                 return None;
             }
         }
@@ -724,9 +754,7 @@ impl Freshness {
         let mut watcher = Watcher::spawn(&shared);
         let armed = watcher
             .as_mut()
-            .is_some_and(|watcher| {
-                !matches!(watcher.reconcile(&plan, &shared), Arm::Failed)
-            });
+            .is_some_and(|watcher| !matches!(watcher.reconcile(&plan, &shared), Arm::Failed));
         if armed {
             // The take above ran before the stream started, and neither
             // FSEvents nor inotify replays what predates its own start:
@@ -788,10 +816,10 @@ impl Freshness {
     /// This request's sync-cookie wait: half the running walk average,
     /// clamped — proportional to what the fallback it triggers costs.
     fn wait_bound(&self) -> Duration {
-        Duration::from_nanos((self.wait_ns / 2.0).clamp(
-            WAIT_MIN.as_nanos() as f64,
-            WAIT_MAX.as_nanos() as f64,
-        ) as u64)
+        Duration::from_nanos(
+            (self.wait_ns / 2.0).clamp(WAIT_MIN.as_nanos() as f64, WAIT_MAX.as_nanos() as f64)
+                as u64,
+        )
     }
 
     /// Sweeps the late set: entries whose expiry passed undelivered are
@@ -915,7 +943,9 @@ impl Freshness {
         // dir newly covered.
         self.shared.watched.lock().clear();
         self.shared.map.lock().clear();
-        let healthy = self.since.is_none_or(|since| since.elapsed() >= HEALTHY_FOR);
+        let healthy = self
+            .since
+            .is_none_or(|since| since.elapsed() >= HEALTHY_FOR);
         let strikes = match self.cool_off {
             Some((_, strikes)) if !healthy => strikes + 1,
             _ => 0,
@@ -1128,9 +1158,9 @@ impl Freshness {
         let mut dirty = dirty;
         let consumed = std::mem::take(&mut self.carry_dirs);
         dirty.extend(consumed.iter().cloned());
-        let (diff, merged) =
-            self.snapshot
-                .take_into(&mut self.plan, &dirty, &self.unwatched, true);
+        let (diff, merged) = self
+            .snapshot
+            .take_into(&mut self.plan, &dirty, &self.unwatched, true);
         self.carry_dirs = merged
             .into_iter()
             .filter(|dir| !consumed.contains(dir))
@@ -1334,16 +1364,17 @@ impl Freshness {
         let moved = {
             let journal = self.shared.journal.lock();
             journal.walk
-                || journal.dirty.iter().any(|path| {
-                    match merge_target(&self.plan, path) {
+                || journal
+                    .dirty
+                    .iter()
+                    .any(|path| match merge_target(&self.plan, path) {
                         Some(target) => {
                             !fs::symlink_metadata(&target).is_ok_and(|m| m.is_file())
                                 || recorded(&target)
                                 || self.plan.configs.contains(&target)
                         }
                         None => false,
-                    }
-                })
+                    })
         };
         if moved {
             return None;
@@ -1424,12 +1455,7 @@ fn unwatched_of(plan: &WalkPlan) -> Vec<PathBuf> {
         .iter()
         .zip(plan.watched.iter())
         .filter_map(|(file, watched)| (!watched).then(|| file.clone()))
-        .chain(
-            plan.walked
-                .iter()
-                .filter(|root| !root.is_dir())
-                .cloned(),
-        )
+        .chain(plan.walked.iter().filter(|root| !root.is_dir()).cloned())
         .collect()
 }
 
@@ -1748,9 +1774,16 @@ mod fsevents {
                 if let Some(done) = mail.done.take() {
                     return done;
                 }
-                if self.mailbox.changed.wait_until(&mut mail, deadline).timed_out() {
+                if self
+                    .mailbox
+                    .changed
+                    .wait_until(&mut mail, deadline)
+                    .timed_out()
+                {
                     return mail.done.take().unwrap_or_else(|| {
-                        Err(format!("the stream thread did not apply within {APPLY_MAX:?}"))
+                        Err(format!(
+                            "the stream thread did not apply within {APPLY_MAX:?}"
+                        ))
                     });
                 }
             }
@@ -1979,7 +2012,9 @@ mod fsevents {
                 .map(|(&path, _)| {
                     // SAFETY: a NUL-terminated path the framework keeps
                     // alive for the whole call.
-                    Path::new(OsStr::from_bytes(unsafe { CStr::from_ptr(path) }.to_bytes()))
+                    Path::new(OsStr::from_bytes(
+                        unsafe { CStr::from_ptr(path) }.to_bytes(),
+                    ))
                 }),
         );
     }
@@ -2066,11 +2101,7 @@ mod tests {
             }
             fs::create_dir_all(&sdk).expect("sdk");
             fs::write(app.join("pubspec.yaml"), "name: app\n").expect("pubspec");
-            fs::write(
-                app.join("analysis_options.yaml"),
-                "analyzer: {}\n",
-            )
-            .expect("options");
+            fs::write(app.join("analysis_options.yaml"), "analyzer: {}\n").expect("options");
             fs::write(
                 app.join(".dart_tool/package_config.json"),
                 r#"{"configVersion":2,"packages":[
@@ -2214,8 +2245,7 @@ mod tests {
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent).ok();
                     }
-                    fs::write(path, format!("ignored {}\n", rng.next()))
-                        .expect("ignored write");
+                    fs::write(path, format!("ignored {}\n", rng.next())).expect("ignored write");
                 }
                 Self::RemoveDartTool(dir) => {
                     let _ = fs::remove_dir_all(dir);
@@ -2245,8 +2275,7 @@ mod tests {
                     // into a missing tree would be a create, not an
                     // edit through the link.
                     if path.parent().is_some_and(|dir| dir.exists()) {
-                        fs::write(path, format!("var through = {};\n", rng.next()))
-                            .expect("write");
+                        fs::write(path, format!("var through = {};\n", rng.next())).expect("write");
                     }
                 }
             }
@@ -2290,9 +2319,7 @@ mod tests {
                     2 if rng.below(3) == 0 => {
                         // A directory rename — one event pair moves a tree.
                         let from = tree.app.join(&tree.dirs[rng.below(tree.dirs.len())]);
-                        let to = tree
-                            .app
-                            .join(format!("lib/renamed{}", rng.below(3)));
+                        let to = tree.app.join(format!("lib/renamed{}", rng.below(3)));
                         Op::Rename(from, to)
                     }
                     2 => {
@@ -2302,9 +2329,7 @@ mod tests {
                     }
                     3 => Op::Mkdir(tree.app.join(&tree.dirs[rng.below(tree.dirs.len())])),
                     4 => Op::Rmdir(tree.app.join(&tree.dirs[rng.below(2)])),
-                    5 => Op::WriteConfig(
-                        tree.app.join(".dart_tool/package_config.json"),
-                    ),
+                    5 => Op::WriteConfig(tree.app.join(".dart_tool/package_config.json")),
                     6 if !link.exists() => Op::LinkCreate(link.clone(), tree.dep.clone()),
                     6 => Op::LinkRemove(link.clone()),
                     7 => Op::WriteThroughLink(link.join("lib/d.dart")),
@@ -2312,9 +2337,7 @@ mod tests {
                     9 if tree.app.join(".dart_tool").is_dir() => {
                         Op::RemoveDartTool(tree.app.join(".dart_tool"))
                     }
-                    9 => Op::CreateDartTool(
-                        tree.app.join(".dart_tool/package_config.json"),
-                    ),
+                    9 => Op::CreateDartTool(tree.app.join(".dart_tool/package_config.json")),
                     10 => Op::WriteIgnored(ignored[rng.below(ignored.len())].clone()),
                     _ => {
                         // An out-of-root dep file — watched through the
@@ -2328,8 +2351,9 @@ mod tests {
                 // backends — include them at random to cover both
                 // shapes.
                 if rng.below(3) == 0
-                    && let Some(parent) = dirty.first().and_then(|p| p.parent()) {
-                        dirty.push(parent.to_path_buf());
+                    && let Some(parent) = dirty.first().and_then(|p| p.parent())
+                {
+                    dirty.push(parent.to_path_buf());
                 }
                 let previous = snapshot.clone();
                 let (diff, _) = snapshot.take_into(&mut plan, &dirty, &unwatched, true);
@@ -2437,7 +2461,10 @@ mod tests {
         let deadline = Instant::now() + LIVE_BOUND;
         let mut journal = shared.journal.lock();
         while !journal.dirty.contains(file) {
-            let timed_out = shared.delivered.wait_until(&mut journal, deadline).timed_out();
+            let timed_out = shared
+                .delivered
+                .wait_until(&mut journal, deadline)
+                .timed_out();
             assert!(
                 !timed_out || journal.dirty.contains(file),
                 "the stream never delivered {} within {LIVE_BOUND:?} (walk flag {})",
@@ -2706,9 +2733,10 @@ mod tests {
         assert!(freshness.armed());
         // Seed the dir into the plan's walked set and arm it.
         freshness.plan.walked.push(gone.clone());
-        let armed = freshness.watcher.as_mut().map(|w| {
-            w.reconcile(&freshness.plan, &freshness.shared)
-        });
+        let armed = freshness
+            .watcher
+            .as_mut()
+            .map(|w| w.reconcile(&freshness.plan, &freshness.shared));
         assert!(matches!(armed, Some(Arm::Ok)));
         let watched: Vec<PathBuf> = freshness
             .shared
@@ -2718,7 +2746,8 @@ mod tests {
             .map(|w| w.dir.clone())
             .collect();
         assert!(
-            watched.iter().any(|dir| gone.starts_with(dir) || dir == &gone
+            watched.iter().any(|dir| gone.starts_with(dir)
+                || dir == &gone
                 || gone.starts_with(dir.parent().unwrap_or(dir))),
             "the new target armed; {watched:?}"
         );
@@ -2727,9 +2756,10 @@ mod tests {
         // want list) while `have` still arms it: the unwatch path runs.
         fs::remove_dir_all(&gone).expect("vanish");
         let before = freshness.watcher.as_ref().map(|w| w.errors).unwrap_or(0);
-        let outcome = freshness.watcher.as_mut().map(|w| {
-            w.reconcile(&freshness.plan, &freshness.shared)
-        });
+        let outcome = freshness
+            .watcher
+            .as_mut()
+            .map(|w| w.reconcile(&freshness.plan, &freshness.shared));
         // Unwatching a deleted dir is not a stream failure — the rest
         // of the surface stays armed.
         assert!(
@@ -3169,25 +3199,17 @@ mod tests {
                 let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
                 while !stop.load(AtomicOrdering::Relaxed) {
                     let op = match rng.below(7) {
-                        0 => Op::Write(
-                            tree.app.join(&tree.files[rng.below(tree.files.len())]),
-                        ),
+                        0 => Op::Write(tree.app.join(&tree.files[rng.below(tree.files.len())])),
                         1 => Op::Remove(tree.app.join(&tree.files[rng.below(4)])),
                         2 => Op::Rename(
                             tree.app.join(format!("lib/r{}.dart", rng.below(6))),
                             tree.app.join(format!("lib/r{}.dart", rng.below(6))),
                         ),
-                        3 => Op::Mkdir(
-                            tree.app.join(&tree.dirs[rng.below(tree.dirs.len())]),
-                        ),
+                        3 => Op::Mkdir(tree.app.join(&tree.dirs[rng.below(tree.dirs.len())])),
                         4 => Op::Rmdir(tree.app.join(&tree.dirs[rng.below(2)])),
-                        5 if !link.exists() => {
-                            Op::LinkCreate(link.clone(), tree.dep.clone())
-                        }
+                        5 if !link.exists() => Op::LinkCreate(link.clone(), tree.dep.clone()),
                         5 => Op::LinkRemove(link.clone()),
-                        _ => Op::Write(
-                            big.join(format!("w{:04}.dart", rng.below(1_500))),
-                        ),
+                        _ => Op::Write(big.join(format!("w{:04}.dart", rng.below(1_500)))),
                     };
                     // Chaos ops may land on a path a previous op
                     // removed — a partial failure still produced real
@@ -3368,7 +3390,7 @@ mod tests {
         };
         {
             let mut freshness = Freshness::new(&tree.roots(), None, &tree.sdk);
-        generous_wait(&mut freshness);
+            generous_wait(&mut freshness);
             assert!(freshness.armed());
             std::thread::sleep(Duration::from_millis(100));
             let _ = freshness.check(&tree.roots());
@@ -3415,7 +3437,11 @@ mod tests {
             freshness.snapshot = Snapshot::default();
         }
         assert!(!freshness.armed(), "the mismatch dropped the watcher");
-        assert_eq!(*freshness.snapshot(), oracle(&tree), "the audit restored truth");
+        assert_eq!(
+            *freshness.snapshot(),
+            oracle(&tree),
+            "the audit restored truth"
+        );
         // The drop came from the verdict, or — under parallel load — a
         // transient cookie strike cooling the watcher off first; either
         // way the truth is restored and nothing stays silently armed.

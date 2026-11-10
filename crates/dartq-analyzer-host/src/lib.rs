@@ -74,9 +74,7 @@ pub enum Aim {
 pub fn covered(path: &Path, aims: &[Aim]) -> bool {
     aims.iter().any(|aim| match aim {
         Aim::Dir(dir) => path.starts_with(dir),
-        Aim::File(file) => {
-            path == file && file.extension().is_some_and(|ext| ext == "dart")
-        }
+        Aim::File(file) => path == file && file.extension().is_some_and(|ext| ext == "dart"),
     })
 }
 
@@ -310,13 +308,31 @@ mod tests {
         let file = Aim::File(PathBuf::from("/p/lib/a.dart"));
         let yaml = Aim::File(PathBuf::from("/p/pubspec.yaml"));
         assert!(covered(Path::new("/p/lib/a.dart"), &[dir.clone()]));
-        assert!(covered(Path::new("/p/lib/deep/b.dart"), std::slice::from_ref(&dir)));
+        assert!(covered(
+            Path::new("/p/lib/deep/b.dart"),
+            std::slice::from_ref(&dir)
+        ));
         assert!(!covered(Path::new("/p/lib2/c.dart"), &[dir.clone()]));
-        assert!(!covered(Path::new("/p/test/t.dart"), std::slice::from_ref(&dir)));
-        assert!(covered(Path::new("/p/lib/a.dart"), std::slice::from_ref(&file)));
-        assert!(!covered(Path::new("/p/lib/b.dart"), std::slice::from_ref(&file)));
-        assert!(covered(Path::new("/p/pubspec.yaml"), &[Aim::Dir(PathBuf::from("/p"))]));
-        assert!(!covered(Path::new("/p/pubspec.yaml"), std::slice::from_ref(&yaml)));
+        assert!(!covered(
+            Path::new("/p/test/t.dart"),
+            std::slice::from_ref(&dir)
+        ));
+        assert!(covered(
+            Path::new("/p/lib/a.dart"),
+            std::slice::from_ref(&file)
+        ));
+        assert!(!covered(
+            Path::new("/p/lib/b.dart"),
+            std::slice::from_ref(&file)
+        ));
+        assert!(covered(
+            Path::new("/p/pubspec.yaml"),
+            &[Aim::Dir(PathBuf::from("/p"))]
+        ));
+        assert!(!covered(
+            Path::new("/p/pubspec.yaml"),
+            std::slice::from_ref(&yaml)
+        ));
     }
 
     /// The pooled spec's daemon directory is the pool's rendezvous: it

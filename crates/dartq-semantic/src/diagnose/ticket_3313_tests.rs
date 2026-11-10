@@ -227,8 +227,7 @@ fn member_walk_reports_the_defining_container() {
     )
     .expect("self-declared member");
     assert_eq!(
-        declared.0,
-        container,
+        declared.0, container,
         "a self-declaration names the anchor itself"
     );
 }
@@ -372,10 +371,7 @@ fn container_lookup_is_file_local_then_namespace() {
     let lib_a = builder.intern("package:t/a.dart");
     let lib_b = builder.intern("package:t/b.dart");
     let mut index = ElementIndex::default();
-    for (lib, file, elements) in [
-        (lib_a, file_a, &elements_a),
-        (lib_b, file_b, &elements_b),
-    ] {
+    for (lib, file, elements) in [(lib_a, file_a, &elements_a), (lib_b, file_b, &elements_b)] {
         index.insert(file, elements.clone());
         for (name, decl) in elements.declarations() {
             if decl.kind != MicroKind::TypeParam {

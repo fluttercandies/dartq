@@ -149,8 +149,7 @@ fn value_receiver_keeps_the_shape_display() {
     let getters = messages_named(&report, "undefined_getter");
     assert_eq!(getters.len(), 1, "one getter miss: {getters:?}");
     assert_eq!(
-        getters[0],
-        "The getter 'gone' isn't defined for the type 'void Function()'.",
+        getters[0], "The getter 'gone' isn't defined for the type 'void Function()'.",
         "the value face keeps its display: {getters:?}"
     );
 }
@@ -166,7 +165,11 @@ fn object_member_on_alias_literal_stays_silent() {
     assert!(
         messages_named(&report, "undefined_getter").is_empty(),
         "the Object face resolves: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -182,6 +185,10 @@ fn dynamic_typed_value_stays_silent() {
     assert!(
         messages_named(&report, "undefined_getter").is_empty(),
         "a dynamic value dispatches: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }

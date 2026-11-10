@@ -31,7 +31,7 @@
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
-use crate::tests::collector::{latest_features, Collector};
+use crate::tests::collector::{Collector, latest_features};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` and returns the scanner+parser rows as a set of
@@ -144,10 +144,7 @@ fn pattern_function_literal_operand() {
     // function literal (flag re-enabled inside the object pattern); oracle
     // emits only the semantic `non_constant_relational_pattern_expression`
     // face, which the parser does not surface here.
-    assert_rows(
-        "f(x) => switch(x) { Foo(bar: == () => 0) => 0 };\n",
-        &[],
-    );
+    assert_rows("f(x) => switch(x) { Foo(bar: == () => 0) => 0 };\n", &[]);
 }
 
 #[test]
@@ -160,5 +157,3 @@ fn paren_expression_not_type_argument() {
         &[],
     );
 }
-
-

@@ -270,8 +270,7 @@ fn async_future_or_alias_to_future_or_stays_silent() {
 /// Probed: no completion row.
 #[test]
 fn async_nested_future_or_alias_to_future_or_stays_silent() {
-    let source =
-        "typedef NF = FutureOr<void>;\nFutureOr<FutureOr<NF>> f() async {}\n";
+    let source = "typedef NF = FutureOr<void>;\nFutureOr<FutureOr<NF>> f() async {}\n";
     assert_eq!(completion_rows(source), Vec::new());
 }
 

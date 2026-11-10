@@ -58,9 +58,7 @@ fn t3259_enum_index_override_is_silent() {
 /// (the `Enum` face's superclass chain), exactly the oracle's interface map.
 #[test]
 fn t3259_enum_tostring_override_is_silent() {
-    let report = report_ops(
-        "enum E { a, b; @override String toString() => 'E'; }",
-    );
+    let report = report_ops("enum E { a, b; @override String toString() => 'E'; }");
     assert!(
         !report
             .diagnostics

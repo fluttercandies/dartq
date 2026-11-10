@@ -38,7 +38,8 @@ fn assert_single_void(report: &super::FileReport, _fixture: &str, at: usize, len
 /// (`.at(propertyName)`), never at the receiver.
 #[test]
 fn ticket_3249_member_read_void_receiver() {
-    let fixture = "void v() {}\nclass A {\n  int bar = 0;\n}\nvoid main() {\n  var a = v();\n  a.bar;\n}";
+    let fixture =
+        "void v() {}\nclass A {\n  int bar = 0;\n}\nvoid main() {\n  var a = v();\n  a.bar;\n}";
     let report = report_ops(fixture);
     assert_single_void(&report, fixture, fixture.find(".bar").unwrap() + 1, 3);
 }
@@ -67,7 +68,8 @@ fn ticket_3249_member_write_void_receiver() {
 /// `a` of `a.bar()` (`.at(target)`), length 1.
 #[test]
 fn ticket_3249_member_send_void_receiver() {
-    let fixture = "void v() {}\nclass A {\n  void bar() {}\n}\nvoid main() {\n  var a = v();\n  a.bar();\n}";
+    let fixture =
+        "void v() {}\nclass A {\n  void bar() {}\n}\nvoid main() {\n  var a = v();\n  a.bar();\n}";
     let report = report_ops(fixture);
     assert_single_void(&report, fixture, fixture.find("a.bar();").unwrap(), 1);
 }

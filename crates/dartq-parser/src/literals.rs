@@ -325,12 +325,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         if synthetic {
                             // The scanner parked `]` at the wrong spot:
                             // `moveSynthetic` (:8537-8540) relocates it here.
-                            end = self.move_synthetic_close(
-                                left,
-                                close,
-                                TokenKind::CloseSquare,
-                                "]",
-                            );
+                            end =
+                                self.move_synthetic_close(left, close, TokenKind::CloseSquare, "]");
                             break;
                         }
                         self.report(msg::expected_but_got("]"), self.peek_span());
@@ -554,7 +550,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     let junk_end = at.range.offset + at.range.length;
                     self.report(msg::missing_identifier(), at);
                     self.cursor.advance();
-                    let id = self.cursor.insert_synthetic(TokenKind::Identifier, junk_end);
+                    let id = self
+                        .cursor
+                        .insert_synthetic(TokenKind::Identifier, junk_end);
                     self.cursor.advance();
                     self.span_of(id)
                 };

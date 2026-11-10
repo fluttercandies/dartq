@@ -28,7 +28,7 @@
 //!   stays for the iterable/`)` recovery instead of falling to the C-style
 //!   `parseForRest` (`expected ';'` + `unexpected <junk>` cascades).
 
-use super::collector::{latest_features, scan_ok, Collector};
+use super::collector::{Collector, latest_features, scan_ok};
 
 /// `(code, start, end)` parser rows for `source` under latest features.
 fn rows_with(source: &'static str, features: crate::ParserFeatures) -> Vec<(String, u32, u32)> {
@@ -117,9 +117,7 @@ fn type_variable_missing_name_before_extends() {
 fn await_for_junk_takes_for_in_dispatch() {
     let rows = rows_with("f() async { await for ( break; }\n", latest_features());
     assert!(
-        !rows
-            .iter()
-            .any(|(c, _, _)| c == "unexpected_token"),
+        !rows.iter().any(|(c, _, _)| c == "unexpected_token"),
         "no unexpected_token junk rows, got {rows:?}"
     );
     // `break` spans 24..29; the for-in recovery anchors `')'` at its head

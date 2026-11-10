@@ -33,9 +33,7 @@ use dartq_scanner::{ScanConfig, TokenTable};
 fn dead_of(source: &str) -> Vec<String> {
     dead_offsets(source)
         .into_iter()
-        .map(|(offset, length)| {
-            source[offset as usize..(offset + length) as usize].to_string()
-        })
+        .map(|(offset, length)| source[offset as usize..(offset + length) as usize].to_string())
         .collect()
 }
 
@@ -132,7 +130,8 @@ fn record_tested_is_does_not_leak_dead_arm() {
     // `factor_typed` on Unknown vacuously bottoms the unmatched arm,
     // which used to leak a dead-code row on the conditional's else.
     // The gate keeps both arms reachable: no row.
-    let src = "void k() {\n  Object r = (1, 2);\n  var v = r is (int,) ? true : true;\n  print(v);\n}";
+    let src =
+        "void k() {\n  Object r = (1, 2);\n  var v = r is (int,) ? true : true;\n  print(v);\n}";
     assert_eq!(dead_of(src), Vec::<String>::new());
 }
 

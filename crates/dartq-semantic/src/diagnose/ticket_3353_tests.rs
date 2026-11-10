@@ -75,7 +75,8 @@ fn report(main: &str, dependency: &str, legacy: bool) -> FileReport {
     let scanned = scan_fixture(main, file);
     let scanned_dep = scan_fixture(dependency, dep_file);
     let elements = crate::collector::collect(main, &scanned.tokens, features, &strings);
-    let dep_elements = crate::collector::collect(dependency, &scanned_dep.tokens, features, &strings);
+    let dep_elements =
+        crate::collector::collect(dependency, &scanned_dep.tokens, features, &strings);
     let mut builder = LibraryGraphBuilder::new(&strings);
     let lib = builder.intern("package:app/main.dart");
     let dep_lib = builder.intern(DEP_URI);
@@ -157,11 +158,7 @@ fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::Scan
 #[test]
 fn extend_face_reports_at_the_supertype() {
     const MAIN: &str = "import 'package:s/kit.dart';\nclass Bar extends Foo {}\n";
-    let report = report(
-        MAIN,
-        "@Deprecated.extend()\nclass Foo {}",
-        false,
-    );
+    let report = report(MAIN, "@Deprecated.extend()\nclass Foo {}", false);
     let rows = code_rows(&report, "deprecated_extend");
     assert_eq!(rows.len(), 1, "{report:?}");
     assert_eq!(rows[0].message, "Extending 'Foo' is deprecated.");

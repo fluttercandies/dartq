@@ -104,7 +104,10 @@ fn illegal_concrete_enum_member_declaration_anchors_at_the_name() {
 #[test]
 fn illegal_concrete_enum_member_declaration_skips_abstract_members() {
     let bodyless = "abstract class A implements Enum {\n  int get hashCode;\n}\n";
-    assert_eq!(count(&report_ops(bodyless), "illegal_concrete_enum_member"), 0);
+    assert_eq!(
+        count(&report_ops(bodyless), "illegal_concrete_enum_member"),
+        0
+    );
 
     let concrete = "abstract class A implements Enum {\n  int get hashCode => 0;\n}\n";
     let report = report_ops(concrete);
@@ -126,7 +129,8 @@ fn illegal_concrete_enum_member_inheritance_anchors_at_the_class_name() {
     assert_eq!(
         spans(&report, "illegal_concrete_enum_member"),
         vec![span_of(source, "B")]
-    );    assert_eq!(
+    );
+    assert_eq!(
         messages(&report, "illegal_concrete_enum_member"),
         vec![
             "A concrete instance member named 'hashCode' can't be inherited from 'A' in a \
@@ -142,7 +146,10 @@ fn illegal_concrete_enum_member_inheritance_anchors_at_the_class_name() {
 fn illegal_concrete_enum_member_inheritance_ignores_implements() {
     let source = "class A {\n  int hashCode = 0;\n}\n\n\
                   abstract class B implements A, Enum {}\n";
-    assert_eq!(count(&report_ops(source), "illegal_concrete_enum_member"), 0);
+    assert_eq!(
+        count(&report_ops(source), "illegal_concrete_enum_member"),
+        0
+    );
 }
 
 // —— illegal_enum_values ——
@@ -261,8 +268,7 @@ fn mixin_application_constraint_anchors_at_the_mixin_name() {
     assert_eq!(
         messages(&report, "mixin_application_not_implemented_interface"),
         vec![
-            "'M' can't be mixed onto 'Object' because 'Object' doesn't implement 'A'."
-                .to_string()
+            "'M' can't be mixed onto 'Object' because 'Object' doesn't implement 'A'.".to_string()
         ]
     );
 }
@@ -272,7 +278,10 @@ fn mixin_application_constraint_anchors_at_the_mixin_name() {
 fn mixin_application_constraint_accepts_a_matching_supertype() {
     let source = "class A {}\n\nmixin M on A {}\n\nclass C extends A with M {}\n";
     assert_eq!(
-        count(&report_ops(source), "mixin_application_not_implemented_interface"),
+        count(
+            &report_ops(source),
+            "mixin_application_not_implemented_interface"
+        ),
         0
     );
 }
@@ -284,7 +293,10 @@ fn mixin_application_constraint_accepts_an_earlier_mixin() {
     let source = "class A {}\n\nmixin M on A {}\n\n\
                   class C extends Object with A, M {}\n";
     assert_eq!(
-        count(&report_ops(source), "mixin_application_not_implemented_interface"),
+        count(
+            &report_ops(source),
+            "mixin_application_not_implemented_interface"
+        ),
         0
     );
 }

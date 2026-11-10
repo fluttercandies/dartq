@@ -164,10 +164,7 @@ fn t3374_local_read_never_widens_to_dynamic() {
 fn t3374_written_dynamic_formal_read_is_dynamic() {
     let source = "void f(dynamic d) { d; }";
     let analysis = analyze_core(source);
-    assert_eq!(
-        analysis.type_of(span_of(source, "d; }")),
-        Some(Ty::Dynamic)
-    );
+    assert_eq!(analysis.type_of(span_of(source, "d; }")), Some(Ty::Dynamic));
 }
 
 /// An `is`-promoted read of an untyped formal publishes the PROMOTED type,
@@ -224,7 +221,11 @@ fn t3374_rider_discard_position_void_getter_silent() {
 /// fixture-relative offset of `needle` beside it (the rig prefixes the
 /// core prelude, so the offsets are re-based before comparing).
 #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
-fn getter_rows(getter: &str, statement: &str, needle: &str) -> (Vec<(&'static str, u32, u32)>, u32) {
+fn getter_rows(
+    getter: &str,
+    statement: &str,
+    needle: &str,
+) -> (Vec<(&'static str, u32, u32)>, u32) {
     let source = format!(
         "extension E on int {{ void f() {{}} }}\n\
          class C {{ {getter} }}\n\

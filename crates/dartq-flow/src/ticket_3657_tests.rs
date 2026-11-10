@@ -70,7 +70,11 @@ fn unassigned_rows(source: &str) -> Vec<(u32, bool)> {
 /// The offset of the read `needle` starts with (the needle must occur
 /// exactly once in `source`).
 fn at(source: &str, needle: &str) -> u32 {
-    assert_eq!(source.matches(needle).count(), 1, "{needle:?} in {source:?}");
+    assert_eq!(
+        source.matches(needle).count(),
+        1,
+        "{needle:?} in {source:?}"
+    );
     u32::try_from(source.find(needle).expect("needle present")).expect("offset fits u32")
 }
 
@@ -135,7 +139,11 @@ fn post_loop_read_attributes_to_the_outer_local() {
         "void f(List<void Function(int)> fs) {\n  int i;\n  for (void Function(int) i in fs) {}\n  i;\n}\n",
         "void f() {\n  int i;\n  for (var i = 0; i < 3; i++) {}\n  i;\n}\n",
     ] {
-        assert_eq!(unassigned_rows(src), vec![(at(src, "i;\n}"), true)], "{src:?}");
+        assert_eq!(
+            unassigned_rows(src),
+            vec![(at(src, "i;\n}"), true)],
+            "{src:?}"
+        );
     }
 }
 
@@ -178,5 +186,9 @@ fn nested_and_identifier_heads_keep_the_scope_stack_balanced() {
         "  k;\n",
         "}\n",
     );
-    assert_eq!(unassigned_rows(src), vec![(at(src, "k;\n}"), true)], "{src:?}");
+    assert_eq!(
+        unassigned_rows(src),
+        vec![(at(src, "k;\n}"), true)],
+        "{src:?}"
+    );
 }

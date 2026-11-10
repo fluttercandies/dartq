@@ -52,7 +52,9 @@
 use super::test_rig::{code_names, report_ops, rows};
 
 /// The `return_of_invalid_type_from_closure` rows of `report`.
-fn closure_rows(report: &crate::diagnose::types::FileReport) -> Vec<&dartq_diagnostics::Diagnostic> {
+fn closure_rows(
+    report: &crate::diagnose::types::FileReport,
+) -> Vec<&dartq_diagnostics::Diagnostic> {
     report
         .diagnostics
         .iter()

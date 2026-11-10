@@ -28,8 +28,8 @@
 //! non-augmenting members a fragment introduces, and must not touch the
 //! probe side.
 
-use super::test_rig::report_ops_experiments_with;
 use super::FileReport;
+use super::test_rig::report_ops_experiments_with;
 use dartq_language::Feature;
 
 fn conflicts(report: &FileReport) -> Vec<(u32, u32, String)> {
@@ -62,7 +62,11 @@ fn non_augment_field_in_augment_container_still_claims_and_reports() {
          }\n",
     );
     assert_eq!(rows.len(), 1, "fragment introduction claims: {rows:?}");
-    assert_eq!((rows[0].0, rows[0].1), (23, 3), "anchor is the static probe: {rows:?}");
+    assert_eq!(
+        (rows[0].0, rows[0].1),
+        (23, 3),
+        "anchor is the static probe: {rows:?}"
+    );
     assert!(rows[0].2.contains("'C.foo'"), "{rows:?}");
 }
 
@@ -105,5 +109,9 @@ fn non_augment_static_in_augment_container_still_probes_and_reports() {
     // The anchor is the fragment's own static member name: the
     // introduction (`class C {\n  int foo = 0;\n}\n`, 27 bytes) plus the
     // fragment head (`augment class C {\n`, 18) plus `  static int ` (13).
-    assert_eq!((rows[0].0, rows[0].1), (58, 3), "anchor is the fragment probe: {rows:?}");
+    assert_eq!(
+        (rows[0].0, rows[0].1),
+        (58, 3),
+        "anchor is the fragment probe: {rows:?}"
+    );
 }

@@ -46,9 +46,10 @@ fn pattern_assignment_to_initialized_final_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, _"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, _"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );
@@ -60,11 +61,7 @@ fn pattern_assignment_to_initialized_final_reports() {
 fn pattern_assignment_to_var_is_silent() {
     let fixture = "void f() {\n  var af = 0;\n  (af, _) = (1, 2);\n  af;\n}\n";
     let report = report_ops(fixture);
-    assert!(
-        atfl_rows(&report).is_empty(),
-        "{:#?}",
-        rows(&report)
-    );
+    assert!(atfl_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
 
 /// `final af; (af, _) = (1, 2);` — the FIRST write to a declared-but-
@@ -73,11 +70,7 @@ fn pattern_assignment_to_var_is_silent() {
 fn pattern_assignment_first_write_to_unassigned_final_is_silent() {
     let fixture = "void f() {\n  final af;\n  (af, _) = (1, 2);\n  af;\n}\n";
     let report = report_ops(fixture);
-    assert!(
-        atfl_rows(&report).is_empty(),
-        "{:#?}",
-        rows(&report)
-    );
+    assert!(atfl_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
 
 /// `final af; af = 0; (af, _) = (1, 2);` — the prior plain assignment
@@ -88,9 +81,10 @@ fn pattern_assignment_after_prior_write_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, _"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, _"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );
@@ -104,9 +98,10 @@ fn pattern_assignment_to_final_formal_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, _"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, _"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );
@@ -117,11 +112,7 @@ fn pattern_assignment_to_final_formal_reports() {
 fn pattern_assignment_to_mutable_formal_is_silent() {
     let fixture = "void f(af) {\n  (af, _) = (1, 2);\n  af;\n}\n";
     let report = report_ops(fixture);
-    assert!(
-        atfl_rows(&report).is_empty(),
-        "{:#?}",
-        rows(&report)
-    );
+    assert!(atfl_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
 
 /// A write inside a nested closure to an enclosing `final` reports even
@@ -133,9 +124,10 @@ fn pattern_assignment_inside_closure_to_enclosing_final_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, _"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, _"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );
@@ -149,9 +141,10 @@ fn pattern_assignment_after_one_sided_prior_write_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, _"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, _"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );
@@ -165,9 +158,10 @@ fn second_pattern_assignment_to_final_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, _) = (3, 4)"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, _) = (3, 4)"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );
@@ -181,9 +175,10 @@ fn pattern_assignment_only_final_target_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![
-            (at(fixture, "af, bg"), "The final variable 'af' can only be set once.".to_string()),
-        ],
+        vec![(
+            at(fixture, "af, bg"),
+            "The final variable 'af' can only be set once.".to_string()
+        ),],
         "{:#?}",
         rows(&report)
     );

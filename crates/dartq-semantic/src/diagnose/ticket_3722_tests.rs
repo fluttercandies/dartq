@@ -21,8 +21,8 @@
 //! ambiguous name, a prefix, or an indexed-but-non-type declaration).
 
 use super::test_rig::{code_names, report_ops};
-use crate::diagnose::FileReport;
 use crate::collector::collect;
+use crate::diagnose::FileReport;
 use crate::library::ElementIndex;
 use crate::model::MicroKind;
 use dartq_language::{FeatureSet, LanguageVersion};
@@ -57,9 +57,8 @@ fn family_codes(report: &FileReport) -> Vec<&'static str> {
 /// stub as `InvalidType` and dropped the row.
 #[test]
 fn object_stub_scrutinee_duplicate_null_case_reports_unreachable() {
-    let report = report_ops(
-        "void f(Object? o) { switch (o) { case Null _: break; case Null _: break; } }",
-    );
+    let report =
+        report_ops("void f(Object? o) { switch (o) { case Null _: break; case Null _: break; } }");
     assert_eq!(
         family_codes(&report),
         ["unreachable_switch_case"],
@@ -104,9 +103,7 @@ fn object_stub_scrutinee_exhaustive_stays_silent() {
 /// never produced, outside this ticket).
 #[test]
 fn object_stub_scrutinee_expression_duplicate_reports_unreachable() {
-    let report = report_ops(
-        "int e(Object? o) => switch (o) { Null _ => 1, Null _ => 2 };",
-    );
+    let report = report_ops("int e(Object? o) => switch (o) { Null _ => 1, Null _ => 2 };");
     assert_eq!(
         family_codes(&report),
         ["unreachable_switch_case"],
@@ -248,9 +245,8 @@ fn switch_report(main_source: &str, dependency: &str, imported: bool) -> FileRep
 /// `dead_code`).
 #[test]
 fn object_stub_scrutinee_resolvable_clause_synthesizes_no_dead_rows() {
-    let report = report_ops(
-        "void k(Object? o) { switch (o) { case int i: break; case Null _: break; } }",
-    );
+    let report =
+        report_ops("void k(Object? o) { switch (o) { case int i: break; case Null _: break; } }");
     let dead: Vec<_> = report
         .diagnostics
         .iter()
@@ -267,9 +263,7 @@ fn object_stub_scrutinee_resolvable_clause_synthesizes_no_dead_rows() {
 fn non_object_named_scrutinee_verdict_still_decides() {
     // A declared, resolved enum head keeps the gate's pre-existing
     // behavior exactly: the missing constant reports at `switch`.
-    let report = report_ops(
-        "enum K { a, b } int f(K k) { switch (k) { case K.a: return 1; } }",
-    );
+    let report = report_ops("enum K { a, b } int f(K k) { switch (k) { case K.a: return 1; } }");
     assert_eq!(
         family_codes(&report),
         ["non_exhaustive_switch_statement"],

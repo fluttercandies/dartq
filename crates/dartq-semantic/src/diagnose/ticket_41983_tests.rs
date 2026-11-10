@@ -37,7 +37,8 @@ fn void_rows(report: &FileReport) -> Vec<(usize, u32)> {
 /// (probe: the 10,000-section `regress41983_test.dart` yields zero rows).
 #[test]
 fn cascade_void_sections_report_nothing() {
-    let fixture = "void f() {\n  List<int> ints = <int>[]\n    ..add(0)\n    ..add(1)\n    ..add(2);\n}\n";
+    let fixture =
+        "void f() {\n  List<int> ints = <int>[]\n    ..add(0)\n    ..add(1)\n    ..add(2);\n}\n";
     assert_eq!(void_rows(&report_ops(fixture)), Vec::<(usize, u32)>::new());
 }
 
@@ -59,7 +60,8 @@ fn cascade_two_hundred_void_sections_report_nothing() {
 /// answers no rows).
 #[test]
 fn cascade_void_sections_on_class_target_report_nothing() {
-    let fixture = "class A {\n  void bar() {}\n  int baz = 0;\n}\nvoid main() {\n  A()..bar()..baz;\n}\n";
+    let fixture =
+        "class A {\n  void bar() {}\n  int baz = 0;\n}\nvoid main() {\n  A()..bar()..baz;\n}\n";
     assert_eq!(void_rows(&report_ops(fixture)), Vec::<(usize, u32)>::new());
 }
 
@@ -69,7 +71,8 @@ fn cascade_void_sections_on_class_target_report_nothing() {
 /// at the `v()` of column 3, length 3).
 #[test]
 fn cascade_void_target_send_reports_once_at_target() {
-    let fixture = "void v() {}\nclass A {\n  void bar() {}\n}\nvoid main() {\n  v()..bar()..bar();\n}\n";
+    let fixture =
+        "void v() {}\nclass A {\n  void bar() {}\n}\nvoid main() {\n  v()..bar()..bar();\n}\n";
     let report = report_ops(fixture);
     let target = fixture.find("v()..").expect("fixture target");
     assert_eq!(void_rows(&report), vec![(target, 3)]);

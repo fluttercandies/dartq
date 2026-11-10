@@ -59,7 +59,11 @@ int f() { return \"s\"; }
         rows.len(),
         1,
         "one row: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     // The report's offset rides the rig's prepended prelude — the
     // stable face is the operand's own LENGTH (`"s"` is 3 columns).
@@ -81,7 +85,11 @@ void vf() { return 0; }
         rows.len(),
         1,
         "the void host rejects an int value: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(rows[0].message.contains("return type of 'void'"));
 }
@@ -101,7 +109,11 @@ dynamic dd() { return vvoid(); }
     assert!(
         roit(&report).is_empty(),
         "void-expression returns into void/dynamic hosts are clean: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -119,7 +131,11 @@ int bad() { return vvoid(); }
         rows.len(),
         1,
         "void into int reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -137,7 +153,11 @@ T gen<T>(T x) { return 3; }
         rows.len(),
         1,
         "int into T reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(rows[0].message.contains("return type of 'T'"));
 }
@@ -159,7 +179,11 @@ Future<int> h() async { return \"s\"; }
         rows.len(),
         1,
         "one row: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("return type of 'Future<int>'"),
@@ -182,7 +206,11 @@ Future<int> fi() async { return fut(); }
     assert!(
         roit(&report).is_empty(),
         "Future<int> into Future<int> is clean through the flatten leg: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -202,7 +230,11 @@ Future<int> fi() async { return fs(); }
         rows.len(),
         1,
         "Future<String> into Future<int> reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -227,7 +259,11 @@ fn await_return_row_anchors_at_keyword() {
         rows.len(),
         1,
         "one row: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         rows[0].range.length, 9,
@@ -253,7 +289,11 @@ class C {
         rows.len(),
         1,
         "the operator's return reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(rows[0].message.contains("from the method '>'"));
     assert!(rows[0].message.contains("return type of 'int'"));
@@ -277,7 +317,11 @@ class C {
         rows.len(),
         1,
         "the factory's return reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(rows[0].message.contains("from the constructor 'C.f'"));
     assert!(rows[0].message.contains("return type of 'C'"));
@@ -300,7 +344,11 @@ class A<T> {
         rows.len(),
         1,
         "the generic factory's return reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("return type of 'A<T>'"),
@@ -326,7 +374,11 @@ class C {
         rows.len(),
         1,
         "the generative arrow's return reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(rows[0].message.contains("from the constructor 'C'"));
 }
@@ -345,10 +397,13 @@ class C { set s(int v) {} }
 ";
     let report = report_ops(fixture);
     assert!(
-        roit(&report).is_empty()
-            && rows_named(&report, "non_void_return_for_setter").is_empty(),
+        roit(&report).is_empty() && rows_named(&report, "non_void_return_for_setter").is_empty(),
         "untyped executables stay silent: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -368,7 +423,11 @@ class C {
         rows.len(),
         1,
         "the named generative's return reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(rows[0].message.contains("from the constructor 'C.named'"));
     assert!(rows[0].message.contains("'Null'"));

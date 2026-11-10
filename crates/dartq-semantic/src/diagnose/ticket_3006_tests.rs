@@ -305,4 +305,3 @@ fn explicit_super_still_satisfies_beside_super_formals() {
         code_names(&report)
     );
 }
-

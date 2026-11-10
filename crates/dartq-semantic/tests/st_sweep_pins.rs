@@ -421,7 +421,7 @@ fn unit_report(source: &str) -> dartq_semantic::FileReport {
             prefix: None,
             deferred: false,
             combinators: Combinators::unfiltered(),
-                non_library: false,
+            non_library: false,
         },
     );
     let mut index = ElementIndex::default();

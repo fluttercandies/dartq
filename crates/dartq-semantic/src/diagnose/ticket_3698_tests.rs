@@ -25,12 +25,7 @@ fn position_rows(source: &str) -> Vec<String> {
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "wrong_type_parameter_variance_position")
-        .map(|d| {
-            format!(
-                "@{}+{}: {}",
-                d.range.offset, d.range.length, d.message
-            )
-        })
+        .map(|d| format!("@{}+{}: {}", d.range.offset, d.range.length, d.message))
         .collect()
 }
 
@@ -240,8 +235,12 @@ fn compound_member_anchors_each_arm_at_its_own_node() {
         rows,
         vec![
             format!("@{ret}+1: The 'in' type parameter 'T' can't be used in an 'out' position."),
-            format!("@{formal}+11: The 'in' type parameter 'T' can't be used in an 'out' position."),
-            format!("@{bound}+11: The 'in' type parameter 'T' can't be used in an 'inout' position."),
+            format!(
+                "@{formal}+11: The 'in' type parameter 'T' can't be used in an 'out' position."
+            ),
+            format!(
+                "@{bound}+11: The 'in' type parameter 'T' can't be used in an 'inout' position."
+            ),
             format!("@{named}+20: The 'in' type parameter 'T' can't be used in an 'out' position."),
         ],
     );

@@ -34,8 +34,8 @@
 //! the corpus span; anchors locate with `source.find` — no hand-counted
 //! offsets. Registered through `diagnose/tests.rs`'s `#[path]` block.
 
-use super::*;
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
+use super::*;
 
 /// `(code, offset, written text at the row)` — the span-exact projection:
 /// code + offset + text pin a row's code, anchor, and length together.
@@ -78,7 +78,11 @@ fn for_element_reports_the_element_and_the_literal() {
     assert_eq!(
         oracle_rows(&rep, &source),
         vec![
-            ("const_eval_for_element", for_element, "for (var i = 0; i < 3; i++) i"),
+            (
+                "const_eval_for_element",
+                for_element,
+                "for (var i = 0; i < 3; i++) i"
+            ),
             (
                 "const_initialized_with_non_constant_value",
                 literal,
@@ -107,7 +111,11 @@ fn local_for_element_reports_the_element_alone() {
     assert_eq!(
         oracle_rows(&rep, &source),
         vec![
-            ("const_eval_for_element", for_element, "for (var i = 0; i < 3; i++) i"),
+            (
+                "const_eval_for_element",
+                for_element,
+                "for (var i = 0; i < 3; i++) i"
+            ),
             ("unused_local_variable", z_decl, "z"),
         ],
         "{:#?}",
@@ -125,7 +133,12 @@ fn spread_decided_set_literal_with_a_clean_operand_is_silent() {
     // `report` leaves it a non-type (`non_type_as_type_argument`).
     let source = format!("{CORE_PRELUDE}const list = <int>[1, 2];\nconst s = {{...list}};\n");
     let rep = report_ops_bare(&source);
-    assert_eq!(oracle_rows(&rep, &source), vec![], "{:#?}", oracle_rows(&rep, &source));
+    assert_eq!(
+        oracle_rows(&rep, &source),
+        vec![],
+        "{:#?}",
+        oracle_rows(&rep, &source)
+    );
 }
 
 /// `const s = {...x}` where the operand is a non-constant `List` (an
@@ -148,11 +161,7 @@ fn spread_decided_set_literal_with_a_nonconstant_operand_reports() {
     assert_eq!(
         oracle_rows(&rep, &source),
         vec![
-            (
-                "const_initialized_with_non_constant_value",
-                operand,
-                "x",
-            ),
+            ("const_initialized_with_non_constant_value", operand, "x",),
             ("non_constant_set_element", operand, "x"),
         ],
         "{:#?}",
@@ -242,13 +251,11 @@ fn throw_anchors_the_whole_throw_expression() {
     let rep = report(source);
     assert_eq!(
         oracle_rows(&rep, source),
-        vec![
-            (
-                "const_initialized_with_non_constant_value",
-                throw_start,
-                "throw 'e'",
-            ),
-        ],
+        vec![(
+            "const_initialized_with_non_constant_value",
+            throw_start,
+            "throw 'e'",
+        ),],
         "{:#?}",
         oracle_rows(&rep, source)
     );
@@ -262,7 +269,12 @@ fn throw_anchors_the_whole_throw_expression() {
 fn dynamic_type_literal_is_a_valid_constant() {
     let source = "const d = dynamic;\n";
     let rep = report(source);
-    assert_eq!(oracle_rows(&rep, source), vec![], "{:#?}", oracle_rows(&rep, source));
+    assert_eq!(
+        oracle_rows(&rep, source),
+        vec![],
+        "{:#?}",
+        oracle_rows(&rep, source)
+    );
 }
 
 /// `const v = .undef` under a declaration shorthand context that cannot

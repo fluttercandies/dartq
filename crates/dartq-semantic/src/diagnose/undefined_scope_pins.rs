@@ -23,8 +23,7 @@
 //! real binary before the fix).
 
 use super::test_rig::{
-    RigImport, assert_silent, code_names, report_ops, report_ops_imports,
-    report_ops_wildcards,
+    RigImport, assert_silent, code_names, report_ops, report_ops_imports, report_ops_wildcards,
 };
 
 /// A bare name declared nowhere reports `undefined_identifier`.

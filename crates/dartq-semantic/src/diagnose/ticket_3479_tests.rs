@@ -23,8 +23,8 @@
 //! Registered here via `#[path]`; the module stays inside the `diagnose`
 //! subtree so `crate::diagnose::test_rig` resolves.
 
-use super::test_rig::{report_ops, rows};
 use super::FileReport;
+use super::test_rig::{report_ops, rows};
 
 /// The `unused_field`/`unused_element` rows of `report` (the family's
 /// lens — the fixtures pin the exact verdict).
@@ -52,7 +52,8 @@ class A {
     let report = report_ops(fixture);
     let bad = unused(&report);
     assert!(
-        bad.iter().any(|r| r.contains("unused_field") && r.contains("'_f'")),
+        bad.iter()
+            .any(|r| r.contains("unused_field") && r.contains("'_f'")),
         "the discarded `_f += 2` never reads the getter: {bad:?}\n{}",
         rows(&report).join("\n")
     );
@@ -73,7 +74,8 @@ class A {
     let report = report_ops(fixture);
     let bad = unused(&report);
     assert!(
-        bad.iter().any(|r| r.contains("unused_field") && r.contains("'_f'")),
+        bad.iter()
+            .any(|r| r.contains("unused_field") && r.contains("'_f'")),
         "the discarded `_f++` never reads the getter: {bad:?}\n{}",
         rows(&report).join("\n")
     );
@@ -144,7 +146,8 @@ class A {
     let report = report_ops(fixture);
     let bad = unused(&report);
     assert!(
-        bad.iter().any(|r| r.contains("unused_field") && r.contains("'_f'")),
+        bad.iter()
+            .any(|r| r.contains("unused_field") && r.contains("'_f'")),
         "the `_f = 0` initializer never reads the getter: {bad:?}\n{}",
         rows(&report).join("\n")
     );

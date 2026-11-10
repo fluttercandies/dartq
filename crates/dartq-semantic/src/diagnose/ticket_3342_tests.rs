@@ -40,8 +40,8 @@
 //! the module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves).
 
-use super::types::FileReport;
 use super::test_rig::{RigImport, code_names, report_ops_experiments_with, rows};
+use super::types::FileReport;
 
 /// The sibling library every fixture imports; it declares one class so a
 /// bare or prefixed reference can credit the edge.

@@ -102,7 +102,11 @@ fn body_less_function_reports() {
     // Oracle 3.13.1: `void f();` reports exactly once at the `;` (1:9
     // len 1, "A function body must be provided."), the parseFunctionBody
     // `;` arm's `missingFunctionBody` row.
-    assert_rows_at("void f();\n", latest_set(), &[("missing_function_body", 8, 9)]);
+    assert_rows_at(
+        "void f();\n",
+        latest_set(),
+        &[("missing_function_body", 8, 9)],
+    );
 }
 
 /// The latest-version set (the `latest_features` fold's source set).

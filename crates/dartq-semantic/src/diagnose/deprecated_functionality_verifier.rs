@@ -166,7 +166,11 @@ impl Clause {
     /// The row this clause emits for a deprecation `kind`: each arm tests its
     /// own kind, so the `subclass` arms of `extends`/`implements` report that
     /// code while the same clause's own kind reports its own (:150-183).
-    fn row_for(self, kind: Option<DeprecationKind>, name: &str) -> Option<(CodeInfo, String, Option<String>)> {
+    fn row_for(
+        self,
+        kind: Option<DeprecationKind>,
+        name: &str,
+    ) -> Option<(CodeInfo, String, Option<String>)> {
         let kind = kind?;
         Some(match (self, kind) {
             (Self::Extends, DeprecationKind::Extend) => (
@@ -187,7 +191,9 @@ impl Clause {
             (Self::Implements | Self::On, DeprecationKind::Implement) => (
                 DEPRECATED_IMPLEMENT,
                 format!("Implementing '{name}' is deprecated."),
-                Some(format!("Try removing '{name}' from the 'implements' clause.")),
+                Some(format!(
+                    "Try removing '{name}' from the 'implements' clause."
+                )),
             ),
             (Self::With, DeprecationKind::Mixin) => (
                 DEPRECATED_MIXIN,
@@ -254,9 +260,7 @@ impl Engine<'_> {
                 ContainerKind::Mixin => (false, true, false, true),
                 ContainerKind::Extension | ContainerKind::ExtensionType => continue,
             };
-            if extends
-                && let Some(head) = container.superclass
-            {
+            if extends && let Some(head) = container.superclass {
                 self.clause_rows(
                     site.name,
                     site.range,
@@ -445,13 +449,16 @@ impl Engine<'_> {
         let Some(token) = tokens.get(start) else {
             return (None, start + 1);
         };
-        let is_name = |kind: TokenKind| matches!(kind, TokenKind::Identifier | TokenKind::Keyword(_));
+        let is_name =
+            |kind: TokenKind| matches!(kind, TokenKind::Identifier | TokenKind::Keyword(_));
         if !is_name(token.kind) {
             return (None, start + 1);
         }
         let mut last = start;
         let mut cursor = start + 1;
-        while tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Period)
+        while tokens
+            .get(cursor)
+            .is_some_and(|t| t.kind == TokenKind::Period)
             && tokens.get(cursor + 1).is_some_and(|t| is_name(t.kind))
         {
             last = cursor + 1;
@@ -635,9 +642,11 @@ impl Engine<'_> {
             let Some(open) = self.call_open_paren(edge.range) else {
                 continue;
             };
-            let Some(formals) =
-                self.member_or_decl_formals(edge.target_file, Some(edge.target_container), edge.target_name)
-            else {
+            let Some(formals) = self.member_or_decl_formals(
+                edge.target_file,
+                Some(edge.target_container),
+                edge.target_name,
+            ) else {
                 continue;
             };
             let owner = self.strings.intern(&format!(
@@ -645,7 +654,14 @@ impl Engine<'_> {
                 self.strings.resolve(edge.target_container),
                 self.strings.resolve(edge.target_name)
             ));
-            self.omission_rows(edge.target_file, owner, formals, open, edge.range, &mut rows);
+            self.omission_rows(
+                edge.target_file,
+                owner,
+                formals,
+                open,
+                edge.range,
+                &mut rows,
+            );
         }
         // A creation (`C()`), anchored at the type head — the constructor
         // name's own start.
@@ -678,11 +694,12 @@ impl Engine<'_> {
         };
         let (positional, labels) = self.provided_args(open);
         let decl_lib = self.graph.library_of_file(file).unwrap_or(self.lib);
-        let omitted = formals
-            .positional
-            .iter()
-            .skip(positional)
-            .chain(formals.named.iter().filter(|formal| !labels.contains(&formal.name)));
+        let omitted = formals.positional.iter().skip(positional).chain(
+            formals
+                .named
+                .iter()
+                .filter(|formal| !labels.contains(&formal.name)),
+        );
         for formal in omitted {
             let Some(annotations) = elements.formal_annotations(owner, formal.name) else {
                 continue;
@@ -780,9 +797,7 @@ impl Engine<'_> {
                     return None;
                 }
                 let is_new = self.tokens.lexeme(self.source, cursor + 1) == "new";
-                if !is_new
-                    && tokens.get(cursor + 2).map(|t| t.kind) != Some(TokenKind::OpenParen)
-                {
+                if !is_new && tokens.get(cursor + 2).map(|t| t.kind) != Some(TokenKind::OpenParen) {
                     return None;
                 }
                 let end = selector.utf16_offset + self.token_utf16_len(cursor + 1);
@@ -804,6 +819,9 @@ impl Engine<'_> {
             _ => return None,
         };
         let container = self.index.get(file)?.container(name)?;
-        Some((container, self.graph.library_of_file(file).unwrap_or(self.lib)))
+        Some((
+            container,
+            self.graph.library_of_file(file).unwrap_or(self.lib),
+        ))
     }
 }

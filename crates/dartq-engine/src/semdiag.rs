@@ -84,8 +84,7 @@ use dartq_language::Feature;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::LibraryClassModifiers;
 use dartq_semantic::{
-    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, MicroKind,
-    StrictModes, UnitUseFace,
+    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, MicroKind, StrictModes, UnitUseFace,
 };
 use dartq_source::{ContentId, FileId, LineIndex, SourceRange, StringId, StringTable};
 use rayon::prelude::*;
@@ -458,13 +457,16 @@ fn import_edge_credited(
                     if name == prefix {
                         continue;
                     }
-                    let winner =
-                        library
-                            .namespaces
-                            .lookup_prefixed_in_file(library.graph, lib, Some(use_file), prefix, name);
-                    let dartq_resolution::Lookup::Found(
-                        dartq_resolution::NamespaceEntry::Decl(declaring),
-                    ) = winner
+                    let winner = library.namespaces.lookup_prefixed_in_file(
+                        library.graph,
+                        lib,
+                        Some(use_file),
+                        prefix,
+                        name,
+                    );
+                    let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(
+                        declaring,
+                    )) = winner
                     else {
                         continue;
                     };
@@ -568,9 +570,13 @@ fn prefix_attributed(
     pool.used.iter().any(|&p| {
         p != name
             && !matches!(
-                library
-                    .namespaces
-                    .lookup_prefixed_in_file(library.graph, library.graph_library, Some(use_file), p, name),
+                library.namespaces.lookup_prefixed_in_file(
+                    library.graph,
+                    library.graph_library,
+                    Some(use_file),
+                    p,
+                    name
+                ),
                 dartq_resolution::Lookup::NotFound
             )
     })

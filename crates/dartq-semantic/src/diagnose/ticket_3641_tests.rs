@@ -55,9 +55,7 @@ fn at_len(needle: &str) -> u32 {
 
 /// The never-match message for a column-vs-required verdict.
 fn never_matches(matched: &str, required: &str) -> String {
-    format!(
-        "The matched value type '{matched}' can never match the required type '{required}'."
-    )
+    format!("The matched value type '{matched}' can never match the required type '{required}'.")
 }
 
 // —— record field-columns (the in-scope arm) ———————————————————————————
@@ -80,11 +78,7 @@ void f((E, String) r) {
     let report = report_ops(fixture);
     assert_eq!(
         rows(&report, "pattern_never_matches_value_type"),
-        vec![(
-            at(fixture, "F x", 0),
-            1,
-            never_matches("E", "F"),
-        )],
+        vec![(at(fixture, "F x", 0), 1, never_matches("E", "F"),)],
         "the first slot's column is `E`: {:?}",
         report.diagnostics
     );
@@ -106,11 +100,7 @@ void f((int, {String s}) r) {
     let report = report_ops(fixture);
     assert_eq!(
         rows(&report, "pattern_never_matches_value_type"),
-        vec![(
-            at(fixture, "F x", 0),
-            1,
-            never_matches("String", "F"),
-        )],
+        vec![(at(fixture, "F x", 0), 1, never_matches("String", "F"),)],
         "the named slot `s` is `String`: {:?}",
         report.diagnostics
     );

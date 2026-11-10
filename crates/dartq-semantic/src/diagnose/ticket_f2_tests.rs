@@ -48,9 +48,8 @@ fn promoted_field_member_use_reports_undefined_not_unchecked() {
 /// `PromotedPropertyRead` at `_f`'s token; the member use stands down.
 #[test]
 fn implicit_this_promoted_field_member_use_reports_undefined() {
-    let report = report_ops(
-        "class C { final int? _f = 0; void m() { if (_f != null) { _f.m(); } } }\n",
-    );
+    let report =
+        report_ops("class C { final int? _f = 0; void m() { if (_f != null) { _f.m(); } } }\n");
     let names = code_names(&report);
     assert!(
         !names.contains(&"unchecked_use_of_nullable_value"),

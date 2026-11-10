@@ -70,7 +70,9 @@ use dartq_types::{
 
 use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
-use crate::model::{ArgListId, ArgPool, ContainerKind, FnShapeId, FnSig, MemberKind, MicroKind, Ty};
+use crate::model::{
+    ArgListId, ArgPool, ContainerKind, FnShapeId, FnSig, MemberKind, MicroKind, Ty,
+};
 
 /// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
 /// and bare `Function`). Each snapshot owns its id space.
@@ -474,7 +476,9 @@ impl LibraryTypes {
     /// accessor for the typedef-variance-seeded default-type face (#3523).
     #[cfg(test)]
     pub(crate) fn testing_typedef_defaults(&self, name: StringId) -> Option<Vec<TypeId>> {
-        self.typedef_shapes.get(&name).map(|shape| shape.defaults.to_vec())
+        self.typedef_shapes
+            .get(&name)
+            .map(|shape| shape.defaults.to_vec())
     }
 
     /// Every function-signature binder inside `ty` with its facts bound —
@@ -1954,8 +1958,15 @@ impl Registry {
             self.flatten_leaf(table, pool, strings, sig.return_ty, name, &[], &mut binders)?;
         let mut positional = Vec::with_capacity(sig.formals.positional.len());
         for formal in &sig.formals.positional {
-            positional
-                .push(self.flatten_leaf(table, pool, strings, formal.ty, name, &[], &mut binders)?);
+            positional.push(self.flatten_leaf(
+                table,
+                pool,
+                strings,
+                formal.ty,
+                name,
+                &[],
+                &mut binders,
+            )?);
         }
         let mut named = Vec::with_capacity(sig.formals.named.len());
         for formal in &sig.formals.named {
@@ -1970,10 +1981,9 @@ impl Registry {
         // boundary (`void f([int x])` is `void Function([int])`), so the
         // resolved identity reads the same split the written
         // `Ty::Function` shapes carry.
-        let required_positional = u32::try_from(
-            sig.formals.positional.iter().filter(|f| f.required).count(),
-        )
-        .unwrap_or(u32::MAX);
+        let required_positional =
+            u32::try_from(sig.formals.positional.iter().filter(|f| f.required).count())
+                .unwrap_or(u32::MAX);
         table
             .intern_function(
                 UninternedFunction {
@@ -2051,9 +2061,7 @@ impl Registry {
                     named.push(NamedMember {
                         name: strings.resolve(field_name).to_string(),
                         ty: self
-                            .flatten_rhs(
-                                table, pool, strings, field, alias, own_params, binders,
-                            )?
+                            .flatten_rhs(table, pool, strings, field, alias, own_params, binders)?
                             .0,
                         required: false,
                     });
@@ -2086,9 +2094,11 @@ impl Registry {
                 )?;
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for &formal in &shape.positional {
-                    positional.push(self.flatten_leaf(
-                        table, pool, strings, formal, alias, own_params, binders,
-                    )?);
+                    positional.push(
+                        self.flatten_leaf(
+                            table, pool, strings, formal, alias, own_params, binders,
+                        )?,
+                    );
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for &(formal_name, formal) in &shape.named {
@@ -2174,9 +2184,7 @@ impl Registry {
                             .0,
                     );
                 }
-                self.flatten_named_head(
-                    table, strings, name, nullable, &flattened, alias, binders,
-                )
+                self.flatten_named_head(table, strings, name, nullable, &flattened, alias, binders)
             }
         }
     }
@@ -2249,19 +2257,11 @@ impl Registry {
                 } else {
                     return None;
                 };
-                let map: Vec<(TypeParamId, TypeId)> = params
-                    .iter()
-                    .copied()
-                    .zip(mapped.iter().copied())
-                    .collect();
+                let map: Vec<(TypeParamId, TypeId)> =
+                    params.iter().copied().zip(mapped.iter().copied()).collect();
                 let substituted = table.substitute(shape, &map);
-                let expanded = self.expand_alias_binders(
-                    table,
-                    substituted,
-                    &source_binders,
-                    &map,
-                    binders,
-                );
+                let expanded =
+                    self.expand_alias_binders(table, substituted, &source_binders, &map, binders);
                 return Some((expanded, nullable));
             }
             // A bare-Named alias chain (`typedef B = A;` with `A` still
@@ -2700,11 +2700,7 @@ fn clause_arg_ty(
             &map,
             binder,
         );
-        return Some(with_question(
-            table,
-            shape,
-            entry.nullable || tree.nullable,
-        ));
+        return Some(with_question(table, shape, entry.nullable || tree.nullable));
     }
     let &decl = registry.get(&tree.head)?;
     let args = if tree.args.is_empty() {
@@ -4165,8 +4161,7 @@ impl<'a> ResolvedTypeOps<'a> {
             let on = self.map_ty_strict(on_ty, pool);
             match (receiver, on) {
                 (Some(receiver), Some(on)) => {
-                    let ids: Vec<TypeParamId> =
-                        face_params.iter().map(|(id, _)| *id).collect();
+                    let ids: Vec<TypeParamId> = face_params.iter().map(|(id, _)| *id).collect();
                     self.unify_extended(receiver, on, &ids)
                         .map(|(instantiated, _)| instantiated)
                 }
@@ -5544,10 +5539,7 @@ typedef U<T> = T Function();
                 "`{alias}`'s written bound is captured: {:?}",
                 capture.param_bounds
             );
-            assert!(
-                capture.supers.is_empty(),
-                "an alias declares no supertype"
-            );
+            assert!(capture.supers.is_empty(), "an alias declares no supertype");
         }
         let ops = ResolvedTypeOps::new(&types, &strings, file);
         let table = &types.table;

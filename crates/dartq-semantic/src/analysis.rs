@@ -505,8 +505,10 @@ impl<'a> Analysis<'a> {
         // chain-breaks. The name-level kind face answers the member's
         // kind — the entry is process-static, so it coerces to this
         // query's lifetime.
-        let entry =
-            core_member_entry(self.strings.resolve(container), self.strings.resolve(member))?;
+        let entry = core_member_entry(
+            self.strings.resolve(container),
+            self.strings.resolve(member),
+        )?;
         Some(MemberBinding { container, entry })
     }
 

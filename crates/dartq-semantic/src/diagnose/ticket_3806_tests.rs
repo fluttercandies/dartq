@@ -36,7 +36,7 @@
 //! pin (`case == (.x)` → `'Object'`; `case == .x` → the scrutinee head;
 //! `C(1) == .x` → `'C'`), and the same file through both engines.
 
-use super::test_rig::{rows, report_ops};
+use super::test_rig::{report_ops, rows};
 use crate::diagnose::FileReport;
 
 /// The `dot_shorthand_undefined_member` rows of `report`, in the rig's

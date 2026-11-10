@@ -1313,7 +1313,10 @@ fn unassigned_read_suppressed(
                     // `text_of` keys on the token's table index — the
                     // range payload is unread, so the declared span stands
                     // in for the ident's own.
-                    let ident = Token { id: i as u32, range: decl };
+                    let ident = Token {
+                        id: i as u32,
+                        range: decl,
+                    };
                     let Some(text) = engine.text_of(ident) else {
                         return false;
                     };
@@ -1586,7 +1589,9 @@ pub fn fold_unit_with_ops<'t>(
                 //   token short of the group's `]`/`)`/`}` extends
                 //   through it — statement tails never qualify (their
                 //   anchor is statement-initial).
-                let prev = (span.id > 0).then(|| tokens.get(span.id as usize - 1)).flatten();
+                let prev = (span.id > 0)
+                    .then(|| tokens.get(span.id as usize - 1))
+                    .flatten();
                 let mid_expression_anchor = prev.is_some_and(|t| {
                     matches!(
                         t.kind,
@@ -1781,9 +1786,7 @@ pub fn fold_unit_with_ops<'t>(
                                     )
                                     && t.utf16_offset + t.byte_len == range.end()
                             })
-                            .is_some_and(|close_idx| {
-                                closer_is_subexpression(slice, close_idx)
-                            })
+                            .is_some_and(|close_idx| closer_is_subexpression(slice, close_idx))
                     };
                     if ends_with_closer
                         && !subexpression_tail
@@ -1862,13 +1865,7 @@ pub fn fold_unit_with_ops<'t>(
                     Some(SemanticCode::ReadPotentiallyUnassignedFinal)
                 } else {
                     (potentially_non_nullable
-                        && !unassigned_read_suppressed(
-                            span,
-                            declared_type,
-                            tokens,
-                            &engine,
-                            name,
-                        ))
+                        && !unassigned_read_suppressed(span, declared_type, tokens, &engine, name))
                     .then_some(SemanticCode::NotAssignedPotentiallyNonNullableLocalVariable)
                 };
                 if let Some(code) = code {
@@ -2172,9 +2169,7 @@ pub fn fold_unit_with_ops<'t>(
     // receivers that are not member reads keep their folded classification.
     for member in 0..engine.member_reads.len() {
         let MemberRead {
-            offset,
-            recv_span,
-            ..
+            offset, recv_span, ..
         } = engine.member_reads[member];
         // Only a member-read receiver can carry a promoted-property fact —
         // a bare/local receiver's stand-down is the folded variable latch's
@@ -2602,8 +2597,7 @@ pub fn fold_unit_with_ops<'t>(
             if !ctx.is_expression && !cases.is_empty() {
                 let total = |index: usize| {
                     matches!(
-                        compute(&world, &value, std::slice::from_ref(&cases[index]))
-                            .exhaustiveness,
+                        compute(&world, &value, std::slice::from_ref(&cases[index])).exhaustiveness,
                         Exhaustiveness::Exhaustive
                     )
                 };
@@ -2703,8 +2697,7 @@ pub fn fold_unit_with_ops<'t>(
             // body span (the parse-time `body_dies` anchor shape); a
             // covering row retracts only when this pass owns the covering
             // (no deferral staged it).
-            let case_anchors: FxHashSet<u32> =
-                ctx.cases.iter().map(|c| c.anchor.offset).collect();
+            let case_anchors: FxHashSet<u32> = ctx.cases.iter().map(|c| c.anchor.offset).collect();
             let body_spans: FxHashSet<(u32, u32)> = ctx
                 .cases
                 .iter()
@@ -2719,9 +2712,7 @@ pub fn fold_unit_with_ops<'t>(
                 if row.code.name == unreachable_case && case_anchors.contains(&at) {
                     return keep_unreachable.contains(&at);
                 }
-                if row.code.name == dead_code
-                    && body_spans.contains(&(at, row.range.length))
-                {
+                if row.code.name == dead_code && body_spans.contains(&(at, row.range.length)) {
                     return keep_dead.contains(&(at, row.range.length));
                 }
                 if (row.code.name == ne_statement || row.code.name == ne_expression)
@@ -2938,10 +2929,7 @@ pub fn fold_unit_with_ops<'t>(
                     Diagnostic::new(
                         Severity::Error,
                         SemanticCode::DuplicateDefinition.code_info(),
-                        SemanticCode::DuplicateDefinition.message(
-                            strings.resolve(dup.name),
-                            "",
-                        ),
+                        SemanticCode::DuplicateDefinition.message(strings.resolve(dup.name), ""),
                         file,
                         dup.range,
                         None,
@@ -2950,8 +2938,7 @@ pub fn fold_unit_with_ops<'t>(
                 .collect::<Vec<_>>();
             engine.wildcard_dups_emitted = usize::MAX;
             for row in leftover {
-                let position =
-                    diagnostics.partition_point(|d| d.range.offset <= row.range.offset);
+                let position = diagnostics.partition_point(|d| d.range.offset <= row.range.offset);
                 diagnostics.insert(position, row);
             }
         }
@@ -4249,9 +4236,7 @@ fn suppress_dead_code_inside_dead_clauses(diagnostics: &mut Vec<Diagnostic>) {
 fn gate_non_nullable_callee_rows(diagnostics: &mut Vec<Diagnostic>, engine: &Engine) {
     let function_head = engine.intern("Function");
     diagnostics.retain(|row| {
-        if row.code.name != UNCHECKED_NAME
-            || row.message.as_str() != UNCHECKED_FUNCTION_TEXT
-        {
+        if row.code.name != UNCHECKED_NAME || row.message.as_str() != UNCHECKED_FUNCTION_TEXT {
             return true;
         }
         let Ok(index) = engine
@@ -4318,7 +4303,9 @@ fn gate_extension_resolved_nullable_rows(diagnostics: &mut Vec<Diagnostic>, engi
 /// tables hand the resolution arms).
 fn non_nullable_function_face(engine: &Engine, ty: Ty, function_head: StringId) -> bool {
     match engine.fold_alias_ty(ty) {
-        Ty::Function { nullable: false, .. } => true,
+        Ty::Function {
+            nullable: false, ..
+        } => true,
         Ty::Named {
             name,
             nullable: false,
@@ -4339,9 +4326,15 @@ fn non_nullable_callee_container(engine: &Engine, recv: Receiver) -> Option<Stri
         Receiver::This { container, kind } | Receiver::Super { container, kind } => {
             let face = engine.this_static_ty(container, kind);
             match face {
-                Ty::Named { nullable: false, .. }
-                | Ty::Function { nullable: false, .. }
-                | Ty::Record { nullable: false, .. } => Some(container),
+                Ty::Named {
+                    nullable: false, ..
+                }
+                | Ty::Function {
+                    nullable: false, ..
+                }
+                | Ty::Record {
+                    nullable: false, ..
+                } => Some(container),
                 _ => None,
             }
         }
@@ -4349,9 +4342,15 @@ fn non_nullable_callee_container(engine: &Engine, recv: Receiver) -> Option<Stri
         | Receiver::PrefixedContainer { name, .. }
         | Receiver::Created { name, .. } => Some(name),
         Receiver::Typed { type_name, ty } => match ty {
-            Ty::Named { nullable: false, .. }
-            | Ty::Function { nullable: false, .. }
-            | Ty::Record { nullable: false, .. } => Some(type_name),
+            Ty::Named {
+                nullable: false, ..
+            }
+            | Ty::Function {
+                nullable: false, ..
+            }
+            | Ty::Record {
+                nullable: false, ..
+            } => Some(type_name),
             _ => None,
         },
         Receiver::Prefix { .. } | Receiver::Unknown => None,
@@ -4430,9 +4429,9 @@ fn gate_invalid_scrutinee_switches(
         let Ty::Named { name, .. } = read_types[join].1 else {
             return true;
         };
-        *resolvable
-            .entry(name)
-            .or_insert_with(|| !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name))
+        *resolvable.entry(name).or_insert_with(|| {
+            !scrutinee_head_is_invalid(graph, namespaces, index, lib, file, name)
+        })
     })
 }
 
@@ -5807,11 +5806,7 @@ fn statement_semi_end(slice: &[dartq_scanner::Token], first: usize) -> Option<u3
 /// following `else` either chains a nested `if` (recurse one loop) or
 /// rows its own clause end as the statement's last. `None` on any
 /// clause the token shape cannot terminate.
-fn if_stmt_end(
-    slice: &[dartq_scanner::Token],
-    tokens: &TokenTable,
-    if_idx: usize,
-) -> Option<u32> {
+fn if_stmt_end(slice: &[dartq_scanner::Token], tokens: &TokenTable, if_idx: usize) -> Option<u32> {
     use dartq_scanner::{Keyword, TokenKind};
     let mut idx = if_idx;
     // Each loop answers one `if (cond) <then> [else <tail>]` — a chained
@@ -5883,10 +5878,7 @@ fn if_stmt_end(
 /// `return` mean the group rides inside a larger construct (an
 /// initializer, an index access, an argument); `=>`, a spread head, or a
 /// statement head mean the group IS the construct's own extent.
-fn closer_is_subexpression(
-    slice: &[dartq_scanner::Token],
-    close_idx: usize,
-) -> bool {
+fn closer_is_subexpression(slice: &[dartq_scanner::Token], close_idx: usize) -> bool {
     use dartq_scanner::TokenKind;
     let mut depth = 0i32;
     let mut open_idx = None;
@@ -7367,6 +7359,10 @@ mod ticket_3016_tests;
 #[cfg(test)]
 mod ticket_3065_tests;
 
+#[cfg(test)]
+mod ticket_3026_tests;
+#[cfg(test)]
+mod ticket_3035_tests;
 /// The #3069 pins — the call-site givens the `unused_element_parameter`
 /// rule reads for the invocations that slipped the recording: the
 /// reserved `new` selector keys under its class segment (`C.new(used)`
@@ -7377,10 +7373,6 @@ mod ticket_3065_tests;
 /// :146-153).
 #[cfg(test)]
 mod ticket_3069_tests;
-#[cfg(test)]
-mod ticket_3026_tests;
-#[cfg(test)]
-mod ticket_3035_tests;
 
 /// The #3040 pins — the unnamed-extension member edge's "no container"
 /// sentinel (`StringId::NONE`): the reference latch mints the edge with the

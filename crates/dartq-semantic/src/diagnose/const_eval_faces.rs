@@ -429,8 +429,7 @@ impl<'a> Engine<'a> {
             match &n.expr {
                 Expr::Member { recv, name } => {
                     if let Expr::Ident(head) = &recv.expr
-                        && let BareInfo::Container { name: c, .. } =
-                            self.resolve_bare(*head).0
+                        && let BareInfo::Container { name: c, .. } = self.resolve_bare(*head).0
                     {
                         let key = format!(
                             "{}\u{2}{}",
@@ -535,8 +534,7 @@ impl<'a> Engine<'a> {
                             }
                             let range = if cursor < toks.len() {
                                 let t = &toks[cursor];
-                                let end = self
-                                    .utf16_of((t.byte_offset + t.byte_len) as usize);
+                                let end = self.utf16_of((t.byte_offset + t.byte_len) as usize);
                                 let r = SourceRange {
                                     offset: t.utf16_offset,
                                     length: end - t.utf16_offset,
@@ -544,7 +542,10 @@ impl<'a> Engine<'a> {
                                 cursor += 1;
                                 r
                             } else {
-                                SourceRange { offset: 0, length: 0 }
+                                SourceRange {
+                                    offset: 0,
+                                    length: 0,
+                                }
                             };
                             (*name, range)
                         })
@@ -804,7 +805,10 @@ impl<'a> Engine<'a> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if !bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$') {
+        if !bytes
+            .get(i)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$')
+        {
             return span;
         }
         while i < bytes.len()
@@ -874,8 +878,7 @@ impl<'a> Engine<'a> {
                     let whole = self.shorthand_whole_span(*span);
                     // A decl-root shorthand's `report_root_shorthand` already
                     // landed this row; the Unresolved verdict's twin collapses.
-                    let info =
-                        SemanticCode::ConstInitializedWithNonConstantValue.code_info();
+                    let info = SemanticCode::ConstInitializedWithNonConstantValue.code_info();
                     if !self
                         .report
                         .diagnostics
@@ -1017,9 +1020,7 @@ impl<'a> Engine<'a> {
             ConstFault::Recursive => SemanticCode::RecursiveCompileTimeConstant,
             ConstFault::ForElement => SemanticCode::ConstEvalForElement,
             ConstFault::NonBoolCondition => SemanticCode::NonBoolCondition,
-            ConstFault::SpreadExpectedListOrSet => {
-                SemanticCode::ConstSpreadExpectedListOrSet
-            }
+            ConstFault::SpreadExpectedListOrSet => SemanticCode::ConstSpreadExpectedListOrSet,
             ConstFault::SpreadExpectedMap => SemanticCode::ConstSpreadExpectedMap,
             ConstFault::ExpressionInMap => SemanticCode::ExpressionInMap,
         };
@@ -1413,26 +1414,24 @@ impl<'a> Engine<'a> {
         // `rows` walk cannot find it). The bare path keeps the row-based
         // walk for `C<T>(`.
         let head = match self.invokes.last().and_then(|slot| *slot) {
-            Some(callee_index) => {
-                match self.rows.get(callee_index) {
-                    Some(callee) if callee.qualified => {
-                        let mut index = callee_index;
-                        while index > 0
-                            && matches!(
-                                self.rows.get(index - 1).map(|r| &r.shape),
-                                Some(RowShape::TypeUse(..))
-                            )
-                        {
-                            index -= 1;
-                        }
-                        index
-                            .checked_sub(1)
-                            .and_then(|i| self.rows.get(i))
-                            .map(|row| (row.name, row.range))
+            Some(callee_index) => match self.rows.get(callee_index) {
+                Some(callee) if callee.qualified => {
+                    let mut index = callee_index;
+                    while index > 0
+                        && matches!(
+                            self.rows.get(index - 1).map(|r| &r.shape),
+                            Some(RowShape::TypeUse(..))
+                        )
+                    {
+                        index -= 1;
                     }
-                    other => other.map(|row| (row.name, row.range)),
+                    index
+                        .checked_sub(1)
+                        .and_then(|i| self.rows.get(i))
+                        .map(|row| (row.name, row.range))
                 }
-            }
+                other => other.map(|row| (row.name, row.range)),
+            },
             None => {
                 // `C<T>.named(` — `creation_ref` carries the class head `C`;
                 // its `type_uses` entry is the span the `<` follows.
@@ -1587,21 +1586,16 @@ impl<'a> Engine<'a> {
                         }
                         return CallClass::Unknown;
                     }
-                    if matches!(
-                        target,
-                        RefTarget::Local | RefTarget::Opaque
-                    ) {
+                    if matches!(target, RefTarget::Local | RefTarget::Opaque) {
                         // A bare-identifier call on a LOCAL / FORMAL: the
                         // resolver rewrites it to a
                         // `FunctionExpressionInvocation` (see
                         // [`CallClass::ValueCall`]).
                         return CallClass::ValueCall;
                     }
-                    if matches!(
-                        target,
-                        RefTarget::This | RefTarget::Member { .. }
-                    ) || (matches!(target, RefTarget::Decl { .. })
-                        && self.type_resolution(recv.name).0 == TypeResolution::NonType)
+                    if matches!(target, RefTarget::This | RefTarget::Member { .. })
+                        || (matches!(target, RefTarget::Decl { .. })
+                            && self.type_resolution(recv.name).0 == TypeResolution::NonType)
                     {
                         return CallClass::Invocable;
                     }
@@ -1669,12 +1663,7 @@ impl<'a> Engine<'a> {
         let Some(dot) = idx.checked_sub(1).and_then(|i| toks.get(i)) else {
             return span;
         };
-        if self
-            .source
-            .as_bytes()
-            .get(self.byte_of(dot.utf16_offset))
-            != Some(&b'.')
-        {
+        if self.source.as_bytes().get(self.byte_of(dot.utf16_offset)) != Some(&b'.') {
             return span;
         }
         SourceRange {
@@ -1799,12 +1788,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .any(|d| d.range == whole && d.code == info)
             {
-                self.emit(
-                    SemanticCode::DotShorthandMissingContext,
-                    whole,
-                    "",
-                    "",
-                );
+                self.emit(SemanticCode::DotShorthandMissingContext, whole, "", "");
             }
         }
         let info = SemanticCode::ConstInitializedWithNonConstantValue.code_info();
@@ -2655,8 +2639,7 @@ impl<'a> Engine<'a> {
         let mut clean: Vec<SourceRange> = Vec::new();
         let mut failed = None;
         for part in parts {
-            if let Some(v) = verify_const_element(part, code, lookup, &mut rows, &mut clean, self)
-            {
+            if let Some(v) = verify_const_element(part, code, lookup, &mut rows, &mut clean, self) {
                 failed.get_or_insert(v);
             }
         }
@@ -3886,20 +3869,20 @@ fn verify_const_element(
                     // `_reportNotPotentialConstants` over the skipped
                     // element) but never fault the literal — the live
                     // branch alone decides the verdict.
-                        // The live branch (`then` on true, `els` — which may
-                        // be absent — on false) verifies like an element; the
-                        // dead one scans its not-potentially-constant shapes.
-                        if b {
-                            if let Some(els) = els.as_deref() {
-                                dead_branch_npc(els, code, lookup, rows, engine);
-                            }
-                            verify_const_element(then, code, lookup, rows, clean, engine)
-                        } else {
-                            dead_branch_npc(then, code, lookup, rows, engine);
-                            els.as_deref().and_then(|els| {
-                                verify_const_element(els, code, lookup, rows, clean, engine)
-                            })
+                    // The live branch (`then` on true, `els` — which may
+                    // be absent — on false) verifies like an element; the
+                    // dead one scans its not-potentially-constant shapes.
+                    if b {
+                        if let Some(els) = els.as_deref() {
+                            dead_branch_npc(els, code, lookup, rows, engine);
                         }
+                        verify_const_element(then, code, lookup, rows, clean, engine)
+                    } else {
+                        dead_branch_npc(then, code, lookup, rows, engine);
+                        els.as_deref().and_then(|els| {
+                            verify_const_element(els, code, lookup, rows, clean, engine)
+                        })
+                    }
                 }
                 // A known non-bool condition faults `non_bool_condition`
                 // at the condition (the oracle's entity is the
@@ -4177,15 +4160,22 @@ mod face_tests {
         let const_init = |rep: &FileReport| -> Vec<&str> {
             code_names(rep)
                 .into_iter()
-                .filter(|c| {
-                    c.starts_with("const_") || c.starts_with("non_constant")
-                })
+                .filter(|c| c.starts_with("const_") || c.starts_with("non_constant"))
                 .collect()
         };
-        let rep = unit_report("bool identical(a, b) { return true; }\nconst x = identical(1, 1);\n");
-        assert!(const_init(&rep).is_empty(), "identical: {:?}", const_init(&rep));
+        let rep =
+            unit_report("bool identical(a, b) { return true; }\nconst x = identical(1, 1);\n");
+        assert!(
+            const_init(&rep).is_empty(),
+            "identical: {:?}",
+            const_init(&rep)
+        );
         let rep = unit_report("const y = 'a${2}';\n");
-        assert!(const_init(&rep).is_empty(), "interp: {:?}", const_init(&rep));
+        assert!(
+            const_init(&rep).is_empty(),
+            "interp: {:?}",
+            const_init(&rep)
+        );
         // Unary `-` on a constant: valid (ConstantVerifier prefix arm).
         let rep = unit_report("const k = 1;\nconst z = -k;\n");
         assert!(const_init(&rep).is_empty(), "neg: {:?}", const_init(&rep));
@@ -4232,7 +4222,11 @@ mod face_tests {
             })
             .map(|d| (d.code.name, d.range.offset, d.range.length))
             .collect();
-        assert_eq!(rows, [("non_constant_map_element", 52, 8)], "spread: {rows:?}");
+        assert_eq!(
+            rows,
+            [("non_constant_map_element", 52, 8)],
+            "spread: {rows:?}"
+        );
     }
 
     /// A `new` creation in a const initializer reports at the whole

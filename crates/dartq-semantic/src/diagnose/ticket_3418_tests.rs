@@ -21,9 +21,7 @@
 //! declared in NEITHER still reports; ⑤ the merge is order-independent —
 //! the same fragments in a different unit order answer the same face.
 
-use super::test_rig::{
-    code_names, report_ops_augment, report_ops_augment_intro_experiments, rows,
-};
+use super::test_rig::{code_names, report_ops_augment, report_ops_augment_intro_experiments, rows};
 use crate::collector::collect;
 use crate::library::{ElementIndex, resolve_container};
 use crate::model::MicroKind;
@@ -98,9 +96,15 @@ impl Fixture {
     /// The member spellings the container anchor answers in `file`, sorted.
     fn members(&self, file: FileId, container: &str) -> Vec<String> {
         let name = self.strings.intern(container);
-        let (face, owner) =
-            resolve_container(&self.graph, &self.namespaces, &self.index, self.lib, file, name)
-                .unwrap_or_else(|| panic!("`{container}` resolves from the fixture's unit"));
+        let (face, owner) = resolve_container(
+            &self.graph,
+            &self.namespaces,
+            &self.index,
+            self.lib,
+            file,
+            name,
+        )
+        .unwrap_or_else(|| panic!("`{container}` resolves from the fixture's unit"));
         assert_eq!(owner, file, "the anchor owns the row it answers with");
         let mut members: Vec<String> = face
             .members
@@ -134,8 +138,14 @@ fn the_element_face_is_the_union_of_its_fragments() {
 #[test]
 fn the_fragment_merge_is_order_independent() {
     let intro = ("main.dart", "class C { int a = 1; }");
-    let first = ("one.dart", "part of 'main.dart';\naugment class C { int b = 2; }");
-    let last = ("two.dart", "part of 'main.dart';\naugment class C { int c = 3; }");
+    let first = (
+        "one.dart",
+        "part of 'main.dart';\naugment class C { int b = 2; }",
+    );
+    let last = (
+        "two.dart",
+        "part of 'main.dart';\naugment class C { int c = 3; }",
+    );
     let forward = library(&[intro, first, last]);
     let reversed = library(&[intro, last, first]);
     let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];

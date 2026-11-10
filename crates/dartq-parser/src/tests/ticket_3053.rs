@@ -119,8 +119,10 @@ fn prefixed_builtin_head_is_silent() {
 #[test]
 fn valid_type_builtins_are_silent() {
     let rows = rows_with("class D extends dynamic {}\n");
-    assert!(rows.is_empty(), "`extends dynamic` is a valid type, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "`extends dynamic` is a valid type, got {rows:?}"
+    );
     let rows = rows_with("int Function() f = () => throw 0;\n");
     assert!(rows.is_empty(), "`int Function()` is silent, got {rows:?}");
 }
-

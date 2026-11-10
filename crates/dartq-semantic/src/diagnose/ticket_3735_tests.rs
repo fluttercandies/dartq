@@ -99,10 +99,7 @@ fn void_type_arg_not_null_against_t() {
     let null_vs_t = spans_of(&report, &full, "argument_type_not_assignable")
         .iter()
         .any(|span| span.contains("null"));
-    assert!(
-        !null_vs_t,
-        "A<void>(null) must not report Null-against-T"
-    );
+    assert!(!null_vs_t, "A<void>(null) must not report Null-against-T");
 }
 
 // -- Shape 3: bare alias/container heads resolve to `Type` in expression position

@@ -43,18 +43,17 @@ fn assert_code_count(report: &FileReport, name: &str, count: usize) {
         .iter()
         .filter(|d| d.code.name == name)
         .count();
-    assert_eq!(hits, count, "expected {count} {name} rows; got {:#?}", rows(report));
+    assert_eq!(
+        hits,
+        count,
+        "expected {count} {name} rows; got {:#?}",
+        rows(report)
+    );
 }
 
 /// One row of `name` anchored at `offset:len` carrying `message`.
 #[track_caller]
-fn assert_row(
-    report: &FileReport,
-    name: &str,
-    offset: usize,
-    len: u32,
-    message: &str,
-) {
+fn assert_row(report: &FileReport, name: &str, offset: usize, len: u32, message: &str) {
     let hits: Vec<_> = report
         .diagnostics
         .iter()

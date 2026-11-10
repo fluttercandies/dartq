@@ -59,7 +59,9 @@ fn code_spans(report: &crate::diagnose::FileReport) -> Vec<(&'static str, u32, u
 }
 
 fn mixin_msg(name: &str) -> String {
-    format!("The class '{name}' can't be used as a mixin because it's neither a mixin class nor a mixin.")
+    format!(
+        "The class '{name}' can't be used as a mixin because it's neither a mixin class nor a mixin."
+    )
 }
 
 // —— F1: an alias to a plain class reports the folded element ————————————

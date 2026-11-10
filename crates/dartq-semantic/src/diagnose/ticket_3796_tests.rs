@@ -176,9 +176,11 @@ fn declared_index_read_blocks_extension_index_write() {
 /// Probed: 0 rows on `x++` where `x` is `Never`.
 #[test]
 fn postfix_increment_on_never_silent() {
-    let report = report_ops("void f(Never x) {\n\
+    let report = report_ops(
+        "void f(Never x) {\n\
          \x20 x++;\n\
-         }\n");
+         }\n",
+    );
     assert_eq!(
         undefined_operator_rows(&report),
         Vec::<(u32, u32)>::new(),
@@ -252,7 +254,10 @@ fn extension_setter_shadowed_invoke_names_on_type() {
         code_names(&report)
     );
     let msg = &misses[0].message;
-    assert!(msg.contains("topLevelMethod") && msg.contains("'A'"), "row: {msg}");
+    assert!(
+        msg.contains("topLevelMethod") && msg.contains("'A'"),
+        "row: {msg}"
+    );
 }
 
 /// The bare write inside an extension body falls to `this` — the `on`
@@ -342,7 +347,10 @@ fn generic_tearoff_operator_display_keeps_type_params() {
         .iter()
         .find(|d| d.code.name == "undefined_operator");
     let Some(row) = row else {
-        panic!("expected the `<` undefined_operator row, codes={:?}", code_names(&report));
+        panic!(
+            "expected the `<` undefined_operator row, codes={:?}",
+            code_names(&report)
+        );
     };
     assert!(
         row.message.contains("Function<T1, T2>"),

@@ -69,10 +69,8 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "dartq-sdk-locate-{tag}-{}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("dartq-sdk-locate-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("scratch dir");
             Self(dir.canonicalize().expect("scratch canonicalizes"))
@@ -149,7 +147,10 @@ mod tests {
         scratch.write("dart-sdk/bin/dart");
         scratch.write("dart-sdk/version");
         scratch.write("dart-sdk/lib/libraries.json");
-        assert_eq!(dart_sdk_root_of_dart(&sdk.join("bin").join("dart")), Some(sdk));
+        assert_eq!(
+            dart_sdk_root_of_dart(&sdk.join("bin").join("dart")),
+            Some(sdk)
+        );
 
         let flutter = scratch.flutter_root();
         scratch.write("flutter/bin/dart");

@@ -28,7 +28,7 @@
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
-use crate::ty::{ArgTy, Base, Ty, TypeOps, EMPTY_ARGS};
+use crate::ty::{ArgTy, Base, EMPTY_ARGS, Ty, TypeOps};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -202,10 +202,7 @@ fn analyze<'t>(
 fn reads<'a>(
     source: &'a str,
     facts: &[FlowFact],
-) -> (
-    Vec<(&'a str, Ty, u32)>,
-    Vec<(&'a str, Ty, u32)>,
-) {
+) -> (Vec<(&'a str, Ty, u32)>, Vec<(&'a str, Ty, u32)>) {
     let at = |span: dartq_source::SourceRange| {
         &source[span.offset as usize..(span.offset + span.length) as usize]
     };
@@ -355,9 +352,11 @@ fn written_object_pattern_args_promote_the_instantiated_head() {
         "the row carries the WRITTEN `ValueT` list: {read:?}"
     );
     assert!(
-        promoted.iter().any(|(snippet, ty, args)| *snippet == "value"
-            && ty.base == Base::Name(ad)
-            && arg_is(&flow, *args, vt)),
+        promoted
+            .iter()
+            .any(|(snippet, ty, args)| *snippet == "value"
+                && ty.base == Base::Name(ad)
+                && arg_is(&flow, *args, vt)),
         "{promoted:?}"
     );
 }
@@ -406,11 +405,9 @@ fn non_generic_scrutinee_promotes_to_the_raw_head() {
             "`{var}` promotes to the raw `AsyncData` head: {read:?}"
         );
         assert!(
-            promoted
-                .iter()
-                .any(|(snippet, ty, args)| *snippet == var
-                    && ty.base == Base::Name(ad)
-                    && *args == EMPTY_ARGS),
+            promoted.iter().any(|(snippet, ty, args)| *snippet == var
+                && ty.base == Base::Name(ad)
+                && *args == EMPTY_ARGS),
             "{promoted:?}"
         );
     }

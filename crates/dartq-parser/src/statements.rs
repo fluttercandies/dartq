@@ -460,10 +460,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // selector-silent there via [`Parser::assignment_op_spliced`]
         // (`C() : this = 0;` carries expected_token '.' +
         // missing_assignment_in_initializer, never a selector or the rider).
-        let head_assigns =
-            matches!(head, TokenKind::Keyword(Keyword::Super | Keyword::This))
-                && self.precedence_of(self.cursor.look_kind(1))
-                    == Some(crate::expressions::ASSIGNMENT_PRECEDENCE);
+        let head_assigns = matches!(head, TokenKind::Keyword(Keyword::Super | Keyword::This))
+            && self.precedence_of(self.cursor.look_kind(1))
+                == Some(crate::expressions::ASSIGNMENT_PRECEDENCE);
         // The statement-root marker for the assignment arm's
         // `illegalAssignmentToNonAssignable` rider: only the frame whose LHS
         // begins at this token is the statement's ROOT assignment, exactly
@@ -761,10 +760,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // `language/cascade/precedence_test` — dartq's narrower gate read it
         // as a record-typed declaration and minted `expected_token ')'`,
         // `unexpected ':'` cascades).
-        if no_modifiers
-            && !for_parts
-            && type_info.is_nullable()
-            && type_info.could_be_expression()
+        if no_modifiers && !for_parts && type_info.is_nullable() && type_info.could_be_expression()
         {
             if !self.peek_is_identifier() {
                 let next = self.peek_span();
@@ -1134,7 +1130,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // synthetic-group recovery branch below reports its own — its `open`
         // is the condition token itself.
         if self.ends_bare_super_after(open, self.last_consumed_span()) {
-            self.report(msg::missing_assignable_selector(), self.span_of(open.id + 1));
+            self.report(
+                msg::missing_assignable_selector(),
+                self.span_of(open.id + 1),
+            );
         }
         if allow_case && self.peek_kind() == TokenKind::Keyword(Keyword::Case) {
             let case_kw = self.peek_span();
@@ -1965,12 +1964,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     // at the relocation point (official `moveSynthetic`,
                     // :10776 — the unmatched-group row anchors there and the
                     // parse resumes on the junk).
-                    repaired_close = Some(self.move_synthetic_close(
-                        open,
-                        close,
-                        TokenKind::CloseParen,
-                        ")",
-                    ));
+                    repaired_close =
+                        Some(self.move_synthetic_close(open, close, TokenKind::CloseParen, ")"));
                     repaired = true;
                 } else {
                     current_comma = Some(self.synthetic(TokenKind::Comma, at.range.offset));
@@ -2356,7 +2351,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // ast_builder.dart:4179): a bare `super` arrow body carries the
         // selector-missing row (`() => super`, `void g() => super;`).
         if self.ends_bare_super_after(arrow, self.last_consumed_span()) {
-            self.report(msg::missing_assignable_selector(), self.span_of(arrow.id + 1));
+            self.report(
+                msg::missing_assignable_selector(),
+                self.span_of(arrow.id + 1),
+            );
         }
         // The member flavor requires `;`; the function-expression flavor
         // leaves the end token `None` (official parseExpressionFunctionBody

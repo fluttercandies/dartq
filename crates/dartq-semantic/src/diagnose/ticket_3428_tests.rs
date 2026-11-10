@@ -72,10 +72,7 @@ fn t3428_as_prefixed_miss_reports_cast_to_non_type() {
 /// operand alike (the argument face outranks the operand face).
 #[test]
 fn t3428_prefixed_miss_in_type_arguments_reports_the_argument_code() {
-    assert_eq!(
-        names("List<p.Missing>? x;"),
-        ["non_type_as_type_argument"]
-    );
+    assert_eq!(names("List<p.Missing>? x;"), ["non_type_as_type_argument"]);
     assert_eq!(
         names("void f(Object? v) { v is List<p.Missing>; }"),
         ["non_type_as_type_argument"]
@@ -130,14 +127,8 @@ fn t3428_prefixed_miss_anchors_the_qualified_span() {
 /// touch.
 #[test]
 fn t3428_prefixed_miss_in_a_plain_position_keeps_undefined_class() {
-    assert_eq!(
-        names("typedef M = p.Missing;"),
-        ["undefined_class"]
-    );
-    assert_eq!(
-        names("p.Missing f() => throw 0;"),
-        ["undefined_class"]
-    );
+    assert_eq!(names("typedef M = p.Missing;"), ["undefined_class"]);
+    assert_eq!(names("p.Missing f() => throw 0;"), ["undefined_class"]);
 }
 
 /// Regression guards: a RESOLVED `p.C` operand produces neither row, a

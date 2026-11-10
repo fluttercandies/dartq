@@ -20,8 +20,8 @@
 //! Oracle rows below were captured against `dart analyze --format machine`
 //! 3.13.7 with `analyzer.enable-experiment: [augmentations]` on.
 
-use super::test_rig::report_ops_experiments_with;
 use super::FileReport;
+use super::test_rig::report_ops_experiments_with;
 use dartq_language::Feature;
 
 fn unused_rows(source: &str) -> Vec<(u32, u32, String)> {

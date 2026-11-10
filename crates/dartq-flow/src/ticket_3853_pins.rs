@@ -168,10 +168,7 @@ mod tests {
                       \x20 }\n\
                       }\n";
         let (reads, promoted) = trace(source);
-        assert_eq!(
-            reads,
-            pairs(&[("r4", "Unknown?"), ("r4", "Unknown")])
-        );
+        assert_eq!(reads, pairs(&[("r4", "Unknown?"), ("r4", "Unknown")]));
         assert_eq!(promoted, pairs(&[("r4", "Unknown")]));
     }
 

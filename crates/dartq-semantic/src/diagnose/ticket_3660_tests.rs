@@ -179,7 +179,9 @@ fn class_with_mixin_on_unrelated_reports_object_supertype() {
     assert_eq!(spans(&report, CODE), vec![nth_span_of(source, "M", 1)]);
     assert_eq!(
         messages(&report, CODE),
-        vec!["'M' can't be mixed onto 'Object' because 'Object' doesn't implement 'A'.".to_string()]
+        vec![
+            "'M' can't be mixed onto 'Object' because 'Object' doesn't implement 'A'.".to_string()
+        ]
     );
 }
 

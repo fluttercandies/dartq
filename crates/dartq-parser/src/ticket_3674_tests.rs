@@ -186,7 +186,11 @@ fn augment_final_variable_does_not_claim_setter() {
 fn augment_variable_claims_setter_intro() {
     // `augment var x = 0;` also induces the setter fragment, so the
     // `set x(v);` intro flips to the multi-fragment face — silent.
-    assert_rows_at("void set x(int v);\naugment var x = 0;\n", augment_set(), &[]);
+    assert_rows_at(
+        "void set x(int v);\naugment var x = 0;\n",
+        augment_set(),
+        &[],
+    );
 }
 
 #[test]

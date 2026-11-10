@@ -26,8 +26,8 @@
 //!   `void f([int a = 0]); augment void f([int a]) {}` -> 0 rows (the
 //!   introduction's default settles it).
 
-use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops_experiments_with};
 use crate::FileReport;
+use crate::diagnose::test_rig::{CORE_PRELUDE, report_ops_experiments_with};
 use dartq_language::Feature;
 
 /// The fixture's rows of one code as `(offset, length)`, ascending.
@@ -100,10 +100,7 @@ fn missing_default_reports_both_fragments_without_a_chain_default() {
 fn missing_default_silences_the_chain_when_an_augment_supplies_one() {
     let source = "void f([int a]);\n\naugment void f([int a = 0]) {}\n";
     let report = with_augmentations(source);
-    assert_eq!(
-        rows(&report, "missing_default_value_for_parameter"),
-        vec![]
-    );
+    assert_eq!(rows(&report, "missing_default_value_for_parameter"), vec![]);
 }
 
 /// The introduction's own default settles the chain the same way (0 rows).
@@ -111,10 +108,7 @@ fn missing_default_silences_the_chain_when_an_augment_supplies_one() {
 fn missing_default_silences_the_augment_when_the_intro_supplies_one() {
     let source = "void f([int a = 0]);\n\naugment void f([int a]) {}\n";
     let report = with_augmentations(source);
-    assert_eq!(
-        rows(&report, "missing_default_value_for_parameter"),
-        vec![]
-    );
+    assert_eq!(rows(&report, "missing_default_value_for_parameter"), vec![]);
 }
 
 /// Bisect: a plain `;`-bodied top-level function still expects defaults —

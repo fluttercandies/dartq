@@ -397,11 +397,7 @@ fn for_header_stall_on_block_close() {
 fn for_header_stall_empty_parts() {
     assert_codes_with_scanner(
         "void f() {\n  for (;;\n}\n",
-        &[
-            "expected_token",
-            "expected_token",
-            "missing_identifier",
-        ],
+        &["expected_token", "expected_token", "missing_identifier"],
         "empty for parts at block closer, gate silent",
     );
 }

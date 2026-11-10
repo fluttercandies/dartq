@@ -201,8 +201,7 @@ fn body_and_condition_faces_match_oracle() {
          parenthesized-condition parser"
     );
     assert!(
-        sorted_rows("void f() { if super) {} }\n")
-            .contains(&mas(14, 19)),
+        sorted_rows("void f() { if super) {} }\n").contains(&mas(14, 19)),
         "oracle: the synthetic-group recovery keeps the condition face on \
          the condition token"
     );

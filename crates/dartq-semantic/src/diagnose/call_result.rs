@@ -129,7 +129,11 @@ impl Engine<'_> {
         } else {
             self.alias_rhs_any(name).is_some()
         };
-        if alias_use { ty } else { self.fold_alias_ty(ty) }
+        if alias_use {
+            ty
+        } else {
+            self.fold_alias_ty(ty)
+        }
     }
 
     /// The instantiate-to-bounds environment of a raw generic receiver

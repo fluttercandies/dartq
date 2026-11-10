@@ -82,7 +82,7 @@ fn unit_fold<'s>(source: &'s str, strings: &StringTable) -> UnitFold {
             prefix: None,
             deferred: false,
             combinators: Combinators::unfiltered(),
-                non_library: false,
+            non_library: false,
         },
     );
     let mut index = ElementIndex::default();

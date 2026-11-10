@@ -233,7 +233,10 @@ fn at(fixture: &str, needle: &str, nth: usize) -> u32 {
             .expect("needle appears in the fixture")
             + needle.len();
     }
-    let hit = from + fixture[from..].find(needle).expect("needle appears in the fixture");
+    let hit = from
+        + fixture[from..]
+            .find(needle)
+            .expect("needle appears in the fixture");
     u32::try_from(CORE_PRELUDE.len() + hit).expect("fixture offsets fit u32")
 }
 

@@ -26,7 +26,12 @@ fn rows_at(report: &super::FileReport, prelude: usize) -> Vec<(&'static str, usi
     report
         .diagnostics
         .iter()
-        .map(|d| (d.code.name, (d.range.offset as usize).saturating_sub(prelude)))
+        .map(|d| {
+            (
+                d.code.name,
+                (d.range.offset as usize).saturating_sub(prelude),
+            )
+        })
         .collect()
 }
 
@@ -76,7 +81,8 @@ fn ticket_3251_default_value_void_use() {
         report
             .diagnostics
             .iter()
-            .any(|d| d.message == VOID_MSG && (d.range.offset as usize).saturating_sub(prelude) == at),
+            .any(|d| d.message == VOID_MSG
+                && (d.range.offset as usize).saturating_sub(prelude) == at),
         "{:?}",
         rows(&report)
     );
@@ -102,7 +108,8 @@ fn ticket_3251_ctor_field_init_void_accepted() {
         report
             .diagnostics
             .iter()
-            .any(|d| d.message == VOID_MSG && (d.range.offset as usize).saturating_sub(prelude) == at),
+            .any(|d| d.message == VOID_MSG
+                && (d.range.offset as usize).saturating_sub(prelude) == at),
         "{:?}",
         rows(&report)
     );
@@ -148,7 +155,8 @@ fn ticket_3251_for_part_decl_initializer_void() {
         report
             .diagnostics
             .iter()
-            .any(|d| d.message == VOID_MSG && (d.range.offset as usize).saturating_sub(prelude) == at),
+            .any(|d| d.message == VOID_MSG
+                && (d.range.offset as usize).saturating_sub(prelude) == at),
         "{:?}",
         rows(&report)
     );

@@ -280,7 +280,8 @@ fn null_shorted_send_keeps_its_short_machinery() {
 /// face inside the then arm.
 #[test]
 fn method_call_result_unchanged() {
-    let source = "class C { int m() => 0; }\nvoid g(C c) {\n  if (c.m() is int) {\n    c;\n  }\n}\n";
+    let source =
+        "class C { int m() => 0; }\nvoid g(C c) {\n  if (c.m() is int) {\n    c;\n  }\n}\n";
     let facts = analyze(source, None);
     assert_eq!(dead_of(source, &facts), Vec::<String>::new());
     let then_read = source.rfind("c;").expect("then read");
@@ -300,7 +301,8 @@ fn method_call_result_unchanged() {
 /// gate does not touch (the flag was never the leaked slot).
 #[test]
 fn unresolved_call_result_keeps_the_invalid_face() {
-    let source = "class C {}\nvoid g() {\n  if (nowheresfn() is C) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+    let source =
+        "class C {}\nvoid g() {\n  if (nowheresfn() is C) {\n    1;\n  } else {\n    2;\n  }\n}\n";
     let ops: &dyn TypeOps = &UnresolvedHeadOps;
     let facts = analyze(source, Some(ops));
     let dead = dead_of(source, &facts);
@@ -310,7 +312,10 @@ fn unresolved_call_result_keeps_the_invalid_face() {
         "the unresolved call's `is` still deads exactly the else arm, \
          got {dead:?}"
     );
-    assert!(dead[0].contains('2'), "the dead arm is the else, got {dead:?}");
+    assert!(
+        dead[0].contains('2'),
+        "the dead arm is the else, got {dead:?}"
+    );
 }
 
 /// The gate's boundary, pinned on its exact edge: a `g<int>` type-
@@ -322,7 +327,8 @@ fn unresolved_call_result_keeps_the_invalid_face() {
 /// mark would have nothing to land on.
 #[test]
 fn type_argument_application_keeps_the_reference() {
-    let source = "void g(Object? g) {\n  if (g<int> == null) {\n    1;\n  } else {\n    g;\n  }\n}\n";
+    let source =
+        "void g(Object? g) {\n  if (g<int> == null) {\n    1;\n  } else {\n    g;\n  }\n}\n";
     let facts = analyze(source, None);
     let else_read = source.rfind("g;").expect("else read");
     match read_ty_at(&facts, else_read) {
@@ -375,9 +381,8 @@ impl TypeOps for UnresolvedHeadOps {
         // The 0c arm: any relation with the invalid head is vacuous.
         self.is_invalid(left, names)
             || self.is_invalid(right, names)
-            || crate::ty::NameTypeOps.is_subtype_typed(
-                left, left_args, right, right_args, arena, names,
-            )
+            || crate::ty::NameTypeOps
+                .is_subtype_typed(left, left_args, right, right_args, arena, names)
     }
 
     fn is_invalid_typed(

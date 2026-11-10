@@ -278,7 +278,8 @@ fn covariant_super_parameter_allows_narrowing() {
 /// accept `num`.
 #[test]
 fn operator_plus_param_mismatch_reports() {
-    let fixture = "class A{num operator+(num o)=>0;}\nclass B extends A{int operator+(int o)=>0;}\n";
+    let fixture =
+        "class A{num operator+(num o)=>0;}\nclass B extends A{int operator+(int o)=>0;}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),
@@ -294,8 +295,7 @@ fn operator_plus_param_mismatch_reports() {
 /// setter marker): the message reads `'B.=='`, never `'B.='`.
 #[test]
 fn operator_eq_param_mismatch_reports_with_eq_eq_display() {
-    let fixture =
-        "class A{bool operator==(Object o)=>true;}\nclass B extends A{bool operator==(B o)=>true;}\n";
+    let fixture = "class A{bool operator==(Object o)=>true;}\nclass B extends A{bool operator==(B o)=>true;}\n";
     let report = report_ops(fixture);
     let found = overrides(&report);
     assert_eq!(
@@ -321,8 +321,7 @@ fn operator_eq_param_mismatch_reports_with_eq_eq_display() {
 /// the `[]=` spelling keeps its `=` intact in the message.
 #[test]
 fn operator_index_set_param_mismatch_reports() {
-    let fixture =
-        "class A{void operator[]=(int i,num v){}}\nclass B extends A{void operator[]=(int i,String v){}}\n";
+    let fixture = "class A{void operator[]=(int i,num v){}}\nclass B extends A{void operator[]=(int i,String v){}}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),
@@ -339,14 +338,17 @@ fn operator_index_set_param_mismatch_reports() {
 /// its `return_ty` like any method's; `String` does not fit `num`.
 #[test]
 fn operator_index_set_return_mismatch_reports() {
-    let fixture =
-        "class A{num operator[]=(int i,num v){}}\nclass B extends A{String operator[]=(int i,num v){}}\n";
+    let fixture = "class A{num operator[]=(int i,num v){}}\nclass B extends A{String operator[]=(int i,num v){}}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),
         // B's `[]=` head — the needle anchors at B's `String` return, and
         // `+15` walks `String operator` to the `[]=` token.
-        vec![("invalid_override", at(fixture, "String operator[]=") + 15, 3)],
+        vec![(
+            "invalid_override",
+            at(fixture, "String operator[]=") + 15,
+            3
+        )],
         "rows: {:?}",
         rows(&report)
     );
@@ -356,8 +358,7 @@ fn operator_index_set_return_mismatch_reports() {
 /// `invalid_override` — the single-parameter operator face, display `<`.
 #[test]
 fn operator_lt_param_mismatch_reports() {
-    let fixture =
-        "class A{bool operator<(num o)=>true;}\nclass B extends A{bool operator<(String o)=>true;}\n";
+    let fixture = "class A{bool operator<(num o)=>true;}\nclass B extends A{bool operator<(String o)=>true;}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),

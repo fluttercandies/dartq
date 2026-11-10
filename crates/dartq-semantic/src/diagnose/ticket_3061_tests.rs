@@ -236,10 +236,7 @@ fn ifnull_null_rhs_write_face_is_declared_form() {
         "`f(y)` after the if-null write offers `num?` — the assignment's own static type"
     );
     assert!(
-        folded.diagnostics[0]
-            .message
-            .as_str()
-            .contains("'num?'"),
+        folded.diagnostics[0].message.as_str().contains("'num?'"),
         "the message renders the declared `num?` write face, got: {}",
         folded.diagnostics[0].message
     );

@@ -41,11 +41,18 @@ const SOURCE: &str = "const dynamic D = null;\nconst C1 = !D;\nconst C2 = -D;\nc
 /// (`"!D"`, `"-  D"`): the one-character operator token, the operand
 /// suffix, and the whole expression the oracle anchors on.
 fn spans_of(source: &str, expr: &str) -> (SourceRange, SourceRange, SourceRange) {
-    let start = u32::try_from(source.find(expr).expect("the fixture spells the expression"))
-        .expect("fixture offsets fit u32");
+    let start = u32::try_from(
+        source
+            .find(expr)
+            .expect("the fixture spells the expression"),
+    )
+    .expect("fixture offsets fit u32");
     let expr_len = u32::try_from(expr.len()).expect("fixture length fits u32");
-    let operand_len = u32::try_from(expr.trim_start_matches(|c: char| !c.is_alphanumeric()).len())
-        .expect("operand length fits u32");
+    let operand_len = u32::try_from(
+        expr.trim_start_matches(|c: char| !c.is_alphanumeric())
+            .len(),
+    )
+    .expect("operand length fits u32");
     (
         SourceRange {
             offset: start,
@@ -225,13 +232,7 @@ fn ticket_3860_legal_unary_constants_stay_silent() {
     let world = w();
 
     let (op_span, operand, whole) = spans_of(source, "-5");
-    let negated = capture_literal(
-        &world,
-        ConstantValue::Int(5),
-        operand,
-        UnOp::Neg,
-        op_span,
-    );
+    let negated = capture_literal(&world, ConstantValue::Int(5), operand, UnOp::Neg, op_span);
     assert_eq!(negated.span, whole, "the wrapping still covers `-5`");
     assert_eq!(
         eval(&negated, &world),

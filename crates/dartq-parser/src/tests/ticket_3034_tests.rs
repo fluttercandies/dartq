@@ -77,7 +77,10 @@ fn prefix_and_infix_tilde_mix_parses_clean() {
 /// `:` (no precedence), so the conditional still parses clean.
 #[test]
 fn infix_tilde_inside_conditional_arm_parses_clean() {
-    let rows = rows_with("void f() {\n  var z = c ? a ~ b : d;\n}\n", latest_features());
+    let rows = rows_with(
+        "void f() {\n  var z = c ? a ~ b : d;\n}\n",
+        latest_features(),
+    );
     assert!(
         rows.is_empty(),
         "infix `~` inside a conditional arm must parse clean, got {rows:?}"

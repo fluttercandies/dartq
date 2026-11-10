@@ -102,7 +102,15 @@ fn settled_chain_method_face_names_the_bare_head() {
          }\n",
     );
     let methods = messages_named(&report, "undefined_method");
-    assert!(!methods.is_empty(), "the miss reports: {:?}", report.diagnostics.iter().map(|d| (d.code.name, d.message.to_string())).collect::<Vec<_>>());
+    assert!(
+        !methods.is_empty(),
+        "the miss reports: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.message.to_string()))
+            .collect::<Vec<_>>()
+    );
     assert!(
         methods.iter().all(|m| m.contains("the type 'List'.")),
         "settled method miss names the bare head: {methods:?}"
@@ -164,7 +172,10 @@ fn static_container_miss_names_the_container() {
 fn new_selector_invocation_names_unknown_read_names_invalid_type() {
     let report = report_ops("void main() { var x = Missing.new(); }\n");
     let identifiers = messages_named(&report, "undefined_identifier");
-    assert!(!identifiers.is_empty(), "the head miss reports: {identifiers:?}");
+    assert!(
+        !identifiers.is_empty(),
+        "the head miss reports: {identifiers:?}"
+    );
     let methods = messages_named(&report, "undefined_method");
     assert_eq!(methods.len(), 1, "one method miss: {methods:?}");
     assert!(
@@ -196,6 +207,10 @@ fn dynamic_and_defined_receivers_stay_silent() {
     assert!(
         rows_named(&report, "undefined_method").is_empty(),
         "dynamic dispatch and defined members never report: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }

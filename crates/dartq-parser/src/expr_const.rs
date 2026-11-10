@@ -542,8 +542,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // patterns re-enable the flag inside their fields); the plain
                 // record-literal path would strand the `=> e` body as a
                 // spurious `expected_token ')'`.
-                let end =
-                    self.parse_parenthesized_expression_function_literal_or_record_literal();
+                let end = self.parse_parenthesized_expression_function_literal_or_record_literal();
                 self.parse_selector_chain(end, context)
             }
             TokenKind::OpenSquare | TokenKind::Index => {

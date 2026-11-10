@@ -87,7 +87,11 @@ fn keyword_named_methods_report_single_keyword_error() {
         (80, 84, "void"),
     ] {
         assert!(
-            rows.contains(&("expected_identifier_but_got_keyword".to_owned(), span_start, span_end)),
+            rows.contains(&(
+                "expected_identifier_but_got_keyword".to_owned(),
+                span_start,
+                span_end
+            )),
             "expected expected_identifier_but_got_keyword at ({span_start},{span_end}) for {name}, got {rows:?}"
         );
     }
@@ -125,7 +129,11 @@ fn keyword_named_fields_report_single_keyword_error() {
         (65, 69, "void"),
     ] {
         assert!(
-            rows.contains(&("expected_identifier_but_got_keyword".to_owned(), span_start, span_end)),
+            rows.contains(&(
+                "expected_identifier_but_got_keyword".to_owned(),
+                span_start,
+                span_end
+            )),
             "expected expected_identifier_but_got_keyword at ({span_start},{span_end}) for {name}, got {rows:?}"
         );
     }
@@ -151,10 +159,9 @@ fn identifier_named_method_still_consumed_silently() {
         augment_set(),
     );
     assert!(
-        !rows
-            .iter()
-            .any(|(c, _, _)| c == "expected_identifier_but_got_keyword"
-                || c == "missing_identifier"),
+        !rows.iter().any(
+            |(c, _, _)| c == "expected_identifier_but_got_keyword" || c == "missing_identifier"
+        ),
         "plain method name was reported: {rows:?}"
     );
 }

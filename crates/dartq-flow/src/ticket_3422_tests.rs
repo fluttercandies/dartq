@@ -95,7 +95,9 @@ fn dead_else_branch_block_reports_the_block_extent() {
                   if (null == null) {\n      shouldBePromoted = 0; // Reachable\n    \
                   } else {\n      shouldNotBeDemoted = null; // Unreachable\n    }\n  \
                   }\n}\n";
-    let else_open = source.find("{\n      shouldNotBeDemoted").expect("else brace");
+    let else_open = source
+        .find("{\n      shouldNotBeDemoted")
+        .expect("else brace");
     assert_eq!(
         dead_rows(source),
         vec![(
@@ -138,7 +140,8 @@ fn reachable_branch_block_reports_no_interval() {
 /// then brace while the oracle's `391:12|55` starts at the else brace).
 #[test]
 fn callable_typed_callee_does_not_flip_the_branch() {
-    let source = "void g(Null Function() nf) {\n  if (null == nf()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+    let source =
+        "void g(Null Function() nf) {\n  if (null == nf()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
     assert_eq!(dead_rows(source), Vec::new());
 }
 
@@ -147,7 +150,8 @@ fn callable_typed_callee_does_not_flip_the_branch() {
 /// the `==` shape only.
 #[test]
 fn callable_typed_callee_does_not_flip_the_inequality_branch() {
-    let source = "void g(Null Function() nf) {\n  if (null != nf()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+    let source =
+        "void g(Null Function() nf) {\n  if (null != nf()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
     assert_eq!(dead_rows(source), Vec::new());
 }
 
@@ -157,7 +161,6 @@ fn callable_typed_callee_does_not_flip_the_inequality_branch() {
 /// downgrade cannot start inventing a verdict).
 #[test]
 fn callable_result_keeps_both_branches_on_a_value_comparison() {
-    let source =
-        "void g(int v, Null Function() nf) {\n  if (v == nf()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+    let source = "void g(int v, Null Function() nf) {\n  if (v == nf()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
     assert_eq!(dead_rows(source), Vec::new());
 }

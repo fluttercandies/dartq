@@ -1,5 +1,5 @@
-use super::*;
 use super::scopes_bodies::PATTERN_ARM_SCOPE_BASE;
+use super::*;
 use dartq_scanner::{Keyword, TokenKind};
 
 /// One `case`-head contribution to a shared-body member group (#3519):
@@ -1085,8 +1085,8 @@ impl<'a> Engine<'a> {
         let start = self
             .read_types
             .partition_point(|(row, _)| row.offset < range.offset);
-        let end = start
-            + self.read_types[start..].partition_point(|(row, _)| row.offset == range.offset);
+        let end =
+            start + self.read_types[start..].partition_point(|(row, _)| row.offset == range.offset);
         let mut candidates = self.read_types[start..end].iter().filter_map(|(_, ty)| {
             (*ty != from
                 && !matches!(ty, Ty::Unknown | Ty::Void | Ty::Never)
@@ -3067,10 +3067,7 @@ impl<'a> Engine<'a> {
         while i > 0 {
             i -= 1;
             match toks[i].kind {
-                TokenKind::Minus
-                | TokenKind::Tilde
-                | TokenKind::Bang
-                | TokenKind::OpenParen => {}
+                TokenKind::Minus | TokenKind::Tilde | TokenKind::Bang | TokenKind::OpenParen => {}
                 TokenKind::Gt
                 | TokenKind::GtEq
                 | TokenKind::Lt
@@ -3229,9 +3226,9 @@ impl<'a> Engine<'a> {
             return;
         }
         // A postfix `++`/`--` widens the anchor over the operator token.
-        let postfix = toks.get(next).filter(|t| {
-            matches!(t.kind, TokenKind::PlusPlus | TokenKind::MinusMinus)
-        });
+        let postfix = toks
+            .get(next)
+            .filter(|t| matches!(t.kind, TokenKind::PlusPlus | TokenKind::MinusMinus));
         let anchor = postfix.map_or(range, |t| SourceRange {
             offset: range.offset,
             length: t.utf16_offset + t.byte_len as u32 - range.offset,
@@ -3330,8 +3327,7 @@ impl<'a> Engine<'a> {
                     depth -= 1;
                 }
                 TokenKind::Keyword(Keyword::When) if depth <= 0 => return true,
-                TokenKind::Keyword(Keyword::Case | Keyword::Default)
-                | TokenKind::Semicolon
+                TokenKind::Keyword(Keyword::Case | Keyword::Default) | TokenKind::Semicolon
                     if depth <= 0 =>
                 {
                     return false;
@@ -3379,8 +3375,9 @@ impl<'a> Engine<'a> {
                 while j > 0 {
                     j -= 1;
                     match toks[j].kind {
-                        TokenKind::CloseParen | TokenKind::CloseSquare
-                        | TokenKind::CloseCurly => inner += 1,
+                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                            inner += 1
+                        }
                         TokenKind::OpenParen => {
                             if inner == 0 {
                                 return matches!(
@@ -3452,7 +3449,9 @@ impl<'a> Engine<'a> {
         };
         let decl = &self.locals[hit as usize];
         let guarded = matches!(decl.kind, LocalKind::PatternVariable)
-            && decl.group.is_none_or(|group| group >= PATTERN_ARM_SCOPE_BASE || group % 2 == 1);
+            && decl
+                .group
+                .is_none_or(|group| group >= PATTERN_ARM_SCOPE_BASE || group % 2 == 1);
         if guarded {
             self.emit(
                 SemanticCode::PatternVariableAssignmentInsideGuard,
@@ -3513,9 +3512,9 @@ impl<'a> Engine<'a> {
             // `_finishJoinedPatternVariables`: the joined variable demands
             // the same declared type and finality in every head.
             let consistent = {
-                let mut it = heads.iter().filter_map(|head| {
-                    head.vars.iter().find(|(n, ..)| *n == name)
-                });
+                let mut it = heads
+                    .iter()
+                    .filter_map(|head| head.vars.iter().find(|(n, ..)| *n == name));
                 match it.next() {
                     Some((_, ty, fin)) => it.all(|(_, ty2, fin2)| ty2 == ty && fin2 == fin),
                     None => true,
@@ -3558,7 +3557,11 @@ impl<'a> Engine<'a> {
         // FINISHED same-depth switch's stale scopes (its last member may
         // have closed on a `default:` — leaving `member_body` false on
         // the trailing row); they must not leak into this group.
-        let switch_offset = self.switch.switches.last().map_or(0, |ctx| ctx.switch_kw.offset);
+        let switch_offset = self
+            .switch
+            .switches
+            .last()
+            .map_or(0, |ctx| ctx.switch_kw.offset);
         let run: Vec<&SwitchArmScope> = self
             .switch_arm_scopes
             .iter()
@@ -4513,8 +4516,7 @@ impl<'a> Engine<'a> {
                 let code = if name.starts_with('_') {
                     Some(SemanticCode::InvalidFieldNamePrivate)
                 } else if let Some(index) = Self::positional_field_index(name) {
-                    (index < positional_count)
-                        .then_some(SemanticCode::InvalidFieldNamePositional)
+                    (index < positional_count).then_some(SemanticCode::InvalidFieldNamePositional)
                 } else if Self::is_forbidden_record_field_name(name) {
                     Some(SemanticCode::InvalidFieldNameFromObject)
                 } else {
@@ -4583,10 +4585,7 @@ impl<'a> Engine<'a> {
         let mut named: Vec<(StringId, Ty)> = Vec::new();
         for (index, ty) in fields.into_iter().enumerate() {
             let boundary = boundaries[index];
-            let end = boundaries
-                .get(index + 1)
-                .copied()
-                .unwrap_or(close as u32);
+            let end = boundaries.get(index + 1).copied().unwrap_or(close as u32);
             let is_named = boundary + 2 < end
                 && self
                     .tokens
@@ -5267,9 +5266,7 @@ impl<'a> Engine<'a> {
                         // its miss stays silent in every position.
                         let catch_on =
                             self.catch_on_miss_rows.last().copied() == Some(range.offset);
-                        if local
-                            || (!suppressed && self.type_arg_depth == 0 && !catch_on)
-                        {
+                        if local || (!suppressed && self.type_arg_depth == 0 && !catch_on) {
                             self.push_row(Row {
                                 name,
                                 range,
@@ -5292,9 +5289,7 @@ impl<'a> Engine<'a> {
                             if self.type_arg_depth > 0 {
                                 self.type_arg_miss_rows.push(qualified.offset);
                             }
-                            if catch_on
-                                && let Some(key) = self.catch_on_miss_rows.last_mut()
-                            {
+                            if catch_on && let Some(key) = self.catch_on_miss_rows.last_mut() {
                                 // The listener armed the leaf offset; the
                                 // context-miss lookup keys on the row's own
                                 // offset — the qualified span's open.
@@ -5963,12 +5958,14 @@ mod implicit_this_extension_tests {
     /// dereference reports.
     #[test]
     fn nullable_on_face_applies_to_nullable_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              extension E on C? {\n\
              \x20 void g() {\n\
              \x20   extra;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_silent_on(
             &report,
             &["undefined_identifier", "unchecked_use_of_nullable_value"],
@@ -5978,15 +5975,21 @@ mod implicit_this_extension_tests {
     /// The same law for an invocation member.
     #[test]
     fn nullable_on_face_method_applies_to_nullable_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              extension E on C? {\n\
              \x20 void g() {\n\
              \x20   poke();\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_silent_on(
             &report,
-            &["undefined_identifier", "undefined_method", "unchecked_use_of_nullable_value"],
+            &[
+                "undefined_identifier",
+                "undefined_method",
+                "unchecked_use_of_nullable_value",
+            ],
         );
     }
 
@@ -5994,12 +5997,14 @@ mod implicit_this_extension_tests {
     /// parameter's implicit `Object?` bound admits `C?`).
     #[test]
     fn unbounded_on_param_face_applies_to_nullable_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              extension E on C? {\n\
              \x20 void g() {\n\
              \x20   mem;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_silent_on(
             &report,
             &["undefined_identifier", "unchecked_use_of_nullable_value"],
@@ -6010,12 +6015,14 @@ mod implicit_this_extension_tests {
     /// receiver — the bound its own `?` spelling satisfies.
     #[test]
     fn nullable_bound_on_param_face_applies_to_nullable_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              extension E on C? {\n\
              \x20 void g() {\n\
              \x20   nmem;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_silent_on(
             &report,
             &["undefined_identifier", "unchecked_use_of_nullable_value"],
@@ -6027,12 +6034,14 @@ mod implicit_this_extension_tests {
     /// name stays undefined.
     #[test]
     fn non_nullable_on_face_rejects_nullable_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              extension E on C? {\n\
              \x20 void g() {\n\
              \x20   plain;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_reports(
             &report,
             &["undefined_identifier", "unchecked_use_of_nullable_value"],
@@ -6043,12 +6052,14 @@ mod implicit_this_extension_tests {
     /// receiver the same way.
     #[test]
     fn non_nullable_bound_on_param_face_rejects_nullable_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              extension E on C? {\n\
              \x20 void g() {\n\
              \x20   bmem;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_reports(
             &report,
             &["undefined_identifier", "unchecked_use_of_nullable_value"],
@@ -6059,12 +6070,14 @@ mod implicit_this_extension_tests {
     /// too: the parameter instantiates to the receiver's type.
     #[test]
     fn unbounded_on_param_face_applies_to_class_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              class D {\n\
              \x20 void m() {\n\
              \x20   mem;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_silent_on(&report, &["undefined_identifier"]);
     }
 
@@ -6072,12 +6085,14 @@ mod implicit_this_extension_tests {
     /// outside `C` applies no face, so the bare name stays undefined.
     #[test]
     fn bounded_on_param_face_rejects_out_of_bound_class_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              class D {\n\
              \x20 void n() {\n\
              \x20   bmem;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_reports(&report, &["undefined_identifier"]);
     }
 
@@ -6086,12 +6101,14 @@ mod implicit_this_extension_tests {
     /// through the receiver's bound relation.
     #[test]
     fn unbounded_on_param_face_applies_to_bound_subtype_class_this() {
-        let report = report("import 'package:a/faces.dart';\n\
+        let report = report(
+            "import 'package:a/faces.dart';\n\
              class Decl extends C {\n\
              \x20 void m() {\n\
              \x20   mem;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_silent_on(&report, &["undefined_identifier"]);
     }
 }

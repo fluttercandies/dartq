@@ -32,7 +32,7 @@
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
-use crate::tests::collector::{latest_features, Collector};
+use crate::tests::collector::{Collector, latest_features};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` and returns the scanner+parser rows as a set of
@@ -158,14 +158,20 @@ fn super_initializer_bare_follower_reports_on_follower() {
     // token; the `}` stays current for the class-body close.
     assert_rows(
         "\nclass C {C() : super}",
-        &[("expected_token", 21, 22), ("missing_function_body", 21, 22)],
+        &[
+            ("expected_token", 21, 22),
+            ("missing_function_body", 21, 22),
+        ],
     );
     // test_constructor_super_getter — `C() : super int get a => 0;`
     // anchors the same pair on `int` (the construct delimiter), then the
     // `int get a => 0;` member reparses clean.
     assert_rows(
         "\nclass C {C() : super int get a => 0;}",
-        &[("expected_token", 22, 25), ("missing_function_body", 22, 25)],
+        &[
+            ("expected_token", 22, 25),
+            ("missing_function_body", 22, 25),
+        ],
     );
     // Negative: a real `super()` call stays silent.
     assert_rows("\nclass C {C() : super();}", &[]);

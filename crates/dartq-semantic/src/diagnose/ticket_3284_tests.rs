@@ -42,7 +42,8 @@ fn unchecked(report: &FileReport) -> Vec<(u32, String)> {
 
 /// The function variant's text — the only problem message an invoked
 /// non-callable-shaped callee row can carry.
-const FUNCTION_TEXT: &str = "The function can't be unconditionally invoked because it can be 'null'.";
+const FUNCTION_TEXT: &str =
+    "The function can't be unconditionally invoked because it can be 'null'.";
 
 /// The dominant cluster: a field or getter of NON-nullable function type
 /// invoked through an explicit receiver (a parameter, a local, `this`, and

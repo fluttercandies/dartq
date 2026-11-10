@@ -94,9 +94,11 @@ main() {
     let offset = at(src, "A();");
     assert_eq!(
         messages_at(&report, "could_not_infer", offset, 1),
-        ["Couldn't infer type parameter 'X2'.\n\nTried to infer 'B<Object?>' for 'X2' which \
+        [
+            "Couldn't infer type parameter 'X2'.\n\nTried to infer 'B<Object?>' for 'X2' which \
           doesn't work:\n  Type parameter 'X2' is declared to extend 'B<X2>' producing \
-          'B<B<Object?>>'.\n\nConsider passing explicit type argument(s) to the generic.\n\n"],
+          'B<B<Object?>>'.\n\nConsider passing explicit type argument(s) to the generic.\n\n"
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -134,8 +136,10 @@ main() {
     );
     assert_eq!(
         messages_at(&report, "type_argument_not_matching_bounds", offset, 1),
-        ["'B<Object?, Object?>' doesn't conform to the bound 'B<B<Object?, Object?>, dynamic>' \
-          of the type parameter 'X'."],
+        [
+            "'B<Object?, Object?>' doesn't conform to the bound 'B<B<Object?, Object?>, dynamic>' \
+          of the type parameter 'X'."
+        ],
         "{:#?}",
         rows(&report)
     );

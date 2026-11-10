@@ -32,7 +32,10 @@ impl<'a> Engine<'a> {
     /// before the generic non-constant arm could anchor the whole
     /// expression instead). `None` when no deferred prefix is named —
     /// the common path, no import-edge walk at all.
-    pub(crate) fn legacy_deferred_span(&self, node: &crate::const_eval::Node) -> Option<SourceRange> {
+    pub(crate) fn legacy_deferred_span(
+        &self,
+        node: &crate::const_eval::Node,
+    ) -> Option<SourceRange> {
         // A deferred library's constants are reachable only through its
         // prefix — `d.c` is `Member{recv:Ident(d)}`; a bare identifier can
         // never spell a deferred reference (deferred imports bind no
@@ -96,11 +99,8 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Expr::Spread { operand, .. } => walk(operand, hit),
-                Expr::Value(_)
-                | Expr::Ident(_)
-                | Expr::Opaque
-                | Expr::Other
-                | Expr::Faulted(_) => {}
+                Expr::Value(_) | Expr::Ident(_) | Expr::Opaque | Expr::Other | Expr::Faulted(_) => {
+                }
             }
         }
         let mut hit = None;
@@ -178,11 +178,8 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Expr::Spread { operand, .. } => stack.push(operand),
-                Expr::Value(_)
-                | Expr::Ident(_)
-                | Expr::Opaque
-                | Expr::Other
-                | Expr::Faulted(_) => {}
+                Expr::Value(_) | Expr::Ident(_) | Expr::Opaque | Expr::Other | Expr::Faulted(_) => {
+                }
             }
         }
         fn member_span(node: &crate::const_eval::Node) -> Option<SourceRange> {

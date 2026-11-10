@@ -392,11 +392,7 @@ impl Host {
             pooled: spec.pool,
             budget: (spec.budget > 0).then_some(spec.budget),
             server: None,
-            freshness: Freshness::new(
-                &spec.roots,
-                spec.packages.as_deref(),
-                &spec.sdk_home(),
-            ),
+            freshness: Freshness::new(&spec.roots, spec.packages.as_deref(), &spec.sdk_home()),
             degrade_streak: 0,
             degrade_noted: false,
             files,
@@ -404,8 +400,7 @@ impl Host {
             lease: None,
             max_percent: spec.max_percent,
             max_concurrent: spec.max_concurrent,
-            peak_key: repo_key(&spec.roots)
-                .unwrap_or_else(|| cache.display().to_string()),
+            peak_key: repo_key(&spec.roots).unwrap_or_else(|| cache.display().to_string()),
             source_bytes: source_bytes(&spec.roots),
             brake: dartq_toolchain::ledger::GrowthBrake::default(),
             cache,
@@ -540,8 +535,7 @@ impl Host {
                         // rows.
                         if owned.is_empty() {
                             let render = (self.renderer)(&[], face);
-                            let Some(mut wire) =
-                                face_header(&render.meta, render.bytes.len())
+                            let Some(mut wire) = face_header(&render.meta, render.bytes.len())
                             else {
                                 return Reply::Answer(Answer::NotServed);
                             };
@@ -592,7 +586,9 @@ impl Host {
         self.disk.check();
         let reply = match serde_json::from_str::<Ask>(&line) {
             Ok(ask) if self.pooled => self.join(&stream, ask),
-            Ok(ask) if ask.roots == self.roots => self.analyze(&stream, &ask.aims, ask.face.as_ref()),
+            Ok(ask) if ask.roots == self.roots => {
+                self.analyze(&stream, &ask.aims, ask.face.as_ref())
+            }
             Ok(_) => Reply::Answer(Answer::Fault("the daemon serves other roots".into())),
             Err(error) => Reply::Answer(Answer::Fault(format!("unreadable request: {error}"))),
         };
@@ -655,7 +651,9 @@ impl Host {
             Ok(()) => Ok(()),
             Err(Fault::Budget { budget, measured }) => {
                 self.forget();
-                return Err(Answer::Budget(Fault::Budget { budget, measured }.to_string()));
+                return Err(Answer::Budget(
+                    Fault::Budget { budget, measured }.to_string(),
+                ));
             }
             Err(Fault::Yield { peak }) => {
                 // The growth brake fired: the server is already dead.
@@ -782,11 +780,8 @@ impl Host {
         client: &UnixStream,
     ) -> Result<Option<dartq_toolchain::ledger::Lease>, Fault> {
         use dartq_toolchain::ledger::{self, Face, Releasable, Request};
-        let (bytes, sized) = ledger::sizing_with_source(
-            &self.peak_key,
-            Face::AnalysisServer,
-            self.source_bytes,
-        );
+        let (bytes, sized) =
+            ledger::sizing_with_source(&self.peak_key, Face::AnalysisServer, self.source_bytes);
         let request = Request {
             face: Face::AnalysisServer,
             label: self
@@ -927,8 +922,9 @@ fn degradation_note(
         // see above), a journal answer, or a by-design walk — the
         // covering walk after an arm or a stream restart, a pool
         // rebase: none count, the streak starts over.
-        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout)
-        | None => return (0, None),
+        Some(WalkReason::First | WalkReason::Rebase | WalkReason::CookieTimeout) | None => {
+            return (0, None);
+        }
     };
     let streak = streak.saturating_add(1);
     (streak, (streak >= 2).then_some(why))
@@ -1057,8 +1053,7 @@ mod tests {
         assert!(!served.contains(&Path::new("/w/a")));
         // The primary never leaves: two joins on a 2-cap pool refuse —
         // dropping the primary is not a join, it is another daemon.
-        let mut small: Vec<(PathBuf, Instant)> =
-            vec![(PathBuf::from("/w/primary"), at(1500))];
+        let mut small: Vec<(PathBuf, Instant)> = vec![(PathBuf::from("/w/primary"), at(1500))];
         assert_eq!(
             admit(&mut small, &roots(&["/w/x", "/w/y"]), 2, now),
             None,
@@ -1093,7 +1088,14 @@ mod tests {
         let evicted = admit(&mut active, &[PathBuf::from("/w/c")], 3, now).expect("admitted");
         assert_eq!(evicted, vec![PathBuf::from("/w/b")]);
         let served: Vec<&Path> = active.iter().map(|(root, _)| root.as_path()).collect();
-        assert_eq!(served, [Path::new("/w/primary"), Path::new("/w/a"), Path::new("/w/c")]);
+        assert_eq!(
+            served,
+            [
+                Path::new("/w/primary"),
+                Path::new("/w/a"),
+                Path::new("/w/c")
+            ]
+        );
 
         // Two joiners need two places; one cold root cannot give both.
         let mut mixed: Vec<(PathBuf, Instant)> = vec![
@@ -1103,7 +1105,12 @@ mod tests {
         ];
         let before = mixed.clone();
         assert_eq!(
-            admit(&mut mixed, &[PathBuf::from("/w/x"), PathBuf::from("/w/y")], 3, now),
+            admit(
+                &mut mixed,
+                &[PathBuf::from("/w/x"), PathBuf::from("/w/y")],
+                3,
+                now
+            ),
             None
         );
         assert_eq!(mixed, before, "a refused join evicts nothing");
@@ -1123,8 +1130,11 @@ mod tests {
         std::fs::create_dir_all(&gitdir).expect("worktree git dir");
         std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
         std::fs::create_dir_all(&linked).expect("linked worktree");
-        std::fs::write(linked.join(".git"), format!("gitdir: {}\n", gitdir.display()))
-            .expect("linked .git");
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("linked .git");
         let common = main.join(".git").canonicalize().expect("common dir");
         let key = |roots: &[PathBuf]| repo_key(roots);
         assert_eq!(
@@ -1132,7 +1142,11 @@ mod tests {
             Some(format!("{}:", common.display())),
             "the main worktree's top"
         );
-        assert_eq!(key(&[linked.clone()]), key(&[main.clone()]), "a linked sibling");
+        assert_eq!(
+            key(&[linked.clone()]),
+            key(&[main.clone()]),
+            "a linked sibling"
+        );
         let sub = Path::new("pkgs").join("a");
         assert_eq!(
             key(&[linked.join(&sub)]),
@@ -1145,9 +1159,16 @@ mod tests {
         std::fs::create_dir_all(&module).expect("module git dir");
         let submodule = main.join("m");
         std::fs::create_dir_all(&submodule).expect("submodule");
-        std::fs::write(submodule.join(".git"), format!("gitdir: {}\n", module.display()))
-            .expect("submodule .git");
-        assert_ne!(key(&[submodule]), key(&[main.clone()]), "its own common dir");
+        std::fs::write(
+            submodule.join(".git"),
+            format!("gitdir: {}\n", module.display()),
+        )
+        .expect("submodule .git");
+        assert_ne!(
+            key(&[submodule]),
+            key(&[main.clone()]),
+            "its own common dir"
+        );
 
         let other = tmp.path().join("other");
         std::fs::create_dir_all(other.join(".git")).expect("other repo");
@@ -1176,9 +1197,7 @@ mod tests {
     #[test]
     fn the_face_header_refuses_over_cap_and_writes_in_cap() {
         let meta = crate::face::FaceMeta::default();
-        let over = usize::try_from(crate::client::MAX_FACE_BYTES)
-            .expect("cap fits usize")
-            + 1;
+        let over = usize::try_from(crate::client::MAX_FACE_BYTES).expect("cap fits usize") + 1;
         assert_eq!(face_header(&meta, over), None);
         assert_eq!(face_header(&meta, usize::MAX), None, "u32 overflow");
         let line = face_header(&meta, 42).expect("in-cap header");
@@ -1222,7 +1241,10 @@ mod tests {
     #[test]
     fn two_consecutive_degraded_checks_note_the_reason() {
         let shapes = [
-            (WalkReason::CookieBlocked, "its sync files cannot be written"),
+            (
+                WalkReason::CookieBlocked,
+                "its sync files cannot be written",
+            ),
             (WalkReason::StreamLost, "its event stream lost events"),
             (WalkReason::Unarmed, "its watcher is unavailable"),
         ];
@@ -1245,7 +1267,11 @@ mod tests {
     /// persistence, so an interrupted streak starts over.
     #[test]
     fn journal_and_by_design_answers_reset_the_streak() {
-        assert_eq!(degradation_note(1, None, false), (0, None), "a journal answer");
+        assert_eq!(
+            degradation_note(1, None, false),
+            (0, None),
+            "a journal answer"
+        );
         assert_eq!(
             degradation_note(1, Some(WalkReason::CookieTimeout), false),
             (0, None),

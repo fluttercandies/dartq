@@ -33,7 +33,8 @@ use std::path::Path;
 
 /// The shared core library both import edges point at: the classes the
 /// corpus's `core.`-prefixed leaves spell.
-const CORE_LIB: &str = "class Object {}\nclass Function {}\nclass int {}\nclass bool {}\nclass List<E> {}\n";
+const CORE_LIB: &str =
+    "class Object {}\nclass Function {}\nclass int {}\nclass bool {}\nclass List<E> {}\n";
 
 /// Diagnoses `main` as one file of a library importing `core.dart` twice —
 /// once as `core`, once unprefixed (the conformance files' real shape:
@@ -290,10 +291,7 @@ fn literal_target_inner_core_optional_fires() {
 /// below must not regress it.
 #[test]
 fn literal_target_unprefixed_control_fires() {
-    let report = literal_report(
-        "Function(int) Function()",
-        "Function(int)",
-    );
+    let report = literal_report("Function(int) Function()", "Function(int)");
     assert!(
         !utc_rows(&report).is_empty(),
         "diags: {:?}",

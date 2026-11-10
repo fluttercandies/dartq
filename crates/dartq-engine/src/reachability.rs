@@ -647,8 +647,7 @@ fn derive_unit(
             continue;
         };
         let first = saturate_slot_u32(
-            (run.as_ptr() as usize - decls.as_ptr() as usize)
-                / std::mem::size_of::<DeclRow>(),
+            (run.as_ptr() as usize - decls.as_ptr() as usize) / std::mem::size_of::<DeclRow>(),
         );
         for source in sources.into_iter().flatten() {
             for target_row in first..first + run.len() as u32 {

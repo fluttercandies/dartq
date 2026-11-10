@@ -170,7 +170,8 @@ fn conditional_skipped_then_is_scanned() {
 /// for a const variable read).
 #[test]
 fn skipped_const_operand_stays_silent() {
-    let source = "const a = false;\nconst c = false && a;\nconst d = true || a;\nconst e = 0 ?? a;\n";
+    let source =
+        "const a = false;\nconst c = false && a;\nconst d = true || a;\nconst e = 0 ?? a;\n";
     let rep = report(source);
     let rows = rows(&rep, source);
     assert_eq!(count(&rows, SITE), 0, "{rows:?}");

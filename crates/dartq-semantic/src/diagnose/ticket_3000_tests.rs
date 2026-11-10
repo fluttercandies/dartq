@@ -126,7 +126,12 @@ fn null_receiver_reports_invalid_use_of_null() {
         "unexpected undefined_operator: {:?}",
         rows(&report)
     );
-    assert_eq!(names, vec!["invalid_use_of_null_value"], "{:?}", rows(&report));
+    assert_eq!(
+        names,
+        vec!["invalid_use_of_null_value"],
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// `n++` on `Null` — the increment twin swaps to `invalid_use_of_null_value`.
@@ -242,9 +247,7 @@ fn member_result_type_parameter_is_silent() {
 /// publication's declaring container.
 #[test]
 fn bare_field_type_parameter_compound_is_silent() {
-    let report = report_ops(
-        "class C<T extends int> { T? a; void m() { a! += 1; } }\n",
-    );
+    let report = report_ops("class C<T extends int> { T? a; void m() { a! += 1; } }\n");
     assert!(
         !code_names(&report).contains(&"undefined_operator"),
         "unexpected undefined_operator: {:?}",

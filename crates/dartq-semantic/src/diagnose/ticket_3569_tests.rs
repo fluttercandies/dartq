@@ -22,10 +22,10 @@
 //! completing augment                                               -> silent
 //! ```
 
+use crate::FileReport;
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, report_ops_augment_intro_experiments, report_ops_experiments_with,
 };
-use crate::FileReport;
 use dartq_language::Feature;
 
 /// The fixture's rows of one code as `(offset, length)`, ascending.
@@ -55,7 +55,14 @@ fn dump(report: &FileReport) -> Vec<(&'static str, u32, u32, &str)> {
     report
         .diagnostics
         .iter()
-        .map(|d| (d.code.name, d.range.offset, d.range.length, d.message.as_str()))
+        .map(|d| {
+            (
+                d.code.name,
+                d.range.offset,
+                d.range.length,
+                d.message.as_str(),
+            )
+        })
         .collect()
 }
 
@@ -212,8 +219,7 @@ fn induced_accessors_not_complete_static_abstract_field() {
         .map(|d| d.message.to_string())
         .expect("getter row");
     assert!(
-        getter_message.contains("'foo'")
-            && getter_message.ends_with("augmentations are applied."),
+        getter_message.contains("'foo'") && getter_message.ends_with("augmentations are applied."),
         "{getter_message}"
     );
     let setter_message = report
@@ -222,7 +228,10 @@ fn induced_accessors_not_complete_static_abstract_field() {
         .find(|d| d.code.name == ISET)
         .map(|d| d.message.to_string())
         .expect("setter row");
-    assert!(setter_message.starts_with("The setter induced by 'foo'"), "{setter_message}");
+    assert!(
+        setter_message.starts_with("The setter induced by 'foo'"),
+        "{setter_message}"
+    );
 }
 
 /// A `final` field induces no setter — only the getter row fires.

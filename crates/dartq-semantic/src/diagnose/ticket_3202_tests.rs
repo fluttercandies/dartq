@@ -24,8 +24,8 @@
 //! types): the crash path is the generic assignability, not the
 //! extension-type face itself.
 
-use crate::diagnose::test_rig::report_ops;
 use crate::FileReport;
+use crate::diagnose::test_rig::report_ops;
 
 fn all_codes(report: &FileReport) -> Vec<&'static str> {
     report.diagnostics.iter().map(|d| d.code.name).collect()

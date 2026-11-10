@@ -64,7 +64,11 @@ fn untyped_inner_formal_renders_dynamic_param_face() {
         rows.len(),
         1,
         "void Function(dynamic) param rejects a void Function(int) arg: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("void Function(dynamic)"),
@@ -106,7 +110,11 @@ fn untyped_inner_formal_return_of_invalid_type() {
         rows.len(),
         1,
         "void Function(dynamic) cannot return as int Function(int): {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -125,7 +133,11 @@ fn untyped_formal_pair_assigns_cleanly() {
     assert!(
         rows_named(&report, "argument_type_not_assignable").is_empty(),
         "untyped-formal pair must not report ATNA: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -140,7 +152,11 @@ fn untyped_optional_formal_pair_assigns_cleanly() {
     assert!(
         rows_named(&report, "argument_type_not_assignable").is_empty(),
         "untyped-optional pair must not report ATNA: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -155,7 +171,11 @@ fn typed_inner_formal_match_silent() {
     assert!(
         rows_named(&report, "argument_type_not_assignable").is_empty(),
         "int-to-int inner formal is clean: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -168,7 +188,11 @@ fn typed_inner_formal_mismatch_reports() {
          void main() { f((String y) => 0); }\n",
     );
     let rows = rows_named(&report, "argument_type_not_assignable");
-    assert_eq!(rows.len(), 1, "String-vs-int inner formal reports: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "String-vs-int inner formal reports: {rows:?}"
+    );
     assert!(
         rows[0].message.contains("void Function(int)"),
         "typed face stays int: {}",

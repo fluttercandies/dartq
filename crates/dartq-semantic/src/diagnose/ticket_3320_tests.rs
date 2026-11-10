@@ -171,7 +171,11 @@ fn context_free_generic_keeps_the_under_report() {
          void f() { var x = castObject(true); x.varMiss(); }",
     );
     assert_no_function_receiver(&report);
-    assert!(mentions(&report, "varMiss").is_empty(), "{:#?}", mentions(&report, "varMiss"));
+    assert!(
+        mentions(&report, "varMiss").is_empty(),
+        "{:#?}",
+        mentions(&report, "varMiss")
+    );
 }
 
 /// An explicit `.call` on a callable class resolves through the member walk:
@@ -183,7 +187,11 @@ fn explicit_call_member_resolves() {
          void f(Callable c) { c.call(); }",
     );
     assert_no_function_receiver(&report);
-    assert!(mentions(&report, "'call'").is_empty(), "{:#?}", mentions(&report, "'call'"));
+    assert!(
+        mentions(&report, "'call'").is_empty(),
+        "{:#?}",
+        mentions(&report, "'call'")
+    );
 }
 
 /// A chained send (`g()()`) invoked twice produces no member row: the inner
@@ -221,7 +229,11 @@ fn context_free_unsolved_generic_receiver_is_dynamic_not_function() {
          void f() { castObject(true).cfMiss(); }",
     );
     assert_no_function_receiver(&report);
-    assert!(mentions(&report, "cfMiss").is_empty(), "{:#?}", mentions(&report, "cfMiss"));
+    assert!(
+        mentions(&report, "cfMiss").is_empty(),
+        "{:#?}",
+        mentions(&report, "cfMiss")
+    );
 }
 
 /// A declared `dynamic` return types the result `dynamic`: the receiver is
@@ -233,7 +245,11 @@ fn dynamic_callee_result_is_silent() {
          void f() { plainDyn(1).dynMiss(); }",
     );
     assert_no_function_receiver(&report);
-    assert!(mentions(&report, "dynMiss").is_empty(), "{:#?}", mentions(&report, "dynMiss"));
+    assert!(
+        mentions(&report, "dynMiss").is_empty(),
+        "{:#?}",
+        mentions(&report, "dynMiss")
+    );
 }
 
 /// The conditional's condition is a `bool` context; the cascade target

@@ -129,8 +129,7 @@ fn non_type_type_argument_replaces_the_fallthrough() {
     let args = messages_named(&report, "non_type_as_type_argument");
     assert_eq!(args.len(), 1, "one type-argument row: {args:?}");
     assert_eq!(
-        args[0],
-        "The name 'i' isn't a type, so it can't be used as a type argument.",
+        args[0], "The name 'i' isn't a type, so it can't be used as a type argument.",
         "the context face reports: {args:?}"
     );
 }

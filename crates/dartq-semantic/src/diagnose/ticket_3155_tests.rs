@@ -60,7 +60,8 @@ fn assert_row(report: &FileReport, code: &str, offset: usize, length: u32) {
         .find(|d| d.code.name == code)
         .unwrap_or_else(|| panic!("missing {code}; rows: {:#?}", rows(report)));
     assert_eq!(
-        hit.range.offset as usize, offset,
+        hit.range.offset as usize,
+        offset,
         "offset for {code}; rows: {:#?}",
         rows(report)
     );
@@ -163,12 +164,7 @@ fn isolate_local_invalid_exception_value() {
 #[test]
 fn isolate_local_argument_must_be_a_constant() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  int e = 123;\n  NativeCallable<Int32 Function(Int32)>.isolateLocal(f, exceptionalReturn: e);\n}\n";
-    assert_row(
-        &report(f),
-        "argument_must_be_a_constant",
-        at(f, 6, 77),
-        1,
-    );
+    assert_row(&report(f), "argument_must_be_a_constant", at(f, 6, 77), 1);
 }
 
 // A `dartToNative`-incompatible exception value reports `mustBeASubtype`

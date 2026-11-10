@@ -69,8 +69,8 @@ fn dead_of(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -98,10 +98,7 @@ fn mutable_local_literal_folds_stmt_if() {
 /// the literal, not the spelling).
 #[test]
 fn mutable_var_literal_folds() {
-    assert_eq!(
-        dead_of("f() { var b = true; var l = [if (!b) 1]; }"),
-        ["1"]
-    );
+    assert_eq!(dead_of("f() { var b = true; var l = [if (!b) 1]; }"), ["1"]);
 }
 
 /// A write clears the fold — the `apply_write` invariant upstream's
@@ -120,9 +117,7 @@ fn mutable_local_write_clears_fold() {
 #[test]
 fn mutable_local_closure_write_clears_fold() {
     assert_eq!(
-        dead_of(
-            "f() { bool b = true; var g = () { b = false; }; var l = [if (!b) 1]; }"
-        ),
+        dead_of("f() { bool b = true; var g = () { b = false; }; var l = [if (!b) 1]; }"),
         Vec::<String>::new()
     );
 }
@@ -161,7 +156,10 @@ fn mutable_local_literal_folds_or_rhs() {
 /// original face.
 #[test]
 fn final_local_still_folds() {
-    assert_eq!(dead_of("f() { final b = true; if (!b) {} else {} }"), ["{}"]);
+    assert_eq!(
+        dead_of("f() { final b = true; if (!b) {} else {} }"),
+        ["{}"]
+    );
 }
 
 /// `int x; x ??= 1` — non-nullable LHS kills the RHS entry. The interval

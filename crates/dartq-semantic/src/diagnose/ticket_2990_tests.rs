@@ -53,10 +53,8 @@ const PLAIN_INDEX: &str =
     "The receiver can't be null, so the null-aware operator '?[' is unnecessary.";
 const PLAIN_CASCADE: &str =
     "The receiver can't be null, so the null-aware operator '?..' is unnecessary.";
-const SHORT_INDEX: &str =
-    "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '?[' can't be used.";
-const SHORT_ACCESS: &str =
-    "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '?.' can't be used.";
+const SHORT_INDEX: &str = "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '?[' can't be used.";
+const SHORT_ACCESS: &str = "The receiver can't be 'null' because of short-circuiting, so the null-aware operator '?.' can't be used.";
 const QUESTION_CAUSE: &str = "The operator '?' is causing the short circuiting.";
 
 /// `x?[i]` anchors the operator pair: the `?` token's start through the
@@ -106,10 +104,7 @@ fn member_after_index_reads_the_pre_lift_element() {
             (24, 2, SHORT_ACCESS.to_string()),
         ]
     );
-    assert_eq!(
-        contexts(source),
-        vec![(20, 1, QUESTION_CAUSE.to_string())]
-    );
+    assert_eq!(contexts(source), vec![(20, 1, QUESTION_CAUSE.to_string())]);
 }
 
 /// The same law over a NULLABLE receiver: the `?[` itself is legal (a
@@ -122,10 +117,7 @@ fn member_after_index_reads_the_pre_lift_element() {
 fn nullable_receiver_index_short_circuit_uses_question_context() {
     let source = "f(List<int>? y) {\n  y?[0]?.isEven;\n}\n";
     assert_eq!(rows(source), vec![(25, 2, SHORT_ACCESS.to_string())]);
-    assert_eq!(
-        contexts(source),
-        vec![(21, 1, QUESTION_CAUSE.to_string())]
-    );
+    assert_eq!(contexts(source), vec![(21, 1, QUESTION_CAUSE.to_string())]);
 }
 
 /// `a?[0]?.b` over a class element type: the `?.` reads the pre-lift `B`.
@@ -139,10 +131,7 @@ fn member_after_class_index_reports() {
             (55, 2, SHORT_ACCESS.to_string()),
         ]
     );
-    assert_eq!(
-        contexts(source),
-        vec![(51, 1, QUESTION_CAUSE.to_string())]
-    );
+    assert_eq!(contexts(source), vec![(51, 1, QUESTION_CAUSE.to_string())]);
 }
 
 /// `a?[0].b?[1]`: the plain `.` between the links breaks the
@@ -169,10 +158,7 @@ fn plain_link_breaks_the_short_circuit_walk() {
 fn plain_continuation_is_null_shorted() {
     let source = "class B {\n  List<int> b = [0];\n}\nf(List<B> a) {\n  a?[0].b;\n}\n";
     let report = report_ops_bare(source);
-    assert_eq!(
-        null_aware(&report),
-        vec![(51, 2, PLAIN_INDEX.to_string())]
-    );
+    assert_eq!(null_aware(&report), vec![(51, 2, PLAIN_INDEX.to_string())]);
     assert!(
         !report
             .diagnostics
@@ -243,10 +229,7 @@ fn nullable_element_keeps_the_member_legal() {
 fn non_nullable_element_continuation_is_quiet() {
     let source = "f(List<int> x) {\n  x?[0].isEven;\n}\n";
     let report = report_ops_bare(source);
-    assert_eq!(
-        null_aware(&report),
-        vec![(20, 2, PLAIN_INDEX.to_string())]
-    );
+    assert_eq!(null_aware(&report), vec![(20, 2, PLAIN_INDEX.to_string())]);
     assert!(
         !report
             .diagnostics

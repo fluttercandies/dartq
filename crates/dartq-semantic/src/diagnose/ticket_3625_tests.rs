@@ -179,7 +179,10 @@ fn generic_enum_type_param_scrutinee_still_silent() {
                class C<T extends num> {\n\
                String test(E<T> e) => switch (e) { E.a => 'a', E.c => 'c' };\n\
                }\n";
-    assert!(rows_of(src, "non_exhaustive_switch_expression").is_empty(), "{src}");
+    assert!(
+        rows_of(src, "non_exhaustive_switch_expression").is_empty(),
+        "{src}"
+    );
 }
 
 // —— non_exhaustive_switch_expression: the ET erasure substitution ————
@@ -228,7 +231,10 @@ fn extension_type_bare_use_keeps_written_face() {
 fn const_bool_variable_pattern_covers_its_value() {
     let src = "const c = true;\n\
                String test(bool b) => switch (b) { c => 't', false => 'f' };\n";
-    assert!(rows_of(src, "non_exhaustive_switch_expression").is_empty(), "{src}");
+    assert!(
+        rows_of(src, "non_exhaustive_switch_expression").is_empty(),
+        "{src}"
+    );
 }
 
 // —— missing_default_value_for_parameter: the `InvalidType` arm ————
@@ -333,7 +339,10 @@ fn wildcard_positional_augment_without_default_reports() {
 #[test]
 fn augment_formal_gates_on_intro_ty() {
     let src = "void f({int? a}) {}\naugment void f({int a}) {}\n";
-    assert!(rows_of(src, "missing_default_value_for_parameter").is_empty(), "{src}");
+    assert!(
+        rows_of(src, "missing_default_value_for_parameter").is_empty(),
+        "{src}"
+    );
 }
 
 /// The reverse arm: `augment void f({int? a})` over `void f({int a})`

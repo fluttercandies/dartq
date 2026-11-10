@@ -940,8 +940,7 @@ impl TableState {
                 // Mint the fresh binder group and record the pairs before
                 // the rename runs — the order matches the walk the caller
                 // re-keys facts over.
-                let new_params: Vec<TypeParamId> =
-                    old_params.iter().map(|_| fresh()).collect();
+                let new_params: Vec<TypeParamId> = old_params.iter().map(|_| fresh()).collect();
                 pairs.extend(old_params.iter().copied().zip(new_params.iter().copied()));
                 // Rename the binder occurrences inside each section — the
                 // same positional correlation the function-subtype leg
@@ -951,10 +950,8 @@ impl TableState {
                     .copied()
                     .zip(new_params.iter().copied())
                     .map(|(old, new)| {
-                        let fresh_ty = self.intern_kind(
-                            UninternedType::TypeParameter { parameter: new },
-                            false,
-                        );
+                        let fresh_ty = self
+                            .intern_kind(UninternedType::TypeParameter { parameter: new }, false);
                         (old, fresh_ty)
                     })
                     .collect();
@@ -995,17 +992,20 @@ impl TableState {
                 if !changed {
                     return ty;
                 }
-                self.intern_kind(UninternedType::Interface { decl, args: rebound }, t.is_nullable())
+                self.intern_kind(
+                    UninternedType::Interface {
+                        decl,
+                        args: rebound,
+                    },
+                    t.is_nullable(),
+                )
             }
             TypeKind::FutureOr { base } => {
                 let rebound = self.rebind(base, fresh, pairs);
                 if rebound == base {
                     return ty;
                 }
-                self.intern_kind(
-                    UninternedType::FutureOr { base: rebound },
-                    t.is_nullable(),
-                )
+                self.intern_kind(UninternedType::FutureOr { base: rebound }, t.is_nullable())
             }
             TypeKind::Record { shape } => {
                 let shape = self.shapes[shape.raw() as usize];
@@ -1031,11 +1031,8 @@ impl TableState {
                 if !changed {
                     return ty;
                 }
-                self.intern_record(
-                    UninternedRecord { positional, named },
-                    t.is_nullable(),
-                )
-                .expect("rebinding preserves record well-formedness")
+                self.intern_record(UninternedRecord { positional, named }, t.is_nullable())
+                    .expect("rebinding preserves record well-formedness")
             }
             TypeKind::TypeParameter { .. }
             | TypeKind::Never

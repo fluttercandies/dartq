@@ -28,7 +28,7 @@
 //! !hasInitializer)`), which the same-file carve-out
 //! `field_declares_no_setter` mirrors.
 
-use super::test_rig::{assert_silent, code_names, report_ops, report_ops_imports, rows, RigImport};
+use super::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows};
 
 /// The cluster's dominant shape: `: fn = e` initializes a same-file
 /// `final` field — silent upstream, the corpus's 1,490-row head.

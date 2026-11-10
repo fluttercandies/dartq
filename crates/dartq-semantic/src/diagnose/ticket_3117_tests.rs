@@ -55,13 +55,7 @@ fn dup_rows(report: &crate::diagnose::FileReport) -> Vec<(u32, u32, String)> {
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "duplicate_definition")
-        .map(|d| {
-            (
-                d.range.offset,
-                d.range.length,
-                d.message.to_string(),
-            )
-        })
+        .map(|d| (d.range.offset, d.range.length, d.message.to_string()))
         .collect()
 }
 
@@ -122,11 +116,7 @@ fn method_then_field_reports_once() {
          }\n",
     );
     let rows = dup_rows(&report);
-    assert_eq!(
-        rows.len(),
-        1,
-        "method then field emits one row: {rows:?}"
-    );
+    assert_eq!(rows.len(), 1, "method then field emits one row: {rows:?}");
 }
 
 /// A setter then a getter merges into the pair (upstream :320-334); a
@@ -300,11 +290,7 @@ fn duplicate_named_class_member_scope_is_fresh() {
          class C { int x = 0; }\n",
     );
     let rows = dup_rows(&report);
-    assert_eq!(
-        rows.len(),
-        1,
-        "only the class name duplicates: {rows:?}"
-    );
+    assert_eq!(rows.len(), 1, "only the class name duplicates: {rows:?}");
     assert_eq!(
         rows[0].2,
         "The name 'C' is already defined.".to_string(),
@@ -348,11 +334,7 @@ fn getter_setter_across_duplicate_classes_never_merge() {
          class C { set x(int v) {} }\n",
     );
     let rows = dup_rows(&report);
-    assert_eq!(
-        rows.len(),
-        1,
-        "only the class-name dup reports: {rows:?}"
-    );
+    assert_eq!(rows.len(), 1, "only the class-name dup reports: {rows:?}");
     assert_eq!(
         rows[0].2,
         "The name 'C' is already defined.".to_string(),

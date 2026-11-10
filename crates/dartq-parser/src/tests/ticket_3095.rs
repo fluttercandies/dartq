@@ -67,11 +67,7 @@ fn redirecting_initializer_head_stays_silent() {
         sorted_rows("class C { C() : this = 0; }\n"),
         vec![
             (String::from("expected_token"), 21, 22),
-            (
-                String::from("missing_assignment_in_initializer"),
-                16,
-                20
-            ),
+            (String::from("missing_assignment_in_initializer"), 16, 20),
         ],
         "oracle: no selector row on the redirecting-initializer head — \
          expected_token anchors on the `=` follower, the missing-assignment \

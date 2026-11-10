@@ -6,10 +6,7 @@ enum SendPosition {
     /// The index argument of `a[e]`: the `[`'s token index, and whether
     /// the access is a pure write (`a[e] = v` — the `[]=` formal's
     /// context).
-    Index {
-        lbracket: usize,
-        write_only: bool,
-    },
+    Index { lbracket: usize, write_only: bool },
     /// A call argument: the enclosing `(`'s token index, the selector
     /// spelling before it, the named label (`m(x: e)`), and the
     /// positional index among the depth-0 commas.
@@ -338,12 +335,7 @@ impl<'a> Engine<'a> {
                         // A top-level function keys its parameter stars
                         // under its own name, on its declaring file.
                         if let Some(file) = self.top_level_decl_file(callee_name) {
-                            self.check_formal_arg_annotations(
-                                range,
-                                name,
-                                file,
-                                callee_name,
-                            );
+                            self.check_formal_arg_annotations(range, name, file, callee_name);
                         }
                     }
                     (decl.is_some(), defined)
@@ -457,11 +449,7 @@ impl<'a> Engine<'a> {
         &mut self,
         callee_row: Option<usize>,
     ) -> Option<(Formals, FileId, StringId)> {
-        let callee = self
-            .invokes
-            .last()
-            .and_then(|slot| *slot)
-            .or(callee_row)?;
+        let callee = self.invokes.last().and_then(|slot| *slot).or(callee_row)?;
         let (shape, name, qualified) = match self.rows.get(callee) {
             Some(row) => (row.shape.clone(), row.name, row.qualified),
             None => return None,
@@ -481,12 +469,10 @@ impl<'a> Engine<'a> {
                 let recv = callee
                     .checked_sub(1)
                     .and_then(|index| self.rows.get(index))
-                    .map_or(Receiver::Unknown, |below| {
-                        match &below.shape {
-                            RowShape::Bare(info) => Engine::receiver_of_bare(*info),
-                            RowShape::Receiver(recv) => *recv,
-                            _ => Receiver::Unknown,
-                        }
+                    .map_or(Receiver::Unknown, |below| match &below.shape {
+                        RowShape::Bare(info) => Engine::receiver_of_bare(*info),
+                        RowShape::Receiver(recv) => *recv,
+                        _ => Receiver::Unknown,
                     });
                 if let Some(formals) = self.member_formals_full(&recv, name) {
                     let formals = formals.into_owned();
@@ -664,10 +650,7 @@ impl<'a> Engine<'a> {
         // selector for a named face and the class's own name for the
         // unnamed one (`A.new`, `A`, `super(...)` all land on `C.C`).
         let key = match selector {
-            Some(selector) => format!(
-                "{class}.{}",
-                self.strings.resolve(selector)
-            ),
+            Some(selector) => format!("{class}.{}", self.strings.resolve(selector)),
             None => format!("{class}.{class}"),
         };
         Some((owner_file, self.strings.intern(&key)))
@@ -688,9 +671,10 @@ impl<'a> Engine<'a> {
         let (container, super_walk) = match *recv {
             Receiver::This { container, .. } => (container, false),
             Receiver::Super { container, .. } => (container, true),
-            Receiver::Typed { type_name, .. } | Receiver::Created { name: type_name, .. } => {
-                (type_name, false)
-            }
+            Receiver::Typed { type_name, .. }
+            | Receiver::Created {
+                name: type_name, ..
+            } => (type_name, false),
             Receiver::Container {
                 name: container, ..
             } => {
@@ -705,8 +689,11 @@ impl<'a> Engine<'a> {
                 return decl.members.get(&name).and_then(|entry| {
                     (entry.kind == MemberKind::Method).then(|| {
                         (
-                            self.strings
-                                .intern(&format!("{}.{}", self.strings.resolve(container), self.strings.resolve(name))),
+                            self.strings.intern(&format!(
+                                "{}.{}",
+                                self.strings.resolve(container),
+                                self.strings.resolve(name)
+                            )),
                             owner_file,
                         )
                     })
@@ -728,8 +715,11 @@ impl<'a> Engine<'a> {
                 return decl.members.get(&name).and_then(|entry| {
                     (entry.kind == MemberKind::Method).then(|| {
                         (
-                            self.strings
-                                .intern(&format!("{}.{}", self.strings.resolve(container), self.strings.resolve(name))),
+                            self.strings.intern(&format!(
+                                "{}.{}",
+                                self.strings.resolve(container),
+                                self.strings.resolve(name)
+                            )),
                             owner_file,
                         )
                     })
@@ -1343,9 +1333,7 @@ impl<'a> Engine<'a> {
         let local_fn_scopes = if rows.iter().any(|row| {
             matches!(
                 row.shape,
-                RowShape::Bare(BareInfo::Missing {
-                    in_exec: true, ..
-                })
+                RowShape::Bare(BareInfo::Missing { in_exec: true, .. })
             ) && matches!(row.intent, Intent::Invoke)
         }) {
             self.build_local_fn_scopes()
@@ -1492,12 +1480,7 @@ impl<'a> Engine<'a> {
                 .conditional_uri_rows
                 .contains(&deferred[index].range.offset)
             {
-                self.resolve_row(
-                    promotions,
-                    deferred_row,
-                    &cascade_targets,
-                    &local_fn_scopes,
-                );
+                self.resolve_row(promotions, deferred_row, &cascade_targets, &local_fn_scopes);
             }
         }
         // The `[]` argument's void face: the index expression is the
@@ -1819,9 +1802,7 @@ impl<'a> Engine<'a> {
                     .member_reads
                     .iter()
                     .rev()
-                    .find(|read| {
-                        read.offset < row.range.offset && read.recv != Receiver::Unknown
-                    })
+                    .find(|read| read.offset < row.range.offset && read.recv != Receiver::Unknown)
                     .copied();
                 if let Some(read) = src
                     && !self.semicolon_between(read.offset, row.range.offset)
@@ -1930,13 +1911,7 @@ impl<'a> Engine<'a> {
                     // is E's own application — probed silent).
                     if matches!(self.walk_members(resolved, spelling), Walk::Missing)
                         && !matches!(
-                            self.extension_application(
-                                resolved,
-                                this_ty,
-                                spelling,
-                                false,
-                                false
-                            ),
+                            self.extension_application(resolved, this_ty, spelling, false, false),
                             ExtensionApp::Single | ExtensionApp::UnsafeSingle
                         )
                     {
@@ -1969,11 +1944,7 @@ impl<'a> Engine<'a> {
                             return;
                         };
                         let is_index = op == self.intern("[]");
-                        let applied = if is_index {
-                            Some(op)
-                        } else {
-                            read.or(write)
-                        };
+                        let applied = if is_index { Some(op) } else { read.or(write) };
                         if let Some(text) = applied.map(|s| self.strings.resolve(s)) {
                             let anchor = if is_index {
                                 SourceRange {
@@ -2011,7 +1982,10 @@ impl<'a> Engine<'a> {
                 // against `InvalidType` upstream (`SuperContext.of != valid`
                 // — binary_expression_resolver.dart:391-404) — the operator
                 // lookup never runs and the dedicated context face reports.
-                if matches!(kind, ContainerKind::Extension | ContainerKind::ExtensionType) {
+                if matches!(
+                    kind,
+                    ContainerKind::Extension | ContainerKind::ExtensionType
+                ) {
                     return;
                 }
                 let mut missing: Vec<String> = Vec::new();
@@ -2335,12 +2309,7 @@ impl<'a> Engine<'a> {
                             && !self.guard.ignore(None, row.name)
                         {
                             let name_text = self.strings.resolve(row.name).to_string();
-                            self.emit(
-                                SemanticCode::UndefinedIdentifier,
-                                row.range,
-                                &name_text,
-                                "",
-                            );
+                            self.emit(SemanticCode::UndefinedIdentifier, row.range, &name_text, "");
                         }
                         self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
                         return;
@@ -2387,8 +2356,7 @@ impl<'a> Engine<'a> {
                     )
                 {
                     self.emit_extension_ambiguity(row.name, row.range, displays);
-                    if !self.keyword_bare_reference(row.range)
-                        && !self.guard.ignore(None, row.name)
+                    if !self.keyword_bare_reference(row.range) && !self.guard.ignore(None, row.name)
                     {
                         let name_text = self.strings.resolve(row.name).to_string();
                         self.emit(SemanticCode::UndefinedIdentifier, row.range, &name_text, "");
@@ -2583,8 +2551,7 @@ impl<'a> Engine<'a> {
                                 )
                         });
                 if !matches!(row.intent, Intent::Write | Intent::ReadWrite)
-                    && (self.field_init_this_rows.contains(&row.range.offset)
-                        || init_this_member)
+                    && (self.field_init_this_rows.contains(&row.range.offset) || init_this_member)
                 {
                     self.emit(
                         SemanticCode::ImplicitThisReferenceInInitializer,
@@ -2711,11 +2678,7 @@ impl<'a> Engine<'a> {
                     // A non-member read answers `None` inside the
                     // substitution and keeps `ty` byte for byte.
                     let ty = self
-                        .promotable_field_substitution(
-                            &self.prop_promotion_rows,
-                            row.range,
-                            ty,
-                        )
+                        .promotable_field_substitution(&self.prop_promotion_rows, row.range, ty)
                         .unwrap_or(ty);
                     // A resolved function-DECLARATION identifier carries
                     // its signature face (`f + 1` over `int f(int)` reads
@@ -2945,9 +2908,9 @@ impl<'a> Engine<'a> {
                                     // display name (dynamic/unknown
                                     // dispatch dynamically — silent).
                                     let type_text = match self.fold_alias_ty(ty) {
-                                        face @ (Ty::Record { .. } | Ty::Function { .. }) => Some(
-                                            face.render(&self.strings, &self.boundary.pool()),
-                                        ),
+                                        face @ (Ty::Record { .. } | Ty::Function { .. }) => {
+                                            Some(face.render(&self.strings, &self.boundary.pool()))
+                                        }
                                         face @ Ty::Named { .. } => Some(self.ty_display(face)),
                                         _ => None,
                                     };
@@ -3322,13 +3285,14 @@ impl<'a> Engine<'a> {
                                 && !self.container_declares_member(container, row.name)
                                 && !Self::synthetic_reference(row.range)
                                 && !self.keyword_bare_reference(row.range)
-                                && let ExtensionApp::Ambiguous(displays) = self.extension_application(
-                                    container,
-                                    Ty::named(container),
-                                    row.name,
-                                    matches!(row.intent, Intent::Write | Intent::ReadWrite),
-                                    false,
-                                )
+                                && let ExtensionApp::Ambiguous(displays) = self
+                                    .extension_application(
+                                        container,
+                                        Ty::named(container),
+                                        row.name,
+                                        matches!(row.intent, Intent::Write | Intent::ReadWrite),
+                                        false,
+                                    )
                             {
                                 self.emit_extension_ambiguity(row.name, row.range, displays);
                             }
@@ -3337,7 +3301,12 @@ impl<'a> Engine<'a> {
                                 && !self.guard.ignore(None, row.name)
                                 && !rescued
                             {
-                                self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
+                                self.emit(
+                                    SemanticCode::UndefinedIdentifier,
+                                    row.range,
+                                    name_text,
+                                    "",
+                                );
                             }
                         }
                         let use_kind = match row.intent {
@@ -3698,8 +3667,9 @@ impl<'a> Engine<'a> {
         let tokens = self.tokens.as_slice();
         // A bare read or a completed call window (`ident(...)`).
         let is_read = hi == lo + 1;
-        let is_call =
-            hi > lo + 1 && tokens[lo + 1].kind == K::OpenParen && self.tokens.matching_end(lo + 1) == Some(hi - 1);
+        let is_call = hi > lo + 1
+            && tokens[lo + 1].kind == K::OpenParen
+            && self.tokens.matching_end(lo + 1) == Some(hi - 1);
         if !is_read && !is_call {
             return false;
         }
@@ -3779,7 +3749,10 @@ impl<'a> Engine<'a> {
                         }
                         at += 1;
                     }
-                    K::OpenParen | K::OpenSquare | K::OpenCurly | K::StringInterpolationExpression => {
+                    K::OpenParen
+                    | K::OpenSquare
+                    | K::OpenCurly
+                    | K::StringInterpolationExpression => {
                         if let Some(close) = self.tokens.matching_end(at) {
                             if close < hi {
                                 at = close + 1;
@@ -3889,16 +3862,20 @@ impl<'a> Engine<'a> {
             // member/cascade selector: `const A() => 0` (a switch case's
             // constant pattern) and `x.m() {…}`-shaped spellings are
             // invocations, not local functions.
-            if index.checked_sub(1).and_then(|prev| toks.get(prev)).is_some_and(|prev| {
-                matches!(
-                    prev.kind,
-                    TokenKind::Keyword(Keyword::Const | Keyword::New)
-                        | TokenKind::Period
-                        | TokenKind::QuestionPeriod
-                        | TokenKind::PeriodPeriod
-                        | TokenKind::QuestionPeriodPeriod
-                )
-            }) {
+            if index
+                .checked_sub(1)
+                .and_then(|prev| toks.get(prev))
+                .is_some_and(|prev| {
+                    matches!(
+                        prev.kind,
+                        TokenKind::Keyword(Keyword::Const | Keyword::New)
+                            | TokenKind::Period
+                            | TokenKind::QuestionPeriod
+                            | TokenKind::PeriodPeriod
+                            | TokenKind::QuestionPeriodPeriod
+                    )
+                })
+            {
                 continue;
             }
             let mut cursor = index + 1;
@@ -4026,19 +4003,19 @@ impl<'a> Engine<'a> {
                         }
                     }
                     TokenKind::Colon
-                        | TokenKind::Keyword(Keyword::If)
-                        | TokenKind::Keyword(Keyword::Else)
-                        | TokenKind::Keyword(Keyword::For)
-                        | TokenKind::Keyword(Keyword::While)
-                        | TokenKind::Keyword(Keyword::Do)
-                        | TokenKind::Keyword(Keyword::Try)
-                        | TokenKind::Keyword(Keyword::Catch)
-                        | TokenKind::Keyword(Keyword::Finally)
-                        | TokenKind::Keyword(Keyword::Switch)
-                        | TokenKind::Keyword(Keyword::Case)
-                        | TokenKind::Keyword(Keyword::Default)
-                        | TokenKind::Keyword(Keyword::Assert)
-                        | TokenKind::Keyword(Keyword::On)
+                    | TokenKind::Keyword(Keyword::If)
+                    | TokenKind::Keyword(Keyword::Else)
+                    | TokenKind::Keyword(Keyword::For)
+                    | TokenKind::Keyword(Keyword::While)
+                    | TokenKind::Keyword(Keyword::Do)
+                    | TokenKind::Keyword(Keyword::Try)
+                    | TokenKind::Keyword(Keyword::Catch)
+                    | TokenKind::Keyword(Keyword::Finally)
+                    | TokenKind::Keyword(Keyword::Switch)
+                    | TokenKind::Keyword(Keyword::Case)
+                    | TokenKind::Keyword(Keyword::Default)
+                    | TokenKind::Keyword(Keyword::Assert)
+                    | TokenKind::Keyword(Keyword::On)
                         if depth == 0 =>
                     {
                         non_block = true;
@@ -4105,9 +4082,7 @@ impl<'a> Engine<'a> {
             let (text, kind, compound) = match token.kind {
                 dartq_scanner::TokenKind::PlusPlus => ("+", UncheckedNullableKind::Method, false),
                 dartq_scanner::TokenKind::PlusEq => ("+", UncheckedNullableKind::Method, true),
-                dartq_scanner::TokenKind::MinusMinus => {
-                    ("-", UncheckedNullableKind::Method, false)
-                }
+                dartq_scanner::TokenKind::MinusMinus => ("-", UncheckedNullableKind::Method, false),
                 dartq_scanner::TokenKind::MinusEq => ("-", UncheckedNullableKind::Method, true),
                 dartq_scanner::TokenKind::StarEq => ("*", UncheckedNullableKind::Method, true),
                 dartq_scanner::TokenKind::SlashEq => ("/", UncheckedNullableKind::Method, true),
@@ -4117,12 +4092,8 @@ impl<'a> Engine<'a> {
                 }
                 dartq_scanner::TokenKind::LtLtEq => ("<<", UncheckedNullableKind::Method, true),
                 dartq_scanner::TokenKind::GtGtEq => (">>", UncheckedNullableKind::Method, true),
-                dartq_scanner::TokenKind::GtGtGtEq => {
-                    (">>>", UncheckedNullableKind::Method, true)
-                }
-                dartq_scanner::TokenKind::AmpersandEq => {
-                    ("&", UncheckedNullableKind::Method, true)
-                }
+                dartq_scanner::TokenKind::GtGtGtEq => (">>>", UncheckedNullableKind::Method, true),
+                dartq_scanner::TokenKind::AmpersandEq => ("&", UncheckedNullableKind::Method, true),
                 dartq_scanner::TokenKind::BarEq => ("|", UncheckedNullableKind::Method, true),
                 dartq_scanner::TokenKind::CaretEq => ("^", UncheckedNullableKind::Method, true),
                 _ => return None,
@@ -4344,18 +4315,21 @@ impl<'a> Engine<'a> {
         // the lookup spelling pair covers both forms.
         let unary = self.intern("unary-");
         let minus = self.intern("-");
-        [read, write, adjacent].into_iter().flatten().any(|spelling| {
-            spelling == self.intern("==")
-                || (spelling == unary
-                    && matches!(
-                        self.extension_application(name, ty, minus, false, true),
+        [read, write, adjacent]
+            .into_iter()
+            .flatten()
+            .any(|spelling| {
+                spelling == self.intern("==")
+                    || (spelling == unary
+                        && matches!(
+                            self.extension_application(name, ty, minus, false, true),
+                            ExtensionApp::Single
+                        ))
+                    || matches!(
+                        self.extension_application(name, ty, spelling, false, true),
                         ExtensionApp::Single
-                    ))
-                || matches!(
-                    self.extension_application(name, ty, spelling, false, true),
-                    ExtensionApp::Single
-                )
-        })
+                    )
+            })
     }
 
     /// Whether a bare invocation's callee type is function-shaped (the
@@ -4441,8 +4415,8 @@ impl<'a> Engine<'a> {
                 // and the export scope never carries the synthetic element,
                 // so the push-time verdict reads a prefixed miss. Reporting
                 // here named a class that does not exist.
-                let builtin_top = row.name == self.intern("dynamic")
-                    && self.prefix_exports_dynamic(prefix);
+                let builtin_top =
+                    row.name == self.intern("dynamic") && self.prefix_exports_dynamic(prefix);
                 // The local-prefix face: a prefix head that names a local
                 // or parameter element is not an import prefix — the
                 // oracle's prefixed lookup fails on the head and asks no
@@ -5170,11 +5144,7 @@ impl<'a> Engine<'a> {
     /// re-enters. Leading/trailing `?`/`:` tokens a mis-paired
     /// conditional split leaves behind (`x is int? ? a : b`'s type
     /// suffix) trim first.
-    fn arm_span(
-        &self,
-        tokens: &[dartq_scanner::Token],
-        lo: usize,
-    ) -> Option<SourceRange> {
+    fn arm_span(&self, tokens: &[dartq_scanner::Token], lo: usize) -> Option<SourceRange> {
         let mut front = 0usize;
         let mut len = tokens.len();
         while len > front
@@ -5250,9 +5220,7 @@ impl<'a> Engine<'a> {
             (Ty::Dynamic, _) | (Ty::Void, _) => Some(a),
             (_, Ty::Dynamic) | (_, Ty::Void) => Some(b),
             (Ty::Null, other) | (other, Ty::Null) => Some(match other {
-                Ty::Named {
-                    name, args, ..
-                } => Ty::Named {
+                Ty::Named { name, args, .. } => Ty::Named {
                     name,
                     nullable: true,
                     args,
@@ -5346,12 +5314,10 @@ impl<'a> Engine<'a> {
             .iter()
             .find(|reference| reference.range.offset == read_span.offset)?;
         match reference.target {
-            RefTarget::Member { container } => {
-                match self.walk_members(container, reference.name) {
-                    Walk::Found(entry) => self.member_entry_shape_ty(&entry),
-                    _ => None,
-                }
-            }
+            RefTarget::Member { container } => match self.walk_members(container, reference.name) {
+                Walk::Found(entry) => self.member_entry_shape_ty(&entry),
+                _ => None,
+            },
             RefTarget::Decl { .. } => {
                 let decl = self.top_level_decl(reference.name)?;
                 if !matches!(decl.kind, MicroKind::TopLevelFn) {
@@ -5432,8 +5398,7 @@ impl<'a> Engine<'a> {
                             .iter()
                             .filter(|(range, _)| range.end() <= decl_offset)
                             .filter(|(range, _)| {
-                                self.source.as_bytes()
-                                    [self.byte_of(range.end())..decl_byte]
+                                self.source.as_bytes()[self.byte_of(range.end())..decl_byte]
                                     .iter()
                                     .all(u8::is_ascii_whitespace)
                             })
@@ -5455,8 +5420,7 @@ impl<'a> Engine<'a> {
                         while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
                             at += 1;
                         }
-                        (bytes.get(at) == Some(&b'('))
-                            .then(|| self.closure_init_ty(bytes, at))
+                        (bytes.get(at) == Some(&b'(')).then(|| self.closure_init_ty(bytes, at))
                     }
                     _ => None,
                 }
@@ -5888,9 +5852,7 @@ impl<'a> Engine<'a> {
                             .and_then(|i| self.recv_expression_ty(self.member_reads[i].recv_span))
                             .and_then(|ty| match ty {
                                 Ty::Dynamic => Some("dynamic".to_owned()),
-                                ty @ Ty::Named { name, .. }
-                                    if !self.is_invalid_ty(ty) =>
-                                {
+                                ty @ Ty::Named { name, .. } if !self.is_invalid_ty(ty) => {
                                     Some(self.strings.resolve(name).to_string())
                                 }
                                 _ => None,
@@ -5980,8 +5942,7 @@ impl<'a> Engine<'a> {
                                 return None;
                             }
                             self.receiver_decl_shape(read_span)
-                        })
-                    {
+                        }) {
                         Some(
                             face @ Ty::Named {
                                 name: flow_head, ..
@@ -6037,22 +5998,13 @@ impl<'a> Engine<'a> {
                                 )
                                 .unwrap_or(face);
                             let receiver_nullable = match face {
-                                Ty::Record { nullable, .. }
-                                | Ty::Function { nullable, .. } => {
-                                    nullable
-                                        && !self
-                                            .null_aware_members
-                                            .contains(&row.range.offset)
+                                Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
+                                    nullable && !self.null_aware_members.contains(&row.range.offset)
                                 }
                                 _ => false,
                             };
                             let display = self.render_ty(face);
-                            self.check_shape_receiver(
-                                row,
-                                face,
-                                &display,
-                                receiver_nullable,
-                            );
+                            self.check_shape_receiver(row, face, &display, receiver_nullable);
                             return;
                         }
                         _ => {}
@@ -6119,15 +6071,12 @@ impl<'a> Engine<'a> {
                     if receiver_nullable
                         && let Some(read_span) = self
                             .promoted_recv_reads
-                            .binary_search_by(|(member, _)| {
-                                member.cmp(&row.range.offset)
-                            })
+                            .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
                             .ok()
                             .map(|index| self.promoted_recv_reads[index].1)
                         && !self.read_offset_is_member(read_span.offset)
                         && let Some(promoted) = promotions.promoted(read_span)
-                        && (promoted == Ty::Unknown
-                            || promoted.is_strictly_non_nullable())
+                        && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
                     {
                         receiver_nullable = false;
                     }
@@ -6506,8 +6455,13 @@ impl<'a> Engine<'a> {
             && let Some(entry) = resolved.members.get(&row.name)
         {
             let (kind, is_final, name_range) = (entry.kind, entry.is_final, entry.name_range);
-            if self.report_setter_less_write(row, kind, is_final, name_range, Some((owner, container)))
-            {
+            if self.report_setter_less_write(
+                row,
+                kind,
+                is_final,
+                name_range,
+                Some((owner, container)),
+            ) {
                 return;
             }
         }
@@ -6520,7 +6474,13 @@ impl<'a> Engine<'a> {
                 || (entry.kind == MemberKind::Field && entry.is_final))
         {
             let (kind, is_final, name_range) = (entry.kind, entry.is_final, entry.name_range);
-            self.report_setter_less_write(row, kind, is_final, name_range, Some((owner, container)));
+            self.report_setter_less_write(
+                row,
+                kind,
+                is_final,
+                name_range,
+                Some((owner, container)),
+            );
         }
         if defined {
             // The compound-write read face: a write satisfied through the
@@ -6918,24 +6878,15 @@ impl<'a> Engine<'a> {
                     head,
                 )
             } else {
-                resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    lib,
-                    file,
-                    head,
-                )
+                resolve_container(self.graph, self.namespaces, self.index, lib, file, head)
             };
             if let Some(hit) = resolved {
                 return Some(hit);
             }
-            let Lookup::Found(NamespaceEntry::Decl(owner)) = self.namespaces.lookup_in_file(
-                self.graph,
-                lib,
-                Some(file),
-                head,
-            ) else {
+            let Lookup::Found(NamespaceEntry::Decl(owner)) =
+                self.namespaces
+                    .lookup_in_file(self.graph, lib, Some(file), head)
+            else {
                 return None;
             };
             let decl = self.index.get(owner)?.decl(head)?;
@@ -7172,24 +7123,15 @@ impl<'a> Engine<'a> {
                 // The keyword heads have no invocation-side twin — that
                 // face is alias-gated — so their invoke reports here.
                 Intent::Invoke if is_alias => {}
-                Intent::Invoke => self.emit(
-                    SemanticCode::UndefinedMethod,
-                    row.range,
-                    name_text,
-                    "Type",
-                ),
-                Intent::Read => self.emit(
-                    SemanticCode::UndefinedGetter,
-                    row.range,
-                    name_text,
-                    "Type",
-                ),
-                Intent::Write | Intent::ReadWrite => self.emit(
-                    SemanticCode::UndefinedSetter,
-                    row.range,
-                    name_text,
-                    "Type",
-                ),
+                Intent::Invoke => {
+                    self.emit(SemanticCode::UndefinedMethod, row.range, name_text, "Type")
+                }
+                Intent::Read => {
+                    self.emit(SemanticCode::UndefinedGetter, row.range, name_text, "Type")
+                }
+                Intent::Write | Intent::ReadWrite => {
+                    self.emit(SemanticCode::UndefinedSetter, row.range, name_text, "Type")
+                }
                 Intent::Operator(..) => {}
             }
         }
@@ -8001,10 +7943,8 @@ impl<'a> Engine<'a> {
                         || row.name == self.intern("==")
                         || self.record_extension_face(shape, row.name).is_some();
                     let setter = self.setter_spelling(row.name);
-                    let write_resolved = write
-                        && self
-                            .record_extension_face(shape, setter)
-                            .is_some();
+                    let write_resolved =
+                        write && self.record_extension_face(shape, setter).is_some();
                     // A write resolves only through the `name=` extension
                     // spelling; its READ half reports unless the field or
                     // an `Object` member answered it (`check_shape_receiver`'s
@@ -8026,8 +7966,7 @@ impl<'a> Engine<'a> {
                                 access_kind(&row.intent),
                             );
                         } else {
-                            let param_text =
-                                self.strings.resolve(container).to_string();
+                            let param_text = self.strings.resolve(container).to_string();
                             match row.intent {
                                 Intent::Invoke => {
                                     self.emit(
@@ -8273,7 +8212,12 @@ impl<'a> Engine<'a> {
                 let name_text = self.strings.resolve(row.name);
                 let type_text =
                     self.getter_display(&recv, container, receiver_ty, row.range.offset);
-                self.emit(SemanticCode::UndefinedGetter, row.range, name_text, &type_text);
+                self.emit(
+                    SemanticCode::UndefinedGetter,
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
                 self.record_miss(row.name, row.range, true, NameUse::Read);
                 return;
             }
@@ -8528,11 +8472,7 @@ impl<'a> Engine<'a> {
             // non-null projection, so `x.om()` earns the oracle's unsafe
             // application row beside `y.om()`'s silent resolve over
             // `FutureOr<int>`.
-            self.check_core_type_member(
-                container,
-                row,
-                receiver_nullable || future_or_nullable,
-            );
+            self.check_core_type_member(container, row, receiver_nullable || future_or_nullable);
             return;
         };
         if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&row.name) {
@@ -8640,8 +8580,7 @@ impl<'a> Engine<'a> {
         // on a null-aware access (the shorted non-null face — the
         // `getter_display` doc's p6 probe); the setter face keeps the
         // plain render (its own family owns that text).
-        let getter_text =
-            self.getter_display(&recv, report_on, receiver_ty, row.range.offset);
+        let getter_text = self.getter_display(&recv, report_on, receiver_ty, row.range.offset);
         match row.intent {
             Intent::Invoke => self.emit(
                 SemanticCode::UndefinedMethod,
@@ -8704,7 +8643,10 @@ impl<'a> Engine<'a> {
         container: StringId,
         kind: ContainerKind,
     ) {
-        if matches!(kind, ContainerKind::Extension | ContainerKind::ExtensionType) {
+        if matches!(
+            kind,
+            ContainerKind::Extension | ContainerKind::ExtensionType
+        ) {
             return;
         }
         if let Intent::Operator(..) = row.intent {
@@ -8878,29 +8820,29 @@ impl<'a> Engine<'a> {
         // first, then the `name=` setter (upstream runs the read leg's
         // `getMember`/`getInherited` pair before the write leg's
         // `lookUpSetter` pair).
-        let report = |engine: &mut Self, spelling: StringId, miss_shape: SuperShape| {
-            match engine.walk_super_interface(container, spelling) {
-                Walk::Found(entry) => {
-                    let shape = match entry.kind {
-                        MemberKind::Getter | MemberKind::Field => SuperShape::Getter,
-                        MemberKind::Setter => SuperShape::Setter,
-                        MemberKind::Method => SuperShape::Method,
-                    };
-                    engine.emit(
-                        SemanticCode::AbstractSuperMemberReference(shape),
-                        row.range,
-                        &name_text,
-                        "",
-                    );
-                }
-                Walk::Missing | Walk::ChainBroken => {
-                    engine.emit(
-                        SemanticCode::UndefinedSuperMember(miss_shape),
-                        row.range,
-                        &name_text,
-                        &type_text,
-                    );
-                }
+        let report = |engine: &mut Self, spelling: StringId, miss_shape: SuperShape| match engine
+            .walk_super_interface(container, spelling)
+        {
+            Walk::Found(entry) => {
+                let shape = match entry.kind {
+                    MemberKind::Getter | MemberKind::Field => SuperShape::Getter,
+                    MemberKind::Setter => SuperShape::Setter,
+                    MemberKind::Method => SuperShape::Method,
+                };
+                engine.emit(
+                    SemanticCode::AbstractSuperMemberReference(shape),
+                    row.range,
+                    &name_text,
+                    "",
+                );
+            }
+            Walk::Missing | Walk::ChainBroken => {
+                engine.emit(
+                    SemanticCode::UndefinedSuperMember(miss_shape),
+                    row.range,
+                    &name_text,
+                    &type_text,
+                );
             }
         };
         match row.intent {
@@ -9391,23 +9333,14 @@ impl<'a> Engine<'a> {
         // resolves but the dereference reports the shared unchecked code
         // at the selector (`applicableTo`'s non-nullable `on` never covers
         // a nullable `FutureOr<A>` receiver — the #3457 `x.om()` face).
-        match self.extension_application(
-            container,
-            Ty::UNKNOWN,
-            row.name,
-            write,
-            receiver_nullable,
-        ) {
+        match self.extension_application(container, Ty::UNKNOWN, row.name, write, receiver_nullable)
+        {
             ExtensionApp::None => {}
             ExtensionApp::Single => return,
             ExtensionApp::UnsafeSingle => {
                 if receiver_nullable {
                     let name_text = self.strings.resolve(row.name);
-                    self.emit_unchecked_nullable(
-                        row.range,
-                        name_text,
-                        access_kind(&row.intent),
-                    );
+                    self.emit_unchecked_nullable(row.range, name_text, access_kind(&row.intent));
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 }
                 return;
@@ -9732,7 +9665,12 @@ impl<'a> Engine<'a> {
             // `instanceReceiverType` — the composite type, never the
             // method's `receiverClassName`).
             Intent::Operator(_, op_range) => {
-                self.emit(SemanticCode::UndefinedOperator, op_range, name_text, display);
+                self.emit(
+                    SemanticCode::UndefinedOperator,
+                    op_range,
+                    name_text,
+                    display,
+                );
             }
         }
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
@@ -9870,8 +9808,7 @@ impl<'a> Engine<'a> {
     /// member was found on; a same-file or same-library hit is always
     /// accessible, and a public member is accessible from anywhere.
     fn member_accessible_in(&self, name: StringId, owner: FileId) -> bool {
-        !self.is_private_name(name)
-            || self.graph.library_of_file(owner) == Some(self.lib)
+        !self.is_private_name(name) || self.graph.library_of_file(owner) == Some(self.lib)
     }
 
     /// A member's result type as far as M1 knows it: the declared field type
@@ -10040,7 +9977,8 @@ impl<'a> Engine<'a> {
                             }
                             depth -= 1;
                         }
-                        dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenCurly => {
+                        dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenCurly => {
                             if depth == 0 {
                                 return None;
                             }
@@ -10090,7 +10028,8 @@ impl<'a> Engine<'a> {
                         }
                         // A collection literal between the send and the
                         // paren (`h([f()])`) — the send is no argument.
-                        dartq_scanner::TokenKind::OpenSquare | dartq_scanner::TokenKind::OpenCurly => {
+                        dartq_scanner::TokenKind::OpenSquare
+                        | dartq_scanner::TokenKind::OpenCurly => {
                             if depth == 0 {
                                 return None;
                             }
@@ -10123,7 +10062,7 @@ impl<'a> Engine<'a> {
                         tokens[at - 3].kind,
                         dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::Comma
                     ))
-                    .then(|| self.intern(&self.source[tokens[at - 2].byte_range()]));
+                .then(|| self.intern(&self.source[tokens[at - 2].byte_range()]));
                 // The positional index: the depth-0 commas between the
                 // enclosing `(` and the send's own head. The backward scan
                 // above broke at depth 0, so the counter restarts there.
@@ -10166,17 +10105,14 @@ impl<'a> Engine<'a> {
                 lbracket,
                 write_only,
             } => self.index_formal_context(lbracket, write_only),
-            SendPosition::Argument {
-                open, selector, ..
-            } => {
+            SendPosition::Argument { open, selector, .. } => {
                 // The enclosing send's callee row: the last row spelling
                 // the selector that closed before its argument list —
                 // the same resolution the row stack already landed.
                 let open_offset = self.tokens.as_slice()[open].utf16_offset;
-                let at = self
-                    .rows
-                    .iter()
-                    .rposition(|probe| probe.name == selector && probe.range.end() <= open_offset)?;
+                let at = self.rows.iter().rposition(|probe| {
+                    probe.name == selector && probe.range.end() <= open_offset
+                })?;
                 let parent = &self.rows[at];
                 // A cascade section resolves without the enclosing context
                 // (upstream `test_remainder_int_context_cascaded` infers
@@ -10227,10 +10163,9 @@ impl<'a> Engine<'a> {
                 index,
             } => {
                 let open_offset = self.tokens.as_slice()[open].utf16_offset;
-                let at = self
-                    .rows
-                    .iter()
-                    .rposition(|probe| probe.name == selector && probe.range.end() <= open_offset)?;
+                let at = self.rows.iter().rposition(|probe| {
+                    probe.name == selector && probe.range.end() <= open_offset
+                })?;
                 let formals = self.send_formals(&self.rows[at])?;
                 let formal = match label {
                     Some(label) => formals.named_formal(label)?.ty,
@@ -10378,8 +10313,12 @@ impl<'a> Engine<'a> {
                     Receiver::Typed { type_name, .. } => *type_name,
                     Receiver::This { container, .. }
                     | Receiver::Super { container, .. }
-                    | Receiver::Created { name: container, .. }
-                    | Receiver::Container { name: container, .. } => *container,
+                    | Receiver::Created {
+                        name: container, ..
+                    }
+                    | Receiver::Container {
+                        name: container, ..
+                    } => *container,
                     _ => return None,
                 };
                 let entry = self.resolved_member(container, row.name)?;
@@ -10410,7 +10349,9 @@ impl<'a> Engine<'a> {
         // An unsatisfiable binding falls back upstream (`T extends num`
         // under a `String` context answers the bound, never the
         // context) — the unknown stand-in is the same under-report.
-        if let Some(bound) = bound && !self.name_subtype(context, self.fold_alias_ty(bound)) {
+        if let Some(bound) = bound
+            && !self.name_subtype(context, self.fold_alias_ty(bound))
+        {
             return None;
         }
         Some(context)
@@ -11314,7 +11255,9 @@ impl<'a> Engine<'a> {
         let at = tokens.partition_point(|token| token.utf16_offset < range.end());
         matches!(
             tokens.get(at).map(|token| token.kind),
-            Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In))
+            Some(dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::In
+            ))
         )
     }
 
@@ -11330,9 +11273,7 @@ impl<'a> Engine<'a> {
         let incdec = |kind: Option<dartq_scanner::TokenKind>| {
             matches!(
                 kind,
-                Some(
-                    dartq_scanner::TokenKind::PlusPlus | dartq_scanner::TokenKind::MinusMinus
-                )
+                Some(dartq_scanner::TokenKind::PlusPlus | dartq_scanner::TokenKind::MinusMinus)
             )
         };
         let after = tokens.partition_point(|token| token.utf16_offset < row.range.end());
@@ -11436,7 +11377,9 @@ impl<'a> Engine<'a> {
         // `SimpleIdentifier` assignment — `checkFinalAlreadyAssigned`
         // never runs for it).
         if let Some(receiver) = at.checked_sub(2)
-            && tokens.get(at - 1).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
+            && tokens
+                .get(at - 1)
+                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
             && matches!(
                 tokens[receiver].kind,
                 dartq_scanner::TokenKind::Keyword(
@@ -11564,9 +11507,7 @@ impl<'a> Engine<'a> {
                         // (`Square(:a) = …`, `C.named(:a)`, `f<T>(…)`):
                         // an object pattern keeps the walk moving.
                         Some(dartq_scanner::TokenKind::Identifier) => {
-                            let before_head = prev
-                                .checked_sub(2)
-                                .map(|i| tokens[i].kind);
+                            let before_head = prev.checked_sub(2).map(|i| tokens[i].kind);
                             if matches!(
                                 before_head,
                                 Some(
@@ -11607,22 +11548,20 @@ impl<'a> Engine<'a> {
                         // `catch (`, `assert (`) opens the STATEMENT's
                         // head, not a pattern or a formal list — the walk
                         // stops at the declaration's boundary.
-                        Some(
-                            dartq_scanner::TokenKind::Keyword(
-                                dartq_scanner::Keyword::For
-                                    | dartq_scanner::Keyword::If
-                                    | dartq_scanner::Keyword::While
-                                    | dartq_scanner::Keyword::Switch
-                                    | dartq_scanner::Keyword::Catch
-                                    | dartq_scanner::Keyword::On
-                                    | dartq_scanner::Keyword::Assert
-                                    | dartq_scanner::Keyword::Return
-                                    | dartq_scanner::Keyword::Throw
-                                    | dartq_scanner::Keyword::Await
-                                    | dartq_scanner::Keyword::Do
-                                    | dartq_scanner::Keyword::Else
-                            ),
-                        )
+                        Some(dartq_scanner::TokenKind::Keyword(
+                            dartq_scanner::Keyword::For
+                            | dartq_scanner::Keyword::If
+                            | dartq_scanner::Keyword::While
+                            | dartq_scanner::Keyword::Switch
+                            | dartq_scanner::Keyword::Catch
+                            | dartq_scanner::Keyword::On
+                            | dartq_scanner::Keyword::Assert
+                            | dartq_scanner::Keyword::Return
+                            | dartq_scanner::Keyword::Throw
+                            | dartq_scanner::Keyword::Await
+                            | dartq_scanner::Keyword::Do
+                            | dartq_scanner::Keyword::Else,
+                        ))
                         | Some(dartq_scanner::TokenKind::Function)
                         | Some(dartq_scanner::TokenKind::Eq)
                         | Some(dartq_scanner::TokenKind::Semicolon) => break,
@@ -11928,9 +11867,7 @@ impl<'a> Engine<'a> {
         let mut probe = at + 1;
         while probe < end {
             match tokens[probe].kind {
-                TokenKind::OpenParen
-                | TokenKind::OpenSquare
-                | TokenKind::OpenCurly => depth += 1,
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => depth += 1,
                 TokenKind::CloseParen | TokenKind::CloseSquare => depth = depth.saturating_sub(1),
                 TokenKind::CloseCurly => {
                     if depth == 0 {
@@ -12012,12 +11949,10 @@ impl<'a> Engine<'a> {
                 let mut probe = cursor;
                 while probe < end {
                     match tokens[probe].kind {
-                        TokenKind::OpenParen
-                        | TokenKind::OpenSquare
-                        | TokenKind::OpenCurly => depth += 1,
-                        TokenKind::CloseParen
-                        | TokenKind::CloseSquare
-                        | TokenKind::CloseCurly => {
+                        TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                            depth += 1
+                        }
+                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
                             if depth == 0 {
                                 return false;
                             }
@@ -12077,12 +12012,12 @@ impl<'a> Engine<'a> {
                         return false;
                     };
                     match token.kind {
-                        TokenKind::OpenParen
-                        | TokenKind::OpenSquare
-                        | TokenKind::OpenCurly => depth += 1,
-                        TokenKind::CloseParen
-                        | TokenKind::CloseSquare
-                        | TokenKind::CloseCurly => depth = depth.saturating_sub(1),
+                        TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                            depth += 1
+                        }
+                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                            depth = depth.saturating_sub(1)
+                        }
                         TokenKind::Semicolon if depth == 0 => break probe + 1,
                         _ => {}
                     }
@@ -12210,9 +12145,9 @@ impl<'a> Engine<'a> {
                 let mut cursor = prev;
                 while let Some(at) = cursor.checked_sub(1) {
                     match tokens[at].kind {
-                        TokenKind::CloseParen
-                        | TokenKind::CloseSquare
-                        | TokenKind::CloseCurly => depth += 1,
+                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                            depth += 1
+                        }
                         TokenKind::OpenParen | TokenKind::OpenSquare => {
                             if depth == 0 {
                                 break;
@@ -12393,11 +12328,7 @@ impl<'a> Engine<'a> {
                                 length: row.range.end() - read.recv_span.offset,
                             })
                             .unwrap_or(row.range);
-                        self.emit_unchecked_nullable(
-                            range,
-                            "",
-                            UncheckedNullableKind::Function,
-                        );
+                        self.emit_unchecked_nullable(range, "", UncheckedNullableKind::Function);
                     }
                 }
             }
@@ -13198,8 +13129,7 @@ impl<'a> Engine<'a> {
                 // `extension E on C { static void a() {} }` leaves `c.a()`
                 // the class's own `undefined_method` face).
                 if !(face.members.get(&member).is_some_and(|e| !e.is_static)
-                    || (accept_setter
-                        && face.members.get(&setter).is_some_and(|e| !e.is_static)))
+                    || (accept_setter && face.members.get(&setter).is_some_and(|e| !e.is_static)))
                 {
                     continue;
                 }
@@ -13617,11 +13547,19 @@ impl<'a> Engine<'a> {
             // source, pkg/analyzer resolver/extension_member_resolver.dart
             // `_getApplicable`).
             let self_param_nullable_safe = receiver_nullable
-                && matches!(on_ty, Ty::Named { args: ArgListId::EMPTY, .. })
+                && matches!(
+                    on_ty,
+                    Ty::Named {
+                        args: ArgListId::EMPTY,
+                        ..
+                    }
+                )
                 && face
                     .on_type
                     .and_then(|head| {
-                        face.type_param_names.iter().position(|&param| param == head)
+                        face.type_param_names
+                            .iter()
+                            .position(|&param| param == head)
                     })
                     .is_some_and(|index| match face.type_param_bounds.get(index).copied() {
                         None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
@@ -13814,8 +13752,7 @@ impl<'a> Engine<'a> {
                 match face.type_param_bounds.get(index).copied() {
                     None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
                     Some(bound) => {
-                        let bound =
-                            Self::non_null_form(self.boundary.ty(face_file, bound));
+                        let bound = Self::non_null_form(self.boundary.ty(face_file, bound));
                         self.resolved_subtype(Self::non_null_form(receiver), bound)
                     }
                 }
@@ -13873,7 +13810,9 @@ impl<'a> Engine<'a> {
             Ty::Function {
                 shape: recv_shape, ..
             },
-            Ty::Function { shape: on_shape, .. },
+            Ty::Function {
+                shape: on_shape, ..
+            },
         ) = (receiver, on_ty)
         else {
             return false;
@@ -13940,9 +13879,11 @@ impl<'a> Engine<'a> {
         // Every parameter must bind somewhere — an unconstrained slot is
         // one the inferrer solves to its bound, a face the name level
         // cannot spell inside the substituted `on`.
-        if face.type_param_names.iter().any(|param| {
-            !lowers.contains_key(param) && !uppers.contains_key(param)
-        }) {
+        if face
+            .type_param_names
+            .iter()
+            .any(|param| !lowers.contains_key(param) && !uppers.contains_key(param))
+        {
             return false;
         }
         // Solve each parameter's interval: a candidate binding must lie
@@ -13985,7 +13926,9 @@ impl<'a> Engine<'a> {
             let Some(param) = face.type_param_names.get(index) else {
                 continue;
             };
-            let Some(binding) = bindings.get(param) else { continue };
+            let Some(binding) = bindings.get(param) else {
+                continue;
+            };
             let bound = Self::non_null_form(self.boundary.ty(face_file, *bound));
             if !self.resolved_subtype(Self::non_null_form(*binding), bound) {
                 return false;
@@ -14228,8 +14171,7 @@ impl<'a> Engine<'a> {
                 let applies = match face.type_param_bounds.get(index).copied() {
                     None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
                     Some(bound) => {
-                        let bound =
-                            Self::non_null_form(self.boundary.ty(face_file, bound));
+                        let bound = Self::non_null_form(self.boundary.ty(face_file, bound));
                         self.resolved_subtype(Self::non_null_form(receiver), bound)
                     }
                 };
@@ -14470,7 +14412,11 @@ impl<'a> Engine<'a> {
     /// The face's `on_ty` (not the bare-head `on_type` spelling) renders
     /// the `on` clause — the oracle displays the declared type verbatim,
     /// arguments and `?` included, its own type-parameter leaves spelled.
-    pub(crate) fn extension_display(&self, face: &ExtensionFace, face_file: FileId) -> (String, String) {
+    pub(crate) fn extension_display(
+        &self,
+        face: &ExtensionFace,
+        face_file: FileId,
+    ) -> (String, String) {
         let on_ty = self.boundary.ty(face_file, face.on_ty);
         let bounds: Vec<Ty> = face
             .type_param_bounds
@@ -14705,10 +14651,7 @@ impl<'a> Engine<'a> {
     /// as a type qualifies — a call receiver (`f().{ ... }`) keeps the
     /// undecidable posture (its face is the callee's return, a leg the
     /// drained pass-1 rows own).
-    fn anon_receiver_creation_ty(
-        &self,
-        entry: &crate::model::AnonMethodInvocation,
-    ) -> Option<Ty> {
+    fn anon_receiver_creation_ty(&self, entry: &crate::model::AnonMethodInvocation) -> Option<Ty> {
         let token = self.anon_receiver_tail_token(entry)?;
         if !matches!(
             token.kind,
@@ -14717,8 +14660,7 @@ impl<'a> Engine<'a> {
             return None;
         }
         let bytes = self.source.as_bytes();
-        let is_ident_byte =
-            |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
         let mut at = token.byte_offset as usize;
         // The matching opener, walking back over nested groups.
         let mut depth = 0usize;
@@ -14927,9 +14869,7 @@ impl<'a> Engine<'a> {
         let Some(row) = self.rows.last_mut() else {
             return false;
         };
-        if row.range != range
-            || !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
-        {
+        if row.range != range || !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. })) {
             return false;
         }
         row.shape = RowShape::Bare(BareInfo::Missing {
@@ -16511,22 +16451,26 @@ mod tests {
     /// index read resolves on it, no `undefined_operator`.
     #[test]
     fn is_map_narrowed_dynamic_index_silent() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is Map) {\n\
              \x20   d[0];\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
     /// `d is List` — the same face on the list twin.
     #[test]
     fn is_list_narrowed_dynamic_index_silent() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is List) {\n\
              \x20   d[0];\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16534,22 +16478,26 @@ mod tests {
     /// read so `+` resolves on `int` (oracle-silent).
     #[test]
     fn is_int_narrowed_dynamic_plus_silent() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is int) {\n\
              \x20   d + 1;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
     /// `d is String` — the scalar twin through `String`'s own `+`.
     #[test]
     fn is_string_narrowed_dynamic_concat_silent() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is String) {\n\
              \x20   d + 'a';\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16557,11 +16505,13 @@ mod tests {
     /// read against the instantiated interface.
     #[test]
     fn is_generic_map_narrowed_index_silent() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is Map<String, int>) {\n\
              \x20   d['k'];\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16569,14 +16519,16 @@ mod tests {
     /// interface's write spelling resolves.
     #[test]
     fn is_narrowed_dynamic_index_write_silent() {
-        let report = report_ops("class Box {\n\
+        let report = report_ops(
+            "class Box {\n\
              \x20 operator []=(int i, int v) {}\n\
              }\n\
              void f(dynamic d) {\n\
              \x20 if (d is Box) {\n\
              \x20   d[0] = 1;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16585,12 +16537,14 @@ mod tests {
     /// actual is Map`).
     #[test]
     fn and_joined_is_narrow_both_index_silent() {
-        let report = report_ops("void f(dynamic expected, dynamic actual) {\n\
+        let report = report_ops(
+            "void f(dynamic expected, dynamic actual) {\n\
              \x20 if (expected is Map && actual is Map) {\n\
              \x20   expected['a'];\n\
              \x20   actual['b'];\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16598,10 +16552,12 @@ mod tests {
     /// the remainder, the index read resolves (co19 `checkFailures` shape).
     #[test]
     fn is_not_guard_tail_index_silent() {
-        let report = report_ops("void f(dynamic failures) {\n\
+        let report = report_ops(
+            "void f(dynamic failures) {\n\
              \x20 if (failures is! List) return;\n\
              \x20 failures[0];\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16611,14 +16567,16 @@ mod tests {
     /// ~2895 aux rows — silent on both engines.
     #[test]
     fn deep_equals_shape_index_silent() {
-        let report = report_ops("void plan2check(a, b) {}\n\
+        let report = report_ops(
+            "void plan2check(a, b) {}\n\
              void deepEquals(expected, actual) {\n\
              \x20 if (expected is Map) {\n\
              \x20   plan2check(expected['k'], actual['k']);\n\
              \x20 } else if (expected is List) {\n\
              \x20   plan2check(expected[0], actual[0]);\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16627,11 +16585,13 @@ mod tests {
     /// not `''` and not `dynamic`.
     #[test]
     fn is_int_narrowed_index_still_reports_named_type() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is int) {\n\
              \x20   d[0];\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
             vec!["The operator '[]' isn't defined for the type 'int'.".to_string()]
@@ -16642,11 +16602,13 @@ mod tests {
     /// `d[0] = 1` reports `[]=` on `int`.
     #[test]
     fn is_int_narrowed_index_write_still_reports_named_type() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is int) {\n\
              \x20   d[0] = 1;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
             vec!["The operator '[]=' isn't defined for the type 'int'.".to_string()]
@@ -16663,16 +16625,17 @@ mod tests {
     /// not the bare head.
     #[test]
     fn is_map_narrowed_operator_miss_renders_instantiated() {
-        let report = report_ops("void f(dynamic d) {\n\
+        let report = report_ops(
+            "void f(dynamic d) {\n\
              \x20 if (d is Map) {\n\
              \x20   d + 1;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
             vec![
-                "The operator '+' isn't defined for the type 'Map<dynamic, dynamic>'."
-                    .to_string()
+                "The operator '+' isn't defined for the type 'Map<dynamic, dynamic>'.".to_string()
             ]
         );
     }
@@ -16680,12 +16643,14 @@ mod tests {
     /// `d is G<int>` — the written argument rides the promoted face.
     #[test]
     fn is_generic_narrowed_operator_miss_renders_written_args() {
-        let report = report_ops("class G<T> {}\n\
+        let report = report_ops(
+            "class G<T> {}\n\
              void f(dynamic d) {\n\
              \x20 if (d is G<int>) {\n\
              \x20   d + 1;\n\
              \x20 }\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
             vec!["The operator '+' isn't defined for the type 'G<int>'.".to_string()]
@@ -16701,32 +16666,30 @@ mod tests {
     /// Top-level function identifier as an operator operand.
     #[test]
     fn fn_identifier_binary_reports_function_type() {
-        let report = report_ops("int f(int x) => x;\n\
+        let report = report_ops(
+            "int f(int x) => x;\n\
              void g() {\n\
              \x20 f + 1;\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
-            vec![
-                "The operator '+' isn't defined for the type 'int Function(int)'."
-                    .to_string()
-            ]
+            vec!["The operator '+' isn't defined for the type 'int Function(int)'.".to_string()]
         );
     }
 
     /// The same face on a local function declaration.
     #[test]
     fn local_fn_identifier_binary_reports_function_type() {
-        let report = report_ops("void g() {\n\
+        let report = report_ops(
+            "void g() {\n\
              \x20 int f(int x) => x;\n\
              \x20 f + 1;\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
-            vec![
-                "The operator '+' isn't defined for the type 'int Function(int)'."
-                    .to_string()
-            ]
+            vec!["The operator '+' isn't defined for the type 'int Function(int)'.".to_string()]
         );
     }
 
@@ -16734,16 +16697,15 @@ mod tests {
     /// — the `[]` the co19 cascades apply).
     #[test]
     fn fn_identifier_index_reports_function_type() {
-        let report = report_ops("int f(int x) => x;\n\
+        let report = report_ops(
+            "int f(int x) => x;\n\
              void g() {\n\
              \x20 f[0];\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             undefined_operator_messages(&report),
-            vec![
-                "The operator '[]' isn't defined for the type 'int Function(int)'."
-                    .to_string()
-            ]
+            vec!["The operator '[]' isn't defined for the type 'int Function(int)'.".to_string()]
         );
     }
 
@@ -16756,18 +16718,22 @@ mod tests {
     /// `(c ? l1 : l2)[0]` — both arms `List`-faced: the index resolves.
     #[test]
     fn conditional_receiver_same_head_index_silent() {
-        let report = report_ops("void f(bool c, List<int> l1, List<int> l2) {\n\
+        let report = report_ops(
+            "void f(bool c, List<int> l1, List<int> l2) {\n\
              \x20 (c ? l1 : l2)[0];\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
     /// `(l1 ?? l2)[0]` — the if-null twin.
     #[test]
     fn if_null_receiver_index_silent() {
-        let report = report_ops("void f(List<int>? l1, List<int> l2) {\n\
+        let report = report_ops(
+            "void f(List<int>? l1, List<int> l2) {\n\
              \x20 (l1 ?? l2)[0];\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16776,11 +16742,13 @@ mod tests {
     /// arm type the oracle's LUB produced.
     #[test]
     fn conditional_receiver_member_on_joined_face() {
-        let report = report_ops("class A { int get v => 0; }\n\
+        let report = report_ops(
+            "class A { int get v => 0; }\n\
              class B extends A {}\n\
              void f(bool c, A a, B b) {\n\
              \x20 (c ? a : b).v;\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 
@@ -16789,11 +16757,13 @@ mod tests {
     /// arms; subtype-ordered arms name the wider side).
     #[test]
     fn if_null_receiver_member_miss_names_join() {
-        let report = report_ops("class A {}\n\
+        let report = report_ops(
+            "class A {}\n\
              class B extends A {}\n\
              void f(B? l, B r) {\n\
              \x20 (l ?? r).nope;\n\
-             }\n");
+             }\n",
+        );
         // `LUB(B?, B) = B`; the `nope` miss names `B`.
         assert_eq!(
             report
@@ -16817,10 +16787,12 @@ mod tests {
     /// `({int bar})` — the oracle's own row, not silence.
     #[test]
     fn record_named_field_write_reports_undefined_setter() {
-        let report = report_ops("void f() {\n\
+        let report = report_ops(
+            "void f() {\n\
              \x20 var r = (bar: 1);\n\
              \x20 r.bar = 3;\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             report
                 .diagnostics
@@ -16828,9 +16800,7 @@ mod tests {
                 .filter(|d| d.code.name == "undefined_setter")
                 .map(|d| d.message.to_string())
                 .collect::<Vec<_>>(),
-            vec![
-                "The setter 'bar' isn't defined for the type '({int bar})'.".to_string()
-            ]
+            vec!["The setter 'bar' isn't defined for the type '({int bar})'.".to_string()]
         );
     }
 
@@ -16838,10 +16808,12 @@ mod tests {
     /// alone (`r.bar += 1` — the read resolved, the write's face misses).
     #[test]
     fn record_named_field_compound_write_reports_undefined_setter() {
-        let report = report_ops("void f() {\n\
+        let report = report_ops(
+            "void f() {\n\
              \x20 var r = (bar: 1);\n\
              \x20 r.bar += 1;\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(
             report
                 .diagnostics
@@ -16849,9 +16821,7 @@ mod tests {
                 .filter(|d| d.code.name == "undefined_setter")
                 .map(|d| d.message.to_string())
                 .collect::<Vec<_>>(),
-            vec![
-                "The setter 'bar' isn't defined for the type '({int bar})'.".to_string()
-            ]
+            vec!["The setter 'bar' isn't defined for the type '({int bar})'.".to_string()]
         );
     }
 
@@ -16859,10 +16829,12 @@ mod tests {
     /// write face alone reports).
     #[test]
     fn record_named_field_read_stays_silent() {
-        let report = report_ops("int f() {\n\
+        let report = report_ops(
+            "int f() {\n\
              \x20 var r = (bar: 1);\n\
              \x20 return r.bar;\n\
-             }\n");
+             }\n",
+        );
         assert_eq!(code_names(&report), Vec::<&'static str>::new());
     }
 }

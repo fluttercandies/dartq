@@ -98,7 +98,8 @@ fn ctor_assert_entry_rows_whole_call() {
 fn ctor_throw_mid_list_next_entry_owns_row() {
     // Oracle 4:33|5 — `z = throw 0` itself is live; `w = 3` is the first
     // dead node and its entry the row.
-    let src = "class A {\n  bool y;\n  int z;\n  int w;\n  A() : assert(y), z = throw 0, w = 3 {}\n}\n";
+    let src =
+        "class A {\n  bool y;\n  int z;\n  int w;\n  A() : assert(y), z = throw 0, w = 3 {}\n}\n";
     assert_eq!(dead_of(src), vec!["w = 3".to_string()]);
 }
 

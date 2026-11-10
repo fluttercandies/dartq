@@ -43,7 +43,9 @@ fn empty_list_case_witnesses_the_open_rest() {
     );
     assert_eq!(
         rows,
-        ["The type 'List<int>' isn't exhaustively matched by the switch cases since it doesn't match the pattern '[...]'."]
+        [
+            "The type 'List<int>' isn't exhaustively matched by the switch cases since it doesn't match the pattern '[...]'."
+        ]
     );
 }
 
@@ -68,7 +70,9 @@ fn covered_sizes_leave_the_empty_witness() {
     );
     assert_eq!(
         rows,
-        ["The type 'List<int>' isn't exhaustively matched by the switch cases since it doesn't match the pattern '[]'."]
+        [
+            "The type 'List<int>' isn't exhaustively matched by the switch cases since it doesn't match the pattern '[]'."
+        ]
     );
 }
 

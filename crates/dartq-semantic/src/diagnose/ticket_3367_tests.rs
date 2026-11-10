@@ -35,7 +35,9 @@
 //! [`record_extension_face`]: crate::diagnose::row_resolution
 //! [`prefixed_hit`]: crate::diagnose::row_resolution
 
-use crate::diagnose::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports};
+use crate::diagnose::test_rig::{
+    RigImport, assert_silent, code_names, report_ops, report_ops_imports,
+};
 
 /// `extension E<T> on T` applies to every receiver (the unbounded
 /// parameter is the top): the send resolves and reports nothing.

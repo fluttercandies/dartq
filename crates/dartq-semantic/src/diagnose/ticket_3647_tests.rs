@@ -26,8 +26,8 @@
 //! `record_type_annotation_resolver.dart` / `record_literal_resolver.dart`,
 //! `diagnostic.g.dart` `invalid_field_name*` uniqueName rows.
 
-use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_wildcards, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, report_ops, report_ops_wildcards, rows};
 
 /// The absolute offset of `needle`'s `n`th occurrence (0-based) in
 /// `fixture` as the rig analyzes it: `report_ops` prefixes
@@ -68,7 +68,8 @@ const FROM_OBJECT: &str = "Record field names can't be the same as a member from
 // —— label span (`record_expressions_A03`'s co19 shape).
 #[test]
 fn literal_object_member_names_report() {
-    let source = "void f() { var r = (hashCode: 1, noSuchMethod: 2, runtimeType: 3, toString: 4); }\n";
+    let source =
+        "void f() { var r = (hashCode: 1, noSuchMethod: 2, runtimeType: 3, toString: 4); }\n";
     let r = report_ops(source);
     assert_eq!(
         ifn_rows(&r),
@@ -263,7 +264,8 @@ fn type_object_member_names_report() {
 // —— by name-token lexemes).
 #[test]
 fn nested_record_types_each_check() {
-    let source = "((int _a, {int hashCode}) x, {int toString}) r = ((1, hashCode: 2), toString: 3);\n";
+    let source =
+        "((int _a, {int hashCode}) x, {int toString}) r = ((1, hashCode: 2), toString: 3);\n";
     let r = report_ops(source);
     assert_eq!(
         ifn_rows(&r),

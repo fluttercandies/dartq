@@ -108,9 +108,7 @@ fn read_rows(source: &str) -> Vec<(u32, String)> {
     facts
         .into_iter()
         .filter_map(|fact| match fact {
-            FlowFact::ReadType { span, ty, .. } => {
-                Some((span.range.offset, face(ty, &flow)))
-            }
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, face(ty, &flow))),
             _ => None,
         })
         .collect()
@@ -221,10 +219,7 @@ fn parameterized_alias_rhs_nullability_rides_the_declared_face() {
     // the guard read is nullable and the in-branch read promotes.
     assert_eq!(
         read_rows(source),
-        [
-            (guard, "L?".to_string()),
-            (in_branch, "L".to_string()),
-        ]
+        [(guard, "L?".to_string()), (in_branch, "L".to_string()),]
     );
     assert_eq!(promoted_faces(source), ["L".to_string()]);
     // The non-nullable twin (`typedef L = List<int>;`) is the isSameType

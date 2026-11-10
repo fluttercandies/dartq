@@ -30,7 +30,7 @@
 use std::collections::BTreeSet;
 
 use crate::parser::Parser;
-use crate::tests::collector::{latest_features, Collector};
+use crate::tests::collector::{Collector, latest_features};
 use dartq_scanner::ScanConfig;
 
 /// Parses `source` and returns the scanner+parser rows as a set of

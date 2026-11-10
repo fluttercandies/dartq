@@ -114,7 +114,14 @@ fn ops_for_impl(source: &str, names: &[&str], captured: bool) -> ResolvedTypeOps
     let namespaces = Namespaces::build(&graph);
     let mut clauses = crate::resolved_ops::ClauseTrees::empty();
     if captured {
-        crate::capture_clause_trees(file, source, &scanned.tokens, features, strings, &mut clauses);
+        crate::capture_clause_trees(
+            file,
+            source,
+            &scanned.tokens,
+            features,
+            strings,
+            &mut clauses,
+        );
     }
     let types: &'static LibraryTypes = Box::leak(Box::new(LibraryTypes::build_with_clauses(
         &graph,
@@ -194,11 +201,20 @@ fn resolved_verdict_lattice_matches_upstream_subtype() {
 
     // Primitive lattice: the `String -> int` / `int -> String` rejects and
     // the `int -> num` accept the corpus expects in argument position.
-    assert!(!ops.is_subtype(string_ty, int_ty), "`String` is not an `int`");
-    assert!(!ops.is_subtype(int_ty, string_ty), "`int` is not a `String`");
+    assert!(
+        !ops.is_subtype(string_ty, int_ty),
+        "`String` is not an `int`"
+    );
+    assert!(
+        !ops.is_subtype(int_ty, string_ty),
+        "`int` is not a `String`"
+    );
     assert!(ops.is_subtype(int_ty, num_ty), "`int <: num`");
     assert!(!ops.is_subtype(num_ty, int_ty), "`num` is not an `int`");
-    assert!(!ops.is_subtype(string_ty, num_ty), "`String` is not a `num`");
+    assert!(
+        !ops.is_subtype(string_ty, num_ty),
+        "`String` is not a `num`"
+    );
 
     // Nullability: `int -> int?` accepts, `int? -> int` rejects, and `Null`
     // rides only the nullable faces.
@@ -219,13 +235,19 @@ fn resolved_verdict_lattice_matches_upstream_subtype() {
     // subtypes everything, `dynamic` only the tops.
     assert!(ops.is_subtype(never_ty, int_ty), "`Never <: int`");
     assert!(ops.is_subtype(int_ty, dynamic_ty), "`int <: dynamic`");
-    assert!(!ops.is_subtype(dynamic_ty, int_ty), "`dynamic` is not `int`");
+    assert!(
+        !ops.is_subtype(dynamic_ty, int_ty),
+        "`dynamic` is not `int`"
+    );
     assert!(ops.is_subtype(dynamic_ty, object_question));
 
     // Declaration hierarchy (the `A -> B` / `A? -> A` pairs): the resolved
     // face answers the real edge, which the name level cannot.
     assert!(ops.is_subtype(derived_ty, base_ty), "`Derived <: Base`");
-    assert!(!ops.is_subtype(base_ty, derived_ty), "`Base` is not `Derived`");
+    assert!(
+        !ops.is_subtype(base_ty, derived_ty),
+        "`Base` is not `Derived`"
+    );
     assert!(
         !ops.is_subtype(
             FlowTy {
@@ -241,7 +263,10 @@ fn resolved_verdict_lattice_matches_upstream_subtype() {
     // edge decides (`List<dynamic> <: Iterable<dynamic>`) and its reverse
     // never does.
     assert!(ops.is_subtype(list_ty, iterable_ty), "`List <: Iterable`");
-    assert!(!ops.is_subtype(iterable_ty, list_ty), "`Iterable` is not `List`");
+    assert!(
+        !ops.is_subtype(iterable_ty, list_ty),
+        "`Iterable` is not `List`"
+    );
 
     // `tryPromoteToType`'s strict gate (type_system.dart:1729-1760): a
     // covered subtype is a step, a mutual subtype is not.

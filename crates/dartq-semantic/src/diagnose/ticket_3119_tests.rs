@@ -108,7 +108,8 @@ fn yield_each_nullable_operand_reports() {
         .collect();
     assert_eq!(rows.len(), 1, "{:?}", codes(&report));
     assert_eq!(
-        rows[0].message, "A nullable expression can't be used in a yield-each statement."
+        rows[0].message,
+        "A nullable expression can't be used in a yield-each statement."
     );
 }
 
@@ -248,7 +249,8 @@ fn bang_null_aware_member_reports_condition() {
         .collect();
     assert_eq!(rows.len(), 1, "{:?}", codes(&report));
     assert_eq!(
-        rows[0].message, "A nullable expression can't be used as a condition."
+        rows[0].message,
+        "A nullable expression can't be used as a condition."
     );
 }
 
@@ -274,6 +276,7 @@ fn bang_null_aware_on_non_nullable_still_nullable() {
         .collect();
     assert_eq!(rows.len(), 1, "{:?}", codes(&report));
     assert_eq!(
-        rows[0].message, "A nullable expression can't be used as a condition."
+        rows[0].message,
+        "A nullable expression can't be used as a condition."
     );
 }

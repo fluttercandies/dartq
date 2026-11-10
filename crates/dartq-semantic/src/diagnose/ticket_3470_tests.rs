@@ -21,12 +21,7 @@ fn void_spans(fixture: &str) -> Vec<(usize, usize)> {
         .diagnostics
         .iter()
         .filter(|d| d.code.name == "use_of_void_result")
-        .map(|d| {
-            (
-                d.range.offset as usize - shift,
-                d.range.length as usize,
-            )
-        })
+        .map(|d| (d.range.offset as usize - shift, d.range.length as usize))
         .collect();
     spans.sort_unstable();
     spans
@@ -120,7 +115,12 @@ fn ticket_3470_await_operand_anchors_whole_invocation() {
 fn ticket_3470_property_access_operand_anchors_chain() {
     let fixture = "class E { void get id => throw 0; }\nvoid test(E x) {\n  -x.id;\n}";
     let spans = void_spans(fixture);
-    assert_eq!(spans, vec![span_of(fixture, "x.id")], "{:?}", rows(&report_ops(fixture)));
+    assert_eq!(
+        spans,
+        vec![span_of(fixture, "x.id")],
+        "{:?}",
+        rows(&report_ops(fixture))
+    );
 }
 
 /// A `!`-prefix operand on a `void Function()` formal anchors the send —

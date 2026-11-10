@@ -83,11 +83,7 @@ fn record_keyword_name_stays_tolerant_consume() {
     let rows = rows_with("void f() { var r = (this: 1); }\n");
     assert_eq!(
         rows,
-        vec![(
-            "expected_identifier_but_got_keyword".to_owned(),
-            20,
-            24
-        )]
+        vec![("expected_identifier_but_got_keyword".to_owned(), 20, 24)]
     );
 }
 
@@ -161,11 +157,7 @@ fn pattern_postfix_increment_non_assignable_reports_illegal() {
     let rows = rows_with("void f(x) { switch (x) { case 1++: break; } }\n");
     assert_eq!(
         rows,
-        vec![(
-            "illegal_assignment_to_non_assignable".to_owned(),
-            31,
-            33
-        )]
+        vec![("illegal_assignment_to_non_assignable".to_owned(), 31, 33)]
     );
 }
 
@@ -185,7 +177,10 @@ fn pattern_prefix_increment_in_parens_reports_selector() {
 #[test]
 fn pattern_prefix_increment_assignable_is_silent() {
     let rows = rows_with("void f(x) { switch (x) { case ++x: break; } }\n");
-    assert!(rows.is_empty(), "assignable operand is silent, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "assignable operand is silent, got {rows:?}"
+    );
 }
 
 /// `[if (x) o++]` (oracle: silent) — the postfix arm keeps the assignable
@@ -193,5 +188,8 @@ fn pattern_prefix_increment_assignable_is_silent() {
 #[test]
 fn collection_element_postfix_assignable_is_silent() {
     let rows = rows_with("void f() { var l = [if (x) o++]; }\n");
-    assert!(rows.is_empty(), "assignable operand is silent, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "assignable operand is silent, got {rows:?}"
+    );
 }

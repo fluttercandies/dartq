@@ -1968,12 +1968,7 @@ fn skip_interpolation_chain(tokens: &TokenTable, mut j: usize) -> usize {
 /// The whole-literal UTF-16 span from token `start` through token `end - 1`
 /// — the URI node's beginToken..endToken, the anchor every shapeless
 /// (interpolated) face reports at (library_analyzer.dart:732/:993/:1031).
-fn whole_literal_span(
-    text: &str,
-    tokens: &TokenTable,
-    start: usize,
-    end: usize,
-) -> SourceRange {
+fn whole_literal_span(text: &str, tokens: &TokenTable, start: usize, end: usize) -> SourceRange {
     let head = tokens.get(start).expect("start token exists");
     let last = end - 1;
     let tail = tokens.get(last).expect("the chain advanced past a token");
@@ -1996,7 +1991,10 @@ fn is_name_token(kind: TokenKind) -> bool {
     match kind {
         TokenKind::Identifier => true,
         TokenKind::Keyword(keyword) => {
-            matches!(keyword.style(), KeywordStyle::BuiltIn | KeywordStyle::Pseudo)
+            matches!(
+                keyword.style(),
+                KeywordStyle::BuiltIn | KeywordStyle::Pseudo
+            )
         }
         _ => false,
     }
@@ -2356,7 +2354,9 @@ fn walk_import_export(
                         .get(i)
                         .map_or(tokens.last().utf16_offset, |token| token.utf16_offset)
                 } else {
-                    name_spans.last().map_or(0, |span| span.offset + span.length)
+                    name_spans
+                        .last()
+                        .map_or(0, |span| span.offset + span.length)
                 };
                 last_combinator_end = last_combinator_end.max(clause_end);
                 let clause = if hide {
@@ -4327,10 +4327,7 @@ pub(crate) mod tests {
             // maps the name, then probes the file (`internalMapDartUri` +
             // `importedFile.exists`) — an unwritten entry reports
             // `uri_does_not_exist` just like the oracle's SDK miss.
-            write(
-                "sdk/lib/core/core.dart",
-                "library dart.core;\n",
-            );
+            write("sdk/lib/core/core.dart", "library dart.core;\n");
             write(
                 "sdk/lib/_internal/allowed_experiments.json",
                 experiments_json,

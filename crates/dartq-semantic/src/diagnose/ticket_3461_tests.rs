@@ -242,8 +242,7 @@ fn conditional_check_reports() {
 /// verdict reads the promoted face (`int <: num` still constant-true).
 #[test]
 fn promoted_receiver_reports() {
-    let report =
-        report_ops("void f(num x) { if (x is int) { x is num; } }\n");
+    let report = report_ops("void f(num x) { if (x is int) { x is num; } }\n");
     assert_eq!(
         names(&report),
         vec!["unnecessary_type_check"],

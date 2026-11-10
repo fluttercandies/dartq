@@ -181,12 +181,7 @@ fn distinct_int_keys_stay_silent() {
                    \x20 if (x case {0: 1, 2: 3}) {}\n\
                    \x20 }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// `1` and `1.0` are not identical and not `==`-equal under the const
@@ -199,12 +194,7 @@ fn int_and_double_keys_are_not_equal() {
                    \x20 if (x case {1: 0, 1.0: 0}) {}\n\
                    \x20 }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// `{(): 1, (): 2}` — the `test_recordType_primitiveEqual_empty` shape
@@ -265,12 +255,7 @@ fn different_record_shapes_stay_silent() {
                    \x20 if (x case {(0, 1): 2, (0,): 3}) {}\n\
                    \x20 }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// Named record keys with different values never collide
@@ -281,12 +266,7 @@ fn different_named_record_values_stay_silent() {
                    \x20 if (x case {(a: 0): 1, (a: 2): 3}) {}\n\
                    \x20 }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 // —— non_constant_map_pattern_key ————————————————————————————————————
@@ -343,12 +323,7 @@ fn explicit_const_creation_key_stays_silent() {
                    \x20 if (x case {const A(): 0}) {}\n\
                    \x20 }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// `{a(): 0}` over a function-typed formal — the `test_rewrite_key` shape:
@@ -383,7 +358,10 @@ fn mutable_local_relational_operand_reports() {
     let (report, source) = run(fixture);
     assert_eq!(
         rows(&report, &source),
-        [("non_constant_relational_pattern_expression", "i".to_string())],
+        [(
+            "non_constant_relational_pattern_expression",
+            "i".to_string()
+        )],
         "{:#?}",
         report.diagnostics
     );
@@ -408,7 +386,10 @@ fn compound_operand_anchors_at_the_non_constant_leaf() {
     let (report, source) = run(fixture);
     assert_eq!(
         rows(&report, &source),
-        [("non_constant_relational_pattern_expression", "i".to_string())],
+        [(
+            "non_constant_relational_pattern_expression",
+            "i".to_string()
+        )],
         "{:#?}",
         report.diagnostics
     );
@@ -448,12 +429,7 @@ fn literal_relational_operand_stays_silent() {
                    \x20 }\n\
                    }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// `case > a` over a `const` variable stays silent (`test_const_*`).
@@ -467,12 +443,7 @@ fn const_variable_relational_operand_stays_silent() {
                    \x20 }\n\
                    }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 // Residual (not pinned): `case > fn()` / `case > f()` — a CALL operand. The
@@ -501,12 +472,7 @@ fn const_static_field_pattern_stays_silent() {
                    \x20 if (x case A.a) {}\n\
                    }\n";
     let (report, source) = run(fixture);
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// `case i` over a local — the `test_localVariable_notConst` shape
@@ -573,10 +539,7 @@ fn deferred_prefix_constant_pattern_reports() {
     );
     assert_eq!(
         rows(&report, &source),
-        [(
-            "pattern_constant_from_deferred_library",
-            "c".to_string()
-        )],
+        [("pattern_constant_from_deferred_library", "c".to_string())],
         "{:#?}",
         report.diagnostics
     );
@@ -605,12 +568,7 @@ fn plain_prefix_constant_pattern_stays_silent() {
             source: "const int c = 0;\n",
         }],
     );
-    assert_eq!(
-        rows(&report, &source),
-        [],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(rows(&report, &source), [], "{:#?}", report.diagnostics);
 }
 
 /// A deferred type literal in a constant pattern
@@ -635,10 +593,7 @@ fn deferred_prefix_type_literal_reports() {
     );
     assert_eq!(
         rows(&report, &source),
-        [(
-            "pattern_constant_from_deferred_library",
-            "A".to_string()
-        )],
+        [("pattern_constant_from_deferred_library", "A".to_string())],
         "{:#?}",
         report.diagnostics
     );

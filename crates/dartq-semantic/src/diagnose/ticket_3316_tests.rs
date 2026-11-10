@@ -102,7 +102,11 @@ fn ticket_3316_index_argument_invocation_anchors_on_the_callee() {
     // (`.at(methodName)`), the same anchor the binary operand face uses.
     let fixture = "void v() {}\nvoid f(List list) {\n  list[v()];\n}";
     let spans = void_spans(&report_ops(fixture));
-    assert_eq!(spans, vec![callee_span(fixture, "v()")], "callee-name anchor");
+    assert_eq!(
+        spans,
+        vec![callee_span(fixture, "v()")],
+        "callee-name anchor"
+    );
 }
 
 #[test]

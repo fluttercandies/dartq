@@ -152,7 +152,9 @@ fn call_still_resolves_the_function_signature() {
          }\n",
     );
     assert!(
-        !rows(&report).iter().any(|row| row.starts_with("undefined_method")),
+        !rows(&report)
+            .iter()
+            .any(|row| row.starts_with("undefined_method")),
         "call resolves the signature: {:#?}",
         rows(&report)
     );

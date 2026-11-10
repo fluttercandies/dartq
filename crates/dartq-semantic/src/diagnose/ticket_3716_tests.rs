@@ -32,8 +32,8 @@
 //! `_resolveBinary` argument check run on the operand's resolved
 //! `staticType`, which for an extension-type `ET(1)` is `ET`.
 
-use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The absolute offset of the first `needle` in `fixture` as the rig
 /// analyzes it: `report_ops` prefixes [`CORE_PRELUDE`], so every
@@ -81,8 +81,7 @@ fn extension_type_creation_arms_operator_signature() {
         vec![(
             at(source, "\"s\""),
             3,
-            "The argument type 'String' can't be assigned to the parameter type 'ET'. "
-                .to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'ET'. ".to_string(),
         )],
         "the `ET` operand resolves the `+` signature: {:?}",
         rows(&r)
@@ -136,8 +135,7 @@ fn class_creation_operator_signature_unchanged() {
         vec![(
             at(source, "\"s\""),
             3,
-            "The argument type 'String' can't be assigned to the parameter type 'C'. "
-                .to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'C'. ".to_string(),
         )],
         "the class `+` formal still gates: {:?}",
         rows(&r)

@@ -31,8 +31,8 @@
 //! Registered here via `#[path]`; the module stays inside the `diagnose`
 //! subtree so `crate::diagnose::test_rig` resolves.
 
-use super::test_rig::{report_ops, rows};
 use super::FileReport;
+use super::test_rig::{report_ops, rows};
 
 /// The `unused_element`/`unused_field` rows of `report`, rendered for the
 /// failure message (the family's lens — every fixture must be silent).

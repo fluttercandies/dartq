@@ -262,7 +262,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// pass skips it. A pre-#1485 silent relocation here relied on the
     /// scanner's own row, which no longer exists.
 
-
     /// Official `parseOptionalPositionalParameters`: `[`-bracketed group.
     fn parse_optional_positional_parameters(&mut self, kind: MemberKind) -> TokenSpan {
         let begin = self.peek_span(); // `[`
@@ -962,10 +961,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                             // 2227 `<...>(` and :2240-2256 `(`): the modifier
                             // reports `experiment_not_enabled` instead of the
                             // `function_typed_parameter_var` wording.
-                            self.report(
-                                msg::experiment_not_enabled("primary-constructors"),
-                                t,
-                            );
+                            self.report(msg::experiment_not_enabled("primary-constructors"), t);
                         }
                     }
                     inline_name = Some(name);
@@ -1069,9 +1065,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // at `var`; `class C(var a) {}` — no type after `var` —
                 // stays silent). The `final` arm (:2299-2307) has no type
                 // gate.
-                if is_var
-                    && !matches!(type_info, TypeInfo::NoType)
-                {
+                if is_var && !matches!(type_info, TypeInfo::NoType) {
                     if member_kind != MemberKind::PrimaryConstructor {
                         self.report(msg::var_and_type(), t);
                     } else if !self.features.primary_constructors_enabled {
@@ -1400,7 +1394,10 @@ mod tests {
         // `class C { void m(int x int y) {} }`: the member formal list takes
         // the same arm — one row, the method closes and the body parses
         // (oracle 23|0).
-        assert_faces("class C { void m(int x int y) {} }", &[("expected_token", 23, 26)]);
+        assert_faces(
+            "class C { void m(int x int y) {} }",
+            &[("expected_token", 23, 26)],
+        );
     }
 
     #[test]
@@ -1408,7 +1405,10 @@ mod tests {
         // `void f(int x int y) {} void g() {}`: the continue must not swallow
         // the rest of the unit — `g` parses silently behind the repaired
         // list (oracle: the single comma row 13|0).
-        assert_faces("void f(int x int y) {} void g() {}", &[("expected_token", 13, 16)]);
+        assert_faces(
+            "void f(int x int y) {} void g() {}",
+            &[("expected_token", 13, 16)],
+        );
     }
 
     // —— the synthetic-closer priority (:1969-1972) ————————————————————

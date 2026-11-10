@@ -13,9 +13,9 @@
 //! multiplication.
 
 use super::test_rig::report_ops;
+use super::test_rig::report_ops_experiments_with;
 use super::{Diagnostic, FileReport};
 use dartq_language::Feature;
-use super::test_rig::report_ops_experiments_with;
 
 /// The rows of one clause code, in emission order.
 fn rows_of<'a>(report: &'a FileReport, code: &str) -> Vec<&'a Diagnostic> {
@@ -41,9 +41,8 @@ fn single_with_miss_reports_once() {
 /// (once per declaration) — four rows.
 #[test]
 fn two_same_name_with_misses_report_once_each() {
-    let report = report_ops(
-        "class C extends Object with Missing {} class C extends Object with Missing {}",
-    );
+    let report =
+        report_ops("class C extends Object with Missing {} class C extends Object with Missing {}");
     let rows = rows_of(&report, "mixin_of_non_class");
     // One row per declaration — two declarations, two distinct anchors.
     assert_eq!(rows.len(), 2, "{:?}", report.diagnostics);
@@ -76,9 +75,8 @@ fn repeated_name_reports_per_declaration_not_per_name() {
 /// report each header.
 #[test]
 fn two_distinct_classes_each_report() {
-    let report = report_ops(
-        "class A extends Object with Missing {} class B extends Object with Missing {}",
-    );
+    let report =
+        report_ops("class A extends Object with Missing {} class B extends Object with Missing {}");
     let rows = rows_of(&report, "mixin_of_non_class");
     assert_eq!(rows.len(), 2, "{:?}", report.diagnostics);
 }
@@ -102,8 +100,7 @@ fn repeated_implements_miss_reports_once_per_declaration() {
 /// declaration still reports its own `with`/`implements` entries once.
 #[test]
 fn repeated_enum_implements_reports_once_per_declaration() {
-    let report =
-        report_ops("enum E implements Missing { a } enum E implements Missing { a }");
+    let report = report_ops("enum E implements Missing { a } enum E implements Missing { a }");
     let rows = rows_of(&report, "implements_non_class");
     assert_eq!(rows.len(), 2, "{:?}", report.diagnostics);
 }
@@ -166,12 +163,7 @@ fn corpus_plain_shape_prefix_reports_eight_distinct_anchors() {
 #[test]
 fn corpus_no_class_body_counts_match_the_oracle() {
     let fixture = "class C; class C extends O; class C extends O implements I; class C extends O with M implements I; class C extends O with M; class C implements I; class C with M implements I; class C with M; class C<T>; class C<T> extends O<T>; class C<T> extends O<T> implements I<T>; class C<T> extends O<T> with M<T> implements I<T>; class C<T> extends O<T> with M<T>; class C<T> implements I<T>; class C<T> with M<T> implements I<T>; class C<T> with M<T>; class C(); class C() extends O; class C() extends O implements I; class C() extends O with M implements I; class C() extends O with M; class C() implements I; class C() with M implements I; class C() with M; class C<T>(); class C<T>() extends O<T>; class C<T>() extends O<T> implements I<T>; class C<T>() extends O<T> with M<T> implements I<T>; class C<T>() extends O<T> with M<T>; class C<T>() implements I<T>; class C<T>() with M<T> implements I<T>; class C<T>() with M<T>; class const C(); class const C() extends O; class const C() extends O implements I; class const C() extends O with M implements I; class const C() extends O with M; class const C() implements I; class const C() with M implements I; class const C() with M; class const C<T>(); class const C<T>() extends O<T>; class const C<T>() extends O<T> implements I<T>; class const C<T>() extends O<T> with M<T> implements I<T>; class const C<T>() extends O<T> with M<T>; class const C<T>() implements I<T>; class const C<T>() with M<T> implements I<T>; class const C<T>() with M<T>; class C.named(); class C.named() extends O; class C.named() extends O implements I; class C.named() extends O with M implements I; class C.named() extends O with M; class C.named() implements I; class C.named() with M implements I; class C.named() with M; class C<T>.named(); class C<T>.named() extends O<T>; class C<T>.named() extends O<T> implements I<T>; class C<T>.named() extends O<T> with M<T> implements I<T>; class C<T>.named() extends O<T> with M<T>; class C<T>.named() implements I<T>; class C<T>.named() with M<T> implements I<T>; class C<T>.named() with M<T>; class const C.named(); class const C.named() extends O; class const C.named() extends O implements I; class const C.named() extends O with M implements I; class const C.named() extends O with M; class const C.named() implements I; class const C.named() with M implements I; class const C.named() with M; class const C<T>.named(); class const C<T>.named() extends O<T>; class const C<T>.named() extends O<T> implements I<T>; class const C<T>.named() extends O<T> with M<T> implements I<T>; class const C<T>.named() extends O<T> with M<T>; class const C<T>.named() implements I<T>; class const C<T>.named() with M<T> implements I<T>; class const C<T>.named() with M<T>;";
-    let report = report_ops_experiments_with(
-        fixture,
-        &[],
-        None,
-        &[Feature::PrimaryConstructors],
-    );
+    let report = report_ops_experiments_with(fixture, &[], None, &[Feature::PrimaryConstructors]);
     for (code, count) in [
         ("mixin_of_non_class", 40),
         ("implements_non_class", 40),

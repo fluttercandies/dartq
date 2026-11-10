@@ -67,8 +67,7 @@ fn ticket_3240_logical_in_condition_single_report() {
 /// ordinary `bool` operands.
 #[test]
 fn ticket_3240_logical_bool_operands_stay_silent() {
-    let fixture =
-        "void main() {\n  bool flag = true;\n  bool other = false;\n  flag && other;\n}";
+    let fixture = "void main() {\n  bool flag = true;\n  bool other = false;\n  flag && other;\n}";
     let report = report_ops(fixture);
     assert!(
         !code_names(&report)

@@ -174,6 +174,7 @@ fn live_if_stays_silent() {
 /// the one where only over-eager synthesis could emit.)
 #[test]
 fn composed_condition_synthesizes_nothing() {
-    let fixture = "void f(bool a, int x) {\n  if (a || x == null) { print(0); } else { print(1); }\n}";
+    let fixture =
+        "void f(bool a, int x) {\n  if (a || x == null) { print(0); } else { print(1); }\n}";
     assert_eq!(dead_rows(&report_ops(fixture)), []);
 }

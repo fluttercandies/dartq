@@ -55,7 +55,8 @@ fn dead_of(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -108,7 +109,11 @@ void f(int x) {
 }";
     assert_eq!(
         dead_of(source),
-        vec!["default".to_string(), "case".to_string(), "break;".to_string()]
+        vec![
+            "default".to_string(),
+            "case".to_string(),
+            "break;".to_string()
+        ]
     );
 }
 
@@ -129,7 +134,11 @@ void f(int x) {
 }";
     assert_eq!(
         dead_of(source),
-        vec!["default".to_string(), "case".to_string(), "break;".to_string()]
+        vec![
+            "default".to_string(),
+            "case".to_string(),
+            "break;".to_string()
+        ]
     );
 }
 

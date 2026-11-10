@@ -575,9 +575,7 @@ impl TreeSink {
             // root so `end_function_type`'s arm reads it (the class's
             // own `<X extends T Function<...>(T)>` bound drops here
             // otherwise, #3748).
-            Some(_) if node.function.is_some() || node.record.is_some() => {
-                self.done.push(node)
-            }
+            Some(_) if node.function.is_some() || node.record.is_some() => self.done.push(node),
             Some(_) => {}
             None => self.done.push(node),
         }

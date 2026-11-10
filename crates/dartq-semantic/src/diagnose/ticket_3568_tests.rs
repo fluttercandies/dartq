@@ -90,7 +90,8 @@ fn eq_operand_member_miss_reports_at_selector() {
 // —— shorthand; the row lands at the `z` selector.
 #[test]
 fn argument_position_miss_reports_at_selector() {
-    let source = "enum E { a, b }\nvoid take(E e) {}\nvoid f() { bool b = true && (take(.z) == null); }\n";
+    let source =
+        "enum E { a, b }\nvoid take(E e) {}\nvoid f() { bool b = true && (take(.z) == null); }\n";
     let r = report_ops(source);
     assert_eq!(
         shorthand_rows(&r),
@@ -152,8 +153,7 @@ fn bare_statement_eq_operand_hit_stays_silent() {
 // —— `Color` and the row lands at the `z` selector.
 #[test]
 fn bare_statement_eq_operand_miss_reports() {
-    let source =
-        "enum Color { red, blue }\nvoid f() { Color m = Color.red; if (m == .z) {} }\n";
+    let source = "enum Color { red, blue }\nvoid f() { Color m = Color.red; if (m == .z) {} }\n";
     let r = report_ops(source);
     assert_eq!(
         shorthand_rows(&r),
@@ -211,5 +211,3 @@ fn over_report_guards_stay_silent_dot_new_reports() {
         rows(&r)
     );
 }
-
-

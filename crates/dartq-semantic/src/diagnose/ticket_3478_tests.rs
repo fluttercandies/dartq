@@ -27,8 +27,8 @@
 //! Registered here via `#[path]`; the module stays inside the `diagnose`
 //! subtree so `crate::diagnose::test_rig` resolves.
 
-use super::test_rig::{report_ops, rows};
 use super::FileReport;
+use super::test_rig::{report_ops, rows};
 
 /// The `unused_element`/`unused_field` rows of `report`, rendered for the
 /// failure message.
@@ -89,7 +89,8 @@ class A {
     let report = report_ops(fixture);
     let bad = unused(&report);
     assert!(
-        bad.iter().any(|r| r.contains("unused_field") && r.contains("'_f'")),
+        bad.iter()
+            .any(|r| r.contains("unused_field") && r.contains("'_f'")),
         "the parameter's read is not the field's: {bad:?}\n{}",
         rows(&report).join("\n")
     );
@@ -110,7 +111,8 @@ class A {
     let report = report_ops(fixture);
     let bad = unused(&report);
     assert!(
-        bad.iter().any(|r| r.contains("unused_field") && r.contains("'_f'")),
+        bad.iter()
+            .any(|r| r.contains("unused_field") && r.contains("'_f'")),
         "the formal's reads are not the field's: {bad:?}\n{}",
         rows(&report).join("\n")
     );

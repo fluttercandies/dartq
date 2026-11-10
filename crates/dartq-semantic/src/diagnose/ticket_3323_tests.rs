@@ -153,7 +153,11 @@ fn instance_field_face_reports_only_non_nullable() {
     let full = format!("{CORE_PRELUDE}{fixture}");
     let report = report_ops(fixture);
     assert_eq!(
-        spans_of(&report, &full, "not_initialized_non_nullable_instance_field"),
+        spans_of(
+            &report,
+            &full,
+            "not_initialized_non_nullable_instance_field"
+        ),
         vec!["c".to_string()],
     );
     assert!(

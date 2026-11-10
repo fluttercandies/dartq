@@ -84,7 +84,11 @@ fn ticket_3230_fn_tear_off_absent_getter_reports() {
     let fixture = "void f() {}\nvoid g() {\n  f.gone;\n}";
     let report = report_ops(fixture);
     let shown = rows(&report);
-    assert_eq!(code_names(&report), ["undefined_getter"], "rows: {shown:#?}");
+    assert_eq!(
+        code_names(&report),
+        ["undefined_getter"],
+        "rows: {shown:#?}"
+    );
     assert_eq!(
         report
             .diagnostics

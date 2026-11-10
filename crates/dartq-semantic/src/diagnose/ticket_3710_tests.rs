@@ -13,8 +13,8 @@
 //! and an opaque promotion the `ReadType` join cannot spell still proves
 //! non-null through the staged `PromotedRead` marker.
 
-use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The prelude shifts every offset; the fixtures below are ASCII.
 fn prelude_len() -> u32 {

@@ -83,7 +83,10 @@ fn written_out_chain_50k_folds_flat_on_default_stack() {
         !codes.iter().any(|c| c == "stack_overflow"),
         "the depth fuse must never trip: the chain folds in one frame's loop"
     );
-    assert!(bailed, "the per-link report flood latches the diagnostics cap");
+    assert!(
+        bailed,
+        "the per-link report flood latches the diagnostics cap"
+    );
     assert_eq!(
         c.errors.len(),
         MAX_DIAGNOSTICS,
@@ -121,7 +124,10 @@ fn written_out_chain_1000_links_folds_completely() {
     assert!(
         codes.iter().all(|c| c == "binary_operator_written_out"),
         "no other diagnostic: {:?}",
-        codes.iter().filter(|c| *c != "binary_operator_written_out").collect::<Vec<_>>()
+        codes
+            .iter()
+            .filter(|c| *c != "binary_operator_written_out")
+            .collect::<Vec<_>>()
     );
     assert_eq!(binary_begins(&c), 1_000);
     assert_eq!(binary_ends(&c), 1_000);
@@ -158,8 +164,7 @@ fn mixed_written_out_tiers_fold_without_nesting_per_link() {
     assert!(!bailed);
     let codes = c.error_codes();
     assert_eq!(
-        codes,
-        ["binary_operator_written_out"; 3],
+        codes, ["binary_operator_written_out"; 3],
         "one row per written-out operator: {codes:?}"
     );
     assert_eq!(binary_begins(&c), 3);

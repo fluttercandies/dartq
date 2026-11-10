@@ -285,10 +285,7 @@ fn resolved_prefixed_member_operand_stays_silent() {
         !names.contains(&"invalid_assignment"),
         "{names:?} — a resolved prefixed member is no InvalidType"
     );
-    assert!(
-        !names.contains(&"undefined_prefixed_name"),
-        "{names:?}"
-    );
+    assert!(!names.contains(&"undefined_prefixed_name"), "{names:?}");
 }
 
 // —— the code-split table (oracle 3.13.7): bare expression miss →
@@ -367,9 +364,7 @@ fn declared_class_member_miss_reports_undefined_method() {
 /// beside `undefined_identifier` because `C` is resolvable).
 #[test]
 fn mixin_opaque_on_bare_miss_stays_a_gap() {
-    let report = report(
-        "class C {}\nmixin M on C {\n  m() {\n    int i = 1 - x;\n  }\n}",
-    );
+    let report = report("class C {}\nmixin M on C {\n  m() {\n    int i = 1 - x;\n  }\n}");
     let names = codes(&report);
     assert!(names.contains(&"undefined_identifier"), "{names:?}");
     assert!(

@@ -10,7 +10,9 @@
 //! `~/.dartq-oracle/3.13.7/dart-sdk/bin/dart analyze` before the fix
 //! landed; the shapes were verified net-neutral against the lib suite.
 
-use super::test_rig::{CORE_PRELUDE, RigImport, report_ops, report_ops_imports, report_ops_wildcards};
+use super::test_rig::{
+    CORE_PRELUDE, RigImport, report_ops, report_ops_imports, report_ops_wildcards,
+};
 use super::*;
 
 /// The rows of `code` as the exact anchored source text, source order.

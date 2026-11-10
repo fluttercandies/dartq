@@ -125,17 +125,17 @@ fn nonconforming_generic_function_arguments_report() {
 /// whose `FnVarSig.params` for a function-type alias is built by
 /// `Resolution::alias_fn_sig` as `params: Box::default()` — the RHS's own
 /// `<U>` binders are dropped before `relateTypeParameters` can read them.
-    /// `bounds.rs::is_well_bounded`/`system.rs::function_subtype` (this fix's
-    /// path) is not the emitter for these rows, so the `TypeId`-engine
-    /// correct answer never surfaces here. The `Ty`-engine side landed its
-    /// half in #3693 (`alias_fn_sig` fills `sig.params` from the RHS
-    /// function's own `<T>` group — the alias-bound repro passes), but the
-    /// INLINE bound `void Function<U>()` still reaches the judged side with
-    /// its binder row dropped: `Snapshot::tree_of`'s Function arm
-    /// (bounds.rs) writes `type_params_named` entries as `(name, None)`
-    /// and the clause-site bound check never sees a decidable bound.
-    /// Un-ignorable once the inline bound's own binder facts survive
-    /// `tree_of` — bounds.rs, outside this lane's scope.
+/// `bounds.rs::is_well_bounded`/`system.rs::function_subtype` (this fix's
+/// path) is not the emitter for these rows, so the `TypeId`-engine
+/// correct answer never surfaces here. The `Ty`-engine side landed its
+/// half in #3693 (`alias_fn_sig` fills `sig.params` from the RHS
+/// function's own `<T>` group — the alias-bound repro passes), but the
+/// INLINE bound `void Function<U>()` still reaches the judged side with
+/// its binder row dropped: `Snapshot::tree_of`'s Function arm
+/// (bounds.rs) writes `type_params_named` entries as `(name, None)`
+/// and the clause-site bound check never sees a decidable bound.
+/// Un-ignorable once the inline bound's own binder facts survive
+/// `tree_of` — bounds.rs, outside this lane's scope.
 #[test]
 fn inline_generic_function_bound_is_honored() {
     let report = report_ops(

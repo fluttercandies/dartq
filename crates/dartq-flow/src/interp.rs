@@ -1162,9 +1162,7 @@ impl DeadWindow {
     /// already sits before the statement (an earlier dead statement owns
     /// the tail).
     pub(crate) fn snap_split_start(&mut self, offset: u32) {
-        if self.split.is_some()
-            && self.split_start.is_some_and(|start| start >= offset)
-        {
+        if self.split.is_some() && self.split_start.is_some_and(|start| start >= offset) {
             self.split_start = Some(offset);
         }
     }
@@ -2987,13 +2985,9 @@ impl<'o> Interp<'o> {
         if self.ctor_init_reported.is_some() {
             return;
         }
-        let anchored_inside = self
-            .dead
-            .as_ref()
-            .is_some_and(|window| {
-                window.anchor.range.offset >= begin.range.offset
-                    && window.anchor.range.offset < end
-            });
+        let anchored_inside = self.dead.as_ref().is_some_and(|window| {
+            window.anchor.range.offset >= begin.range.offset && window.anchor.range.offset < end
+        });
         if anchored_inside
             || (self.ctor_init_began_dead
                 && self.dead.is_none()
@@ -4443,9 +4437,9 @@ impl Interp<'_> {
         // re-anchors to the element only when its anchor sits inside it
         // (an inner element poll); an anchor before the loop belongs to
         // the enclosing one-row fold and keeps ownership.
-        if collection && body_began_dead
-            && let Some(element) =
-                events[bounds.body.clone()].iter().find_map(|ev| ev.span())
+        if collection
+            && body_began_dead
+            && let Some(element) = events[bounds.body.clone()].iter().find_map(|ev| ev.span())
         {
             if let Some(window) = &mut self.dead {
                 if window.anchor_from(element.range.offset) {

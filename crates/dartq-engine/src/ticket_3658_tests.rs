@@ -58,7 +58,9 @@ fn unused_import_rows(
 /// Whether any `unused_import` row exists — the gate-suppression and
 /// silent-release faces assert on this without a span.
 fn has_unused_import(diagnostics: &[Diagnostic]) -> bool {
-    diagnostics.iter().any(|row| row.code.name == "unused_import")
+    diagnostics
+        .iter()
+        .any(|row| row.code.name == "unused_import")
 }
 
 /// A throwaway single-package workspace + a synthetic SDK carrying
@@ -146,9 +148,7 @@ fn pin_engine() -> (PathBuf, Engine) {
 /// Analyzes a fresh workspace holding `files` (lib-relative paths) and
 /// returns the workspace root, the full diagnostic set, and the
 /// FileId → file-basename map the row assertions read.
-fn analyze_files(
-    files: &[(&str, &str)],
-) -> (PathBuf, Vec<Diagnostic>, FxHashMap<FileId, String>) {
+fn analyze_files(files: &[(&str, &str)]) -> (PathBuf, Vec<Diagnostic>, FxHashMap<FileId, String>) {
     let (root, mut engine) = pin_engine();
     let lib = root.join("lib");
     std::fs::create_dir_all(&lib).expect("lib dir");
@@ -397,10 +397,7 @@ fn duplicated_unused_import_reports_both_spans() {
 #[test]
 fn used_unprefixed_import_stays_silent() {
     let (_, diagnostics, _names) = analyze_files(&[
-        (
-            "test.dart",
-            "import 'lib1.dart';\nA? f;\n",
-        ),
+        ("test.dart", "import 'lib1.dart';\nA? f;\n"),
         ("lib1.dart", "class A {}\n"),
     ]);
     assert!(
@@ -415,10 +412,7 @@ fn used_unprefixed_import_stays_silent() {
 #[test]
 fn doc_reference_releases_the_import() {
     let (_, diagnostics, _names) = analyze_files(&[
-        (
-            "test.dart",
-            "import 'lib1.dart';\n/// [A]\nvoid f() {}\n",
-        ),
+        ("test.dart", "import 'lib1.dart';\n/// [A]\nvoid f() {}\n"),
         ("lib1.dart", "class A {}\n"),
     ]);
     assert!(

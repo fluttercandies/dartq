@@ -45,8 +45,7 @@ fn overrides(report: &crate::diagnose::FileReport) -> Vec<(&'static str, u32, u3
 /// own spelling, never a setter marker.
 #[test]
 fn eq_param_mismatch_reports_with_eq_eq_display() {
-    let fixture =
-        "class A{bool operator==(Object o)=>true;}\nclass B extends A{bool operator==(B o)=>true;}\n";
+    let fixture = "class A{bool operator==(Object o)=>true;}\nclass B extends A{bool operator==(B o)=>true;}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),
@@ -70,8 +69,7 @@ fn eq_param_mismatch_reports_with_eq_eq_display() {
 /// return face: `int` does not fit `bool`, so `invalid_override`.
 #[test]
 fn eq_return_mismatch_reports() {
-    let fixture =
-        "class A{bool operator==(Object o)=>true;}\nclass B extends A{int operator==(Object o)=>0;}\n";
+    let fixture = "class A{bool operator==(Object o)=>true;}\nclass B extends A{int operator==(Object o)=>0;}\n";
     let report = report_ops(fixture);
     // B's `==` token — the needle anchors at B's `int` return and `+12`
     // walks `int operator` to the `==` token.
@@ -103,21 +101,17 @@ fn eq_on_plain_class_still_overrides_object() {
 /// override (the `Object` parameter accepts the super's `Object`), silent.
 #[test]
 fn eq_honest_override_is_silent() {
-    let fixture =
-        "class A{bool operator==(Object o)=>true;}\nclass B extends A{bool operator==(Object o)=>true;}\n";
+    let fixture = "class A{bool operator==(Object o)=>true;}\nclass B extends A{bool operator==(Object o)=>true;}\n";
     let report = report_ops(fixture);
-    assert!(
-        overrides(&report).is_empty(),
-        "rows: {:?}",
-        rows(&report)
-    );
+    assert!(overrides(&report).is_empty(), "rows: {:?}", rows(&report));
 }
 
 /// Controls: `+`/`[]=` param mismatches report exactly like `==`'s — the
 /// same contravariant operator-parameter face.
 #[test]
 fn plus_and_index_set_param_controls() {
-    let fixture = "class A{num operator+(num o)=>0;}\nclass B extends A{int operator+(int o)=>0;}\n";
+    let fixture =
+        "class A{num operator+(num o)=>0;}\nclass B extends A{int operator+(int o)=>0;}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),
@@ -125,8 +119,7 @@ fn plus_and_index_set_param_controls() {
         "rows: {:?}",
         rows(&report)
     );
-    let fixture =
-        "class A{void operator[]=(int i,num v){}}\nclass B extends A{void operator[]=(int i,String v){}}\n";
+    let fixture = "class A{void operator[]=(int i,num v){}}\nclass B extends A{void operator[]=(int i,String v){}}\n";
     let report = report_ops(fixture);
     assert_eq!(
         overrides(&report),

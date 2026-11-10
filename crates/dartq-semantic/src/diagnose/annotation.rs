@@ -100,7 +100,11 @@ const TARGET_KINDS: &[(&str, &str, TKind)] = &[
     ("function", "top-level functions", TKind::Function),
     ("library", "libraries", TKind::Library),
     ("getter", "getters", TKind::Getter),
-    ("importDirective", "import directives", TKind::ImportDirective),
+    (
+        "importDirective",
+        "import directives",
+        TKind::ImportDirective,
+    ),
     ("method", "methods", TKind::Method),
     ("mixinType", "mixins", TKind::MixinType),
     (
@@ -120,7 +124,11 @@ const TARGET_KINDS: &[(&str, &str, TKind)] = &[
         TKind::PartOfDirective,
     ),
     ("setter", "setters", TKind::Setter),
-    ("topLevelVariable", "top-level variables", TKind::TopLevelVariable),
+    (
+        "topLevelVariable",
+        "top-level variables",
+        TKind::TopLevelVariable,
+    ),
     (
         "type",
         "types (classes, enums, mixins, or typedefs)",
@@ -209,7 +217,10 @@ fn instance_overridable(site: SiteKind) -> bool {
                 )
                 && matches!(
                     kind,
-                    MemberKind::Field | MemberKind::Getter | MemberKind::Setter | MemberKind::Method
+                    MemberKind::Field
+                        | MemberKind::Getter
+                        | MemberKind::Setter
+                        | MemberKind::Method
                 )
         }
         _ => false,
@@ -294,8 +305,8 @@ impl Engine<'_> {
             // header's constant list; an enum with no `;` ends its
             // constants at the closing brace) — a later `static int f` is
             // a real field (`FieldElement.isEnumConstant`).
-            let constant_end = (container.kind == ContainerKind::Enum)
-                .then(|| self.enum_constant_list_end(*name));
+            let constant_end =
+                (container.kind == ContainerKind::Enum).then(|| self.enum_constant_list_end(*name));
             for (_, entry) in container.members.iter() {
                 let is_enum_constant = entry.kind == MemberKind::Field
                     && entry.is_static
@@ -355,7 +366,7 @@ impl Engine<'_> {
                 DeclKind::TopLevelVar => SiteKind::TopLevelVariable,
                 DeclKind::TypeAlias => SiteKind::TypeAlias,
                 DeclKind::Container | DeclKind::Member { .. } | DeclKind::Constructor { .. } => {
-                    continue
+                    continue;
                 }
             };
             let Some(decl) = elements.decl(site.name) else {
@@ -446,18 +457,17 @@ impl Engine<'_> {
         // The prefix face: a first segment that names an import prefix of
         // the site's library (the scope resolution's own split).
         let head_id_0 = self.strings.intern(segments[0]);
-        let (prefix, rest): (Option<&str>, &[&str]) =
-            if segments.len() >= 2
-                && self
-                    .graph
-                    .import_edges(self.lib)
-                    .iter()
-                    .any(|edge| edge.prefix == Some(head_id_0))
-            {
-                (Some(segments[0]), &segments[1..])
-            } else {
-                (None, &segments[..])
-            };
+        let (prefix, rest): (Option<&str>, &[&str]) = if segments.len() >= 2
+            && self
+                .graph
+                .import_edges(self.lib)
+                .iter()
+                .any(|edge| edge.prefix == Some(head_id_0))
+        {
+            (Some(segments[0]), &segments[1..])
+        } else {
+            (None, &segments[..])
+        };
         // The dart:core `@override` face: hardcoded kinds, no `@Target`
         // read (annotation_target.dart:99-101 with `isOverride`'s
         // core-getter test). The spelled name must not be locally
@@ -625,9 +635,7 @@ impl Engine<'_> {
         };
         match prefix {
             Some(prefix) => resolves(Some(self.strings.intern(prefix))),
-            None => {
-                matches!(self.graph.local(lib, name_id), LocalLookup::Absent) && resolves(None)
-            }
+            None => matches!(self.graph.local(lib, name_id), LocalLookup::Absent) && resolves(None),
         }
     }
 
@@ -680,7 +688,7 @@ impl Engine<'_> {
         for token in &tokens[start..] {
             match token.kind {
                 TokenKind::Semicolon | TokenKind::CloseCurly => {
-                    return token.utf16_offset + token.byte_len
+                    return token.utf16_offset + token.byte_len;
                 }
                 _ => {}
             }
@@ -727,20 +735,18 @@ impl Engine<'_> {
                                     offset: tokens[cursor].utf16_offset,
                                     length: tokens[cursor].byte_len,
                                 };
-                                let span = name_span.map_or(span, |first: SourceRange| {
-                                    SourceRange {
+                                let span =
+                                    name_span.map_or(span, |first: SourceRange| SourceRange {
                                         offset: first.offset,
                                         length: span.offset + span.length - first.offset,
-                                    }
-                                });
+                                    });
                                 if !spelling.is_empty() {
                                     spelling.push('.');
                                 }
                                 spelling.push_str(lexeme);
                                 name_span = Some(span);
                                 cursor += 1;
-                                if cursor < tokens.len()
-                                    && tokens[cursor].kind == TokenKind::Period
+                                if cursor < tokens.len() && tokens[cursor].kind == TokenKind::Period
                                 {
                                     cursor += 1;
                                 } else {

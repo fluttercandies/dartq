@@ -47,7 +47,12 @@ fn gft_alias_self_pair_stays_silent() {
          \x20 C4<exp4>(1);\n\
          }\n",
     );
-    assert_eq!(bounds_rows(&report), Vec::<String>::new(), "{:#?}", rows(&report));
+    assert_eq!(
+        bounds_rows(&report),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// A container's own parameter bounded by a GFT alias rejects the same
@@ -62,7 +67,12 @@ fn gft_alias_bound_on_class_self_pair_stays_silent() {
          \x20 C1<exp1>(1);\n\
          }\n",
     );
-    assert_eq!(bounds_rows(&report), Vec::<String>::new(), "{:#?}", rows(&report));
+    assert_eq!(
+        bounds_rows(&report),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// The genuine violation keeps reporting: a concrete argument that does

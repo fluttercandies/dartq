@@ -96,8 +96,8 @@ fn pin_engine() -> (PathBuf, Engine) {
         )
         .expect("valid config"),
     );
-    let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
-        .expect("valid lock");
+    let lock =
+        LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n").expect("valid lock");
     let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
         .expect("valid pubspec");
     let graph = build_graph(
@@ -358,11 +358,8 @@ fn uri_form_mismatch_reports_part_of_different_library_with_uris() {
     const P: &str = "part of 'other.dart';\nint g() => 1;\n";
     const OTHER: &str = "int h() => 2;\n";
 
-    let (root, _engine, diagnostics) = analyze_files(&[
-        ("test.dart", TEST),
-        ("p.dart", P),
-        ("other.dart", OTHER),
-    ]);
+    let (root, _engine, diagnostics) =
+        analyze_files(&[("test.dart", TEST), ("p.dart", P), ("other.dart", OTHER)]);
     assert_eq!(
         rows(&diagnostics, "part_of_different_library"),
         vec![(

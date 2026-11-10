@@ -113,7 +113,9 @@ fn non_nullable_extension_receiver_still_fires() {
     );
     assert_eq!(
         rows,
-        ["'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."],
+        [
+            "'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."
+        ],
     );
 }
 

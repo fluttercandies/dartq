@@ -519,7 +519,10 @@ fn member_ctor_and_method_same_tail_stay_silent() {
          }\n",
     );
     let dups = dup_messages(&report);
-    assert!(dups.is_empty(), "ctor tail and method are separate namespaces: {dups:?}");
+    assert!(
+        dups.is_empty(),
+        "ctor tail and method are separate namespaces: {dups:?}"
+    );
 }
 
 // —— clean-file pin ——

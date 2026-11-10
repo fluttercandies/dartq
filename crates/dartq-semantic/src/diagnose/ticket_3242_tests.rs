@@ -54,8 +54,7 @@ fn at(fixture: &str, needle: &str, nth: usize) -> u32 {
 /// The never-match row an `E` scrutinee owes for a record pattern of two
 /// positional fields.
 fn two_slot_required() -> String {
-    "The matched value type 'E' can never match the required type '(Object?, Object?)'."
-        .to_string()
+    "The matched value type 'E' can never match the required type '(Object?, Object?)'.".to_string()
 }
 
 /// The Record kind runs the never-match verdict at its own node: a required
@@ -250,8 +249,7 @@ void f(E e) {
             (
                 at(fixture, "Box(value", 0),
                 3,
-                "The matched value type 'E' can never match the required type 'Box'."
-                    .to_string(),
+                "The matched value type 'E' can never match the required type 'Box'.".to_string(),
             ),
             // The field against its column (`Box.value` is `E`, never `F`).
             (

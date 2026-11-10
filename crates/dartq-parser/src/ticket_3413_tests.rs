@@ -149,7 +149,11 @@ fn only(events: &[Ev], want: impl Fn(&Ev) -> bool) -> usize {
         .filter(|(_, ev)| want(ev))
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(hits.len(), 1, "expected exactly one match, events: {events:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one match, events: {events:?}"
+    );
     hits[0]
 }
 
@@ -205,10 +209,7 @@ fn assert_anon_member_shape(
         .iter()
         .position(|ev| *ev == Ev::Ident(body.0, body.1))
         .expect("body identifier");
-    assert!(
-        receiver_at < begin,
-        "receiver before begin: {events:?}"
-    );
+    assert!(receiver_at < begin, "receiver before begin: {events:?}");
     assert!(
         begin < body_at && body_at < end,
         "body between begin and end: {events:?}"
@@ -225,10 +226,7 @@ fn assert_anon_member_shape(
 /// `_parseAnonymousMethod(dot, afterDot)` with the `.` as the punctuation.
 #[test]
 fn selector_arrow_punctuation_is_the_dot() {
-    let events = shape(
-        "void main() {\n  buffer.=> foo;\n}\n",
-        anon_features(),
-    );
+    let events = shape("void main() {\n  buffer.=> foo;\n}\n", anon_features());
     // `buffer` 16..22, `.` 22..23, `=>` 23..25, `foo` 26..29, `;` 29..30.
     assert_anon_member_shape(&events, (16, 6), (22, 1), (23, 2), (26, 3), (29, 1));
 }
@@ -239,10 +237,7 @@ fn selector_arrow_punctuation_is_the_dot() {
 /// fires no `handleCascadeAccess`.
 #[test]
 fn cascade_arrow_punctuation_is_the_double_dot() {
-    let events = shape(
-        "void main() {\n  buffer..=> foo;\n}\n",
-        anon_features(),
-    );
+    let events = shape("void main() {\n  buffer..=> foo;\n}\n", anon_features());
     // `buffer` 16..22, `..` 22..24, `=>` 24..26, `foo` 27..30, `;` 30..31.
     assert_anon_member_shape(&events, (16, 6), (22, 2), (24, 2), (27, 3), (30, 1));
     let cascade_at = only(&events, |ev| matches!(ev, Ev::BeginCascade(..)));
@@ -257,10 +252,7 @@ fn cascade_arrow_punctuation_is_the_double_dot() {
 /// replaces the null-aware member events).
 #[test]
 fn null_aware_cascade_arrow_punctuation_is_the_question_double_dot() {
-    let events = shape(
-        "void main() {\n  buffer?..=> foo;\n}\n",
-        anon_features(),
-    );
+    let events = shape("void main() {\n  buffer?..=> foo;\n}\n", anon_features());
     // `buffer` 16..22, `?..` 22..25, `=>` 25..27, `foo` 28..31, `;` 31..32.
     assert_anon_member_shape(&events, (16, 6), (22, 3), (25, 2), (28, 3), (31, 1));
     let cascade_at = only(&events, |ev| matches!(ev, Ev::BeginCascade(..)));
@@ -274,9 +266,10 @@ fn null_aware_cascade_arrow_punctuation_is_the_question_double_dot() {
 fn ordinary_cascade_section_stays_a_cascade_access() {
     let events = shape("void main() {\n  a..b;\n}\n", anon_features());
     assert!(
-        !events
-            .iter()
-            .any(|ev| matches!(ev, Ev::BeginAnon(..) | Ev::EndAnon { .. } | Ev::ImplicitParams(..))),
+        !events.iter().any(|ev| matches!(
+            ev,
+            Ev::BeginAnon(..) | Ev::EndAnon { .. } | Ev::ImplicitParams(..)
+        )),
         "no anonymous-method events for `a..b`: {events:?}"
     );
     // `a` 16..17, `..` 17..19, `b` 19..20, `;` 20..21 (the member's
@@ -298,9 +291,10 @@ fn ordinary_cascade_section_stays_a_cascade_access() {
 fn ordinary_dot_access_stays_a_dot_access() {
     let events = shape("void main() {\n  a.foo;\n}\n", anon_features());
     assert!(
-        !events
-            .iter()
-            .any(|ev| matches!(ev, Ev::BeginAnon(..) | Ev::EndAnon { .. } | Ev::ImplicitParams(..))),
+        !events.iter().any(|ev| matches!(
+            ev,
+            Ev::BeginAnon(..) | Ev::EndAnon { .. } | Ev::ImplicitParams(..)
+        )),
         "no anonymous-method events for `a.foo`: {events:?}"
     );
     // `a` 16..17, `.` 17..18, `foo` 18..21, `;` 21..22 (the access's

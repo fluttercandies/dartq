@@ -32,7 +32,7 @@
 //! type_system.dart:919-923).
 
 use crate::hierarchy::{CoreDecls, TypeHierarchy};
-use crate::ids::{TypeDeclId, TypeParamId, TypeId};
+use crate::ids::{TypeDeclId, TypeId, TypeParamId};
 use crate::system::TypeSystem;
 use crate::table::TypeTable;
 use crate::ty::{UninternedFunction, UninternedType};
@@ -122,8 +122,14 @@ fn generic_function_bounds_are_invariant() {
     let plain = TypeSystem::new(&table, &hierarchy);
     assert!(plain.is_subtype(f_int, f_num), "inert without the snapshot");
     let sys = TypeSystem::new(&table, &hierarchy).with_param_facts(&facts);
-    assert!(!sys.is_subtype(f_int, f_num), "int bound <: num bound rejected");
-    assert!(!sys.is_subtype(f_num, f_int), "num bound <: int bound rejected");
+    assert!(
+        !sys.is_subtype(f_int, f_num),
+        "int bound <: num bound rejected"
+    );
+    assert!(
+        !sys.is_subtype(f_num, f_int),
+        "num bound <: int bound rejected"
+    );
     assert!(sys.is_subtype(f_int, f_int), "reflexivity untouched");
 }
 
@@ -137,8 +143,7 @@ fn generic_function_bounds_are_invariant() {
 fn generic_function_matching_bounds_still_subtype() {
     let (table, hierarchy) = fixture();
     let (int, num) = (itf(&table, INT, &[]), itf(&table, NUM, &[]));
-    let t_of =
-        |p: TypeParamId| table.intern(UninternedType::TypeParameter { parameter: p }, false);
+    let t_of = |p: TypeParamId| table.intern(UninternedType::TypeParameter { parameter: p }, false);
     // `<U extends num>` / `<V extends num>`; the mismatched F-bound `W`;
     // the F-bounded pair `<U2 extends List<U2>>` / `<V2 extends List<V2>>`;
     // the sibling-referencing pair `<A extends B, B extends num>` /
@@ -171,8 +176,14 @@ fn generic_function_matching_bounds_still_subtype() {
     facts.set(u, ParamFacts::LEGACY.with_bound(num));
     facts.set(v, ParamFacts::LEGACY.with_bound(num));
     facts.set(w, ParamFacts::LEGACY.with_bound(itf(&table, LIST, &[int])));
-    facts.set(u2, ParamFacts::LEGACY.with_bound(itf(&table, LIST, &[t_of(u2)])));
-    facts.set(v2, ParamFacts::LEGACY.with_bound(itf(&table, LIST, &[t_of(v2)])));
+    facts.set(
+        u2,
+        ParamFacts::LEGACY.with_bound(itf(&table, LIST, &[t_of(u2)])),
+    );
+    facts.set(
+        v2,
+        ParamFacts::LEGACY.with_bound(itf(&table, LIST, &[t_of(v2)])),
+    );
     facts.set(a, ParamFacts::LEGACY.with_bound(t_of(b)));
     facts.set(b, ParamFacts::LEGACY.with_bound(num));
     facts.set(x, ParamFacts::LEGACY.with_bound(t_of(y)));
@@ -188,10 +199,7 @@ fn generic_function_matching_bounds_still_subtype() {
     assert!(sys.is_subtype(generic_fn(&table, &[u2]), generic_fn(&table, &[v2])));
     assert!(!sys.is_subtype(generic_fn(&table, &[u2]), generic_fn(&table, &[w])));
     // Sibling reference: the bound's `B` renames onto `Y`.
-    assert!(sys.is_subtype(
-        generic_fn(&table, &[a, b]),
-        generic_fn(&table, &[x, y])
-    ));
+    assert!(sys.is_subtype(generic_fn(&table, &[a, b]), generic_fn(&table, &[x, y])));
 
     // Missing ≡ dynamic: unbounded vs `Object?`-bound correlate (both
     // tops, mutual subtyping); unbounded vs `int`-bound does not

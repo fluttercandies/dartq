@@ -165,7 +165,19 @@ fn annotation_arg_statement_keyword_recovery() {
     let mut p = setup(source);
     p.parse_unit();
     let c = &p.listener;
-    assert!(reported_at(c, source, "@a( break", "break", "missing_identifier"));
-    assert!(reported_at(c, source, "@a( break", "break", "expected_token"));
+    assert!(reported_at(
+        c,
+        source,
+        "@a( break",
+        "break",
+        "missing_identifier"
+    ));
+    assert!(reported_at(
+        c,
+        source,
+        "@a( break",
+        "break",
+        "expected_token"
+    ));
     c.assert_sequence(&[("handle", "break_statement")]);
 }

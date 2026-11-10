@@ -225,7 +225,6 @@ fn member_formal_kind(kind: dartq_parser::MemberKind) -> bool {
 /// `UnsafeSingle` verdict. The row anchors at the operator token, its
 /// length the lexeme's own width.
 impl DiagnoseListener<'_> {
-
     /// The WRITTEN extent of the map-pattern key that ends at `colon`: the
     /// first token after the entry's opening `{`/`,` through the token
     /// before the `:`. The oracle anchors both the key rows
@@ -256,17 +255,17 @@ impl DiagnoseListener<'_> {
                         break;
                     }
                 }
-                dartq_scanner::TokenKind::Comma | dartq_scanner::TokenKind::Colon
-                    if depth == 0 =>
-                {
+                dartq_scanner::TokenKind::Comma | dartq_scanner::TokenKind::Colon if depth == 0 => {
                     break;
                 }
                 _ => {}
             }
             start -= 1;
         }
-        let (Some(first), Some(last)) = (toks.get(start), end.checked_sub(1).and_then(|i| toks.get(i)))
-        else {
+        let (Some(first), Some(last)) = (
+            toks.get(start),
+            end.checked_sub(1).and_then(|i| toks.get(i)),
+        ) else {
             return colon.range;
         };
         if start >= end {
@@ -333,7 +332,10 @@ impl DiagnoseListener<'_> {
                 let object = Engine::nullable_form(Ty::named(engine.intern("Object")));
                 let shape = engine.boundary.args.borrow_mut().intern_record(
                     &vec![object; positional.len()],
-                    &named.iter().map(|(name, _)| (*name, object)).collect::<Vec<_>>(),
+                    &named
+                        .iter()
+                        .map(|(name, _)| (*name, object))
+                        .collect::<Vec<_>>(),
                 );
                 Restriction::Record {
                     shape,
@@ -561,13 +563,21 @@ impl DiagnoseListener<'_> {
             // (a `dynamic`/unknown matched value — the oracle's
             // `List<dynamic>` row on `void f(x)`).
             let element = match engine.fold_alias_ty(scrutinee) {
-                Ty::Named { args, .. } if args != crate::model::ArgListId::EMPTY => {
-                    engine.boundary.pool().get(args).first().copied().unwrap_or(Ty::Dynamic)
-                }
+                Ty::Named { args, .. } if args != crate::model::ArgListId::EMPTY => engine
+                    .boundary
+                    .pool()
+                    .get(args)
+                    .first()
+                    .copied()
+                    .unwrap_or(Ty::Dynamic),
                 _ => Ty::Dynamic,
             };
             let list = engine.intern("List");
-            engine.boundary.args.borrow_mut().named(list, false, &[element])
+            engine
+                .boundary
+                .args
+                .borrow_mut()
+                .named(list, false, &[element])
         };
         let op_text = engine.text_of(operator)?.to_owned();
         Some((scrutinee, op_text))
@@ -692,9 +702,7 @@ impl DiagnoseListener<'_> {
         if equality && self.engine.potentially_nullable(scrutinee) {
             return;
         }
-        let probe = self
-            .engine
-            .intern(if equality { "==" } else { &op_text });
+        let probe = self.engine.intern(if equality { "==" } else { &op_text });
         let engine = &mut self.engine;
         let face = engine.fold_alias_ty(scrutinee);
         let Ty::Named { name, .. } = face else {
@@ -712,7 +720,10 @@ impl DiagnoseListener<'_> {
                 else {
                     return;
                 };
-                let Ty::Named { name: bound_name, .. } = engine.fold_alias_ty(bound) else {
+                let Ty::Named {
+                    name: bound_name, ..
+                } = engine.fold_alias_ty(bound)
+                else {
                     return;
                 };
                 match engine.walk_members(bound_name, probe) {
@@ -784,7 +795,9 @@ impl DiagnoseListener<'_> {
                     depth += 1;
                     false
                 }
-                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare | dartq_scanner::TokenKind::CloseCurly => {
+                dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare
+                | dartq_scanner::TokenKind::CloseCurly => {
                     if depth == 0 {
                         true
                     } else {
@@ -2848,8 +2861,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // iterable's row mark (the pop below).
         if let Some(kw) = pattern_keyword
             && let Some(&mark) = self.engine.for_in_marks.last()
-            && let Some((sem_ty, _)) =
-                self.engine.for_in_element_staging(mark, await_kw.is_some())
+            && let Some((sem_ty, _)) = self.engine.for_in_element_staging(mark, await_kw.is_some())
         {
             self.engine.irrefutable_walk_for_in_head(kw, in_kw, sem_ty);
         }
@@ -2871,7 +2883,8 @@ impl ParserListener for DiagnoseListener<'_> {
             _ => None,
         };
         if let Some(range) = void_element {
-            self.engine.emit(SemanticCode::UseOfVoidResult, range, "", "");
+            self.engine
+                .emit(SemanticCode::UseOfVoidResult, range, "", "");
         }
 
         // The `_checkForEachParts` iterable face: the iterable's operand
@@ -2950,10 +2963,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // Hand the enclosing group's declared type back when this one was
         // nested inside its initializer (a for-element's loop variable);
         // the outermost group closes to the idle `None` pair.
-        let (outer_ty, outer_unresolved) = self
-            .decl_group_stack
-            .pop()
-            .unwrap_or((None, false));
+        let (outer_ty, outer_unresolved) = self.decl_group_stack.pop().unwrap_or((None, false));
         engine.pending_decl_ty = outer_ty;
         engine.pending_decl_ty_unresolved = outer_unresolved;
         engine.armed_ty = None;
@@ -3105,9 +3115,10 @@ impl ParserListener for DiagnoseListener<'_> {
                                     && engine.rows[mark + 1].ty != Ty::UNKNOWN
                                     && (engine.byte_at(engine.rows[mark + 1].range.end())
                                         == Some(b'!')
-                                        || ((Engine::is_nullable_ty(engine.rows[mark + 1].ty)
-                                            || engine
-                                                .strictly_non_nullable(engine.rows[mark + 1].ty))
+                                        || ((Engine::is_nullable_ty(
+                                            engine.rows[mark + 1].ty,
+                                        ) || engine
+                                            .strictly_non_nullable(engine.rows[mark + 1].ty))
                                             && !engine
                                                 .index_receiver_latched(&engine.rows[mark]))) =>
                             {
@@ -3492,11 +3503,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         .armed_ty_span
                         .filter(|span| span.offset > var_range.offset)
                         .map_or_else(
-                            || {
-                                extends_or_super.map_or(var_range.end(), |token| {
-                                    token.range.end()
-                                })
-                            },
+                            || extends_or_super.map_or(var_range.end(), |token| token.range.end()),
                             |span| span.end(),
                         )
                 } else {
@@ -4471,10 +4478,11 @@ impl ParserListener for DiagnoseListener<'_> {
                         && engine.fn_type_stash.is_none()
                         && !engine.group_augment
                     {
-                        let slot = engine.container_context().map_or(
-                            VarInferSlot::TopLevel,
-                            |(container, _)| VarInferSlot::Field(container),
-                        );
+                        let slot = engine
+                            .container_context()
+                            .map_or(VarInferSlot::TopLevel, |(container, _)| {
+                                VarInferSlot::Field(container)
+                            });
                         engine
                             .pending_model_declarators
                             .push((name, token.range, slot));
@@ -5159,10 +5167,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         env.insert(name, CtorBinding::Opaque);
                     }
                 }
-                let scope = InitRhsLookup {
-                    engine,
-                    env: &env,
-                };
+                let scope = InitRhsLookup { engine, env: &env };
                 for node in &engine.ctor_init_pending {
                     collect_not_potentially_constant(node, &scope, &mut spans);
                 }
@@ -5175,9 +5180,12 @@ impl ParserListener for DiagnoseListener<'_> {
                 // `_reportNotPotentialConstants` is a single pass, so a
                 // same-code same-span hit is the duplicate, not a second
                 // row.
-                if engine.report.diagnostics.iter().any(|d| {
-                    d.code.name == "invalid_constant" && d.range == span
-                }) {
+                if engine
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.name == "invalid_constant" && d.range == span)
+                {
                     continue;
                 }
                 engine.emit(SemanticCode::InvalidConstant, span, "", "");
@@ -5347,7 +5355,10 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.query_type_rows.push((token.range, ty));
             }
             let recv = match literal_ty {
-                Some(ty @ Ty::Named { name, .. }) => Receiver::Typed { type_name: name, ty },
+                Some(ty @ Ty::Named { name, .. }) => Receiver::Typed {
+                    type_name: name,
+                    ty,
+                },
                 _ => Receiver::Unknown,
             };
             engine.push_row(Row {
@@ -5635,7 +5646,8 @@ impl ParserListener for DiagnoseListener<'_> {
                     _ => FlowBase::Unknown,
                 },
             };
-            self.flow().stage_call_result(offset, FlowTy { base, nullable }, tree);
+            self.flow()
+                .stage_call_result(offset, FlowTy { base, nullable }, tree);
         } else if let Some((offset, name)) = self.engine.send_invalid_staging.take() {
             // The genuinely-unresolved head's Invalid face (#2860): the
             // setter certified the call head resolves nowhere (the send's
@@ -5984,13 +5996,16 @@ impl ParserListener for DiagnoseListener<'_> {
                         nullable: rn,
                         args: ra,
                     },
-                    (Ty::Named { name: l, args: la, .. }, Ty::Named { nullable: rn, .. }) => {
+                    (
                         Ty::Named {
-                            name: l,
-                            nullable: rn,
-                            args: la,
-                        }
-                    }
+                            name: l, args: la, ..
+                        },
+                        Ty::Named { nullable: rn, .. },
+                    ) => Ty::Named {
+                        name: l,
+                        nullable: rn,
+                        args: la,
+                    },
                     _ => from_ty,
                 }
             } else {
@@ -6081,8 +6096,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // carrying a staged `index_arg_faces` entry is the one.
         {
             let index_op = engine.intern("[]");
-            let marked = engine.rows.iter().find_map(|row| {
-                match (&row.intent, row.write_op) {
+            let marked = engine
+                .rows
+                .iter()
+                .find_map(|row| match (&row.intent, row.write_op) {
                     (Intent::Operator(op, bracket), write_op @ Some(_))
                         if *op == index_op
                             && engine.index_arg_faces.contains_key(&bracket.offset) =>
@@ -6090,8 +6107,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         Some((bracket.offset, write_op))
                     }
                     _ => None,
-                }
-            });
+                });
             if let Some((bracket_offset, write_op)) = marked {
                 engine.check_index_argument(bracket_offset, write_op);
             }
@@ -6141,8 +6157,7 @@ impl ParserListener for DiagnoseListener<'_> {
             });
             if let Some(rhs) = rhs
                 && let Some(target) = engine.rows[..rhs].iter().rposition(|row| {
-                    !matches!(row.shape, RowShape::TypeUse(..))
-                        && row.range.end() <= limit
+                    !matches!(row.shape, RowShape::TypeUse(..)) && row.range.end() <= limit
                 })
             {
                 let (static_receiver, lhs_offset) = {
@@ -6160,9 +6175,10 @@ impl ParserListener for DiagnoseListener<'_> {
                 };
                 if !static_receiver && engine.null_aware_members.contains(&lhs_offset) {
                     let rhs_offset = engine.rows[rhs].range.offset;
-                    engine
-                        .if_null_results
-                        .insert(rhs_offset, (lhs_offset, Engine::nullable_form(staged_from_ty)));
+                    engine.if_null_results.insert(
+                        rhs_offset,
+                        (lhs_offset, Engine::nullable_form(staged_from_ty)),
+                    );
                 }
             }
         }
@@ -6227,8 +6243,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     prev.kind,
                     dartq_scanner::TokenKind::GtGt | dartq_scanner::TokenKind::GtGtEq
                 )
-                && prev.byte_offset + prev.byte_len
-                    == engine.byte_of(operator.range.offset) as u32
+                && prev.byte_offset + prev.byte_len == engine.byte_of(operator.range.offset) as u32
             {
                 Some(prev.utf16_offset)
             } else {
@@ -6508,7 +6523,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {
-        self.flow().handle_unary_prefix_assignment_expression(operator);
+        self.flow()
+            .handle_unary_prefix_assignment_expression(operator);
 
         let engine = &mut self.engine;
         // The prefix `++`/`--` junction (`increment_or_decrement_resolver.
@@ -6540,7 +6556,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
-        self.flow().handle_unary_postfix_assignment_expression(operator);
+        self.flow()
+            .handle_unary_postfix_assignment_expression(operator);
 
         let engine = &mut self.engine;
         engine.const_capture.unary_postfix(operator.range);
@@ -6835,12 +6852,17 @@ impl ParserListener for DiagnoseListener<'_> {
             // keeps `callee_return_ty`'s declared-return answer.
             let prefixed_container = |prefix: StringId, name: StringId| -> bool {
                 let Lookup::Found(NamespaceEntry::Decl(file)) =
-                    engine.namespaces.lookup_prefixed(engine.graph, engine.lib, prefix, name)
+                    engine
+                        .namespaces
+                        .lookup_prefixed(engine.graph, engine.lib, prefix, name)
                 else {
                     return false;
                 };
-                engine.index.get(file).and_then(|f| f.decl(name)).is_some_and(
-                    |decl| {
+                engine
+                    .index
+                    .get(file)
+                    .and_then(|f| f.decl(name))
+                    .is_some_and(|decl| {
                         !matches!(
                             decl.kind,
                             MicroKind::TopLevelVar
@@ -6848,8 +6870,7 @@ impl ParserListener for DiagnoseListener<'_> {
                                 | MicroKind::Prefix
                                 | MicroKind::TypeParam
                         )
-                    },
-                )
+                    })
             };
             let row = &engine.rows[index];
             // A written argument group (`C<int>()`, `p.C<int>()`) instantiates
@@ -6859,11 +6880,7 @@ impl ParserListener for DiagnoseListener<'_> {
             // entry keys on the callee row's head offset: the group's
             // arguments spell the instance face the verdict compares.
             let created_ty = |engine: &Engine, name: StringId, offset: u32| -> Ty {
-                match engine
-                    .call_type_args
-                    .iter()
-                    .find(|(at, _)| *at == offset)
-                {
+                match engine.call_type_args.iter().find(|(at, _)| *at == offset) {
                     Some((_, entry)) => engine
                         .boundary
                         .args
@@ -6883,8 +6900,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 RowShape::Bare(BareInfo::Container { name, kind }) => {
                     if row.intent == Intent::Invoke {
                         if *kind != ContainerKind::Extension
-                            || engine.container_kind_of(*name)
-                                == Some(ContainerKind::ExtensionType)
+                            || engine.container_kind_of(*name) == Some(ContainerKind::ExtensionType)
                         {
                             Some(created_ty(engine, row.name, row.range.offset))
                         } else {
@@ -6917,8 +6933,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 // suppress (`Ex(1) is Ex` stays silent upstream).
                 RowShape::Receiver(Receiver::Created { name, kind, .. }) => {
                     if *kind != ContainerKind::Extension
-                        || engine.container_kind_of(*name)
-                            == Some(ContainerKind::ExtensionType)
+                        || engine.container_kind_of(*name) == Some(ContainerKind::ExtensionType)
                     {
                         Some(created_ty(engine, *name, row.range.offset))
                     } else {
@@ -8056,7 +8071,10 @@ impl ParserListener for DiagnoseListener<'_> {
             // chain both key on the inner span, never the parens.
             let recv = if !engine.local_hits.contains_key(&recv.offset)
                 && !engine.rows[pos].qualified
-                && matches!(engine.rows[pos].shape, RowShape::Bare(BareInfo::Plain { .. }))
+                && matches!(
+                    engine.rows[pos].shape,
+                    RowShape::Bare(BareInfo::Plain { .. })
+                )
                 && engine.strings.resolve(engine.rows[pos].name).is_empty()
             {
                 engine
@@ -8077,19 +8095,18 @@ impl ParserListener for DiagnoseListener<'_> {
                         engine
                             .tokens
                             .as_slice()
-                            .get(engine.tokens.as_slice().partition_point(|t| {
-                                t.utf16_offset < inner_offset
-                            }))
+                            .get(
+                                engine
+                                    .tokens
+                                    .as_slice()
+                                    .partition_point(|t| t.utf16_offset < inner_offset),
+                            )
                             .filter(|t| t.utf16_offset == inner_offset)
                             .map(|token| {
                                 let raw = &engine.source[token.byte_range()];
                                 SourceRange {
                                     offset: inner_offset,
-                                    length: raw
-                                        .chars()
-                                        .map(char::len_utf16)
-                                        .sum::<usize>()
-                                        as u32,
+                                    length: raw.chars().map(char::len_utf16).sum::<usize>() as u32,
                                 }
                             })
                     })
@@ -8239,17 +8256,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 // last stacked expression inside the bracket (a member
                 // merge, a send fold, or a bare/literal operand all leave
                 // exactly one row covering the argument's span).
-                let arg = engine
-                    .rows
-                    .get(pos + 1..)
-                    .and_then(|rows| {
-                        rows.iter()
-                            .filter(|row| {
-                                open.range.offset <= row.range.offset
-                                    && row.range.end() <= close.range.end()
-                            })
-                            .max_by_key(|row| (row.range.end(), row.range.offset))
-                    });
+                let arg = engine.rows.get(pos + 1..).and_then(|rows| {
+                    rows.iter()
+                        .filter(|row| {
+                            open.range.offset <= row.range.offset
+                                && row.range.end() <= close.range.end()
+                        })
+                        .max_by_key(|row| (row.range.end(), row.range.offset))
+                });
                 if let Some(arg) = arg {
                     let index_ty = engine.expression_row_ty(arg);
                     let literal = Engine::primitive_literal(arg, &engine.members.primitive_ids);
@@ -8753,12 +8767,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // `{...}` node, type-argument group included): `count` counts
         // every element slot, rest elements included, matching the
         // oracle's `node.elements` list.
-        super::pattern_faces::empty_map_pattern_face(
-            &mut self.engine,
-            count,
-            left,
-            right,
-        );
+        super::pattern_faces::empty_map_pattern_face(&mut self.engine, count, left, right);
         // The Map kind of `checkPatternNeverMatchesValueType`
         // (resolver.dart:1632-1637): `analyzeMapPattern`'s required type is
         // `Map<K, V>` of the matched map's type arguments — or
@@ -8835,7 +8844,6 @@ impl ParserListener for DiagnoseListener<'_> {
         // the key so its nodes accumulate.
         self.engine.const_capture.open_map_pattern_key();
     }
-
 
     fn handle_map_pattern_entry(&mut self, colon: Token, _end: Token) {
         // Close the key's window and evaluate it: a non-constant key reports
@@ -9038,25 +9046,21 @@ impl ParserListener for DiagnoseListener<'_> {
                             .collect();
                         let named_restr: Vec<(StringId, Restriction)> = named
                             .iter()
-                            .map(|(name, value)| {
-                                (*name, Self::constant_leaf(engine, value))
-                            })
+                            .map(|(name, value)| (*name, Self::constant_leaf(engine, value)))
                             .collect();
                         let shape = match constant {
                             Some(Ty::Record { shape, .. }) => shape,
                             _ => {
-                                let object = Engine::nullable_form(Ty::named(
-                                    engine.intern("Object"),
-                                ));
+                                let object =
+                                    Engine::nullable_form(Ty::named(engine.intern("Object")));
                                 let positional_ty = vec![object; positional.len()];
-                                let named_ty: Vec<(StringId, Ty)> = named
-                                    .iter()
-                                    .map(|(name, _)| (*name, object))
-                                    .collect();
-                                engine.boundary.args.borrow_mut().intern_record(
-                                    &positional_ty,
-                                    &named_ty,
-                                )
+                                let named_ty: Vec<(StringId, Ty)> =
+                                    named.iter().map(|(name, _)| (*name, object)).collect();
+                                engine
+                                    .boundary
+                                    .args
+                                    .borrow_mut()
+                                    .intern_record(&positional_ty, &named_ty)
                             }
                         };
                         Restriction::Record {
@@ -9183,8 +9187,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // oracle's pattern walk never runs — it would feed downstream
         // verdicts the `as ValueT` cast reads differently).
         if let Some(head) = head
-            && let Some((count, group_open, group_end)) =
-                engine.pending_pattern_type_args.take()
+            && let Some((count, group_open, group_end)) = engine.pending_pattern_type_args.take()
             && engine.trivia_between(first_identifier.range.end(), group_open)
             && let Some(declared) = engine.declared_type_params_of_container(head)
             && declared != count
@@ -9524,8 +9527,9 @@ impl ParserListener for DiagnoseListener<'_> {
             // declared type (the still-armed `armed_ty`, alias-folded) and
             // the `final` keyword's finality.
             let binder_ty = engine.armed_ty.map(|ty| engine.fold_alias_ty(ty));
-            let binder_fin =
-                keyword.and_then(|kw| engine.text_of(kw)).map(|text| text == "final");
+            let binder_fin = keyword
+                .and_then(|kw| engine.text_of(kw))
+                .map(|text| text == "final");
             super::pattern_faces::note_declared_binder(
                 &mut self.pattern_rows,
                 engine,
@@ -10713,123 +10717,121 @@ impl ParserListener for DiagnoseListener<'_> {
             let _ = engine.const_capture.take_pending_for_elements();
             match shape {
                 SetOrMap::Map(parts) => {
-                        // The oracle names the failing side
-                        // (`_validateMapLiteralEntry`): `non_constant_map_key` /
-                        // `non_constant_map_value` at each entry's key and
-                        // value. The ordered parts interleave `Expr::Entry`
-                        // pseudo-operands with control elements — an entry
-                        // checks each side's face, a control element checks
-                        // the map-element code (`expression_in_map` for a
-                        // bare leaf, `const_eval_for_element` for a `for`,
-                        // the `if`/spread verifier arms).
-                        let mut failed = None;
-                        for part in &parts {
-                            match &part.expr {
-                                crate::const_eval::Expr::Entry(key, value) => {
-                                    for (code, side) in [
-                                        (SemanticCode::NonConstantMapKey, key.as_ref()),
-                                        (SemanticCode::NonConstantMapValue, value.as_ref()),
-                                    ] {
-                                        if let Some(at) = engine.check_const_elements(
-                                            code,
-                                            std::slice::from_ref(side),
-                                        ) {
-                                            failed.get_or_insert(at);
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if let Some(at) = engine.check_const_elements(
-                                        SemanticCode::NonConstantMapElement,
-                                        std::slice::from_ref(part),
-                                    ) {
+                    // The oracle names the failing side
+                    // (`_validateMapLiteralEntry`): `non_constant_map_key` /
+                    // `non_constant_map_value` at each entry's key and
+                    // value. The ordered parts interleave `Expr::Entry`
+                    // pseudo-operands with control elements — an entry
+                    // checks each side's face, a control element checks
+                    // the map-element code (`expression_in_map` for a
+                    // bare leaf, `const_eval_for_element` for a `for`,
+                    // the `if`/spread verifier arms).
+                    let mut failed = None;
+                    for part in &parts {
+                        match &part.expr {
+                            crate::const_eval::Expr::Entry(key, value) => {
+                                for (code, side) in [
+                                    (SemanticCode::NonConstantMapKey, key.as_ref()),
+                                    (SemanticCode::NonConstantMapValue, value.as_ref()),
+                                ] {
+                                    if let Some(at) = engine
+                                        .check_const_elements(code, std::slice::from_ref(side))
+                                    {
                                         failed.get_or_insert(at);
                                     }
                                 }
                             }
+                            _ => {
+                                if let Some(at) = engine.check_const_elements(
+                                    SemanticCode::NonConstantMapElement,
+                                    std::slice::from_ref(part),
+                                ) {
+                                    failed.get_or_insert(at);
+                                }
+                            }
                         }
-                        // The const spread-shape face: a `...expr`
-                        // operand that evaluates to a non-map value
-                        // reports `const_spread_expected_map`. The literal's
-                        // RESOLVED kind decides the expected shape — the
-                        // parser's `hasSetEntry` flag missed spread-decided
-                        // literals (`const {...list}` is a set upstream),
-                        // and an ambiguous literal's verifier never runs.
-                        if let Some(kind) = resolved_kind {
-                            engine.check_const_spread_shapes(
-                                left,
-                                right,
-                                &parts,
-                                kind == SpreadLiteralKind::Map,
-                            );
-                        }
-                        let payload = engine.map_payload(&parts);
-                        engine.push_literal_value(
-                            failed,
-                            right.range,
-                            SourceRange {
-                                offset: left.range.offset,
-                                length: right.range.end() - left.range.offset,
-                            },
-                            InstanceKind::Map,
-                            payload,
+                    }
+                    // The const spread-shape face: a `...expr`
+                    // operand that evaluates to a non-map value
+                    // reports `const_spread_expected_map`. The literal's
+                    // RESOLVED kind decides the expected shape — the
+                    // parser's `hasSetEntry` flag missed spread-decided
+                    // literals (`const {...list}` is a set upstream),
+                    // and an ambiguous literal's verifier never runs.
+                    if let Some(kind) = resolved_kind {
+                        engine.check_const_spread_shapes(
+                            left,
+                            right,
+                            &parts,
+                            kind == SpreadLiteralKind::Map,
                         );
                     }
-                    SetOrMap::Set(elements) => {
-                        // The literal's own resolution decides the element
-                        // code: a `:`-led entry anywhere in the leaves
-                        // makes the literal a map upstream, so a
-                        // non-Entry element (a bare expression, a spread)
-                        // reports `non_constant_map_element` instead of
-                        // `non_constant_set_element` — the parser's
-                        // `has_set_entry` only reflects the first simple
-                        // entry's colon, not the resolved kind.
-                        let has_entry = {
-                            let bytes = engine.source.as_bytes();
-                            let start = engine.byte_of(left.range.end());
-                            let end = engine.byte_of(right.range.offset);
-                            literal_comma_segments(bytes, start, end)
-                                .into_iter()
-                                .any(|(s, e)| {
-                                    let s = trim_trivia(bytes, s, e);
-                                    s < e && top_level_colon(bytes, s, e).is_some()
-                                })
-                        };
-                        let element_code = if has_entry {
-                            SemanticCode::NonConstantMapElement
-                        } else {
-                            SemanticCode::NonConstantSetElement
-                        };
-                        let failed =
-                            engine.check_const_elements(element_code, &elements);
-                        // The const spread-shape face asks the literal's
-                        // RESOLVED kind — a `:`-led leaf makes it a map,
-                        // a spread-decided literal reads its operand's
-                        // side (`const {...list}` is a set upstream), and
-                        // an ambiguous literal's verifier never runs.
-                        if let Some(kind) = resolved_kind {
-                            engine.check_const_spread_shapes(
-                                left,
-                                right,
-                                &elements,
-                                kind == SpreadLiteralKind::Map,
-                            );
-                        }
-                        let payload = engine
-                            .literal_payload(&elements)
-                            .map(|values| ConstantValue::Set(values.into()));
-                        engine.push_literal_value(
-                            failed,
-                            right.range,
-                            SourceRange {
-                                offset: left.range.offset,
-                                length: right.range.end() - left.range.offset,
-                            },
-                            InstanceKind::Set,
-                            payload,
-                        );
-                    }
+                    let payload = engine.map_payload(&parts);
+                    engine.push_literal_value(
+                        failed,
+                        right.range,
+                        SourceRange {
+                            offset: left.range.offset,
+                            length: right.range.end() - left.range.offset,
+                        },
+                        InstanceKind::Map,
+                        payload,
+                    );
                 }
+                SetOrMap::Set(elements) => {
+                    // The literal's own resolution decides the element
+                    // code: a `:`-led entry anywhere in the leaves
+                    // makes the literal a map upstream, so a
+                    // non-Entry element (a bare expression, a spread)
+                    // reports `non_constant_map_element` instead of
+                    // `non_constant_set_element` — the parser's
+                    // `has_set_entry` only reflects the first simple
+                    // entry's colon, not the resolved kind.
+                    let has_entry = {
+                        let bytes = engine.source.as_bytes();
+                        let start = engine.byte_of(left.range.end());
+                        let end = engine.byte_of(right.range.offset);
+                        literal_comma_segments(bytes, start, end)
+                            .into_iter()
+                            .any(|(s, e)| {
+                                let s = trim_trivia(bytes, s, e);
+                                s < e && top_level_colon(bytes, s, e).is_some()
+                            })
+                    };
+                    let element_code = if has_entry {
+                        SemanticCode::NonConstantMapElement
+                    } else {
+                        SemanticCode::NonConstantSetElement
+                    };
+                    let failed = engine.check_const_elements(element_code, &elements);
+                    // The const spread-shape face asks the literal's
+                    // RESOLVED kind — a `:`-led leaf makes it a map,
+                    // a spread-decided literal reads its operand's
+                    // side (`const {...list}` is a set upstream), and
+                    // an ambiguous literal's verifier never runs.
+                    if let Some(kind) = resolved_kind {
+                        engine.check_const_spread_shapes(
+                            left,
+                            right,
+                            &elements,
+                            kind == SpreadLiteralKind::Map,
+                        );
+                    }
+                    let payload = engine
+                        .literal_payload(&elements)
+                        .map(|values| ConstantValue::Set(values.into()));
+                    engine.push_literal_value(
+                        failed,
+                        right.range,
+                        SourceRange {
+                            offset: left.range.offset,
+                            length: right.range.end() - left.range.offset,
+                        },
+                        InstanceKind::Set,
+                        payload,
+                    );
+                }
+            }
         }
         // A typed literal (`<int>{}` → `Set<int>`, `<K, V>{}` → `Map<K, V>`)
         // carries its written static type: the same face the typed list
@@ -10859,9 +10861,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let nested = engine.group_has_nested_args(left);
         let helper_typed = engine.typed_set_or_map_literal_ty(left);
         let (mut element, mut key, mut value) = (None, None, None);
-        if !nested
-            && let Some((_, Ty::Named { args, .. })) = helper_typed.as_ref()
-        {
+        if !nested && let Some((_, Ty::Named { args, .. })) = helper_typed.as_ref() {
             let args = engine.boundary.args.borrow().get(*args).to_vec();
             match args.as_slice() {
                 [only] => element = Some(*only),
@@ -11039,18 +11039,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // the `:` separator (`{?k: v}`'s `k` sits left of it while `v` is
         // already stacked).
         let engine = &mut self.engine;
-        for (question, side, before) in [
-            (nk, "key", Some(colon.range.offset)),
-            (nv, "value", None),
-        ]
-        .into_iter()
-        .filter_map(|(q, side, b)| q.map(|q| (q, side, b)))
+        for (question, side, before) in [(nk, "key", Some(colon.range.offset)), (nv, "value", None)]
+            .into_iter()
+            .filter_map(|(q, side, b)| q.map(|q| (q, side, b)))
         {
             let pos = match before {
-                Some(bound) => engine
-                    .rows
-                    .iter()
-                    .rposition(|row| row.range.end() <= bound),
+                Some(bound) => engine.rows.iter().rposition(|row| row.range.end() <= bound),
                 None => engine.rows.len().checked_sub(1),
             };
             let Some(pos) = pos else {
@@ -11062,7 +11056,10 @@ impl ParserListener for DiagnoseListener<'_> {
             // access (`{?f(1)?.abs(): 1}`) reads the chain's own nullable
             // type (`null_aware_members`), so the `?` stays live.
             let mut ty = engine.operand_static_ty(&engine.rows[pos]);
-            if ty != Ty::UNKNOWN && engine.null_aware_members.contains(&engine.rows[pos].range.offset)
+            if ty != Ty::UNKNOWN
+                && engine
+                    .null_aware_members
+                    .contains(&engine.rows[pos].range.offset)
             {
                 ty = Engine::nullable_form(ty);
             }
@@ -11159,8 +11156,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     let from = engine.byte_of(open_offset + 1).min(bytes.len());
                     let head_byte = trim_ws(bytes, from, bytes.len());
                     head_byte < bytes.len()
-                        && operand_expr_head(engine, row.range.offset)
-                            == engine.utf16_of(head_byte)
+                        && operand_expr_head(engine, row.range.offset) == engine.utf16_of(head_byte)
                 } =>
             {
                 let ty = engine.operand_static_ty(row);
@@ -11940,10 +11936,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_if_control_flow(&mut self, token: Token) {
         self.flow().begin_if_control_flow(token);
-        self.engine.const_capture.begin_ctl_element(
-            crate::const_eval::CtlElementKind::If,
-            token.range,
-        );
+        self.engine
+            .const_capture
+            .begin_ctl_element(crate::const_eval::CtlElementKind::If, token.range);
         // The collection form's condition arms the same window the
         // statement's does when it carries a case clause (the element face
         // of `begin_pattern`'s gate). The parser pairs this event with
@@ -12594,14 +12589,10 @@ impl ParserListener for DiagnoseListener<'_> {
                     if let Some(sig) = self.engine.fn_type_stash.take() {
                         self.engine.fn_var_sigs.insert(name_id, sig.clone());
                         self.engine.fn_param_sigs.insert(name_id, sig.clone());
-                        if let Some(exec) =
-                            self.engine.frames.last().and_then(|f| match &f.kind {
-                                FrameKind::Executable { ret: Some(ret), .. } => {
-                                    Some(ret.name)
-                                }
-                                _ => None,
-                            })
-                        {
+                        if let Some(exec) = self.engine.frames.last().and_then(|f| match &f.kind {
+                            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.name),
+                            _ => None,
+                        }) {
                             let table = self.engine.fn_formal_sigs.entry(exec).or_default();
                             if self.engine.fn_formal_named_section {
                                 table.named.insert(name_id, sig);
@@ -12819,8 +12810,7 @@ impl ParserListener for DiagnoseListener<'_> {
             .last()
             .map(|capture| capture.required_positional.min(u16::MAX as usize) as u16);
         self.engine.fn_capture_end(question.is_some());
-        if let (Some(required), Some(Ty::Function { shape, .. })) =
-            (required, self.engine.armed_ty)
+        if let (Some(required), Some(Ty::Function { shape, .. })) = (required, self.engine.armed_ty)
             && shape != crate::model::FnShapeId::EMPTY
         {
             self.engine
@@ -12884,9 +12874,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 let return_ty = capture.ret.map_or(Ty::Dynamic, |(ty, ..)| ty);
                 self.engine.fn_type_stash = Some(Box::new(FnVarSig {
                     params: capture.params.into_boxed_slice(),
-                    required_positional: capture
-                        .required_positional
-                        .min(u16::MAX as usize) as u16,
+                    required_positional: capture.required_positional.min(u16::MAX as usize) as u16,
                     positional: capture.positional.into_boxed_slice(),
                     named: capture.named.into_boxed_slice(),
                     return_ty,
@@ -13450,7 +13438,10 @@ impl ParserListener for DiagnoseListener<'_> {
             let mut ty = engine
                 .compound_element_ty()
                 .unwrap_or_else(|| engine.operand_static_ty(&engine.rows[pos]));
-            if ty != Ty::UNKNOWN && engine.null_aware_members.contains(&engine.rows[pos].range.offset)
+            if ty != Ty::UNKNOWN
+                && engine
+                    .null_aware_members
+                    .contains(&engine.rows[pos].range.offset)
             {
                 ty = Engine::nullable_form(ty);
             }
@@ -13589,10 +13580,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_spread_expression(&mut self, operator: Token) {
         self.flow().handle_spread_expression(operator);
-        self.engine.const_capture.begin_ctl_element(
-            crate::const_eval::CtlElementKind::Spread,
-            operator.range,
-        );
+        self.engine
+            .const_capture
+            .begin_ctl_element(crate::const_eval::CtlElementKind::Spread, operator.range);
 
         // The `...?e` null-aware spread (upstream `visitSpreadElement`
         // :2176-2184 → `_checkForUnnecessaryNullAware(_, spreadOperator,
@@ -14230,7 +14220,9 @@ fn group_head_exempts_init(engine: &Engine<'_>, name_offset: u32) -> bool {
         .rposition(|token| {
             matches!(
                 token.kind,
-                dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::OpenCurly | dartq_scanner::TokenKind::CloseCurly
+                dartq_scanner::TokenKind::Semicolon
+                    | dartq_scanner::TokenKind::OpenCurly
+                    | dartq_scanner::TokenKind::CloseCurly
             )
         })
         .map_or(0, |boundary| boundary + 1);
@@ -14240,7 +14232,9 @@ fn group_head_exempts_init(engine: &Engine<'_>, name_offset: u32) -> bool {
         .any(|token| {
             matches!(
                 token.kind,
-                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Abstract | dartq_scanner::Keyword::External)
+                dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Abstract | dartq_scanner::Keyword::External
+                )
             )
         })
 }
@@ -14714,9 +14708,7 @@ impl Engine<'_> {
                 }
                 // `dynamic`/undecidable/`Never` fill all three slots —
                 // can-be either side, must-be neither.
-                Some(ty)
-                    if ty == Ty::UNKNOWN || ty == Ty::Dynamic || self.is_never_ty(ty) =>
-                {
+                Some(ty) if ty == Ty::UNKNOWN || ty == Ty::Dynamic || self.is_never_ty(ty) => {
                     // An untyped CONSTANT read still carries its evaluated
                     // value, and a constant's value kind is its static
                     // type's side: `const m = {1: 2}` (an untyped literal
@@ -15006,11 +14998,7 @@ impl Engine<'_> {
                 continue;
             }
             let null_aware = bytes.get(s + 3) == Some(&b'?');
-            let operand_start = trim_ws(
-                bytes,
-                s + 3 + usize::from(null_aware),
-                e,
-            );
+            let operand_start = trim_ws(bytes, s + 3 + usize::from(null_aware), e);
             if operand_start >= e {
                 continue;
             }
@@ -15043,12 +15031,7 @@ impl Engine<'_> {
             // silently; `...` reports `not_null_aware_null_spread`.
             if self.assignable(operand_ty, Ty::Null, false) == Some(true) {
                 if !null_aware {
-                    self.emit(
-                        SemanticCode::NotNullAwareNullSpread,
-                        operand_range,
-                        "",
-                        "",
-                    );
+                    self.emit(SemanticCode::NotNullAwareNullSpread, operand_range, "", "");
                 }
                 continue;
             }
@@ -15114,12 +15097,7 @@ impl Engine<'_> {
                     // head reaches `Iterable`/`List`/`Set` through its
                     // declared superchain.
                     if !operand_heads.iter().any(|h| self.head_reaches_iterable(*h)) {
-                        self.emit(
-                            SemanticCode::NotIterableSpread,
-                            operand_range,
-                            "",
-                            "",
-                        );
+                        self.emit(SemanticCode::NotIterableSpread, operand_range, "", "");
                         continue;
                     }
                     // The element type asks assignability: the iterable's
@@ -15133,12 +15111,10 @@ impl Engine<'_> {
                             pool.get(args).first().copied().unwrap_or(Ty::UNKNOWN)
                         };
                         if element_ty != Ty::UNKNOWN
-                            && let Some(expected) =
-                                self.literal_set_or_map_element(left, right)
+                            && let Some(expected) = self.literal_set_or_map_element(left, right)
                             && self.assignable(element_ty, expected, false) == Some(false)
                         {
-                            let (a0, a1) =
-                                (self.ty_display(element_ty), self.ty_display(expected));
+                            let (a0, a1) = (self.ty_display(element_ty), self.ty_display(expected));
                             self.emit(
                                 SemanticCode::SetElementTypeNotAssignable,
                                 operand_range,
@@ -15333,9 +15309,7 @@ impl Engine<'_> {
             // staged leaf for the pre-wrap shapes) — the probe keys on the
             // operand's own offset.
             let node = elements.iter().find_map(|n| match &n.expr {
-                crate::const_eval::Expr::Spread { operand, .. }
-                    if operand.span.offset == s16 =>
-                {
+                crate::const_eval::Expr::Spread { operand, .. } if operand.span.offset == s16 => {
                     Some(operand.as_ref())
                 }
                 _ if n.span.offset == s16 => Some(n),
@@ -15348,19 +15322,14 @@ impl Engine<'_> {
                     // `spread.isNull && element.isNullAware` → `continue`).
                     let null_aware = bytes.get(s + 3) == Some(&b'?');
                     let code = match (&verdict, map) {
-                        (
-                            Verdict::Value(
-                                ConstantValue::List(_) | ConstantValue::Set(_),
-                            ),
-                            false,
-                        ) => continue,
+                        (Verdict::Value(ConstantValue::List(_) | ConstantValue::Set(_)), false) => {
+                            continue;
+                        }
                         (Verdict::Value(ConstantValue::Map(_)), true) => continue,
                         (Verdict::Value(ConstantValue::Null), _) if null_aware => {
                             continue;
                         }
-                        (Verdict::Value(_), false) => {
-                            SemanticCode::ConstSpreadExpectedListOrSet
-                        }
+                        (Verdict::Value(_), false) => SemanticCode::ConstSpreadExpectedListOrSet,
                         (Verdict::Value(_), true) => SemanticCode::ConstSpreadExpectedMap,
                         _ => continue,
                     };
@@ -15388,9 +15357,7 @@ impl Engine<'_> {
                     else {
                         continue;
                     };
-                    if matches!(ty, Ty::UNKNOWN | Ty::Dynamic | Ty::Never)
-                        || self.is_never_ty(ty)
-                    {
+                    if matches!(ty, Ty::UNKNOWN | Ty::Dynamic | Ty::Never) || self.is_never_ty(ty) {
                         continue;
                     }
                     // A `Null`-typed operand: `...?` admits `null` silently
@@ -15610,9 +15577,7 @@ impl Engine<'_> {
     /// closest row wholly before it (the row `merge_member` is about to
     /// fold). `None` for a recovery shape with no operand row.
     fn access_receiver_index(&self, at: u32) -> Option<usize> {
-        self.rows
-            .iter()
-            .rposition(|row| row.range.end() <= at)
+        self.rows.iter().rposition(|row| row.range.end() <= at)
     }
 
     /// Whether a `use_of_void_result` row already sits at `range`. The
@@ -15834,7 +15799,9 @@ impl Engine<'_> {
         // A field/super formal (`this.x`, `super.a`) never reports
         // `assignment_to_final_local` — its writes resolve to the FIELD.
         if let Some(receiver) = at.checked_sub(2)
-            && tokens.get(at - 1).is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
+            && tokens
+                .get(at - 1)
+                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Period)
             && matches!(
                 tokens[receiver].kind,
                 dartq_scanner::TokenKind::Keyword(
@@ -15938,9 +15905,7 @@ impl Engine<'_> {
                         // list — the parameter is bound on entry — unless
                         // the head itself sits in pattern context.
                         Some(dartq_scanner::TokenKind::Identifier) => {
-                            let before_head = prev
-                                .checked_sub(2)
-                                .map(|i| tokens[i].kind);
+                            let before_head = prev.checked_sub(2).map(|i| tokens[i].kind);
                             if matches!(
                                 before_head,
                                 Some(
@@ -15979,22 +15944,20 @@ impl Engine<'_> {
                         }
                         // A control-head `(` opens the STATEMENT's head,
                         // not a pattern or a formal list.
-                        Some(
-                            dartq_scanner::TokenKind::Keyword(
-                                dartq_scanner::Keyword::For
-                                    | dartq_scanner::Keyword::If
-                                    | dartq_scanner::Keyword::While
-                                    | dartq_scanner::Keyword::Switch
-                                    | dartq_scanner::Keyword::Catch
-                                    | dartq_scanner::Keyword::On
-                                    | dartq_scanner::Keyword::Assert
-                                    | dartq_scanner::Keyword::Return
-                                    | dartq_scanner::Keyword::Throw
-                                    | dartq_scanner::Keyword::Await
-                                    | dartq_scanner::Keyword::Do
-                                    | dartq_scanner::Keyword::Else
-                            ),
-                        )
+                        Some(dartq_scanner::TokenKind::Keyword(
+                            dartq_scanner::Keyword::For
+                            | dartq_scanner::Keyword::If
+                            | dartq_scanner::Keyword::While
+                            | dartq_scanner::Keyword::Switch
+                            | dartq_scanner::Keyword::Catch
+                            | dartq_scanner::Keyword::On
+                            | dartq_scanner::Keyword::Assert
+                            | dartq_scanner::Keyword::Return
+                            | dartq_scanner::Keyword::Throw
+                            | dartq_scanner::Keyword::Await
+                            | dartq_scanner::Keyword::Do
+                            | dartq_scanner::Keyword::Else,
+                        ))
                         | Some(dartq_scanner::TokenKind::Function)
                         | Some(dartq_scanner::TokenKind::Eq)
                         | Some(dartq_scanner::TokenKind::Semicolon) => break,
@@ -16191,7 +16154,11 @@ impl Engine<'_> {
         use dartq_scanner::TokenKind;
         match pred {
             dartq_scanner::TokenKind::Keyword(
-                dartq_scanner::Keyword::Final | dartq_scanner::Keyword::Var | dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Required | dartq_scanner::Keyword::In,
+                dartq_scanner::Keyword::Final
+                | dartq_scanner::Keyword::Var
+                | dartq_scanner::Keyword::Case
+                | dartq_scanner::Keyword::Required
+                | dartq_scanner::Keyword::In,
             )
             | dartq_scanner::TokenKind::OpenParen
             | dartq_scanner::TokenKind::OpenSquare
@@ -16231,13 +16198,18 @@ impl Engine<'_> {
                 dartq_scanner::TokenKind::OpenParen
                 | dartq_scanner::TokenKind::OpenSquare
                 | dartq_scanner::TokenKind::OpenCurly => depth += 1,
-                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => depth = depth.saturating_sub(1),
+                dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                    depth = depth.saturating_sub(1)
+                }
                 dartq_scanner::TokenKind::CloseCurly => {
                     if depth == 0 {
                         let Some(next) = tokens.get(probe + 1) else {
                             return false;
                         };
-                        if !matches!(next.kind, dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Else)) {
+                        if !matches!(
+                            next.kind,
+                            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Else)
+                        ) {
                             return false;
                         }
                         if self.pa_write_in_clause(probe + 1, end) {
@@ -16257,7 +16229,9 @@ impl Engine<'_> {
                                 return self.pa_write_in_clause(probe + 1, end)
                                     || self.pa_chain_continues(probe + 1, end);
                             }
-                            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Default) => return true,
+                            dartq_scanner::TokenKind::Keyword(
+                                dartq_scanner::Keyword::Case | dartq_scanner::Keyword::Default,
+                            ) => return true,
                             _ => {}
                         }
                     }
@@ -16282,10 +16256,14 @@ impl Engine<'_> {
                 let mut probe = cursor + 1;
                 while let Some(token) = tokens.get(probe) {
                     match token.kind {
-                        dartq_scanner::TokenKind::OpenCurly | dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                        dartq_scanner::TokenKind::OpenCurly
+                        | dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare => {
                             depth += 1;
                         }
-                        dartq_scanner::TokenKind::CloseCurly | dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                        dartq_scanner::TokenKind::CloseCurly
+                        | dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare => {
                             depth -= 1;
                             if depth == 0 {
                                 return probe >= end;
@@ -16342,10 +16320,14 @@ impl Engine<'_> {
                         return false;
                     };
                     match token.kind {
-                        dartq_scanner::TokenKind::OpenCurly | dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                        dartq_scanner::TokenKind::OpenCurly
+                        | dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare => {
                             depth += 1;
                         }
-                        dartq_scanner::TokenKind::CloseCurly | dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                        dartq_scanner::TokenKind::CloseCurly
+                        | dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare => {
                             depth -= 1;
                             if depth == 0 {
                                 break probe + 1;
@@ -16409,7 +16391,9 @@ impl Engine<'_> {
         let mut cursor = start;
         while let Some(prev) = cursor.checked_sub(1) {
             match tokens[prev].kind {
-                dartq_scanner::TokenKind::CloseCurly | dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => {
+                dartq_scanner::TokenKind::CloseCurly
+                | dartq_scanner::TokenKind::CloseParen
+                | dartq_scanner::TokenKind::CloseSquare => {
                     depth += 1;
                 }
                 dartq_scanner::TokenKind::OpenCurly => {
@@ -16452,7 +16436,8 @@ impl Engine<'_> {
                 let mut cursor = prev;
                 while let Some(open) = cursor.checked_sub(1) {
                     match tokens[open].kind {
-                        dartq_scanner::TokenKind::CloseParen | dartq_scanner::TokenKind::CloseSquare => depth += 1,
+                        dartq_scanner::TokenKind::CloseParen
+                        | dartq_scanner::TokenKind::CloseSquare => depth += 1,
                         dartq_scanner::TokenKind::OpenParen => {
                             depth -= 1;
                             if depth == 0 {
@@ -16477,10 +16462,14 @@ impl Engine<'_> {
             }
             // `sync {` / `async {` / `sync* {` / `async* {` bodies, and a
             // constructor body's `{` after its initializer list's `:`.
-            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Sync | dartq_scanner::Keyword::Async) => true,
+            dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::Sync | dartq_scanner::Keyword::Async,
+            ) => true,
             dartq_scanner::TokenKind::Star => matches!(
                 prev.checked_sub(1).map(|i| tokens[i].kind),
-                Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Sync | dartq_scanner::Keyword::Async))
+                Some(dartq_scanner::TokenKind::Keyword(
+                    dartq_scanner::Keyword::Sync | dartq_scanner::Keyword::Async
+                ))
             ),
             _ => {
                 // A constructor's `this : f = 0 {` body: scan back over
@@ -16493,7 +16482,8 @@ impl Engine<'_> {
                         dartq_scanner::TokenKind::CloseParen
                         | dartq_scanner::TokenKind::CloseSquare
                         | dartq_scanner::TokenKind::CloseCurly => depth += 1,
-                        dartq_scanner::TokenKind::OpenParen | dartq_scanner::TokenKind::OpenSquare => {
+                        dartq_scanner::TokenKind::OpenParen
+                        | dartq_scanner::TokenKind::OpenSquare => {
                             if depth == 0 {
                                 break;
                             }
@@ -16505,7 +16495,10 @@ impl Engine<'_> {
                             }
                             depth -= 1;
                         }
-                        dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Function if depth == 0 => {
+                        dartq_scanner::TokenKind::Semicolon
+                        | dartq_scanner::TokenKind::Function
+                            if depth == 0 =>
+                        {
                             return false;
                         }
                         dartq_scanner::TokenKind::Colon if depth == 0 => {
@@ -16704,8 +16697,7 @@ fn operand_expr_head(engine: &Engine<'_>, from: u32) -> u32 {
                     };
                     if let Some(group_open) = group_open {
                         head = group_open;
-                        while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte)
-                        {
+                        while head > 0 && engine.byte_at(head - 1).is_some_and(is_ident_byte) {
                             head -= 1;
                         }
                     }

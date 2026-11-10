@@ -65,9 +65,13 @@ fn ticket_3164_binary_left_invocation_anchors_method_name() {
     );
     let diagnostic = &report.diagnostics[0];
     assert_eq!(diagnostic.message, VOID_MSG);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v() + 1").unwrap();
-    assert_eq!(diagnostic.range.offset as usize, offset, "{:?}", rows(&report));
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v() + 1").unwrap();
+    assert_eq!(
+        diagnostic.range.offset as usize,
+        offset,
+        "{:?}",
+        rows(&report)
+    );
     assert_eq!(diagnostic.range.length, 1, "{:?}", rows(&report));
 }
 
@@ -109,10 +113,10 @@ fn ticket_3164_logical_operators_check_both_operands() {
     assert_eq!(names, ["use_of_void_result"], "{:?}", rows(&right));
     // The right operand's anchor is the `v` inside `flag && v()`.
     let fixture = "void v() {}\nvoid main() {\n  bool flag = true;\n  flag && v();\n}";
-    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len()
-        + fixture.find("v();\n}").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v();\n}").unwrap();
     assert_eq!(
-        right.diagnostics[0].range.offset as usize, offset,
+        right.diagnostics[0].range.offset as usize,
+        offset,
         "{:?}",
         rows(&right)
     );
@@ -158,10 +162,10 @@ fn ticket_3164_negation_operand_fires_void_not_non_bool() {
     let report = report_ops(fixture);
     let names = code_names(&report);
     assert_eq!(names, ["use_of_void_result"], "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v();").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v();").unwrap();
     assert_eq!(
-        report.diagnostics[0].range.offset as usize, offset,
+        report.diagnostics[0].range.offset as usize,
+        offset,
         "{:?}",
         rows(&report)
     );
@@ -178,10 +182,10 @@ fn ticket_3164_null_assert_operand_anchors_whole_bang_expression() {
     let names = code_names(&report);
     assert_eq!(names, ["use_of_void_result"], "{:?}", rows(&report));
     // The anchor covers `v()!` — operand start through `!` end, length 4.
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v()!").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("v()!").unwrap();
     assert_eq!(
-        report.diagnostics[0].range.offset as usize, offset,
+        report.diagnostics[0].range.offset as usize,
+        offset,
         "{:?}",
         rows(&report)
     );
@@ -251,15 +255,15 @@ fn ticket_3164_ternary_condition_reports_void() {
         "{:?}",
         rows(&report)
     );
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
         .iter()
         .find(|d| d.code.name == "use_of_void_result")
         .expect("use_of_void_result row");
     assert_eq!(
-        void_row.range.offset as usize, offset,
+        void_row.range.offset as usize,
+        offset,
         "{:?}",
         rows(&report)
     );
@@ -272,7 +276,9 @@ fn ticket_3164_ternary_condition_reports_void() {
 fn ticket_3164_expression_statement_discard_stays_silent() {
     let report = report_ops("void v() {}\nvoid main() {\n  v();\n}");
     assert!(
-        !code_names(&report).iter().any(|name| *name == "use_of_void_result"),
+        !code_names(&report)
+            .iter()
+            .any(|name| *name == "use_of_void_result"),
         "{:?}",
         rows(&report)
     );

@@ -190,7 +190,12 @@ impl<'a> Engine<'a> {
             if declaring_kind != ContainerKind::Class || declaring != excluded {
                 let a0 = self.member_display(member);
                 let a1 = self.display_of(declaring);
-                self.stage_row(SemanticCode::IllegalConcreteEnumMember, name_range, &a0, &a1);
+                self.stage_row(
+                    SemanticCode::IllegalConcreteEnumMember,
+                    name_range,
+                    &a0,
+                    &a1,
+                );
             }
         }
         // `_checkIllegalEnumValuesInheritance` reads the merged interface.
@@ -295,8 +300,7 @@ impl<'a> Engine<'a> {
             (None, ContainerKind::Enum) => self.intern("Enum"),
             (None, _) => object_id,
         };
-        let resolved_super =
-            self.resolve_clause_face(name, self.file, scope_lib, implicit_super);
+        let resolved_super = self.resolve_clause_face(name, self.file, scope_lib, implicit_super);
         let mut previous: Vec<(StringId, FileId)> = Vec::new();
         for (position, mixin) in container.with_clause.iter().enumerate() {
             let resolved = self.resolve_clause_face(name, self.file, scope_lib, *mixin);
@@ -678,14 +682,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Stages one three-placeholder row (the mixin-constraint face).
-    fn stage_row3(
-        &mut self,
-        code: SemanticCode,
-        range: SourceRange,
-        a0: &str,
-        a1: &str,
-        a2: &str,
-    ) {
+    fn stage_row3(&mut self, code: SemanticCode, range: SourceRange, a0: &str, a1: &str, a2: &str) {
         let correction = code.correction_message(a0);
         self.report.usage.push(Diagnostic::new(
             code.severity(),

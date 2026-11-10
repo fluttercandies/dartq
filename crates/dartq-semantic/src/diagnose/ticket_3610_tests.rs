@@ -171,7 +171,8 @@ fn non_const_assign_leaves_condition_live() {
 /// statement's later extent. Oracle on `c && (x = g()) > 0`: `> 0`.
 #[test]
 fn logical_rhs_interior_death_closes_at_operand_end() {
-    let source = "Never g() => throw 0;\nvoid t(bool c, int x) {\n  var r = c && (x = g()) > 0;\n}\n";
+    let source =
+        "Never g() => throw 0;\nvoid t(bool c, int x) {\n  var r = c && (x = g()) > 0;\n}\n";
     let report = report_ops(source);
     assert_eq!(dead_text(&report, source), vec!["> 0".to_owned()]);
 }
@@ -191,7 +192,8 @@ fn logical_or_rhs_interior_death_closes_at_operand_end() {
 /// Oracle on `c is int && g() is int`: `4:30|3` — `int` alone.
 #[test]
 fn logical_rhs_never_call_is_test_rows_the_type_head() {
-    let source = "Never g() => throw 0;\nvoid t(Object? c) {\n  var r = c is int && g() is int;\n}\n";
+    let source =
+        "Never g() => throw 0;\nvoid t(Object? c) {\n  var r = c is int && g() is int;\n}\n";
     let report = report_ops(source);
     assert_eq!(dead_text(&report, source), vec!["int".to_owned()]);
 }

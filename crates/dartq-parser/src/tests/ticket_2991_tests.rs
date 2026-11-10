@@ -117,9 +117,7 @@ fn receiver_function_typed_formals_group_and_untyped() {
 fn receiver_function_typed_formal_missing_period() {
     assert_rows(
         "class F { F(U this f<U>(U a)); }\n",
-        &[
-            ("expected_token", 1, 20, 1, "Expected to find '.'."),
-        ],
+        &[("expected_token", 1, 20, 1, "Expected to find '.'.")],
         "this f<U>( missing period",
     );
 }
@@ -149,7 +147,13 @@ fn var_receiver_function_typed_formal() {
     assert_rows(
         "void g(var this.h());\n",
         &[
-            ("extraneous_modifier", 1, 8, 3, "Can't have modifier 'var' here."),
+            (
+                "extraneous_modifier",
+                1,
+                8,
+                3,
+                "Can't have modifier 'var' here.",
+            ),
             (
                 "function_typed_parameter_var",
                 1,

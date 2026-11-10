@@ -319,7 +319,13 @@ pub fn typedef_parameter_variances(
     body: TypeId,
     argument_variance: impl Fn(TypeDeclId, usize) -> Option<Variance>,
 ) -> Vec<Variance> {
-    typedef_parameter_variances_with(table, &|p| facts.get(p), parameters, body, argument_variance)
+    typedef_parameter_variances_with(
+        table,
+        &|p| facts.get(p),
+        parameters,
+        body,
+        argument_variance,
+    )
 }
 
 /// [`typedef_parameter_variances`] over a caller-held facts provider — the
@@ -383,16 +389,14 @@ fn variance_in_type_bounded(
             }
             result
         }
-        TypeKind::FutureOr { base } => {
-            variance_in_type_bounded(
-                table,
-                facts_of,
-                parameter,
-                base,
-                argument_variance,
-                depth - 1,
-            )
-        }
+        TypeKind::FutureOr { base } => variance_in_type_bounded(
+            table,
+            facts_of,
+            parameter,
+            base,
+            argument_variance,
+            depth - 1,
+        ),
         TypeKind::Function { signature } => {
             let sig = table.signature(signature);
             let mut result = variance_in_type_bounded(

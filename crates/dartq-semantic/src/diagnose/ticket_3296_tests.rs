@@ -99,7 +99,9 @@ fn implicit_creation_group_reports() {
 /// double-count the head that its own site already judged.
 #[test]
 fn written_group_head_stays_single() {
-    let hits = bounds_rows(&report_ops("class C<T extends int> {}\nvoid f(C<String> x) {}\n"));
+    let hits = bounds_rows(&report_ops(
+        "class C<T extends int> {}\nvoid f(C<String> x) {}\n",
+    ));
     assert_eq!(hits.len(), 1, "{hits:#?}");
 }
 

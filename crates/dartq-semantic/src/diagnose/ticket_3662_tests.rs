@@ -27,7 +27,11 @@
 use super::test_rig::{assert_silent, code_names, report_ops, report_ops_bare, rows};
 
 fn code_count(report: &crate::diagnose::FileReport, name: &str) -> usize {
-    report.diagnostics.iter().filter(|d| d.code.name == name).count()
+    report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == name)
+        .count()
 }
 
 fn wnta(report: &crate::diagnose::FileReport) -> usize {
@@ -178,7 +182,12 @@ fn unnamed_ctor_type_args_report_ctor_code() {
         "A<int>.new<int> is the constructor-selector face: {:?}",
         rows(&report)
     );
-    assert_eq!(wnta(&report), 0, "the head is correct arity: {:?}", rows(&report));
+    assert_eq!(
+        wnta(&report),
+        0,
+        "the head is correct arity: {:?}",
+        rows(&report)
+    );
 }
 
 /// (b) `A<int>.foo<int>` — a named-constructor selector's group reports
@@ -199,7 +208,12 @@ fn named_ctor_type_args_report_ctor_code() {
         "A<int>.foo<int> is the constructor-selector face: {:?}",
         rows(&report)
     );
-    assert_eq!(wnta(&report), 0, "the head is correct arity: {:?}", rows(&report));
+    assert_eq!(
+        wnta(&report),
+        0,
+        "the head is correct arity: {:?}",
+        rows(&report)
+    );
 }
 
 /// (c) The `NamedType` anchor covers the whole `name<args>` —
@@ -222,7 +236,12 @@ fn implicit_creation_reports_named_type_anchor() {
         .filter(|d| d.code.name == "wrong_number_of_type_arguments")
         .collect();
     assert_eq!(diags.len(), 1, "one base-code row: {:?}", rows(&report));
-    assert_eq!(diags[0].range.length, 6, "span is `C<int>`: {:?}", rows(&report));
+    assert_eq!(
+        diags[0].range.length,
+        6,
+        "span is `C<int>`: {:?}",
+        rows(&report)
+    );
 }
 
 /// (c) `A<A>?` — a declared-2 head given 1 arg inside a nullable
@@ -243,7 +262,8 @@ fn nullable_annotation_anchor_includes_question_mark() {
         .collect();
     assert_eq!(diags.len(), 1, "one base-code row: {:?}", rows(&report));
     assert_eq!(
-        diags[0].range.length, 5,
+        diags[0].range.length,
+        5,
         "span is `A<A>?` (name..>..?): {:?}",
         rows(&report)
     );
@@ -270,7 +290,8 @@ fn typedef_instantiation_reports_at_group() {
         .collect();
     assert_eq!(diags.len(), 1, "one base-code row: {:?}", rows(&report));
     assert_eq!(
-        diags[0].range.length, 5,
+        diags[0].range.length,
+        5,
         "span is the `<int>` group: {:?}",
         rows(&report)
     );
@@ -296,7 +317,8 @@ fn typedef_ctor_ref_reports_named_type_anchor() {
         .collect();
     assert_eq!(diags.len(), 1, "one base-code row: {:?}", rows(&report));
     assert_eq!(
-        diags[0].range.length, 11,
+        diags[0].range.length,
+        11,
         "span is `MyList<int>`: {:?}",
         rows(&report)
     );
@@ -309,7 +331,12 @@ fn typedef_ctor_ref_reports_named_type_anchor() {
 #[test]
 fn never_type_args_report() {
     let report = report_ops("void f(Never<int> x) {}\n");
-    assert_eq!(wnta(&report), 1, "Never is a 0-arity type head: {:?}", rows(&report));
+    assert_eq!(
+        wnta(&report),
+        1,
+        "Never is a 0-arity type head: {:?}",
+        rows(&report)
+    );
 }
 
 /// Negative control — a correctly-sized group stays silent: `C<int>`

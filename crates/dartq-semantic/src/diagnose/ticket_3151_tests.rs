@@ -165,9 +165,8 @@ fn local_function_inside_closure_reports() {
 /// A local function inside a switch case reports identically.
 #[test]
 fn local_function_inside_switch_case_reports() {
-    let report = report(
-        "int f(int x) { switch (x) { case 1: int g() {} return g(); default: return 0; } }",
-    );
+    let report =
+        report("int f(int x) { switch (x) { case 1: int g() {} return g(); default: return 0; } }");
     assert_eq!(
         completion_rows(&report),
         vec![("body_might_complete_normally", 40)]

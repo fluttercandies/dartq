@@ -69,7 +69,10 @@ class A<T extends F<num>> {}
     let bound = param_bound(&types, &strings, file, "T");
     // The bound is the expanded function signature.
     assert!(
-        matches!(types.testing_table().get(bound).kind(), TypeKind::Function { .. }),
+        matches!(
+            types.testing_table().get(bound).kind(),
+            TypeKind::Function { .. }
+        ),
         "`F<num>`'s bound must be the expanded function type, got {:?}",
         types.testing_table().get(bound).kind()
     );
@@ -95,7 +98,10 @@ class A<T extends F<num>> {}
     let (types, strings, file) = types_for(source);
     let bound = param_bound(&types, &strings, file, "T");
     assert!(
-        matches!(types.testing_table().get(bound).kind(), TypeKind::Interface { .. }),
+        matches!(
+            types.testing_table().get(bound).kind(),
+            TypeKind::Interface { .. }
+        ),
         "`F<num>`'s bound must be the `List<..>` instantiation"
     );
     let binders = types.testing_fn_binder_bounds(bound);

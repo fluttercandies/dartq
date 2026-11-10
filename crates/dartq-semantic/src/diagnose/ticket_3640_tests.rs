@@ -234,7 +234,11 @@ fn record_node_with_wildcard_field_reports_only_the_node() {
         rows[0].2.contains("'({int x1})'") && rows[0].2.contains("'(Object?,)'"),
         "{rows:#?}"
     );
-    assert!(refutable_rows(&report).is_empty(), "{:#?}", report.diagnostics);
+    assert!(
+        refutable_rows(&report).is_empty(),
+        "{:#?}",
+        report.diagnostics
+    );
 }
 
 /// `var (:int _) = (x3: 1);` — the record node reports, and the typed
@@ -292,7 +296,11 @@ fn object_relational_field_is_refutable() {
         "{:#?}",
         report.diagnostics
     );
-    assert!(mismatch_rows(&report).is_empty(), "{:#?}", report.diagnostics);
+    assert!(
+        mismatch_rows(&report).is_empty(),
+        "{:#?}",
+        report.diagnostics
+    );
 }
 
 /// A `||` object field value reports the whole logical-or node and

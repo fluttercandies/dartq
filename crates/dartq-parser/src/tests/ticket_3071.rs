@@ -75,7 +75,9 @@ fn for_equals_break_reports_on_junk_not_on_curly() {
         "one unexpected_token on the junk `break`, got {rows:?}"
     );
     assert!(
-        !rows.iter().any(|(code, start, _)| code == "unexpected_token" && *start != 19),
+        !rows
+            .iter()
+            .any(|(code, start, _)| code == "unexpected_token" && *start != 19),
         "no unexpected_token away from the junk anchor, got {rows:?}"
     );
 }
@@ -124,11 +126,14 @@ fn catch_trace_junk_relocates_closer_and_stalls_body_on_junk() {
         "catch_syntax on the junk `assert`, got {rows:?}"
     );
     assert!(
-        !rows.iter().any(|(code, _, _)| code == "expected_identifier_but_got_keyword"),
+        !rows
+            .iter()
+            .any(|(code, _, _)| code == "expected_identifier_but_got_keyword"),
         "no keyword-name face from a re-parse over the junk, got {rows:?}"
     );
     assert!(
-        !rows.iter()
+        !rows
+            .iter()
             .any(|(code, _, _)| code == "catch_syntax_extra_parameters"),
         "no extra-parameters row behind a synthetic name, got {rows:?}"
     );

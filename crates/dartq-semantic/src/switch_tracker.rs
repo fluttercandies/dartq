@@ -17,7 +17,6 @@ use dartq_types::{ExhaustivenessWorld, Key, Single, Space};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 
-
 /// The open-switch context stack: a `Vec` face for every caller (the
 /// `Deref` chain keeps `last`/`last_mut`/`len`/`is_empty` verbatim), with
 /// one twist — `pop` RETAINS the closed context into `completed` so the
@@ -628,9 +627,7 @@ pub(crate) fn restriction_disjoint_from(
         // head can be one (`canBeSubtypeOf`'s type ask over the
         // unrestricted list face — the element/size refinements only
         // narrow the case's own space, the `Restriction::Object` rule).
-        Restriction::List { elem, .. } => {
-            !world.can_be_subtype_of(&world.list_ty(*elem), &matched)
-        }
+        Restriction::List { elem, .. } => !world.can_be_subtype_of(&world.list_ty(*elem), &matched),
         // The object pattern's head test decides the overlap; the property
         // refinements only narrow the case's own space.
         Restriction::Object(name, _) => {
@@ -644,15 +641,13 @@ pub(crate) fn restriction_disjoint_from(
         }
         // The record pattern's head test decides the overlap; the field
         // refinements only narrow the case's own space.
-        Restriction::Record { shape, .. } => {
-            !world.can_be_subtype_of(
-                &NameTy::Record {
-                    shape: *shape,
-                    nullable: false,
-                },
-                &matched,
-            )
-        }
+        Restriction::Record { shape, .. } => !world.can_be_subtype_of(
+            &NameTy::Record {
+                shape: *shape,
+                nullable: false,
+            },
+            &matched,
+        ),
         Restriction::BoolValue(value) => {
             !world.can_be_subtype_of(&NameTy::BoolValue(*value), &matched)
         }
@@ -739,11 +734,7 @@ fn always_exhaustive_within(world: &NameWorld<'_>, ty: NameTy, budget: u8) -> bo
                     .iter()
                     .chain(shape.named.iter().map(|(_, ty)| ty))
                     .all(|field| {
-                        always_exhaustive_within(
-                            world,
-                            NameTy::from_semantic(*field),
-                            budget - 1,
-                        )
+                        always_exhaustive_within(world, NameTy::from_semantic(*field), budget - 1)
                     })
             }
             None => false,
@@ -1822,7 +1813,9 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 | NameTy::EnumValue(..)
                 | NameTy::BoolValue(_)
                 | NameTy::ListPat { .. }
-                | NameTy::Record { nullable: false, .. },
+                | NameTy::Record {
+                    nullable: false, ..
+                },
                 NameTy::TopNonNullable,
             ) => true,
             // A record-pair subtype (subtype.dart's record arm): the same
@@ -1904,7 +1897,13 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 // first, list.dart:280): `[...]` covers every list.
                 (*tr && *ts == 0)
                     || (self.elem_sub(*se, *te)
-                        && if *tr { ss >= ts } else if *sr { false } else { ss == ts })
+                        && if *tr {
+                            ss >= ts
+                        } else if *sr {
+                            false
+                        } else {
+                            ss == ts
+                        })
             }
             // A list pattern type is still a `List<E>` at the interface
             // face (`TypeBasedStaticType.isSubtypeOfInternal` — the
@@ -1918,11 +1917,14 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             // (`has_rest && size == 0` IS `List<E>` — `[...]`); every
             // restricted target rejects an unrestricted source
             // (types.dart:236-241).
-            (sub, NameTy::ListPat {
-                elem,
-                size: 0,
-                has_rest: true,
-            }) => self.is_subtype_of(sub, &self.list_ty(*elem)),
+            (
+                sub,
+                NameTy::ListPat {
+                    elem,
+                    size: 0,
+                    has_rest: true,
+                },
+            ) => self.is_subtype_of(sub, &self.list_ty(*elem)),
             (_, NameTy::ListPat { .. }) => false,
             _ => false,
         }
@@ -2134,7 +2136,12 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             if max_head + max_tail < *size as usize {
                 max_head = *size as usize - max_tail;
             }
-            let field = |key: &Key| fields.iter().find(|(k, _)| k == key).map(|(_, t)| t.as_str());
+            let field = |key: &Key| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, t)| t.as_str())
+            };
             let mut text = String::from("[");
             let mut comma = "";
             for index in 0..max_head {
@@ -2185,7 +2192,12 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         {
             let pool = engine.boundary.pool();
             let shape = pool.record_shape(*shape);
-            let field = |key: &Key| fields.iter().find(|(k, _)| k == key).map(|(_, t)| t.as_str());
+            let field = |key: &Key| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, t)| t.as_str())
+            };
             let mut text = String::from("(");
             let mut comma = "";
             for index in 0..shape.positional.len() {
@@ -2411,7 +2423,8 @@ impl<'a> NameWorld<'a> {
     /// parse-time window the argument slots cannot be resolved and the
     /// pre-#3236 collapse answer stands.
     fn same_head_can_be(&self, left: &NameTy, right: &NameTy, budget: u8) -> bool {
-        let (NameTy::NamedArgs(_, _, left_args), NameTy::NamedArgs(_, _, right_args)) = (left, right)
+        let (NameTy::NamedArgs(_, _, left_args), NameTy::NamedArgs(_, _, right_args)) =
+            (left, right)
         else {
             return true;
         };
@@ -2691,12 +2704,10 @@ impl<'a> NameWorld<'a> {
             // keeps the written representation (the under-report direction).
             let repr = match (current, fold_engine()) {
                 (NameTy::NamedArgs(_, _, use_args), Some(engine))
-                    if use_args != ArgListId::EMPTY
-                        && !container.type_param_names.is_empty() =>
+                    if use_args != ArgListId::EMPTY && !container.type_param_names.is_empty() =>
                 {
                     let projected = engine.boundary.ty(owner, repr);
-                    let use_args: Vec<Ty> =
-                        engine.boundary.pool().get(use_args).to_vec();
+                    let use_args: Vec<Ty> = engine.boundary.pool().get(use_args).to_vec();
                     Self::substitute_params(
                         engine,
                         projected,
@@ -2806,7 +2817,10 @@ impl<'a> NameWorld<'a> {
                 | NameTy::EnumValue(..)
                 | NameTy::BoolValue(_)
                 | NameTy::ListPat { .. }
-                | NameTy::Record { nullable: false, .. }
+                | NameTy::Record {
+                    nullable: false,
+                    ..
+                }
                 | NameTy::Never
         )
     }
@@ -2980,11 +2994,11 @@ impl<'a> NameWorld<'a> {
     fn list_ty(&self, elem: Ty) -> NameTy {
         match fold_engine() {
             Some(engine) => {
-                let ty = engine.boundary.args.borrow_mut().named(
-                    self.list_head(),
-                    false,
-                    &[elem],
-                );
+                let ty = engine
+                    .boundary
+                    .args
+                    .borrow_mut()
+                    .named(self.list_head(), false, &[elem]);
                 match ty {
                     Ty::Named { name, args, .. } => NameTy::NamedArgs(name, false, args),
                     _ => NameTy::Named(self.list_head(), false),
@@ -3034,8 +3048,15 @@ impl<'a> NameWorld<'a> {
         sub.positional
             .iter()
             .zip(sup.positional.iter())
-            .chain(sub.named.iter().zip(sup.named.iter()).map(|((_, a), (_, b))| (a, b)))
-            .all(|(a, b)| self.is_subtype_of(&NameTy::from_semantic(*a), &NameTy::from_semantic(*b)))
+            .chain(
+                sub.named
+                    .iter()
+                    .zip(sup.named.iter())
+                    .map(|((_, a), (_, b))| (a, b)),
+            )
+            .all(|(a, b)| {
+                self.is_subtype_of(&NameTy::from_semantic(*a), &NameTy::from_semantic(*b))
+            })
     }
 
     /// The element type of a `List`-headed static type: the written
@@ -3254,11 +3275,7 @@ impl<'a> NameWorld<'a> {
                     Some(args) => format!("{}{args}", self.strings.resolve(*name)),
                     None => self.strings.resolve(*name).to_string(),
                 };
-                if *nullable {
-                    format!("{text}?")
-                } else {
-                    text
-                }
+                if *nullable { format!("{text}?") } else { text }
             }
             NameTy::EnumValue(enum_name, constant) => {
                 format!(
@@ -3452,14 +3469,8 @@ impl<'a> NameWorld<'a> {
             return true;
         }
         for (sub_arg, sup_arg) in sub_list.iter().zip(sup_list.iter()) {
-            let (
-                Ty::Named {
-                    name: sub_name, ..
-                },
-                Ty::Named {
-                    name: sup_name, ..
-                },
-            ) = (sub_arg, sup_arg)
+            let (Ty::Named { name: sub_name, .. }, Ty::Named { name: sup_name, .. }) =
+                (sub_arg, sup_arg)
             else {
                 return true;
             };
@@ -3478,9 +3489,8 @@ impl<'a> NameWorld<'a> {
                 // so `String <: num` decides `false` where the walk's
                 // `cut` answers `None`. The primitive faces the model
                 // already trusts ([`Self::primitive_ids`]) decide it.
-                None
-                    if self.primitive_ids.contains(sub_name)
-                        && self.primitive_ids.contains(sup_name) =>
+                None if self.primitive_ids.contains(sub_name)
+                    && self.primitive_ids.contains(sup_name) =>
                 {
                     return false;
                 }
@@ -3847,12 +3857,7 @@ impl<'a> NameWorld<'a> {
     /// The property columns of an object single are not walked here (a cast
     /// whose sub-pattern constrains fields answers the conservative `false`,
     /// so the row keeps the narrower space — never a false full coverage).
-    pub(crate) fn contained_in(
-        &self,
-        ty: NameTy,
-        space: &Restriction,
-        context: NameTy,
-    ) -> bool {
+    pub(crate) fn contained_in(&self, ty: NameTy, space: &Restriction, context: NameTy) -> bool {
         match space {
             Restriction::NamedContext => self.is_subtype_of(&ty, &context),
             Restriction::Union(parts) => {
@@ -3867,9 +3872,11 @@ impl<'a> NameWorld<'a> {
                 }
                 let subtypes = self.subtypes(&ty, &rustc_hash::FxHashSet::default());
                 !subtypes.is_empty()
-                    && subtypes
-                        .iter()
-                        .all(|sub| parts.iter().any(|part| self.contained_in(*sub, part, context)))
+                    && subtypes.iter().all(|sub| {
+                        parts
+                            .iter()
+                            .any(|part| self.contained_in(*sub, part, context))
+                    })
             }
             Restriction::Null => matches!(ty, NameTy::Null),
             // The official `_isContainedIn` gate is `_isUnrestricted(single)`

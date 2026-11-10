@@ -55,12 +55,11 @@ fn all_names(report: &FileReport) -> Vec<&'static str> {
 /// A bare-version fixture: `report_ops_bare` reads the `// @dart=` marker
 /// only when it leads the file (no prelude), so each fixture spells its own
 /// types.
-const ENUM_FIXTURE: &str = "enum E { a, b }\nvoid f(E e) {\n  switch (e) {\n    case E.a:\n      break;\n  }\n}\n";
-const NULL_ENUM_FIXTURE: &str =
-    "enum E { a, b }\nvoid f(E? e) {\n  switch (e) {\n    case E.a:\n      break;\n    case E.b:\n      break;\n  }\n}\n";
+const ENUM_FIXTURE: &str =
+    "enum E { a, b }\nvoid f(E e) {\n  switch (e) {\n    case E.a:\n      break;\n  }\n}\n";
+const NULL_ENUM_FIXTURE: &str = "enum E { a, b }\nvoid f(E? e) {\n  switch (e) {\n    case E.a:\n      break;\n    case E.b:\n      break;\n  }\n}\n";
 const EQUALS_FIXTURE: &str = "class Object {}\nclass C {\n  const C();\n  bool operator ==(Object o) => true;\n}\nconst c = C();\nvoid f(Object o) {\n  switch (o) {\n    case c:\n      break;\n  }\n}\n";
-const SUBTYPE_FIXTURE: &str =
-    "class int {}\nclass String {}\nvoid f(int i) {\n  switch (i) {\n    case 'x':\n      break;\n  }\n}\n";
+const SUBTYPE_FIXTURE: &str = "class int {}\nclass String {}\nvoid f(int i) {\n  switch (i) {\n    case 'x':\n      break;\n  }\n}\n";
 
 /// `case E.a` over `enum E {a, b}` with no `default`: the uncovered `b`
 /// reports at the `switch (e)` span. Oracle:
@@ -104,7 +103,12 @@ fn missing_enum_constant_silent_at_3_13() {
 fn missing_enum_null_constant_fires_at_2_19() {
     let report = report_ops_bare(&format!("// @dart=2.19\n{NULL_ENUM_FIXTURE}"));
     let rows = code_rows(&report, "missing_enum_constant_in_switch");
-    assert_eq!(rows.len(), 1, "one 'null' row expected: {:?}", all_names(&report));
+    assert_eq!(
+        rows.len(),
+        1,
+        "one 'null' row expected: {:?}",
+        all_names(&report)
+    );
 }
 
 /// Same nullable source at 3.13: silent to the legacy code.
@@ -159,7 +163,11 @@ fn case_expression_implements_equals_silent_at_3_13() {
 fn case_expression_type_mismatch_fires_at_2_19() {
     let report = report_ops_bare(&format!("// @dart=2.19\n{SUBTYPE_FIXTURE}"));
     assert_eq!(
-        code_rows(&report, "case_expression_type_is_not_switch_expression_subtype").len(),
+        code_rows(
+            &report,
+            "case_expression_type_is_not_switch_expression_subtype"
+        )
+        .len(),
         1,
         "the type-mismatch head reports: {:?}",
         all_names(&report)
@@ -172,7 +180,11 @@ fn case_expression_type_mismatch_fires_at_2_19() {
 fn case_expression_type_mismatch_silent_at_3_13() {
     let report = report_ops_bare(&format!("// @dart=3.13\n{SUBTYPE_FIXTURE}"));
     assert!(
-        code_rows(&report, "case_expression_type_is_not_switch_expression_subtype").is_empty(),
+        code_rows(
+            &report,
+            "case_expression_type_is_not_switch_expression_subtype"
+        )
+        .is_empty(),
         "the pre-3.0 type-mismatch gate must not run under patterns: {:?}",
         all_names(&report)
     );
@@ -191,9 +203,7 @@ fn deferred_report() -> FileReport {
     let mut builder = LibraryGraphBuilder::new(&strings);
     let core_lib = builder.intern("dart:core");
     let core_file = files.intern(Path::new("<dart:core>"));
-    for name in [
-        "Object", "int", "bool", "num", "String", "Null", "Enum",
-    ] {
+    for name in ["Object", "int", "bool", "num", "String", "Null", "Enum"] {
         builder.declare(core_lib, strings.intern(name), core_file);
     }
     let scan = |source: &str, file: dartq_source::FileId| {
@@ -210,10 +220,9 @@ fn deferred_report() -> FileReport {
     };
     let main = "// @dart=2.19\nimport 'def.dart' deferred as d;\nvoid f(int i) {\n  switch (i) {\n    case d.c:\n      break;\n  }\n}\n";
     let dep = "const c = 1;\n";
-    let features =
-        ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-            LanguageVersion::new(2, 19),
-        ));
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(2, 19),
+    ));
     let mut index = ElementIndex::default();
     let mut units = Vec::new();
     for (uri, source) in [("package:t/main.dart", main), ("package:t/def.dart", dep)] {
@@ -283,7 +292,10 @@ fn deferred_report() -> FileReport {
 #[test]
 fn deferred_library_head_fires_at_2_19() {
     let report = deferred_report();
-    let rows = code_rows(&report, "non_constant_case_expression_from_deferred_library");
+    let rows = code_rows(
+        &report,
+        "non_constant_case_expression_from_deferred_library",
+    );
     assert_eq!(
         rows.len(),
         1,

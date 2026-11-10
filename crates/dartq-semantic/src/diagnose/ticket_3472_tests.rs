@@ -71,9 +71,8 @@ fn legacy_library_switch_is_silent() {
 /// expression face below is what the oracle reports.
 #[test]
 fn dynamic_statement_switch_is_silent() {
-    let report = report_ops(
-        "void f(dynamic d) {\n  switch (d) {\n    case int(): break;\n  }\n}\n",
-    );
+    let report =
+        report_ops("void f(dynamic d) {\n  switch (d) {\n    case int(): break;\n  }\n}\n");
     assert_silent(&report);
 }
 
@@ -86,7 +85,9 @@ fn dynamic_switch_expression_witnesses_the_object() {
     let rows = covering_rows("int f(dynamic d) => switch (d) { int() => 1 };\n");
     assert_eq!(
         rows,
-        ["The type 'dynamic' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Object()'."]
+        [
+            "The type 'dynamic' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Object()'."
+        ]
     );
 }
 
@@ -100,12 +101,12 @@ fn dynamic_switch_expression_witnesses_the_object() {
 /// stays unpinned here.
 #[test]
 fn same_library_private_constant_keeps_the_plain_template() {
-    let rows = covering_rows(
-        "enum E { _c, a }\nString f(E e) => switch (e) { E.a => 'a' };\n",
-    );
+    let rows = covering_rows("enum E { _c, a }\nString f(E e) => switch (e) { E.a => 'a' };\n");
     assert_eq!(
         rows,
-        ["The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E._c'."]
+        [
+            "The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E._c'."
+        ]
     );
 }
 
@@ -129,7 +130,9 @@ fn sealed_split_carries_the_scrutinee_instantiation() {
     );
     assert_eq!(
         rows,
-        ["The type 'Face<num>' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Queen<num>()'."]
+        [
+            "The type 'Face<num>' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Queen<num>()'."
+        ]
     );
 }
 
@@ -152,7 +155,9 @@ fn map_pattern_witness_renders_the_head_with_arguments() {
     );
     assert_eq!(
         covering_of(&report),
-        ["The type 'Map<bool, bool>' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Map<bool, bool>(length: int())'."]
+        [
+            "The type 'Map<bool, bool>' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'Map<bool, bool>(length: int())'."
+        ]
     );
 }
 
@@ -173,7 +178,9 @@ fn cast_pattern_covers_the_subpattern_not_the_cast_type() {
     );
     assert_eq!(
         rows,
-        ["The type 'A' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'C()'."]
+        [
+            "The type 'A' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'C()'."
+        ]
     );
 }
 
@@ -190,7 +197,9 @@ fn cast_pattern_over_an_extension_type_names_the_extension_type() {
     );
     assert_eq!(
         rows,
-        ["The type 'AET1' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'C()'."]
+        [
+            "The type 'AET1' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'C()'."
+        ]
     );
 }
 
@@ -211,7 +220,11 @@ fn exhaustive_switches_stay_silent() {
         "enum E<T> { a<int>(), b<String>(), c<double>() }\n\
          String f(E<num> e) => switch (e) { E.a => 'a', E.c => 'c' };\n",
     );
-    assert!(code_names(&enum_scrutinee).is_empty(), "{:?}", code_names(&enum_scrutinee));
+    assert!(
+        code_names(&enum_scrutinee).is_empty(),
+        "{:?}",
+        code_names(&enum_scrutinee)
+    );
 }
 
 /// The same enum with `E.b` in the case set: `b` cannot inhabit `E<num>`, so
@@ -225,6 +238,8 @@ fn generic_enum_witness_skips_the_non_inhabitant_constant() {
     );
     assert_eq!(
         rows,
-        ["The type 'E<num>' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.c'."]
+        [
+            "The type 'E<num>' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.c'."
+        ]
     );
 }

@@ -94,9 +94,7 @@ fn cascade_unknown_recv_inherits_prior_section_face() {
 /// dispatches without a member face.
 #[test]
 fn unknown_recv_stays_silent_outside_cascade() {
-    let report = report_ops(
-        "void main() { dynamic d; d.foo; d.foo(); d.foo = 1; }\n",
-    );
+    let report = report_ops("void main() { dynamic d; d.foo; d.foo(); d.foo = 1; }\n");
     let member_misses = report
         .diagnostics
         .iter()

@@ -98,7 +98,8 @@ fn never_top_level_getter_condition_stays_dead() {
 /// `{ print(1); }` and `print(2);`.
 #[test]
 fn never_call_condition_stays_dead() {
-    let source = "Never never() => throw 0;\nvoid f() {\n  if (never()) { print(1); }\n  print(2);\n}\n";
+    let source =
+        "Never never() => throw 0;\nvoid f() {\n  if (never()) { print(1); }\n  print(2);\n}\n";
     assert_eq!(
         dead_of(source),
         vec!["{ print(1); }".to_string(), "print(2);".to_string()]
@@ -115,6 +116,3 @@ fn never_parameter_statement_still_kills() {
     let source = "void f(Never v) {\n  v;\n  print(1);\n}\n";
     assert_eq!(dead_of(source), vec!["print(1);".to_string()]);
 }
-
-
-

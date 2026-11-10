@@ -53,10 +53,7 @@ fn facts_of(source: &str) -> Vec<FlowFact> {
 }
 
 /// `(snippet, ty)` of every `ReadType`/`PromotedRead` row, in fact order.
-fn reads<'a>(
-    source: &'a str,
-    facts: &[FlowFact],
-) -> (Vec<(&'a str, Ty)>, Vec<(&'a str, Ty)>) {
+fn reads<'a>(source: &'a str, facts: &[FlowFact]) -> (Vec<(&'a str, Ty)>, Vec<(&'a str, Ty)>) {
     let at = |span: dartq_source::SourceRange| {
         &source[span.offset as usize..(span.offset + span.length) as usize]
     };
@@ -169,7 +166,8 @@ fn written_nullable_local_keeps_null_check_promotion() {
         .map(|(_, ty)| *ty)
         .collect::<Vec<_>>();
     assert!(
-        arm.iter().any(|ty| !ty.nullable && matches!(ty.base, Base::Name(_))),
+        arm.iter()
+            .any(|ty| !ty.nullable && matches!(ty.base, Base::Name(_))),
         "the else arm reads n non-nullable (promoted off num?): {read:?}"
     );
 }

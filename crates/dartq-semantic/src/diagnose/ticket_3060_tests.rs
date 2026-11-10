@@ -120,7 +120,8 @@ fn alias_application_argument_reports() {
 /// the oracle's `invalid_assignment` (`static5_test_06`).
 #[test]
 fn field_initializer_into_type_param_reports() {
-    let folded = report_ops("class A {\n  const A();\n}\nclass C<U> {\n  final U x = const A();\n}\n");
+    let folded =
+        report_ops("class A {\n  const A();\n}\nclass C<U> {\n  final U x = const A();\n}\n");
     assert_eq!(
         codes(&folded),
         vec!["invalid_assignment"],
@@ -164,11 +165,7 @@ fn null_and_reflexive_param_writes_follow_the_conjunct() {
         "`Null <: T` fails the nullable conjunct"
     );
     let nullable = report_ops("void h<T>(T? v) {\n  v = null;\n}\n");
-    assert_eq!(
-        codes(&nullable),
-        Vec::<&str>::new(),
-        "`Null <: T?` holds"
-    );
+    assert_eq!(codes(&nullable), Vec::<&str>::new(), "`Null <: T?` holds");
     let reflexive = report_ops("void k<T>(T t) {\n  t = t;\n}\n");
     assert_eq!(
         codes(&reflexive),

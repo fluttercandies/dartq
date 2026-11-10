@@ -13,8 +13,8 @@
 //! face of a function-name read (its static type is the declaration's
 //! `FunctionType`, formals and written return included).
 
-use super::async_return_tests::{code_names, report};
 use super::super::types::FileReport;
+use super::async_return_tests::{code_names, report};
 
 /// The three codes this ticket owns; the pins assert over these alone so
 /// incidental warnings (`unused_local_variable` on pin locals) never blur
@@ -53,14 +53,22 @@ fn never_target_null_reports() {
 #[test]
 fn never_source_into_nullable_stays_clean() {
     let report = report("class Never {}\nNever nv = throw 1;\nint? h = nv;");
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// A `Never`-typed read is clean against its own target too.
 #[test]
 fn never_source_into_never_stays_clean() {
     let report = report("class Never {}\nNever nv = throw 1;\nNever g = nv;");
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// Right Nullable (subtype.dart:224-246): `int? x = "s"` reports — the
@@ -82,7 +90,11 @@ fn nullable_target_var_source_reports() {
 #[test]
 fn nullable_target_null_stays_clean() {
     let report = report("class int {}\nint? d = null;");
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// Left Nullable ahead of Right Nullable: `int? <: int?` decomposes on
@@ -90,7 +102,11 @@ fn nullable_target_null_stays_clean() {
 #[test]
 fn nullable_into_same_nullable_stays_clean() {
     let report = report("class int {}\nint one = 1;\nint? d = one;\nint? e = d;");
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// The bare function-name initializer IS the tear-off: `int x = nf;`
@@ -133,7 +149,11 @@ fn tear_off_param_contravariance_reports() {
 #[test]
 fn tear_off_matching_stays_clean() {
     let report = report("void vf() {}\nvoid Function() q = vf;");
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// The nullable function target runs the same signature rule through the
@@ -156,9 +176,8 @@ fn tear_off_return_position_reports() {
 /// capture (#2852) at the initializer position too.
 #[test]
 fn local_fn_tear_off_reports() {
-    let report = report(
-        "class int {}\nclass num {}\nvoid main() {\n  num lx() => 1;\n  int y = lx;\n}",
-    );
+    let report =
+        report("class int {}\nclass num {}\nvoid main() {\n  num lx() => 1;\n  int y = lx;\n}");
     assert_eq!(assign_codes(&report), ["invalid_assignment"]);
 }
 
@@ -167,9 +186,8 @@ fn local_fn_tear_off_reports() {
 /// `String` against `int`.
 #[test]
 fn return_send_result_reports() {
-    let report = report(
-        "class int {}\nclass String {}\nString g() => \"s\";\nint f1() { return g(); }",
-    );
+    let report =
+        report("class int {}\nclass String {}\nString g() => \"s\";\nint f1() { return g(); }");
     assert_eq!(assign_codes(&report), ["return_of_invalid_type"]);
 }
 
@@ -218,7 +236,11 @@ fn async_return_value_stays_clean() {
     let report = report(
         "class int {}\nclass Future<T> { Future.value(T v); }\nFuture<int> f() async { return 1; }",
     );
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// The argument position's tear-off face keeps its own pin: passing the
@@ -239,9 +261,8 @@ fn tear_off_argument_into_non_function_reports() {
 /// not a top type.
 #[test]
 fn if_null_assign_into_nullable_reports() {
-    let report = report(
-        "class int {}\nclass String {}\nvoid main() {\n  String? s;\n  s ??= 42;\n}",
-    );
+    let report =
+        report("class int {}\nclass String {}\nvoid main() {\n  String? s;\n  s ??= 42;\n}");
     assert_eq!(assign_codes(&report), ["invalid_assignment"]);
 }
 
@@ -249,9 +270,8 @@ fn if_null_assign_into_nullable_reports() {
 /// reports `String` into `int?`.
 #[test]
 fn if_null_assign_string_into_nullable_int_reports() {
-    let report = report(
-        "class int {}\nclass String {}\nvoid main() {\n  int? i2;\n  i2 ??= \"x\";\n}",
-    );
+    let report =
+        report("class int {}\nclass String {}\nvoid main() {\n  int? i2;\n  i2 ??= \"x\";\n}");
     assert_eq!(assign_codes(&report), ["invalid_assignment"]);
 }
 
@@ -259,10 +279,12 @@ fn if_null_assign_string_into_nullable_int_reports() {
 /// base leg accepts `String`).
 #[test]
 fn if_null_assign_matching_stays_clean() {
-    let report = report(
-        "class String {}\nvoid main() {\n  String? s;\n  s ??= \"v\";\n}",
+    let report = report("class String {}\nvoid main() {\n  String? s;\n  s ??= \"v\";\n}");
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
     );
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
 }
 
 /// The compound operator's own argument row
@@ -272,9 +294,8 @@ fn if_null_assign_matching_stays_clean() {
 /// alone — the `String` result writes back clean.
 #[test]
 fn compound_atna_string_plus_int_reports() {
-    let report = report(
-        "class int {}\nclass String {}\nvoid main() {\n  String t = \"a\";\n  t += 1;\n}",
-    );
+    let report =
+        report("class int {}\nclass String {}\nvoid main() {\n  String t = \"a\";\n  t += 1;\n}");
     assert_eq!(assign_codes(&report), ["argument_type_not_assignable"]);
     let atna = report
         .diagnostics
@@ -308,8 +329,10 @@ fn compound_atna_beside_writeback_reports() {
 /// fits `num`, the refined `int` result fits the slot).
 #[test]
 fn compound_matching_stays_clean() {
-    let report = report(
-        "class int {}\nclass num {}\nvoid main() {\n  int i = 1;\n  i += 2;\n}",
+    let report = report("class int {}\nclass num {}\nvoid main() {\n  int i = 1;\n  i += 2;\n}");
+    assert!(
+        assign_codes(&report).is_empty(),
+        "{:?}",
+        code_names(&report)
     );
-    assert!(assign_codes(&report).is_empty(), "{:?}", code_names(&report));
 }

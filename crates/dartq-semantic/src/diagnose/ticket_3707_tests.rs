@@ -43,7 +43,12 @@ fn named_field_not_last_anchors_at_label() {
     let report = report_ops(fixture);
     let start = at(fixture, "a: v()");
     let len = "a: v()".chars().map(char::len_utf16).sum::<usize>() as u32;
-    assert_eq!(void_rows(&report), vec![(start, len)], "{:#?}", rows(&report));
+    assert_eq!(
+        void_rows(&report),
+        vec![(start, len)],
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// `(a: v())` — the trailing named field (the common shape the gate was
@@ -54,7 +59,12 @@ fn trailing_named_field_anchor_unchanged() {
     let report = report_ops(fixture);
     let start = at(fixture, "a: v()");
     let len = "a: v()".chars().map(char::len_utf16).sum::<usize>() as u32;
-    assert_eq!(void_rows(&report), vec![(start, len)], "{:#?}", rows(&report));
+    assert_eq!(
+        void_rows(&report),
+        vec![(start, len)],
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// `(v(), a: 1)` — a positional `void` field before a named one: its
@@ -67,7 +77,12 @@ fn positional_field_before_named_keeps_value_anchor() {
     // inside the record literal instead.
     let start = at(fixture, "(v(), a: 1)") + 1;
     let len = "v()".chars().map(char::len_utf16).sum::<usize>() as u32;
-    assert_eq!(void_rows(&report), vec![(start, len)], "{:#?}", rows(&report));
+    assert_eq!(
+        void_rows(&report),
+        vec![(start, len)],
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// `(a: v(), b: v())` — two named `void` fields, both anchored at their
@@ -79,10 +94,7 @@ fn two_named_void_fields_anchor_at_their_labels() {
     let len = "a: v()".chars().map(char::len_utf16).sum::<usize>() as u32;
     assert_eq!(
         void_rows(&report),
-        vec![
-            (at(fixture, "a: v()"), len),
-            (at(fixture, "b: v()"), len),
-        ],
+        vec![(at(fixture, "a: v()"), len), (at(fixture, "b: v()"), len),],
         "{:#?}",
         rows(&report)
     );

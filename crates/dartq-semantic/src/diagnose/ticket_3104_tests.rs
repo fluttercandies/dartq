@@ -67,7 +67,8 @@ fn member_call_inside_dead_block_stays_silent() {
 /// windows and still reports only `dead_code`.
 #[test]
 fn member_read_inside_nested_dead_blocks_stays_silent() {
-    let fixture = "void f(int? x) {\n  if (false) {\n    if (false) {\n      x.abs();\n    }\n  }\n}";
+    let fixture =
+        "void f(int? x) {\n  if (false) {\n    if (false) {\n      x.abs();\n    }\n  }\n}";
     let report = report_ops(fixture);
     assert_dead_code(&report);
     assert_no_unchecked(&report);

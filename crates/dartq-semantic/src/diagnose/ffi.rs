@@ -416,14 +416,11 @@ impl<'a> Engine<'a> {
                 // evaluated map's entries, anchored on the written
                 // argument.
                 if let Some(open) = args_text.find('{') {
-                    let Some(brace_close) =
-                        matching_close(args_text.as_bytes(), open, b'{', b'}')
+                    let Some(brace_close) = matching_close(args_text.as_bytes(), open, b'{', b'}')
                     else {
                         return (face, Some(args_span));
                     };
-                    for (rel, len) in
-                        split_top_level(&args_text[open + 1..brace_close], b',')
-                    {
+                    for (rel, len) in split_top_level(&args_text[open + 1..brace_close], b',') {
                         let entry = &args_text[open + 1 + rel..open + 1 + rel + len];
                         let Some(colon) = top_level_colon(entry) else {
                             continue;
@@ -656,8 +653,7 @@ fn ffi_flatten_varargs(text: &str, strings: &StringTable) -> Vec<StringId> {
             if let Some(varargs_pos) = text.find("VarArgs") {
                 let after = &text[varargs_pos + "VarArgs".len()..];
                 if let Some(angle) = after.find('<')
-                    && let Some(angle_close) =
-                        matching_close(after.as_bytes(), angle, b'<', b'>')
+                    && let Some(angle_close) = matching_close(after.as_bytes(), angle, b'<', b'>')
                 {
                     let record = &after[angle + 1..angle_close];
                     let record = record.trim();
@@ -700,7 +696,12 @@ fn named_arg_is_true(args_text: &str, name: &str) -> bool {
             .trim()
             .trim_start_matches(['(', '[', '{'])
             .trim();
-        if label == name && arg[colon + 1..].trim().trim_end_matches([')', ']', '}']).trim() == "true"
+        if label == name
+            && arg[colon + 1..]
+                .trim()
+                .trim_end_matches([')', ']', '}'])
+                .trim()
+                == "true"
         {
             return true;
         }
@@ -786,8 +787,8 @@ fn parse_array_dims(
                 {
                     let value_text = trimmed[colon + 1..].trim();
                     if let Some(parsed) = parse_int_literal(value_text) {
-                        let vlead = trimmed[colon + 1..].len()
-                            - trimmed[colon + 1..].trim_start().len();
+                        let vlead =
+                            trimmed[colon + 1..].len() - trimmed[colon + 1..].trim_start().len();
                         let at = 1 + rel + lead + colon + 1 + vlead;
                         variable = Some((
                             parsed,
@@ -802,8 +803,7 @@ fn parse_array_dims(
                 let Some(bracket) = entry.find('[') else {
                     continue;
                 };
-                let Some(bracket_close) =
-                    matching_close(entry.as_bytes(), bracket, b'[', b']')
+                let Some(bracket_close) = matching_close(entry.as_bytes(), bracket, b'[', b']')
                 else {
                     continue;
                 };
@@ -1133,7 +1133,11 @@ impl<'a> Engine<'a> {
         let mut out = Vec::new();
         let mut cursor = name_start;
         loop {
-            while cursor > 0 && bytes.get(cursor - 1).is_some_and(|b| b.is_ascii_whitespace()) {
+            while cursor > 0
+                && bytes
+                    .get(cursor - 1)
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            {
                 cursor -= 1;
             }
             // Skip a trailing `)` of an argument group. `cursor == 0`
@@ -1161,7 +1165,11 @@ impl<'a> Engine<'a> {
                     at -= 1;
                 }
                 cursor = at;
-                while cursor > 0 && bytes.get(cursor - 1).is_some_and(|b| b.is_ascii_whitespace()) {
+                while cursor > 0
+                    && bytes
+                        .get(cursor - 1)
+                        .is_some_and(|b| b.is_ascii_whitespace())
+                {
                     cursor -= 1;
                 }
             }
@@ -1381,9 +1389,7 @@ impl<'a> Engine<'a> {
             let (leaf, _) = clause_entry_parts(&text);
             if let Some(leaf_name) = leaf {
                 let leaf_id = self.strings.intern(leaf_name);
-                if !self.ffi_class_spelling(leaf_id)
-                    && self.clause_entry_text_is_compound(&text)
-                {
+                if !self.ffi_class_spelling(leaf_id) && self.clause_entry_text_is_compound(&text) {
                     self.emit(
                         SemanticCode::SubtypeOfStructClassInExtends,
                         span,
@@ -2064,7 +2070,12 @@ impl<'a> Engine<'a> {
                     Some((name, _)),
                 ) => *owner == name,
                 (DeclKind::TopLevelFn | DeclKind::TopLevelVar, None) => true,
-                (DeclKind::Member { container: owner, .. }, None) => self
+                (
+                    DeclKind::Member {
+                        container: owner, ..
+                    },
+                    None,
+                ) => self
                     .index
                     .get(self.file)
                     .is_some_and(|elements| elements.container(*owner).is_none()),
@@ -2242,11 +2253,7 @@ impl<'a> Engine<'a> {
                     .container(*container)
                     .and_then(|c| c.members.get(&site.name))
                 {
-                    return (
-                        member.var_ty,
-                        member.return_ty,
-                        member.formals.as_ref(),
-                    );
+                    return (member.var_ty, member.return_ty, member.formals.as_ref());
                 }
                 // An unnamed extension's members live on its
                 // `ExtensionFace` (collector.rs:1963-1981 — the face owns
@@ -2301,7 +2308,10 @@ impl<'a> Engine<'a> {
         let is_extension_like = instance_member && self.ffi_is_extension_member(site);
         if is_extension_like {
             if dart_param_count + 1 != flat_params.len() {
-                let (a0, a1) = ((dart_param_count + 1).to_string(), flat_params.len().to_string());
+                let (a0, a1) = (
+                    (dart_param_count + 1).to_string(),
+                    flat_params.len().to_string(),
+                );
                 self.emit(
                     SemanticCode::FfiNativeUnexpectedNumberOfParameters,
                     site.range,
@@ -2396,10 +2406,7 @@ impl<'a> Engine<'a> {
                 if self.strings.resolve(*head) != "Pointer" {
                     continue;
                 }
-                let formal_ty = formals
-                    .positional
-                    .get(i)
-                    .map(|formal| formal.ty);
+                let formal_ty = formals.positional.get(i).map(|formal| formal.ty);
                 let ok = match formal_ty {
                     Some(Ty::Named { name, .. }) => {
                         let text = self.strings.resolve(name);
@@ -2459,13 +2466,10 @@ impl<'a> Engine<'a> {
         // empty placeholder name (`push_container_frame` interns `""`) —
         // their face is found by member ownership, not by name.
         if elements.container(*container).is_none() {
-            return elements
-                .extension_faces()
-                .iter()
-                .any(|face| {
-                    face.name == Some(*container)
-                        || (face.name.is_none() && face.members.contains_key(&site.name))
-                });
+            return elements.extension_faces().iter().any(|face| {
+                face.name == Some(*container)
+                    || (face.name.is_none() && face.members.contains_key(&site.name))
+            });
         }
         false
     }
@@ -2681,12 +2685,7 @@ impl<'a> Engine<'a> {
     /// `allow_array` is only `true` for the `@Native` field face
     /// (upstream `allowArray` rides the `_checkFfiNativeField` call);
     /// function signatures never allow `Array` as a parameter type.
-    fn ffi_valid_native_type(
-        &self,
-        head: StringId,
-        allow_void: bool,
-        allow_handle: bool,
-    ) -> bool {
+    fn ffi_valid_native_type(&self, head: StringId, allow_void: bool, allow_handle: bool) -> bool {
         self.ffi_valid_native_type_full(head, allow_void, false, false, allow_handle, false)
     }
 
@@ -2915,7 +2914,8 @@ impl<'a> Engine<'a> {
             // The tear-off compat is `dartToNative` (upstream
             // `_validateFromFunction` — the Dart callback becomes the
             // native function).
-            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret_head, &native_params) {
+            if !self.ffi_compatible_functions_d2n(dart_ret, dart_params, &ret_head, &native_params)
+            {
                 let dart_display = self.ffi_render_function(dart_ret, dart_params);
                 // The supertype display is the WRITTEN type argument
                 // (`mustBeASubtype`'s second placeholder keeps the source
@@ -3395,9 +3395,10 @@ impl<'a> Engine<'a> {
         // `null`, and sign-prefixed numerics. Everything else (operators,
         // conditionals, calls) is not.
         matches!(text, "true" | "false" | "null")
-            || text.chars().next().is_some_and(|c| {
-                c.is_ascii_digit() || c == '"' || c == '\''
-            })
+            || text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c == '"' || c == '\'')
             || (text.starts_with('-') || text.starts_with('+'))
                 && text[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
     }
@@ -3459,18 +3460,17 @@ impl<'a> Engine<'a> {
             && self.strings.resolve(native.head) == "NativeFunction"
         {
             // The target's `@Native` annotation's written signature.
-            let annotated_sig = self
-                .decl_sites
-                .iter()
-                .position(|site| site.name == target)
-                .and_then(|index| {
-                    self.ffi_native_annos(index).first().and_then(|anno| {
-                        anno.face
-                            .sig
-                            .as_ref()
-                            .map(|sig| (sig.display.clone(), sig.ret_head, sig.param_heads.clone()))
-                    })
-                });
+            let annotated_sig =
+                self.decl_sites
+                    .iter()
+                    .position(|site| site.name == target)
+                    .and_then(|index| {
+                        self.ffi_native_annos(index).first().and_then(|anno| {
+                            anno.face.sig.as_ref().map(|sig| {
+                                (sig.display.clone(), sig.ret_head, sig.param_heads.clone())
+                            })
+                        })
+                    });
             if let Some((_, a_ret, a_params)) = annotated_sig
                 && let Some((t_ret, t_params)) = self.ffi_type_arg_shape(&native)
                 && (t_ret != a_ret || *t_params != *a_params)
@@ -3693,12 +3693,7 @@ impl<'a> Engine<'a> {
         if void_like {
             if invocation.args.len() == 2 {
                 let at = self.ffi_named_arg_span(invocation, 1);
-                self.emit(
-                    SemanticCode::InvalidExceptionValue,
-                    at,
-                    "isolateLocal",
-                    "",
-                );
+                self.emit(SemanticCode::InvalidExceptionValue, at, "isolateLocal", "");
             }
             return;
         }
@@ -3769,10 +3764,7 @@ impl<'a> Engine<'a> {
             recv_ty: invocation.recv_ty,
             whole: SourceRange {
                 offset: head.offset,
-                length: invocation
-                    .whole
-                    .end()
-                    .saturating_sub(head.offset),
+                length: invocation.whole.end().saturating_sub(head.offset),
             },
             is_creation: true,
         };
@@ -4073,19 +4065,13 @@ impl<'a> Engine<'a> {
                 while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
                     cursor += 1;
                 }
-                if cursor + 1 < bytes.len()
-                    && bytes[cursor] == b'/'
-                    && bytes[cursor + 1] == b'/'
-                {
+                if cursor + 1 < bytes.len() && bytes[cursor] == b'/' && bytes[cursor + 1] == b'/' {
                     while cursor < bytes.len() && bytes[cursor] != b'\n' {
                         cursor += 1;
                     }
                     continue;
                 }
-                if cursor + 1 < bytes.len()
-                    && bytes[cursor] == b'/'
-                    && bytes[cursor + 1] == b'*'
-                {
+                if cursor + 1 < bytes.len() && bytes[cursor] == b'/' && bytes[cursor + 1] == b'*' {
                     cursor += 2;
                     while cursor + 1 < bytes.len()
                         && !(bytes[cursor] == b'*' && bytes[cursor + 1] == b'/')
@@ -4108,19 +4094,13 @@ impl<'a> Engine<'a> {
                     chain += 1;
                 }
                 // Skip comments inside the annotation chain.
-                if chain + 1 < bytes.len()
-                    && bytes[chain] == b'/'
-                    && bytes[chain + 1] == b'/'
-                {
+                if chain + 1 < bytes.len() && bytes[chain] == b'/' && bytes[chain + 1] == b'/' {
                     while chain < bytes.len() && bytes[chain] != b'\n' {
                         chain += 1;
                     }
                     continue;
                 }
-                if chain + 1 < bytes.len()
-                    && bytes[chain] == b'/'
-                    && bytes[chain + 1] == b'*'
-                {
+                if chain + 1 < bytes.len() && bytes[chain] == b'/' && bytes[chain + 1] == b'*' {
                     chain += 2;
                     while chain + 1 < bytes.len()
                         && !(bytes[chain] == b'*' && bytes[chain + 1] == b'/')
@@ -4154,9 +4134,7 @@ impl<'a> Engine<'a> {
                     // name, not the alias's.
                     let alias = &self.source[name_start..name_end];
                     if alias != "DefaultAsset" {
-                        seen += usize::from(
-                            self.ffi_const_alias_is(alias, "DefaultAsset"),
-                        );
+                        seen += usize::from(self.ffi_const_alias_is(alias, "DefaultAsset"));
                         if seen > 1 {
                             let offset = byte_offset_to_utf16(self.source, name_start);
                             self.emit(
@@ -4338,9 +4316,7 @@ impl<'a> Engine<'a> {
         dart_params
             .iter()
             .zip(native_params.iter())
-            .all(|(dart, native)| {
-                self.ffi_compatible_native_value(Ty::named(*dart), *native, true)
-            })
+            .all(|(dart, native)| self.ffi_compatible_native_value(Ty::named(*dart), *native, true))
     }
 
     /// The `dartToNative` mirror of `ffi_compatible_functions` (upstream
@@ -4459,8 +4435,7 @@ impl<'a> Engine<'a> {
                 // `Int8`→`Int8List`, `Uint16`→`Uint16List`, `IntPtr`→`IntPtrList`.
                 if let Some(list) = dart.strip_suffix("List") {
                     list == native
-                        && (NATIVE_INT_TYPES.contains(&native)
-                            || matches!(native, "IntPtr"))
+                        && (NATIVE_INT_TYPES.contains(&native) || matches!(native, "IntPtr"))
                 } else {
                     false
                 }

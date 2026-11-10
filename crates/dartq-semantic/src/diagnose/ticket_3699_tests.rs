@@ -233,5 +233,3 @@ fn arg_position_resolves() {
                    void f() { take(.named(null)); }\n";
     assert_silent(&report_ops(fixture));
 }
-
-

@@ -1124,13 +1124,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// reported — `int x; int x;` is one upstream row, and the second
     /// variable's induced `x=` never joins `definedSetters`). The
     /// setter-side caller reads the flag to skip that second claim.
-    fn declare_top(
-        &mut self,
-        name: StringId,
-        range: SourceRange,
-        decl: TopDecl,
-        tier: u8,
-    ) -> bool {
+    fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl, tier: u8) -> bool {
         // The `augment` head comes first: it neither claims a vacant slot
         // nor displaces a type parameter's declaration-scoped placeholder.
         if self.declaring_augment {
@@ -2488,8 +2482,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // resolve).
         sitting.superclass = sitting.superclass.or(fragment.superclass);
         sitting.with_clause = union(&sitting.with_clause, &fragment.with_clause);
-        sitting.implements_clause =
-            union(&sitting.implements_clause, &fragment.implements_clause);
+        sitting.implements_clause = union(&sitting.implements_clause, &fragment.implements_clause);
         sitting.on_clause = union(&sitting.on_clause, &fragment.on_clause);
         // The implicit default's gate is the ELEMENT's declaration count, so
         // the fragment's declarations join the element's before the flag is
@@ -4640,8 +4633,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             .map(|t| builder.span_of(t));
         // A top-level `const` group opens the const-creation face's
         // capture window (member and local groups never latch it).
-        builder.top_const_group =
-            builder.containers.is_empty() && builder.field_const.is_some();
+        builder.top_const_group = builder.containers.is_empty() && builder.field_const.is_some();
         builder.field_augment = augment_kw.map(|t| builder.span_of(t));
         builder.declaring_augment = augment_kw.is_some();
     }
@@ -5126,8 +5118,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 // just-collected type parameters until they move into
                 // `TopDecl` below; read them directly (the drained
                 // `pending_top` slot is always `None` here).
-                augment.type_params =
-                    builder.zip_type_var_rows(&pending.type_param_names, &pending.type_param_bounds);
+                augment.type_params = builder
+                    .zip_type_var_rows(&pending.type_param_names, &pending.type_param_bounds);
                 augment.type_params_close = builder.type_group_close;
                 augment.name = spelling;
                 let spelling_text = builder.strings.resolve(spelling);
@@ -5342,7 +5334,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 }
             }
             capture_unnamed = capture.has_unnamed;
-            factory_complete = capture.completion || std::mem::take(&mut builder.pending_ctor_external);
+            factory_complete =
+                capture.completion || std::mem::take(&mut builder.pending_ctor_external);
             for name in &named {
                 if !open.ctor_named.contains(name) {
                     open.ctor_named.push(*name);
@@ -5882,10 +5875,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         // flag is the written boundary, so `typedef fx([int
                         // c])` is `dynamic Function([int])`, never
                         // `dynamic Function(int)`.
-                        let required_positional = u16::try_from(
-                            formals.positional.iter().filter(|f| f.required).count(),
-                        )
-                        .unwrap_or(u16::MAX);
+                        let required_positional =
+                            u16::try_from(formals.positional.iter().filter(|f| f.required).count())
+                                .unwrap_or(u16::MAX);
                         let return_ty = leaf(pending.return_ty);
                         builder.type_args.function_required(
                             0,
@@ -6455,8 +6447,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // written `final` keyword: `var int a` induces a mutable field
         // (upstream `fieldFragment.isFinal = formalParameter.isFinal`,
         // element_builder.dart:2090-2092).
-        let declaring_final = var_or_final
-            .is_some_and(|token| builder.kind_of(token) == Some(TokenKind::Keyword(Keyword::Final)));
+        let declaring_final = var_or_final.is_some_and(|token| {
+            builder.kind_of(token) == Some(TokenKind::Keyword(Keyword::Final))
+        });
         // A primary-constructor formal with a `var`/`final` keyword
         // declares an instance field (`FieldFormalParameterElement
         // .isDeclaring`, element_builder.dart:2089-2099 — the only gate is
@@ -7319,7 +7312,10 @@ mod tests {
         let a_eq = member("A", "==");
         assert_eq!(a_eq.return_ty, Ty::named(id(&strings, "bool")));
         let a_formals = a_eq.formals.as_deref().expect("A.== formals");
-        assert_eq!(a_formals.positional[0].ty, Ty::named(id(&strings, "Object")));
+        assert_eq!(
+            a_formals.positional[0].ty,
+            Ty::named(id(&strings, "Object"))
+        );
         // Controls: `+`/`[]=` carry their own signatures.
         let plus = member("B", "+");
         assert_eq!(plus.return_ty, Ty::named(id(&strings, "num")));
@@ -8235,10 +8231,7 @@ mod tests {
         let strings = StringTable::new();
         // The getter outranks the function in either order (the model
         // tags both `TopLevelFn` — the claim cannot read the tag).
-        for source in [
-            "int get h => 0; void h() {}",
-            "void h() {} int get h => 0;",
-        ] {
+        for source in ["int get h => 0; void h() {}", "void h() {} int get h => 0;"] {
             let elements = build(source, &strings);
             let decl = elements.decl(id(&strings, "h")).expect("h");
             assert_eq!(decl.kind, MicroKind::TopLevelFn, "{source:?}");
@@ -8293,10 +8286,7 @@ mod tests {
     #[test]
     fn ticket_3483_typedef_tier() {
         let strings = StringTable::new();
-        for source in [
-            "typedef T = int; class T {}",
-            "class T {} typedef T = int;",
-        ] {
+        for source in ["typedef T = int; class T {}", "class T {} typedef T = int;"] {
             let elements = build(source, &strings);
             assert_eq!(
                 winner(&elements, &strings, "T"),

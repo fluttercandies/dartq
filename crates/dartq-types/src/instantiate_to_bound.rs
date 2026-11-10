@@ -257,8 +257,7 @@ pub fn instantiate_type_formals_to_bounds_directed(
     // official instance's `NullabilitySuffix.none`.
     let never = table.intern(UninternedType::Never, false);
     let all: FxHashSet<TypeParamId> = parameters.iter().copied().collect();
-    let mut index_of: rustc_hash::FxHashMap<TypeParamId, usize> =
-        rustc_hash::FxHashMap::default();
+    let mut index_of: rustc_hash::FxHashMap<TypeParamId, usize> = rustc_hash::FxHashMap::default();
     for (i, &parameter) in parameters.iter().enumerate() {
         index_of.insert(parameter, i);
     }
@@ -303,10 +302,7 @@ pub fn instantiate_type_formals_to_bounds_directed(
     let components = strong_components(&dependents);
     let mut cyclic = vec![false; count];
     for component in &components {
-        let is_cycle = component.len() > 1
-            || component
-                .iter()
-                .any(|&i| dependents[i].contains(&i));
+        let is_cycle = component.len() > 1 || component.iter().any(|&i| dependents[i].contains(&i));
         if is_cycle {
             for &i in component {
                 cyclic[i] = true;
@@ -316,10 +312,8 @@ pub fn instantiate_type_formals_to_bounds_directed(
             .iter()
             .map(|&i| (parameters[i], dynamic))
             .collect();
-        let lower: Vec<(TypeParamId, TypeId)> = component
-            .iter()
-            .map(|&i| (parameters[i], never))
-            .collect();
+        let lower: Vec<(TypeParamId, TypeId)> =
+            component.iter().map(|&i| (parameters[i], never)).collect();
         for &i in component {
             bounds[i] = replace_upper_lower(
                 table,
@@ -517,8 +511,8 @@ fn replace_upper_lower(
                 // `visitTypeArgument` (:458-469): the argument's subtree
                 // sees `current.combine(parameter.variance)`; the saved
                 // variance restores after — the combine is per position.
-                let combined = variance
-                    .combine(argument_variance(decl, i).unwrap_or(Variance::Covariant));
+                let combined =
+                    variance.combine(argument_variance(decl, i).unwrap_or(Variance::Covariant));
                 let new_arg = replace_upper_lower(
                     table,
                     arg,
@@ -533,10 +527,9 @@ fn replace_upper_lower(
                 }
             }
             match rewritten {
-                Some(args) => table.intern(
-                    UninternedType::Interface { decl, args },
-                    node.is_nullable(),
-                ),
+                Some(args) => {
+                    table.intern(UninternedType::Interface { decl, args }, node.is_nullable())
+                }
                 None => ty,
             }
         }
@@ -553,7 +546,10 @@ fn replace_upper_lower(
             if new_base == base {
                 return ty;
             }
-            table.intern(UninternedType::FutureOr { base: new_base }, node.is_nullable())
+            table.intern(
+                UninternedType::FutureOr { base: new_base },
+                node.is_nullable(),
+            )
         }
         TypeKind::Function { signature } => {
             let sig = table.signature(signature);
@@ -618,8 +614,7 @@ fn replace_upper_lower(
                         // their bounds ride `ParamFactsTable`, not the type
                         // (see the function doc).
                         type_parameters: table.function_type_parameters(sig.type_parameters),
-                        positional: positional
-                            .unwrap_or_else(|| table.args(sig.positional)),
+                        positional: positional.unwrap_or_else(|| table.args(sig.positional)),
                         named: named.unwrap_or_else(|| table.named_members(sig.named)),
                         required_positional: sig.required_positional,
                     },
@@ -666,17 +661,18 @@ fn replace_upper_lower(
             table
                 .intern_record(
                     UninternedRecord {
-                        positional: positional
-                            .unwrap_or_else(|| table.args(shape.positional)),
+                        positional: positional.unwrap_or_else(|| table.args(shape.positional)),
                         named: named.unwrap_or_else(|| table.named_members(shape.named)),
                     },
                     node.is_nullable(),
                 )
                 .expect("upper/lower substitution preserves record well-formedness")
         }
-        TypeKind::Never | TypeKind::Dynamic | TypeKind::Void | TypeKind::Invalid | TypeKind::Null => {
-            ty
-        }
+        TypeKind::Never
+        | TypeKind::Dynamic
+        | TypeKind::Void
+        | TypeKind::Invalid
+        | TypeKind::Null => ty,
     }
 }
 
@@ -705,13 +701,10 @@ fn strong_components(dependents: &[Vec<usize>]) -> Vec<Vec<usize>> {
         for &neighbor in &dependents[vertex] {
             if preorder[neighbor] == usize::MAX {
                 visit(
-                    neighbor, dependents, count, preorder, unassigned, candidates, assigned,
-                    result,
+                    neighbor, dependents, count, preorder, unassigned, candidates, assigned, result,
                 );
             } else if !assigned[neighbor] {
-                while preorder[*candidates.last().expect("path is nonempty")]
-                    > preorder[neighbor]
-                {
+                while preorder[*candidates.last().expect("path is nonempty")] > preorder[neighbor] {
                     candidates.pop();
                 }
             }
@@ -1120,9 +1113,8 @@ mod tests {
         let x = TypeParamId::from_raw(19);
         let x_ty = table.intern(UninternedType::TypeParameter { parameter: x }, false);
         let bound = a_of(&table, x_ty);
-        let result = instantiate_type_formals_to_bounds_with(&table, &[x], |p| {
-            (p == x).then_some(bound)
-        });
+        let result =
+            instantiate_type_formals_to_bounds_with(&table, &[x], |p| (p == x).then_some(bound));
         assert!(result.malbounded);
         assert!(
             matches!(table.get(result.defaults[0]).kind(), TypeKind::Interface { decl: A, args } if args.len() == 1 && matches!(table.get(table.arg(args.offset())).kind(), TypeKind::Dynamic)),
@@ -1139,9 +1131,8 @@ mod tests {
         let x = TypeParamId::from_raw(20);
         let x_ty = table.intern(UninternedType::TypeParameter { parameter: x }, false);
         let bound = table.intern(UninternedType::FutureOr { base: x_ty }, false);
-        let result = instantiate_type_formals_to_bounds_with(&table, &[x], |p| {
-            (p == x).then_some(bound)
-        });
+        let result =
+            instantiate_type_formals_to_bounds_with(&table, &[x], |p| (p == x).then_some(bound));
         assert!(result.malbounded);
         assert!(
             matches!(table.get(result.defaults[0]).kind(), TypeKind::FutureOr { base } if matches!(table.get(base).kind(), TypeKind::Dynamic)),
@@ -1164,9 +1155,8 @@ mod tests {
             },
             false,
         );
-        let result = instantiate_type_formals_to_bounds_with(&table, &[t], |p| {
-            (p == t).then_some(bound)
-        });
+        let result =
+            instantiate_type_formals_to_bounds_with(&table, &[t], |p| (p == t).then_some(bound));
         assert!(result.malbounded);
         assert!(
             matches!(table.get(result.defaults[0]).kind(), TypeKind::Interface { decl, args } if decl == comparable && args.len() == 1 && matches!(table.get(table.arg(args.offset())).kind(), TypeKind::Dynamic)),

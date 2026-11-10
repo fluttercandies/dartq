@@ -196,8 +196,9 @@ class Test extends A {}
     );
     let contexts = bounds_contexts(&report);
     assert!(
-        contexts.iter().any(|c| c
-            .contains("The raw type was instantiated as 'A<B<dynamic>>'")),
+        contexts
+            .iter()
+            .any(|c| c.contains("The raw type was instantiated as 'A<B<dynamic>>'")),
         "the raw-type context row: {contexts:?}"
     );
 }
@@ -346,7 +347,9 @@ main() {
         rows.iter().any(|(_, _, msg)| {
             msg.contains("Couldn't infer type parameter 'X'")
                 && msg.contains("Tried to infer 'B<Object?>' for 'X'")
-                && msg.contains("Type parameter 'X' is declared to extend 'B<X>' producing 'B<B<Object?>>'")
+                && msg.contains(
+                    "Type parameter 'X' is declared to extend 'B<X>' producing 'B<B<Object?>>'",
+                )
         }),
         "the declared-to-extend origin text: {:?}",
         rows
@@ -374,7 +377,9 @@ main() {
         rows.iter().any(|(_, _, msg)| {
             msg.contains("Couldn't infer type parameter 'X1'")
                 && msg.contains("Tried to infer 'B<Object?>' for 'X1'")
-                && msg.contains("Type parameter 'X1' is declared to extend 'B<X2>' producing 'B<B<Object?>>'")
+                && msg.contains(
+                    "Type parameter 'X1' is declared to extend 'B<X2>' producing 'B<B<Object?>>'",
+                )
         }),
         "the alias X1 origin text: {:?}",
         rows

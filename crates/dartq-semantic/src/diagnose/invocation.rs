@@ -762,14 +762,15 @@ impl<'a> Engine<'a> {
                         if let Some(token) = self
                             .tokens
                             .as_slice()
-                            .get(self.tokens.as_slice().partition_point(|t| {
-                                t.utf16_offset < inner_offset
-                            }))
+                            .get(
+                                self.tokens
+                                    .as_slice()
+                                    .partition_point(|t| t.utf16_offset < inner_offset),
+                            )
                             .filter(|t| t.utf16_offset == inner_offset)
                         {
                             let raw = &self.source[token.byte_range()];
-                            let length =
-                                raw.chars().map(char::len_utf16).sum::<usize>() as u32;
+                            let length = raw.chars().map(char::len_utf16).sum::<usize>() as u32;
                             recv_span = SourceRange {
                                 offset: inner_offset,
                                 length,
@@ -1611,9 +1612,7 @@ impl<'a> Engine<'a> {
                         crate::diagnose::types::DeadChainKind::Member => (*op, "?.", 2u32),
                         crate::diagnose::types::DeadChainKind::Index => (*op, "?", 1u32),
                         crate::diagnose::types::DeadChainKind::CascadeMember
-                        | crate::diagnose::types::DeadChainKind::CascadeIndex => {
-                            (*op, "?..", 3u32)
-                        }
+                        | crate::diagnose::types::DeadChainKind::CascadeIndex => (*op, "?..", 3u32),
                     })
                     // A `?[` receiver's own question is the prior
                     // short-circuiter when no latched chain covers this
@@ -1625,13 +1624,13 @@ impl<'a> Engine<'a> {
                     .or_else(|| {
                         if shorted_elem_ty.is_some() && !self.in_cascade {
                             receiver_offset.and_then(|offset| {
-                                self.index_result_recvs
-                                    .get(&offset)
-                                    .and_then(|(indexed, null_aware)| {
+                                self.index_result_recvs.get(&offset).and_then(
+                                    |(indexed, null_aware)| {
                                         null_aware.then(|| {
                                             (self.skip_whitespace(indexed.end()), "?", 1u32)
                                         })
-                                    })
+                                    },
+                                )
                             })
                         } else {
                             None
@@ -1984,8 +1983,7 @@ impl<'a> Engine<'a> {
                 (
                     true,
                     shorted_elem_ty.is_some_and(|elem| {
-                        !Self::is_nullable_ty(elem)
-                            && !self.future_or_potentially_nullable(elem)
+                        !Self::is_nullable_ty(elem) && !self.future_or_potentially_nullable(elem)
                     }),
                 )
             } else {
@@ -2168,8 +2166,7 @@ impl<'a> Engine<'a> {
     ) -> bool {
         let unnamed = selector == container || selector == self.intern("new");
         let own = |face: &Container| {
-            face.constructors.contains(&selector)
-                || (unnamed && face.has_unnamed_constructor)
+            face.constructors.contains(&selector) || (unnamed && face.has_unnamed_constructor)
         };
         let effective = resolve_container(
             self.graph,
@@ -2198,8 +2195,7 @@ impl<'a> Engine<'a> {
         if unnamed && face.has_unnamed_constructor {
             return !self.ctor_is_factory(face, face_owner, face_name);
         }
-        face.constructors.contains(&selector)
-            && !self.ctor_is_factory(face, face_owner, selector)
+        face.constructors.contains(&selector) && !self.ctor_is_factory(face, face_owner, selector)
     }
 
     /// The container whose constructor tables answer `name`'s constructor
@@ -2233,10 +2229,7 @@ impl<'a> Engine<'a> {
                     .any(|target| target.is_mixin_application && target.name == name)
             })
         };
-        if decl.superclass.is_none()
-            || decl.with_clause.is_empty()
-            || !is_mixin_app(owner, name)
-        {
+        if decl.superclass.is_none() || decl.with_clause.is_empty() || !is_mixin_app(owner, name) {
             return Some((decl, owner, name));
         }
         let mut seen: FxHashSet<StringId> = FxHashSet::from_iter([name]);
@@ -2246,8 +2239,8 @@ impl<'a> Engine<'a> {
             // A mixin application always writes a head type (`= S with`),
             // so `superclass` is present on every hop the flag marks.
             let super_name = cur.superclass?;
-            let super_lib = owner_library(self.graph, self.lib, cur_owner, cur_name)
-                .unwrap_or(scope_lib);
+            let super_lib =
+                owner_library(self.graph, self.lib, cur_owner, cur_name).unwrap_or(scope_lib);
             let (super_decl, super_owner) = resolve_container(
                 self.graph,
                 self.namespaces,
@@ -2276,12 +2269,7 @@ impl<'a> Engine<'a> {
     /// name for the unnamed face). The declaring unit's `decl_kinds` row
     /// is authoritative; `face`'s `factory_formals` table backstops it for
     /// a declaration whose target row never sealed.
-    pub(crate) fn ctor_is_factory(
-        &self,
-        face: &Container,
-        owner: FileId,
-        key: StringId,
-    ) -> bool {
+    pub(crate) fn ctor_is_factory(&self, face: &Container, owner: FileId, key: StringId) -> bool {
         face.factory_formals.contains_key(&key)
             || self.index.get(owner).is_some_and(|elements| {
                 elements
@@ -2299,14 +2287,12 @@ impl<'a> Engine<'a> {
     /// the forwarding hop's alone). A broken forwarding chain answers the
     /// container's own flag (the under-report posture).
     fn unnamed_ctor_exists(&self, decl: &'a Container, owner: FileId, name: StringId) -> bool {
-        let Some((face, face_owner, face_name)) =
-            self.effective_ctor_container(decl, owner, name)
+        let Some((face, face_owner, face_name)) = self.effective_ctor_container(decl, owner, name)
         else {
             return decl.has_unnamed_constructor;
         };
         face.has_unnamed_constructor
-            && (std::ptr::eq(face, decl)
-                || !self.ctor_is_factory(face, face_owner, face_name))
+            && (std::ptr::eq(face, decl) || !self.ctor_is_factory(face, face_owner, face_name))
     }
 
     /// The formal table `selector`'s GENERATIVE constructor carries on
@@ -2623,8 +2609,7 @@ impl<'a> Engine<'a> {
             // at the whole `C<T>.name` extent exactly like the oracle's
             // `factoryRedirectionTarget` entity.
             let (target_container, target, target_span) = self.redirect_target_face(edge);
-            if edge.is_const
-                && self.redirect_target_const(target_container, target) == Some(false)
+            if edge.is_const && self.redirect_target_const(target_container, target) == Some(false)
             {
                 let span = if edge.factory {
                     target_span
@@ -2676,10 +2661,7 @@ impl<'a> Engine<'a> {
     /// (`p.C<T>.name` splits `C.name`); a lone segment is a qualified
     /// container head (`= p.C` reads container `C`, the unnamed face); none
     /// keeps the edge's own answer.
-    fn redirect_target_face(
-        &self,
-        edge: &RedirectEdge,
-    ) -> (StringId, StringId, SourceRange) {
+    fn redirect_target_face(&self, edge: &RedirectEdge) -> (StringId, StringId, SourceRange) {
         if !edge.factory || edge.target != edge.target_container {
             return (edge.target_container, edge.target, edge.span);
         }
@@ -2989,14 +2971,10 @@ impl<'a> Engine<'a> {
                         // associates against the forwarded table on the
                         // terminal face — `class S = T with M;` declares
                         // `T`'s constructors, keyed on `T`'s own spelling.
-                        self.effective_ctor_container(
-                            super_container,
-                            super_owner,
-                            superclass,
-                        )
-                        .and_then(|(face, _, face_name)| {
-                            face.ctor_formals.get(&target.unwrap_or(face_name))
-                        })
+                        self.effective_ctor_container(super_container, super_owner, superclass)
+                            .and_then(|(face, _, face_name)| {
+                                face.ctor_formals.get(&target.unwrap_or(face_name))
+                            })
                     }
                     // A dead-edge super face takes no parameters (the
                     // undefined-name shape above); a declaration the index
@@ -4284,7 +4262,9 @@ impl<'a> Engine<'a> {
         // (`x.foo(`) keeps its own faces.
         let (class, selector, class_offset) = match self.creation_class_before(head_range) {
             Some((class, class_offset)) => (class, head, class_offset),
-            None if self.keyword_creation_head(head_range.offset) => (head, head, head_range.offset),
+            None if self.keyword_creation_head(head_range.offset) => {
+                (head, head, head_range.offset)
+            }
             None => return None,
         };
         if self.type_resolution(class).0 != TypeResolution::Type {
@@ -4445,13 +4425,7 @@ impl<'a> Engine<'a> {
             return;
         }
         let tys = self.boundary.args.borrow().get(args).to_vec();
-        let spans = vec![
-            SourceRange {
-                offset,
-                length: 0,
-            };
-            tys.len()
-        ];
+        let spans = vec![SourceRange { offset, length: 0 }; tys.len()];
         self.call_type_args.push((
             offset,
             CallTypeArgs {
@@ -4484,9 +4458,7 @@ impl<'a> Engine<'a> {
         // shorthand's dot, and `pending_name` for the `name:` label the
         // parent captured before the shorthand began.
         let named = level.pending_name;
-        let open_from = if let Some((_, head_range)) =
-            level.unnamed_head.or(level.named_head)
-        {
+        let open_from = if let Some((_, head_range)) = level.unnamed_head.or(level.named_head) {
             Some(head_range.end())
         } else {
             self.rows.get(level.callee_row?).map(|row| row.range.end())
@@ -4518,8 +4490,7 @@ impl<'a> Engine<'a> {
         // other callee shape — a top-level function, an unresolvable head
         // — leaves the context undecided and the shorthand keeps the
         // ordinary `pending_decl_ty` face.
-        let (parent_class, parent_formals) = if let Some((head, _)) = level.unnamed_head
-        {
+        let (parent_class, parent_formals) = if let Some((head, _)) = level.unnamed_head {
             (Some(head), self.ctor_schema_formals(head, head))
         } else if let Some((head, head_range)) = level.named_head {
             let class = self
@@ -4554,10 +4525,13 @@ impl<'a> Engine<'a> {
             (
                 class,
                 class.and_then(|c| {
-                    self.ctor_schema_formals(c, match &parent_row.shape {
-                        RowShape::Bare(BareInfo::Plain { .. }) => parent_row.name,
-                        _ => c,
-                    })
+                    self.ctor_schema_formals(
+                        c,
+                        match &parent_row.shape {
+                            RowShape::Bare(BareInfo::Plain { .. }) => parent_row.name,
+                            _ => c,
+                        },
+                    )
                 }),
             )
         };
@@ -5078,11 +5052,9 @@ impl<'a> Engine<'a> {
                     // the flattened `T` too (#3061: `f(await fut)` offered
                     // `Future<dynamic>` against `num`).
                     let ty = if ty != Ty::UNKNOWN
-                        && self
-                            .await_operand_extents
-                            .iter()
-                            .any(|&(start, end)| row.range.offset >= start && row.range.end() <= end)
-                    {
+                        && self.await_operand_extents.iter().any(|&(start, end)| {
+                            row.range.offset >= start && row.range.end() <= end
+                        }) {
                         self.flatten(ty)
                     } else {
                         ty
@@ -5159,7 +5131,13 @@ impl<'a> Engine<'a> {
                             .iter()
                             .enumerate()
                             .map(|(index, name)| {
-                                (*name, e.type_param_bounds.get(index).copied().filter(|b| *b != Ty::Dynamic))
+                                (
+                                    *name,
+                                    e.type_param_bounds
+                                        .get(index)
+                                        .copied()
+                                        .filter(|b| *b != Ty::Dynamic),
+                                )
                             })
                             .collect(),
                     ),
@@ -5170,7 +5148,13 @@ impl<'a> Engine<'a> {
                             .iter()
                             .enumerate()
                             .map(|(index, name)| {
-                                (*name, e.type_param_bounds.get(index).copied().filter(|b| *b != Ty::Dynamic))
+                                (
+                                    *name,
+                                    e.type_param_bounds
+                                        .get(index)
+                                        .copied()
+                                        .filter(|b| *b != Ty::Dynamic),
+                                )
                             })
                             .collect(),
                     ),
@@ -5636,16 +5620,13 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|&(n, t)| (n, self.infer_closure(t, params, !covariant)))
                     .collect();
-                self.boundary
-                    .args
-                    .borrow_mut()
-                    .function_generic(
-                        &pool_shape.type_params_named,
-                        return_ty,
-                        &positional,
-                        &named,
-                        nullable,
-                    )
+                self.boundary.args.borrow_mut().function_generic(
+                    &pool_shape.type_params_named,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                )
             }
             Ty::Record { shape, nullable } => {
                 let pool_shape = {
@@ -5813,14 +5794,7 @@ impl<'a> Engine<'a> {
                 }
                 true
             }
-            (
-                Ty::Function {
-                    shape: p_shape, ..
-                },
-                Ty::Function {
-                    shape: q_shape, ..
-                },
-            ) => {
+            (Ty::Function { shape: p_shape, .. }, Ty::Function { shape: q_shape, .. }) => {
                 let (p_shape, q_shape) = {
                     let pool = self.boundary.pool();
                     (
@@ -5829,16 +5803,17 @@ impl<'a> Engine<'a> {
                     )
                 };
                 // Return covariant: `P.ret <: Q.ret`.
-                if !self.infer_gather(p_shape.return_ty, q_shape.return_ty, params, left_schema, round)
-                {
+                if !self.infer_gather(
+                    p_shape.return_ty,
+                    q_shape.return_ty,
+                    params,
+                    left_schema,
+                    round,
+                ) {
                     return false;
                 }
                 // Positional formals contravariant: `Q.arg <: P.arg`.
-                for (&qa, &pa) in q_shape
-                    .positional
-                    .iter()
-                    .zip(p_shape.positional.iter())
-                {
+                for (&qa, &pa) in q_shape.positional.iter().zip(p_shape.positional.iter()) {
                     if !self.infer_gather(qa, pa, params, !left_schema, round) {
                         return false;
                     }
@@ -5854,14 +5829,7 @@ impl<'a> Engine<'a> {
                 }
                 true
             }
-            (
-                Ty::Record {
-                    shape: p_shape, ..
-                },
-                Ty::Record {
-                    shape: q_shape, ..
-                },
-            ) => {
+            (Ty::Record { shape: p_shape, .. }, Ty::Record { shape: q_shape, .. }) => {
                 let (p_shape, q_shape) = {
                     let pool = self.boundary.pool();
                     (
@@ -5869,11 +5837,7 @@ impl<'a> Engine<'a> {
                         pool.record_shape(q_shape).clone(),
                     )
                 };
-                for (&pa, &qa) in p_shape
-                    .positional
-                    .iter()
-                    .zip(q_shape.positional.iter())
-                {
+                for (&pa, &qa) in p_shape.positional.iter().zip(q_shape.positional.iter()) {
                     if !self.infer_gather(pa, qa, params, left_schema, round) {
                         return false;
                     }
@@ -5922,9 +5886,7 @@ impl<'a> Engine<'a> {
             (_, Ty::Dynamic) | (_, Ty::Void) => return b,
             (Ty::Null, other) | (other, Ty::Null) => {
                 return match other {
-                    Ty::Named {
-                        name, args, ..
-                    } => Ty::Named {
+                    Ty::Named { name, args, .. } => Ty::Named {
                         name,
                         nullable: true,
                         args,
@@ -5973,28 +5935,19 @@ impl<'a> Engine<'a> {
                     ..
                 },
             ) => {
-                let candidates: [StringId; 3] =
-                    [self.intern("num"), self.intern("Object"), self.intern("Comparable")];
+                let candidates: [StringId; 3] = [
+                    self.intern("num"),
+                    self.intern("Object"),
+                    self.intern("Comparable"),
+                ];
                 for target in candidates {
                     let a_inst = if a_head == target {
-                        Some(
-                            self.boundary
-                                .args
-                                .borrow()
-                                .get(a_args)
-                                .to_vec(),
-                        )
+                        Some(self.boundary.args.borrow().get(a_args).to_vec())
                     } else {
                         self.super_instantiation(a_head, target)
                     };
                     let b_inst = if b_head == target {
-                        Some(
-                            self.boundary
-                                .args
-                                .borrow()
-                                .get(b_args)
-                                .to_vec(),
-                        )
+                        Some(self.boundary.args.borrow().get(b_args).to_vec())
                     } else {
                         self.super_instantiation(b_head, target)
                     };
@@ -6021,15 +5974,7 @@ impl<'a> Engine<'a> {
         // The function pair joins pointwise (return LUB, formals GLB —
         // the upstream `FunctionType` LUB's structural arms), shapes of
         // equal arity only.
-        if let (
-            Ty::Function {
-                shape: a_shape, ..
-            },
-            Ty::Function {
-                shape: b_shape, ..
-            },
-        ) = (a, b)
-        {
+        if let (Ty::Function { shape: a_shape, .. }, Ty::Function { shape: b_shape, .. }) = (a, b) {
             let (a_shape, b_shape) = {
                 let pool = self.boundary.pool();
                 (
@@ -6159,7 +6104,9 @@ impl<'a> Engine<'a> {
         for index in 0..params.len() {
             seed(self, params, index, &mut out, &mut visiting);
         }
-        out.into_iter().map(|slot| slot.unwrap_or(Ty::Dynamic)).collect()
+        out.into_iter()
+            .map(|slot| slot.unwrap_or(Ty::Dynamic))
+            .collect()
     }
 
     /// One inference round's merged per-parameter constraint — upstream's
@@ -6244,16 +6191,13 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|&(n, t)| (n, self.infer_schema_closure(t, !greatest)))
                     .collect();
-                self.boundary
-                    .args
-                    .borrow_mut()
-                    .function_generic(
-                        &pool_shape.type_params_named,
-                        return_ty,
-                        &positional,
-                        &named,
-                        nullable,
-                    )
+                self.boundary.args.borrow_mut().function_generic(
+                    &pool_shape.type_params_named,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                )
             }
             Ty::Record { shape, nullable } => {
                 let pool_shape = {
@@ -6466,9 +6410,7 @@ impl<'a> Engine<'a> {
                     level
                         .closures
                         .iter()
-                        .find(|(start, end, _)| {
-                            range.offset >= *start && range.offset <= *end
-                        })
+                        .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
                         .map(|(.., sig)| sig.clone())
                 });
             let arg_ty = if *ty != Ty::Unknown {
@@ -6639,10 +6581,19 @@ impl<'a> Engine<'a> {
             }
 
             if !success {
-                let detail = self.infer_format_error(params[index].0, inferred_ty, &constraints[index], &origins);
+                let detail = self.infer_format_error(
+                    params[index].0,
+                    inferred_ty,
+                    &constraints[index],
+                    &origins,
+                );
                 let parameter = self.strings.resolve(params[index].0).to_string();
                 let message = SemanticCode::CouldNotInfer.message(&parameter, &detail);
-                self.emit_message_with_correction(SemanticCode::CouldNotInfer, callee_range, message);
+                self.emit_message_with_correction(
+                    SemanticCode::CouldNotInfer,
+                    callee_range,
+                    message,
+                );
                 reported = true;
             }
         }
@@ -6689,10 +6640,7 @@ impl<'a> Engine<'a> {
         // substituted-formals and return writes below read them
         // (`_typesInferredSoFar`'s winners alone; `_` never fills).
         for (index, slot) in solutions.iter_mut().enumerate() {
-            if slot.is_none()
-                && index < inferred.len()
-                && self.infer_known(inferred[index])
-            {
+            if slot.is_none() && index < inferred.len() && self.infer_known(inferred[index]) {
                 *slot = Some(inferred[index]);
             }
         }
@@ -6773,10 +6721,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .enumerate()
                 .map(|(other, (param, _))| {
-                    let ty = inferred_prior
-                        .get(other)
-                        .copied()
-                        .unwrap_or(Ty::Unknown);
+                    let ty = inferred_prior.get(other).copied().unwrap_or(Ty::Unknown);
                     (*param, ty)
                 })
                 .collect();
@@ -6792,10 +6737,10 @@ impl<'a> Engine<'a> {
     /// (the under-report posture — a wrongly-decided `false` invents a
     /// `couldNotInfer` the oracle never printed).
     fn infer_satisfied(&self, c: &InferConstraint, inferred: Ty) -> bool {
-        let upper_ok = c.upper == Ty::Unknown
-            || self.assignable(inferred, c.upper, false) != Some(false);
-        let lower_ok = c.lower == Ty::Unknown
-            || self.assignable(c.lower, inferred, false) != Some(false);
+        let upper_ok =
+            c.upper == Ty::Unknown || self.assignable(inferred, c.upper, false) != Some(false);
+        let lower_ok =
+            c.lower == Ty::Unknown || self.assignable(c.lower, inferred, false) != Some(false);
         // The `Object` fallback's own face: the merged answer `Object`
         // satisfies only `Object`/`Object?`/`dynamic`-headed uppers — a
         // concrete head's ask is decidable-false even when the head's
@@ -6803,7 +6748,11 @@ impl<'a> Engine<'a> {
         // names-only `Object` stub has no `double` climb).
         if upper_ok
             && let (
-                Ty::Named { name: i_head, nullable: false, .. },
+                Ty::Named {
+                    name: i_head,
+                    nullable: false,
+                    ..
+                },
                 Ty::Named {
                     name: u_head,
                     nullable: u_nullable,
@@ -6841,8 +6790,7 @@ impl<'a> Engine<'a> {
         for c in constraints {
             match order.iter().position(|&o| o == c.origin) {
                 Some(slot) => {
-                    satisfied[slot] =
-                        satisfied[slot] && self.infer_satisfied(c, inferred);
+                    satisfied[slot] = satisfied[slot] && self.infer_satisfied(c, inferred);
                 }
                 None => {
                     order.push(c.origin);
@@ -6931,16 +6879,13 @@ impl<'a> Engine<'a> {
             // `inferFnType`'s `typeParameters: const []` fold: the
             // parts keep their `T` spellings (they ARE the schema
             // holes the gather matches).
-            self.boundary
-                .args
-                .borrow_mut()
-                .function_generic(
-                    &[],
-                    pool_shape.return_ty,
-                    &pool_shape.positional,
-                    &pool_shape.named,
-                    matches!(fn_ty, Ty::Function { nullable: true, .. }),
-                )
+            self.boundary.args.borrow_mut().function_generic(
+                &[],
+                pool_shape.return_ty,
+                &pool_shape.positional,
+                &pool_shape.named,
+                matches!(fn_ty, Ty::Function { nullable: true, .. }),
+            )
         };
         // `fnType <: contextType` covariant — the fn type's pieces are
         // the schema (`leftSchema: true` keeps `P`-side upper arms live
@@ -7058,9 +7003,7 @@ impl<'a> Engine<'a> {
                     level
                         .closures
                         .iter()
-                        .find(|(start, end, _)| {
-                            range.offset >= *start && range.offset <= *end
-                        })
+                        .find(|(start, end, _)| range.offset >= *start && range.offset <= *end)
                         .map(|(.., sig)| sig.clone())
                 });
             let Some(sig) = arg_sig else {
@@ -7136,13 +7079,14 @@ impl<'a> Engine<'a> {
         // The body's expression row, when it survived the fold (`=> expr`
         // literals leave the expression's own row inside the literal
         // span); a primitive literal token is typed by its lexeme.
-        if let Some(row) = self
-            .rows
-            .iter()
-            .rev()
-            .find(|row| row.range.offset >= start && row.range.end() <= end
-                && matches!(row.intent, Intent::Read | Intent::Invoke | Intent::Operator(..)))
-        {
+        if let Some(row) = self.rows.iter().rev().find(|row| {
+            row.range.offset >= start
+                && row.range.end() <= end
+                && matches!(
+                    row.intent,
+                    Intent::Read | Intent::Invoke | Intent::Operator(..)
+                )
+        }) {
             let ty = self.expression_row_ty(row);
             if ty != Ty::UNKNOWN {
                 return Some(ty);
@@ -7158,10 +7102,12 @@ impl<'a> Engine<'a> {
         // depth 0) and classify the primitive lexeme.
         let start = self.byte_of(start);
         let text = self.source.get(start..)?;
-        
+
         let tail = text.split("=>").nth(1)?.trim_start();
-        let ty = if tail.starts_with('\'') || tail.starts_with('"')
-            || tail.starts_with("r'") || tail.starts_with("r\"")
+        let ty = if tail.starts_with('\'')
+            || tail.starts_with('"')
+            || tail.starts_with("r'")
+            || tail.starts_with("r\"")
         {
             self.intern("String")
         } else {
@@ -7277,24 +7223,20 @@ impl<'a> Engine<'a> {
         let Some(below) = below else {
             return;
         };
-        let Some(index) = self
-            .deferred_closure_formals
-            .iter()
-            .position(|d| {
-                d.callee_name == callee_spelling
-                    && d.below == below
-                    && match (d.slot, slot) {
-                        (SchemaSlot::Positional(a), SchemaSlot::Positional(b)) => a == b,
-                        (SchemaSlot::Named(a), SchemaSlot::Named(b)) => a == b,
-                        _ => false,
-                    }
-                    && match (d.formal, formal) {
-                        (SchemaSlot::Positional(a), SchemaSlot::Positional(b)) => a == b,
-                        (SchemaSlot::Named(a), SchemaSlot::Named(b)) => a == b,
-                        _ => false,
-                    }
-            })
-        else {
+        let Some(index) = self.deferred_closure_formals.iter().position(|d| {
+            d.callee_name == callee_spelling
+                && d.below == below
+                && match (d.slot, slot) {
+                    (SchemaSlot::Positional(a), SchemaSlot::Positional(b)) => a == b,
+                    (SchemaSlot::Named(a), SchemaSlot::Named(b)) => a == b,
+                    _ => false,
+                }
+                && match (d.formal, formal) {
+                    (SchemaSlot::Positional(a), SchemaSlot::Positional(b)) => a == b,
+                    (SchemaSlot::Named(a), SchemaSlot::Named(b)) => a == b,
+                    _ => false,
+                }
+        }) else {
             return;
         };
         let d = &self.deferred_closure_formals[index];
@@ -7313,17 +7255,10 @@ impl<'a> Engine<'a> {
     /// `tryChooseFinalTypes`'s `result`: known inferred types stay, the
     /// `_` leftovers fill from the i2b seeds (the
     /// `_checkArgumentsNotMatchingBounds` argument vector).
-    fn infer_i2b_full(
-        &self,
-        params: &[(StringId, Option<Ty>)],
-        inferred: &[Ty],
-    ) -> Vec<Ty> {
+    fn infer_i2b_full(&self, params: &[(StringId, Option<Ty>)], inferred: &[Ty]) -> Vec<Ty> {
         let mut result: Vec<Ty> = inferred.to_vec();
         // i2b seeds only where inference left `_`.
-        let need_seed: Vec<bool> = inferred
-            .iter()
-            .map(|&ty| !self.infer_known(ty))
-            .collect();
+        let need_seed: Vec<bool> = inferred.iter().map(|&ty| !self.infer_known(ty)).collect();
         if !need_seed.iter().any(|&n| n) {
             return result;
         }
@@ -7462,11 +7397,7 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|name| (*name, None))
                     .collect();
-                return Some((
-                    params.into_boxed_slice(),
-                    Vec::new(),
-                    decl_bounds(&entry),
-                ));
+                return Some((params.into_boxed_slice(), Vec::new(), decl_bounds(&entry)));
             }
             // A folded creation's instance send (`new C().m(42)`): the
             // instance face — the constructor-argument membership check
@@ -7624,11 +7555,7 @@ impl<'a> Engine<'a> {
     /// table [`Self::extension_member_bounds`] builds; a send that carries
     /// no group, no resolved receiver, or no extension application is
     /// silent (the under-report direction).
-    fn check_extension_member_type_arg_bounds(
-        &mut self,
-        callee: usize,
-        recv: Option<Receiver>,
-    ) {
+    fn check_extension_member_type_arg_bounds(&mut self, callee: usize, recv: Option<Receiver>) {
         let Some(recv) = recv else { return };
         let Some(member) = self.rows.get(callee).map(|row| row.name) else {
             return;
@@ -7760,10 +7687,7 @@ impl<'a> Engine<'a> {
         // IS the expression, not a nesting level.
         let (mut lo, mut hi) = (first, last);
         while hi > lo
-            && matches!(
-                tokens[lo].kind,
-                K::OpenParen | K::OpenSquare | K::OpenCurly
-            )
+            && matches!(tokens[lo].kind, K::OpenParen | K::OpenSquare | K::OpenCurly)
             && self.tokens.matching_end(lo) == Some(hi)
         {
             lo += 1;
@@ -7830,9 +7754,7 @@ impl<'a> Engine<'a> {
         member: StringId,
     ) -> Option<Box<[(StringId, Option<Ty>)]>> {
         let (head, receiver_ty, receiver_nullable) = match *recv {
-            Receiver::Typed { type_name, ty } => {
-                (type_name, ty, self.potentially_nullable(ty))
-            }
+            Receiver::Typed { type_name, ty } => (type_name, ty, self.potentially_nullable(ty)),
             // An extension body's `this`: the extended type is the
             // receiver (`this.m<..>()` re-applies the face like any typed
             // receiver).
@@ -9012,9 +8934,9 @@ impl<'a> Engine<'a> {
                     .pending_bounded_checks
                     .iter()
                     .filter_map(|check| match check {
-                        PendingBoundedCheck::Site { head, args, site, .. }
-                            if *head == enum_name && site.offset >= name_range.end() =>
-                        {
+                        PendingBoundedCheck::Site {
+                            head, args, site, ..
+                        } if *head == enum_name && site.offset >= name_range.end() => {
                             Some((site.offset, args))
                         }
                         _ => None,
@@ -9067,8 +8989,7 @@ impl<'a> Engine<'a> {
                             (*name, bound)
                         })
                         .collect();
-                    let mut constraints: Vec<Vec<InferConstraint>> =
-                        vec![Vec::new(); params.len()];
+                    let mut constraints: Vec<Vec<InferConstraint>> = vec![Vec::new(); params.len()];
                     let no_fixed = vec![false; params.len()];
                     // The gather table carries no param-named bounds: the
                     // `P <: T` bound gate in `infer_gather` closes a bound
@@ -9111,13 +9032,7 @@ impl<'a> Engine<'a> {
                         let gathered =
                             self.infer_gather(*ty, formal.ty, &gather_params, false, &mut raw);
                         if gathered {
-                            self.infer_merge_round(
-                                &params,
-                                &raw,
-                                0,
-                                &mut constraints,
-                                &no_fixed,
-                            );
+                            self.infer_merge_round(&params, &raw, 0, &mut constraints, &no_fixed);
                         }
                     }
                     let mut inferred: Vec<Ty> = Vec::with_capacity(params.len());
@@ -9305,11 +9220,8 @@ impl<'a> Engine<'a> {
                     );
                 }
                 let note = self.record_arity_note(flow_ty, formal.ty);
-                let message = SemanticCode::ArgumentTypeNotAssignable.message3(
-                    &from_text,
-                    &to_text,
-                    &note,
-                );
+                let message =
+                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, &note);
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -9383,8 +9295,8 @@ impl<'a> Engine<'a> {
             if self.argument_verdict(flow_ty, param_ty, face.literal) == Some(false) {
                 let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(param_ty);
-                let message = SemanticCode::ArgumentTypeNotAssignable
-                    .message3(&from_text, &to_text, "");
+                let message =
+                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, "");
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     face.index_range,
@@ -9628,8 +9540,8 @@ impl<'a> Engine<'a> {
                     );
                 }
                 let note = self.record_arity_note(flow_ty, formal.ty);
-                let message = SemanticCode::ArgumentTypeNotAssignable
-                    .message3(&from_text, &to_text, &note);
+                let message =
+                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, &note);
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -9648,10 +9560,7 @@ impl<'a> Engine<'a> {
         // the first argument's span, or the annotation head's (reconstructed
         // from the written text's start) when the list is empty — position
         // is load-bearing only for the (severity, code, file) key.
-        let given = args
-            .iter()
-            .take_while(|(name, ..)| name.is_none())
-            .count();
+        let given = args.iter().take_while(|(name, ..)| name.is_none()).count();
         let required = formals.positional.iter().filter(|f| f.required).count();
         let anchor = args
             .iter()
@@ -9662,10 +9571,8 @@ impl<'a> Engine<'a> {
                 length: 0,
             });
         if given < required {
-            let ctor_text = selector.map_or_else(
-                || head.to_string(),
-                |sel| format!("{head}.{sel}"),
-            );
+            let ctor_text =
+                selector.map_or_else(|| head.to_string(), |sel| format!("{head}.{sel}"));
             let (shape, a0, a1) = if required == 1 {
                 (
                     ArgCountShape::NameSingular,
@@ -9882,9 +9789,7 @@ impl<'a> Engine<'a> {
         let index = level.callee_row?;
         let row = self.rows.get(index)?;
         match &row.shape {
-            RowShape::Receiver(Receiver::This { container, .. })
-                if row.name == self.intern("") =>
-            {
+            RowShape::Receiver(Receiver::This { container, .. }) if row.name == self.intern("") => {
                 Some((*container, None, true))
             }
             _ => None,
@@ -10076,8 +9981,7 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        let Some(formals) = face.ctor_formals.get(&face_name).map(|f| (**f).clone())
-        else {
+        let Some(formals) = face.ctor_formals.get(&face_name).map(|f| (**f).clone()) else {
             return;
         };
         let mut formals = formals;
@@ -10305,12 +10209,15 @@ impl<'a> Engine<'a> {
         // own. `ctor_schema_formals` carries the schema projection the
         // send-close path reads (the element model's `ctor_formals` keeps
         // the written spellings through it).
-        let Some((face, face_owner, face_name)) =
-            self.effective_ctor_container(decl, owner, class)
+        let Some((face, face_owner, face_name)) = self.effective_ctor_container(decl, owner, class)
         else {
             return;
         };
-        let key = if selector == class { face_name } else { selector };
+        let key = if selector == class {
+            face_name
+        } else {
+            selector
+        };
         let Some(mut formals) = face.ctor_formals.get(&key).map(|f| (**f).clone()) else {
             return;
         };
@@ -10421,9 +10328,7 @@ impl<'a> Engine<'a> {
             .creation_call_site_ty(Some(level), Some((selector, selector_range)))
             .or_else(|| self.creation_row_ty(class, false, class_offset))
             .and_then(|ty| match ty {
-                Ty::Named { name, args, .. }
-                    if name == class && args != ArgListId::EMPTY =>
-                {
+                Ty::Named { name, args, .. } if name == class && args != ArgListId::EMPTY => {
                     Some(self.boundary.args.borrow().get(args).to_vec())
                 }
                 _ => None,
@@ -10525,12 +10430,8 @@ impl<'a> Engine<'a> {
                         // pairs `T`'s `t1` formals (keyed on `T`, not `S`).
                         // A broken forwarding chain keeps the under-report
                         // posture the selector miss already carried.
-                        let Some((face, face_owner, face_name)) = self
-                            .effective_ctor_container(
-                                super_container,
-                                super_owner,
-                                superclass,
-                            )
+                        let Some((face, face_owner, face_name)) =
+                            self.effective_ctor_container(super_container, super_owner, superclass)
                         else {
                             return;
                         };
@@ -10723,7 +10624,10 @@ impl<'a> Engine<'a> {
             .filter(|(owner, ..)| open_site.is_some() && *owner == open_site)
             .map(|(_, _, named, name, ..)| (*named, *name))
             .collect();
-        given += super_formals_here.iter().filter(|(named, _)| !*named).count();
+        given += super_formals_here
+            .iter()
+            .filter(|(named, _)| !*named)
+            .count();
         if given < required {
             let anchor = level
                 .args
@@ -10867,11 +10771,8 @@ impl<'a> Engine<'a> {
                 let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
                 let note = self.record_arity_note(flow_ty, formal.ty);
-                let message = SemanticCode::ArgumentTypeNotAssignable.message3(
-                    &from_text,
-                    &to_text,
-                    &note,
-                );
+                let message =
+                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, &note);
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -11644,10 +11545,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 if edge == target {
-                    let candidate: Vec<Ty> = next_args
-                        .iter()
-                        .map(|&ty| self.norm_ty(ty))
-                        .collect();
+                    let candidate: Vec<Ty> = next_args.iter().map(|&ty| self.norm_ty(ty)).collect();
                     hits = Some(match hits {
                         None => candidate,
                         Some(existing) => {
@@ -11966,9 +11864,7 @@ impl<'a> Engine<'a> {
                     self.file,
                     *name,
                 )
-                .filter(|(decl, owner)| {
-                    !self.unnamed_ctor_exists(*decl, *owner, *name)
-                })
+                .filter(|(decl, owner)| !self.unnamed_ctor_exists(*decl, *owner, *name))
                 .map(|_| (*name, head.range))
             });
         if let Some((container, head_range)) = unnamed_creation_miss {
@@ -11990,9 +11886,7 @@ impl<'a> Engine<'a> {
                 self.file,
                 name,
             )
-            .is_some_and(|(decl, owner)| {
-                !self.unnamed_ctor_exists(decl, owner, name)
-            })
+            .is_some_and(|(decl, owner)| !self.unnamed_ctor_exists(decl, owner, name))
         {
             // The row-transport under-report seam: a bare creation whose
             // callee row resolved outside the container shape (the
@@ -12903,12 +12797,7 @@ impl<'a> Engine<'a> {
         {
             let params: Vec<(StringId, Option<Ty>)> = rhs_params
                 .iter()
-                .map(|(param, bound, _)| {
-                    (
-                        *param,
-                        bound.as_ref().map(|tree| self.tree_ty(tree)),
-                    )
-                })
+                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
                 .collect();
             decl_bounds = Some(params.iter().copied().map(TypeArgBound::from).collect());
             exec_params = Some(params.into());
@@ -13153,9 +13042,7 @@ impl<'a> Engine<'a> {
         let mut explicit_args = self.call_args_for(callee);
         if shorthand_arg
             && let Some(args) = explicit_args.take()
-            && let Some(below) = callee
-                .checked_sub(1)
-                .and_then(|index| self.rows.get(index))
+            && let Some(below) = callee.checked_sub(1).and_then(|index| self.rows.get(index))
         {
             // The shorthand `.name(...)` spells no type-argument group of
             // its own: anything `call_args_for` answered came through the
@@ -13222,15 +13109,12 @@ impl<'a> Engine<'a> {
                 .collect();
             self.check_call_type_arg_bounds(&params, args);
         }
-        
+
         if let Some(params) = &exec_params {
             let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
             // The explicit fix precedes every inference face.
             if let Some(explicit) = &explicit_args {
-                for (index, (slot, ty)) in solutions
-                    .iter_mut()
-                    .zip(explicit.tys.iter())
-                    .enumerate()
+                for (index, (slot, ty)) in solutions.iter_mut().zip(explicit.tys.iter()).enumerate()
                 {
                     *slot = Some(*ty);
                     explicit_fixed.insert(index);
@@ -13476,7 +13360,6 @@ impl<'a> Engine<'a> {
             // argument walk checks and the instantiated return write
             // consume them).
             if explicit_args.is_none() {
-                
                 let infer_below = self
                     .rows
                     .get(callee)
@@ -13694,12 +13577,7 @@ impl<'a> Engine<'a> {
                 if name.is_some() {
                     span = self.label_span(span).unwrap_or(span);
                 }
-                self.emit(
-                    SemanticCode::UseOfVoidResult,
-                    span,
-                    "",
-                    "",
-                );
+                self.emit(SemanticCode::UseOfVoidResult, span, "", "");
                 continue;
             }
             // The function-subtype face (`_isFunctionSubtypeOf`,
@@ -14267,11 +14145,8 @@ impl<'a> Engine<'a> {
                             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
                             true
                         }
-                        Ty::Named {
-                            name, nullable, ..
-                        } => {
-                            if self.source.as_bytes().get(self.byte_of(range.offset))
-                                == Some(&b']')
+                        Ty::Named { name, nullable, .. } => {
+                            if self.source.as_bytes().get(self.byte_of(range.offset)) == Some(&b']')
                             {
                                 true
                             } else if nullable
@@ -14478,8 +14353,11 @@ impl<'a> Engine<'a> {
                                 })
                                 .and_then(|index| u32::try_from(index).ok())
                             {
-                                self.extension_member_used
-                                    .insert((face_file, face_index, self.intern("call")));
+                                self.extension_member_used.insert((
+                                    face_file,
+                                    face_index,
+                                    self.intern("call"),
+                                ));
                             }
                             self.credit_extension_import(face, face_file);
                         }
@@ -14822,13 +14700,12 @@ impl<'a> Engine<'a> {
             // row at the `(` token — the range already leads the group, so
             // only the close can extend it.
             let at = tokens.partition_point(|t| t.utf16_offset < wrapped.offset);
-            if tokens
-                .get(at)
-                .is_some_and(|t| t.utf16_offset == wrapped.offset && t.kind == dartq_scanner::TokenKind::OpenParen)
-                && let Some(close) = self.tokens.matching_end(at)
+            if tokens.get(at).is_some_and(|t| {
+                t.utf16_offset == wrapped.offset && t.kind == dartq_scanner::TokenKind::OpenParen
+            }) && let Some(close) = self.tokens.matching_end(at)
             {
-                let close_end = self
-                    .utf16_of((tokens[close].byte_offset + tokens[close].byte_len) as usize);
+                let close_end =
+                    self.utf16_of((tokens[close].byte_offset + tokens[close].byte_len) as usize);
                 if close_end > wrapped.end() {
                     wrapped = SourceRange {
                         offset: wrapped.offset,
@@ -14841,10 +14718,9 @@ impl<'a> Engine<'a> {
             // — `(f)`'s callee folds to a bare row anchored on the closer.
             // Its matching `(` re-opens the group's own extent the way the
             // inner-token arm below does from the other side.
-            if tokens
-                .get(at)
-                .is_some_and(|t| t.utf16_offset == wrapped.offset && t.kind == dartq_scanner::TokenKind::CloseParen)
-            {
+            if tokens.get(at).is_some_and(|t| {
+                t.utf16_offset == wrapped.offset && t.kind == dartq_scanner::TokenKind::CloseParen
+            }) {
                 let mut depth = 0u32;
                 let mut open = None;
                 for i in (0..at).rev() {
@@ -15387,8 +15263,7 @@ impl<'a> Engine<'a> {
                 // then inherits.
                 let cascade_follows = {
                     let tokens = self.tokens.as_slice();
-                    let next = tokens
-                        .partition_point(|token| token.utf16_offset < end.range.end());
+                    let next = tokens.partition_point(|token| token.utf16_offset < end.range.end());
                     tokens.get(next).is_some_and(|token| {
                         matches!(
                             token.kind,
@@ -16022,19 +15897,16 @@ impl<'a> Engine<'a> {
                             let positional: Vec<Ty> = sig
                                 .positional
                                 .iter()
-                                .map(|ty| {
-                                    self.subst_params(*ty, &map).unwrap_or(*ty)
-                                })
+                                .map(|ty| self.subst_params(*ty, &map).unwrap_or(*ty))
                                 .collect();
                             let named: Vec<(StringId, Ty)> = sig
                                 .named
                                 .iter()
-                                .map(|(n, ty, _)| {
-                                    (*n, self.subst_params(*ty, &map).unwrap_or(*ty))
-                                })
+                                .map(|(n, ty, _)| (*n, self.subst_params(*ty, &map).unwrap_or(*ty)))
                                 .collect();
-                            let return_ty =
-                                self.subst_params(sig.return_ty, &map).unwrap_or(sig.return_ty);
+                            let return_ty = self
+                                .subst_params(sig.return_ty, &map)
+                                .unwrap_or(sig.return_ty);
                             let instantiated =
                                 self.boundary.args.borrow_mut().function_generic_required(
                                     &[],
@@ -16049,9 +15921,7 @@ impl<'a> Engine<'a> {
                             }
                         }
                     }
-                } else if let Some((declared, kind)) = self
-                    .tear_off_element_arity(row_name)
-                {
+                } else if let Some((declared, kind)) = self.tear_off_element_arity(row_name) {
                     // An unqualified reference the top-level table missed:
                     // a declared LOCAL function (`f() { g<int>; }` — its
                     // own value is the tear-off, the `_function`-kind
@@ -16181,8 +16051,7 @@ impl<'a> Engine<'a> {
                             // need `&mut` faces — lift the entry's facts to
                             // owned copies first.
                             let entry_return_ty = entry.return_ty;
-                            let entry_param_names: Vec<StringId> =
-                                entry.type_param_names.to_vec();
+                            let entry_param_names: Vec<StringId> = entry.type_param_names.to_vec();
                             let map: Vec<(StringId, Ty)> = entry_param_names
                                 .iter()
                                 .copied()
@@ -16207,16 +16076,10 @@ impl<'a> Engine<'a> {
                                         (f.name, self.subst_params(f.ty, &map).unwrap_or(f.ty))
                                     })
                                     .collect();
-                                let required = formals
-                                    .positional
-                                    .iter()
-                                    .filter(|f| f.required)
-                                    .count();
-                                let instantiated = self
-                                    .boundary
-                                    .args
-                                    .borrow_mut()
-                                    .function_generic_required(
+                                let required =
+                                    formals.positional.iter().filter(|f| f.required).count();
+                                let instantiated =
+                                    self.boundary.args.borrow_mut().function_generic_required(
                                         &[],
                                         u16::try_from(required).unwrap_or(u16::MAX),
                                         return_ty,
@@ -16251,8 +16114,7 @@ impl<'a> Engine<'a> {
                     // typeParameter/explicitReceiver rows all carry only
                     // `undefined_getter`).
                     Walk::Missing => {
-                        if let Some((class, ctor)) =
-                            self.ctor_arity_target(&recv_ty, row_name)
+                        if let Some((class, ctor)) = self.ctor_arity_target(&recv_ty, row_name)
                             && count != 0
                         {
                             let class = self.strings.resolve(class).to_string();
@@ -16747,8 +16609,7 @@ impl<'a> Engine<'a> {
             && !anchored
             && (self.switch.case_sink_open || self.switch.pattern_depth > 0)
         {
-            self.pending_pattern_type_args =
-                Some((count, begin.range.offset, range.end()));
+            self.pending_pattern_type_args = Some((count, begin.range.offset, range.end()));
         }
         // The clause-entry capture (#1289 E1): the group closed — an
         // outermost one re-arms the entry span's closer latch, consumed by
@@ -16840,8 +16701,7 @@ impl<'a> Engine<'a> {
             if let Some(capture) = self.call_args_capture.take()
                 && let Some(params) = self.captured_type_arg_bounds(head_id)
             {
-                let (tys, spans): (Vec<Ty>, Vec<SourceRange>) =
-                    capture.members.into_iter().unzip();
+                let (tys, spans): (Vec<Ty>, Vec<SourceRange>) = capture.members.into_iter().unzip();
                 let args = CallTypeArgs {
                     tys: tys.into_boxed_slice(),
                     spans: spans.into_boxed_slice(),
@@ -16967,10 +16827,7 @@ impl<'a> Engine<'a> {
                     // `new C<int>()`/`const C<int>()`: the class head is
                     // the stack's top row — the `NamedType` anchor is
                     // `C<int>` (head through `>`), not the `<...>` alone.
-                    let head = self
-                        .rows
-                        .last()
-                        .map_or(range.offset, |r| r.range.offset);
+                    let head = self.rows.last().map_or(range.offset, |r| r.range.offset);
                     self.check_annotation_arity(class, head, count, range);
                     self.check_creation_ref_bounds(class);
                 }
@@ -17100,8 +16957,10 @@ impl<'a> Engine<'a> {
         // counts — the base code, not the executable `_element` face. Check
         // here; the deferred path only sees the group when a send's `(`
         // follows — a type-annotation head's `;` never consumes the slot.
-        if matches!(target.shape, RowShape::Bare(BareInfo::Plain { .. }) | RowShape::TypeUse(..))
-            && self.resolve_local(target.name).is_none()
+        if matches!(
+            target.shape,
+            RowShape::Bare(BareInfo::Plain { .. }) | RowShape::TypeUse(..)
+        ) && self.resolve_local(target.name).is_none()
             && let Some((container, _)) = resolve_container(
                 self.graph,
                 self.namespaces,

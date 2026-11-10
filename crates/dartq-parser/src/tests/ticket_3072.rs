@@ -35,10 +35,7 @@ fn sorted_rows(source: &'static str) -> Vec<(String, u32, u32)> {
 /// file) SET, so the cascade pins commit to the code multiset plus the
 /// anchors #3052 documented from the oracle, not emission order.
 fn sorted_codes(source: &'static str) -> Vec<String> {
-    let mut codes: Vec<String> = sorted_rows(source)
-        .into_iter()
-        .map(|(c, _, _)| c)
-        .collect();
+    let mut codes: Vec<String> = sorted_rows(source).into_iter().map(|(c, _, _)| c).collect();
     codes.sort();
     codes
 }

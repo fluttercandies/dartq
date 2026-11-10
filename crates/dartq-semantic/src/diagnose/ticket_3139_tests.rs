@@ -60,7 +60,8 @@ fn uf3139_typed_field_formal_fires() {
 /// (upstream `visitSuperFormalParameter` → `_checkFinalParameter`).
 #[test]
 fn uf3139_typed_super_formal_fires() {
-    let main = "class A {\n  A(int x);\n}\nclass B extends A {\n  B(final int super.x) : super(1);\n}\n";
+    let main =
+        "class A {\n  A(int x);\n}\nclass B extends A {\n  B(final int super.x) : super(1);\n}\n";
     let report = report_ops_bare(main);
     let rows = rows_named(&report, "unnecessary_final");
     assert_eq!(rows.len(), 1, "{report:?}");
@@ -147,7 +148,11 @@ fn uf3139_statement_body_call_silent() {
                 }\n";
     let report = report_ops_bare(main);
     let rows = rows_named(&report, "unnecessary_final");
-    assert_eq!(rows.len(), 1, "only the constructor's own formal: {report:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the constructor's own formal: {report:?}"
+    );
     assert_eq!(
         rows[0].range,
         SourceRange {
@@ -211,7 +216,10 @@ fn uf3139_typed_formal_with_initializer_fires() {
     let report = report_ops_bare(main);
     let rows = rows_named(&report, "unnecessary_final");
     assert_eq!(rows.len(), 2, "{report:?}");
-    let expected = [anchor(main, "final int this.a", 0), anchor(main, "final int this.b", 0)];
+    let expected = [
+        anchor(main, "final int this.a", 0),
+        anchor(main, "final int this.b", 0),
+    ];
     let mut actual: Vec<u32> = rows.iter().map(|row| row.range.offset).collect();
     actual.sort_unstable();
     assert_eq!(actual, expected, "{report:?}");

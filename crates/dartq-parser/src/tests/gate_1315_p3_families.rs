@@ -269,8 +269,11 @@ fn typedef_record_return_type_parses_as_typedef() {
     );
     // Positional record return + empty formals.
     assert!(
-        rows_with("typedef (int, String) R2();\n", super::collector::latest_features())
-            .is_empty()
+        rows_with(
+            "typedef (int, String) R2();\n",
+            super::collector::latest_features()
+        )
+        .is_empty()
     );
     // Named-field record return.
     assert!(
@@ -281,9 +284,7 @@ fn typedef_record_return_type_parses_as_typedef() {
         .is_empty()
     );
     // Empty record `()` return type stays a typedef too.
-    assert!(
-        rows_with("typedef () foo();\n", super::collector::latest_features()).is_empty()
-    );
+    assert!(rows_with("typedef () foo();\n", super::collector::latest_features()).is_empty());
     // Sibling: single-field record without trailing comma keeps its own row
     // (parseRecordType's `recordTypeOnePositionalNoTrailingComma`,
     // parser_impl.dart:1849-1855) — the typedef head is not the owner. (dartq
@@ -294,14 +295,16 @@ fn typedef_record_return_type_parses_as_typedef() {
             "typedef (int) bar(int x);\n",
             super::collector::latest_features()
         ),
-        vec![("record_type_one_positional_no_trailing_comma".to_string(), 12, 13)],
+        vec![(
+            "record_type_one_positional_no_trailing_comma".to_string(),
+            12,
+            13
+        )],
     );
     // Sibling: `typedef` followed by a non-record `(` shape still takes the
     // member path unchanged (`typedef` usable as a plain identifier).
     // (assert via a clean non-record function pair)
-    assert!(
-        rows_with("typedef void R4();\n", super::collector::latest_features()).is_empty()
-    );
+    assert!(rows_with("typedef void R4();\n", super::collector::latest_features()).is_empty());
 }
 
 // —— C6b: class-member tail recovery + adopted-closer faces —————————————
@@ -354,9 +357,7 @@ fn adopted_paren_closer_never_resurfaces_as_member() {
         vec![("expected_token".to_string(), 23, 24)],
     );
     // A well-formed twin stays silent.
-    assert!(
-        rows_with("class C { m() {} }\n", super::collector::latest_features()).is_empty()
-    );
+    assert!(rows_with("class C { m() {} }\n", super::collector::latest_features()).is_empty());
 }
 
 // —— FAM8: primary-constructor feature posture ———————————————————————————
@@ -688,7 +689,8 @@ fn object_pattern_assignment_enters_pattern_path() {
     assert!(
         !rows
             .iter()
-            .any(|(c, _, _)| c == "missing_identifier" || c == "illegal_assignment_to_non_assignable"),
+            .any(|(c, _, _)| c == "missing_identifier"
+                || c == "illegal_assignment_to_non_assignable"),
         "object pattern must route to parse_pattern_assignment, got {rows:?}"
     );
     assert!(
@@ -702,11 +704,13 @@ fn object_pattern_assignment_enters_pattern_path() {
         let src = format!(
             "class Square {{ final int areaAsInt; Square(this.areaAsInt); }}\nmain() {{\n  var x = Square(1);\n  Square(areaAsInt: {tail}) = x;\n}}\n"
         );
-        let rows = rows_with(Box::leak(src.into_boxed_str()), super::collector::latest_features());
+        let rows = rows_with(
+            Box::leak(src.into_boxed_str()),
+            super::collector::latest_features(),
+        );
         assert!(
-            !rows
-                .iter()
-                .any(|(c, _, _)| c == "missing_identifier" || c == "illegal_assignment_to_non_assignable"),
+            !rows.iter().any(|(c, _, _)| c == "missing_identifier"
+                || c == "illegal_assignment_to_non_assignable"),
             "{tail:?} must stay in the pattern path, got {rows:?}"
         );
     }
@@ -720,7 +724,8 @@ fn object_pattern_assignment_enters_pattern_path() {
     assert!(
         !rows
             .iter()
-            .any(|(c, _, _)| c == "missing_identifier" || c == "illegal_assignment_to_non_assignable"),
+            .any(|(c, _, _)| c == "missing_identifier"
+                || c == "illegal_assignment_to_non_assignable"),
         "shorthand `:var d` must stay in the pattern path, got {rows:?}"
     );
     assert!(

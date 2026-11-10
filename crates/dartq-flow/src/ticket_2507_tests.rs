@@ -118,10 +118,7 @@ fn map_where_chain_keeps_the_nullable_element() {
     // element (`M`, non-null — the closure body's own return face).
     let e_formal = source.find("(e) =>").unwrap() as u32 + 1;
     let x_formal = source.find("(x) =>").unwrap() as u32 + 1;
-    let staged = vec![
-        (e_formal, "L", true),
-        (x_formal, "M", false),
-    ];
+    let staged = vec![(e_formal, "L", true), (x_formal, "M", false)];
     let (e_read, ids) = read_ty_at(source, &staged, &["L"], "e.field");
     assert_eq!(
         e_read.base,
@@ -149,10 +146,7 @@ fn nonnulls_chain_keeps_the_stripped_element() {
         "void g(List<L?> ls) {\n  ls.nonNulls.map((e) => e.field).where((x) => x != null);\n}\n";
     let e_formal = source.find("(e) =>").unwrap() as u32 + 1;
     let x_formal = source.find("(x) =>").unwrap() as u32 + 1;
-    let staged = vec![
-        (e_formal, "L", false),
-        (x_formal, "M", false),
-    ];
+    let staged = vec![(e_formal, "L", false), (x_formal, "M", false)];
     let (e_read, ids) = read_ty_at(source, &staged, &["L"], "e.field");
     assert_eq!(
         e_read.base,

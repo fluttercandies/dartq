@@ -411,12 +411,7 @@ fn stale_mark_resweep_stays_idempotent() {
     let source = "enum E { a, b }\nvoid f() { E x = .c; E y = .c; }\n";
     let r = report_ops(source);
     let at_rows = shorthand_rows(&r);
-    assert_eq!(
-        at_rows.len(),
-        2,
-        "each window reports once: {:?}",
-        rows(&r)
-    );
+    assert_eq!(at_rows.len(), 2, "each window reports once: {:?}", rows(&r));
     assert!(
         at_rows.iter().all(|&(_, len)| len == 1),
         "both rows anchor a one-char selector: {at_rows:?}"
@@ -442,7 +437,8 @@ fn rider_invalid_on_clause_renders_invalid_type() {
         .find(|d| d.code.name == "dead_code_on_catch_subtype")
         .unwrap_or_else(|| panic!("no dead_code_on_catch_subtype row: {:?}", rows(&r)));
     assert!(
-        row.message.contains("'InvalidType' is a subtype of 'List<String>'"),
+        row.message
+            .contains("'InvalidType' is a subtype of 'List<String>'"),
         "the invalid head spells InvalidType: {:?}",
         row.message
     );
@@ -464,8 +460,7 @@ fn rider_invalid_argument_keeps_written_head() {
         .find(|d| d.code.name == "dead_code_on_catch_subtype")
         .unwrap_or_else(|| panic!("no dead_code_on_catch_subtype row: {:?}", rows(&r)));
     assert!(
-        row
-            .message
+        row.message
             .contains("'InvalidType' is a subtype of 'List<Unresolved10>'"),
         "the written head survives the argument fill: {:?}",
         row.message
@@ -477,9 +472,7 @@ fn rider_invalid_argument_keeps_written_head() {
 // —— `InvalidType` splice anywhere.
 #[test]
 fn rider_ordinary_catch_message_unchanged() {
-    let r = report_ops(
-        "void f() { try { throw 0; } on String {} on Object {} }\n",
-    );
+    let r = report_ops("void f() { try { throw 0; } on String {} on Object {} }\n");
     assert!(
         r.diagnostics
             .iter()

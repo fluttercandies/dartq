@@ -158,9 +158,7 @@ fn completeness_names_the_most_specific_declaring_member() {
         .collect();
     assert_eq!(
         descriptions,
-        vec![
-            "Missing concrete implementation of 'PSetBase.contains'.".to_string(),
-        ],
+        vec!["Missing concrete implementation of 'PSetBase.contains'.".to_string(),],
         "rows: {:?}",
         rows(&report)
     );

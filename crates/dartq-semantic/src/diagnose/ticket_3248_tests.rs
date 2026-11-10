@@ -226,8 +226,7 @@ void main() {
         rows(&report, "argument_type_not_assignable"),
         vec![(
             at(fixture, "0", 0),
-            "The argument type 'int' can't be assigned to the parameter type 'String'."
-                .to_string(),
+            "The argument type 'int' can't be assigned to the parameter type 'String'.".to_string(),
         )],
         "no appendix for a non-record pair: {:?}",
         report.diagnostics
@@ -251,8 +250,7 @@ void main(Map<int, int> m) {
         rows(&report, "argument_type_not_assignable"),
         vec![(
             at(fixture, "'x'", 0),
-            "The argument type 'String' can't be assigned to the parameter type 'int'."
-                .to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'int'.".to_string(),
         )],
         "the write element's key formal decides the index argument: {:?}",
         report.diagnostics
@@ -274,8 +272,7 @@ void main(Map<int, int> m) {
         atna.first(),
         Some(&(
             at(fixture, "'x'", 0),
-            "The argument type 'String' can't be assigned to the parameter type 'int'."
-                .to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'int'.".to_string(),
         )),
         "the compound write form checks the key formal too: {:?}",
         report.diagnostics
@@ -347,4 +344,3 @@ void main() {
         report.diagnostics
     );
 }
-

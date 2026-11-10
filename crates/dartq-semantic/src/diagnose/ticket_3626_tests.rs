@@ -373,7 +373,9 @@ fn three_way_conflict_reports_the_first_failure_only() {
     );
     assert_eq!(
         conflict_rows(&report),
-        ["The class 'D' can't implement both 'I<int>' and 'I<String>' because the type arguments are different."]
+        [
+            "The class 'D' can't implement both 'I<int>' and 'I<String>' because the type arguments are different."
+        ]
     );
 }
 

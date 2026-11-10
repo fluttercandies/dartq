@@ -129,7 +129,9 @@ fn const_bool_conditional_stays_silent() {
 
 #[test]
 fn const_bool_if_else_stays_silent() {
-    no_dead("const bool DEBUG = true;\nvoid g() {\n  if (DEBUG) {\n    1;\n  } else {\n    2;\n  }\n}\n");
+    no_dead(
+        "const bool DEBUG = true;\nvoid g() {\n  if (DEBUG) {\n    1;\n  } else {\n    2;\n  }\n}\n",
+    );
 }
 
 #[test]

@@ -90,7 +90,11 @@ fn ticket_3237_declared_never_fire_faces() {
             failures.push(format!("{fixture:?} -> {:?}", rows(&report)));
         }
     }
-    assert!(failures.is_empty(), "silent faces:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "silent faces:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// An inferred-`Never` local — `var` adopts the `throw`'s bottom type, so
@@ -117,7 +121,11 @@ fn ticket_3237_never_call_receiver() {
             failures.push(format!("{fixture:?} -> {:?}", rows(&report)));
         }
     }
-    assert!(failures.is_empty(), "silent faces:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "silent faces:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// A `throw`'s canonical `Ty::Never` receiver (the row rewrite, not the

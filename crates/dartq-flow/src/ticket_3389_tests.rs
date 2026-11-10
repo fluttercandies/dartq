@@ -59,7 +59,8 @@ fn dead_of(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -128,7 +129,10 @@ fn exhaustive_all_cannot_match_switch_deads_the_post_switch() {
         "}\n",
     );
     let rows = dead_of(src);
-    assert!(rows.iter().any(|row| row.contains("notReached")), "{rows:?}");
+    assert!(
+        rows.iter().any(|row| row.contains("notReached")),
+        "{rows:?}"
+    );
 }
 
 /// The typed declared-variable head (`case Null v:`) answers the same

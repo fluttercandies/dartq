@@ -86,7 +86,8 @@ fn for_element_list_literal_non_matching_check_stays_silent() {
 /// 'List<int>'.` at the literal (len 36).
 #[test]
 fn for_element_typed_literal_reports_invalid_assignment() {
-    let fixture = "void main() {\n  List<int> u = <num>[for (int i = 0; i < 3; i++) i];\n  print(u);\n}\n";
+    let fixture =
+        "void main() {\n  List<int> u = <num>[for (int i = 0; i < 3; i++) i];\n  print(u);\n}\n";
     let report = report_ops(fixture);
     assert_eq!(
         rows_of(&report, "invalid_assignment"),
@@ -108,7 +109,8 @@ fn for_element_typed_literal_reports_invalid_assignment() {
 /// silent.
 #[test]
 fn for_element_typed_literal_matching_target_stays_silent() {
-    let fixture = "void main() {\n  List<num> u = <num>[for (int i = 0; i < 3; i++) i];\n  print(u);\n}\n";
+    let fixture =
+        "void main() {\n  List<num> u = <num>[for (int i = 0; i < 3; i++) i];\n  print(u);\n}\n";
     let report = report_ops(fixture);
     assert!(
         rows_of(&report, "invalid_assignment").is_empty(),

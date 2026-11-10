@@ -169,8 +169,10 @@ void f(List<int>? other) {
         report
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code.name == "unchecked_use_of_nullable_value"
-                && diagnostic.range.offset == call + 3),
+            .any(
+                |diagnostic| diagnostic.code.name == "unchecked_use_of_nullable_value"
+                    && diagnostic.range.offset == call + 3
+            ),
         "the row anchors the `add` selector after `xs.`: {:?}",
         report.diagnostics
     );

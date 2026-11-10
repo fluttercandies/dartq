@@ -45,9 +45,7 @@ fn bare_alias_head_argument_keeps_the_alias_spelling() {
     );
     assert_eq!(
         bounds_messages(&report),
-        [
-            "'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'X'."
-        ],
+        ["'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'X'."],
         "{:?}",
         bounds_messages(&report)
     );
@@ -90,9 +88,7 @@ fn dependent_parameter_grounds_through_the_cycle_member() {
     );
     assert_eq!(
         bounds_messages(&report),
-        [
-            "'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'X'."
-        ],
+        ["'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'X'."],
         "{:?}",
         bounds_messages(&report)
     );
@@ -112,9 +108,7 @@ fn clause_site_regular_pass_keeps_the_dynamic_grounding() {
     );
     assert_eq!(
         bounds_messages(&report),
-        [
-            "'A<dynamic>' doesn't conform to the bound 'A<A<dynamic>>' of the type parameter 'X'."
-        ],
+        ["'A<dynamic>' doesn't conform to the bound 'A<A<dynamic>>' of the type parameter 'X'."],
         "{:?}",
         bounds_messages(&report)
     );
@@ -133,9 +127,7 @@ fn unbounded_and_class_headed_bounds_keep_their_faces() {
     );
     assert_eq!(
         bounds_messages(&report),
-        [
-            "'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'Y'."
-        ],
+        ["'A<Never>' doesn't conform to the bound 'A<A<Never>>' of the type parameter 'Y'."],
         "{:?}",
         bounds_messages(&report)
     );

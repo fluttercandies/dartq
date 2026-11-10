@@ -45,7 +45,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::codes::{AlreadyCompleteShape, ReturnShape, SemanticCode, WithoutDeclarationShape};
 use crate::library::ElementIndex;
 use crate::model::{
-    AugKind, AugmentDecl, AugmentFormal, AugTarget, Container, ContainerKind, FileElements, Formal,
+    AugKind, AugTarget, AugmentDecl, AugmentFormal, Container, ContainerKind, FileElements, Formal,
     Formals, MemberEntry, MemberKind, MicroKind, Ty,
 };
 
@@ -1486,11 +1486,7 @@ fn check_formals(
                         })
                         .unwrap_or_default()
                 } else {
-                    first
-                        .positional
-                        .iter()
-                        .map(|f| Some(f.name))
-                        .collect()
+                    first.positional.iter().map(|f| Some(f.name)).collect()
                 }
             })
             .collect();
@@ -1614,43 +1610,44 @@ fn check_default_chain(
     // One preceding fragment's same-slot formal carried a default:
     // `constantInitializer != null` — `Formal::default_value` on the intro,
     // `AugmentFormal::default_separator` on an augment fragment.
-    let preceding_had_default = |entry: &Entry, positional: Option<usize>, named: Option<StringId>| {
-        if entry.is_augment {
-            let Some(elements) = index.get(entry.unit) else {
-                return false;
-            };
-            let Some(decl) = elements.augmentations().get(entry.aug_index) else {
-                return false;
-            };
-            match (positional, named) {
-                (Some(at), None) => decl
-                    .formals
-                    .iter()
-                    .filter(|f| f.required_positional || f.optional_positional)
-                    .nth(at)
-                    .is_some_and(|f| f.default_separator.is_some()),
-                (None, Some(name)) => decl
-                    .formals
-                    .iter()
-                    .find(|f| f.named && f.name == Some(name))
-                    .is_some_and(|f| f.default_separator.is_some()),
-                _ => false,
+    let preceding_had_default =
+        |entry: &Entry, positional: Option<usize>, named: Option<StringId>| {
+            if entry.is_augment {
+                let Some(elements) = index.get(entry.unit) else {
+                    return false;
+                };
+                let Some(decl) = elements.augmentations().get(entry.aug_index) else {
+                    return false;
+                };
+                match (positional, named) {
+                    (Some(at), None) => decl
+                        .formals
+                        .iter()
+                        .filter(|f| f.required_positional || f.optional_positional)
+                        .nth(at)
+                        .is_some_and(|f| f.default_separator.is_some()),
+                    (None, Some(name)) => decl
+                        .formals
+                        .iter()
+                        .find(|f| f.named && f.name == Some(name))
+                        .is_some_and(|f| f.default_separator.is_some()),
+                    _ => false,
+                }
+            } else {
+                match (positional, named) {
+                    (Some(at), None) => first
+                        .positional
+                        .get(at)
+                        .is_some_and(|f| f.default_value.is_some()),
+                    (None, Some(name)) => first
+                        .named
+                        .iter()
+                        .find(|f| f.name == name)
+                        .is_some_and(|f| f.default_value.is_some()),
+                    _ => false,
+                }
             }
-        } else {
-            match (positional, named) {
-                (Some(at), None) => first
-                    .positional
-                    .get(at)
-                    .is_some_and(|f| f.default_value.is_some()),
-                (None, Some(name)) => first
-                    .named
-                    .iter()
-                    .find(|f| f.name == name)
-                    .is_some_and(|f| f.default_value.is_some()),
-                _ => false,
-            }
-        }
-    };
+        };
     let mut positional_at = 0usize;
     for formal in aug.formals.iter() {
         // The parameter element's slot: a positional index for the
@@ -1670,10 +1667,8 @@ fn check_default_chain(
         // named formal (a required named formal is not optional upstream
         // and its default reports `default_value_on_required_parameter`
         // instead).
-        let optional =
-            formal.optional_positional || (formal.named && formal.required_kw.is_none());
-        let (Some(separator), Some((positional, named))) = (formal.default_separator, slot)
-        else {
+        let optional = formal.optional_positional || (formal.named && formal.required_kw.is_none());
+        let (Some(separator), Some((positional, named))) = (formal.default_separator, slot) else {
             continue;
         };
         if !optional {
@@ -1956,8 +1951,14 @@ fn canon_into(
                             }
                         })
                         .collect();
-                    if canon_alias(out, decl_file, decl_name, &canon_args, cx, depth.saturating_sub(1))
-                        == Leaf::Invalid
+                    if canon_alias(
+                        out,
+                        decl_file,
+                        decl_name,
+                        &canon_args,
+                        cx,
+                        depth.saturating_sub(1),
+                    ) == Leaf::Invalid
                     {
                         return Leaf::Invalid;
                     }
@@ -2000,9 +2001,7 @@ fn canon_into(
                     out.push(',');
                 }
                 first = false;
-                if canon_into(out, *field, file, unit, params, sig, cx, depth)
-                    == Leaf::Invalid
-                {
+                if canon_into(out, *field, file, unit, params, sig, cx, depth) == Leaf::Invalid {
                     out.push_str("?invalid");
                 }
             }
@@ -2011,9 +2010,7 @@ fn canon_into(
                     out.push(',');
                 }
                 first = false;
-                if canon_into(out, *field, file, unit, params, sig, cx, depth)
-                    == Leaf::Invalid
-                {
+                if canon_into(out, *field, file, unit, params, sig, cx, depth) == Leaf::Invalid {
                     out.push_str("?invalid");
                 }
                 out.push(' ');
@@ -2030,8 +2027,11 @@ fn canon_into(
             // `relateTypeFormals` — `<T>T -> T` equals `<U>U -> U`), so the
             // columns judge each variable by position, never by spelling;
             // the signature's own bound group judges by position too.
-            let inner: Vec<StringId> =
-                shape.type_params_named.iter().map(|(name, _)| *name).collect();
+            let inner: Vec<StringId> = shape
+                .type_params_named
+                .iter()
+                .map(|(name, _)| *name)
+                .collect();
             if canon_into(out, shape.return_ty, file, unit, params, &inner, cx, depth)
                 == Leaf::Invalid
             {
@@ -2063,8 +2063,7 @@ fn canon_into(
                     out.push(',');
                 }
                 first = false;
-                if canon_into(out, *formal, file, unit, params, &inner, cx, depth)
-                    == Leaf::Invalid
+                if canon_into(out, *formal, file, unit, params, &inner, cx, depth) == Leaf::Invalid
                 {
                     out.push_str("?invalid");
                 }
@@ -2074,8 +2073,7 @@ fn canon_into(
                     out.push(',');
                 }
                 first = false;
-                if canon_into(out, *formal, file, unit, params, &inner, cx, depth)
-                    == Leaf::Invalid
+                if canon_into(out, *formal, file, unit, params, &inner, cx, depth) == Leaf::Invalid
                 {
                     out.push_str("?invalid");
                 }
@@ -2213,7 +2211,10 @@ fn canon_alias(
     // has no bound walk here).
     let mut subst: FxHashMap<StringId, String> = FxHashMap::default();
     for (index, param) in decl.type_param_names.iter().enumerate() {
-        let text = args.get(index).cloned().unwrap_or_else(|| "dynamic".to_string());
+        let text = args
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| "dynamic".to_string());
         subst.insert(*param, text);
     }
     canon_alias_ty(
@@ -2272,9 +2273,8 @@ fn canon_alias_ty(
                                 if index > 0 {
                                     out.push(',');
                                 }
-                                if canon_alias_ty(
-                                    out, *arg, decl_file, decl_unit, subst, cx, depth,
-                                ) == Leaf::Invalid
+                                if canon_alias_ty(out, *arg, decl_file, decl_unit, subst, cx, depth)
+                                    == Leaf::Invalid
                                 {
                                     out.push_str("?invalid");
                                 }
@@ -2302,8 +2302,14 @@ fn canon_alias_ty(
                                 }
                             })
                             .collect();
-                        if canon_alias(out, file_id, decl_name, &canon_args, cx, depth.saturating_sub(1))
-                            == Leaf::Invalid
+                        if canon_alias(
+                            out,
+                            file_id,
+                            decl_name,
+                            &canon_args,
+                            cx,
+                            depth.saturating_sub(1),
+                        ) == Leaf::Invalid
                         {
                             out.push_str("?invalid");
                         }
@@ -2832,14 +2838,7 @@ fn executable_member_row(
     };
     let mut fragments = 0usize;
     let mut complete = false;
-    for aug in later_augments(
-        own,
-        index,
-        after,
-        member.name_range.offset,
-        key,
-        strings,
-    ) {
+    for aug in later_augments(own, index, after, member.name_range.offset, key, strings) {
         match accessor {
             Some(chain) if !aug_in_accessor(aug, chain) => continue,
             None if aug.kind != aug_kind => continue,
@@ -2963,14 +2962,7 @@ fn induced_accessor_rows(
         property_name(member_name, AugKind::Field, strings),
         Space::StaticMember,
     );
-    let augments = later_augments(
-        own,
-        index,
-        after,
-        member.name_range.offset,
-        key,
-        strings,
-    );
+    let augments = later_augments(own, index, after, member.name_range.offset, key, strings);
     // Each accessor element's chain: the intro's induced fragment plus
     // every merging fragment that lands in that accessor's element. A
     // `final` field has no setter at all (upstream `fieldFragment.hasSetter`

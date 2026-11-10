@@ -67,9 +67,7 @@ fn messages_named(report: &FileReport, name: &str) -> Vec<String> {
 /// `co19/LanguageFeatures/Constructor-tear-offs/summary_A03_t01.dart:90`.
 #[test]
 fn alias_literal_object_method_invoke_stays_silent() {
-    let report = report_ops(&format!(
-        "{CB_ALIAS}void f() {{\n  Cb.toString();\n}}\n"
-    ));
+    let report = report_ops(&format!("{CB_ALIAS}void f() {{\n  Cb.toString();\n}}\n"));
     assert_eq!(rows(&report), Vec::<(String, String)>::new());
 }
 
@@ -109,7 +107,9 @@ fn alias_literal_invoke_miss_still_names_type() {
 /// `Type`.
 #[test]
 fn alias_literal_getter_miss_still_names_type() {
-    let report = report_ops(&format!("{CB_ALIAS}int f(int x) {{\n  Cb.foo;\n  return x;\n}}\n"));
+    let report = report_ops(&format!(
+        "{CB_ALIAS}int f(int x) {{\n  Cb.foo;\n  return x;\n}}\n"
+    ));
     assert_eq!(
         messages_named(&report, "undefined_getter"),
         ["The getter 'foo' isn't defined for the type 'Type'."]

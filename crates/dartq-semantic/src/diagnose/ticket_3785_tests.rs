@@ -55,8 +55,8 @@ fn report(source: &str) -> FileReport {
     let core = builder.intern("dart:core");
     let core_file = files.intern(Path::new("<dart:core>"));
     for name in [
-        "num", "int", "double", "String", "bool", "Object", "Null", "Enum", "Record",
-        "List", "Map", "Set", "Iterable", "Future", "Stream",
+        "num", "int", "double", "String", "bool", "Object", "Null", "Enum", "Record", "List",
+        "Map", "Set", "Iterable", "Future", "Stream",
     ] {
         builder.declare(core, strings.intern(name), core_file);
     }

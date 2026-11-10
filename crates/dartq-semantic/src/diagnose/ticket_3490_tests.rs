@@ -74,7 +74,9 @@ fn pattern_rows(source: &str) -> Vec<(&'static str, String)> {
 /// Oracle a.dart f1: zero rows (spec `test_matchedNull_requiredNull`).
 #[test]
 fn matched_null_required_null_is_silent() {
-    assert_silent(&report_ops("void f(Null x) {\n  if (x case Null _) {}\n}\n"));
+    assert_silent(&report_ops(
+        "void f(Null x) {\n  if (x case Null _) {}\n}\n",
+    ));
 }
 
 /// `Null x; case A? _` — `Null` fits every nullable spelling. Baseline
@@ -153,7 +155,9 @@ fn required_null_nullable_matched_is_silent() {
 /// Spec `test_requiredNull_matchedNullable_dynamicType`: silent.
 #[test]
 fn required_null_dynamic_matched_is_silent() {
-    assert_silent(&report_ops("void f(dynamic x) {\n  if (x case Null _) {}\n}\n"));
+    assert_silent(&report_ops(
+        "void f(dynamic x) {\n  if (x case Null _) {}\n}\n",
+    ));
 }
 
 /// `T x; case Null _` — an unbounded type parameter's implicit `Object?`
@@ -163,7 +167,9 @@ fn required_null_dynamic_matched_is_silent() {
 /// `test_requiredNull_matchedNullable_typeParameterType_implicitBound`).
 #[test]
 fn required_null_unbounded_parameter_is_silent() {
-    assert_silent(&report_ops("void f<T>(T x) {\n  if (x case Null _) {}\n}\n"));
+    assert_silent(&report_ops(
+        "void f<T>(T x) {\n  if (x case Null _) {}\n}\n",
+    ));
 }
 
 /// `T extends num x; case Null _` — a non-nullable bound reads
@@ -244,7 +250,10 @@ fn matched_null_future_or_decides_by_element() {
 fn cast_pattern_from_null_to_null_is_unnecessary() {
     assert_eq!(
         pattern_rows("void f(Null x) {\n  if (x case _ as Null) {}\n}\n"),
-        [("unnecessary_cast_pattern", "Unnecessary cast pattern.".to_string())]
+        [(
+            "unnecessary_cast_pattern",
+            "Unnecessary cast pattern.".to_string()
+        )]
     );
 }
 
@@ -256,7 +265,10 @@ fn cast_pattern_from_null_to_null_is_unnecessary() {
 fn cast_pattern_from_null_to_nullable_is_unnecessary() {
     assert_eq!(
         pattern_rows("class A {}\nvoid f(Null x) {\n  if (x case _ as A?) {}\n}\n"),
-        [("unnecessary_cast_pattern", "Unnecessary cast pattern.".to_string())]
+        [(
+            "unnecessary_cast_pattern",
+            "Unnecessary cast pattern.".to_string()
+        )]
     );
 }
 

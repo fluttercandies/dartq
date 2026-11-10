@@ -149,7 +149,8 @@ fn analyze(libs: &[RigLib<'_>]) -> Vec<FileReport> {
         index.insert(file, elements);
         // The engine's `build_class_modifiers` posture: the defining file's
         // settled version through the feature registry.
-        let class_modifiers = FeatureSet::for_language_version(version).is_enabled(Feature::ClassModifiers);
+        let class_modifiers =
+            FeatureSet::for_language_version(version).is_enabled(Feature::ClassModifiers);
         posture.insert(lib_id, class_modifiers);
         units.push((lib_id, file, scanned, features, lib.source));
     }

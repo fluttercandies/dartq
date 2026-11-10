@@ -19,9 +19,7 @@
 //! and shadowing locals are parameters (an unreferenced parameter is
 //! never a diagnostic).
 
-use super::test_rig::{
-    RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows,
-};
+use super::test_rig::{RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows};
 
 /// `new p.C()` where `p` is a top-level function: the importPrefix arm's
 /// fall-through reports the shadowed face at the head token.
@@ -292,9 +290,8 @@ fn annotation_dynamic_head_reports_prefix_shadowed() {
 /// continuation name over the written span.
 #[test]
 fn annotation_inherited_member_head_reports_undefined_class() {
-    let report = report_ops(
-        "class O { int field = 0; }\nclass I extends O { field.Class? m() => null; }\n",
-    );
+    let report =
+        report_ops("class O { int field = 0; }\nclass I extends O { field.Class? m() => null; }\n");
     assert_eq!(
         code_names(&report),
         vec!["undefined_class"],

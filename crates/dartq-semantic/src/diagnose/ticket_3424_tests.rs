@@ -117,10 +117,7 @@ fn empty_braces_take_the_set_side_of_an_iterable_context() {
 #[test]
 fn empty_braces_read_a_type_parameter_through_its_bound() {
     let source = "class D<T extends Iterable<Object>> {\n  T t = {};\n}\n";
-    assert_eq!(
-        assignment_rows(source),
-        [row("{}", "Set<dynamic>", "T")]
-    );
+    assert_eq!(assignment_rows(source), [row("{}", "Set<dynamic>", "T")]);
 }
 
 /// The assignment face anchors the whole literal — its first row is the
@@ -190,9 +187,5 @@ fn leaves_without_an_exact_face_refuse() {
          C<B> mixed = {{B1(), B2()}};\n}}\n"
     );
     let rows = assignment_rows(&source);
-    assert_eq!(
-        rows,
-        [row("{...xs}", "Set<int>", "C<int>")],
-        "{rows:#?}"
-    );
+    assert_eq!(rows, [row("{...xs}", "Set<int>", "C<int>")], "{rows:#?}");
 }

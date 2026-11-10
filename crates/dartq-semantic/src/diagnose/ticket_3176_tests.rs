@@ -21,8 +21,7 @@ use crate::diagnose::test_rig::{code_names, report_ops, rows};
 
 /// The message the oracle spells for every face — parameterless
 /// (messages.yaml:19638 `useOfVoidResult`).
-const VOID_MSG: &str =
-    "This expression has a type of 'void' so its value can't be used.";
+const VOID_MSG: &str = "This expression has a type of 'void' so its value can't be used.";
 
 /// Asserts a `use_of_void_result` diagnostic sits at `offset`, tolerating
 /// the co-diagnostics a declared-but-unread local (`unused_local_variable`)
@@ -49,8 +48,7 @@ fn assert_void_at(report: &super::FileReport, offset: usize) {
 fn ticket_3176_assignment_rhs_void_call() {
     let fixture = "void v() {}\nvoid main() {\n  Object x = Object();\n  x = v();\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
     let diagnostic = report
         .diagnostics
@@ -92,8 +90,7 @@ fn ticket_3176_assignment_rhs_void_read() {
 fn ticket_3176_decl_initializer_void_call() {
     let fixture = "void v() {}\nvoid main() {\n  Object a = v();\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -106,7 +103,9 @@ fn ticket_3176_var_decl_inferred_void_stays_silent() {
     let fixture = "void v() {}\nvoid main() {\n  var a = v();\n}";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report).iter().any(|name| *name == "use_of_void_result"),
+        !code_names(&report)
+            .iter()
+            .any(|name| *name == "use_of_void_result"),
         "{:?}",
         rows(&report)
     );
@@ -117,11 +116,9 @@ fn ticket_3176_var_decl_inferred_void_stays_silent() {
 /// face): a `void` actual into a non-`void` formal reports.
 #[test]
 fn ticket_3176_argument_void_call() {
-    let fixture =
-        "void v() {}\nvoid g(Object x) {}\nvoid main() {\n  g(v());\n}";
+    let fixture = "void v() {}\nvoid g(Object x) {}\nvoid main() {\n  g(v());\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -131,11 +128,9 @@ fn ticket_3176_argument_void_call() {
 /// `for_in_of_invalid_type`.
 #[test]
 fn ticket_3176_for_in_iterable_void() {
-    let fixture =
-        "void v() {}\nvoid main() {\n  for (var x in v()) {}\n}";
+    let fixture = "void v() {}\nvoid main() {\n  for (var x in v()) {}\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -145,8 +140,7 @@ fn ticket_3176_for_in_iterable_void() {
 fn ticket_3176_switch_statement_scrutinee_void() {
     let fixture = "void v() {}\nvoid main() {\n  switch (v()) {\n    case 1:\n      break;\n  }\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -157,8 +151,7 @@ fn ticket_3176_switch_statement_scrutinee_void() {
 fn ticket_3176_if_null_left_void() {
     let fixture = "void v() {}\nvoid main() {\n  var x = v() ?? 1;\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -169,8 +162,7 @@ fn ticket_3176_if_null_left_void() {
 fn ticket_3176_is_operand_void() {
     let fixture = "void v() {}\nvoid main() {\n  var b = v() is int;\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -181,8 +173,7 @@ fn ticket_3176_is_operand_void() {
 fn ticket_3176_interpolation_element_void() {
     let fixture = "void v() {}\nvoid main() {\n  var s = \"${v()}\";\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -191,11 +182,9 @@ fn ticket_3176_interpolation_element_void() {
 /// operand's value.
 #[test]
 fn ticket_3176_await_operand_void() {
-    let fixture =
-        "void v() {}\nFuture<void> main() async {\n  await v();\n}";
+    let fixture = "void v() {}\nFuture<void> main() async {\n  await v();\n}";
     let report = report_ops(fixture);
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     assert_void_at(&report, offset);
 }
 
@@ -212,14 +201,18 @@ fn ticket_3176_throw_operand_void() {
         "{:?}",
         rows(&report)
     );
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
         .iter()
         .find(|d| d.message == VOID_MSG)
         .expect("use_of_void_result row");
-    assert_eq!(void_row.range.offset as usize, offset, "{:?}", rows(&report));
+    assert_eq!(
+        void_row.range.offset as usize,
+        offset,
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// `yield v()` inside a `sync*`/`async*` generator
@@ -227,8 +220,7 @@ fn ticket_3176_throw_operand_void() {
 /// `_checkForUseOfVoidResult(node.expression)`).
 #[test]
 fn ticket_3176_yield_operand_void() {
-    let fixture =
-        "void v() {}\nIterable<int> main() sync* {\n  yield v();\n}";
+    let fixture = "void v() {}\nIterable<int> main() sync* {\n  yield v();\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
     assert!(
@@ -236,14 +228,18 @@ fn ticket_3176_yield_operand_void() {
         "{:?}",
         rows(&report)
     );
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
         .iter()
         .find(|d| d.message == VOID_MSG)
         .expect("use_of_void_result row");
-    assert_eq!(void_row.range.offset as usize, offset, "{:?}", rows(&report));
+    assert_eq!(
+        void_row.range.offset as usize,
+        offset,
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// A non-`!` prefix unary (`-v()`/`~v()`/`++v()`/`--v()` — upstream
@@ -260,14 +256,18 @@ fn ticket_3176_prefix_minus_void() {
         "{:?}",
         rows(&report)
     );
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.rfind("v()").unwrap();
     let void_row = report
         .diagnostics
         .iter()
         .find(|d| d.message == VOID_MSG)
         .expect("use_of_void_result row");
-    assert_eq!(void_row.range.offset as usize, offset, "{:?}", rows(&report));
+    assert_eq!(
+        void_row.range.offset as usize,
+        offset,
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// An untyped list literal's `void` element (`[v()]`) stays silent: the

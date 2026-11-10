@@ -47,7 +47,12 @@ void f() {
 }
 "#,
     );
-    assert_eq!(code_names(&report), ["undefined_method"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["undefined_method"],
+        "{:#?}",
+        rows(&report)
+    );
     let row = rows(&report).remove(0);
     assert!(
         row.contains("The method 'gone' isn't defined for the type 'C'."),
@@ -68,7 +73,12 @@ void f() {
 }
 "#,
     );
-    assert_eq!(code_names(&report), ["undefined_method"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["undefined_method"],
+        "{:#?}",
+        rows(&report)
+    );
     let row = rows(&report).remove(0);
     assert!(
         row.contains("The method 'gone' isn't defined for the type 'List'."),
@@ -119,7 +129,12 @@ void f() {
 }
 "#,
     );
-    assert_eq!(code_names(&report), ["undefined_getter"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["undefined_getter"],
+        "{:#?}",
+        rows(&report)
+    );
     let row = rows(&report).remove(0);
     assert!(
         row.contains("The getter 'goneStatic' isn't defined for the type 'C<T>'."),

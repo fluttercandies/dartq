@@ -52,7 +52,9 @@ fn typedef_contravariant_body_fires_the_superinterface_row() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     let offset = source.find("B<X>").unwrap() + 2; // the `X` token
     assert!(
-        rows[0].starts_with(&format!("@{offset}: 'X' can't be used contravariantly or invariantly in 'A<F<X>>'")),
+        rows[0].starts_with(&format!(
+            "@{offset}: 'X' can't be used contravariantly or invariantly in 'A<F<X>>'"
+        )),
         "{rows:?}"
     );
 }
@@ -90,7 +92,10 @@ fn typedef_invariant_body_fires_the_superinterface_row() {
 /// capture's `VarTreeKind::Fn` arm): `X` occurs contravariantly.
 #[test]
 fn bare_function_superinterface_still_fires() {
-    let source = concat!("class A<X> {}\n", "class B<X> extends A<void Function(X)> {}\n");
+    let source = concat!(
+        "class A<X> {}\n",
+        "class B<X> extends A<void Function(X)> {}\n"
+    );
     let rows = super_rows(source);
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
@@ -125,11 +130,7 @@ fn function_typed_field_fires_at_its_name() {
 /// over-reports a second row at the same anchor.
 #[test]
 fn covariant_field_suppresses_only_the_setter_face() {
-    let source = concat!(
-        "class A<in T> {\n",
-        "  covariant late T e;\n",
-        "}\n",
-    );
+    let source = concat!("class A<in T> {\n", "  covariant late T e;\n", "}\n",);
     let rows = position_rows(source);
     assert_eq!(rows.len(), 1, "{rows:?}");
 }
@@ -140,12 +141,11 @@ fn covariant_field_suppresses_only_the_setter_face() {
 /// `covariant T x` must not fire the `in` row a plain `T x` fires.
 #[test]
 fn covariant_formal_is_exempt_but_plain_formal_fires() {
-    let exempt = concat!(
-        "class A<out T> {\n",
-        "  void m(covariant T x) {}\n",
-        "}\n",
+    let exempt = concat!("class A<out T> {\n", "  void m(covariant T x) {}\n", "}\n",);
+    assert!(
+        position_rows(exempt).is_empty(),
+        "covariant formal must not fire"
     );
-    assert!(position_rows(exempt).is_empty(), "covariant formal must not fire");
     let plain = concat!("class A<out T> {\n", "  void m(T x) {}\n", "}\n");
     // The plain formal's check anchors at the formal's own span upstream
     // (rider: the member-name anchor stands in until the model carries
@@ -158,7 +158,11 @@ fn covariant_formal_is_exempt_but_plain_formal_fires() {
 /// records-face twin of `final T Function() b`.
 #[test]
 fn record_typed_field_fires_at_its_name() {
-    let source = concat!("class A<in T> {\n", "  final (T,) r = (throw \"\",);\n", "}\n");
+    let source = concat!(
+        "class A<in T> {\n",
+        "  final (T,) r = (throw \"\",);\n",
+        "}\n"
+    );
     let rows = position_rows(source);
     assert_eq!(rows.len(), 1, "{rows:?}");
 }

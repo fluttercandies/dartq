@@ -52,8 +52,8 @@
 //! `expectStaticType<Exactly<T>>` generic extension tear-off shape
 //! present in non-anonymous conformance cases too.
 
-use crate::diagnose::types::FileReport;
 use crate::diagnose::test_rig::report_ops_experiments_with;
+use crate::diagnose::types::FileReport;
 use dartq_language::Feature;
 
 /// Diagnoses `source` with the anonymous-methods experiment opted in

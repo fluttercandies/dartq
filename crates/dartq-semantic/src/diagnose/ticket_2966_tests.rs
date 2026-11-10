@@ -68,16 +68,14 @@ fn var_fn_receiver_call_resolves() {
 /// interface walk's last leg answers them.
 #[test]
 fn var_fn_receiver_object_members_resolve() {
-    let report =
-        report_ops("void f() { var g = () => 0; g.toString; g.hashCode; g == g; }\n");
+    let report = report_ops("void f() { var g = () => 0; g.toString; g.hashCode; g == g; }\n");
     assert_silent(&report);
 }
 
 /// A `int Function()` formal carries the same face.
 #[test]
 fn fn_typed_formal_receiver_reports() {
-    let report =
-        report_ops("void f(int Function() p) { p.bar; }\n");
+    let report = report_ops("void f(int Function() p) { p.bar; }\n");
     assert_eq!(
         code_names(&report),
         vec!["undefined_getter"],
@@ -114,9 +112,7 @@ fn null_aware_fn_receiver_reports_undefined_getter() {
 /// face.
 #[test]
 fn method_tear_off_receiver_reports() {
-    let report = report_ops(
-        "class C { void m() { m.bar; } }\n",
-    );
+    let report = report_ops("class C { void m() { m.bar; } }\n");
     assert_eq!(
         code_names(&report),
         vec!["undefined_getter"],
@@ -218,9 +214,7 @@ fn record_receiver_write_reports_undefined_setter() {
 /// and named slots stay silent.
 #[test]
 fn record_own_fields_resolve() {
-    let report = report_ops(
-        "void f() { var r = (1, s: \"a\"); r.\x241; r.s; }\n",
-    );
+    let report = report_ops("void f() { var r = (1, s: \"a\"); r.\x241; r.s; }\n");
     assert_silent(&report);
 }
 

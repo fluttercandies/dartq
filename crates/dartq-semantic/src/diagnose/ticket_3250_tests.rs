@@ -21,7 +21,7 @@
 //! shape the recon ticket mis-attributed to this family (probed against
 //! the oracle: `void Function() f = () {}; void g() { f(); }` → silent).
 
-use crate::diagnose::test_rig::{code_names, report_ops, rows, CORE_PRELUDE};
+use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The message the oracle spells for every face (messages.yaml
 /// `useOfVoidResult`).
@@ -74,7 +74,12 @@ void h(void x) {
         "{:?}",
         rows(&report)
     );
-    assert_eq!(code_names(&report), ["use_of_void_result"], "{:?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["use_of_void_result"],
+        "{:?}",
+        rows(&report)
+    );
     assert_void_msg(&report);
 }
 
@@ -168,7 +173,8 @@ void h(void x) {
 }";
     let report = report_ops(fixture);
     let second = at_last(fixture, "x()");
-    let first = u32::try_from(CORE_PRELUDE.len() + fixture.find("x()").expect("first")).expect("offset");
+    let first =
+        u32::try_from(CORE_PRELUDE.len() + fixture.find("x()").expect("first")).expect("offset");
     assert_eq!(
         offsets(&report, "use_of_void_result"),
         [first, second],

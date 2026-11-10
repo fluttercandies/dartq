@@ -57,8 +57,12 @@ fn na_rows(source: &str) -> Vec<(&'static str, u32, String)> {
 
 /// Offset of `needle` inside the first occurrence of `line`.
 fn at(source: &str, line: &str, needle: &str) -> u32 {
-    let line_at = source.find(line).unwrap_or_else(|| panic!("fixture has {line:?}"));
-    let needle_at = line.find(needle).unwrap_or_else(|| panic!("{line:?} has {needle:?}"));
+    let line_at = source
+        .find(line)
+        .unwrap_or_else(|| panic!("fixture has {line:?}"));
+    let needle_at = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("{line:?} has {needle:?}"));
     (line_at + needle_at) as u32
 }
 
@@ -79,7 +83,11 @@ fn tear_off_elements_report_the_dead_operator() {
     let tail = "  print([l1, l2]);\n}\n";
     let source = format!("{CORE_PRELUDE}{HEAD}{l1}{l2}{tail}");
     let q = |line: &str, needle: &str| {
-        ("invalid_null_aware_operator", at(&source, line, needle), "?".to_string())
+        (
+            "invalid_null_aware_operator",
+            at(&source, line, needle),
+            "?".to_string(),
+        )
     };
     assert_eq!(
         na_rows(&source),
@@ -111,11 +119,20 @@ fn set_and_map_key_null_aware_faces_share_the_verdict() {
     let tail = "  print([s1, m1]);\n}\n";
     let source = format!("{CORE_PRELUDE}{HEAD}{s1}{m1}{tail}");
     let q = |line: &str, needle: &str| {
-        ("invalid_null_aware_operator", at(&source, line, needle), "?".to_string())
+        (
+            "invalid_null_aware_operator",
+            at(&source, line, needle),
+            "?".to_string(),
+        )
     };
     assert_eq!(
         na_rows(&source),
-        [q(s1, "?C.new"), q(s1, "?() {}"), q(m1, "?1"), q(m1, "?C.new")],
+        [
+            q(s1, "?C.new"),
+            q(s1, "?() {}"),
+            q(m1, "?1"),
+            q(m1, "?C.new")
+        ],
         "{:?}",
         na_rows(&source)
     );
@@ -133,7 +150,11 @@ fn literal_and_type_literal_elements_report_and_nullable_operands_stay_silent() 
     let tail = "  print([l3]);\n}\n";
     let source = format!("{CORE_PRELUDE}{HEAD}{l3}{tail}");
     let q = |line: &str, needle: &str| {
-        ("invalid_null_aware_operator", at(&source, line, needle), "?".to_string())
+        (
+            "invalid_null_aware_operator",
+            at(&source, line, needle),
+            "?".to_string(),
+        )
     };
     assert_eq!(
         na_rows(&source),
@@ -150,7 +171,11 @@ fn literal_and_type_literal_elements_report_and_nullable_operands_stay_silent() 
         na_rows(&source)
     );
     let live = "void f(int? maybe) {\n  var l = [?maybe, ?null];\n  print(l);\n}\n";
-    assert!(na_rows(&format!("{CORE_PRELUDE}{live}")).is_empty(), "{:?}", na_rows(&format!("{CORE_PRELUDE}{live}")));
+    assert!(
+        na_rows(&format!("{CORE_PRELUDE}{live}")).is_empty(),
+        "{:?}",
+        na_rows(&format!("{CORE_PRELUDE}{live}"))
+    );
 }
 
 /// The shared verdict's verbatim message pair (the `_element` uniqueName's
@@ -159,9 +184,7 @@ fn literal_and_type_literal_elements_report_and_nullable_operands_stay_silent() 
 /// Oracle na.dart line 9's row text.
 #[test]
 fn the_verdict_keeps_the_element_message_pair() {
-    let report = report_ops(&format!(
-        "{HEAD}  var l1 = [?C.new];\n  print(l1);\n}}\n"
-    ));
+    let report = report_ops(&format!("{HEAD}  var l1 = [?C.new];\n  print(l1);\n}}\n"));
     let d = report
         .diagnostics
         .iter()

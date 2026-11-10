@@ -190,8 +190,7 @@ impl Engine<'_> {
                     // `case` — a pattern (a `final` pattern variable, the
                     // pattern family's territory).
                     if frame.opener_prev == TokenKind::Keyword(Keyword::For)
-                        || (frame.opener_prev == TokenKind::Keyword(Keyword::If)
-                            && frame.case_seen)
+                        || (frame.opener_prev == TokenKind::Keyword(Keyword::If) && frame.case_seen)
                     {
                         continue;
                     }
@@ -347,13 +346,7 @@ impl Engine<'_> {
             };
             // The anchor and the argument-list walk both start at the
             // callee's name token.
-            self.check_required_callee(
-                reference.range,
-                file,
-                None,
-                reference.name,
-                &mut reported,
-            );
+            self.check_required_callee(reference.range, file, None, reference.name, &mut reported);
         }
         self.refs = refs;
         let member_refs = std::mem::take(&mut self.report.member_refs);
@@ -526,9 +519,8 @@ impl Engine<'_> {
     /// the callee's explicit type arguments (`g<int>(…)`) skipped.
     pub(super) fn call_open_paren(&self, callee_range: SourceRange) -> Option<usize> {
         let tokens = self.tokens.as_slice();
-        let mut index = tokens.partition_point(|t| {
-            t.utf16_offset < callee_range.offset + callee_range.length
-        });
+        let mut index =
+            tokens.partition_point(|t| t.utf16_offset < callee_range.offset + callee_range.length);
         if tokens.get(index).is_some_and(|t| t.kind == TokenKind::Lt) {
             index = self.angle_group_end(index)? + 1;
         }
@@ -554,7 +546,10 @@ impl Engine<'_> {
             let token = tokens[cursor];
             match token.kind {
                 TokenKind::OpenParen | TokenKind::OpenCurly | TokenKind::OpenSquare => {
-                    cursor = self.tokens.matching_end(cursor).map_or(cursor + 1, |e| e + 1);
+                    cursor = self
+                        .tokens
+                        .matching_end(cursor)
+                        .map_or(cursor + 1, |e| e + 1);
                     argument_start = false;
                 }
                 TokenKind::Comma => {
@@ -562,7 +557,10 @@ impl Engine<'_> {
                     argument_start = true;
                 }
                 TokenKind::Identifier if argument_start => {
-                    if tokens.get(cursor + 1).is_some_and(|t| t.kind == TokenKind::Colon) {
+                    if tokens
+                        .get(cursor + 1)
+                        .is_some_and(|t| t.kind == TokenKind::Colon)
+                    {
                         let lexeme = self.tokens.lexeme(self.source, cursor);
                         labels.push(self.strings.intern(lexeme));
                         cursor += 2;
@@ -674,7 +672,9 @@ impl<'a> Engine<'a> {
         // list (`A.named(`), when the tokens spell one.
         let mut cursor = after;
         let mut key = name;
-        if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Period)
+        if tokens
+            .get(cursor)
+            .is_some_and(|t| t.kind == TokenKind::Period)
             && tokens
                 .get(cursor + 1)
                 .is_some_and(|t| t.kind == TokenKind::Identifier)
@@ -857,9 +857,9 @@ fn decl_head(head: Option<TokenKind>) -> bool {
         // A declaration-body boundary — a member/`;` boundary inside a
         // declaration body (`class C { C(…); }`, `; void m(…)`), or the
         // closing `>` of a type-parameter group.
-        Some(TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::CloseCurly | TokenKind::Gt) => {
-            true
-        }
+        Some(
+            TokenKind::Semicolon | TokenKind::OpenCurly | TokenKind::CloseCurly | TokenKind::Gt,
+        ) => true,
         // Anything else — `=`, `,`, `(`, `?`, `return`, `await`, `case`,
         // `in`, `=>`, `Function`, an operator, a literal — makes the `(`
         // an expression, a call's argument list, or a function-type list.

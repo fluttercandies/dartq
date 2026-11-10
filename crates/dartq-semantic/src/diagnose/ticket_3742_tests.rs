@@ -22,14 +22,17 @@ use crate::diagnose::test_rig::{code_names, report_ops};
 /// reports the `Future<int>()` witness, not the union's own face.
 #[test]
 fn future_or_scrutinee_int_only_reports_future_witness() {
-    let report = report_ops(
-        "String f(FutureOr<int> x) => switch (x) { int _ => 'i' };",
-    );
+    let report = report_ops("String f(FutureOr<int> x) => switch (x) { int _ => 'i' };");
     let row = report
         .diagnostics
         .iter()
         .find(|d| d.code.name == "non_exhaustive_switch_expression")
-        .unwrap_or_else(|| panic!("expected a non_exhaustive row, got {:?}", code_names(&report)));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a non_exhaustive row, got {:?}",
+                code_names(&report)
+            )
+        });
     assert_eq!(
         row.message,
         "The type 'FutureOr<int>' isn't exhaustively matched by the switch cases \
@@ -58,14 +61,17 @@ fn future_or_scrutinee_full_cover_is_silent() {
 /// covered, the `int` half is the covering gap — the witness is `int()`.
 #[test]
 fn future_or_scrutinee_future_only_reports_int_witness() {
-    let report = report_ops(
-        "String f(FutureOr<int> x) => switch (x) { Future<int> _ => 'f' };",
-    );
+    let report = report_ops("String f(FutureOr<int> x) => switch (x) { Future<int> _ => 'f' };");
     let row = report
         .diagnostics
         .iter()
         .find(|d| d.code.name == "non_exhaustive_switch_expression")
-        .unwrap_or_else(|| panic!("expected a non_exhaustive row, got {:?}", code_names(&report)));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a non_exhaustive row, got {:?}",
+                code_names(&report)
+            )
+        });
     assert_eq!(
         row.message,
         "The type 'FutureOr<int>' isn't exhaustively matched by the switch cases \
@@ -77,14 +83,18 @@ fn future_or_scrutinee_future_only_reports_int_witness() {
 /// `FutureOr<bool>` over `true`/`false` constants: the `bool` half is
 #[test]
 fn future_or_bool_constants_report_future_witness() {
-    let report = report_ops(
-        "String f(FutureOr<bool> x) => switch (x) { true => 't', false => 'f' };",
-    );
+    let report =
+        report_ops("String f(FutureOr<bool> x) => switch (x) { true => 't', false => 'f' };");
     let row = report
         .diagnostics
         .iter()
         .find(|d| d.code.name == "non_exhaustive_switch_expression")
-        .unwrap_or_else(|| panic!("expected a non_exhaustive row, got {:?}", code_names(&report)));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a non_exhaustive row, got {:?}",
+                code_names(&report)
+            )
+        });
     assert_eq!(
         row.message,
         "The type 'FutureOr<bool>' isn't exhaustively matched by the switch cases \

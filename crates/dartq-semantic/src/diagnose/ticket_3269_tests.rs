@@ -79,9 +79,15 @@ fn covariant_group_latch_resets_between_groups() {
     let container = collected
         .container(strings.intern("C"))
         .expect("class C collected");
-    let x = container.members.get(&strings.intern("x")).expect("field x");
+    let x = container
+        .members
+        .get(&strings.intern("x"))
+        .expect("field x");
     assert!(x.covariant, "the marked group keeps the mark");
-    let y = container.members.get(&strings.intern("y")).expect("field y");
+    let y = container
+        .members
+        .get(&strings.intern("y"))
+        .expect("field y");
     assert!(!y.covariant, "the mark never bleeds into the next group");
 }
 

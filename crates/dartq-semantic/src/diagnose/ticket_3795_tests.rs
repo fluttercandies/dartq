@@ -152,7 +152,11 @@ void main() {
 "#,
     );
     let rows = ue_rows(&report);
-    assert_eq!(rows.len(), 2, "expected both operators unused, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected both operators unused, got {rows:?}"
+    );
 }
 
 // --- Record-typed operand -------------------------------------------------

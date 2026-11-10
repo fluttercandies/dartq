@@ -25,7 +25,7 @@
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
-use crate::ty::{Base, Ty, TypeOps, EMPTY_ARGS};
+use crate::ty::{Base, EMPTY_ARGS, Ty, TypeOps};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -128,8 +128,8 @@ fn dead_of_with(
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -146,8 +146,7 @@ fn null_aware_field_on_invalid_bound_param_dies_at_member_name() {
     // arm stages exactly this `DB? _database` spelling,
     // diagnose/listener.rs). Oracle 3.13.1: one `dead_code` row at the
     // member name — `close()` — never at the `?.` operator.
-    let src =
-        "class C<DB extends Und> {\n  DB? x;\n  void f() {\n    x?.close();\n  }\n}\n";
+    let src = "class C<DB extends Und> {\n  DB? x;\n  void f() {\n    x?.close();\n  }\n}\n";
     let read_offset = src.find("x?.close()").expect("read in source") as u32;
     let rows = dead_of_with(src, Some("Und"), |flow, db, _und| {
         flow.stage_this_member_type(
@@ -201,8 +200,7 @@ fn null_aware_read_on_resolved_bound_stays_live() {
     // (bisection: the pristine drift file in its package context is
     // clean). The staging channel still runs; only the bound's validity
     // differs.
-    let src =
-        "class C<DB extends Res> {\n  DB? x;\n  void f() {\n    x?.close();\n  }\n}\n";
+    let src = "class C<DB extends Res> {\n  DB? x;\n  void f() {\n    x?.close();\n  }\n}\n";
     let read_offset = src.find("x?.close()").expect("read in source") as u32;
     let rows = dead_of_with(src, None, |flow, db, _und| {
         flow.stage_this_member_type(

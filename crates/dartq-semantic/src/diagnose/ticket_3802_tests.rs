@@ -92,7 +92,8 @@ void f(List<int> l) {
     assert_eq!(
         messages(&report),
         vec![
-            "The receiver can't be null, so the null-aware operator '?[' is unnecessary.".to_string()
+            "The receiver can't be null, so the null-aware operator '?[' is unnecessary."
+                .to_string()
         ],
         "`l?[0]` over a non-nullable list reports once; got: {:?}",
         report.diagnostics

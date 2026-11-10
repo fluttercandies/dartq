@@ -125,7 +125,9 @@ fn satisfied_application_still_merges_the_mixin_interfaces() {
         conflict_rows(&report),
         // The declaration's `implements` face collects before the `with`
         // chain (the official clause order), so `B<String>` stands first.
-        ["The class 'X' can't implement both 'B<String>' and 'B<int>' because the type arguments are different."]
+        [
+            "The class 'X' can't implement both 'B<String>' and 'B<int>' because the type arguments are different."
+        ]
     );
 }
 
@@ -220,6 +222,8 @@ fn the_subtype_check_reads_the_finished_hierarchy() {
     );
     assert_eq!(
         conflict_rows(&report),
-        ["The class 'Local' can't implement both 'F<Local, ioDir>' and 'F<Dir, ioDir>' because the type arguments are different."]
+        [
+            "The class 'Local' can't implement both 'F<Local, ioDir>' and 'F<Dir, ioDir>' because the type arguments are different."
+        ]
     );
 }

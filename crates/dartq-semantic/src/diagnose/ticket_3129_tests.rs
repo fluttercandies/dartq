@@ -186,8 +186,7 @@ fn new_creation_operand_anchors_at_keyword() {
 /// promoted `int` source proves the check (oracle-verified row).
 #[test]
 fn promoted_read_redecides_through_deferred_walk() {
-    let report =
-        report_ops("void f() { int? q = 0; if (q != null) { q is int; } }");
+    let report = report_ops("void f() { int? q = 0; if (q != null) { q is int; } }");
     let rows = utc_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", all_codes(&report));
     assert!(rows[0].message.contains("always 'true'"));
@@ -200,9 +199,7 @@ fn promoted_read_redecides_through_deferred_walk() {
 /// function rule via `fn_sig_subtype`).
 #[test]
 fn function_typed_local_reports_true() {
-    let report = report_ops(
-        "void f() { int Function(int) g = (x) => x; g is int Function(int); }",
-    );
+    let report = report_ops("void f() { int Function(int) g = (x) => x; g is int Function(int); }");
     let rows = utc_rows(&report);
     assert_eq!(rows.len(), 1, "{:?}", all_codes(&report));
 }
@@ -211,9 +208,8 @@ fn function_typed_local_reports_true() {
 /// String` refuses: informative (oracle-verified silent).
 #[test]
 fn function_return_misfit_stays_silent() {
-    let report = report_ops(
-        "void f() { int Function(int) g = (x) => x; g is String Function(int); }",
-    );
+    let report =
+        report_ops("void f() { int Function(int) g = (x) => x; g is String Function(int); }");
     assert!(utc_rows(&report).is_empty(), "{:?}", all_codes(&report));
 }
 

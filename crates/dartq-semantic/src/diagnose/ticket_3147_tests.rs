@@ -144,11 +144,7 @@ fn sync_generator_statement_reports_return_in_generator() {
         "Stream<int> f() async* { return \"x\"; }",
     ] {
         let report = report(source);
-        assert_eq!(
-            return_codes(&report),
-            ["return_in_generator"],
-            "{source:?}"
-        );
+        assert_eq!(return_codes(&report), ["return_in_generator"], "{source:?}");
     }
 }
 
@@ -229,8 +225,7 @@ fn factory_ctor_matching_return_stays_silent() {
 /// `D` against the `C` host (the declared-subtype negative).
 #[test]
 fn factory_ctor_foreign_return_reports() {
-    let report =
-        report("class C { C._(); factory C() { return D(); } }\nclass D {}");
+    let report = report("class C { C._(); factory C() { return D(); } }\nclass D {}");
     assert_eq!(return_codes(&report), ["return_of_invalid_type"]);
 }
 
@@ -250,9 +245,7 @@ fn creation_return_reports_invalid_type() {
 /// against `int`.
 #[test]
 fn factory_creation_return_reports_invalid_type() {
-    let report = report(
-        "class D { D._(); factory D() => D._(); }\nint f() { return D(); }",
-    );
+    let report = report("class D { D._(); factory D() => D._(); }\nint f() { return D(); }");
     assert_eq!(return_codes(&report), ["return_of_invalid_type"]);
 }
 
@@ -351,9 +344,8 @@ fn value_return_matches_stay_silent() {
 /// ask (oracle: no `return_of_invalid_type`).
 #[test]
 fn generic_fn_return_instantiates_to_context() {
-    let report = report(
-        "T id<T>(T x) => x;\nint Function(int) f() { T Function<T>(T) g = id; return g; }",
-    );
+    let report =
+        report("T id<T>(T x) => x;\nint Function(int) f() { T Function<T>(T) g = id; return g; }");
     assert!(
         return_codes(&report).is_empty(),
         "{:?}",

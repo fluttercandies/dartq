@@ -410,13 +410,14 @@ impl<'a> Engine<'a> {
         // A prefixed face (`p.C`): the prefix keys the element, the local
         // leaf names it — the same bare-leaf convention the element model
         // keeps.
-        let (prefix, head) = if lex_at(i) == Some(".") && self.conflict_intern(scan, i + 1).is_some() {
-            let local = self.conflict_intern(scan, i + 1)?;
-            i += 2;
-            (Some(first), local)
-        } else {
-            (None, first)
-        };
+        let (prefix, head) =
+            if lex_at(i) == Some(".") && self.conflict_intern(scan, i + 1).is_some() {
+                let local = self.conflict_intern(scan, i + 1)?;
+                i += 2;
+                (Some(first), local)
+            } else {
+                (None, first)
+            };
         let mut args: Vec<Ty> = Vec::new();
         if lex_at(i) == Some("<") {
             i = self.scan_conflict_args(scan, i, &mut args)?;
@@ -567,9 +568,7 @@ impl<'a> Engine<'a> {
         let mut i = start;
         while i < scan.len() {
             match lex_at(i) {
-                Some("{") => {
-                    return scan.matching_end(i).map_or(scan.len(), |close| close + 1)
-                }
+                Some("{") => return scan.matching_end(i).map_or(scan.len(), |close| close + 1),
                 Some(";") => return i + 1,
                 _ => i += 1,
             }
@@ -724,7 +723,10 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             {
                 for ((ikey_prefix, ikey_head), ty) in inner.interfaces {
                     let ty = self.substitute(ty, &resolved.params, &resolved.args);
-                    match applied.iter().position(|(k, _)| *k == (ikey_prefix, ikey_head)) {
+                    match applied
+                        .iter()
+                        .position(|(k, _)| *k == (ikey_prefix, ikey_head))
+                    {
                         Some(at) => applied[at].1 = ty,
                         None => applied.push(((ikey_prefix, ikey_head), ty)),
                     }
@@ -1257,9 +1259,7 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             return false;
         };
         for face in faces {
-            if !full
-                && !matches!(face.clause, FaceClause::Extends | FaceClause::Implements)
-            {
+            if !full && !matches!(face.clause, FaceClause::Extends | FaceClause::Implements) {
                 continue;
             }
             if face.head == target {
@@ -1324,9 +1324,7 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
             && pattern_list
                 .iter()
                 .zip(actual_list.iter())
-                .all(|(pattern, actual)| {
-                    self.unify_constraint(*pattern, *actual, params, bindings)
-                })
+                .all(|(pattern, actual)| self.unify_constraint(*pattern, *actual, params, bindings))
     }
 
     /// The type-alias declaration `name` resolves to from `scope_file`'s
@@ -1537,11 +1535,7 @@ impl<'e, 'a> IfaceWalk<'e, 'a> {
                         mentions = true;
                     }
                 });
-                if mentions {
-                    Ty::Unknown
-                } else {
-                    ty
-                }
+                if mentions { Ty::Unknown } else { ty }
             }
             _ => ty,
         }

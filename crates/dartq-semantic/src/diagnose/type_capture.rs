@@ -116,9 +116,7 @@ impl<'a> Engine<'a> {
             // through the member model above (the `exempt` check); a
             // top-level variable has no model row, so its head is read off
             // the token stream.
-            if check.container.is_none()
-                && self.decl_head_exempts_init(check.range.offset)
-            {
+            if check.container.is_none() && self.decl_head_exempts_init(check.range.offset) {
                 continue;
             }
             // The top-level final face is the parser's (the shared CFE
@@ -170,7 +168,10 @@ impl<'a> Engine<'a> {
     pub(crate) fn lexeme_at(&self, offset: u32) -> Option<&'a str> {
         let tokens = self.tokens.as_slice();
         let at = tokens.partition_point(|token| token.utf16_offset < offset);
-        if tokens.get(at).is_some_and(|token| token.utf16_offset == offset) {
+        if tokens
+            .get(at)
+            .is_some_and(|token| token.utf16_offset == offset)
+        {
             Some(self.tokens.lexeme(self.source, at))
         } else {
             None
@@ -198,9 +199,11 @@ impl<'a> Engine<'a> {
     fn written_nullable(&self, ty: Ty) -> bool {
         match ty {
             Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
-            Ty::Named {
-                name, nullable, ..
-            } if nullable || self.strings.resolve(name) != "FutureOr" => nullable,
+            Ty::Named { name, nullable, .. }
+                if nullable || self.strings.resolve(name) != "FutureOr" =>
+            {
+                nullable
+            }
             Ty::Named {
                 args: crate::model::ArgListId::EMPTY,
                 ..
@@ -741,9 +744,7 @@ impl<'a> Engine<'a> {
                                 formals
                                     .positional
                                     .iter()
-                                    .filter(|formal| {
-                                        formal.default_value == Some(super_forward)
-                                    })
+                                    .filter(|formal| formal.default_value == Some(super_forward))
                                     .count()
                             })
                             .unwrap_or(0);
@@ -755,9 +756,7 @@ impl<'a> Engine<'a> {
                                 required_named.remove(&self.formal_public_name(formal.name));
                             }
                         }
-                        if required_positional > supplied_positional
-                            || !required_named.is_empty()
-                        {
+                        if required_positional > supplied_positional || !required_named.is_empty() {
                             let super_text = self.strings.resolve(superclass).to_string();
                             self.emit(
                                 SemanticCode::ImplicitSuperInitializerMissingArguments,
@@ -861,8 +860,8 @@ impl<'a> Engine<'a> {
             match self.lexeme_at(prev.offset) {
                 Some("augment") => return true,
                 Some(
-                    "class" | "mixin" | "enum" | "extension" | "type" | "abstract"
-                    | "base" | "final" | "interface" | "sealed",
+                    "class" | "mixin" | "enum" | "extension" | "type" | "abstract" | "base"
+                    | "final" | "interface" | "sealed",
                 ) => offset = prev.offset,
                 _ => return false,
             }
@@ -1639,8 +1638,7 @@ impl<'a> Engine<'a> {
         // today's completion-order slice behaviour-identical.
         let type_params: Vec<(StringId, Option<Ty>)> = match self.fn_type_capture.last() {
             Some(capture) => {
-                let names: Vec<StringId> =
-                    capture.params.iter().map(|(name, _)| *name).collect();
+                let names: Vec<StringId> = capture.params.iter().map(|(name, _)| *name).collect();
                 self.window_type_params(&names)
                     .unwrap_or_else(|| capture.params.clone())
             }
@@ -1685,18 +1683,14 @@ impl<'a> Engine<'a> {
         // window-rebuilt slice (declaration order, bounds with their
         // written arguments) when the latch matched, else the captured
         // slice as before.
-        let fn_ty = self
-            .boundary
-            .args
-            .borrow_mut()
-            .function_generic_required(
-                &type_params,
-                required_positional,
-                return_ty,
-                &capture.positional,
-                &named,
-                nullable,
-            );
+        let fn_ty = self.boundary.args.borrow_mut().function_generic_required(
+            &type_params,
+            required_positional,
+            return_ty,
+            &capture.positional,
+            &named,
+            nullable,
+        );
         self.armed_ty = Some(fn_ty);
         self.armed_ty_unresolved = false;
         // An inner capture that never landed a pending formal nor a
@@ -2770,9 +2764,7 @@ impl<'a> Engine<'a> {
                     let (name, tree, params) = entry;
                     let variances: Vec<Variance> = params
                         .iter()
-                        .map(|param| {
-                            variance_in_tree(tree, *param, &table, VARIANCE_WALK_DEPTH)
-                        })
+                        .map(|param| variance_in_tree(tree, *param, &table, VARIANCE_WALK_DEPTH))
                         .collect();
                     // A still-unseeded alias inside the body leaves the
                     // row all-Unrelated exactly when the param never
@@ -2973,9 +2965,8 @@ impl<'a> Engine<'a> {
                             // The return-type arm anchors at the return
                             // TypeAnnotation node (`T` in `T method1()`),
                             // not the member name.
-                            let return_anchor = face
-                                .and_then(|face| face.return_span)
-                                .unwrap_or(anchor);
+                            let return_anchor =
+                                face.and_then(|face| face.return_span).unwrap_or(anchor);
                             self.check_variance_position(
                                 variance,
                                 declared_variance,
@@ -2994,9 +2985,8 @@ impl<'a> Engine<'a> {
                                 if matches!(*bound, Ty::Dynamic) {
                                     continue;
                                 }
-                                let variance = Variance::Invariant.combine(
-                                    self.variance_in_ty(*bound, parameter, &table),
-                                );
+                                let variance = Variance::Invariant
+                                    .combine(self.variance_in_ty(*bound, parameter, &table));
                                 let bound_anchor = face
                                     .and_then(|face| face.bounds.get(index))
                                     .copied()
@@ -3010,11 +3000,8 @@ impl<'a> Engine<'a> {
                                 );
                             }
                             if let Some(formals) = &entry.formals {
-                                for (index, formal) in formals
-                                    .positional
-                                    .iter()
-                                    .chain(&formals.named)
-                                    .enumerate()
+                                for (index, formal) in
+                                    formals.positional.iter().chain(&formals.named).enumerate()
                                 {
                                     // A `covariant` formal skips the
                                     // contravariant-position check
@@ -3344,11 +3331,9 @@ impl<'a> Engine<'a> {
                     // `written_function_literal_span` grows a bare
                     // `Function` head through its formals group — match
                     // by containment inside the segment instead.
-                    args.iter()
-                        .position(|&(start, _)| {
-                            start <= offset
-                                && args.iter().all(|&(s, _)| !(start < s && s <= offset))
-                        })
+                    args.iter().position(|&(start, _)| {
+                        start <= offset && args.iter().all(|&(s, _)| !(start < s && s <= offset))
+                    })
                 })
             else {
                 continue;
@@ -3398,8 +3383,15 @@ impl<'a> Engine<'a> {
         let Some((head, receiver_ty, receiver_nullable)) = self.bounds_recv_face(recv) else {
             return false;
         };
-        if self.bounds_verdict_at(head, receiver_ty, receiver_nullable, member, args, arg, arg_at)
-        {
+        if self.bounds_verdict_at(
+            head,
+            receiver_ty,
+            receiver_nullable,
+            member,
+            args,
+            arg,
+            arg_at,
+        ) {
             return true;
         }
         // The context-shaped alternates (#3797): each receiver face the
@@ -3412,8 +3404,7 @@ impl<'a> Engine<'a> {
             let Some((alt_head, alt_ty, alt_nullable)) = self.bounds_alt_face(ty) else {
                 continue;
             };
-            if self.bounds_verdict_at(alt_head, alt_ty, alt_nullable, member, args, arg, arg_at)
-            {
+            if self.bounds_verdict_at(alt_head, alt_ty, alt_nullable, member, args, arg, arg_at) {
                 return true;
             }
         }
@@ -3770,12 +3761,9 @@ impl<'a> Engine<'a> {
         // group so the composite window is the whole parenthesized
         // expression rather than its final `)`.
         if last == first + 1 && tokens[first].kind == K::CloseParen {
-            if let Some(opener) = (0..first)
-                .rev()
-                .find(|&i| {
-                    tokens[i].kind == K::OpenParen && self.tokens.matching_end(i) == Some(first)
-                })
-            {
+            if let Some(opener) = (0..first).rev().find(|&i| {
+                tokens[i].kind == K::OpenParen && self.tokens.matching_end(i) == Some(first)
+            }) {
                 first = opener;
             }
         }
@@ -3929,7 +3917,11 @@ impl<'a> Engine<'a> {
     /// shape outside the argument-slot channel (an assignment target, a
     /// nested composite's own context, a member/prefixed callee) — the
     /// keep direction.
-    fn prune_composite_context(&mut self, recv_span: SourceRange, composite_lo: usize) -> Option<Ty> {
+    fn prune_composite_context(
+        &mut self,
+        recv_span: SourceRange,
+        composite_lo: usize,
+    ) -> Option<Ty> {
         use dartq_scanner::TokenKind as K;
         let tokens = self.tokens.as_slice();
         // The argument-list `(` enclosing the composite: the nearest
@@ -3974,10 +3966,7 @@ impl<'a> Engine<'a> {
             // Written type-argument group `f<W0..>(` — walk back over
             // the matched `<...>`: the closer before `(` is `>`; its
             // opener is a `<` at angle-depth 0.
-            if matches!(
-                tokens[callee_at - 1].kind,
-                K::Gt | K::GtGt | K::GtGtGt
-            ) {
+            if matches!(tokens[callee_at - 1].kind, K::Gt | K::GtGt | K::GtGtGt) {
                 let mut depth = 0usize;
                 let mut j = callee_at - 1;
                 let mut found = None;
@@ -4044,7 +4033,11 @@ impl<'a> Engine<'a> {
             while i < composite_lo {
                 match tokens[i].kind {
                     K::OpenParen | K::OpenSquare | K::OpenCurly | K::Lt => depth += 1,
-                    K::CloseParen | K::CloseSquare | K::CloseCurly | K::Gt | K::GtGt
+                    K::CloseParen
+                    | K::CloseSquare
+                    | K::CloseCurly
+                    | K::Gt
+                    | K::GtGt
                     | K::GtGtGt => depth = depth.saturating_sub(1),
                     K::Comma if depth == 0 => {
                         positional += 1;
@@ -4055,9 +4048,7 @@ impl<'a> Engine<'a> {
                         // `name:` — a named-argument label: the next
                         // token is `:`.
                         if tokens.get(i + 1).is_some_and(|t| t.kind == K::Colon) {
-                            named = Some(
-                                self.strings.intern(self.tokens.lexeme(self.source, i)),
-                            );
+                            named = Some(self.strings.intern(self.tokens.lexeme(self.source, i)));
                         }
                     }
                     _ => {}
@@ -4069,11 +4060,7 @@ impl<'a> Engine<'a> {
         // declaring file's pool already (`Projected` carries them), so
         // `formal.ty` is the boundary face.
         let formal_ty = match named {
-            Some(label) => formals
-                .named
-                .iter()
-                .find(|f| f.name == label)
-                .map(|f| f.ty),
+            Some(label) => formals.named.iter().find(|f| f.name == label).map(|f| f.ty),
             None => formals.positional.get(positional).map(|f| f.ty),
         }?;
         // The instantiation: written type arguments pair positionally
@@ -4148,12 +4135,7 @@ impl<'a> Engine<'a> {
                 for arg in inner {
                     out.push(self.prune_greatest_closure(arg, params, subst, covariant)?);
                 }
-                Some(
-                    self.boundary
-                        .args
-                        .borrow_mut()
-                        .named(name, nullable, &out),
-                )
+                Some(self.boundary.args.borrow_mut().named(name, nullable, &out))
             }
             Ty::Function { shape, nullable } => {
                 let shape = self.boundary.pool().function_shape(shape).clone();
@@ -4163,12 +4145,8 @@ impl<'a> Engine<'a> {
                 let ret = self.prune_greatest_closure(shape.return_ty, params, subst, covariant)?;
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for param in shape.positional.iter() {
-                    positional.push(self.prune_greatest_closure(
-                        *param,
-                        params,
-                        subst,
-                        !covariant,
-                    )?);
+                    positional
+                        .push(self.prune_greatest_closure(*param, params, subst, !covariant)?);
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for (name, formal) in shape.named.iter() {
@@ -4190,12 +4168,7 @@ impl<'a> Engine<'a> {
                 let shape = self.boundary.pool().record_shape(shape).clone();
                 let mut positional = Vec::with_capacity(shape.positional.len());
                 for field in shape.positional.iter() {
-                    positional.push(self.prune_greatest_closure(
-                        *field,
-                        params,
-                        subst,
-                        covariant,
-                    )?);
+                    positional.push(self.prune_greatest_closure(*field, params, subst, covariant)?);
                 }
                 let mut named = Vec::with_capacity(shape.named.len());
                 for (name, field) in shape.named.iter() {
@@ -4204,11 +4177,12 @@ impl<'a> Engine<'a> {
                         self.prune_greatest_closure(*field, params, subst, covariant)?,
                     ));
                 }
-                Some(self.boundary.args.borrow_mut().record(
-                    &positional,
-                    &named,
-                    nullable,
-                ))
+                Some(
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .record(&positional, &named, nullable),
+                )
             }
             other => Some(other),
         }
@@ -4454,8 +4428,7 @@ mod exec_bounds_pairing_tests {
     #[test]
     fn written_return_fn_pairs_its_bound_like_a_bare_fn() {
         let bare = bound_driven_rows("f<T extends num>(T t) => t;\nvoid g() { f(null); }\n");
-        let written =
-            bound_driven_rows("T f<T extends num>(T t) => t;\nvoid g() { f(null); }\n");
+        let written = bound_driven_rows("T f<T extends num>(T t) => t;\nvoid g() { f(null); }\n");
         assert!(
             bare.iter().any(|m| m.contains("'num'")),
             "bare fn's bound must drive the clamp row: {bare:?}"
@@ -4551,7 +4524,6 @@ mod exec_bounds_pairing_tests {
             "the row anchors at the written annotation's head: {rows:?}"
         );
     }
-
 }
 
 // The #3642 pins (the `wrong_type_parameter_variance_position` /

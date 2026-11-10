@@ -70,17 +70,13 @@ typedef Pub = _C;
         "expected unused_element for _C._hidden: {:#?}",
         rows(&report)
     );
-    let hidden_reported = rows(&report)
-        .iter()
-        .any(|row| row.contains("_C._hidden"));
+    let hidden_reported = rows(&report).iter().any(|row| row.contains("_C._hidden"));
     assert!(
         hidden_reported,
         "expected the _C._hidden row specifically: {:#?}",
         rows(&report)
     );
-    let named_reported = rows(&report)
-        .iter()
-        .any(|row| row.contains("_C.named'"));
+    let named_reported = rows(&report).iter().any(|row| row.contains("_C.named'"));
     assert!(
         !named_reported,
         "the alias must spare _C.named: {:#?}",

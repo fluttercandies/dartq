@@ -85,6 +85,7 @@ fn add_import(
             target: Some(target),
             prefix: prefix.map(|p| strings.intern(p)),
             deferred: false,
+            non_library: false,
             combinators,
         },
     );

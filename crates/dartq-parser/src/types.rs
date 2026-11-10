@@ -807,7 +807,11 @@ mod tests {
             .iter()
             .filter(|e| **e == ("begin", "function_type"))
             .count();
-        assert_eq!(begins, count, "function types for {source:?}; log: {:?}", c.log);
+        assert_eq!(
+            begins, count,
+            "function types for {source:?}; log: {:?}",
+            c.log
+        );
     }
 
     #[test]

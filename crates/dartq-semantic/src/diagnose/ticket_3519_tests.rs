@@ -47,9 +47,7 @@ fn offsets_of(report: &super::FileReport, code: &str) -> Vec<String> {
 /// span, `num` not assignable to `int`.
 #[test]
 fn irrefutable_typed_leaf() {
-    let report = report_ops(
-        "void f(num x) {\n  var (int a) = x;\n}\n",
-    );
+    let report = report_ops("void f(num x) {\n  var (int a) = x;\n}\n");
     assert_eq!(
         offsets_of(&report, "pattern_type_mismatch_in_irrefutable_context"),
         vec!["@23+5".to_string()],
@@ -70,8 +68,7 @@ fn irrefutable_typed_leaf_agreeing() {
     ] {
         let report = report_ops(source);
         assert!(
-            !code_names(&report)
-                .contains(&"pattern_type_mismatch_in_irrefutable_context"),
+            !code_names(&report).contains(&"pattern_type_mismatch_in_irrefutable_context"),
             "{source:?} rows: {:#?}",
             rows(&report)
         );
@@ -172,8 +169,7 @@ fn relational_operand_nonconst() {
     ] {
         let report = report_ops(source);
         assert!(
-            !code_names(&report)
-                .contains(&"non_constant_relational_pattern_expression"),
+            !code_names(&report).contains(&"non_constant_relational_pattern_expression"),
             "{source:?} rows: {:#?}",
             rows(&report)
         );
@@ -233,8 +229,7 @@ fn guard_assignment() {
     ] {
         let report = report_ops(source);
         assert!(
-            !code_names(&report)
-                .contains(&"pattern_variable_assignment_inside_guard"),
+            !code_names(&report).contains(&"pattern_variable_assignment_inside_guard"),
             "{source:?} rows: {:#?}",
             rows(&report)
         );
@@ -265,7 +260,8 @@ fn shared_scope_not_all_cases() {
         .find(|d| d.code.name == "invalid_pattern_variable_in_shared_case_scope")
         .expect("row");
     assert!(
-        row.message.contains("is available in some, but not all cases"),
+        row.message
+            .contains("is available in some, but not all cases"),
         "{}",
         row.message
     );

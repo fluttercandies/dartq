@@ -104,8 +104,9 @@ fn nullable_return_spelling_stays_verbatim() {
 /// `'String Function()' …` against the callee's own bound.
 #[test]
 fn generic_function_call_site_checks_the_argument() {
-    let source =
-        format!("{PREAMBLE}T f<T extends num>() => throw ''; void main() {{ f<String Function()>(); }}");
+    let source = format!(
+        "{PREAMBLE}T f<T extends num>() => throw ''; void main() {{ f<String Function()>(); }}"
+    );
     let start = at(&source, "String Function()");
     assert_eq!(
         bounds_rows(&source),

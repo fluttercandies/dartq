@@ -23,8 +23,8 @@ use crate::parser::Parser;
 use crate::recovery::is_identifier;
 use crate::token_id::TokenSpan;
 use crate::type_args::TypeParamOrArg;
-use crate::types::is_valid_non_record_type_reference;
 use crate::types::TypeInfo;
+use crate::types::is_valid_non_record_type_reference;
 
 /// Whether a computed type is a named type — the `handleType` face an
 /// `extends`/`implements`/`with`/`on` clause list entry must be
@@ -1278,7 +1278,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             TokenKind::Keyword(kw) if kw.style() != dartq_scanner::KeywordStyle::Pseudo
                 || (self.features.variance_enabled
                     && matches!(kw, Keyword::Inout | Keyword::Out))
-        ) && !(reserved_head && Self::starts_next_top_level_declaration(self.peek_kind()))
+        ) && !(reserved_head
+            && Self::starts_next_top_level_declaration(self.peek_kind()))
         {
             // The verifier's built-in-name face (error_verifier.dart:846-849,
             // `_checkForBuiltInIdentifierAsName(node.namePart.typeName,
@@ -1954,8 +1955,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // restarts from here, so an unconsumed-looking `(` ahead of a `{`
         // takes the skipped-junk face (`class C({var int a})` at EOF).
         let header_start = self.cursor.mark();
-        if self.parse_primary_constructor_opt(DeclarationKind::Class, Some(name), const_keyword, true)
-        {
+        if self.parse_primary_constructor_opt(
+            DeclarationKind::Class,
+            Some(name),
+            const_keyword,
+            true,
+        ) {
             // The "params consumed" fact must be captured here — before the
             // clause walk advances the cursor. Measured at recovery time the
             // clause tokens (`extends A`, …) have already moved the cursor
@@ -2384,8 +2389,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             let next = self.peek_kind();
             if !matches!(next, TokenKind::Keyword(_)) {
                 let follower = self.cursor.look_kind(1);
-                if matches!(follower, TokenKind::Keyword(Keyword::On | Keyword::Implements))
-                    || follower == TokenKind::OpenCurly
+                if matches!(
+                    follower,
+                    TokenKind::Keyword(Keyword::On | Keyword::Implements)
+                ) || follower == TokenKind::OpenCurly
                 {
                     self.report(
                         msg::unexpected_token(self.cursor.lexeme(self.peek_id())),
@@ -3288,10 +3295,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // body, and the oracle anchors `expected_body` on the name. The
         // per-kind block-body message keeps the analyzer registry name
         // `expected_body` (message.rs `expected_block_body`).
-        self.report(
-            msg::expected_block_body(msg_block_kind_class(), ""),
-            name,
-        );
+        self.report(msg::expected_block_body(msg_block_kind_class(), ""), name);
         let lparen = self.peek_span();
         let paren_parked = self.cursor.table_matching_end(lparen.id);
         self.report(msg::expected_executable(), lparen);

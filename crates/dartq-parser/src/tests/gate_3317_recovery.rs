@@ -30,11 +30,10 @@ use super::collector::{Collector, scan_ok};
 /// feature flag forced to `augmentations`.
 fn parse(source: &'static str, augmentations: bool) -> Collector {
     let (table, text) = scan_ok(source);
-    let mut features = crate::ParserFeatures::from_feature_set(
-        dartq_language::FeatureSet::for_language_version(
+    let mut features =
+        crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
             dartq_language::LanguageVersion::new(3, 15),
-        ),
-    );
+        ));
     features.augmentations_enabled = augmentations;
     let mut parser = crate::parser::Parser::new(
         text,

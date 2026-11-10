@@ -166,11 +166,7 @@ fn foreign_fn_typedef_identical_pair_stays_silent() {
         }],
     );
     let rows = invalid_assignments(&report);
-    assert_eq!(
-        rows.len(),
-        0,
-        "F<int> -> F<int> stays silent: {rows:?}"
-    );
+    assert_eq!(rows.len(), 0, "F<int> -> F<int> stays silent: {rows:?}");
 }
 
 /// The callable-class → `Function` arm: `void Function() g = C();` over
@@ -179,12 +175,14 @@ fn foreign_fn_typedef_identical_pair_stays_silent() {
 /// member and `Function` its supertype). Silent.
 #[test]
 fn callable_class_into_function_target_stays_silent() {
-    let report = report_ops("class C {\n\
+    let report = report_ops(
+        "class C {\n\
          \x20 void call() {}\n\
          }\n\
          void main() {\n\
          \x20 void Function() g = C();\n\
-         }\n");
+         }\n",
+    );
     let rows = invalid_assignments(&report);
     assert_eq!(
         rows.len(),
@@ -201,12 +199,14 @@ fn callable_class_into_function_target_stays_silent() {
 /// explicitly.
 #[test]
 fn instantiated_callable_matching_signature_stays_silent() {
-    let report = report_ops("class C<T> {\n\
+    let report = report_ops(
+        "class C<T> {\n\
          \x20 T call() => throw 0;\n\
          }\n\
          void main() {\n\
          \x20 int Function() g = C<int>();\n\
-         }\n");
+         }\n",
+    );
     let rows = invalid_assignments(&report);
     assert_eq!(
         rows.len(),
@@ -221,12 +221,14 @@ fn instantiated_callable_matching_signature_stays_silent() {
 /// exactly as the bare-head twin does.
 #[test]
 fn instantiated_callable_mismatched_signature_reports() {
-    let report = report_ops("class C<T> {\n\
+    let report = report_ops(
+        "class C<T> {\n\
          \x20 T call() => throw 0;\n\
          }\n\
          void main() {\n\
          \x20 String Function() g = C<int>();\n\
-         }\n");
+         }\n",
+    );
     let rows = invalid_assignments(&report);
     assert_eq!(
         rows.len(),
@@ -241,9 +243,11 @@ fn instantiated_callable_mismatched_signature_reports() {
 /// callable arm.
 #[test]
 fn non_function_pair_still_reports() {
-    let report = report_ops("void main() {\n\
+    let report = report_ops(
+        "void main() {\n\
          \x20 int x = \"s\";\n\
-         }\n");
+         }\n",
+    );
     let rows = invalid_assignments(&report);
     assert_eq!(rows.len(), 1, "int = String reports: {rows:?}");
 }

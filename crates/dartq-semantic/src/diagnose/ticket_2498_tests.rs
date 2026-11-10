@@ -46,7 +46,11 @@ fn report_sdk_faces(source: &str) -> FileReport {
     let core_file = files.intern(Path::new("<dart:core>"));
     let async_file = files.intern(Path::new("<dart:async>"));
     for (node, sdk_file, names) in [
-        (core, core_file, &["Error", "RangeError", "Object", "StackTrace"][..]),
+        (
+            core,
+            core_file,
+            &["Error", "RangeError", "Object", "StackTrace"][..],
+        ),
         (async_lib, async_file, &["FutureOr", "Future", "Stream"][..]),
     ] {
         for name in names {
@@ -155,11 +159,7 @@ fn range_error_check_valid_range_still_types_int() {
                   class int extends num {} \
                   void f(int? e) { e = RangeError.checkValidRange(0, e, 3); if (e < 3) {} }";
     let report = report_sdk_faces(source);
-    assert!(
-        code_names(&report).is_empty(),
-        "{:?}",
-        code_names(&report)
-    );
+    assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
 }
 
 // —— Face 5: the object-pattern NamedType arity verdict —————————————————
@@ -204,7 +204,9 @@ fn object_pattern_named_type_matching_arity_silent() {
     let report = crate::diagnose::test_rig::report_ops_bare(source);
     let names = code_names(&report);
     assert!(
-        !names.iter().any(|&c| c.starts_with("wrong_number_of_type_arguments")),
+        !names
+            .iter()
+            .any(|&c| c.starts_with("wrong_number_of_type_arguments")),
         "unexpected arity row: {names:?}"
     );
 }

@@ -24,8 +24,8 @@ use dartq_resolution::{
     RECURSIVE_INTERFACE_INHERITANCE, RECURSIVE_INTERFACE_INHERITANCE_EXTENDS,
     RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS, RECURSIVE_INTERFACE_INHERITANCE_ON,
     RECURSIVE_INTERFACE_INHERITANCE_WITH, ResolutionCode, ResolutionCodeInfo, ResolvedTarget,
-    UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
-    canonical_dart_uri, compose_canonical_uri, part_of_row,
+    UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME, canonical_dart_uri, compose_canonical_uri,
+    part_of_row,
 };
 use dartq_semantic::{ElementIndex, MicroKind};
 use dartq_source::{FileId, FileTable, SourceRange, StringId, StringTable, saturate_slot_u32};
@@ -935,7 +935,9 @@ fn diagnose_library(
             .filter(|text| text.contains("ignore:") || text.contains("ignore_for_file:"))
             .map(crate::DartIgnores::parse);
         let suppressed = |row: &Arc<Diagnostic>| {
-            let Some(ignores) = &ignores else { return false };
+            let Some(ignores) = &ignores else {
+                return false;
+            };
             if !gate_ignorable(state, *file, row.code.name) {
                 return false;
             }
@@ -956,36 +958,42 @@ fn diagnose_library(
         // library_analyzer.dart:1030-1046). Imports/exports keep the
         // written literal (`selectedUri.relativeUriStr`), so only `part`
         // rows re-spell, and only ones the URI layer coded at a target.
-        out.extend(facts.diagnostics.iter().filter(|row| !suppressed(row)).map(|row| {
-            if row.code.name != "uri_does_not_exist"
-                && row.code.name != "uri_has_not_been_generated"
-            {
-                return row.clone();
-            }
-            let Some(directive) = facts.directives.iter().find(|d| {
-                d.kind == DirectiveKind::Part
-                    && d.uri_span == row.range
-                    && matches!(
-                        d.code,
-                        Some(
-                            ResolutionCode::UriDoesNotExist
-                                | ResolutionCode::UriHasNotBeenGenerated
-                        )
-                    )
-            }) else {
-                return row.clone();
-            };
-            let ResolvedTarget::Resolved(target) = directive.target else {
-                return row.clone();
-            };
-            let code = directive.code.expect("matched some above");
-            Arc::new(l1::uri_diagnostic(
-                code,
-                &canonical_uri_spelling(state, target),
-                row.range,
-                row.file,
-            ))
-        }));
+        out.extend(
+            facts
+                .diagnostics
+                .iter()
+                .filter(|row| !suppressed(row))
+                .map(|row| {
+                    if row.code.name != "uri_does_not_exist"
+                        && row.code.name != "uri_has_not_been_generated"
+                    {
+                        return row.clone();
+                    }
+                    let Some(directive) = facts.directives.iter().find(|d| {
+                        d.kind == DirectiveKind::Part
+                            && d.uri_span == row.range
+                            && matches!(
+                                d.code,
+                                Some(
+                                    ResolutionCode::UriDoesNotExist
+                                        | ResolutionCode::UriHasNotBeenGenerated
+                                )
+                            )
+                    }) else {
+                        return row.clone();
+                    };
+                    let ResolvedTarget::Resolved(target) = directive.target else {
+                        return row.clone();
+                    };
+                    let code = directive.code.expect("matched some above");
+                    Arc::new(l1::uri_diagnostic(
+                        code,
+                        &canonical_uri_spelling(state, target),
+                        row.range,
+                        row.file,
+                    ))
+                }),
+        );
         // Directive-combinator static warnings (dead_code_verifier.dart
         // :85-98/:58-70 visit the import/export directives alike): every
         // written `show`/`hide` token the resolved target's export scope
@@ -1380,13 +1388,7 @@ fn part_family_diagnostics(
                     continue;
                 }
                 let includer = state.residency[file].file_role();
-                match part_of_row(
-                    included,
-                    includer,
-                    *file,
-                    library_name,
-                    enhanced_parts,
-                ) {
+                match part_of_row(included, includer, *file, library_name, enhanced_parts) {
                     // The name forms an SDK part can carry (name rows gated
                     // by the same enhanced-parts horizon); `Attached` means
                     // a matching `library <name>;` container claimed it —
@@ -1532,22 +1534,23 @@ fn part_family_diagnostics(
                 // my.lib}`) still reports under a part file.
                 Some(name)
                     if !enhanced_parts
-                        && !(library_name == Some(name)
-                            && !state.residency[file].is_part()) =>
-                match library_name {
-                    Some(expected) => out.push(Arc::new(coded_diagnostic(
-                        ResolutionCode::PartOfDifferentLibrary.info(),
-                        &[expected, name],
-                        directive.uri_span,
-                        *file,
-                    ))),
-                    None => out.push(Arc::new(coded_diagnostic(
-                        ResolutionCode::PartOfUnnamedLibrary.info(),
-                        &[name],
-                        directive.uri_span,
-                        *file,
-                    ))),
-                },
+                        && !(library_name == Some(name) && !state.residency[file].is_part()) =>
+                {
+                    match library_name {
+                        Some(expected) => out.push(Arc::new(coded_diagnostic(
+                            ResolutionCode::PartOfDifferentLibrary.info(),
+                            &[expected, name],
+                            directive.uri_span,
+                            *file,
+                        ))),
+                        None => out.push(Arc::new(coded_diagnostic(
+                            ResolutionCode::PartOfUnnamedLibrary.info(),
+                            &[name],
+                            directive.uri_span,
+                            *file,
+                        ))),
+                    }
+                }
                 Some(_) => {}
                 None => {
                     // URI form: `may_claim(*file)` above already asked the
@@ -1714,8 +1717,7 @@ fn directive_non_library(state: &EngineState, directive: &DirectiveFacts) -> boo
                 .is_some_and(|unit| unit.facts.is_part())
         }
         ResolvedTarget::External => {
-            let Some((sdk_library, sdk_part)) =
-                sdk_uri_parts(directive, &state.declared_variables)
+            let Some((sdk_library, sdk_part)) = sdk_uri_parts(directive, &state.declared_variables)
             else {
                 return false;
             };
@@ -1837,14 +1839,24 @@ fn export_graph_diagnostics(
     // matching the oracle's `type?.alias?.element` ask at name level.
     let in_public_api = state
         .files
-        .path(state.libraries.info(library).expect("live library").defining)
+        .path(
+            state
+                .libraries
+                .info(library)
+                .expect("live library")
+                .defining,
+        )
         .and_then(|path| {
             let identity = state.packages.containing(path)?;
             // Upstream `root.getFolder('lib')` (pub.dart:585-607): the
             // pubspec root's literal `lib/` folder, packageUri-irrelevant.
             let lib_dir = identity.root.join("lib");
             let rel = path.strip_prefix(&lib_dir).ok()?;
-            Some(rel.components().next().is_none_or(|c| c.as_os_str() != "src"))
+            Some(
+                rel.components()
+                    .next()
+                    .is_none_or(|c| c.as_os_str() != "src"),
+            )
         })
         .unwrap_or(false);
     if in_public_api {
@@ -1943,9 +1955,9 @@ fn export_graph_diagnostics(
                     let dartq_semantic::model::Ty::Named { name: leaf, .. } = leaf else {
                         continue;
                     };
-                    let dartq_resolution::Lookup::Found(
-                        dartq_resolution::NamespaceEntry::Decl(alias_file),
-                    ) = resolved.namespaces().lookup_in_file(
+                    let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(
+                        alias_file,
+                    )) = resolved.namespaces().lookup_in_file(
                         &resolved.graph,
                         member_lib,
                         Some(entry.file),
@@ -2039,7 +2051,12 @@ fn export_graph_diagnostics(
                 .flatten();
             let edge = ImportEdge {
                 target: sdk_target.or_else(|| {
-                    graph_target(state, &resolved.graph_ids, &resolved.dep_nodes, directive.target)
+                    graph_target(
+                        state,
+                        &resolved.graph_ids,
+                        &resolved.dep_nodes,
+                        directive.target,
+                    )
                 }),
                 prefix: directive.prefix,
                 deferred: directive.deferred,
@@ -2132,9 +2149,9 @@ fn interface_cycle_diagnostics(
                     .namespaces()
                     .lookup_in_file(&resolved.graph, lib, Some(file), edge)
                 {
-                    dartq_resolution::Lookup::Found(
-                        dartq_resolution::NamespaceEntry::Decl(target),
-                    ) => Some((target, edge)),
+                    dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(
+                        target,
+                    )) => Some((target, edge)),
                     // An ambiguous or missing hop contributes nothing — the
                     // dead-edge posture (`supertype_hop_dead`).
                     _ => None,
@@ -2168,24 +2185,27 @@ fn interface_cycle_diagnostics(
             })
         };
         let display = state.strings.resolve(name).to_owned();
-        let (info, args): (ResolutionCodeInfo, Vec<String>) = if self_named(container.and_then(|c| c.superclass.as_ref())) {
-            (RECURSIVE_INTERFACE_INHERITANCE_EXTENDS, vec![display])
-        } else if container.is_some_and(|c| c.on_clause.iter().any(|e| self_named(Some(e)))) {
-            (RECURSIVE_INTERFACE_INHERITANCE_ON, vec![display])
-        } else if container.is_some_and(|c| c.with_clause.iter().any(|e| self_named(Some(e)))) {
-            (RECURSIVE_INTERFACE_INHERITANCE_WITH, vec![display])
-        } else if container.is_some_and(|c| c.implements_clause.iter().any(|e| self_named(Some(e)))) {
-            (RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS, vec![display])
-        } else {
-            // The generic row: `{1}` is the cycle's member display names
-            // joined ', ' in the oracle's `evaluateScc` (Tarjan pop) order.
-            let loop_names = component
-                .iter()
-                .map(|&(_, member)| state.strings.resolve(member).to_owned())
-                .collect::<Vec<_>>()
-                .join(", ");
-            (RECURSIVE_INTERFACE_INHERITANCE, vec![display, loop_names])
-        };
+        let (info, args): (ResolutionCodeInfo, Vec<String>) =
+            if self_named(container.and_then(|c| c.superclass.as_ref())) {
+                (RECURSIVE_INTERFACE_INHERITANCE_EXTENDS, vec![display])
+            } else if container.is_some_and(|c| c.on_clause.iter().any(|e| self_named(Some(e)))) {
+                (RECURSIVE_INTERFACE_INHERITANCE_ON, vec![display])
+            } else if container.is_some_and(|c| c.with_clause.iter().any(|e| self_named(Some(e)))) {
+                (RECURSIVE_INTERFACE_INHERITANCE_WITH, vec![display])
+            } else if container
+                .is_some_and(|c| c.implements_clause.iter().any(|e| self_named(Some(e))))
+            {
+                (RECURSIVE_INTERFACE_INHERITANCE_IMPLEMENTS, vec![display])
+            } else {
+                // The generic row: `{1}` is the cycle's member display names
+                // joined ', ' in the oracle's `evaluateScc` (Tarjan pop) order.
+                let loop_names = component
+                    .iter()
+                    .map(|&(_, member)| state.strings.resolve(member).to_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (RECURSIVE_INTERFACE_INHERITANCE, vec![display, loop_names])
+            };
         // The anchor: the declaration's name token — `DeclRow.range` from
         // the maintained capture (residency) or a dep unit's own capture;
         // absent rows degrade to the file head (the (severity, code, file)
@@ -2196,8 +2216,19 @@ fn interface_cycle_diagnostics(
             .or_else(|| state.deps.units.get(&file).map(|unit| &unit.capture.index));
         let range = decl_rows
             .and_then(|index| index.by_name(name).and_then(|rows| rows.first()))
-            .map_or(SourceRange { offset: 0, length: 0 }, |row| row.range);
-        out.push(Arc::new(coded_diagnostic(info, &args.iter().map(String::as_str).collect::<Vec<_>>(), range, file)));
+            .map_or(
+                SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+                |row| row.range,
+            );
+        out.push(Arc::new(coded_diagnostic(
+            info,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            range,
+            file,
+        )));
     }
 }
 
@@ -2388,10 +2419,13 @@ fn class_modifier_facts(
 /// container kind is a named `extension` (extension types are
 /// `ExtensionTypeElement` upstream — a different class — so they stay
 /// plain declarations).
-fn is_extension_decl(elements: &dartq_semantic::FileElements, name: dartq_source::StringId) -> bool {
-    elements.container(name).is_some_and(|container| {
-        container.kind == dartq_semantic::ContainerKind::Extension
-    })
+fn is_extension_decl(
+    elements: &dartq_semantic::FileElements,
+    name: dartq_source::StringId,
+) -> bool {
+    elements
+        .container(name)
+        .is_some_and(|container| container.kind == dartq_semantic::ContainerKind::Extension)
 }
 
 /// Registers one declaration with the kind faces the graph's consumers
@@ -5481,9 +5515,7 @@ mod tests {
     fn explicit_dart_core_import_gates_the_implicit_edge() {
         // `show String` hides `int` — the gated edge's combinator, not the
         // unconditional edge, decides the namespace.
-        let names = core_names_for(
-            "import 'dart:core' show String;\nint x = 0;\nString s = '';\n",
-        );
+        let names = core_names_for("import 'dart:core' show String;\nint x = 0;\nString s = '';\n");
         assert!(
             names.iter().any(|name| name == "undefined_class"),
             "hidden `int` reports undefined_class: {names:?}"
@@ -5972,10 +6004,7 @@ mod tests {
             &root.join("lib/hidden.dart"),
             b"import 'package:meta/meta.dart';\n\n@internal\nclass Secret {}\nclass Plain {}\n",
         );
-        let api = engine.set_content(
-            &root.join("lib/api.dart"),
-            b"export 'hidden.dart';\n",
-        );
+        let api = engine.set_content(&root.join("lib/api.dart"), b"export 'hidden.dart';\n");
         let src_api = engine.set_content(
             &root.join("lib/src/api.dart"),
             b"export '../hidden.dart';\n",
@@ -6028,9 +6057,10 @@ mod tests {
         for hit in &generic {
             assert!(hit.message.contains("B, A") || hit.message.contains("A, B"));
         }
-        assert!(hits
-            .iter()
-            .any(|row| row.message.contains("can't extend itself")));
+        assert!(
+            hits.iter()
+                .any(|row| row.message.contains("can't extend itself"))
+        );
     }
 
     /// A mixin's `on` self-constraint picks the on-variant; a class's

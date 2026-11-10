@@ -149,9 +149,7 @@ fn pin_plain_nullable_receiver_still_reports() {
     assert!(
         rows.iter()
             .any(|(_, _, m)| m.contains("The property 'foo'"))
-            && rows
-                .iter()
-                .any(|(_, _, m)| m.contains("The method 'm'")),
+            && rows.iter().any(|(_, _, m)| m.contains("The method 'm'")),
         "the two access variants: {rows:?}"
     );
 }

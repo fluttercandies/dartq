@@ -43,8 +43,7 @@ fn rest_element_relational_reports_list_element() {
 /// `num` — `<` resolves on `num` → silent.
 #[test]
 fn rest_element_relational_typed_list_quiet() {
-    let source =
-        "f(List<num> x) {\n  switch (x) {\n    case [...< 0]:\n      break;\n  }\n}\n";
+    let source = "f(List<num> x) {\n  switch (x) {\n    case [...< 0]:\n      break;\n  }\n}\n";
     assert_eq!(rows(source), Vec::<(u32, u32, String)>::new());
 }
 

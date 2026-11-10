@@ -199,9 +199,7 @@ fn t3598_unsolved_function_result_keeps_single_flatten() {
 #[test]
 #[ignore = "witness: the #3598 send-result fix was reverted as corpus net-negative (975b4177, 5f8c99b4); the direct-assignment row returns with its replacement fix"]
 fn t3598_direct_assignment_reports() {
-    let report = lang_feature_report(
-        "main() {\n  A<int>? source;\n  String s = toF(source);\n}\n",
-    );
+    let report = lang_feature_report("main() {\n  A<int>? source;\n  String s = toF(source);\n}\n");
     let misses: Vec<&str> = report
         .diagnostics
         .iter()
@@ -220,18 +218,44 @@ fn t3598_direct_assignment_reports() {
 #[test]
 fn t3598_bisect_direct() {
     for (name, src, import) in [
-        ("plain_fn", "int Function(int) top() => (int x) => x;\nmain() { String s = top(); }\n", false),
-        ("alias_fn", "typedef G<T> = T Function(T);\nG<int> idc(int x) => (int y) => y;\nmain() { String s = idc(1); }\n", false),
-        ("generic_plain_ret", "int counter<T>(T x) => 1;\nmain() { A<int>? q; String s = counter(q); }\n", true),
-        ("generic_fn_ret", "main() { A<int>? q; String s = toF(q); }\n", true),
+        (
+            "plain_fn",
+            "int Function(int) top() => (int x) => x;\nmain() { String s = top(); }\n",
+            false,
+        ),
+        (
+            "alias_fn",
+            "typedef G<T> = T Function(T);\nG<int> idc(int x) => (int y) => y;\nmain() { String s = idc(1); }\n",
+            false,
+        ),
+        (
+            "generic_plain_ret",
+            "int counter<T>(T x) => 1;\nmain() { A<int>? q; String s = counter(q); }\n",
+            true,
+        ),
+        (
+            "generic_fn_ret",
+            "main() { A<int>? q; String s = toF(q); }\n",
+            true,
+        ),
     ] {
         let body = if import {
-            format!("class num {{}} class int extends num {{}} class String {{}}\nclass A<X extends num> {{}}\n{src}")
+            format!(
+                "class num {{}} class int extends num {{}} class String {{}}\nclass A<X extends num> {{}}\n{src}"
+            )
         } else {
             format!("class String {{}}\n{src}")
         };
         let report = if import {
-            report_ops_with(&body, &[RigImport { uri: "package:x/lang_feature_check.dart", prefix: None, source: LANG_FEATURE_CHECK }], None)
+            report_ops_with(
+                &body,
+                &[RigImport {
+                    uri: "package:x/lang_feature_check.dart",
+                    prefix: None,
+                    source: LANG_FEATURE_CHECK,
+                }],
+                None,
+            )
         } else {
             report_ops_with(&body, &[], None)
         };

@@ -50,8 +50,10 @@ fn added_required_positional_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function(int, int)') isn't a valid override of \
-          'A.m' ('dynamic Function(int)')."]
+        [
+            "'B.m' ('dynamic Function(int, int)') isn't a valid override of \
+          'A.m' ('dynamic Function(int)')."
+        ]
     );
 }
 
@@ -81,8 +83,10 @@ fn dropped_optional_positional_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function([int])') isn't a valid override of \
-          'A.m' ('dynamic Function([int, int])')."]
+        [
+            "'B.m' ('dynamic Function([int])') isn't a valid override of \
+          'A.m' ('dynamic Function([int, int])')."
+        ]
     );
 }
 
@@ -167,8 +171,10 @@ fn positional_lengths_equal_required_counts_differ_break() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function(int, int)') isn't a valid override of \
-          'A.m' ('dynamic Function(int, [int])')."]
+        [
+            "'B.m' ('dynamic Function(int, int)') isn't a valid override of \
+          'A.m' ('dynamic Function(int, [int])')."
+        ]
     );
 }
 
@@ -184,8 +190,10 @@ fn dropped_named_parameter_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function({int a})') isn't a valid override of \
-          'A.m' ('dynamic Function({int a, int b})')."]
+        [
+            "'B.m' ('dynamic Function({int a})') isn't a valid override of \
+          'A.m' ('dynamic Function({int a, int b})')."
+        ]
     );
 }
 
@@ -223,8 +231,10 @@ fn added_required_named_parameter_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function({required int a})') isn't a valid \
-          override of 'A.m' ('dynamic Function()')."]
+        [
+            "'B.m' ('dynamic Function({required int a})') isn't a valid \
+          override of 'A.m' ('dynamic Function()')."
+        ]
     );
 }
 
@@ -239,8 +249,10 @@ fn tightened_named_requiredness_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function({required int? a})') isn't a valid \
-          override of 'A.m' ('dynamic Function({int? a})')."]
+        [
+            "'B.m' ('dynamic Function({required int? a})') isn't a valid \
+          override of 'A.m' ('dynamic Function({int? a})')."
+        ]
     );
 }
 
@@ -266,8 +278,10 @@ fn narrowed_named_parameter_type_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function({String? a})') isn't a valid override \
-          of 'A.m' ('dynamic Function({int? a})')."]
+        [
+            "'B.m' ('dynamic Function({String? a})') isn't a valid override \
+          of 'A.m' ('dynamic Function({int? a})')."
+        ]
     );
 }
 
@@ -281,8 +295,10 @@ fn narrowed_optional_positional_type_breaks() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function([String?])') isn't a valid override of \
-          'A.m' ('dynamic Function([int?])')."]
+        [
+            "'B.m' ('dynamic Function([String?])') isn't a valid override of \
+          'A.m' ('dynamic Function([int?])')."
+        ]
     );
 }
 
@@ -307,8 +323,10 @@ fn corpus_positional_optional_renders_dynamic_and_brackets() {
     );
     assert_eq!(
         override_rows(&report),
-        ["'B.m' ('dynamic Function([dynamic])') isn't a valid override of \
-          'A.m' ('dynamic Function([dynamic, dynamic])')."]
+        [
+            "'B.m' ('dynamic Function([dynamic])') isn't a valid override of \
+          'A.m' ('dynamic Function([dynamic, dynamic])')."
+        ]
     );
 }
 

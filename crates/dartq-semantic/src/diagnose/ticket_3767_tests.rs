@@ -238,7 +238,8 @@ fn ticket_3767_static_method_callable_return_not_flagged() {
 // —— is the parenthesized group `(f())`, so the oracle anchors the group.
 #[test]
 fn ticket_3767_value_callee_void_function_still_flagged() {
-    let fixture = "void use(Object o) {}\nvoid main() {\n  void Function() f = () {};\n  bool b = !(f());\n}";
+    let fixture =
+        "void use(Object o) {}\nvoid main() {\n  void Function() f = () {};\n  bool b = !(f());\n}";
     let report = report_ops(fixture);
     let at = fixture.find("(f())").unwrap();
     assert_void_rows(&report, fixture, &[(at, 5)]);

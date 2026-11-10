@@ -118,5 +118,9 @@ fn unmodified_cross_library_super_faces_are_silent() {
     let fixture =
         "import 'lib.dart';\nclass A extends P {}\nclass B implements P {}\nmixin MW on P {}\n";
     let report = report_ops_imports(fixture, &[dep("class P {}\n")]);
-    assert!(outside_rows(&report).is_empty(), "{:?}", outside_rows(&report));
+    assert!(
+        outside_rows(&report).is_empty(),
+        "{:?}",
+        outside_rows(&report)
+    );
 }

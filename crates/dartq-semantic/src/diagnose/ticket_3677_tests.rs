@@ -41,7 +41,9 @@ const SINK: &str = "void f(Type t) {}\n";
 /// Oracle (`NonErrorResolverTest/test_typeType_class#0`): no rows.
 #[test]
 fn class_name_in_argument_position_is_type_literal() {
-    let report = report_ops(&format!("class C {{}}\n{SINK}void main() {{\n  f(C);\n}}\n"));
+    let report = report_ops(&format!(
+        "class C {{}}\n{SINK}void main() {{\n  f(C);\n}}\n"
+    ));
     assert_silent(&report);
 }
 
@@ -55,8 +57,9 @@ fn class_name_in_argument_position_is_type_literal() {
 /// rows.
 #[test]
 fn function_typedef_in_argument_position_is_type_literal() {
-    let report =
-        report_ops(&format!("typedef F = void Function();\n{SINK}void main() {{\n  f(F);\n}}\n"));
+    let report = report_ops(&format!(
+        "typedef F = void Function();\n{SINK}void main() {{\n  f(F);\n}}\n"
+    ));
     assert_silent(&report);
 }
 
@@ -65,7 +68,9 @@ fn function_typedef_in_argument_position_is_type_literal() {
 /// Oracle: same `Type` literal verdict (`aliasedType` is a function type).
 #[test]
 fn old_style_typedef_in_argument_position_is_type_literal() {
-    let report = report_ops(&format!("typedef F();\n{SINK}void main() {{\n  f(F);\n}}\n"));
+    let report = report_ops(&format!(
+        "typedef F();\n{SINK}void main() {{\n  f(F);\n}}\n"
+    ));
     assert_silent(&report);
 }
 

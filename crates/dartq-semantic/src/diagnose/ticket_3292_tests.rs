@@ -245,11 +245,12 @@ fn ticket_3292_type_typed_read_stays_type() {
         "a Type-declared read types Type"
     );
     assert_eq!(
-        analysis.member_of(
-            span_of(source, "t.toString"),
-            analysis.strings().intern("toString")
-        )
-        .map(|binding| binding.entry.kind),
+        analysis
+            .member_of(
+                span_of(source, "t.toString"),
+                analysis.strings().intern("toString")
+            )
+            .map(|binding| binding.entry.kind),
         None,
         "a Type-typed receiver answers no container member"
     );

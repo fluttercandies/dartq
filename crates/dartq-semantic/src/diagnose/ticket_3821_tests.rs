@@ -71,11 +71,7 @@ fn ticket_3821_identical_signature_alias_reports_true() {
                   }";
     let messages = unnecessary_type_checks(source);
     assert_eq!(messages.len(), 1, "{messages:?}");
-    assert!(
-        messages[0].contains("always 'true'"),
-        "{:?}",
-        messages[0]
-    );
+    assert!(messages[0].contains("always 'true'"), "{:?}", messages[0]);
 }
 
 /// A field inherited from a mixin application (`class C1<V> = Object with

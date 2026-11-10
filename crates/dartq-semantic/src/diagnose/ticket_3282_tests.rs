@@ -50,12 +50,8 @@ fn at(fixture: &str, needle: &str, nth: usize) -> u32 {
             .find(needle)
             .map_or(0, |found| found + needle.len());
     }
-    u32::try_from(
-        from + fixture[from..]
-            .find(needle)
-            .expect("needle occurrence"),
-    )
-    .expect("fixture fits u32")
+    u32::try_from(from + fixture[from..].find(needle).expect("needle occurrence"))
+        .expect("fixture fits u32")
 }
 
 /// No row of the family at all — the positive faces' negative twin.

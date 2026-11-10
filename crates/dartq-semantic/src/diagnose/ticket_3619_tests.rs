@@ -420,7 +420,10 @@ void main(bool b) {{
 }}
 "
     );
-    assert_one_assignment(&report_ops(&source), "of type 'Object Function()' can't be assigned");
+    assert_one_assignment(
+        &report_ops(&source),
+        "of type 'Object Function()' can't be assigned",
+    );
 }
 
 /// The candidate walk's tied-level drop: `C implements I1, I2` and
@@ -484,4 +487,3 @@ void main() {
 ";
     assert_no_assignment(&report_ops(source));
 }
-

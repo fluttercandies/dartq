@@ -43,9 +43,7 @@ const FIXTURE: &str = "class A<X> {\n\
 /// `A<int>.sm<num>()`: one row, `undefined_method` naming `Type`.
 #[test]
 fn instantiated_class_literal_method_names_type() {
-    let report = report_ops(&format!(
-        "{FIXTURE}void main() {{ A<num>.sm<num>(); }}\n"
-    ));
+    let report = report_ops(&format!("{FIXTURE}void main() {{ A<num>.sm<num>(); }}\n"));
     let methods = messages(&report, "undefined_method");
     assert_eq!(
         methods,
@@ -57,9 +55,7 @@ fn instantiated_class_literal_method_names_type() {
 /// The alias-of-class twin: `T<int>.sm<num>()` names `Type` too.
 #[test]
 fn instantiated_alias_literal_method_names_type() {
-    let report = report_ops(&format!(
-        "{FIXTURE}void main() {{ T<num>.sm<num>(); }}\n"
-    ));
+    let report = report_ops(&format!("{FIXTURE}void main() {{ T<num>.sm<num>(); }}\n"));
     let methods = messages(&report, "undefined_method");
     assert_eq!(
         methods,
@@ -75,19 +71,14 @@ fn instantiated_alias_literal_method_names_type() {
 fn creation_face_is_not_claimed() {
     let report = report_ops(&format!("{FIXTURE}void main() {{ A<num>.sm(); }}\n"));
     let methods = messages(&report, "undefined_method");
-    assert!(
-        methods.iter().all(|m| !m.contains("'Type'")),
-        "{methods:?}"
-    );
+    assert!(methods.iter().all(|m| !m.contains("'Type'")), "{methods:?}");
 }
 
 /// Control: a value receiver (`A<num>()`) keeps the instance face — the
 /// generic instance method resolves and stays row-free.
 #[test]
 fn value_receiver_keeps_instance_face() {
-    let report = report_ops(&format!(
-        "{FIXTURE}void main() {{ A<num>().im<num>(); }}\n"
-    ));
+    let report = report_ops(&format!("{FIXTURE}void main() {{ A<num>().im<num>(); }}\n"));
     let methods = messages(&report, "undefined_method");
     assert!(methods.is_empty(), "{methods:?}");
 }

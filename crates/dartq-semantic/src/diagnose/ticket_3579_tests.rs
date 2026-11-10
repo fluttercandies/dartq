@@ -99,9 +99,7 @@ fn t3579_call_result_index_miss_names_return_type() {
 /// type, matching the oracle's `instanceReceiverType` answer.
 #[test]
 fn t3579_tear_off_operand_still_reports() {
-    let report = report_ops(
-        "void test(String Function(int) f, String Function(int) g) { f < g; }",
-    );
+    let report = report_ops("void test(String Function(int) f, String Function(int) g) { f < g; }");
     let codes = code_names(&report);
     assert_eq!(
         codes,

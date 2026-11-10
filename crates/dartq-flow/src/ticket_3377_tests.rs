@@ -68,7 +68,8 @@ fn dead_of(source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -244,7 +245,11 @@ fn null_literal_type_is_the_non_nullable_null_class() {
         base: Base::Null,
         nullable: false,
     };
-    assert_eq!(Ty::NULL, null_class, "the null literal is `Null`, not `Null?`");
+    assert_eq!(
+        Ty::NULL,
+        null_class,
+        "the null literal is `Null`, not `Null?`"
+    );
     assert!(
         ops.is_subtype(Ty::NULL, null_class),
         "`Null <: Null` must hold"
@@ -254,10 +259,13 @@ fn null_literal_type_is_the_non_nullable_null_class() {
         "`Null <: Null?` must hold"
     );
     assert!(
-        !ops.is_subtype(Ty::NULL, Ty {
-            base: Base::Never,
-            nullable: false,
-        }),
+        !ops.is_subtype(
+            Ty::NULL,
+            Ty {
+                base: Base::Never,
+                nullable: false,
+            }
+        ),
         "the null literal is not the bottom type"
     );
 }

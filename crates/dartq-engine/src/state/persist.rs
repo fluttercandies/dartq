@@ -1799,8 +1799,13 @@ mod tests {
         );
 
         let options = salt_config_dir("options", Some("linter:\n  rules:\n    - avoid_print\n"));
-        let with_options =
-            context_salt(build, &options, "vm", &FxHashMap::default(), &roots(&options));
+        let with_options = context_salt(
+            build,
+            &options,
+            "vm",
+            &FxHashMap::default(),
+            &roots(&options),
+        );
         assert_ne!(base, with_options, "located options content moves the salt");
         // The *content* (not the root path) is the folded dimension:
         // rewriting the same file in place moves the digest.
@@ -1811,7 +1816,13 @@ mod tests {
         .expect("rewrite options");
         assert_ne!(
             with_options,
-            context_salt(build, &options, "vm", &FxHashMap::default(), &roots(&options)),
+            context_salt(
+                build,
+                &options,
+                "vm",
+                &FxHashMap::default(),
+                &roots(&options)
+            ),
             "an options edit moves the salt"
         );
     }

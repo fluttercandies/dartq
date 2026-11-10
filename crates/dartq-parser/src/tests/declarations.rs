@@ -1065,10 +1065,7 @@ fn class_head_paren_off_matches_oracle_face_set() {
     // alone (parser-channel order: the experiment gate row, then the skip
     // face, then the three remnant faces, then the moveSynthetic adoption
     // row + boundary face).
-    assert_eq!(
-        c2.errors[0],
-        ("experiment_not_enabled".to_string(), 7, 7)
-    );
+    assert_eq!(c2.errors[0], ("experiment_not_enabled".to_string(), 7, 7));
     assert_eq!(c2.errors[1], ("unexpected_token".to_string(), 7, 8));
     assert_eq!(c2.texts[0], "Unexpected text '('.");
     assert_eq!(c2.errors[5], ("expected_token".to_string(), 12, 13));
@@ -1281,7 +1278,7 @@ fn class_head_spaced_semicolon_junk_face() {
 /// Scanner-unpaired `(` with a `[`-junk tail (`class C( [}`, oracle p08):
 /// the `[` opener takes the junk-member face plus the field-terminator
 /// face (both on the `[`), the `}` remnant member takes
-/// `expected_executable` + `missing_identifier` + 
+/// `expected_executable` + `missing_identifier` +
 /// `missing_const_final_var_or_type` (all on the `}`, width 1), and the
 /// EOF remnant member closes with a zero-width `expected_executable`. The
 /// parser-channel prefix below is the walk's own rows; the trailing
@@ -1398,7 +1395,10 @@ fn class_head_paren_follower_exec_face() {
         c.texts
     );
     assert_eq!(c.texts[4], "Expected to find ')'.");
-    assert_eq!(c.texts[5], "Expected a method, getter, setter or operator declaration.");
+    assert_eq!(
+        c.texts[5],
+        "Expected a method, getter, setter or operator declaration."
+    );
 }
 
 /// Reserved keyword in class-name position (`class if {}`, oracle b12): the
@@ -1416,15 +1416,13 @@ fn class_reserved_name_keyword_face() {
     assert_eq!(
         c.errors,
         [
-            (
-                "expected_identifier_but_got_keyword".to_string(),
-                6, 8
-            ),
+            ("expected_identifier_but_got_keyword".to_string(), 6, 8),
             ("built_in_identifier_in_declaration".to_string(), 6, 8),
         ]
     );
     assert_eq!(
-        c.texts[0], "'if' can't be used as an identifier because it's a keyword."
+        c.texts[0],
+        "'if' can't be used as an identifier because it's a keyword."
     );
     assert_eq!(
         c.texts[1],
@@ -1480,10 +1478,7 @@ fn enum_reserved_name_keyword_face() {
     assert_eq!(
         c.errors,
         [
-            (
-                "expected_identifier_but_got_keyword".to_string(),
-                5, 7
-            ),
+            ("expected_identifier_but_got_keyword".to_string(), 5, 7),
             ("built_in_identifier_in_declaration".to_string(), 5, 7),
         ]
     );
@@ -1517,10 +1512,7 @@ fn sibling_container_reserved_name_faces() {
         c.errors,
         [
             ("built_in_identifier_in_declaration".to_string(), 6, 8),
-            (
-                "expected_identifier_but_got_keyword".to_string(),
-                6, 8
-            ),
+            ("expected_identifier_but_got_keyword".to_string(), 6, 8),
         ]
     );
     assert_eq!(
@@ -1537,10 +1529,7 @@ fn sibling_container_reserved_name_faces() {
         c.errors,
         [
             ("built_in_identifier_in_declaration".to_string(), 15, 17),
-            (
-                "expected_identifier_but_got_keyword".to_string(),
-                15, 17
-            ),
+            ("expected_identifier_but_got_keyword".to_string(), 15, 17),
         ]
     );
     assert_eq!(

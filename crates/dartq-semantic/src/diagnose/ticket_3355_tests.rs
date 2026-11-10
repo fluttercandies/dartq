@@ -243,7 +243,8 @@ fn member_send_void_receiver_anchors_at_callee_name() {
         names(&report)
     );
     assert_eq!(
-        actual[0], expected,
+        actual[0],
+        expected,
         "the row anchors at v (offset {expected}), not the selector {sel}: {:?}",
         names(&report)
     );

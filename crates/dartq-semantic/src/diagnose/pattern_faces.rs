@@ -129,9 +129,7 @@ fn judge_record_field_rows(listener: &mut DiagnoseListener<'_>) {
         None => return,
     };
     let buckets = match listener.pattern_rows.last_mut() {
-        Some(state) if state.fields.len() == names.len() => {
-            std::mem::take(&mut state.fields)
-        }
+        Some(state) if state.fields.len() == names.len() => std::mem::take(&mut state.fields),
         _ => return,
     };
     // The slot columns, pre-read so the emit pass borrows nothing but the
@@ -213,9 +211,10 @@ fn shared_pattern_field_faces(
         let engine = &listener.engine;
         let toks = engine.tokens.as_slice();
         let open_idx = toks.partition_point(|t| t.utf16_offset < begin.range.offset);
-        if toks.get(open_idx).is_none_or(|t| {
-            t.utf16_offset != begin.range.offset || t.kind != TokenKind::OpenParen
-        }) {
+        if toks
+            .get(open_idx)
+            .is_none_or(|t| t.utf16_offset != begin.range.offset || t.kind != TokenKind::OpenParen)
+        {
             return;
         }
         // The group close: the object hook's `end` token locates it by
@@ -348,9 +347,11 @@ fn shared_pattern_field_faces(
         if let Some((name, anchor)) = verdict.ledger {
             if seen.iter().any(|(seen_name, _)| *seen_name == name) {
                 let name_text = listener.engine.strings.resolve(name).to_string();
-                listener
-                    .engine
-                    .emit_corrected(SemanticCode::DuplicatePatternField, anchor, &name_text);
+                listener.engine.emit_corrected(
+                    SemanticCode::DuplicatePatternField,
+                    anchor,
+                    &name_text,
+                );
             } else {
                 seen.push((name, anchor));
             }
@@ -691,7 +692,10 @@ pub(super) fn end_or_operand(
     };
     let left_span = SourceRange {
         offset: left_begin.range.offset,
-        length: operator.range.offset.saturating_sub(left_begin.range.offset),
+        length: operator
+            .range
+            .offset
+            .saturating_sub(left_begin.range.offset),
     };
     let right_span = SourceRange {
         offset: right_begin.range.offset,
@@ -778,10 +782,7 @@ pub(super) fn end_or_operand(
         engine.emit_corrected(SemanticCode::MissingVariablePattern, left_span, &text);
         joined.push(right_binder);
     }
-    if let Some(top) = rows
-        .first_mut()
-        .and_then(|root| root.or_scopes.last_mut())
-    {
+    if let Some(top) = rows.first_mut().and_then(|root| root.or_scopes.last_mut()) {
         top.extend(joined);
     }
 }

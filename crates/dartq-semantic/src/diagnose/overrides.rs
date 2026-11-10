@@ -456,14 +456,20 @@ impl<'a> Engine<'a> {
         owner: FileId,
         scope_lib: LibraryId,
     ) -> Option<(StringId, FileId, LibraryId)> {
-        let (decl, decl_owner) =
-            match lookup_scoped(self.graph, self.namespaces, self.index, scope_lib, owner, name) {
-                ScopedHit::Local(decl) => (decl, owner),
-                ScopedHit::Found(NamespaceEntry::Decl(file)) => {
-                    (self.index.get(file)?.decl(name)?, file)
-                }
-                _ => return None,
-            };
+        let (decl, decl_owner) = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            scope_lib,
+            owner,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (decl, owner),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                (self.index.get(file)?.decl(name)?, file)
+            }
+            _ => return None,
+        };
         if decl.kind != MicroKind::TypeAlias {
             return None;
         }
@@ -482,9 +488,7 @@ impl<'a> Engine<'a> {
         Some((
             head,
             decl_owner,
-            self.graph
-                .library_of_file(decl_owner)
-                .unwrap_or(scope_lib),
+            self.graph.library_of_file(decl_owner).unwrap_or(scope_lib),
         ))
     }
 
@@ -562,8 +566,8 @@ impl<'a> Engine<'a> {
             self.file,
             container,
         ) && container_decl.kind == ContainerKind::Mixin
-        && container_decl.superclass.is_none()
-        && container_decl.with_clause.is_empty()
+            && container_decl.superclass.is_none()
+            && container_decl.with_clause.is_empty()
         {
             let mut seen: FxHashSet<StringId> = FxHashSet::default();
             seen.insert(container);
@@ -748,14 +752,8 @@ impl<'a> Engine<'a> {
                 // unchanged face keeps the raw entry (the under-report
                 // posture).
                 if name != container {
-                    let found_entry = self.hop_member(
-                        writer,
-                        name,
-                        found_owner,
-                        member,
-                        projected,
-                        &mut facts,
-                    );
+                    let found_entry =
+                        self.hop_member(writer, name, found_owner, member, projected, &mut facts);
                     return Walk::Found(found_entry);
                 }
                 return Walk::Found(projected);
@@ -1111,10 +1109,9 @@ impl<'a> Engine<'a> {
         // introduction keeps the bare row's empty clauses and the `Missing`
         // verdict above — the `undefined_super_member` report the oracle
         // emits on the augment-without-declaration corpus face.
-        self.member_faces
-            .walk(container, member, true, || {
-                self.walk_dispatch(container, member)
-            })
+        self.member_faces.walk(container, member, true, || {
+            self.walk_dispatch(container, member)
+        })
     }
 
     // —— invalid_override (#453: the inheritance-override family) ——————
@@ -1437,7 +1434,12 @@ impl<'a> Engine<'a> {
                 self.no_combined_super_candidates(container, spelling, &faces, &mut facts)
         {
             let class_name = self.strings.resolve(container);
-            self.emit(SemanticCode::NoCombinedSuperSignature, range, class_name, &signatures);
+            self.emit(
+                SemanticCode::NoCombinedSuperSignature,
+                range,
+                class_name,
+                &signatures,
+            );
             return;
         }
         let entry = &effective;
@@ -1635,17 +1637,14 @@ impl<'a> Engine<'a> {
                 // method29(int a) }` compares `String` against `int`, never
                 // against an `Unknown` that suppresses the verdict.
                 let inferred;
-                let inherited_entry: &MemberEntry = match self.inferred_inherited(
-                    hit,
-                    lookup,
-                    &mut facts,
-                ) {
-                    Some(entry) => {
-                        inferred = entry;
-                        &inferred
-                    }
-                    None => hit.entry(),
-                };
+                let inherited_entry: &MemberEntry =
+                    match self.inferred_inherited(hit, lookup, &mut facts) {
+                        Some(entry) => {
+                            inferred = entry;
+                            &inferred
+                        }
+                        None => hit.entry(),
+                    };
                 // The super-face type-argument substitution
                 // (`Substitution.fromInterfaceType`): the inherited signature
                 // read through a generic super face carries that face's own
@@ -2059,8 +2058,8 @@ impl<'a> Engine<'a> {
                 ) {
                     Instantiated::Unchanged => face_entry.as_ref().unwrap_or(projected),
                     Instantiated::Applied(env) => {
-                        declared_cmp_owned = self
-                            .substitute_entry(face_entry.as_ref().unwrap_or(projected), &env);
+                        declared_cmp_owned =
+                            self.substitute_entry(face_entry.as_ref().unwrap_or(projected), &env);
                         &declared_cmp_owned
                     }
                     Instantiated::Undecidable => continue,
@@ -2572,12 +2571,7 @@ impl<'a> Engine<'a> {
                             .owner_library_of(mixin_owner, *mixin)
                             .unwrap_or(owner_lib);
                         for mixin_face in mixin_container.with_clause.iter() {
-                            pending.push_back((
-                                *mixin_face,
-                                mixin_owner,
-                                mixin_owner_lib,
-                                *mixin,
-                            ));
+                            pending.push_back((*mixin_face, mixin_owner, mixin_owner_lib, *mixin));
                         }
                     }
                     _ => {}
@@ -2839,10 +2833,8 @@ impl<'a> Engine<'a> {
         }
         match ty {
             Ty::Dynamic | Ty::Void | Ty::Null | Ty::Unknown => true,
-            Ty::Named {
-                name, nullable, ..
-            } if nullable
-                || self.strings.resolve(name) != "FutureOr" =>
+            Ty::Named { name, nullable, .. }
+                if nullable || self.strings.resolve(name) != "FutureOr" =>
             {
                 // An unresolvable head is the oracle's `InvalidType`
                 // (`void f({A a})` over an undeclared `A` resolves to the
@@ -2854,8 +2846,7 @@ impl<'a> Engine<'a> {
                 // `resolve_container` covers classes, mixins, enums and
                 // extension types, the namespace `Decl` probe covers SDK
                 // faces and typedefs the index cannot project.
-                if !nullable && !self.is_scope_param(name) && !self.type_head_resolves(name)
-                {
+                if !nullable && !self.is_scope_param(name) && !self.type_head_resolves(name) {
                     return true;
                 }
                 nullable
@@ -3094,12 +3085,8 @@ impl<'a> Engine<'a> {
                             // among the NAMED parameters (the `_`-or-same-
                             // name rule); record its named index.
                             if self.strings.resolve(item.param) == "_" {
-                                item_pos = Some(
-                                    aug.formals[..at]
-                                        .iter()
-                                        .filter(|f| f.named)
-                                        .count(),
-                                );
+                                item_pos =
+                                    Some(aug.formals[..at].iter().filter(|f| f.named).count());
                             }
                         } else {
                             item_pos = Some(
@@ -3153,22 +3140,18 @@ impl<'a> Engine<'a> {
             // The introductory fragment's formal table (model-side
             // `default_value` carries the written clause).
             let intro_formals = match (container, ctor) {
-                (Some(owner_name), true) => elements
-                    .container(owner_name)
-                    .and_then(|found| {
-                        found
-                            .ctor_formals
-                            .get(&name)
-                            .or_else(|| found.factory_formals.get(&name))
-                            .map(|formals| formals.as_ref())
-                    }),
+                (Some(owner_name), true) => elements.container(owner_name).and_then(|found| {
+                    found
+                        .ctor_formals
+                        .get(&name)
+                        .or_else(|| found.factory_formals.get(&name))
+                        .map(|formals| formals.as_ref())
+                }),
                 (Some(owner_name), false) => elements
                     .container(owner_name)
                     .and_then(|found| found.members.get(&name))
                     .and_then(|entry| entry.formals.as_deref()),
-                (None, _) => elements
-                    .decl(name)
-                    .and_then(|decl| decl.formals.as_deref()),
+                (None, _) => elements.decl(name).and_then(|decl| decl.formals.as_deref()),
             };
             if let Some(formals) = intro_formals {
                 // Positional parameters merge by position: the deferring
@@ -3204,9 +3187,10 @@ impl<'a> Engine<'a> {
                     let intro = match item_pos {
                         Some(at) if item.named => formals.named.get(at),
                         Some(at) => formals.positional.get(at),
-                        None if item.named => {
-                            formals.named.iter().find(|formal| formal.name == item.param)
-                        }
+                        None if item.named => formals
+                            .named
+                            .iter()
+                            .find(|formal| formal.name == item.param),
                         None => None,
                     };
                     if intro.is_some_and(|formal| {
@@ -3224,10 +3208,9 @@ impl<'a> Engine<'a> {
                             .named
                             .get(at)
                             .is_some_and(|formal| formal.default_value.is_some()),
-                        None => formals
-                            .named
-                            .iter()
-                            .any(|formal| formal.name == item.param && formal.default_value.is_some()),
+                        None => formals.named.iter().any(|formal| {
+                            formal.name == item.param && formal.default_value.is_some()
+                        }),
                     }
                 } else {
                     let at = item_pos.or_else(|| {
@@ -3276,10 +3259,7 @@ impl<'a> Engine<'a> {
                             // this fragment's named formal at the same
                             // index.
                             Some(item_pos) => {
-                                let pos = aug.formals[..at]
-                                    .iter()
-                                    .filter(|f| f.named)
-                                    .count();
+                                let pos = aug.formals[..at].iter().filter(|f| f.named).count();
                                 formal.named && pos == item_pos
                             }
                             None => formal.name == Some(item.param),
@@ -3295,9 +3275,7 @@ impl<'a> Engine<'a> {
                             Some(item_pos) => {
                                 let pos = aug.formals[..at]
                                     .iter()
-                                    .filter(|f| {
-                                        f.required_positional || f.optional_positional
-                                    })
+                                    .filter(|f| f.required_positional || f.optional_positional)
                                     .count();
                                 pos == item_pos
                             }
@@ -3958,17 +3936,12 @@ impl<'a> Engine<'a> {
             // supplies the name the deferred slot never latched. A mixin
             // application's `container` IS set (named mixin application
             // `class C = S with M`) and drains through the same path.
-            let clause_container = deferred.container.or_else(|| {
-                self.container_context()
-                    .map(|(name, _)| name)
-            });
+            let clause_container = deferred
+                .container
+                .or_else(|| self.container_context().map(|(name, _)| name));
             if let Some(container) = clause_container {
                 if deferred.container.is_some() {
-                    self.check_modifier_use_sites(
-                        container,
-                        deferred.name_range,
-                        &deferred.spans,
-                    );
+                    self.check_modifier_use_sites(container, deferred.name_range, &deferred.spans);
                 }
                 // An enum header drains at its own
                 // `handle_implements`/`handle_no_implements` event —
@@ -4090,8 +4063,7 @@ impl<'a> Engine<'a> {
         }
         let text = self.strings.resolve(name);
         let written = &self.source[token.byte_range()];
-        written == text
-            || (text.ends_with('=') && written == &text[..text.len() - 1])
+        written == text || (text.ends_with('=') && written == &text[..text.len() - 1])
     }
 
     /// Whether the report already holds this `conflicting_static_and_instance`
@@ -4295,9 +4267,8 @@ impl<'a> Engine<'a> {
                 instance_names.insert(self.bare_name(*name));
             }
         }
-        instance_names.retain(|name| {
-            !ctor_names.contains(name) && !self.strings.resolve(*name).is_empty()
-        });
+        instance_names
+            .retain(|name| !ctor_names.contains(name) && !self.strings.resolve(*name).is_empty());
         // The implicit `Object` instance members a static member can
         // collide with through `getInherited` — the walk has no model rows
         // for them (they live on dart:core's `Object`), so the probe falls
@@ -4310,13 +4281,8 @@ impl<'a> Engine<'a> {
         // `element.interfaces`; `Object` is not one), so a `static int
         // hashCode()` reports `extension_type_declares_member_of_object`
         // alone.
-        const IMPLICIT_OBJECT: [&str; 5] = [
-            "hashCode",
-            "toString",
-            "noSuchMethod",
-            "runtimeType",
-            "==",
-        ];
+        const IMPLICIT_OBJECT: [&str; 5] =
+            ["hashCode", "toString", "noSuchMethod", "runtimeType", "=="];
         const IMPLICIT_ENUM: [&str; 6] = [
             "index",
             "hashCode",
@@ -4434,15 +4400,8 @@ impl<'a> Engine<'a> {
                     Walk::Found(entry) if !entry.is_static
                 );
                 let implicit_hit = implicit.iter().any(|member| self.intern(member) == base);
-                if !values_accessor
-                    && (own_hit || inherited_hit || setter_hit || implicit_hit)
-                {
-                    self.emit_static_instance3(
-                        range,
-                        &container_text,
-                        &base_text,
-                        &container_text,
-                    );
+                if !values_accessor && (own_hit || inherited_hit || setter_hit || implicit_hit) {
+                    self.emit_static_instance3(range, &container_text, &base_text, &container_text);
                 }
                 continue;
             }
@@ -4907,134 +4866,134 @@ impl<'a> Engine<'a> {
                 .any(|&name| self.non_subtypable_clause_head(name))
         };
         if !clause_error {
-        // Pass 1 — the base-implemented walks (`implements` entries, the
-        // named type plus its transitive supertypes, first report per
-        // entry; :3712-3752).
-        for entry in &implements {
-            for (handle, _) in std::iter::once((entry.handle, true)).chain(
-                hierarchy
-                    .closure(entry.handle)
-                    .into_iter()
-                    .map(|h| (h, false)),
-            ) {
-                let facts = SuperFacts {
-                    modifiers: hierarchy.effective(handle),
-                    same_library: hierarchy.library_of(handle) == self.lib,
-                    may_ignore: may_ignore_class_modifiers(
-                        self.library_facts(hierarchy.library_of(handle)),
-                        use_facts,
-                    ),
-                };
-                if let Some(code) = base_implemented_candidate(&facts) {
-                    findings.push(ModifierFinding {
-                        code,
-                        a0: display(handle.1),
-                        a1: String::new(),
-                        anchor: entry.span,
-                    });
-                    break;
-                }
-            }
-        }
-        // Pass 2 — the interface extends face (class drive only;
-        // :5896-5926).
-        if let Some(entry) = &extends
-            && let Some(code) = interface_extends_violation(&super_facts(entry))
-        {
-            findings.push(ModifierFinding {
-                code,
-                a0: display(entry.handle.1),
-                a1: String::new(),
-                anchor: entry.span,
-            });
-        }
-        // Pass 3 — the final faces, official order: extends head
-        // (:5612-5627), `implements` walks (:5628-5665), `on` constraints
-        // (:5666-5686, mixin drive only).
-        if let Some(entry) = &extends
-            && let Some(code) = final_extends_violation(&super_facts(entry))
-        {
-            findings.push(ModifierFinding {
-                code,
-                a0: display(entry.handle.1),
-                a1: String::new(),
-                anchor: entry.span,
-            });
-        }
-        for entry in &implements {
-            let named_facts = self.library_facts(entry.lib);
-            for (handle, is_named) in std::iter::once((entry.handle, true)).chain(
-                hierarchy
-                    .closure(entry.handle)
-                    .into_iter()
-                    .map(|h| (h, false)),
-            ) {
-                let facts = SuperFacts {
-                    modifiers: hierarchy.effective(handle),
-                    same_library: hierarchy.library_of(handle) == self.lib,
-                    may_ignore: may_ignore_class_modifiers(
-                        self.library_facts(hierarchy.library_of(handle)),
-                        use_facts,
-                    ),
-                };
-                if let Some(code) = final_implements_candidate(
-                    &facts,
-                    &ImplementsStep {
-                        is_named_type: is_named,
-                        named_type_has_class_modifiers: named_facts.has_class_modifiers,
-                    },
+            // Pass 1 — the base-implemented walks (`implements` entries, the
+            // named type plus its transitive supertypes, first report per
+            // entry; :3712-3752).
+            for entry in &implements {
+                for (handle, _) in std::iter::once((entry.handle, true)).chain(
+                    hierarchy
+                        .closure(entry.handle)
+                        .into_iter()
+                        .map(|h| (h, false)),
                 ) {
+                    let facts = SuperFacts {
+                        modifiers: hierarchy.effective(handle),
+                        same_library: hierarchy.library_of(handle) == self.lib,
+                        may_ignore: may_ignore_class_modifiers(
+                            self.library_facts(hierarchy.library_of(handle)),
+                            use_facts,
+                        ),
+                    };
+                    if let Some(code) = base_implemented_candidate(&facts) {
+                        findings.push(ModifierFinding {
+                            code,
+                            a0: display(handle.1),
+                            a1: String::new(),
+                            anchor: entry.span,
+                        });
+                        break;
+                    }
+                }
+            }
+            // Pass 2 — the interface extends face (class drive only;
+            // :5896-5926).
+            if let Some(entry) = &extends
+                && let Some(code) = interface_extends_violation(&super_facts(entry))
+            {
+                findings.push(ModifierFinding {
+                    code,
+                    a0: display(entry.handle.1),
+                    a1: String::new(),
+                    anchor: entry.span,
+                });
+            }
+            // Pass 3 — the final faces, official order: extends head
+            // (:5612-5627), `implements` walks (:5628-5665), `on` constraints
+            // (:5666-5686, mixin drive only).
+            if let Some(entry) = &extends
+                && let Some(code) = final_extends_violation(&super_facts(entry))
+            {
+                findings.push(ModifierFinding {
+                    code,
+                    a0: display(entry.handle.1),
+                    a1: String::new(),
+                    anchor: entry.span,
+                });
+            }
+            for entry in &implements {
+                let named_facts = self.library_facts(entry.lib);
+                for (handle, is_named) in std::iter::once((entry.handle, true)).chain(
+                    hierarchy
+                        .closure(entry.handle)
+                        .into_iter()
+                        .map(|h| (h, false)),
+                ) {
+                    let facts = SuperFacts {
+                        modifiers: hierarchy.effective(handle),
+                        same_library: hierarchy.library_of(handle) == self.lib,
+                        may_ignore: may_ignore_class_modifiers(
+                            self.library_facts(hierarchy.library_of(handle)),
+                            use_facts,
+                        ),
+                    };
+                    if let Some(code) = final_implements_candidate(
+                        &facts,
+                        &ImplementsStep {
+                            is_named_type: is_named,
+                            named_type_has_class_modifiers: named_facts.has_class_modifiers,
+                        },
+                    ) {
+                        findings.push(ModifierFinding {
+                            code,
+                            a0: display(handle.1),
+                            a1: String::new(),
+                            anchor: entry.span,
+                        });
+                        break;
+                    }
+                }
+            }
+            for entry in &ons {
+                if let Some(code) = final_mixin_constraint_violation(&super_facts(entry)) {
                     findings.push(ModifierFinding {
                         code,
-                        a0: display(handle.1),
+                        a0: display(entry.handle.1),
                         a1: String::new(),
                         anchor: entry.span,
                     });
-                    break;
                 }
             }
-        }
-        for entry in &ons {
-            if let Some(code) = final_mixin_constraint_violation(&super_facts(entry)) {
-                findings.push(ModifierFinding {
-                    code,
-                    a0: display(entry.handle.1),
-                    a1: String::new(),
-                    anchor: entry.span,
-                });
+            // Pass 4 — the sealed faces, every written face checked
+            // independently (the official NamedType lists: class drive
+            // superclass + `with` + `implements` — error_verifier.dart:2363-2367
+            // `[?superclass, ...?withClause?.mixinTypes,
+            // ...?implementsClause?.interfaces]`; mixin drive `implements` +
+            // `on` — :7838-7841). The class drive sits behind the
+            // `_checkForAllMixinErrorCodes` gate (:2338-2342), but that gate's
+            // class-used-as-mixin arm reports its own row WITHOUT setting
+            // `problemReported` (:2488-2500), so a sealed class reached through
+            // `with` reports beside `class_used_as_mixin`
+            // (`test_mixinOutside_rawClass`). Enums ride the class drive with a
+            // null superclass, so their `with` entries join here too.
+            let sealed_faces: Vec<&ResolvedSuper> = if class_drive {
+                extends
+                    .iter()
+                    .chain(withs.iter())
+                    .chain(implements.iter())
+                    .collect()
+            } else {
+                implements.iter().chain(ons.iter()).collect()
+            };
+            for entry in &sealed_faces {
+                if let Some(code) = sealed_supertype_violation(&super_facts(entry)) {
+                    findings.push(ModifierFinding {
+                        code,
+                        a0: display(entry.handle.1),
+                        a1: String::new(),
+                        anchor: entry.span,
+                    });
+                }
             }
-        }
-        // Pass 4 — the sealed faces, every written face checked
-        // independently (the official NamedType lists: class drive
-        // superclass + `with` + `implements` — error_verifier.dart:2363-2367
-        // `[?superclass, ...?withClause?.mixinTypes,
-        // ...?implementsClause?.interfaces]`; mixin drive `implements` +
-        // `on` — :7838-7841). The class drive sits behind the
-        // `_checkForAllMixinErrorCodes` gate (:2338-2342), but that gate's
-        // class-used-as-mixin arm reports its own row WITHOUT setting
-        // `problemReported` (:2488-2500), so a sealed class reached through
-        // `with` reports beside `class_used_as_mixin`
-        // (`test_mixinOutside_rawClass`). Enums ride the class drive with a
-        // null superclass, so their `with` entries join here too.
-        let sealed_faces: Vec<&ResolvedSuper> = if class_drive {
-            extends
-                .iter()
-                .chain(withs.iter())
-                .chain(implements.iter())
-                .collect()
-        } else {
-            implements.iter().chain(ons.iter()).collect()
-        };
-        for entry in &sealed_faces {
-            if let Some(code) = sealed_supertype_violation(&super_facts(entry)) {
-                findings.push(ModifierFinding {
-                    code,
-                    a0: display(entry.handle.1),
-                    a1: String::new(),
-                    anchor: entry.span,
-                });
-            }
-        }
         }
         // Pass 5 — the base-or-final subtype requirement, official face
         // order superclass → implements → with → `on` (classes) /
@@ -5069,25 +5028,23 @@ impl<'a> Engine<'a> {
                 Some(ContainerKind::Class | ContainerKind::Mixin)
             )
         };
-        let subtype_faces: Vec<&ResolvedSuper> = if !matches!(
-            decl.kind,
-            ContainerKind::Class | ContainerKind::Mixin
-        ) {
-            Vec::new()
-        } else if class_drive {
-            extends
-                .iter()
-                .filter(|entry| super_kind(entry) == Some(ContainerKind::Class))
-                .chain(implements.iter().filter(|e| interface_typed(e)))
-                .chain(withs.iter().filter(|e| interface_typed(e)))
-                .collect()
-        } else {
-            implements
-                .iter()
-                .filter(|e| interface_typed(e))
-                .chain(ons.iter().filter(|e| interface_typed(e)))
-                .collect()
-        };
+        let subtype_faces: Vec<&ResolvedSuper> =
+            if !matches!(decl.kind, ContainerKind::Class | ContainerKind::Mixin) {
+                Vec::new()
+            } else if class_drive {
+                extends
+                    .iter()
+                    .filter(|entry| super_kind(entry) == Some(ContainerKind::Class))
+                    .chain(implements.iter().filter(|e| interface_typed(e)))
+                    .chain(withs.iter().filter(|e| interface_typed(e)))
+                    .collect()
+            } else {
+                implements
+                    .iter()
+                    .filter(|e| interface_typed(e))
+                    .chain(ons.iter().filter(|e| interface_typed(e)))
+                    .collect()
+            };
         let element_mods = hierarchy.effective(element);
         for entry in subtype_faces {
             let Some(ancestor) = nearest_explicit_base_or_final(&hierarchy, entry.handle) else {
@@ -5230,9 +5187,8 @@ impl<'a> Engine<'a> {
             }
         }
         let spelling = self.strings.resolve(head);
-        (spelling == "Enum"
-            || super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&spelling))
-        .then_some(head)
+        (spelling == "Enum" || super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&spelling))
+            .then_some(head)
     }
 
     /// Whether the container's written direct-supertype clauses make the
@@ -5245,11 +5201,7 @@ impl<'a> Engine<'a> {
     /// error and stands the signature checks down, so no `invalid_override`
     /// row fires on the container's members at all — the rows would compare
     /// against supertype faces the broken header never established.
-    fn disallowed_clause_suppresses_members(
-        &self,
-        decl: &Container,
-        kind: ContainerKind,
-    ) -> bool {
+    fn disallowed_clause_suppresses_members(&self, decl: &Container, kind: ContainerKind) -> bool {
         // `_checkDirectSuperType`'s first arm: a `dart:*` library returns
         // before any probe — the SDK's own declarations legitimately subtype
         // the restricted faces (`_Smi implements int`).
@@ -5493,8 +5445,7 @@ impl<'a> Engine<'a> {
                 } else {
                     self.frozen_list_face_hits(*mixin, found_owner, true, &mut hits);
                 }
-                while let Some((face, face_owner, face_lib, concrete)) = applied.pop_front()
-                {
+                while let Some((face, face_owner, face_lib, concrete)) = applied.pop_front() {
                     // A clause cycle in the applied faces poisons the whole
                     // face walk — the same suppression the outer `with`
                     // loop keeps.
@@ -5519,12 +5470,7 @@ impl<'a> Engine<'a> {
                         if !entry.is_static {
                             hits.push(FaceEntry {
                                 name: *member,
-                                entry: self.boundary.member(
-                                    face_owner,
-                                    face,
-                                    *member,
-                                    entry,
-                                ),
+                                entry: self.boundary.member(face_owner, face, *member, entry),
                                 owner_name: face,
                                 owner_file: face_owner,
                                 concrete_source: concrete,
@@ -5535,9 +5481,7 @@ impl<'a> Engine<'a> {
                     // application faces transitively (`A = Object with B`,
                     // `B = Object with M`): each hop's `with` faces join
                     // concrete, its `on`/`implements` join the interface.
-                    let next_lib = self
-                        .owner_library_of(face_owner, face)
-                        .unwrap_or(face_lib);
+                    let next_lib = self.owner_library_of(face_owner, face).unwrap_or(face_lib);
                     for next in face_container.with_clause.iter() {
                         applied.push_back((*next, face_owner, next_lib, true));
                     }
@@ -6265,7 +6209,8 @@ impl<'a> Engine<'a> {
         // The running candidate: the superclass face's seated member first
         // (upstream seeds `namedCandidates` from the supertype interface's
         // map), then the `with` mixin faces in application order.
-        let mut running: Option<&FaceEntry<'a>> = decl.superclass.and_then(|s| seated.get(&s).copied());
+        let mut running: Option<&FaceEntry<'a>> =
+            decl.superclass.and_then(|s| seated.get(&s).copied());
         for mixin in decl.with_clause.iter() {
             let Some(&mixin_hit) = seated.get(mixin) else {
                 continue;
@@ -6857,13 +6802,7 @@ impl<'a> Engine<'a> {
     ) -> Option<MemberEntry> {
         let mut facts: Option<HeaderClauses> = None;
         let hit = self.face_member_in(
-            self.file,
-            container,
-            self.lib,
-            container,
-            container,
-            spelling,
-            &mut facts,
+            self.file, container, self.lib, container, container, spelling, &mut facts,
         )?;
         // The hit carries the merged candidate's RAW signature (`T
         // member()` on `B<T>`) — the interface-map read the caller wants is
@@ -7570,7 +7509,10 @@ impl<'a> Engine<'a> {
             (Ty::Function { shape: x, .. }, Ty::Function { shape: y, .. }) => {
                 let (x, y) = {
                     let pool = self.boundary.pool();
-                    (pool.function_shape(x).clone(), pool.function_shape(y).clone())
+                    (
+                        pool.function_shape(x).clone(),
+                        pool.function_shape(y).clone(),
+                    )
                 };
                 if x.type_params != 0
                     || y.type_params != 0
@@ -7865,8 +7807,20 @@ impl<'a> Engine<'a> {
                     args,
                 },
             ),
-            Ty::Record { shape, nullable } => (nullable, Ty::Record { shape, nullable: false }),
-            Ty::Function { shape, nullable } => (nullable, Ty::Function { shape, nullable: false }),
+            Ty::Record { shape, nullable } => (
+                nullable,
+                Ty::Record {
+                    shape,
+                    nullable: false,
+                },
+            ),
+            Ty::Function { shape, nullable } => (
+                nullable,
+                Ty::Function {
+                    shape,
+                    nullable: false,
+                },
+            ),
             other => (false, other),
         }
     }
@@ -7932,8 +7886,7 @@ impl<'a> Engine<'a> {
             }
             hits
         };
-        let getter_ty = |facts: &mut Option<HeaderClauses>,
-                         hits: &mut Vec<FaceHit<'a>>| {
+        let getter_ty = |facts: &mut Option<HeaderClauses>, hits: &mut Vec<FaceHit<'a>>| {
             let combined = hits.len();
             let witness = self.combined_inherited(container, std::mem::take(hits), facts);
             match witness {
@@ -7949,8 +7902,7 @@ impl<'a> Engine<'a> {
                 None => Some(Ty::Dynamic),
             }
         };
-        let setter_ty = |facts: &mut Option<HeaderClauses>,
-                         hits: &mut Vec<FaceHit<'a>>| {
+        let setter_ty = |facts: &mut Option<HeaderClauses>, hits: &mut Vec<FaceHit<'a>>| {
             let combined = hits.len();
             let witness = self.combined_inherited(container, std::mem::take(hits), facts);
             match witness {
@@ -7969,9 +7921,9 @@ impl<'a> Engine<'a> {
             MemberKind::Field => {
                 let mut getters = getter_candidates(facts);
                 let mut setters = setter_candidates(facts);
-                let covariant = setters.iter().any(|hit| {
-                    self.candidate_first_param_covariant(hit, setter_name, facts)
-                });
+                let covariant = setters
+                    .iter()
+                    .any(|hit| self.candidate_first_param_covariant(hit, setter_name, facts));
                 let mut effective = entry.clone();
                 effective.var_ty = match (getters.is_empty(), setters.is_empty(), entry.is_final) {
                     (false, true, _) | (false, false, true) => {
@@ -8009,9 +7961,9 @@ impl<'a> Engine<'a> {
             MemberKind::Setter => {
                 let mut setters = setter_candidates(facts);
                 let mut getters = getter_candidates(facts);
-                let covariant = setters.iter().any(|hit| {
-                    self.candidate_first_param_covariant(hit, setter_name, facts)
-                });
+                let covariant = setters
+                    .iter()
+                    .any(|hit| self.candidate_first_param_covariant(hit, setter_name, facts));
                 let mut effective = entry.clone();
                 if covariant
                     && let Some(formals) = effective.formals.as_deref_mut()
@@ -8546,7 +8498,11 @@ impl<'a> Engine<'a> {
     /// not honor the flag their own arms read, so the rewrite normalizes the
     /// verdict itself — the row's name and range are the miss's identity.
     fn suppress_type_row(&mut self, range: SourceRange) {
-        for row in self.rows.iter_mut().chain(self.deferred_miss_rows.iter_mut()) {
+        for row in self
+            .rows
+            .iter_mut()
+            .chain(self.deferred_miss_rows.iter_mut())
+        {
             // A `Prefixed` row records the leaf's own span while a scanned
             // entry's span opens at the prefix token — the row matches when
             // it sits inside the entry's span, not only when it equals it.
@@ -8569,7 +8525,11 @@ impl<'a> Engine<'a> {
     /// sweep's face (its `Missing` row sits at the offset itself, the
     /// `parse_type_not_void` re-fire's `{`/`,` token).
     fn suppress_type_row_offset(&mut self, offset: u32) {
-        for row in self.rows.iter_mut().chain(self.deferred_miss_rows.iter_mut()) {
+        for row in self
+            .rows
+            .iter_mut()
+            .chain(self.deferred_miss_rows.iter_mut())
+        {
             if row.range.offset == offset
                 && matches!(
                     row.shape,
@@ -8704,12 +8664,10 @@ impl<'a> Engine<'a> {
                 entry.tag,
                 SuperTag::Implements | SuperTag::With | SuperTag::On
             );
-            let legal = |resolved: Option<ContainerKind>| {
-                match resolved {
-                    Some(ContainerKind::Class) => true,
-                    Some(ContainerKind::Mixin) => clause_accepts_mixin,
-                    _ => false,
-                }
+            let legal = |resolved: Option<ContainerKind>| match resolved {
+                Some(ContainerKind::Class) => true,
+                Some(ContainerKind::Mixin) => clause_accepts_mixin,
+                _ => false,
             };
             // A head the upstream `_resolveType` walk never reaches —
             // silence the row and the ledger entry without a report:
@@ -8732,7 +8690,10 @@ impl<'a> Engine<'a> {
                 && !implements_since_extends)
                 || (kind == ContainerKind::Mixin && entry.tag == SuperTag::With)
                 || (kind == ContainerKind::Enum
-                    && matches!(entry.tag, SuperTag::Extends | SuperTag::On | SuperTag::AliasHead));
+                    && matches!(
+                        entry.tag,
+                        SuperTag::Extends | SuperTag::On | SuperTag::AliasHead
+                    ));
             if entry.tag == SuperTag::Extends {
                 first_extends_consumed = true;
                 implements_since_extends = false;
@@ -8792,7 +8753,12 @@ impl<'a> Engine<'a> {
                         // :1170-1185), so `implements TypedefBase` over
                         // `typedef TypedefBase = BaseClass;` is a legal
                         // class entry, never `implements_non_class`.
-                        match self.index.get(owner).and_then(|f| f.decl(entry.head)).map(|d| d.kind) {
+                        match self
+                            .index
+                            .get(owner)
+                            .and_then(|f| f.decl(entry.head))
+                            .map(|d| d.kind)
+                        {
                             Some(crate::model::MicroKind::TypeAlias) => self
                                 .alias_container_head(entry.head, self.lib, self.file)
                                 .map(|(container, _, _)| container.kind),
@@ -8854,11 +8820,7 @@ impl<'a> Engine<'a> {
         // re-fire's `Missing` row (its own `void`-head span precedes it)
         // or a claim/count disagreement in a recovery shape — both silence
         // with their rows, never reporting the clause code.
-        let mut owned: Vec<u32> = facts
-            .supers
-            .iter()
-            .map(|entry| entry.span.offset)
-            .collect();
+        let mut owned: Vec<u32> = facts.supers.iter().map(|entry| entry.span.offset).collect();
         owned.sort_unstable();
         for offset in window {
             if owned.binary_search(offset).is_err() {
@@ -9296,8 +9258,7 @@ impl<'a> Engine<'a> {
             let tok = toks.get(i)?;
             Some(SourceRange {
                 offset: tok.utf16_offset,
-                length: self.utf16_of((tok.byte_offset + tok.byte_len) as usize)
-                    - tok.utf16_offset,
+                length: self.utf16_of((tok.byte_offset + tok.byte_len) as usize) - tok.utf16_offset,
             })
         };
         let mut i = start;
@@ -9329,18 +9290,16 @@ impl<'a> Engine<'a> {
                 // A prefixed clause face (`p.C`): the prefix stays the
                 // spelling's head, the local name becomes the leaf — the
                 // same bare-leaf convention the element model keeps.
-                let (prefix, head) = if lex_at(i) == Some(".")
-                    && self.intern_checked(i + 1).is_some()
-                {
-                    let local = self.intern_checked(i + 1)?;
-                    i += 2;
-                    (Some(first), local)
-                } else {
-                    (None, first)
-                };
+                let (prefix, head) =
+                    if lex_at(i) == Some(".") && self.intern_checked(i + 1).is_some() {
+                        let local = self.intern_checked(i + 1)?;
+                        i += 2;
+                        (Some(first), local)
+                    } else {
+                        (None, first)
+                    };
                 let last = toks.get(i - 1)?;
-                let head_end =
-                    self.utf16_of((last.byte_offset + last.byte_len) as usize);
+                let head_end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
                 let mut args: Vec<Ty> = Vec::new();
                 if lex_at(i) == Some("<") {
                     i = self.scan_type_args(i, &mut args)?;
@@ -9620,15 +9579,15 @@ impl<'a> Engine<'a> {
                 // arm below's suppression (the under-report direction).
                 let setter_declared;
                 let setter_inherited;
-                let (a, b) =
-                    if declared.kind == MemberKind::Setter && inherited.kind == MemberKind::Setter
-                    {
-                        setter_declared = setter_type_formals(Some(a));
-                        setter_inherited = setter_type_formals(Some(b));
-                        (&setter_declared, &setter_inherited)
-                    } else {
-                        (a, b)
-                    };
+                let (a, b) = if declared.kind == MemberKind::Setter
+                    && inherited.kind == MemberKind::Setter
+                {
+                    setter_declared = setter_type_formals(Some(a));
+                    setter_inherited = setter_type_formals(Some(b));
+                    (&setter_declared, &setter_inherited)
+                } else {
+                    (a, b)
+                };
                 // The function-subtype arity rule, not an equality: the
                 // override must accept every call the super member accepts
                 // (upstream Dart SDK source,
@@ -9873,13 +9832,7 @@ impl<'a> Engine<'a> {
                 return Some(false);
             }
             return self.override_decide(
-                bound,
-                from_scope,
-                from_entry,
-                to_ty,
-                to_scope,
-                to_entry,
-                world,
+                bound, from_scope, from_entry, to_ty, to_scope, to_entry, world,
             );
         }
         if let Ty::Named {
@@ -9998,14 +9951,9 @@ impl<'a> Engine<'a> {
             }
             let mut hop_chain = chain;
             hop_chain.push((face, found_owner));
-            if let Some(hit) = self.face_own_hit(
-                found_owner,
-                face,
-                found,
-                spelling,
-                lib,
-                hop_chain.clone(),
-            ) {
+            if let Some(hit) =
+                self.face_own_hit(found_owner, face, found, spelling, lib, hop_chain.clone())
+            {
                 let kind_matches = match face_kind {
                     MemberKind::Getter => {
                         matches!(hit.entry().kind, MemberKind::Getter | MemberKind::Field)
@@ -10019,15 +9967,14 @@ impl<'a> Engine<'a> {
                     // container); the raw `Unknown` columns would suppress
                     // the verifier's pair comparison.
                     let inferred;
-                    let hit_entry: &MemberEntry = match self.inferred_inherited(
-                        &hit, spelling, facts,
-                    ) {
-                        Some(entry) => {
-                            inferred = entry;
-                            &inferred
-                        }
-                        None => hit.entry(),
-                    };
+                    let hit_entry: &MemberEntry =
+                        match self.inferred_inherited(&hit, spelling, facts) {
+                            Some(entry) => {
+                                inferred = entry;
+                                &inferred
+                            }
+                            None => hit.entry(),
+                        };
                     match self.instantiate_inherited(&hop_chain, hit_entry, container, facts) {
                         Instantiated::Unchanged => {
                             out.push((hit_entry.clone(), face, found_owner));
@@ -10337,10 +10284,7 @@ impl<'a> Engine<'a> {
         match entry.kind {
             MemberKind::Method => {
                 if effective.return_ty == Ty::UNKNOWN {
-                    effective.return_ty = combined
-                        .as_ref()
-                        .map(|c| c.return_ty)
-                        .unwrap_or(dynamic);
+                    effective.return_ty = combined.as_ref().map(|c| c.return_ty).unwrap_or(dynamic);
                 }
                 if let Some(formals) = effective.formals.as_deref_mut() {
                     let slots = combined.as_ref().and_then(|c| c.formals.as_deref());
@@ -10514,8 +10458,7 @@ impl<'a> Engine<'a> {
                             // order (`FunctionTypeImpl` sorts the named set
                             // in its constructor, upstream Dart SDK source
                             // `pkg/analyzer/lib/src/dart/element/type.dart:153-185`).
-                            let mut named_params: Vec<&Formal> =
-                                formals.named.iter().collect();
+                            let mut named_params: Vec<&Formal> = formals.named.iter().collect();
                             named_params.sort_by_key(|f| self.strings.resolve(f.name));
                             let named = named_params
                                 .iter()

@@ -157,12 +157,14 @@ fn const_factory_redirect_to_named_nonconst_generative_reports_at_full_extent() 
     // the prelude's byte length plus `B<T>.A`'s position in the fixture.
     let expected = (super::test_rig::CORE_PRELUDE.len() + source.find("B<T>.A").unwrap()) as u32;
     assert_eq!(
-        redirects[0].range.offset, expected,
+        redirects[0].range.offset,
+        expected,
         "the emit lands on `B`: {:?}",
         rows(&report)
     );
     assert_eq!(
-        redirects[0].range.length, 6,
+        redirects[0].range.length,
+        6,
         "the row anchors the `B<T>.A` extent: {:?}",
         rows(&report)
     );
@@ -429,7 +431,8 @@ fn parenthesized_nonfunction_send_reports_at_wrapped_extent() {
         .collect();
     assert_eq!(found.len(), 1, "{:?}", rows(&report));
     assert_eq!(
-        found[0].range.length, 3,
+        found[0].range.length,
+        3,
         "the row spans `(1)` — parens included: {:?}",
         rows(&report)
     );

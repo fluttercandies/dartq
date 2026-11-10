@@ -172,8 +172,7 @@ impl Interp<'_> {
                 // above, so a marker standing here belongs to this plain
                 // expression and must be reset (a stale one from an earlier
                 // condition would let a live branch's `{}` report).
-                self.if_branch_folded =
-                    cond.bool_value.is_some() || cond.proven_bool.is_some();
+                self.if_branch_folded = cond.bool_value.is_some() || cond.proven_bool.is_some();
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::If {
                     branch: if_false,
@@ -842,10 +841,7 @@ impl Interp<'_> {
                 self.report_member_head(*kw);
                 self.case_pattern_end(*has_guard);
             }
-            Ev::SwitchEnd
-            | Ev::CaseNoWhen
-            | Ev::NoInitializer
-            | Ev::EmptyBody => {}
+            Ev::SwitchEnd | Ev::CaseNoWhen | Ev::NoInitializer | Ev::EmptyBody => {}
             Ev::CaseEnd {
                 expression_count,
                 default_kw,
@@ -864,13 +860,15 @@ impl Interp<'_> {
                     // the clause end.
                     self.report_merged_default_head(frame_index, *expression_count, *default_kw);
                     let reported = match &self.stack[frame_index] {
-                        Frame::Switch { reported_kw, default_row, .. } => {
-                            default_kw.is_some_and(|kw| {
-                                let offset = kw.range.offset;
-                                reported_kw.is_some_and(|kw_offset| kw_offset == offset)
-                                    || *default_row == Some(offset)
-                            })
-                        }
+                        Frame::Switch {
+                            reported_kw,
+                            default_row,
+                            ..
+                        } => default_kw.is_some_and(|kw| {
+                            let offset = kw.range.offset;
+                            reported_kw.is_some_and(|kw_offset| kw_offset == offset)
+                                || *default_row == Some(offset)
+                        }),
                         _ => false,
                     };
                     if let Frame::Switch { dead_default, .. } = &mut self.stack[frame_index] {
@@ -1524,11 +1522,7 @@ impl Interp<'_> {
                     // `apply_write` below — that call clears `const_bool`
                     // like any write, and the declaration's initialization
                     // is the moment the constant lands.
-                    let const_feed = if self
-                        .vars
-                        .get(var as usize)
-                        .is_some_and(|meta| !meta.late)
-                    {
+                    let const_feed = if self.vars.get(var as usize).is_some_and(|meta| !meta.late) {
                         rhs.bool_value
                     } else {
                         None
@@ -1655,8 +1649,7 @@ impl Interp<'_> {
                     // `rhs.literal` rides the same collection-literal
                     // bridge the plain-assign write passes
                     // (`Object? o = <num>[]` promotes `o` to `Object`).
-                    let promote_to_interest = !self.decl.is_final
-                        && self.decl.written;
+                    let promote_to_interest = !self.decl.is_final && self.decl.written;
                     self.apply_write(
                         var,
                         rhs.ty,
@@ -1665,8 +1658,7 @@ impl Interp<'_> {
                         None,
                         rhs.literal,
                     );
-                    if let (Some(value), Some(meta)) =
-                        (const_feed, self.vars.get_mut(var as usize))
+                    if let (Some(value), Some(meta)) = (const_feed, self.vars.get_mut(var as usize))
                     {
                         meta.const_bool = Some(value);
                     }
@@ -1761,9 +1753,7 @@ impl Interp<'_> {
                     // type adopts the staged spelling exactly like the
                     // `var`-declarator window's `meta.ty` adoption
                     // (#2140).
-                    None | Some(Ty::UNKNOWN) => match self
-                        .inferred_locals
-                        .get(&token.range.offset)
+                    None | Some(Ty::UNKNOWN) => match self.inferred_locals.get(&token.range.offset)
                     {
                         Some(&(ty, _)) => (ty, false),
                         // No inference decided it: the implicit `dynamic`
@@ -2075,7 +2065,12 @@ impl Interp<'_> {
             return;
         }
         self.emit(FlowFact::DeadCode { span: kw });
-        if let Frame::Switch { reported_kw, default_row, .. } = &mut self.stack[frame_index] {
+        if let Frame::Switch {
+            reported_kw,
+            default_row,
+            ..
+        } = &mut self.stack[frame_index]
+        {
             *reported_kw = Some(offset);
             *default_row = Some(offset);
         }
@@ -2098,7 +2093,12 @@ impl Interp<'_> {
         let Some((kw, reported)) = latched else {
             return;
         };
-        if let Frame::Switch { unmatched, default_row, .. } = &mut self.stack[frame_index] {
+        if let Frame::Switch {
+            unmatched,
+            default_row,
+            ..
+        } = &mut self.stack[frame_index]
+        {
             *unmatched = unmatched.clone().set_unreachable(&mut self.reach);
             *default_row = Some(kw.range.offset);
         }

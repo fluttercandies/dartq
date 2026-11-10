@@ -39,7 +39,7 @@
 //! test_postfixOperator` (`++`/`--` chains), `patterns_A02_t01` (a
 //! `case` pattern's logical operands read the scrutinee, not `bool`).
 
-use super::test_rig::{CORE_PRELUDE, code_names, report_ops, report_ops_imports, rows, RigImport};
+use super::test_rig::{CORE_PRELUDE, RigImport, code_names, report_ops, report_ops_imports, rows};
 use crate::diagnose::FileReport;
 
 /// The absolute offset of the first `needle` in `fixture` as the rig
@@ -264,7 +264,10 @@ fn collection_elements_and_map_values_arm_the_unknown_schema() {
                   void g() { if ({C(0)} != {.f2(0)}) {} }\n\
                   void h() { if ({\"key\": C(0)} != {\"key\": .intOne}) {} }\n";
     let r = report_ops(source);
-    assert_eq!(undefined_rows(&r), vec![(at(source, "id("), 2), (at(source, "f2("), 2)]);
+    assert_eq!(
+        undefined_rows(&r),
+        vec![(at(source, "id("), 2), (at(source, "f2("), 2)]
+    );
     assert_eq!(missing_rows(&r), vec![(at(source, ".intOne"), 7)]);
 }
 

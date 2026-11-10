@@ -45,7 +45,11 @@ fn local_function_call_is_a_method_invocation() {
         spans_of(&report, &full, "const_eval_method_invocation"),
         ["x()"],
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
     assert!(
         spans_of(&report, &full, "const_initialized_with_non_constant_value").is_empty(),
@@ -68,7 +72,11 @@ fn block_body_local_function_call_is_a_method_invocation() {
         spans_of(&report, &full, "const_eval_method_invocation"),
         ["b()"],
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
     assert!(spans_of(&report, &full, "const_initialized_with_non_constant_value").is_empty());
 }
@@ -88,7 +96,11 @@ fn local_closure_variable_call_keeps_the_site_default() {
         spans_of(&report, &full, "const_initialized_with_non_constant_value"),
         ["f()"],
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
     assert!(spans_of(&report, &full, "const_eval_method_invocation").is_empty());
 }
@@ -103,7 +115,11 @@ fn block_body_function_literal_anchors_whole() {
         spans_of(&report, &full, "const_initialized_with_non_constant_value"),
         ["() {}"],
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -118,7 +134,11 @@ fn arrow_function_literal_anchors_whole() {
         spans_of(&report, &full, "const_initialized_with_non_constant_value"),
         ["() => 1"],
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -137,7 +157,11 @@ fn function_literal_extent_is_shape_gated() {
         spans_of(&report, &full, "const_initialized_with_non_constant_value"),
         ["<int>() async => 1", "v"],
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -157,7 +181,11 @@ fn null_aware_length_on_string_and_dynamic_stays_silent() {
         assert!(
             spans_of(&report, &full, "const_initialized_with_non_constant_value").is_empty(),
             "{fixture:?} must stay silent, got {:?}",
-            report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.code.name)
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -174,7 +202,11 @@ fn null_aware_length_on_null_list_folds_to_null() {
     assert!(
         spans_of(&report, &full, "const_initialized_with_non_constant_value").is_empty(),
         "the null short-circuit must not report, got {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -195,7 +227,11 @@ fn null_aware_access_fault_belongs_to_the_property_access_face() {
         assert!(
             spans_of(&report, &full, "const_initialized_with_non_constant_value").is_empty(),
             "{fixture:?} must not carry the site default, got {:?}",
-            report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.code.name)
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -215,6 +251,10 @@ fn null_aware_access_propagates_a_non_constant_receiver() {
         spans_of(&report, &full, "const_initialized_with_non_constant_value"),
         ["v"],
         "the non-constant receiver must still report, got {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }

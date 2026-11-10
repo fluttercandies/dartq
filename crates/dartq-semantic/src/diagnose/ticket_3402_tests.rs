@@ -55,7 +55,10 @@ fn alias_typed_local_invoke_reports_the_substituted_return() {
     let source = format!("{CORE_PRELUDE}{fixture}");
     let send = source.rfind("f()").expect("fixture has the f() send") as u32;
     // `f` is read by the send so only `s` reports unused.
-    let local = source.find(" s =").map(|i| i as u32 + 1).expect("fixture has s");
+    let local = source
+        .find(" s =")
+        .map(|i| i as u32 + 1)
+        .expect("fixture has s");
     let rep = report_ops_bare(&source);
     assert_eq!(
         oracle_rows(&rep, &source),
@@ -91,7 +94,10 @@ fn invoke_result_feeds_the_next_send() {
     let send = source.find("mk()()").expect("fixture has the send") as u32;
     // `s` is declared and never read — the rig pins the warning beside the
     // error, exactly as the oracle reports both.
-    let local = source.find(" s =").map(|i| i as u32 + 1).expect("fixture has s");
+    let local = source
+        .find(" s =")
+        .map(|i| i as u32 + 1)
+        .expect("fixture has s");
     let rep = report_ops_bare(&source);
     assert_eq!(
         oracle_rows(&rep, &source),

@@ -313,7 +313,9 @@ mod tests {
             .find(|(name, _)| *name == "ffi")
             .expect("generated ffi face list");
         assert!(
-            faces.iter().any(|(name, _)| *name == "NativeFunctionPointer"),
+            faces
+                .iter()
+                .any(|(name, _)| *name == "NativeFunctionPointer"),
             "generated ffi face list lost NativeFunctionPointer"
         );
     }

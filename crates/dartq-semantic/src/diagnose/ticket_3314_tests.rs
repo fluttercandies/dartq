@@ -60,9 +60,8 @@ fn if_case_binder_resolves_in_the_then_branch() {
 /// scope closed, so the read is undefined.
 #[test]
 fn if_case_binder_is_out_of_scope_in_the_else_branch() {
-    let report = report_ops(
-        "void test() {\n  if (42 case var v) {\n    v;\n  } else {\n    v;\n  }\n}\n",
-    );
+    let report =
+        report_ops("void test() {\n  if (42 case var v) {\n    v;\n  } else {\n    v;\n  }\n}\n");
     assert_identifier_rows(&report, &["Undefined name 'v'."]);
 }
 

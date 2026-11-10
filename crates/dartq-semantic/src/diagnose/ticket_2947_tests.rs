@@ -240,11 +240,7 @@ fn in_bounds_arguments_stay_silent() {
          void g<T extends num>(T x) {}\n\
          @A<int>()\nvoid f(C c) {\n  c.m<int>(0);\n  g<int>(0);\n  C<int>(0);\n}\n",
     );
-    assert!(
-        bounds_rows(&report).is_empty(),
-        "{:#?}",
-        rows(&report)
-    );
+    assert!(bounds_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
 
 /// A named-type annotation site's bounds face is unchanged (the
@@ -255,11 +251,7 @@ fn in_bounds_arguments_stay_silent() {
 #[test]
 fn named_type_site_regression_stays() {
     let report = report_ops("class A<T extends num> {}\nA<int> f() => throw 0;\n");
-    assert!(
-        bounds_rows(&report).is_empty(),
-        "{:#?}",
-        rows(&report)
-    );
+    assert!(bounds_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
 
 /// `f<int>(x)` where `int` satisfies `T extends num` — the pre-existing
@@ -267,14 +259,8 @@ fn named_type_site_regression_stays() {
 /// window clone, regression).
 #[test]
 fn in_bounds_top_level_invocation_stays_silent() {
-    let report = report_ops(
-        "void f<T extends num>(T x) {}\nvoid g() {\n  f<int>(0);\n}\n",
-    );
-    assert!(
-        bounds_rows(&report).is_empty(),
-        "{:#?}",
-        rows(&report)
-    );
+    let report = report_ops("void f<T extends num>(T x) {}\nvoid g() {\n  f<int>(0);\n}\n");
+    assert!(bounds_rows(&report).is_empty(), "{:#?}", rows(&report));
 }
 
 /// The prelude's `num` declares the bound head `String` violates

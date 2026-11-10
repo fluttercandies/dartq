@@ -259,7 +259,11 @@ fn bound_nullability_difference_reports() {
          class D extends B { void f<T extends num>(T x) {} }\n",
     );
     let names = code_names(&report);
-    assert_eq!(names, ["invalid_override"], "the nullability-different bound");
+    assert_eq!(
+        names,
+        ["invalid_override"],
+        "the nullability-different bound"
+    );
 }
 
 /// (l) A bound that only re-spells the SAME type-parameter group keeps

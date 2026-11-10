@@ -140,7 +140,13 @@ fn undefined_rows(diagnostics: &[Diagnostic]) -> Vec<(String, u32, u32)> {
     let mut rows: Vec<(String, u32, u32)> = diagnostics
         .iter()
         .filter(|row| row.code.name.starts_with("undefined"))
-        .map(|row| (row.code.name.to_string(), row.range.offset, row.range.length))
+        .map(|row| {
+            (
+                row.code.name.to_string(),
+                row.range.offset,
+                row.range.length,
+            )
+        })
         .collect();
     rows.sort();
     rows

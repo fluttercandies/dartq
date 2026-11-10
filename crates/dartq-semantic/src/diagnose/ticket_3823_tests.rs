@@ -20,8 +20,7 @@ use crate::diagnose::types::FileReport;
 /// messages.yaml's spread operand row (`uncheckedUseOfNullableValueInSpread`).
 const SPREAD_MSG: &str = "A nullable expression can't be used in a spread.";
 /// messages.yaml's for-in row (`uncheckedUseOfNullableValueAsIterator`).
-const ITERATOR_MSG: &str =
-    "A nullable expression can't be used as an iterator in a for-in loop.";
+const ITERATOR_MSG: &str = "A nullable expression can't be used as an iterator in a for-in loop.";
 /// The member-invocation family's shared tail (method/operator variants).
 const INVOKE_MSG: &str = "can't be unconditionally invoked";
 

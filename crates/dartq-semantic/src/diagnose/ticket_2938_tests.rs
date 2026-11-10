@@ -98,11 +98,7 @@ void main() {
 T id2<T>(T x) => x;
 "#;
     let report = report_ops(source);
-    assert!(
-        infer_rows(&report).is_empty(),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(infer_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
 
 /// The generic tear-off argument's own solve
@@ -193,9 +189,7 @@ void main() {
     assert!(
         rows.iter().any(|(_, _, msg)| {
             msg.contains("Couldn't infer type parameter 'Y'")
-                && msg.contains(
-                    "'A<Object?>' doesn't conform to the bound 'A<A<Object?>>'"
-                )
+                && msg.contains("'A<Object?>' doesn't conform to the bound 'A<A<Object?>>'")
                 && msg.contains("instantiated from 'A<X>'")
                 && msg.contains("using type arguments [A<Object?>, A<Object?>]")
         }),
@@ -260,9 +254,5 @@ void later() {
 }
 "#;
     let report = report_ops(source);
-    assert!(
-        infer_rows(&report).is_empty(),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(infer_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }

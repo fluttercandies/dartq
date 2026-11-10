@@ -196,9 +196,7 @@ fn ticket_3841_void_prefix_tilde_reports_unchecked() {
     let report = report_ops(fixture);
     assert_eq!(
         unchecked_messages(&report),
-        vec![
-            "The method '~' can't be unconditionally invoked because the receiver can be 'null'."
-        ],
+        vec!["The method '~' can't be unconditionally invoked because the receiver can be 'null'."],
         "{:?}",
         crate::diagnose::test_rig::rows(&report)
     );

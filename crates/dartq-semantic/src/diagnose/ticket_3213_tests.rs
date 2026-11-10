@@ -110,7 +110,10 @@ fn for_false_body_updater_markers_and_merged_tail() {
     // `for (; false; u) {}` at line 2: updater `u` at `35` len `1`, dead
     // body `{}` at `38` len `2`. `u;` at line 3 stays live. `throw 0;`
     // merges the last two `u;` into ONE tail — `u;\n  u;` at `[59, 66)`.
-    assert_eq!(dead_rows(&report_ops_bare(fixture)), [(35, 1), (38, 2), (59, 7)]);
+    assert_eq!(
+        dead_rows(&report_ops_bare(fixture)),
+        [(35, 1), (38, 2), (59, 7)]
+    );
 }
 
 /// A null-shorted WRITE's dead tail stops at the assignment's own end —
@@ -189,7 +192,6 @@ fn for_init_false_body_and_merged_tail() {
 /// used arm, a live `for`, and no diverging statement.
 #[test]
 fn live_code_emits_no_dead_code() {
-    let fixture =
-        "void f(int x) {\n  x == 0 ? x : x;\n  for (x; x < 3; x) {}\n  x;\n}";
+    let fixture = "void f(int x) {\n  x == 0 ? x : x;\n  for (x; x < 3; x) {}\n  x;\n}";
     assert_eq!(dead_rows(&report_ops_bare(fixture)), []);
 }

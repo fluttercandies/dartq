@@ -200,7 +200,8 @@ fn coercion_error_boundary_variants_decide_on_exact_representability() {
 /// the minus.
 #[test]
 fn negated_argument_variant_anchors_at_the_digits() {
-    let source = "void notDouble([double value = 0.0]) {}\nmain() { notDouble(-9007199254740993,); }\n";
+    let source =
+        "void notDouble([double value = 0.0]) {}\nmain() { notDouble(-9007199254740993,); }\n";
     let (offset, length, message) = one_imprecise(source);
     assert_eq!(length, 16);
     // The digits start one unit past the minus.

@@ -221,7 +221,9 @@ f(ET e) {
         .collect();
     assert_eq!(rows.len(), 1, "rows: {rows:?}");
     assert!(
-        rows[0].message.contains("doesn't match the pattern 'int()'"),
+        rows[0]
+            .message
+            .contains("doesn't match the pattern 'int()'"),
         "{rows:?}"
     );
 }

@@ -25,7 +25,7 @@
 //! the module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 //! resolves — the same convention `ticket_3224_tests.rs` keeps).
 
-use crate::diagnose::test_rig::{code_names, report_ops, rows, CORE_PRELUDE};
+use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The message the oracle spells for every face (messages.yaml
 /// `useOfVoidResult`).

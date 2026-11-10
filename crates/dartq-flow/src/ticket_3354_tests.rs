@@ -125,7 +125,8 @@ fn sealed_exhaustive_switch_all_arms_throw_does_not_complete() {
 /// closes a fully covered enum switch.
 #[test]
 fn enum_exhaustive_switch_all_arms_return_does_not_complete() {
-    let source = "enum E { a, b } int f(E e) { switch (e) { case E.a: return 0; case E.b: return 1; } }";
+    let source =
+        "enum E { a, b } int f(E e) { switch (e) { case E.a: return 0; case E.b: return 1; } }";
     assert!(completion_offsets(source).is_empty());
 }
 

@@ -14,7 +14,7 @@
 //! (`AugTarget::head_range` decides the same-unit pair for constructors).
 
 use super::test_rig::{
-    CORE_PRELUDE, rows, report_ops_augment, report_ops_augment_intro_experiments,
+    CORE_PRELUDE, report_ops_augment, report_ops_augment_intro_experiments, rows,
 };
 use super::*;
 use dartq_language::Feature;
@@ -45,11 +45,7 @@ fn augment_of_earlier_unit_intro_is_silent() {
     let main = "class A {}\n";
     let aug = "augment class A {}\n";
     let report = report_ops_augment(main, aug);
-    assert!(
-        aug_rows(&report).is_empty(),
-        "{:#?}",
-        aug_rows(&report)
-    );
+    assert!(aug_rows(&report).is_empty(), "{:#?}", aug_rows(&report));
 }
 
 /// An augment of a non-existent declaration reports the plain row at the
@@ -209,11 +205,7 @@ fn augment_after_later_position_merges() {
     let main = "class A {}\n";
     let aug = "augment class A {}\n";
     let report = report_ops_augment(main, aug);
-    assert!(
-        aug_rows(&report).is_empty(),
-        "{:#?}",
-        aug_rows(&report)
-    );
+    assert!(aug_rows(&report).is_empty(), "{:#?}", aug_rows(&report));
 }
 
 /// G4, parts-of-parts: the chain is the unit-walk preorder, so an augment
@@ -262,12 +254,7 @@ fn factory_body_ignores_earlier_unit_augment() {
 /// units in that order (the `part` preorder — lib2 follows lib1 the way a
 /// nested part follows its includer). Returns each unit's report in the
 /// same order.
-fn three_unit_rig(
-    main: &str,
-    lib1: &str,
-    lib2: &str,
-    experiments: &[Feature],
-) -> [FileReport; 3] {
+fn three_unit_rig(main: &str, lib1: &str, lib2: &str, experiments: &[Feature]) -> [FileReport; 3] {
     use crate::collector::collect;
     use crate::library::ElementIndex;
     use crate::model::MicroKind;
@@ -345,17 +332,28 @@ fn three_unit_rig(
             if decl.kind == MicroKind::TypeParam {
                 continue;
             }
-            if matches!(decl.kind, MicroKind::Class | MicroKind::Enum | MicroKind::Mixin) {
+            if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+            ) {
                 builder.declare_class(lib, name, *file, ClassModifiers::default());
             } else {
                 builder.declare(lib, name, *file);
             }
         }
-        crate::capture_clause_trees(*file, source, &scanned.tokens, features, &strings, &mut clauses);
+        crate::capture_clause_trees(
+            *file,
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            &mut clauses,
+        );
     }
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
-    let types = LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
+    let types =
+        LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
     let class_modifiers = LibraryClassModifiers::default();
     scanned_units
         .iter()

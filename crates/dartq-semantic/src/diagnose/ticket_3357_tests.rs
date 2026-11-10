@@ -57,7 +57,9 @@ fn at(main: &str, needle: &str, inner: usize) -> SourceRange {
 
 /// The offset of the LAST `needle` in `main` plus `inner`.
 fn at_last(main: &str, needle: &str, inner: usize) -> SourceRange {
-    let base = main.rfind(needle).unwrap_or_else(|| panic!("no {needle:?}"));
+    let base = main
+        .rfind(needle)
+        .unwrap_or_else(|| panic!("no {needle:?}"));
     SourceRange {
         offset: (base + inner) as u32,
         length: 1,
@@ -82,10 +84,18 @@ fn rig(main: &str, lib1: &str, prefix: Option<&str>, deferred: bool) -> FileRepo
     let lib1_lib = builder.intern("package:t/lib1.dart");
     let meta_lib = builder.intern("package:meta/meta.dart");
     builder.library_name(meta_lib, "meta");
-    let meta_elements =
-        crate::collector::collect(META_MOCK, &scan_fixture(META_MOCK, meta_file).tokens, features, &strings);
-    let lib1_elements =
-        crate::collector::collect(lib1, &scan_fixture(lib1, lib1_file).tokens, features, &strings);
+    let meta_elements = crate::collector::collect(
+        META_MOCK,
+        &scan_fixture(META_MOCK, meta_file).tokens,
+        features,
+        &strings,
+    );
+    let lib1_elements = crate::collector::collect(
+        lib1,
+        &scan_fixture(lib1, lib1_file).tokens,
+        features,
+        &strings,
+    );
     for (unit, unit_file, unit_elements) in [
         (lib, file, &elements),
         (lib1_lib, lib1_file, &lib1_elements),
@@ -270,8 +280,7 @@ fn testing_unnamed_constructor_reports() {
 /// (upstream `test_topLevelFunction` — the bare-reference funnel).
 #[test]
 fn testing_top_level_function_reports() {
-    let lib1 =
-        "import 'package:meta/meta.dart';\n\n@visibleForTesting\nvoid f() {}\n";
+    let lib1 = "import 'package:meta/meta.dart';\n\n@visibleForTesting\nvoid f() {}\n";
     let main = "import 'lib1.dart';\n\nvoid g() {\n  f();\n}\n";
     let report = rig(main, lib1, None, false);
     let rows = code_rows(&report, "invalid_use_of_visible_for_testing_member");

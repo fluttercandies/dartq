@@ -81,8 +81,7 @@ fn ticket_3238_same_head_reversed_args_stay_silent() {
 /// every `on A<…>` as the bare `A` and fired here.
 #[test]
 fn ticket_3238_same_head_unrelated_args_stay_silent() {
-    let fixture =
-        "class A<T> {}\nvoid f() {\n  try {\n  } on A<int> {\n  } on A<String> {\n  }\n}";
+    let fixture = "class A<T> {}\nvoid f() {\n  try {\n  } on A<int> {\n  } on A<String> {\n  }\n}";
     assert_eq!(dead_rows(fixture), Vec::new(), "{:#?}", dead_rows(fixture));
 }
 
@@ -92,8 +91,7 @@ fn ticket_3238_same_head_unrelated_args_stay_silent() {
 /// display.
 #[test]
 fn ticket_3238_identical_args_fire_and_render_written_arguments() {
-    let fixture =
-        "void f() {\n  try {\n  } on List<String> {\n  } on List<String> {\n  }\n}";
+    let fixture = "void f() {\n  try {\n  } on List<String> {\n  } on List<String> {\n  }\n}";
     let rows = dead_rows(fixture);
     assert_eq!(
         rows,
@@ -180,8 +178,7 @@ fn ticket_3238_nullable_object_head_is_catch_all() {
 /// row — the measured EXTRA face.
 #[test]
 fn ticket_3238_record_head_takes_the_subtype_arm_silently() {
-    let fixture =
-        "class Foo {}\nvoid f() {\n  try {\n  } on (int, String) {\n  } on Foo {\n  }\n}";
+    let fixture = "class Foo {}\nvoid f() {\n  try {\n  } on (int, String) {\n  } on Foo {\n  }\n}";
     assert_eq!(dead_rows(fixture), Vec::new(), "{:#?}", dead_rows(fixture));
 }
 

@@ -38,8 +38,8 @@
 //!   [`for_in_promoted_type_parameter_is_silent`] is the guard that fails if
 //!   the predicate is extended without the promoted-bound handling.
 
-use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The prelude shifts every offset; the fixtures below are ASCII.
 fn prelude_len() -> u32 {

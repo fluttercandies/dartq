@@ -114,9 +114,7 @@ void f(A? a) {
     );
     assert_eq!(
         messages(&report, "unchecked_use_of_nullable_value"),
-        vec![
-            "The method '~' can't be unconditionally invoked because the receiver can be 'null'."
-        ],
+        vec!["The method '~' can't be unconditionally invoked because the receiver can be 'null'."],
     );
 }
 
@@ -138,10 +136,7 @@ void f(C? c) {
     let report = report_ops(fixture);
     assert_eq!(
         rows(&report, "unchecked_use_of_nullable_value"),
-        vec![
-            (at("-c?.e();", fixture), 1),
-            (at("~c?.e();", fixture), 1),
-        ],
+        vec![(at("-c?.e();", fixture), 1), (at("~c?.e();", fixture), 1),],
     );
     assert_eq!(
         messages(&report, "unchecked_use_of_nullable_value"),

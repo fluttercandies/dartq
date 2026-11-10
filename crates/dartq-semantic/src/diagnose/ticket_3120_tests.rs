@@ -50,7 +50,9 @@
 //!    `clause_miss` offset no scanned [`SuperEntry`] owns silences with
 //!    its row.
 
-use super::test_rig::{CORE_PRELUDE, RigImport, assert_silent, report_ops, report_ops_imports, rows};
+use super::test_rig::{
+    CORE_PRELUDE, RigImport, assert_silent, report_ops, report_ops_imports, rows,
+};
 
 /// The absolute fixture offset of `needle` (the prelude the rig prepends
 /// included; the fixtures are ASCII, so byte offset == UTF-16 offset).
@@ -258,7 +260,11 @@ fn on_dynamic_reports_constraint_non_interface() {
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![("mixin_super_class_constraint_non_interface", at(fixture, "dynamic"), 7)],
+        vec![(
+            "mixin_super_class_constraint_non_interface",
+            at(fixture, "dynamic"),
+            7
+        )],
         "rows: {:?}",
         rows(&report)
     );
@@ -641,7 +647,11 @@ fn mixin_on_enum_reports_constraint_non_interface() {
         code_spans(&report),
         vec![
             ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-            ("mixin_super_class_constraint_non_interface", at(fixture, "E {}"), 1),
+            (
+                "mixin_super_class_constraint_non_interface",
+                at(fixture, "E {}"),
+                1
+            ),
         ],
         "rows: {:?}",
         rows(&report)

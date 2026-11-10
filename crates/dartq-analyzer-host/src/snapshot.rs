@@ -203,7 +203,12 @@ impl WalkPlan {
     /// `walked` and `configs` — the same code path a `take` runs, so a
     /// config edit can never desynchronize the plan from the walk.
     fn refresh(&mut self, snapshot: &Snapshot) {
-        let next = plan_of(&self.roots, self.packages.as_deref(), &self.sdk_home, Some(snapshot));
+        let next = plan_of(
+            &self.roots,
+            self.packages.as_deref(),
+            &self.sdk_home,
+            Some(snapshot),
+        );
         self.walked = next.walked;
         self.configs = next.configs;
         self.watched = next.watched;
@@ -586,7 +591,8 @@ impl Snapshot {
 
     /// `binary_search` on the sorted entry vector.
     fn index(&self, path: &Path) -> Result<usize, usize> {
-        self.0.binary_search_by(|entry| entry.path.as_ref().cmp(path))
+        self.0
+            .binary_search_by(|entry| entry.path.as_ref().cmp(path))
     }
 
     /// Drops the entry at `path` plus every entry under it (a deleted
@@ -647,10 +653,7 @@ impl Snapshot {
         // path is this file's earlier form.
         let mut index = self.index(dir).unwrap_or_else(|index| index);
         while index < self.0.len() && self.0[index].path.starts_with(dir) {
-            if entries
-                .iter()
-                .any(|entry| entry.path == self.0[index].path)
-            {
+            if entries.iter().any(|entry| entry.path == self.0[index].path) {
                 index += 1;
             } else {
                 let gone = self.0.remove(index);
@@ -665,10 +668,7 @@ impl Snapshot {
             }
             let mut index = self.index(&canonical).unwrap_or_else(|index| index);
             while index < self.0.len() && self.0[index].path.starts_with(&canonical) {
-                if entries
-                    .iter()
-                    .any(|entry| entry.path == self.0[index].path)
-                {
+                if entries.iter().any(|entry| entry.path == self.0[index].path) {
                     index += 1;
                 } else {
                     let gone = self.0.remove(index);
@@ -825,9 +825,7 @@ fn walk(
     let mut emit = emit.to_path_buf();
     if let Ok(canonical) = fs::canonicalize(dir) {
         if canonical != emit {
-            links
-                .lock()
-                .push((canonical.clone(), dir.to_path_buf()));
+            links.lock().push((canonical.clone(), dir.to_path_buf()));
             emit = canonical.clone();
         }
         if !visited.lock().insert(canonical) {

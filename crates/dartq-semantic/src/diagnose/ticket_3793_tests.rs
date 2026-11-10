@@ -127,7 +127,9 @@ fn list_element_rows(report: &FileReport) -> Vec<(u32, u32)> {
     report
         .diagnostics
         .iter()
-        .filter(|d| d.message.starts_with("The element type '") && d.message.contains("list type '"))
+        .filter(|d| {
+            d.message.starts_with("The element type '") && d.message.contains("list type '")
+        })
         .map(|d| (d.range.offset, d.range.length))
         .collect()
 }
@@ -368,7 +370,6 @@ fn await_static_factory_value_operand_accepts_int_compound() {
     assert_assign_rows(&report, fixture, &[]);
 }
 
-
 // —— the await-expression span (`return await e` anchors the whole node) ——
 
 /// Every `return_of_invalid_type` row's `(offset, length)` in report
@@ -436,4 +437,3 @@ fn return_await_bare_operand_anchors_through_the_name() {
     let offset = fixture.find("await s").expect("needle");
     assert_return_invalid_rows(&report, fixture, &[(offset, 7)]);
 }
-

@@ -90,7 +90,9 @@ fn inferred_argument_violating_its_bound_falls_back_to_the_bound() {
     );
     assert_eq!(
         conflicts(&report),
-        ["The class 'Local' can't implement both 'F<Local, ioDir>' and 'F<Dir, ioDir>' because the type arguments are different."],
+        [
+            "The class 'Local' can't implement both 'F<Local, ioDir>' and 'F<Dir, ioDir>' because the type arguments are different."
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -233,7 +235,9 @@ fn mixin_implements_face_with_other_arguments_conflicts() {
     );
     assert_eq!(
         conflicts(&report),
-        ["The class 'C' can't implement both 'A<int>' and 'A<String>' because the type arguments are different."],
+        [
+            "The class 'C' can't implement both 'A<int>' and 'A<String>' because the type arguments are different."
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -253,7 +257,9 @@ fn conflicting_on_constraints_report_on_the_mixin() {
     );
     assert_eq!(
         conflicts(&report),
-        ["The mixin 'M' can't implement both 'A<X>' and 'A<Y>' because the type arguments are different."],
+        [
+            "The mixin 'M' can't implement both 'A<X>' and 'A<Y>' because the type arguments are different."
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -286,7 +292,9 @@ fn nested_type_arguments_with_a_fused_closer_conflict() {
     );
     assert_eq!(
         conflicts(&report),
-        ["The class 'D' can't implement both 'A<List<int>>' and 'A<String>' because the type arguments are different."],
+        [
+            "The class 'D' can't implement both 'A<List<int>>' and 'A<String>' because the type arguments are different."
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -305,7 +313,9 @@ fn bare_generic_argument_instantiates_to_bounds() {
     );
     assert_eq!(
         conflicts(&report),
-        ["The class 'D' can't implement both 'A<List<dynamic>>' and 'A<String>' because the type arguments are different."],
+        [
+            "The class 'D' can't implement both 'A<List<dynamic>>' and 'A<String>' because the type arguments are different."
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -329,7 +339,9 @@ fn future_or_over_a_top_argument_collapses_to_the_top_type() {
     );
     assert_eq!(
         conflicts(&report),
-        ["The class 'D' can't implement both 'A<dynamic>' and 'A<int>' because the type arguments are different."],
+        [
+            "The class 'D' can't implement both 'A<dynamic>' and 'A<int>' because the type arguments are different."
+        ],
         "{:#?}",
         rows(&report)
     );

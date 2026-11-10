@@ -94,9 +94,7 @@ fn equality_lhs_root_invocation_reports_unknown_context() {
         rows(&r)
     );
     assert!(
-        shorthand_contexts(&r)
-            .iter()
-            .all(|m| m.contains("'_'")),
+        shorthand_contexts(&r).iter().all(|m| m.contains("'_'")),
         "the left operand arms the unknown schema: {:?}",
         rows(&r)
     );
@@ -117,9 +115,7 @@ fn equality_lhs_root_in_declaration_reports_unknown_context() {
         rows(&r)
     );
     assert!(
-        shorthand_contexts(&r)
-            .iter()
-            .all(|m| m.contains("'_'")),
+        shorthand_contexts(&r).iter().all(|m| m.contains("'_'")),
         "the left operand arms the unknown schema: {:?}",
         rows(&r)
     );
@@ -139,9 +135,7 @@ fn equality_rhs_conditional_nested_reports_unknown_context() {
         rows(&r)
     );
     assert!(
-        shorthand_contexts(&r)
-            .iter()
-            .all(|m| m.contains("'_'")),
+        shorthand_contexts(&r).iter().all(|m| m.contains("'_'")),
         "the nested operand arms the unknown schema: {:?}",
         rows(&r)
     );

@@ -93,7 +93,9 @@ fn no_dead(source: &str) {
 fn enum_alternation_alternatives_stay_live() {
     // `case E.a || E.b || E.c:` — every constant is value-dependent, no
     // alternative is dead (co19 constant alternations).
-    no_dead("enum E { a, b, c }\nvoid f(Object o) {\n  switch (o) {\n    case E.a || E.b || E.c:\n      break;\n  }\n}");
+    no_dead(
+        "enum E { a, b, c }\nvoid f(Object o) {\n  switch (o) {\n    case E.a || E.b || E.c:\n      break;\n  }\n}",
+    );
 }
 
 #[test]
@@ -101,7 +103,9 @@ fn field_alternation_alternatives_stay_live() {
     // `case C(f: E.a || E.b):` — the constants sit at field depth; the
     // may-fail join at depth > 1 keeps the `||` right operand reachable
     // (the over-emit this ticket fixes: `E.b` was flagged dead).
-    no_dead("enum E { a, b, c }\nclass C { final E f; const C(this.f); }\nvoid f(C c) {\n  switch (c) {\n    case C(f: E.a || E.b):\n      break;\n  }\n}");
+    no_dead(
+        "enum E { a, b, c }\nclass C { final E f; const C(this.f); }\nvoid f(C c) {\n  switch (c) {\n    case C(f: E.a || E.b):\n      break;\n  }\n}",
+    );
 }
 
 #[test]
@@ -113,7 +117,9 @@ fn int_literal_alternation_stays_live() {
 fn lone_field_constant_keeps_exit_live() {
     // `case C(f: E.a):` — a single value-dependent field constant: the
     // case may fail, the switch exit stays reachable.
-    no_dead("enum E { a, b, c }\nclass C { final E f; const C(this.f); }\nvoid f(C c) {\n  switch (c) {\n    case C(f: E.a):\n      break;\n  }\n}");
+    no_dead(
+        "enum E { a, b, c }\nclass C { final E f; const C(this.f); }\nvoid f(C c) {\n  switch (c) {\n    case C(f: E.a):\n      break;\n  }\n}",
+    );
 }
 
 // —— alternation kills: guaranteed-match left operand —————————————————
@@ -200,9 +206,6 @@ fn wildcard_case_kills_default() {
     let src = "enum E { a, b }\nvoid f(E e) {\n  switch (e) {\n    case _:\n      break;\n    default:\n      2;\n  }\n}";
     let dead = dead_of(src);
     assert!(!dead.is_empty(), "{dead:?}");
-    assert!(
-        dead.iter().any(|row| row.contains("default")),
-        "{dead:?}"
-    );
+    assert!(dead.iter().any(|row| row.contains("default")), "{dead:?}");
     assert!(dead.iter().any(|row| row.contains("2;")), "{dead:?}");
 }

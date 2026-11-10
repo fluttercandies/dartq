@@ -65,7 +65,11 @@ fn var_binder_in_pattern_assignment_reports() {
                   \x20 (var aaa) = 2;\n\
                   \x20 print(aaa);\n\
                   }\n";
-    assert_eq!(local_rows(source), vec![nth(source, "aaa", 1)], "{source:?}");
+    assert_eq!(
+        local_rows(source),
+        vec![nth(source, "aaa", 1)],
+        "{source:?}"
+    );
 }
 
 /// A `final` binder declares the same element: the row lands on the name,
@@ -77,7 +81,11 @@ fn final_binder_in_pattern_assignment_reports() {
                   \x20 (final bbb) = 2;\n\
                   \x20 print(bbb);\n\
                   }\n";
-    assert_eq!(local_rows(source), vec![nth(source, "bbb", 1)], "{source:?}");
+    assert_eq!(
+        local_rows(source),
+        vec![nth(source, "bbb", 1)],
+        "{source:?}"
+    );
 }
 
 /// A written type is its own declaring head (`(int ccc) = 2;`).
@@ -88,7 +96,11 @@ fn typed_binder_in_pattern_assignment_reports() {
                   \x20 (int ccc) = 2;\n\
                   \x20 print(ccc);\n\
                   }\n";
-    assert_eq!(local_rows(source), vec![nth(source, "ccc", 1)], "{source:?}");
+    assert_eq!(
+        local_rows(source),
+        vec![nth(source, "ccc", 1)],
+        "{source:?}"
+    );
 }
 
 /// The parenthesized logical-and chain (co19 `pattern_assignment_A04_t01`):
@@ -144,7 +156,11 @@ fn object_pattern_binder_in_assignment_pattern_reports() {
                   \x20 Square(areaAsInt: var aaa, sizeAsInt: _) = Square(1, 1);\n\
                   \x20 print(aaa);\n\
                   }\n";
-    assert_eq!(local_rows(source), vec![nth(source, "aaa", 1)], "{source:?}");
+    assert_eq!(
+        local_rows(source),
+        vec![nth(source, "aaa", 1)],
+        "{source:?}"
+    );
 }
 
 /// One spelling repeated inside one pattern reports once — the first

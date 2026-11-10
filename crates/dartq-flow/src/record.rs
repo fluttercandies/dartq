@@ -895,7 +895,9 @@ impl<'t> Flow<'t> {
             };
         }
         self.tokens.get(next).map(|t| t.kind)
-            == Some(dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Function))
+            == Some(dartq_scanner::TokenKind::Keyword(
+                dartq_scanner::Keyword::Function,
+            ))
     }
 
     /// The written-argument tree interned at arena `id` — the cross-crate
@@ -3454,8 +3456,7 @@ impl ParserListener for Flow<'_> {
         // carries the bit the replay needs to open the short itself —
         // `null?.=> 1;` rows `?.=> 1;`. A `?..` head's short is
         // `begin_cascade`'s own, already recorded.
-        let null_aware =
-            self.kind(token) == Some(dartq_scanner::TokenKind::QuestionPeriod);
+        let null_aware = self.kind(token) == Some(dartq_scanner::TokenKind::QuestionPeriod);
         self.record(Ev::AnonMethodBegin {
             punct: token,
             null_aware,

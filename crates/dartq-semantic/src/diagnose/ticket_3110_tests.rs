@@ -69,7 +69,11 @@ void main() {
         rows.len(),
         2,
         "both member writes report: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     let rendered: Vec<String> = rows.iter().map(|d| d.message.to_string()).collect();
     assert!(
@@ -97,7 +101,11 @@ void main() {
         rows.len(),
         1,
         "the alias field write reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("int?"),
@@ -125,7 +133,11 @@ void main() {
         rows.len(),
         1,
         "the setter write on a creation receiver reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("int"),
@@ -151,7 +163,11 @@ void main() {
         rows.len(),
         1,
         "the plain field write still reports once: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("int"),
@@ -182,7 +198,11 @@ void main() { argfx(topx); }
     assert!(
         rows_named(&report, "argument_type_not_assignable").is_empty(),
         "dartq must not report ATNA for an untyped-formal pair: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -200,7 +220,11 @@ void main() { argfy(topy); }
     assert!(
         rows_named(&report, "argument_type_not_assignable").is_empty(),
         "dartq must not report ATNA for an untyped-optional pair: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -219,7 +243,11 @@ void main() { argfn(topy); }
         rows.len(),
         1,
         "a real arity refusal still reports: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -253,7 +281,11 @@ void main() {}
         rows.len(),
         2,
         "oracle reports two invalid_assignment rows: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -279,7 +311,11 @@ void main() {}
         rows.len(),
         1,
         "only the String argument reports: {:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, d.range)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range))
+            .collect::<Vec<_>>()
     );
     assert!(
         rows[0].message.contains("int"),
@@ -305,11 +341,19 @@ void main() {
         rows_named(&report, "type_argument_not_matching_bounds").len(),
         1,
         "the TANMB row fires: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
     assert!(
         rows_named(&report, "argument_type_not_assignable").is_empty(),
         "explicit-arg formal stays the written String — no ATNA: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }

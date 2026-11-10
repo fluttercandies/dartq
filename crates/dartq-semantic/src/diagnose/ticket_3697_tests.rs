@@ -71,8 +71,14 @@ fn parenthesized_pattern_final_write_reports() {
     assert_eq!(
         atfl_rows(&report),
         vec![
-            (at(fixture, "a = 0"), "The final variable 'a' can only be set once.".to_string()),
-            (at(fixture, "b = 1"), "The final variable 'b' can only be set once.".to_string()),
+            (
+                at(fixture, "a = 0"),
+                "The final variable 'a' can only be set once.".to_string()
+            ),
+            (
+                at(fixture, "b = 1"),
+                "The final variable 'b' can only be set once.".to_string()
+            ),
         ],
         "{:#?}",
         rows(&report)
@@ -88,7 +94,10 @@ fn list_pattern_final_write_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "a = 1"), "The final variable 'a' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "a = 1"),
+            "The final variable 'a' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );
@@ -103,7 +112,10 @@ fn map_pattern_final_write_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "a = 1"), "The final variable 'a' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "a = 1"),
+            "The final variable 'a' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );
@@ -119,7 +131,10 @@ fn for_in_pattern_final_increment_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "v++"), "The final variable 'v' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "v++"),
+            "The final variable 'v' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );
@@ -138,8 +153,14 @@ fn case_pattern_final_binder_write_reports() {
     assert_eq!(
         atfl_rows(&report),
         vec![
-            (at(fixture, "a = 1"), "The final variable 'a' can only be set once.".to_string()),
-            (at(fixture, "b = 2"), "The final variable 'b' can only be set once.".to_string()),
+            (
+                at(fixture, "a = 1"),
+                "The final variable 'a' can only be set once.".to_string()
+            ),
+            (
+                at(fixture, "b = 2"),
+                "The final variable 'b' can only be set once.".to_string()
+            ),
         ],
         "{:#?}",
         rows(&report)
@@ -157,7 +178,10 @@ fn pattern_final_compound_write_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "a += 1"), "The final variable 'a' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "a += 1"),
+            "The final variable 'a' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );
@@ -171,7 +195,8 @@ fn pattern_final_compound_write_reports() {
 /// `assignment_to_final_local` at `e`.
 #[test]
 fn catch_exception_parameter_write_reports() {
-    let fixture = "void f() {\n  try {\n    throw \"x\";\n  } catch (e, s) {\n    e = null;\n  }\n}\n";
+    let fixture =
+        "void f() {\n  try {\n    throw \"x\";\n  } catch (e, s) {\n    e = null;\n  }\n}\n";
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
@@ -187,7 +212,8 @@ fn catch_exception_parameter_write_reports() {
 /// The stack-trace parameter is final the same way.
 #[test]
 fn catch_stack_parameter_write_reports() {
-    let fixture = "void f() {\n  try {\n    throw \"x\";\n  } catch (e, s) {\n    s = null;\n  }\n}\n";
+    let fixture =
+        "void f() {\n  try {\n    throw \"x\";\n  } catch (e, s) {\n    s = null;\n  }\n}\n";
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
@@ -216,8 +242,14 @@ fn closure_captured_write_to_final_reports() {
     assert_eq!(
         atfl_rows(&report),
         vec![
-            (at(fixture, "x = 1"), "The final variable 'x' can only be set once.".to_string()),
-            (at(fixture, "x = 0"), "The final variable 'x' can only be set once.".to_string()),
+            (
+                at(fixture, "x = 1"),
+                "The final variable 'x' can only be set once.".to_string()
+            ),
+            (
+                at(fixture, "x = 0"),
+                "The final variable 'x' can only be set once.".to_string()
+            ),
         ],
         "{:#?}",
         rows(&report)
@@ -232,7 +264,10 @@ fn nested_function_captured_write_to_final_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "x = 1"), "The final variable 'x' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "x = 1"),
+            "The final variable 'x' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );
@@ -260,8 +295,7 @@ fn block_write_to_unassigned_final_stays_silent() {
 /// variables_promotion_test`'s `isInt`/`neqNull` arms): no rows.
 #[test]
 fn if_else_branch_writes_stay_silent() {
-    let fixture =
-        "void f(bool b) {\n  final int x;\n  if (b) {\n    x = 1;\n  } else {\n    x = 2;\n  }\n  x;\n}\n";
+    let fixture = "void f(bool b) {\n  final int x;\n  if (b) {\n    x = 1;\n  } else {\n    x = 2;\n  }\n  x;\n}\n";
     let report = report_ops(fixture);
     assert!(
         !code_names(&report).contains(&"assignment_to_final_local"),
@@ -291,7 +325,10 @@ fn write_after_if_else_join_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "x = 3"), "The final variable 'x' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "x = 3"),
+            "The final variable 'x' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );
@@ -317,7 +354,10 @@ fn second_write_same_branch_reports() {
     let report = report_ops(fixture);
     assert_eq!(
         atfl_rows(&report),
-        vec![(at(fixture, "x = 2"), "The final variable 'x' can only be set once.".to_string())],
+        vec![(
+            at(fixture, "x = 2"),
+            "The final variable 'x' can only be set once.".to_string()
+        )],
         "{:#?}",
         rows(&report)
     );

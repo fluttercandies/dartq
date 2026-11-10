@@ -104,7 +104,8 @@ fn paren_expression_silent() {
 /// `print(final this.x)` inside a statement body stay silent.
 #[test]
 fn call_argument_list_silent() {
-    let report = report_ops("class C { int x = 0; void m() { g(final this.x); } void g(int v) {} }");
+    let report =
+        report_ops("class C { int x = 0; void m() { g(final this.x); } void g(int v) {} }");
     assert_eq!(uf_rows(&report), 0);
 }
 

@@ -61,9 +61,10 @@ fn nameless_local_anchors_at_function_name_not_decl() {
     );
     // The discriminating edge: no row may sit at the declaration keyword.
     let kw_at = at(source, "var");
-    let stray = report.diagnostics.iter().any(|d| {
-        d.code.name == "unused_local_variable" && d.range.offset == kw_at
-    });
+    let stray = report
+        .diagnostics
+        .iter()
+        .any(|d| d.code.name == "unused_local_variable" && d.range.offset == kw_at);
     assert!(
         !stray,
         "nameless row must not anchor at the declaration keyword ({kw_at}): {:#?}",
@@ -94,7 +95,8 @@ fn nameless_locals_in_one_function_collapse_to_one_row() {
         })
         .count();
     assert_eq!(
-        hits, 1,
+        hits,
+        1,
         "expected ONE collapsed <unnamed> row at main ({main_at}+0): {:#?}",
         unused_local_rows(&report)
     );

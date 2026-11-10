@@ -82,10 +82,9 @@ pub(super) fn types_for(source: &str) -> (LibraryTypes, StringTable, dartq_sourc
     let file = files.intern(Path::new("main.dart"));
     let source = format!("{CORE_PRELUDE}{source}");
     let scanned = scan_fixture(&source, file);
-    let features =
-        ParserFeatures::from_feature_set(FeatureSet::for_language_version(LanguageVersion::new(
-            3, 15,
-        )));
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ));
     let elements = collect(&source, &scanned.tokens, features, &strings);
     let mut builder = LibraryGraphBuilder::new(&strings);
     let lib = builder.intern("package:t/main.dart");
@@ -289,9 +288,9 @@ pub(super) fn report_ops_experiments_with(
         // the edge deferred: the keyword rides the directive, not the
         // `RigImport` (the corpus's deferred-library fixtures write
         // `import '…' deferred as p;`).
-        let deferred = import.prefix.is_some_and(|prefix| {
-            source.contains(&format!("deferred as {prefix}"))
-        });
+        let deferred = import
+            .prefix
+            .is_some_and(|prefix| source.contains(&format!("deferred as {prefix}")));
         builder.import(
             lib,
             ImportEdge {

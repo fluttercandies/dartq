@@ -209,8 +209,7 @@ fn null_check_promoted_receiver_read_reports_the_non_null_face() {
 /// member identifier itself.
 #[test]
 fn promoted_field_null_aware_receiver_emits_the_property_row() {
-    let source =
-        "class C { final int? _g = 0; void m() { if (_g != null) { _g?.abs(); } } }";
+    let source = "class C { final int? _g = 0; void m() { if (_g != null) { _g?.abs(); } } }";
     let (_, facts) = analyze(source);
     let member = source.rfind("_g?.").unwrap() as u32;
     assert!(
@@ -230,8 +229,7 @@ fn promoted_field_null_aware_receiver_emits_the_property_row() {
 /// after reports `int?`; no `PromotedRead`.
 #[test]
 fn if_null_write_with_nullable_rhs_keeps_the_read_unpromoted() {
-    let source =
-        "int? f2() => null;\nvoid f(int? x) { x ??= f2(); x + 1; }";
+    let source = "int? f2() => null;\nvoid f(int? x) { x ??= f2(); x + 1; }";
     let (flow, facts) = analyze(source);
     let int_name = flow.0.borrow_mut().intern_name("int");
     let read = source.rfind("x +").unwrap() as u32;

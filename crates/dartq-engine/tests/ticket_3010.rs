@@ -42,7 +42,12 @@ fn rows_of(
                         .to_owned()
                 })
                 .unwrap_or_default();
-            (tail, row.range.offset, row.range.length, row.message.to_string())
+            (
+                tail,
+                row.range.offset,
+                row.range.length,
+                row.message.to_string(),
+            )
         })
         .collect()
 }
@@ -72,11 +77,7 @@ fn import_with_an_interpolated_primary_uri_reports_interpolation() {
         )],
         "the interpolated primary import: {diagnostics:?}"
     );
-    for code in [
-        "uri_does_not_exist",
-        "invalid_uri",
-        "import_of_non_library",
-    ] {
+    for code in ["uri_does_not_exist", "invalid_uri", "import_of_non_library"] {
         assert!(
             rows_of(&engine, &diagnostics, code).is_empty(),
             "{code} must stay silent — an interpolated URI never resolves: {diagnostics:?}"

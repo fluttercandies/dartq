@@ -135,7 +135,10 @@ fn unknown_operand_stays_silent() {
         .iter()
         .map(|d| d.code.name)
         .filter(|name| {
-            matches!(*name, "unnecessary_null_comparison" | "unnecessary_type_check")
+            matches!(
+                *name,
+                "unnecessary_null_comparison" | "unnecessary_type_check"
+            )
         })
         .collect();
     assert!(codes.is_empty(), "{codes:?}");

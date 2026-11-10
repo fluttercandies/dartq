@@ -88,7 +88,10 @@ fn member_send_result_is_deads_the_else_arm() {
         "the call result is no reference operand — exactly the else arm \
          dies, got {dead:?}"
     );
-    assert!(dead[0].contains('2'), "the dead arm is the else, got {dead:?}");
+    assert!(
+        dead[0].contains('2'),
+        "the dead arm is the else, got {dead:?}"
+    );
 }
 
 /// The chain INTERRUPT propagates: a member read over the call result
@@ -107,7 +110,10 @@ fn member_of_call_result_deads_the_else_arm() {
         "`x.f().g` is a member read off a call result — non-reference, \
          exactly the else arm dies, got {dead:?}"
     );
-    assert!(dead[0].contains('2'), "the dead arm is the else, got {dead:?}");
+    assert!(
+        dead[0].contains('2'),
+        "the dead arm is the else, got {dead:?}"
+    );
 }
 
 /// The member READ on the same reference chain keeps its lenient arm: no
@@ -163,12 +169,16 @@ fn null_shorted_member_read_is_unchanged() {
 /// there).
 #[test]
 fn direct_call_result_stays_non_reference() {
-    let source = "class C {}\nvoid g() {\n  if (nowheresfn() is C) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+    let source =
+        "class C {}\nvoid g() {\n  if (nowheresfn() is C) {\n    1;\n  } else {\n    2;\n  }\n}\n";
     let ops: &dyn TypeOps = &InvalidFaceOps;
     let facts = analyze(source, Some(ops));
     let dead = dead_of(source, &facts);
     assert_eq!(dead.len(), 1, "exactly the else arm dies, got {dead:?}");
-    assert!(dead[0].contains('2'), "the dead arm is the else, got {dead:?}");
+    assert!(
+        dead[0].contains('2'),
+        "the dead arm is the else, got {dead:?}"
+    );
 }
 
 /// The oracle-cited `f().bar` face: a member read off an unresolved DIRECT
@@ -181,7 +191,10 @@ fn member_of_direct_call_result_deads_the_else_arm() {
     let facts = analyze(source, Some(ops));
     let dead = dead_of(source, &facts);
     assert_eq!(dead.len(), 1, "exactly the else arm dies, got {dead:?}");
-    assert!(dead[0].contains('2'), "the dead arm is the else, got {dead:?}");
+    assert!(
+        dead[0].contains('2'),
+        "the dead arm is the else, got {dead:?}"
+    );
 }
 
 /// The healthy face is untouched: a resolved receiver's method send whose
@@ -209,9 +222,9 @@ struct InvalidFaceOps;
 impl InvalidFaceOps {
     fn is_invalid(&self, ty: Ty, names: &[Box<str>]) -> bool {
         match ty.base {
-            Base::Name(id) => names.get(id as usize).is_some_and(|name| {
-                name.as_ref() == "Nowhere" || name.as_ref() == "nowheresfn"
-            }),
+            Base::Name(id) => names
+                .get(id as usize)
+                .is_some_and(|name| name.as_ref() == "Nowhere" || name.as_ref() == "nowheresfn"),
             _ => false,
         }
     }
@@ -238,9 +251,8 @@ impl TypeOps for InvalidFaceOps {
         // The 0c arm: any relation with the invalid head is vacuous.
         self.is_invalid(left, names)
             || self.is_invalid(right, names)
-            || crate::ty::NameTypeOps.is_subtype_typed(
-                left, left_args, right, right_args, arena, names,
-            )
+            || crate::ty::NameTypeOps
+                .is_subtype_typed(left, left_args, right, right_args, arena, names)
     }
 
     fn is_invalid_typed(

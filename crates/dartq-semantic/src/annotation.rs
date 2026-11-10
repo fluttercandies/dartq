@@ -54,9 +54,7 @@
 //! target's uri must itself be `package:meta/…`, not merely transitively
 //! export it.
 
-use dartq_resolution::{
-    LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces,
-};
+use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 
 use crate::model::Annotation;
@@ -481,8 +479,9 @@ pub fn deprecation_kind_spelling(
         Some((head, selector)) => match DeprecationKind::from_selector(selector) {
             // `@Deprecated.extend` / `@core.Deprecated.extend`: the head
             // (with its written prefix) must be the dart:core tag.
-            Some(kind) => is_core_deprecated_spelling(head, strings, graph, namespaces, lib)
-                .then_some(kind),
+            Some(kind) => {
+                is_core_deprecated_spelling(head, strings, graph, namespaces, lib).then_some(kind)
+            }
             // The dot is a PREFIX (`@core.deprecated`): the tag gate reads
             // the whole spelling and answers the unnamed face.
             None => is_core_deprecated_spelling(spelling, strings, graph, namespaces, lib)
@@ -1333,7 +1332,10 @@ mod tests {
         let rig = CoreRig::build(Some(&["deprecated", "Deprecated"]), &[], &[], &[], false);
         assert!(rig.tag("deprecated"), "const tag through the implicit edge");
         assert!(rig.tag("Deprecated"), "class tag through the implicit edge");
-        assert!(!rig.tag("experimental"), "an untagged spelling stays silent");
+        assert!(
+            !rig.tag("experimental"),
+            "an untagged spelling stays silent"
+        );
     }
 
     /// The rig posture (no `dart:core` node): the implicit import is not
@@ -1349,8 +1351,17 @@ mod tests {
     /// never to dart:core (`element/scope.dart:419-433`).
     #[test]
     fn local_deprecation_spelling_shadows_the_core_tag() {
-        let rig = CoreRig::build(Some(&["deprecated", "Deprecated"]), &["deprecated"], &[], &[], false);
-        assert!(!rig.tag("deprecated"), "the local wins over the implicit import");
+        let rig = CoreRig::build(
+            Some(&["deprecated", "Deprecated"]),
+            &["deprecated"],
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            !rig.tag("deprecated"),
+            "the local wins over the implicit import"
+        );
         assert!(rig.tag("Deprecated"), "the other spelling is untouched");
     }
 

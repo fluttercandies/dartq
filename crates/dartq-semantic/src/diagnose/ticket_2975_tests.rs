@@ -98,10 +98,11 @@ fn cascade_section_promoted_field_null_aware_reports() {
 /// never evidenced.
 #[test]
 fn unpromoted_field_null_aware_stays_silent() {
-    let report = report_ops(
-        "class C { final int? _g = 0; void m() { _g?.toString(); } }\n",
+    let report = report_ops("class C { final int? _g = 0; void m() { _g?.toString(); } }\n");
+    assert!(
+        !code_names(&report).contains(&"invalid_null_aware_operator"),
+        "{report:?}"
     );
-    assert!(!code_names(&report).contains(&"invalid_null_aware_operator"), "{report:?}");
 }
 
 /// A public (non-private) field is never field-promotable — the
@@ -115,7 +116,10 @@ fn public_field_receiver_reports_nothing_via_property_arm() {
     let report = report_ops(
         "class C { final int? g = 0; void m() { if (g != null) { g?.toString(); } } }\n",
     );
-    assert!(!code_names(&report).contains(&"invalid_null_aware_operator"), "{report:?}");
+    assert!(
+        !code_names(&report).contains(&"invalid_null_aware_operator"),
+        "{report:?}"
+    );
 }
 
 /// A local receiver promoted through `!= null` still re-decides through
@@ -123,12 +127,13 @@ fn public_field_receiver_reports_nothing_via_property_arm() {
 /// double-report it.
 #[test]
 fn local_receiver_still_reports_once() {
-    let report = report_ops(
-        "class C { void m(int? x) { if (x != null) { x?.toString(); } } }\n",
-    );
+    let report = report_ops("class C { void m(int? x) { if (x != null) { x?.toString(); } } }\n");
     let names = code_names(&report);
     assert_eq!(
-        names.iter().filter(|n| **n == "invalid_null_aware_operator").count(),
+        names
+            .iter()
+            .filter(|n| **n == "invalid_null_aware_operator")
+            .count(),
         1,
         "{names:?}"
     );

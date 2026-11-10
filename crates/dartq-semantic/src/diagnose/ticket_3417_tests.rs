@@ -132,9 +132,8 @@ fn t3417_bare_literal_cascade_keeps_the_type_face() {
 /// `typedef A = C;` resolves `C`'s static.
 #[test]
 fn t3417_interface_alias_resolves_the_aliased_statics() {
-    let report = report_ops(
-        "class C { static void sm() {} } typedef A = C; void test() { A.sm(); }",
-    );
+    let report =
+        report_ops("class C { static void sm() {} } typedef A = C; void test() { A.sm(); }");
     assert_silent(&report);
 }
 

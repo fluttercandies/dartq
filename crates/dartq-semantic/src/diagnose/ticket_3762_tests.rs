@@ -41,11 +41,7 @@ const VOID_MSG: &str = "This expression has a type of 'void' so its value can't 
 /// `expected` `(offset, length)` pairs (offsets relative to the fixture's
 /// own text, `CORE_PRELUDE` shifted). Other diagnostics a fixture's shape
 /// invites (`unused_element`, `unused_local_variable`) are tolerated.
-fn assert_void_rows(
-    report: &super::FileReport,
-    fixture: &str,
-    expected: &[(usize, u32)],
-) {
+fn assert_void_rows(report: &super::FileReport, fixture: &str, expected: &[(usize, u32)]) {
     let mut got: Vec<(u32, u32)> = report
         .diagnostics
         .iter()

@@ -64,12 +64,7 @@ fn rows_at(source: &'static str, major: u32, minor: u32) -> BTreeSet<(String, u3
     rows
 }
 
-fn assert_rows_at(
-    source: &'static str,
-    major: u32,
-    minor: u32,
-    expected: &[(&str, u32, u32)],
-) {
+fn assert_rows_at(source: &'static str, major: u32, minor: u32, expected: &[(&str, u32, u32)]) {
     let expected: BTreeSet<(String, u32, u32)> = expected
         .iter()
         .map(|(c, s, e)| ((*c).to_owned(), *s, *e))
@@ -150,12 +145,7 @@ fn enhanced_enums_report_below_two_seventeen() {
         &[("experiment_not_enabled", 7, 11)],
     );
     assert_rows_at("enum E with M {}\n", 2, 19, &[]);
-    assert_rows_at(
-        "enum E<T> {}\n",
-        2,
-        16,
-        &[("experiment_not_enabled", 6, 7)],
-    );
+    assert_rows_at("enum E<T> {}\n", 2, 16, &[("experiment_not_enabled", 6, 7)]);
     assert_rows_at("enum E<T> {}\n", 2, 19, &[]);
 }
 

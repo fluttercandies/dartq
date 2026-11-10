@@ -262,7 +262,8 @@ impl<'a> Engine<'a> {
         // `@protected` (:1826-1832): an access inside a container whose
         // type has the declaring class among its supertypes is the
         // sanctioned use, and the whole chain returns.
-        if legs.protected && self.access_within_subclass(anchor.offset, target_file, target_container)
+        if legs.protected
+            && self.access_within_subclass(anchor.offset, target_file, target_container)
         {
             return;
         }
@@ -277,7 +278,9 @@ impl<'a> Engine<'a> {
         }
         // `@visibleForOverriding` (:1850-1863): `super.x` inside the very
         // member that overrides `x` is the sanctioned use.
-        if legs.overriding && super_member_call && self.access_overrides_enclosing(anchor.offset, display)
+        if legs.overriding
+            && super_member_call
+            && self.access_overrides_enclosing(anchor.offset, display)
         {
             return;
         }
@@ -372,9 +375,8 @@ impl<'a> Engine<'a> {
         if start == (target_file, target_container) {
             return true;
         }
-        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
-            self.alias_clause_hop(name, file, lib)
-        };
+        let alias_hop =
+            |name: StringId, file: FileId, lib: LibraryId| self.alias_clause_hop(name, file, lib);
         let hierarchy = FoldHierarchy {
             graph: self.graph,
             namespaces: self.namespaces,
@@ -474,10 +476,7 @@ impl<'a> Engine<'a> {
         };
         at >= 2
             && tokens[at - 1].kind == TokenKind::Period
-            && matches!(
-                tokens[at - 2].kind,
-                TokenKind::Keyword(Keyword::Super)
-            )
+            && matches!(tokens[at - 2].kind, TokenKind::Keyword(Keyword::Super))
     }
 
     /// The access family over the post-pass publications the member
@@ -551,42 +550,39 @@ impl<'a> Engine<'a> {
             let Some(elements) = index.get(edge.target_file) else {
                 continue;
             };
-            let (display, annos) = match member_entry_annotations(
-                elements,
-                edge.target_container,
-                edge.target_name,
-            ) {
-                Some(annos) => {
-                    let spelling = strings.resolve(edge.target_name);
-                    (
-                        spelling.strip_suffix('=').unwrap_or(spelling).to_owned(),
-                        annos,
-                    )
-                }
-                // A constructor edge names a selector no member row carries;
-                // the `A.named` display is the oracle's
-                // `element.dart:838-847` join.
-                None if !matches!(
-                    edge.kind,
-                    MemberRefKind::Written | MemberRefKind::ReadWritten
-                ) && edge.target_name != edge.target_container =>
-                {
-                    let Some(annos) =
-                        elements.ctor_annotations(edge.target_container, edge.target_name)
-                    else {
-                        continue;
-                    };
-                    (
-                        format!(
-                            "{}.{}",
-                            strings.resolve(edge.target_container),
-                            strings.resolve(edge.target_name)
-                        ),
-                        annos,
-                    )
-                }
-                None => continue,
-            };
+            let (display, annos) =
+                match member_entry_annotations(elements, edge.target_container, edge.target_name) {
+                    Some(annos) => {
+                        let spelling = strings.resolve(edge.target_name);
+                        (
+                            spelling.strip_suffix('=').unwrap_or(spelling).to_owned(),
+                            annos,
+                        )
+                    }
+                    // A constructor edge names a selector no member row carries;
+                    // the `A.named` display is the oracle's
+                    // `element.dart:838-847` join.
+                    None if !matches!(
+                        edge.kind,
+                        MemberRefKind::Written | MemberRefKind::ReadWritten
+                    ) && edge.target_name != edge.target_container =>
+                    {
+                        let Some(annos) =
+                            elements.ctor_annotations(edge.target_container, edge.target_name)
+                        else {
+                            continue;
+                        };
+                        (
+                            format!(
+                                "{}.{}",
+                                strings.resolve(edge.target_container),
+                                strings.resolve(edge.target_name)
+                            ),
+                            annos,
+                        )
+                    }
+                    None => continue,
+                };
             let super_member_call = self.access_is_super_call(edge.range.offset);
             self.check_invalid_access_face(
                 edge.range,
@@ -668,7 +664,9 @@ impl<'a> Engine<'a> {
         // element carries a `deferred` fragment — the import edge flag.
         let mut deferred = FxHashSet::default();
         for edge in graph.import_edges(self.lib) {
-            if edge.deferred && let Some(prefix) = edge.prefix {
+            if edge.deferred
+                && let Some(prefix) = edge.prefix
+            {
                 deferred.insert(prefix);
             }
         }
@@ -751,7 +749,10 @@ impl<'a> Engine<'a> {
             end = tokens[close].utf16_offset + self.access_token_len(close);
             next = close + 1;
         }
-        if tokens.get(next).is_some_and(|t| t.kind == TokenKind::Question) {
+        if tokens
+            .get(next)
+            .is_some_and(|t| t.kind == TokenKind::Question)
+        {
             end = tokens[next].utf16_offset + self.access_token_len(next);
             next += 1;
         }
@@ -832,7 +833,8 @@ fn member_entry_annotations<'e>(
         .map(|entry| entry.annotations.as_ref())
         .or_else(|| {
             elements.extension_faces().iter().find_map(|face| {
-                (face.name == Some(container) || (face.name.is_none() && container == StringId::NONE))
+                (face.name == Some(container)
+                    || (face.name.is_none() && container == StringId::NONE))
                     .then(|| face.members.get(&name))
                     .flatten()
                     .map(|entry| entry.annotations.as_ref())
@@ -1047,8 +1049,7 @@ impl Engine<'_> {
                 .or_else(|| {
                     elements.extension_faces().iter().find_map(|face| {
                         (face.name == Some(target_container)
-                            || (face.name.is_none()
-                                && target_container == StringId::NONE))
+                            || (face.name.is_none() && target_container == StringId::NONE))
                             .then(|| face.members.get(&name))
                             .flatten()
                             .map(|entry| entry.annotations.as_ref())
@@ -1098,8 +1099,7 @@ impl Engine<'_> {
                     // container row (upstream `visitExtensionOverride`
                     // reads the extension element's own metadata).
                     elements.extension_faces().iter().find_map(|face| {
-                        (face.name == Some(target_container))
-                            .then(|| face.annotations.as_ref())
+                        (face.name == Some(target_container)).then(|| face.annotations.as_ref())
                     })
                 })
                 .or_else(|| {
@@ -1230,11 +1230,10 @@ impl Engine<'_> {
         let owner_spelling = strings.resolve(owner);
         let owner_member = owner_spelling.rsplit('.').next().unwrap_or(owner_spelling);
         let in_own_executable = self.decl_sites.iter().any(|site| {
-            strings.resolve(site.name) == owner_member
-                && {
-                    let extent = self.declaration_extent(site.range.offset);
-                    extent.0 <= range.offset && range.offset < extent.1
-                }
+            strings.resolve(site.name) == owner_member && {
+                let extent = self.declaration_extent(site.range.offset);
+                extent.0 <= range.offset && range.offset < extent.1
+            }
         });
         if in_own_executable {
             return;
@@ -1512,11 +1511,7 @@ impl Engine<'_> {
                 .and_then(|formals| Some((formals, self.call_open_paren(reference.range)?)))
                 && let Some(decl_elements) = index.get(file)
             {
-                findings.extend(self.scan_closure_argument_elements(
-                    open,
-                    formals,
-                    decl_elements,
-                ));
+                findings.extend(self.scan_closure_argument_elements(open, formals, decl_elements));
             }
         }
         for edge in &self.report.member_refs {
@@ -1529,22 +1524,14 @@ impl Engine<'_> {
                 .and_then(|formals| Some((formals, self.call_open_paren(edge.range)?)))
                 && let Some(decl_elements) = index.get(edge.target_file)
             {
-                findings.extend(self.scan_closure_argument_elements(
-                    open,
-                    formals,
-                    decl_elements,
-                ));
+                findings.extend(self.scan_closure_argument_elements(open, formals, decl_elements));
             }
         }
         for (range, name) in &self.type_uses {
             if let Some((formals, open, file, _)) = self.creation_face(*range, *name)
                 && let Some(decl_elements) = index.get(file)
             {
-                findings.extend(self.scan_closure_argument_elements(
-                    open,
-                    formals,
-                    decl_elements,
-                ));
+                findings.extend(self.scan_closure_argument_elements(open, formals, decl_elements));
             }
         }
         findings
@@ -1583,15 +1570,24 @@ impl Engine<'_> {
         if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Lt) {
             cursor = self.angle_group_end(cursor)? + 1;
         }
-        if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::OpenParen) {
+        if tokens
+            .get(cursor)
+            .is_some_and(|t| t.kind == TokenKind::OpenParen)
+        {
             cursor = self.tokens.matching_end(cursor)? + 1;
         }
         cursor = self.skip_arrow_marker(cursor);
-        if !tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Function) {
+        if !tokens
+            .get(cursor)
+            .is_some_and(|t| t.kind == TokenKind::Function)
+        {
             return None;
         }
         cursor += 1;
-        if !tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::OpenCurly) {
+        if !tokens
+            .get(cursor)
+            .is_some_and(|t| t.kind == TokenKind::OpenCurly)
+        {
             return None;
         }
         let close = self.tokens.matching_end(cursor)?;
@@ -1607,7 +1603,10 @@ impl Engine<'_> {
             Some(TokenKind::Keyword(Keyword::Async)) | Some(TokenKind::Keyword(Keyword::Sync))
         ) {
             cursor += 1;
-            if tokens.get(cursor).is_some_and(|t| t.kind == TokenKind::Star) {
+            if tokens
+                .get(cursor)
+                .is_some_and(|t| t.kind == TokenKind::Star)
+            {
                 cursor += 1;
             }
         }
@@ -1655,20 +1654,21 @@ impl Engine<'_> {
             }
             // The paired formal: a `name:` head joins the named table,
             // any other element takes the next positional slot.
-            let (content_start, formal): (usize, Option<&Formal>) =
-                if tokens[start].kind == TokenKind::Identifier
-                    && tokens.get(start + 1).is_some_and(|t| t.kind == TokenKind::Colon)
-                {
-                    let label = self.strings.intern(self.tokens.lexeme(self.source, start));
-                    (start + 2, formals.named_formal(label))
-                } else {
-                    let formal = formals.positional.get(positional);
-                    positional += 1;
-                    (start, formal)
-                };
+            let (content_start, formal): (usize, Option<&Formal>) = if tokens[start].kind
+                == TokenKind::Identifier
+                && tokens
+                    .get(start + 1)
+                    .is_some_and(|t| t.kind == TokenKind::Colon)
+            {
+                let label = self.strings.intern(self.tokens.lexeme(self.source, start));
+                (start + 2, formals.named_formal(label))
+            } else {
+                let formal = formals.positional.get(positional);
+                positional += 1;
+                (start, formal)
+            };
             if let Some(formal) = formal
-                && let Some(span) =
-                    self.closure_arrow_set_literal(content_start, formal, pool)
+                && let Some(span) = self.closure_arrow_set_literal(content_start, formal, pool)
             {
                 findings.push(span);
             }

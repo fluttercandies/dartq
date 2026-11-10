@@ -72,8 +72,8 @@ fn read_faces(source: &str, needle: &str) -> Vec<(String, Vec<String>)> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::ReadType { span, ty, args } => {
-                let snippet = &source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize];
+                let snippet = &source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize];
                 if snippet != needle {
                     return None;
                 }
@@ -132,7 +132,10 @@ fn raw_object_head_over_top_scrutinee_promotes_to_the_head() {
                   }";
     assert_eq!(
         read_faces(source, "o"),
-        [("Object".to_string(), Vec::new()), ("D".to_string(), Vec::new())],
+        [
+            ("Object".to_string(), Vec::new()),
+            ("D".to_string(), Vec::new())
+        ],
         "{source:?}"
     );
 }
@@ -153,7 +156,10 @@ fn typed_variable_pattern_promotes_the_scrutinee() {
                   }";
     assert_eq!(
         read_faces(source, "x"),
-        [("num".to_string(), Vec::new()), ("int".to_string(), Vec::new())],
+        [
+            ("num".to_string(), Vec::new()),
+            ("int".to_string(), Vec::new())
+        ],
         "{source:?}"
     );
 }
@@ -173,7 +179,10 @@ fn typed_wildcard_operand_promotes_the_scrutinee() {
                   }";
     assert_eq!(
         read_faces(source, "x"),
-        [("num".to_string(), Vec::new()), ("int".to_string(), Vec::new())],
+        [
+            ("num".to_string(), Vec::new()),
+            ("int".to_string(), Vec::new())
+        ],
         "{source:?}"
     );
 }
@@ -193,7 +202,10 @@ fn or_alternation_joins_branch_promotions() {
                   }";
     assert_eq!(
         read_faces(source, "x"),
-        [("Object".to_string(), Vec::new()), ("num".to_string(), Vec::new())],
+        [
+            ("Object".to_string(), Vec::new()),
+            ("num".to_string(), Vec::new())
+        ],
         "{source:?}"
     );
 }

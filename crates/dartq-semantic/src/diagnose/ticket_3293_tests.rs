@@ -133,7 +133,12 @@ fn ticket_3293_named_constructor_reports_through_the_selector() {
         .into_iter()
         .map(|(_, text)| text)
         .collect();
-    assert_eq!(texts, vec!["C.named".to_string()], "{:?}", code_names(&report));
+    assert_eq!(
+        texts,
+        vec!["C.named".to_string()],
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// `hasNonFinalField` climbs the superclass chain: the subclass's const
@@ -167,7 +172,12 @@ fn ticket_3293_unnamed_primary_reports_the_const_keyword() {
         .into_iter()
         .map(|(_, text)| text)
         .collect();
-    assert_eq!(texts, vec!["const".to_string()], "{:?}", code_names(&report));
+    assert_eq!(
+        texts,
+        vec!["const".to_string()],
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// A named primary constructor spans `const` through the constructor name.

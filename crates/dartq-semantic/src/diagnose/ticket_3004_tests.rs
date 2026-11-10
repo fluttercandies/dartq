@@ -186,7 +186,11 @@ fn implicit_super_counts_required_named() {
     let full = format!("{CORE_PRELUDE}{fixture}");
     let report = report_ops(fixture);
     assert_eq!(
-        spans_of(&report, &full, "implicit_super_initializer_missing_arguments"),
+        spans_of(
+            &report,
+            &full,
+            "implicit_super_initializer_missing_arguments"
+        ),
         vec!["D".to_string(), "F".to_string()]
     );
 }
@@ -207,7 +211,11 @@ fn future_or_nullable_argument_stays_silent() {
     let full = format!("{CORE_PRELUDE}{fixture}");
     let report = report_ops(fixture);
     assert_eq!(
-        spans_of(&report, &full, "not_initialized_non_nullable_instance_field"),
+        spans_of(
+            &report,
+            &full,
+            "not_initialized_non_nullable_instance_field"
+        ),
         vec!["b".to_string()],
         "only the non-nullable FutureOr<int> reports"
     );

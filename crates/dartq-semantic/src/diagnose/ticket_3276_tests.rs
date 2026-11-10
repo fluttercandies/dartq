@@ -99,7 +99,10 @@ fn existing_named_field_write_reports_undefined_setter() {
          \x20 r.bar = 3;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_setter"), vec![at(fixture, "bar = 3", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_setter"),
+        vec![at(fixture, "bar = 3", 0)]
+    );
     assert_eq!(
         messages(&report, "undefined_setter"),
         vec!["The setter 'bar' isn't defined for the type '({int bar})'.".to_string()]
@@ -117,12 +120,13 @@ fn annotated_parameter_named_field_write_reports_undefined_setter() {
          \x20 r.foo = 0;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_setter"), vec![at(fixture, "foo = 0", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_setter"),
+        vec![at(fixture, "foo = 0", 0)]
+    );
     assert_eq!(
         messages(&report, "undefined_setter"),
-        vec![
-            "The setter 'foo' isn't defined for the type '({String bar, int foo})'.".to_string()
-        ]
+        vec!["The setter 'foo' isn't defined for the type '({String bar, int foo})'.".to_string()]
     );
 }
 
@@ -135,7 +139,10 @@ fn positional_field_write_reports_undefined_setter() {
          \x20 p.$0 = 3;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_setter"), vec![at(fixture, "$0 = 3", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_setter"),
+        vec![at(fixture, "$0 = 3", 0)]
+    );
     assert_eq!(
         messages(&report, "undefined_setter"),
         vec!["The setter '$0' isn't defined for the type '(int, String)'.".to_string()]
@@ -151,7 +158,10 @@ fn out_of_range_positional_write_reports_the_same_row() {
          \x20 p.$9 = 3;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_setter"), vec![at(fixture, "$9 = 3", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_setter"),
+        vec![at(fixture, "$9 = 3", 0)]
+    );
     assert_eq!(
         messages(&report, "undefined_setter"),
         vec!["The setter '$9' isn't defined for the type '(int, String)'.".to_string()]
@@ -168,7 +178,10 @@ fn missing_field_write_reports_the_same_row() {
          \x20 r.baz = 3;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_setter"), vec![at(fixture, "baz = 3", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_setter"),
+        vec![at(fixture, "baz = 3", 0)]
+    );
     assert_eq!(
         messages(&report, "undefined_setter"),
         vec!["The setter 'baz' isn't defined for the type '({int bar})'.".to_string()]
@@ -195,7 +208,10 @@ fn compound_write_over_existing_field_reports_the_setter_alone() {
          \x20 r.bar += 1;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_setter"), vec![at(fixture, "bar += 1", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_setter"),
+        vec![at(fixture, "bar += 1", 0)]
+    );
     assert_eq!(offsets(&report, "undefined_getter"), Vec::<u32>::new());
 }
 
@@ -212,7 +228,10 @@ fn compound_write_with_extension_setter_only_reports_the_getter() {
          \x20 r.foo += 0;\n\
          }\n";
     let report = report_ops(fixture);
-    assert_eq!(offsets(&report, "undefined_getter"), vec![at(fixture, "foo += 0", 0)]);
+    assert_eq!(
+        offsets(&report, "undefined_getter"),
+        vec![at(fixture, "foo += 0", 0)]
+    );
     assert_eq!(
         messages(&report, "undefined_getter"),
         vec!["The getter 'foo' isn't defined for the type '({int bar})'.".to_string()]

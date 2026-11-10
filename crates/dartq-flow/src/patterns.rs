@@ -625,8 +625,7 @@ impl Interp<'_> {
                         let (matched_arm, unmatched_arm) =
                             self.branch_type_test(var, declared, declared_args, candidate);
                         self.current = matched_arm;
-                        if !self.covers_matched(matched_ty, matched_args, declared, declared_args)
-                        {
+                        if !self.covers_matched(matched_ty, matched_args, declared, declared_args) {
                             self.join_unmatched(unmatched_arm);
                         } else if self.ops.is_invalid_typed(
                             matched_ty,
@@ -693,8 +692,7 @@ impl Interp<'_> {
                         let (matched_arm, unmatched_arm) =
                             self.branch_type_test(var, declared, declared_args, candidate);
                         self.current = matched_arm;
-                        if !self.covers_matched(matched_ty, matched_args, declared, declared_args)
-                        {
+                        if !self.covers_matched(matched_ty, matched_args, declared, declared_args) {
                             self.join_unmatched(unmatched_arm);
                         } else if self.ops.is_invalid_typed(
                             matched_ty,
@@ -968,8 +966,8 @@ impl Interp<'_> {
                 && let Some(slot) = self.pattern_scrutinee_prop()
             {
                 let receiver = self.props[slot as usize].0;
-                let captured = self.prop_target_captured(receiver)
-                    || self.current.prop(slot).captured();
+                let captured =
+                    self.prop_target_captured(receiver) || self.current.prop(slot).captured();
                 if !captured {
                     self.current = self.current.clone().promote_prop_non_null(
                         self.ops,
@@ -1081,8 +1079,14 @@ impl Interp<'_> {
     fn covers_matched(&self, matched: Ty, matched_args: u32, known: Ty, known_args: u32) -> bool {
         let (matched, matched_args) = self.ext_type_erasure(matched, matched_args);
         let (known, known_args) = self.ext_type_erasure(known, known_args);
-        self.ops
-            .is_subtype_typed(matched, matched_args, known, known_args, self.args, self.names)
+        self.ops.is_subtype_typed(
+            matched,
+            matched_args,
+            known,
+            known_args,
+            self.args,
+            self.names,
+        )
     }
 
     /// The name-level `extensionTypeErasure` (type_system.dart:42-63): a
@@ -1345,7 +1349,8 @@ impl Interp<'_> {
     /// answering "no matched type", which fell into the may-fail join and
     /// kept the else branch live.
     fn scrutinee_static_ty(&self) -> Option<(Ty, u32)> {
-        self.frame_scrutinee_ty().or_else(|| self.standalone_scrutinee_ty())
+        self.frame_scrutinee_ty()
+            .or_else(|| self.standalone_scrutinee_ty())
     }
 
     /// The standalone contexts' (if-case, pattern declaration) matched-value

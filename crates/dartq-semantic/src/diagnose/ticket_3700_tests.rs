@@ -50,9 +50,7 @@ fn enum_with_only_implicit_ctor_reports() {
 /// `usedElements.elements` and the declaration stays silent.
 #[test]
 fn enum_with_declared_ctor_is_silent() {
-    let rows = unused_element(
-        "enum _E { e0(0); const _E(this._f); final int _f; }\nmain() {}\n",
-    );
+    let rows = unused_element("enum _E { e0(0); const _E(this._f); final int _f; }\nmain() {}\n");
     assert!(rows.is_empty(), "{rows:?}");
 }
 

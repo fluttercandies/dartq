@@ -123,7 +123,10 @@ fn on_null_reports_clause_error_and_gates_outside_library() {
     let report = report_ops(fixture);
     let rows = disallowed_rows(&report);
     assert_eq!(rows.len(), 1, "clause rows: {:?}", self::rows(&report));
-    assert_eq!(rows[0].1, "'Null' can't be used as a superclass constraint.");
+    assert_eq!(
+        rows[0].1,
+        "'Null' can't be used as a superclass constraint."
+    );
     assert!(
         outside_rows(&report).is_empty(),
         "outside-library must be gated: {:?}",

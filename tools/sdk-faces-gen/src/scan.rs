@@ -478,11 +478,9 @@ fn typedef_rhs_is_function(tail: &str) -> bool {
             b'<' => angle += 1,
             b'>' => angle -= 1,
             b'F' if angle == 0 && rhs[i..].starts_with("Function") => {
-                let bounded_before =
-                    i == 0 || !is_ident_byte(bytes[i - 1]);
+                let bounded_before = i == 0 || !is_ident_byte(bytes[i - 1]);
                 let after = i + "Function".len();
-                let bounded_after =
-                    after >= bytes.len() || !is_ident_byte(bytes[after]);
+                let bounded_after = after >= bytes.len() || !is_ident_byte(bytes[after]);
                 if bounded_before && bounded_after {
                     let mut j = after;
                     while j < bytes.len() && bytes[j].is_ascii_whitespace() {

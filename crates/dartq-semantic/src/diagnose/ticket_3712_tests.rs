@@ -28,8 +28,8 @@
 //! conformance `equalityRhs` family pins the left-operand static type as
 //! the context.
 
-use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The absolute offset of the first `needle` in `fixture` as the rig
 /// analyzes it: `report_ops` prefixes [`CORE_PRELUDE`], so every

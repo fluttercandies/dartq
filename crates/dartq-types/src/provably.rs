@@ -507,8 +507,11 @@ mod tests {
             TypeParamId::from_raw(51),
             TypeParamId::from_raw(52),
         );
-        let fn_ty = |ret: TypeId, params: &[TypeParamId], positional: &[TypeId],
-                     named: &[NamedMember], required: u32| {
+        let fn_ty = |ret: TypeId,
+                     params: &[TypeParamId],
+                     positional: &[TypeId],
+                     named: &[NamedMember],
+                     required: u32| {
             table
                 .intern_function(
                     UninternedFunction {
@@ -522,7 +525,8 @@ mod tests {
                 )
                 .expect("valid signature")
         };
-        let t_of = |p: TypeParamId| table.intern(UninternedType::TypeParameter { parameter: p }, false);
+        let t_of =
+            |p: TypeParamId| table.intern(UninternedType::TypeParameter { parameter: p }, false);
 
         // `<T> T -> T` vs `<U> U -> U`: distinct binder identities, one
         // alpha-equivalence class.
@@ -576,10 +580,7 @@ mod tests {
         assert!(!sys.is_structurally_equal(named_required, named_optional));
         let positional_all_required = fn_ty(int, &[], &[int, int], &[], 2);
         let positional_with_optional = fn_ty(int, &[], &[int, int], &[], 1);
-        assert!(!sys.is_structurally_equal(
-            positional_all_required,
-            positional_with_optional
-        ));
+        assert!(!sys.is_structurally_equal(positional_all_required, positional_with_optional));
         let fn_q = table
             .intern_function(
                 UninternedFunction {

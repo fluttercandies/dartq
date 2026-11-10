@@ -141,16 +141,9 @@ impl Ord for Key {
         }
         match (self, other) {
             (Key::Head(a), Key::Head(b)) => a.cmp(b),
-            (
-                Key::Rest {
-                    head: ah,
-                    tail: at,
-                },
-                Key::Rest {
-                    head: bh,
-                    tail: bt,
-                },
-            ) => ah.cmp(bh).then_with(|| bt.cmp(at)),
+            (Key::Rest { head: ah, tail: at }, Key::Rest { head: bh, tail: bt }) => {
+                ah.cmp(bh).then_with(|| bt.cmp(at))
+            }
             (Key::Tail(a), Key::Tail(b)) => b.cmp(a),
             (Key::MapKey(a), Key::MapKey(b)) => a.cmp(b),
             (Key::RecordIndex(a), Key::RecordIndex(b)) => a.cmp(b),

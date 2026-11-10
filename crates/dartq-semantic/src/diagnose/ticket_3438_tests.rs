@@ -123,7 +123,11 @@ void f(ConstructorClass fallback) {\n\
             .iter()
             .any(|d| d.code.name == "dead_null_aware_expression"),
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -175,6 +179,10 @@ Future<int> f() => Future.value(0);\n";
             .iter()
             .any(|d| d.code.name == "body_might_complete_normally"),
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }

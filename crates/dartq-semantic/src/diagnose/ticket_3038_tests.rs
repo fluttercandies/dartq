@@ -46,8 +46,8 @@ fn unit_report(source: &str) -> FileReport {
         lib,
         core_file,
         &[
-            "Object", "String", "int", "bool", "double", "num", "List", "Map",
-            "Set", "Type", "Function", "Null", "Iterable",
+            "Object", "String", "int", "bool", "double", "num", "List", "Map", "Set", "Type",
+            "Function", "Null", "Iterable",
         ],
     );
     let graph = builder.finish();
@@ -114,8 +114,7 @@ fn type_literal_is_type_fires() {
 /// `isSubtypeOf` gate alone decides — no constant-false row exists).
 #[test]
 fn type_literal_is_class_stays_silent() {
-    let report =
-        unit_report("class C {}\nvoid t() {\n  var c = C;\n  if (c is C) {}\n}\n");
+    let report = unit_report("class C {}\nvoid t() {\n  var c = C;\n  if (c is C) {}\n}\n");
     eprintln!("diags: {:?}", names(&report));
     assert!(
         rows(&report, "unnecessary_type_check").is_empty(),
@@ -127,9 +126,8 @@ fn type_literal_is_class_stays_silent() {
 /// `var c = C<int>; c is Type` — generic type literal.
 #[test]
 fn generic_type_literal_is_type_fires() {
-    let report = unit_report(
-        "class C<T> {}\nvoid t() {\n  var c = C<int>;\n  if (c is Type) {}\n}\n",
-    );
+    let report =
+        unit_report("class C<T> {}\nvoid t() {\n  var c = C<int>;\n  if (c is Type) {}\n}\n");
     eprintln!("diags: {:?}", names(&report));
     assert!(
         !rows(&report, "unnecessary_type_check").is_empty(),

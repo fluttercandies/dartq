@@ -152,8 +152,7 @@ fn top_level_abstract_field_extraneous_gated() {
     const SRC: &str = "abstract int x;\n";
     let off = codes(SRC, latest_features());
     assert!(
-        off.iter()
-            .any(|c| c == "extraneous_modifier"),
+        off.iter().any(|c| c == "extraneous_modifier"),
         "feature off must report extraneous_modifier: {off:?}"
     );
     let on = codes(SRC, augmentations_features());

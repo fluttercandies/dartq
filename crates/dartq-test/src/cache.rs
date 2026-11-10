@@ -677,11 +677,7 @@ impl Cache {
                         // A file the suite reads as data keys on its raw
                         // bytes; everything else on the significant content
                         // a Dart source signs.
-                        hasher.update(if data.contains(&id) {
-                            data_leaf
-                        } else {
-                            code
-                        });
+                        hasher.update(if data.contains(&id) { data_leaf } else { code });
                     }
                 }
                 hasher.update(&(env_names.len() as u64).to_le_bytes());

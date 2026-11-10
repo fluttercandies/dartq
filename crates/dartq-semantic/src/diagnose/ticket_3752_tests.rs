@@ -104,4 +104,3 @@ fn imported_alias_static_getter_miss_names_the_aliased_class() {
         rows(&report)
     );
 }
-

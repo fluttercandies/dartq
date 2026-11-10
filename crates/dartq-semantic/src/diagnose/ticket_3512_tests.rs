@@ -198,7 +198,11 @@ fn no_call_static_call_and_call_getter_still_reject() {
             ),
             (
                 "invalid_assignment",
-                at(&source, "Function b = StaticCall<int>();", "StaticCall<int>()"),
+                at(
+                    &source,
+                    "Function b = StaticCall<int>();",
+                    "StaticCall<int>()"
+                ),
                 "StaticCall<int>()".to_string()
             ),
             (

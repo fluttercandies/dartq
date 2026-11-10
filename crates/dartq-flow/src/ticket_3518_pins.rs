@@ -94,7 +94,10 @@ fn constant_true_guard_keeps_the_later_arm_live() {
 fn constant_false_guard_deads_the_member_body_only() {
     let source = "int h(int i) {\n  switch (i) {\n    case 1 when false:\n      return 0;\n    default:\n      return 1;\n  }\n}";
     let body = source.find("return 0;").unwrap() as u32;
-    let rows: Vec<u32> = dead_ranges(source).into_iter().map(|(off, _)| off).collect();
+    let rows: Vec<u32> = dead_ranges(source)
+        .into_iter()
+        .map(|(off, _)| off)
+        .collect();
     assert_eq!(rows, [body]);
 }
 

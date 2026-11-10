@@ -102,8 +102,7 @@ fn ticket_3173_chain_reaches_case_before_default() {
 /// underlines the arm whole).
 #[test]
 fn ticket_3173_expression_chain_reports_whole_arm() {
-    let source =
-        "Object f(int x) {\n  return switch (x) {\n    int() || 0 => 0,\n    int() => 1,\n    _ => 2,\n  };\n}";
+    let source = "Object f(int x) {\n  return switch (x) {\n    int() || 0 => 0,\n    int() => 1,\n    _ => 2,\n  };\n}";
     let dead = dead_ranges(source);
     // `int() => 1` — pattern start through the body's `1`.
     let start = source.find("int() => 1").unwrap();

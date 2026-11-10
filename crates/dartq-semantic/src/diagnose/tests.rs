@@ -16209,8 +16209,14 @@ fn uninitialized_field_reports_per_generative_constructor() {
             ("not_initialized_non_nullable_instance_field", "C.named"),
             ("implicit_super_initializer_missing_arguments", "D.wild"),
             ("not_initialized_non_nullable_instance_field", "D.wild"),
-            ("implicit_super_initializer_missing_arguments", "D.deprecated"),
-            ("not_initialized_non_nullable_instance_field", "D.deprecated"),
+            (
+                "implicit_super_initializer_missing_arguments",
+                "D.deprecated"
+            ),
+            (
+                "not_initialized_non_nullable_instance_field",
+                "D.deprecated"
+            ),
         ],
         "{:?}",
         anchors(source, &r)
@@ -17569,7 +17575,6 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
 // files out of this ticket's write scope; `#[path]` keeps the module
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3215 pins (F6-A bound-head residual — the `var`-inferred
 // folded-alias `from` whose type-parameter bound is a bare leaf, fixed
 // in `capture.rs`'s `TreeSink::leaf`). Registered here because the
@@ -17577,7 +17582,6 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
 // files out of this ticket's write scope; `#[path]` keeps the module
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3215 pins (F6-A bound-head residual — the `var`-inferred
 // folded-alias `from` whose type-parameter bound is a bare leaf, fixed
 // in `capture.rs`'s `TreeSink::leaf`). Registered here because the
@@ -17585,7 +17589,6 @@ fn recv_walk_depth_cap_degrades_the_formal_schema() {
 // files out of this ticket's write scope; `#[path]` keeps the module
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3215 pins (F6-A bound-head residual — the `var`-inferred
 // folded-alias `from` whose type-parameter bound is a bare leaf, fixed
 // in `capture.rs`'s `TreeSink::leaf`). Registered here because the
@@ -17604,7 +17607,6 @@ mod ticket_3215_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3218 pins (F9-A clause-error drive gate — the outside-library
 // passes 1-4 stand down when a clause-error probe already fired, modeled
 // on `non_subtypable_clause_head` in `overrides.rs`). Registered here
@@ -17613,7 +17615,6 @@ mod ticket_3215_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3218 pins (F9-A clause-error drive gate — the outside-library
 // passes 1-4 stand down when a clause-error probe already fired, modeled
 // on `non_subtypable_clause_head` in `overrides.rs`). Registered here
@@ -17622,7 +17623,6 @@ mod ticket_3215_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3218 pins (F9-A clause-error drive gate — the outside-library
 // passes 1-4 stand down when a clause-error probe already fired, modeled
 // on `non_subtypable_clause_head` in `overrides.rs`). Registered here
@@ -17641,7 +17641,6 @@ mod ticket_3218_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::*` resolves.
 #[cfg(test)]
-
 // The #3219 pins (F9-B pre-feature modifier mask — a declaration in a
 // library predating `class-modifiers` carries no modifier facts, masked in
 // `types.rs`'s `FoldHierarchy::declared`). Registered here because the
@@ -17649,7 +17648,6 @@ mod ticket_3218_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::*` resolves.
 #[cfg(test)]
-
 // The #3219 pins (F9-B pre-feature modifier mask — a declaration in a
 // library predating `class-modifiers` carries no modifier facts, masked in
 // `types.rs`'s `FoldHierarchy::declared`). Registered here because the
@@ -17657,7 +17655,6 @@ mod ticket_3218_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::*` resolves.
 #[cfg(test)]
-
 // The #3219 pins (F9-B pre-feature modifier mask — a declaration in a
 // library predating `class-modifiers` carries no modifier facts, masked in
 // `types.rs`'s `FoldHierarchy::declared`). Registered here because the
@@ -17675,7 +17672,6 @@ mod ticket_3219_tests;
 // scope; `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3224 pins (`consume_send`'s void-operand face tested the invocation's
 // RESULT type instead of the invoked expression's own type — the spurious
 // alias-typed formal discard and the lost `v() + 1` operand). Registered
@@ -17683,7 +17679,6 @@ mod ticket_3219_tests;
 // scope; `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3224 pins (`consume_send`'s void-operand face tested the invocation's
 // RESULT type instead of the invoked expression's own type — the spurious
 // alias-typed formal discard and the lost `v() + 1` operand). Registered
@@ -17691,7 +17686,6 @@ mod ticket_3219_tests;
 // scope; `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3224 pins (`consume_send`'s void-operand face tested the invocation's
 // RESULT type instead of the invoked expression's own type — the spurious
 // alias-typed formal discard and the lost `v() + 1` operand). Registered
@@ -17710,7 +17704,6 @@ mod ticket_3224_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::*` resolves.
 #[cfg(test)]
-
 // The #3227 pins (F9-D same-library `base`/`final` superdeclaration loses its
 // whole modifier plan — local `abstract base class`/`final class` emit zero
 // rows where the imported twin fires, the `basic_restrictions_A04_t04`
@@ -17719,7 +17712,6 @@ mod ticket_3224_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::*` resolves.
 #[cfg(test)]
-
 // The #3227 pins (F9-D same-library `base`/`final` superdeclaration loses its
 // whole modifier plan — local `abstract base class`/`final class` emit zero
 // rows where the imported twin fires, the `basic_restrictions_A04_t04`
@@ -17728,7 +17720,6 @@ mod ticket_3224_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::*` resolves.
 #[cfg(test)]
-
 // The #3227 pins (F9-D same-library `base`/`final` superdeclaration loses its
 // whole modifier plan — local `abstract base class`/`final class` emit zero
 // rows where the imported twin fires, the `basic_restrictions_A04_t04`
@@ -17749,7 +17740,6 @@ mod ticket_3227_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3234 pins (`fold_binary`'s operand locator only accepted
 // `mark_operator`'s `Read`-gated mark, so a `void` invocation used as a
 // non-relation binary operand — `v() + 1` — never reached the void check;
@@ -17759,7 +17749,6 @@ mod ticket_3227_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3234 pins (`fold_binary`'s operand locator only accepted
 // `mark_operator`'s `Read`-gated mark, so a `void` invocation used as a
 // non-relation binary operand — `v() + 1` — never reached the void check;
@@ -17769,7 +17758,6 @@ mod ticket_3227_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3234 pins (`fold_binary`'s operand locator only accepted
 // `mark_operator`'s `Read`-gated mark, so a `void` invocation used as a
 // non-relation binary operand — `v() + 1` — never reached the void check;
@@ -17791,7 +17779,6 @@ mod ticket_3234_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3229 pins (Cluster A of the undefined_* family — a wildcard `_`
 // local-scope declaration binds nothing under `wildcard-variables`, gated
 // across every frame-scope population surface in `scopes_bodies.rs`, with
@@ -17801,7 +17788,6 @@ mod ticket_3234_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3229 pins (Cluster A of the undefined_* family — a wildcard `_`
 // local-scope declaration binds nothing under `wildcard-variables`, gated
 // across every frame-scope population surface in `scopes_bodies.rs`, with
@@ -17811,7 +17797,6 @@ mod ticket_3234_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3229 pins (Cluster A of the undefined_* family — a wildcard `_`
 // local-scope declaration binds nothing under `wildcard-variables`, gated
 // across every frame-scope population surface in `scopes_bodies.rs`, with
@@ -17832,7 +17817,6 @@ mod ticket_3229_tests;
 // live-lane file out of this ticket's write scope; `#[path]` keeps the module
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3235 pins (the never-matches supply gate: `pattern_stack.len() != 1`
 // replaced by `Engine::pattern_matched_ty`, so a `||`/`&&` right operand —
 // its own pattern frame, still matched against the enclosing scrutinee —
@@ -17841,7 +17825,6 @@ mod ticket_3229_tests;
 // live-lane file out of this ticket's write scope; `#[path]` keeps the module
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3235 pins (the never-matches supply gate: `pattern_stack.len() != 1`
 // replaced by `Engine::pattern_matched_ty`, so a `||`/`&&` right operand —
 // its own pattern frame, still matched against the enclosing scrutinee —
@@ -17850,7 +17833,6 @@ mod ticket_3229_tests;
 // live-lane file out of this ticket's write scope; `#[path]` keeps the module
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3235 pins (the never-matches supply gate: `pattern_stack.len() != 1`
 // replaced by `Engine::pattern_matched_ty`, so a `||`/`&&` right operand —
 // its own pattern frame, still matched against the enclosing scrutinee —
@@ -18035,7 +18017,6 @@ mod ticket_3242_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3248 pins (the #3221 recon's invocation faces: the record-argument
 // `additionalInfo` appendix — positional/named arity and unexpected named
 // fields, error_detection_helpers.dart:405-441 — the unindexed `Map`/`List`
@@ -18045,7 +18026,6 @@ mod ticket_3242_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3248 pins (the #3221 recon's invocation faces: the record-argument
 // `additionalInfo` appendix — positional/named arity and unexpected named
 // fields, error_detection_helpers.dart:405-441 — the unindexed `Map`/`List`
@@ -18055,7 +18035,6 @@ mod ticket_3242_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3248 pins (the #3221 recon's invocation faces: the record-argument
 // `additionalInfo` appendix — positional/named arity and unexpected named
 // fields, error_detection_helpers.dart:405-441 — the unindexed `Map`/`List`
@@ -18099,19 +18078,16 @@ mod ticket_3230_tests;
 // `least_upper_bound` join of the arms, which the engine's span-keyed row
 // model stages no fact for).
 #[cfg(test)]
-
 // The #3231 pins (wave-B cluster C: the compound receiver's static type —
 // `(c ? a : b).m` / `(a ?? b).m` resolve against the upstream
 // `least_upper_bound` join of the arms, which the engine's span-keyed row
 // model stages no fact for).
 #[cfg(test)]
-
 // The #3231 pins (wave-B cluster C: the compound receiver's static type —
 // `(c ? a : b).m` / `(a ?? b).m` resolve against the upstream
 // `least_upper_bound` join of the arms, which the engine's span-keyed row
 // model stages no fact for).
 #[cfg(test)]
-
 // The #3231 pins (wave-B cluster C: the compound receiver's static type —
 // `(c ? a : b).m` / `(a ?? b).m` resolve against the upstream
 // `least_upper_bound` join of the arms, which the engine's span-keyed row
@@ -18176,7 +18152,6 @@ mod ticket_3267_tests;
 // this ticket's write scope; `#[path]` keeps the module inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3238 pins (the catch-clause verifier on RESOLVED on-types:
 // `catch_on_ty` carries the written type-argument list so same-head pairs
 // decide covariantly through `resolved_subtype`; the catch-all trigger is
@@ -18187,7 +18162,6 @@ mod ticket_3267_tests;
 // this ticket's write scope; `#[path]` keeps the module inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3238 pins (the catch-clause verifier on RESOLVED on-types:
 // `catch_on_ty` carries the written type-argument list so same-head pairs
 // decide covariantly through `resolved_subtype`; the catch-all trigger is
@@ -18198,7 +18172,6 @@ mod ticket_3267_tests;
 // this ticket's write scope; `#[path]` keeps the module inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3238 pins (the catch-clause verifier on RESOLVED on-types:
 // `catch_on_ty` carries the written type-argument list so same-head pairs
 // decide covariantly through `resolved_subtype`; the catch-all trigger is
@@ -18222,7 +18195,6 @@ mod ticket_3238_tests;
 // this ticket's write scope; `#[path]` keeps the module inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3253 pins (the C2 disallowed-supertype clause gate:
 // `CorrectOverrideHelper.verify()` returns from `_checkDirectSuperTypes`
 // before EVERY member check, so a container whose written `extends` /
@@ -18233,7 +18205,6 @@ mod ticket_3238_tests;
 // this ticket's write scope; `#[path]` keeps the module inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3253 pins (the C2 disallowed-supertype clause gate:
 // `CorrectOverrideHelper.verify()` returns from `_checkDirectSuperTypes`
 // before EVERY member check, so a container whose written `extends` /
@@ -18244,7 +18215,6 @@ mod ticket_3238_tests;
 // this ticket's write scope; `#[path]` keeps the module inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3253 pins (the C2 disallowed-supertype clause gate:
 // `CorrectOverrideHelper.verify()` returns from `_checkDirectSuperTypes`
 // before EVERY member check, so a container whose written `extends` /
@@ -18269,7 +18239,6 @@ mod ticket_3253_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3271 pins (the setter-only implicit-`this` write face:
 // `class C { set only(T v) {} }` + `only = e` resolves no getter, so the row
 // carried no write type and the assignability check stayed silent while the
@@ -18281,7 +18250,6 @@ mod ticket_3253_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3271 pins (the setter-only implicit-`this` write face:
 // `class C { set only(T v) {} }` + `only = e` resolves no getter, so the row
 // carried no write type and the assignability check stayed silent while the
@@ -18293,7 +18261,6 @@ mod ticket_3253_tests;
 // `#[path]` keeps the module inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3271 pins (the setter-only implicit-`this` write face:
 // `class C { set only(T v) {} }` + `only = e` resolves no getter, so the row
 // carried no write type and the assignability check stayed silent while the
@@ -18316,7 +18283,6 @@ mod ticket_3271_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3244 pins (the constructor tear-off's WRITTEN type-argument group at
 // the `unnecessary_type_check` verdict: an instantiated `C<int>.new` is the
 // non-generic `C<int> Function()` and must never be read as the bare
@@ -18325,7 +18291,6 @@ mod ticket_3271_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3244 pins (the constructor tear-off's WRITTEN type-argument group at
 // the `unnecessary_type_check` verdict: an instantiated `C<int>.new` is the
 // non-generic `C<int> Function()` and must never be read as the bare
@@ -18334,7 +18299,6 @@ mod ticket_3271_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3244 pins (the constructor tear-off's WRITTEN type-argument group at
 // the `unnecessary_type_check` verdict: an instantiated `C<int>.new` is the
 // non-generic `C<int> Function()` and must never be read as the bare
@@ -18354,7 +18318,6 @@ mod ticket_3244_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3245 pins (the `unused_local_variable` supply faces that are already
 // green on HEAD: `if-case`/`switch-case` pattern binders, the `&& var`
 // guard composite, and the catch clause's stack-trace parameter staying on
@@ -18363,7 +18326,6 @@ mod ticket_3244_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3245 pins (the `unused_local_variable` supply faces that are already
 // green on HEAD: `if-case`/`switch-case` pattern binders, the `&& var`
 // guard composite, and the catch clause's stack-trace parameter staying on
@@ -18372,7 +18334,6 @@ mod ticket_3244_tests;
 // module inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3245 pins (the `unused_local_variable` supply faces that are already
 // green on HEAD: `if-case`/`switch-case` pattern binders, the `&& var`
 // guard composite, and the catch clause's stack-trace parameter staying on
@@ -18391,7 +18352,6 @@ mod ticket_3245_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3240 pins (the lazy boolean operators' single `use_of_void_result`
 // row for `flag && v()`: the junction arm's `classify_condition` and
 // `fold_binary`'s operand pair reported the same right-operand row twice).
@@ -18399,7 +18359,6 @@ mod ticket_3245_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3240 pins (the lazy boolean operators' single `use_of_void_result`
 // row for `flag && v()`: the junction arm's `classify_condition` and
 // `fold_binary`'s operand pair reported the same right-operand row twice).
@@ -18407,7 +18366,6 @@ mod ticket_3245_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3240 pins (the lazy boolean operators' single `use_of_void_result`
 // row for `flag && v()`: the junction arm's `classify_condition` and
 // `fold_binary`'s operand pair reported the same right-operand row twice).
@@ -18423,19 +18381,16 @@ mod ticket_3240_tests;
 // shape: member name for a read/write, receiver node for a send, bracket
 // pair for an index).
 #[cfg(test)]
-
 // The #3249 pins (the member-read/-write/-send and index `void`-receiver
 // faces plus the record-literal field face — the anchors follow the access
 // shape: member name for a read/write, receiver node for a send, bracket
 // pair for an index).
 #[cfg(test)]
-
 // The #3249 pins (the member-read/-write/-send and index `void`-receiver
 // faces plus the record-literal field face — the anchors follow the access
 // shape: member name for a read/write, receiver node for a send, bracket
 // pair for an index).
 #[cfg(test)]
-
 // The #3249 pins (the member-read/-write/-send and index `void`-receiver
 // faces plus the record-literal field face — the anchors follow the access
 // shape: member name for a read/write, receiver node for a send, bracket
@@ -18448,17 +18403,14 @@ mod ticket_3249_tests;
 // ordering, the formal parameter's default-value assignability and void
 // faces, and the for-part declaration initializer).
 #[cfg(test)]
-
 // The #3251 pins (the constructor field initializer's assignability-first
 // ordering, the formal parameter's default-value assignability and void
 // faces, and the for-part declaration initializer).
 #[cfg(test)]
-
 // The #3251 pins (the constructor field initializer's assignability-first
 // ordering, the formal parameter's default-value assignability and void
 // faces, and the for-part declaration initializer).
 #[cfg(test)]
-
 // The #3251 pins (the constructor field initializer's assignability-first
 // ordering, the formal parameter's default-value assignability and void
 // faces, and the for-part declaration initializer).
@@ -18474,7 +18426,6 @@ mod ticket_3251_tests;
 // file out of this ticket's write scope; `#[path]` keeps the module inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3276 pins (the record receiver's FIELD-write face: records are
 // immutable, so a write to an existing `$n`/named field resolves no setter
 // and reports `undefined_setter` on the record display, while the compound
@@ -18483,7 +18434,6 @@ mod ticket_3251_tests;
 // file out of this ticket's write scope; `#[path]` keeps the module inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3276 pins (the record receiver's FIELD-write face: records are
 // immutable, so a write to an existing `$n`/named field resolves no setter
 // and reports `undefined_setter` on the record display, while the compound
@@ -18492,7 +18442,6 @@ mod ticket_3251_tests;
 // file out of this ticket's write scope; `#[path]` keeps the module inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3276 pins (the record receiver's FIELD-write face: records are
 // immutable, so a write to an existing `$n`/named field resolves no setter
 // and reports `undefined_setter` on the record display, while the compound
@@ -18509,19 +18458,16 @@ mod ticket_3276_tests;
 // collects, so the interface map carries the merged signature, and the
 // merge target's synthesized member when no candidate spells it).
 #[cfg(test)]
-
 // The #3255 pins (the multi-superinterface candidate merge — recon C4:
 // `_getValidOverrides` + `_topMerge` over the candidates a face's climb
 // collects, so the interface map carries the merged signature, and the
 // merge target's synthesized member when no candidate spells it).
 #[cfg(test)]
-
 // The #3255 pins (the multi-superinterface candidate merge — recon C4:
 // `_getValidOverrides` + `_topMerge` over the candidates a face's climb
 // collects, so the interface map carries the merged signature, and the
 // merge target's synthesized member when no candidate spells it).
 #[cfg(test)]
-
 // The #3255 pins (the multi-superinterface candidate merge — recon C4:
 // `_getValidOverrides` + `_topMerge` over the candidates a face's climb
 // collects, so the interface map carries the merged signature, and the
@@ -18537,7 +18483,6 @@ mod ticket_3255_tests;
 // `_checkForUseOfVoidResult(function, function.typeOrThrow)` — while a
 // void-RETURNING function-typed callee stays the legal discard).
 #[cfg(test)]
-
 // The #3250 pins (the void-callee face of a bare invocation send: a
 // `void`-annotated parameter, local or variable invoked bare reports
 // `use_of_void_result` at the callee — upstream
@@ -18545,7 +18490,6 @@ mod ticket_3255_tests;
 // `_checkForUseOfVoidResult(function, function.typeOrThrow)` — while a
 // void-RETURNING function-typed callee stays the legal discard).
 #[cfg(test)]
-
 // The #3250 pins (the void-callee face of a bare invocation send: a
 // `void`-annotated parameter, local or variable invoked bare reports
 // `use_of_void_result` at the callee — upstream
@@ -18553,7 +18497,6 @@ mod ticket_3255_tests;
 // `_checkForUseOfVoidResult(function, function.typeOrThrow)` — while a
 // void-RETURNING function-typed callee stays the legal discard).
 #[cfg(test)]
-
 // The #3250 pins (the void-callee face of a bare invocation send: a
 // `void`-annotated parameter, local or variable invoked bare reports
 // `use_of_void_result` at the callee — upstream
@@ -18573,7 +18516,6 @@ mod ticket_3250_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3237 pins (the `receiver_of_type_never` receiver-read widening:
 // the canonical `Ty::Never` variant `is_never_ty` now covers — a `throw`
 // receiver's row rewrite, an inferred-`Never` `var x = throw`, a
@@ -18583,7 +18525,6 @@ mod ticket_3250_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3237 pins (the `receiver_of_type_never` receiver-read widening:
 // the canonical `Ty::Never` variant `is_never_ty` now covers — a `throw`
 // receiver's row rewrite, an inferred-`Never` `var x = throw`, a
@@ -18593,7 +18534,6 @@ mod ticket_3250_tests;
 // ticket's write scope; `#[path]` keeps the module inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3237 pins (the `receiver_of_type_never` receiver-read widening:
 // the canonical `Ty::Never` variant `is_never_ty` now covers — a `throw`
 // receiver's row rewrite, an inferred-`Never` `var x = throw`, a
@@ -18612,21 +18552,18 @@ mod ticket_3237_tests;
 // renamed signature's own name list must ride the unified spellings or
 // every renamed bound leaf reads as an unresolvable head).
 #[cfg(test)]
-
 // The #3254 pins (the generic-method bound arm of `override_broken`:
 // `relateTypeParameters`' count gate, position unification onto ONE
 // spelling space, and bound equality as a mutual subtype question — the
 // renamed signature's own name list must ride the unified spellings or
 // every renamed bound leaf reads as an unresolvable head).
 #[cfg(test)]
-
 // The #3254 pins (the generic-method bound arm of `override_broken`:
 // `relateTypeParameters`' count gate, position unification onto ONE
 // spelling space, and bound equality as a mutual subtype question — the
 // renamed signature's own name list must ride the unified spellings or
 // every renamed bound leaf reads as an unresolvable head).
 #[cfg(test)]
-
 // The #3254 pins (the generic-method bound arm of `override_broken`:
 // `relateTypeParameters`' count gate, position unification onto ONE
 // spelling space, and bound equality as a mutual subtype question — the
@@ -18644,7 +18581,6 @@ mod ticket_3254_tests;
 // function member, the nullable raw `Function?` head and the ordinary
 // non-function member keep their verdicts).
 #[cfg(test)]
-
 // The #3284 pins (the explicit-receiver member CALLEE face of
 // `unchecked_use_of_nullable_value`: the function variant claims a nullable
 // callee, so a row anchored at a member read whose receiver AND member face
@@ -18653,7 +18589,6 @@ mod ticket_3254_tests;
 // function member, the nullable raw `Function?` head and the ordinary
 // non-function member keep their verdicts).
 #[cfg(test)]
-
 // The #3284 pins (the explicit-receiver member CALLEE face of
 // `unchecked_use_of_nullable_value`: the function variant claims a nullable
 // callee, so a row anchored at a member read whose receiver AND member face
@@ -18662,7 +18597,6 @@ mod ticket_3254_tests;
 // function member, the nullable raw `Function?` head and the ordinary
 // non-function member keep their verdicts).
 #[cfg(test)]
-
 // The #3284 pins (the explicit-receiver member CALLEE face of
 // `unchecked_use_of_nullable_value`: the function variant claims a nullable
 // callee, so a row anchored at a member read whose receiver AND member face
@@ -18682,7 +18616,6 @@ mod ticket_3284_tests;
 // file out of this ticket's write scope; `#[path]` keeps the module inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3241 pins (the `unused_element` used-credit lattice: the shadowed
 // top-level `_` face plus the used-credit joins the #3223 recon mapped onto
 // `finalize_usage` — pattern-field reads, the top-level setter's write
@@ -18691,7 +18624,6 @@ mod ticket_3284_tests;
 // file out of this ticket's write scope; `#[path]` keeps the module inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3241 pins (the `unused_element` used-credit lattice: the shadowed
 // top-level `_` face plus the used-credit joins the #3223 recon mapped onto
 // `finalize_usage` — pattern-field reads, the top-level setter's write
@@ -18700,7 +18632,6 @@ mod ticket_3284_tests;
 // file out of this ticket's write scope; `#[path]` keeps the module inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3241 pins (the `unused_element` used-credit lattice: the shadowed
 // top-level `_` face plus the used-credit joins the #3223 recon mapped onto
 // `finalize_usage` — pattern-field reads, the top-level setter's write
@@ -18722,7 +18653,6 @@ mod ticket_3241_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3274 pins (the context-driven type-argument inference of an instance
 // creation: an omitted `<...>` group takes its parameters from the enclosing
 // expression's context type — declaration initializer, assignment target,
@@ -18733,7 +18663,6 @@ mod ticket_3241_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3274 pins (the context-driven type-argument inference of an instance
 // creation: an omitted `<...>` group takes its parameters from the enclosing
 // expression's context type — declaration initializer, assignment target,
@@ -18744,7 +18673,6 @@ mod ticket_3241_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3274 pins (the context-driven type-argument inference of an instance
 // creation: an omitted `<...>` group takes its parameters from the enclosing
 // expression's context type — declaration initializer, assignment target,
@@ -18767,7 +18695,6 @@ mod ticket_3274_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3270 pins (the `Receiver::Created` write face carries the
 // creation's written type arguments: `Box<B>().slot` writes against `B`,
 // never the container's bare `T` — the same `member_recv_env`
@@ -18777,7 +18704,6 @@ mod ticket_3274_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3270 pins (the `Receiver::Created` write face carries the
 // creation's written type arguments: `Box<B>().slot` writes against `B`,
 // never the container's bare `T` — the same `member_recv_env`
@@ -18787,7 +18713,6 @@ mod ticket_3274_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3270 pins (the `Receiver::Created` write face carries the
 // creation's written type arguments: `Box<B>().slot` writes against `B`,
 // never the container's bare `T` — the same `member_recv_env`
@@ -18807,7 +18732,6 @@ mod ticket_3270_tests;
 // type from). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3256 pins (the field / getter / setter face split — a field rides
 // its implicit getter and, non-final only, its implicit setter, each
 // compared against the super face of the same element kind — plus the
@@ -18815,7 +18739,6 @@ mod ticket_3270_tests;
 // type from). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3256 pins (the field / getter / setter face split — a field rides
 // its implicit getter and, non-final only, its implicit setter, each
 // compared against the super face of the same element kind — plus the
@@ -18823,7 +18746,6 @@ mod ticket_3270_tests;
 // type from). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3256 pins (the field / getter / setter face split — a field rides
 // its implicit getter and, non-final only, its implicit setter, each
 // compared against the super face of the same element kind — plus the
@@ -18841,7 +18763,6 @@ mod ticket_3256_tests;
 // arity-matched shapes). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3257 pins (the arity / named-set / requiredness arm of
 // `override_broken` — the `_isFunctionSubtypeOf` formal walk: positional
 // arity in both directions, the optional-into-required boundary, the named
@@ -18849,7 +18770,6 @@ mod ticket_3256_tests;
 // arity-matched shapes). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3257 pins (the arity / named-set / requiredness arm of
 // `override_broken` — the `_isFunctionSubtypeOf` formal walk: positional
 // arity in both directions, the optional-into-required boundary, the named
@@ -18857,7 +18777,6 @@ mod ticket_3256_tests;
 // arity-matched shapes). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3257 pins (the arity / named-set / requiredness arm of
 // `override_broken` — the `_isFunctionSubtypeOf` formal walk: positional
 // arity in both directions, the optional-into-required boundary, the named
@@ -18875,7 +18794,6 @@ mod ticket_3257_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3290 pins (the two constructor-declaration faces: the
 // `redirect_to_non_const_constructor` target-constness gate, which must
 // read an enum's unnamed constructor as const, and the
@@ -18883,7 +18801,6 @@ mod ticket_3257_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3290 pins (the two constructor-declaration faces: the
 // `redirect_to_non_const_constructor` target-constness gate, which must
 // read an enum's unnamed constructor as const, and the
@@ -18891,7 +18808,6 @@ mod ticket_3257_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3290 pins (the two constructor-declaration faces: the
 // `redirect_to_non_const_constructor` target-constness gate, which must
 // read an enum's unnamed constructor as const, and the
@@ -18909,7 +18825,6 @@ mod ticket_3290_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3288 pins (the `dead_code` emit layer's tail shaping — a `for`
 // header's `)` never rides a dead run, a collection tail carries its
 // closers and the statement terminator — plus the dead-clause containment
@@ -18917,7 +18832,6 @@ mod ticket_3290_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3288 pins (the `dead_code` emit layer's tail shaping — a `for`
 // header's `)` never rides a dead run, a collection tail carries its
 // closers and the statement terminator — plus the dead-clause containment
@@ -18925,7 +18839,6 @@ mod ticket_3290_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3288 pins (the `dead_code` emit layer's tail shaping — a `for`
 // header's `)` never rides a dead run, a collection tail carries its
 // closers and the statement terminator — plus the dead-clause containment
@@ -18943,7 +18856,6 @@ mod ticket_3288_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3287 pins (the callable-class `call` tear-off arm of the
 // `invalid_assignment`/`argument_type_not_assignable` verdict — a generic
 // `call` in a non-generic function context instantiates toward the target
@@ -18951,7 +18863,6 @@ mod ticket_3288_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3287 pins (the callable-class `call` tear-off arm of the
 // `invalid_assignment`/`argument_type_not_assignable` verdict — a generic
 // `call` in a non-generic function context instantiates toward the target
@@ -18959,7 +18870,6 @@ mod ticket_3288_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3287 pins (the callable-class `call` tear-off arm of the
 // `invalid_assignment`/`argument_type_not_assignable` verdict — a generic
 // `call` in a non-generic function context instantiates toward the target
@@ -18978,7 +18888,6 @@ mod ticket_3287_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3282 pins (the `assignment_to_final` / `assignment_to_final_local` /
 // `assignment_to_final_no_setter` emit path: the write's setter lookup
 // misses while the plain spelling resolves a `final` field, an explicit
@@ -18987,7 +18896,6 @@ mod ticket_3287_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3282 pins (the `assignment_to_final` / `assignment_to_final_local` /
 // `assignment_to_final_no_setter` emit path: the write's setter lookup
 // misses while the plain spelling resolves a `final` field, an explicit
@@ -18996,7 +18904,6 @@ mod ticket_3287_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3282 pins (the `assignment_to_final` / `assignment_to_final_local` /
 // `assignment_to_final_no_setter` emit path: the write's setter lookup
 // misses while the plain spelling resolves a `final` field, an explicit
@@ -19017,7 +18924,6 @@ mod ticket_3282_tests;
 // module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3289 pins (the `unused_element` operator-receiver credit: an
 // identifier or literal operand that the resolve layer leaves untyped is
 // classified from the source bytes and the declaration tables — a string
@@ -19027,7 +18933,6 @@ mod ticket_3282_tests;
 // module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3289 pins (the `unused_element` operator-receiver credit: an
 // identifier or literal operand that the resolve layer leaves untyped is
 // classified from the source bytes and the declaration tables — a string
@@ -19037,7 +18942,6 @@ mod ticket_3282_tests;
 // module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3289 pins (the `unused_element` operator-receiver credit: an
 // identifier or literal operand that the resolve layer leaves untyped is
 // classified from the source bytes and the declaration tables — a string
@@ -19058,7 +18962,6 @@ mod ticket_3289_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3279 pins (the `conflicting_static_and_instance` enum arm's probe /
 // target split: an enum constant is a static member, so it is a probe but
 // never a target — `enum E { one, two }` stays silent while a static
@@ -19067,7 +18970,6 @@ mod ticket_3289_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3279 pins (the `conflicting_static_and_instance` enum arm's probe /
 // target split: an enum constant is a static member, so it is a probe but
 // never a target — `enum E { one, two }` stays silent while a static
@@ -19076,7 +18978,6 @@ mod ticket_3289_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3279 pins (the `conflicting_static_and_instance` enum arm's probe /
 // target split: an enum constant is a static member, so it is a probe but
 // never a target — `enum E { one, two }` stays silent while a static
@@ -19097,7 +18998,6 @@ mod ticket_3279_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3292 pins (the constructor-invocation receiver's container face: a
 // `Type`-typed receiver no longer shorts the member walk, and the
 // unindexed `dart:core` containers answer their name-level member KIND —
@@ -19107,7 +19007,6 @@ mod ticket_3279_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3292 pins (the constructor-invocation receiver's container face: a
 // `Type`-typed receiver no longer shorts the member walk, and the
 // unindexed `dart:core` containers answer their name-level member KIND —
@@ -19117,7 +19016,6 @@ mod ticket_3279_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3292 pins (the constructor-invocation receiver's container face: a
 // `Type`-typed receiver no longer shorts the member walk, and the
 // unindexed `dart:core` containers answer their name-level member KIND —
@@ -19140,7 +19038,6 @@ mod ticket_3292_tests;
 // reference). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3295 pins (UNDEF): the `undefined_operator` / `undefined_identifier`
 // shapes the cluster pass re-measured at HEAD — builtin `bool` operator
 // faces, the index read/write spelling split, an extension spelling
@@ -19151,7 +19048,6 @@ mod ticket_3292_tests;
 // reference). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3295 pins (UNDEF): the `undefined_operator` / `undefined_identifier`
 // shapes the cluster pass re-measured at HEAD — builtin `bool` operator
 // faces, the index read/write spelling split, an extension spelling
@@ -19162,7 +19058,6 @@ mod ticket_3292_tests;
 // reference). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3295 pins (UNDEF): the `undefined_operator` / `undefined_identifier`
 // shapes the cluster pass re-measured at HEAD — builtin `bool` operator
 // faces, the index read/write spelling split, an extension spelling
@@ -19185,7 +19080,6 @@ mod ticket_3295_tests;
 // each one. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3294 pins (`type_argument_not_matching_bounds` face census): the
 // reachable verdict arms — written annotation/alias arguments, clause and
 // class-type-alias heads, a bare alias right-hand side, creation and call
@@ -19195,7 +19089,6 @@ mod ticket_3295_tests;
 // each one. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3294 pins (`type_argument_not_matching_bounds` face census): the
 // reachable verdict arms — written annotation/alias arguments, clause and
 // class-type-alias heads, a bare alias right-hand side, creation and call
@@ -19205,7 +19098,6 @@ mod ticket_3295_tests;
 // each one. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3294 pins (`type_argument_not_matching_bounds` face census): the
 // reachable verdict arms — written annotation/alias arguments, clause and
 // class-type-alias heads, a bare alias right-hand side, creation and call
@@ -19226,7 +19118,6 @@ mod ticket_3294_tests;
 // statement). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3297 pins (UNDEF binding tail): the `scopes_bodies` binding faces the
 // #3295 residual clustered — the wildcard type parameter (`<_>` declares
 // nothing under `wildcard-variables`, upstream `TypeParameterScope`) and the
@@ -19235,7 +19126,6 @@ mod ticket_3294_tests;
 // statement). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3297 pins (UNDEF binding tail): the `scopes_bodies` binding faces the
 // #3295 residual clustered — the wildcard type parameter (`<_>` declares
 // nothing under `wildcard-variables`, upstream `TypeParameterScope`) and the
@@ -19244,7 +19134,6 @@ mod ticket_3294_tests;
 // statement). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3297 pins (UNDEF binding tail): the `scopes_bodies` binding faces the
 // #3295 residual clustered — the wildcard type parameter (`<_>` declares
 // nothing under `wildcard-variables`, upstream `TypeParameterScope`) and the
@@ -19256,7 +19145,6 @@ mod ticket_3294_tests;
 #[path = "ticket_3297_tests.rs"]
 mod ticket_3297_tests;
 
-
 // The #3312 pins (callable-class `call` tear-off at an ARGUMENT
 // position): the instance-creation argument materializes the created
 // instance so the shared verdict tears the `call` off — silent where the
@@ -19265,8 +19153,6 @@ mod ticket_3297_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
-
 // The #3312 pins (callable-class `call` tear-off at an ARGUMENT
 // position): the instance-creation argument materializes the created
 // instance so the shared verdict tears the `call` off — silent where the
@@ -19275,8 +19161,6 @@ mod ticket_3297_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
-
 // The #3312 pins (callable-class `call` tear-off at an ARGUMENT
 // position): the instance-creation argument materializes the created
 // instance so the shared verdict tears the `call` off — silent where the
@@ -19285,8 +19169,6 @@ mod ticket_3297_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
-
 // The #3312 pins (callable-class `call` tear-off at an ARGUMENT
 // position): the instance-creation argument materializes the created
 // instance so the shared verdict tears the `call` off — silent where the
@@ -19307,7 +19189,6 @@ mod ticket_3312_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3296 pins (`type_argument_not_matching_bounds`, bare-head face): the
 // head-token `PendingBoundedCheck::Site` enqueue — a group-less named-type
 // head (`void f(G g)`, `G? source`, the super-bounded extension-type head)
@@ -19317,7 +19198,6 @@ mod ticket_3312_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3296 pins (`type_argument_not_matching_bounds`, bare-head face): the
 // head-token `PendingBoundedCheck::Site` enqueue — a group-less named-type
 // head (`void f(G g)`, `G? source`, the super-bounded extension-type head)
@@ -19327,7 +19207,6 @@ mod ticket_3312_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3296 pins (`type_argument_not_matching_bounds`, bare-head face): the
 // head-token `PendingBoundedCheck::Site` enqueue — a group-less named-type
 // head (`void f(G g)`, `G? source`, the super-bounded extension-type head)
@@ -19348,7 +19227,6 @@ mod ticket_3296_tests;
 // re-anchors at the whole binary. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3307 pins (`const_initialized_with_non_constant_value`, LAZY construct
 // faces): the site verdict's anchor mirrors
 // `ConstantVisitor.visitBinaryExpression` / `visitConditionalExpression` — a
@@ -19357,7 +19235,6 @@ mod ticket_3296_tests;
 // re-anchors at the whole binary. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3307 pins (`const_initialized_with_non_constant_value`, LAZY construct
 // faces): the site verdict's anchor mirrors
 // `ConstantVisitor.visitBinaryExpression` / `visitConditionalExpression` — a
@@ -19366,7 +19243,6 @@ mod ticket_3296_tests;
 // re-anchors at the whole binary. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3307 pins (`const_initialized_with_non_constant_value`, LAZY construct
 // faces): the site verdict's anchor mirrors
 // `ConstantVisitor.visitBinaryExpression` / `visitConditionalExpression` — a
@@ -19386,7 +19262,6 @@ mod ticket_3307_tests;
 // its row. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3300 pins (`unchecked_use_of_nullable_value`'s dominant EXTRA
 // cluster): the extension-acceptance rule — an access a nullable-accepting
 // extension resolved (`extension on C?`, the unbounded `on T` of the co19
@@ -19395,7 +19270,6 @@ mod ticket_3307_tests;
 // its row. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3300 pins (`unchecked_use_of_nullable_value`'s dominant EXTRA
 // cluster): the extension-acceptance rule — an access a nullable-accepting
 // extension resolved (`extension on C?`, the unbounded `on T` of the co19
@@ -19404,7 +19278,6 @@ mod ticket_3307_tests;
 // its row. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3300 pins (`unchecked_use_of_nullable_value`'s dominant EXTRA
 // cluster): the extension-acceptance rule — an access a nullable-accepting
 // extension resolved (`extension on C?`, the unbounded `on T` of the co19
@@ -19426,7 +19299,6 @@ mod ticket_3300_tests;
 // turn a suppression into a report. Registered here via `#[path]`; the
 // module stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3313 pins (the `undefined_class` / `undefined_method` /
 // `undefined_getter` cluster): the shared member-resolution substrate every
 // face of the family folds — the container lookup a type-use verdict reads
@@ -19437,7 +19309,6 @@ mod ticket_3300_tests;
 // turn a suppression into a report. Registered here via `#[path]`; the
 // module stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3313 pins (the `undefined_class` / `undefined_method` /
 // `undefined_getter` cluster): the shared member-resolution substrate every
 // face of the family folds — the container lookup a type-use verdict reads
@@ -19448,7 +19319,6 @@ mod ticket_3300_tests;
 // turn a suppression into a report. Registered here via `#[path]`; the
 // module stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3313 pins (the `undefined_class` / `undefined_method` /
 // `undefined_getter` cluster): the shared member-resolution substrate every
 // face of the family folds — the container lookup a type-use verdict reads
@@ -19475,7 +19345,6 @@ mod ticket_3313_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3310 pins (`invalid_null_aware_operator`'s receiver-nullability
 // faces): the frozen verdict is `_checkForUnnecessaryNullAware`'s
 // `isStrictlyNonNullable` gate, so the dominant arms pinned here are the
@@ -19489,7 +19358,6 @@ mod ticket_3313_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3310 pins (`invalid_null_aware_operator`'s receiver-nullability
 // faces): the frozen verdict is `_checkForUnnecessaryNullAware`'s
 // `isStrictlyNonNullable` gate, so the dominant arms pinned here are the
@@ -19503,7 +19371,6 @@ mod ticket_3313_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3310 pins (`invalid_null_aware_operator`'s receiver-nullability
 // faces): the frozen verdict is `_checkForUnnecessaryNullAware`'s
 // `isStrictlyNonNullable` gate, so the dominant arms pinned here are the
@@ -19529,7 +19396,6 @@ mod ticket_3310_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3306 pins (`return_of_invalid_type` emit side): the expression
 // body's `void` exemption (`verifyExpressionFunctionBody` flattens the
 // declared return before it decides — `Future<void> f() async => e;` is
@@ -19539,7 +19405,6 @@ mod ticket_3310_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3306 pins (`return_of_invalid_type` emit side): the expression
 // body's `void` exemption (`verifyExpressionFunctionBody` flattens the
 // declared return before it decides — `Future<void> f() async => e;` is
@@ -19549,7 +19414,6 @@ mod ticket_3310_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3306 pins (`return_of_invalid_type` emit side): the expression
 // body's `void` exemption (`verifyExpressionFunctionBody` flattens the
 // declared return before it decides — `Future<void> f() async => e;` is
@@ -19572,7 +19436,6 @@ mod ticket_3306_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3293 pins (the `const_constructor_with_non_final_field` declaration
 // face): a const generative constructor over a class whose field set (own,
 // superclass chain, mixins) holds a non-final instance field reports at the
@@ -19583,7 +19446,6 @@ mod ticket_3306_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3293 pins (the `const_constructor_with_non_final_field` declaration
 // face): a const generative constructor over a class whose field set (own,
 // superclass chain, mixins) holds a non-final instance field reports at the
@@ -19594,7 +19456,6 @@ mod ticket_3306_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3293 pins (the `const_constructor_with_non_final_field` declaration
 // face): a const generative constructor over a class whose field set (own,
 // superclass chain, mixins) holds a non-final instance field reports at the
@@ -19615,7 +19476,6 @@ mod ticket_3293_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3316 pins (`use_of_void_result`'s value-consumption faces): the
 // row-level consumers that never asked the void question — property/index
 // targets, invocation arguments, collection elements, conditions, `throw`,
@@ -19623,7 +19483,6 @@ mod ticket_3293_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3316 pins (`use_of_void_result`'s value-consumption faces): the
 // row-level consumers that never asked the void question — property/index
 // targets, invocation arguments, collection elements, conditions, `throw`,
@@ -19631,7 +19490,6 @@ mod ticket_3293_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3316 pins (`use_of_void_result`'s value-consumption faces): the
 // row-level consumers that never asked the void question — property/index
 // targets, invocation arguments, collection elements, conditions, `throw`,
@@ -19650,7 +19508,6 @@ mod ticket_3316_tests;
 // rows. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3318 pins (`unused_import`'s site contract on the scopes side): one
 // import site per written directive — a non-string URI head (`import 5;`,
 // an unquoted experimental URI) keeps a text-empty, zero-length site at the
@@ -19659,7 +19516,6 @@ mod ticket_3316_tests;
 // rows. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3318 pins (`unused_import`'s site contract on the scopes side): one
 // import site per written directive — a non-string URI head (`import 5;`,
 // an unquoted experimental URI) keeps a text-empty, zero-length site at the
@@ -19668,7 +19524,6 @@ mod ticket_3316_tests;
 // rows. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3318 pins (`unused_import`'s site contract on the scopes side): one
 // import site per written directive — a non-string URI head (`import 5;`,
 // an unquoted experimental URI) keeps a text-empty, zero-length site at the
@@ -19690,7 +19545,6 @@ mod ticket_3318_tests;
 // row. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3304 pins (the switch-closure half of
 // `body_might_complete_normally`): the resolved face's
 // `isAlwaysExhaustive` declaration arm — `bool`/enum/sealed by element
@@ -19701,7 +19555,6 @@ mod ticket_3318_tests;
 // row. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3304 pins (the switch-closure half of
 // `body_might_complete_normally`): the resolved face's
 // `isAlwaysExhaustive` declaration arm — `bool`/enum/sealed by element
@@ -19712,7 +19565,6 @@ mod ticket_3318_tests;
 // row. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3304 pins (the switch-closure half of
 // `body_might_complete_normally`): the resolved face's
 // `isAlwaysExhaustive` declaration arm — `bool`/enum/sealed by element
@@ -19733,7 +19585,6 @@ mod ticket_3304_tests;
 // into each other. Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3305 pins (the `duplicate_definition` scope matrix): the unit,
 // member, formal-parameter and type-parameter scopes the conformance entry
 // measures, pinned on the shapes the fold already answers 1:1 with the
@@ -19741,7 +19592,6 @@ mod ticket_3304_tests;
 // into each other. Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3305 pins (the `duplicate_definition` scope matrix): the unit,
 // member, formal-parameter and type-parameter scopes the conformance entry
 // measures, pinned on the shapes the fold already answers 1:1 with the
@@ -19749,7 +19599,6 @@ mod ticket_3304_tests;
 // into each other. Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3305 pins (the `duplicate_definition` scope matrix): the unit,
 // member, formal-parameter and type-parameter scopes the conformance entry
 // measures, pinned on the shapes the fold already answers 1:1 with the
@@ -19768,7 +19617,6 @@ mod ticket_3305_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3302 pins (the assignment-pattern declaring binder face of the
 // `unused_local_variable` cluster): a `var`/`final`/typed variable pattern
 // inside a pattern assignment reports the local it mints even though the
@@ -19777,7 +19625,6 @@ mod ticket_3305_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3302 pins (the assignment-pattern declaring binder face of the
 // `unused_local_variable` cluster): a `var`/`final`/typed variable pattern
 // inside a pattern assignment reports the local it mints even though the
@@ -19786,7 +19633,6 @@ mod ticket_3305_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3302 pins (the assignment-pattern declaring binder face of the
 // `unused_local_variable` cluster): a `var`/`final`/typed variable pattern
 // inside a pattern assignment reports the local it mints even though the
@@ -19808,7 +19654,6 @@ mod ticket_3302_tests;
 // itself. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3301 pins (the `invalid_override` cluster's dominant root): the
 // instance-member inference read a super face through the declaring hop
 // instead of the edge-instantiated one, so an implicit slot widened to the
@@ -19819,7 +19664,6 @@ mod ticket_3302_tests;
 // itself. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3301 pins (the `invalid_override` cluster's dominant root): the
 // instance-member inference read a super face through the declaring hop
 // instead of the edge-instantiated one, so an implicit slot widened to the
@@ -19830,7 +19674,6 @@ mod ticket_3302_tests;
 // itself. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3301 pins (the `invalid_override` cluster's dominant root): the
 // instance-member inference read a super face through the declaring hop
 // instead of the edge-instantiated one, so an implicit slot widened to the
@@ -19851,7 +19694,6 @@ mod ticket_3301_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3319 pins (`invalid_use_of_type_outside_library`'s residual faces
 // after #3161's matrix): the `base mixin` message variant, the sealed pass
 // on the `implements` and `on` entries, and the cross-library plain-class
@@ -19859,7 +19701,6 @@ mod ticket_3301_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3319 pins (`invalid_use_of_type_outside_library`'s residual faces
 // after #3161's matrix): the `base mixin` message variant, the sealed pass
 // on the `implements` and `on` entries, and the cross-library plain-class
@@ -19867,7 +19708,6 @@ mod ticket_3301_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3319 pins (`invalid_use_of_type_outside_library`'s residual faces
 // after #3161's matrix): the `base mixin` message variant, the sealed pass
 // on the `implements` and `on` entries, and the cross-library plain-class
@@ -19887,7 +19727,6 @@ mod ticket_3319_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3320 pins (the receiver-type amplifier behind the extra
 // `undefined_method` / `undefined_getter` rows on `... the type
 // 'Function'`): the callee-return materialization is NOT the site — the
@@ -19897,7 +19736,6 @@ mod ticket_3319_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3320 pins (the receiver-type amplifier behind the extra
 // `undefined_method` / `undefined_getter` rows on `... the type
 // 'Function'`): the callee-return materialization is NOT the site — the
@@ -19907,7 +19745,6 @@ mod ticket_3319_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3320 pins (the receiver-type amplifier behind the extra
 // `undefined_method` / `undefined_getter` rows on `... the type
 // 'Function'`): the callee-return materialization is NOT the site — the
@@ -19931,7 +19768,6 @@ mod ticket_3320_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3314 pins (the pattern over-bind residual #3297 left): an if-case /
 // switch-case binder is bound to its case scope alone, so a read in the
 // `else` branch, in a later sibling arm, or after the statement reports
@@ -19943,7 +19779,6 @@ mod ticket_3320_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3314 pins (the pattern over-bind residual #3297 left): an if-case /
 // switch-case binder is bound to its case scope alone, so a read in the
 // `else` branch, in a later sibling arm, or after the statement reports
@@ -19955,7 +19790,6 @@ mod ticket_3320_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3314 pins (the pattern over-bind residual #3297 left): an if-case /
 // switch-case binder is bound to its case scope alone, so a read in the
 // `else` branch, in a later sibling arm, or after the statement reports
@@ -19978,7 +19812,6 @@ mod ticket_3314_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3321 pins (`deprecated_member_use` on the ENGINE graph posture): the
 // tag arm accepted only a namespace MISS, so the face was silent wherever
 // the graph carries a `dart:core` node and the implicit import edge — which
@@ -19987,7 +19820,6 @@ mod ticket_3314_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3321 pins (`deprecated_member_use` on the ENGINE graph posture): the
 // tag arm accepted only a namespace MISS, so the face was silent wherever
 // the graph carries a `dart:core` node and the implicit import edge — which
@@ -19996,7 +19828,6 @@ mod ticket_3314_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3321 pins (`deprecated_member_use` on the ENGINE graph posture): the
 // tag arm accepted only a namespace MISS, so the face was silent wherever
 // the graph carries a `dart:core` node and the implicit import edge — which
@@ -20017,7 +19848,6 @@ mod ticket_3321_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3323 pins (`not_initialized_non_nullable_variable` /
 // `const_not_initialized`): the declaration gates the flush owns — the
 // top-level `abstract`/`external` head exemption read off the token stream,
@@ -20027,7 +19857,6 @@ mod ticket_3321_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3323 pins (`not_initialized_non_nullable_variable` /
 // `const_not_initialized`): the declaration gates the flush owns — the
 // top-level `abstract`/`external` head exemption read off the token stream,
@@ -20037,7 +19866,6 @@ mod ticket_3321_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3323 pins (`not_initialized_non_nullable_variable` /
 // `const_not_initialized`): the declaration gates the flush owns — the
 // top-level `abstract`/`external` head exemption read off the token stream,
@@ -20060,7 +19888,6 @@ mod ticket_3323_tests;
 // kinds. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3327 pins (`invalid_null_aware_operator` at the `?` COLLECTION
 // sites): the spread / element / map-entry gates now read the operand's
 // composite static type (`Engine::operand_static_ty`) instead of the row's
@@ -20071,7 +19898,6 @@ mod ticket_3323_tests;
 // kinds. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3327 pins (`invalid_null_aware_operator` at the `?` COLLECTION
 // sites): the spread / element / map-entry gates now read the operand's
 // composite static type (`Engine::operand_static_ty`) instead of the row's
@@ -20082,7 +19908,6 @@ mod ticket_3323_tests;
 // kinds. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3327 pins (`invalid_null_aware_operator` at the `?` COLLECTION
 // sites): the spread / element / map-entry gates now read the operand's
 // composite static type (`Engine::operand_static_ty`) instead of the row's
@@ -20105,7 +19930,6 @@ mod ticket_3327_tests;
 // twin. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3328 pins (the two `isAlwaysExhaustive` arms #3304 left unmodelled
 // on the resolved face): a type parameter closes through its DECLARED bound
 // (type_system.dart:873-879) and a record through every field (:880-887).
@@ -20115,7 +19939,6 @@ mod ticket_3327_tests;
 // twin. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3328 pins (the two `isAlwaysExhaustive` arms #3304 left unmodelled
 // on the resolved face): a type parameter closes through its DECLARED bound
 // (type_system.dart:873-879) and a record through every field (:880-887).
@@ -20125,7 +19948,6 @@ mod ticket_3327_tests;
 // twin. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3328 pins (the two `isAlwaysExhaustive` arms #3304 left unmodelled
 // on the resolved face): a type parameter closes through its DECLARED bound
 // (type_system.dart:873-879) and a record through every field (:880-887).
@@ -20151,7 +19973,6 @@ mod ticket_3328_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3324 pins (`isStrictlyNonNullable`'s missing `FutureOr` /
 // extension-type arms): the model-level helper
 // `FileElements::is_strictly_non_nullable` decides the union arm through
@@ -20165,7 +19986,6 @@ mod ticket_3328_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3324 pins (`isStrictlyNonNullable`'s missing `FutureOr` /
 // extension-type arms): the model-level helper
 // `FileElements::is_strictly_non_nullable` decides the union arm through
@@ -20179,7 +19999,6 @@ mod ticket_3328_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3324 pins (`isStrictlyNonNullable`'s missing `FutureOr` /
 // extension-type arms): the model-level helper
 // `FileElements::is_strictly_non_nullable` decides the union arm through
@@ -20206,7 +20025,6 @@ mod ticket_3324_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3325 pins (three `overrides.rs` residuals): a supertype clause
 // written through an import prefix now resolves through the prefix's table
 // (`implements p.Base` reports the outside-library row on the whole written
@@ -20217,7 +20035,6 @@ mod ticket_3324_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3325 pins (three `overrides.rs` residuals): a supertype clause
 // written through an import prefix now resolves through the prefix's table
 // (`implements p.Base` reports the outside-library row on the whole written
@@ -20228,7 +20045,6 @@ mod ticket_3324_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3325 pins (three `overrides.rs` residuals): a supertype clause
 // written through an import prefix now resolves through the prefix's table
 // (`implements p.Base` reports the outside-library row on the whole written
@@ -20254,7 +20070,6 @@ mod ticket_3325_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3326 pins (the unused_declaration cluster's annotation gate): the
 // `finalize_usage` spare narrows from "any annotation" to the two gates
 // upstream actually honours — `@pragma('vm:entry-point')` on the
@@ -20267,7 +20082,6 @@ mod ticket_3325_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3326 pins (the unused_declaration cluster's annotation gate): the
 // `finalize_usage` spare narrows from "any annotation" to the two gates
 // upstream actually honours — `@pragma('vm:entry-point')` on the
@@ -20280,7 +20094,6 @@ mod ticket_3325_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3326 pins (the unused_declaration cluster's annotation gate): the
 // `finalize_usage` spare narrows from "any annotation" to the two gates
 // upstream actually honours — `@pragma('vm:entry-point')` on the
@@ -20308,7 +20121,6 @@ mod ticket_3326_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3339 pins (the subtype-verdict layer behind the
 // `argument_type_not_assignable` shape families): the audit routed the
 // family's verdict to `assignability`/`engine_core` (live lanes #3312/#3316)
@@ -20321,7 +20133,6 @@ mod ticket_3326_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3339 pins (the subtype-verdict layer behind the
 // `argument_type_not_assignable` shape families): the audit routed the
 // family's verdict to `assignability`/`engine_core` (live lanes #3312/#3316)
@@ -20334,7 +20145,6 @@ mod ticket_3326_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3339 pins (the subtype-verdict layer behind the
 // `argument_type_not_assignable` shape families): the audit routed the
 // family's verdict to `assignability`/`engine_core` (live lanes #3312/#3316)
@@ -20359,7 +20169,6 @@ mod ticket_3339_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3342 pins (the `unused_import` face): the corpus audit split the
 // family into the credit arms that are green today (a referenced import, a
 // wholly unreferenced one, a `p.Name`-credited prefixed edge) and the
@@ -20369,7 +20178,6 @@ mod ticket_3339_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3342 pins (the `unused_import` face): the corpus audit split the
 // family into the credit arms that are green today (a referenced import, a
 // wholly unreferenced one, a `p.Name`-credited prefixed edge) and the
@@ -20379,7 +20187,6 @@ mod ticket_3339_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3342 pins (the `unused_import` face): the corpus audit split the
 // family into the credit arms that are green today (a referenced import, a
 // wholly unreferenced one, a `p.Name`-credited prefixed edge) and the
@@ -20400,7 +20207,6 @@ mod ticket_3342_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3340 pins (the `final`-declaration initialization faces meet
 // augmentation): the flush runs once per declaration, so an `augment`
 // constructor must report at the introductory element's head only and an
@@ -20409,7 +20215,6 @@ mod ticket_3342_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3340 pins (the `final`-declaration initialization faces meet
 // augmentation): the flush runs once per declaration, so an `augment`
 // constructor must report at the introductory element's head only and an
@@ -20418,7 +20223,6 @@ mod ticket_3342_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3340 pins (the `final`-declaration initialization faces meet
 // augmentation): the flush runs once per declaration, so an `augment`
 // constructor must report at the introductory element's head only and an
@@ -20438,7 +20242,6 @@ mod ticket_3340_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3349 pins (the four `use_of_void_result` residuals #3316 left open):
 // one row per consumed operand (the `&&`/`||` condition faces beside
 // `fold_binary`, `??`'s `end_if_null` beside that same fold), the for-in
@@ -20447,7 +20250,6 @@ mod ticket_3340_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3349 pins (the four `use_of_void_result` residuals #3316 left open):
 // one row per consumed operand (the `&&`/`||` condition faces beside
 // `fold_binary`, `??`'s `end_if_null` beside that same fold), the for-in
@@ -20456,7 +20258,6 @@ mod ticket_3340_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3349 pins (the four `use_of_void_result` residuals #3316 left open):
 // one row per consumed operand (the `&&`/`||` condition faces beside
 // `fold_binary`, `??`'s `end_if_null` beside that same fold), the for-in
@@ -20477,7 +20278,6 @@ mod ticket_3349_tests;
 // exemptions. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3357 pins (the access-annotation family and the
 // `type_annotation_deferred_class` arm): the `@protected` /
 // `@visibleForTesting` / `@visibleForOverriding` legs of the oracle's
@@ -20487,7 +20287,6 @@ mod ticket_3349_tests;
 // exemptions. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3357 pins (the access-annotation family and the
 // `type_annotation_deferred_class` arm): the `@protected` /
 // `@visibleForTesting` / `@visibleForOverriding` legs of the oracle's
@@ -20497,7 +20296,6 @@ mod ticket_3349_tests;
 // exemptions. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3357 pins (the access-annotation family and the
 // `type_annotation_deferred_class` arm): the `@protected` /
 // `@visibleForTesting` / `@visibleForOverriding` legs of the oracle's
@@ -20518,7 +20316,6 @@ mod ticket_3357_tests;
 // declaration's parameter. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3336 pins (a generic top-level function's and a type alias's own
 // `<T extends E>` group reaches the resolved bound ledger): the collector
 // used to take the buffered bound list at the depth-1 close and drop it, so
@@ -20527,7 +20324,6 @@ mod ticket_3357_tests;
 // declaration's parameter. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3336 pins (a generic top-level function's and a type alias's own
 // `<T extends E>` group reaches the resolved bound ledger): the collector
 // used to take the buffered bound list at the depth-1 close and drop it, so
@@ -20536,7 +20332,6 @@ mod ticket_3357_tests;
 // declaration's parameter. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3336 pins (a generic top-level function's and a type alias's own
 // `<T extends E>` group reaches the resolved bound ledger): the collector
 // used to take the buffered bound list at the depth-1 close and drop it, so
@@ -20555,7 +20350,6 @@ mod ticket_3336_tests;
 // non-identifier name slot. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3330 pins (the collector sites behind the #3301/#3305 residuals): the
 // field `covariant` bit its induced setter carries, the merged-element member
 // scope an `augment` block claims into, a primary-constructor declaring
@@ -20563,7 +20357,6 @@ mod ticket_3336_tests;
 // non-identifier name slot. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3330 pins (the collector sites behind the #3301/#3305 residuals): the
 // field `covariant` bit its induced setter carries, the merged-element member
 // scope an `augment` block claims into, a primary-constructor declaring
@@ -20571,7 +20364,6 @@ mod ticket_3336_tests;
 // non-identifier name slot. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3330 pins (the collector sites behind the #3301/#3305 residuals): the
 // field `covariant` bit its induced setter carries, the merged-element member
 // scope an `augment` block claims into, a primary-constructor declaring
@@ -20591,7 +20383,6 @@ mod ticket_3330_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3361 pins (the written `void` type argument of a collection
 // literal's `<…>` group): the keyword fires no type-use row (the parser
 // routes it through `handle_void_keyword`), so the list/set/map literal
@@ -20601,7 +20392,6 @@ mod ticket_3330_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3361 pins (the written `void` type argument of a collection
 // literal's `<…>` group): the keyword fires no type-use row (the parser
 // routes it through `handle_void_keyword`), so the list/set/map literal
@@ -20611,7 +20401,6 @@ mod ticket_3330_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3361 pins (the written `void` type argument of a collection
 // literal's `<…>` group): the keyword fires no type-use row (the parser
 // routes it through `handle_void_keyword`), so the list/set/map literal
@@ -20632,7 +20421,6 @@ mod ticket_3361_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3331 pins (`no_combined_super_signature`, the #3301 residual C): the
 // registry row plus the emit face — a METHOD with an implicit type slot over
 // a multi-candidate set with no combined signature reports at the method
@@ -20641,7 +20429,6 @@ mod ticket_3361_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3331 pins (`no_combined_super_signature`, the #3301 residual C): the
 // registry row plus the emit face — a METHOD with an implicit type slot over
 // a multi-candidate set with no combined signature reports at the method
@@ -20650,7 +20437,6 @@ mod ticket_3361_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3331 pins (`no_combined_super_signature`, the #3301 residual C): the
 // registry row plus the emit face — a METHOD with an implicit type slot over
 // a multi-candidate set with no combined signature reports at the method
@@ -20671,7 +20457,6 @@ mod ticket_3331_tests;
 // machinery. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3343 pins (the const-eval residual faces #3307 routed here): the
 // for-element collection-literal rows (`const_eval_for_element` at the for
 // element + the site default at the literal), the const dot-shorthand
@@ -20681,7 +20466,6 @@ mod ticket_3331_tests;
 // machinery. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3343 pins (the const-eval residual faces #3307 routed here): the
 // for-element collection-literal rows (`const_eval_for_element` at the for
 // element + the site default at the literal), the const dot-shorthand
@@ -20691,7 +20475,6 @@ mod ticket_3331_tests;
 // machinery. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3343 pins (the const-eval residual faces #3307 routed here): the
 // for-element collection-literal rows (`const_eval_for_element` at the for
 // element + the site default at the literal), the const dot-shorthand
@@ -20713,7 +20496,6 @@ mod ticket_3343_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3345 pins (the invalid_override residual cohort): the per-face
 // `interface.map` selection over the transitive hits (the superclass /
 // `with`-own-replace / inherited-merge / implements-append assembly), the
@@ -20723,7 +20505,6 @@ mod ticket_3343_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3345 pins (the invalid_override residual cohort): the per-face
 // `interface.map` selection over the transitive hits (the superclass /
 // `with`-own-replace / inherited-merge / implements-append assembly), the
@@ -20733,7 +20514,6 @@ mod ticket_3343_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3345 pins (the invalid_override residual cohort): the per-face
 // `interface.map` selection over the transitive hits (the superclass /
 // `with`-own-replace / inherited-merge / implements-append assembly), the
@@ -20753,7 +20533,6 @@ mod ticket_3345_tests;
 // `num x` draws). Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3269 pins (the #3252 covariant-field residual): the group latch's
 // reset between field groups, the `covariant` bit's persist/restore round
 // trip, and the induced-setter verdict on the plain concrete-field shape
@@ -20761,7 +20540,6 @@ mod ticket_3345_tests;
 // `num x` draws). Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3269 pins (the #3252 covariant-field residual): the group latch's
 // reset between field groups, the `covariant` bit's persist/restore round
 // trip, and the induced-setter verdict on the plain concrete-field shape
@@ -20769,7 +20547,6 @@ mod ticket_3345_tests;
 // `num x` draws). Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3269 pins (the #3252 covariant-field residual): the group latch's
 // reset between field groups, the `covariant` bit's persist/restore round
 // trip, and the induced-setter verdict on the plain concrete-field shape
@@ -20787,7 +20564,6 @@ mod ticket_3269_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3356 pins (the `unnecessary_type_check` /
 // `unnecessary_null_comparison` operand-static-type faces): the untyped-row
 // arm (`untyped_operand_ty`) reaching the is-check and `== null` walks, the
@@ -20795,7 +20571,6 @@ mod ticket_3269_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3356 pins (the `unnecessary_type_check` /
 // `unnecessary_null_comparison` operand-static-type faces): the untyped-row
 // arm (`untyped_operand_ty`) reaching the is-check and `== null` walks, the
@@ -20803,7 +20578,6 @@ mod ticket_3269_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3356 pins (the `unnecessary_type_check` /
 // `unnecessary_null_comparison` operand-static-type faces): the untyped-row
 // arm (`untyped_operand_ty`) reaching the is-check and `== null` walks, the
@@ -20821,7 +20595,6 @@ mod ticket_3356_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3341 pins (the `type_alias_cannot_reference_itself` residual): the
 // syntactic self-reference walk (direct right-hand reference, co-alias
 // pair, class-bound descent, the non-recursive negative) and the fold's
@@ -20829,7 +20602,6 @@ mod ticket_3356_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3341 pins (the `type_alias_cannot_reference_itself` residual): the
 // syntactic self-reference walk (direct right-hand reference, co-alias
 // pair, class-bound descent, the non-recursive negative) and the fold's
@@ -20837,7 +20609,6 @@ mod ticket_3356_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3341 pins (the `type_alias_cannot_reference_itself` residual): the
 // syntactic self-reference walk (direct right-hand reference, co-alias
 // pair, class-bound descent, the non-recursive negative) and the fold's
@@ -20858,7 +20629,6 @@ mod ticket_3341_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3355 pins (the `missing_required_argument` coverage walk + the
 // `use_of_void_result` residual faces absorbed from #3350): the six
 // invocation emit sites' required-named coverage (`required` named formal
@@ -20869,7 +20639,6 @@ mod ticket_3341_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3355 pins (the `missing_required_argument` coverage walk + the
 // `use_of_void_result` residual faces absorbed from #3350): the six
 // invocation emit sites' required-named coverage (`required` named formal
@@ -20880,7 +20649,6 @@ mod ticket_3341_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3355 pins (the `missing_required_argument` coverage walk + the
 // `use_of_void_result` residual faces absorbed from #3350): the six
 // invocation emit sites' required-named coverage (`required` named formal
@@ -20902,7 +20670,6 @@ mod ticket_3355_tests;
 // `call` face. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3368 pins (the `invalid_assignment`/`argument_type_not_assignable`
 // foreign-alias residual): the folded-pair function-shape read inside
 // `Engine::assignable` (a foreign function-RHS typedef unfolds through
@@ -20911,7 +20678,6 @@ mod ticket_3355_tests;
 // `call` face. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3368 pins (the `invalid_assignment`/`argument_type_not_assignable`
 // foreign-alias residual): the folded-pair function-shape read inside
 // `Engine::assignable` (a foreign function-RHS typedef unfolds through
@@ -20920,7 +20686,6 @@ mod ticket_3355_tests;
 // `call` face. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3368 pins (the `invalid_assignment`/`argument_type_not_assignable`
 // foreign-alias residual): the folded-pair function-shape read inside
 // `Engine::assignable` (a foreign function-RHS typedef unfolds through
@@ -20939,7 +20704,6 @@ mod ticket_3368_tests;
 // negative. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3369 pins (the extension override's receiver anchors): the `void`
 // receiver's `use_of_void_result` at the whole receiver expression (`f()`
 // for `E(f()).g`, `c.bad` for a member read, the plain identifier's own
@@ -20947,7 +20711,6 @@ mod ticket_3368_tests;
 // negative. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3369 pins (the extension override's receiver anchors): the `void`
 // receiver's `use_of_void_result` at the whole receiver expression (`f()`
 // for `E(f()).g`, `c.bad` for a member read, the plain identifier's own
@@ -20955,7 +20718,6 @@ mod ticket_3368_tests;
 // negative. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3369 pins (the extension override's receiver anchors): the `void`
 // receiver's `use_of_void_result` at the whole receiver expression (`f()`
 // for `E(f()).g`, `c.bad` for a member read, the plain identifier's own
@@ -20976,7 +20738,6 @@ mod ticket_3369_tests;
 // declarations). Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3370 pins (the `undefined_*` residuals the recon cluster map routes
 // to `diagnose/augmentations.rs` and `diagnose/pattern_scope.rs`): two
 // green guards lock the pattern-scope state a C10 fix must preserve (an
@@ -20987,7 +20748,6 @@ mod ticket_3369_tests;
 // declarations). Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3370 pins (the `undefined_*` residuals the recon cluster map routes
 // to `diagnose/augmentations.rs` and `diagnose/pattern_scope.rs`): two
 // green guards lock the pattern-scope state a C10 fix must preserve (an
@@ -20998,7 +20758,6 @@ mod ticket_3369_tests;
 // declarations). Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3370 pins (the `undefined_*` residuals the recon cluster map routes
 // to `diagnose/augmentations.rs` and `diagnose/pattern_scope.rs`): two
 // green guards lock the pattern-scope state a C10 fix must preserve (an
@@ -21024,7 +20783,6 @@ mod ticket_3370_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3372 pins (the `clause_arg_ty` typedef-alias arm): a typedef head in
 // a written parameter bound expands through `typedef_shapes` — the shape
 // substituted by the written arguments (or the to-bounds defaults for a raw
@@ -21037,7 +20795,6 @@ mod ticket_3370_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3372 pins (the `clause_arg_ty` typedef-alias arm): a typedef head in
 // a written parameter bound expands through `typedef_shapes` — the shape
 // substituted by the written arguments (or the to-bounds defaults for a raw
@@ -21050,7 +20807,6 @@ mod ticket_3370_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3372 pins (the `clause_arg_ty` typedef-alias arm): a typedef head in
 // a written parameter bound expands through `typedef_shapes` — the shape
 // substituted by the written arguments (or the to-bounds defaults for a raw
@@ -21074,7 +20830,6 @@ mod ticket_3372_tests;
 // face. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3373 pins (the enum member-set and mixin-application faces): one
 // repro + negative pair per face — the illegal concrete enum member
 // (declaration and inheritance arms), `illegal_enum_values` (both arms),
@@ -21083,7 +20838,6 @@ mod ticket_3372_tests;
 // face. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3373 pins (the enum member-set and mixin-application faces): one
 // repro + negative pair per face — the illegal concrete enum member
 // (declaration and inheritance arms), `illegal_enum_values` (both arms),
@@ -21092,7 +20846,6 @@ mod ticket_3372_tests;
 // face. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3373 pins (the enum member-set and mixin-application faces): one
 // repro + negative pair per face — the illegal concrete enum member
 // (declaration and inheritance arms), `illegal_enum_values` (both arms),
@@ -21114,7 +20867,6 @@ mod ticket_3373_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3367 pins (the `undefined_*` EXTRA clusters the recon's C1–C3
 // table routes to `diagnose/row_resolution.rs`): the own-parameter `on`
 // head (`extension E<T> on T`) across named/function/record receivers and
@@ -21125,7 +20877,6 @@ mod ticket_3373_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3367 pins (the `undefined_*` EXTRA clusters the recon's C1–C3
 // table routes to `diagnose/row_resolution.rs`): the own-parameter `on`
 // head (`extension E<T> on T`) across named/function/record receivers and
@@ -21136,7 +20887,6 @@ mod ticket_3373_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3367 pins (the `undefined_*` EXTRA clusters the recon's C1–C3
 // table routes to `diagnose/row_resolution.rs`): the own-parameter `on`
 // head (`extension E<T> on T`) across named/function/record receivers and
@@ -21161,7 +20911,6 @@ mod ticket_3367_tests;
 // regress it. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3382 pins (the collection-literal write-face predicate in
 // `diagnose/collection_literal.rs`): the list, set/map, `<T>`-prefixed and
 // `const`-prefixed heads, the head behind a comment (the probe now reads the
@@ -21173,7 +20922,6 @@ mod ticket_3367_tests;
 // regress it. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3382 pins (the collection-literal write-face predicate in
 // `diagnose/collection_literal.rs`): the list, set/map, `<T>`-prefixed and
 // `const`-prefixed heads, the head behind a comment (the probe now reads the
@@ -21185,7 +20933,6 @@ mod ticket_3367_tests;
 // regress it. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3382 pins (the collection-literal write-face predicate in
 // `diagnose/collection_literal.rs`): the list, set/map, `<T>`-prefixed and
 // `const`-prefixed heads, the head behind a comment (the probe now reads the
@@ -21212,7 +20959,6 @@ mod ticket_3382_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3375 pins (the recon's C12 prefix/combinator faces): the clause-carry
 // lookup faces this crate owns — shown keyword-spelled members (`show hide,
 // show hide ugly`), the bare and prefixed show/hide twins, and the
@@ -21225,7 +20971,6 @@ mod ticket_3382_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3375 pins (the recon's C12 prefix/combinator faces): the clause-carry
 // lookup faces this crate owns — shown keyword-spelled members (`show hide,
 // show hide ugly`), the bare and prefixed show/hide twins, and the
@@ -21238,7 +20983,6 @@ mod ticket_3382_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3375 pins (the recon's C12 prefix/combinator faces): the clause-carry
 // lookup faces this crate owns — shown keyword-spelled members (`show hide,
 // show hide ugly`), the bare and prefixed show/hide twins, and the
@@ -21266,7 +21010,6 @@ mod ticket_3375_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3388 pins (recon bucket C's `creation_args.rs` half): the created
 // row's type reader — the written `<...>` group's precedence, the send's
 // published solved instantiation, the instantiate-to-bounds fill for a raw
@@ -21279,7 +21022,6 @@ mod ticket_3375_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3388 pins (recon bucket C's `creation_args.rs` half): the created
 // row's type reader — the written `<...>` group's precedence, the send's
 // published solved instantiation, the instantiate-to-bounds fill for a raw
@@ -21292,7 +21034,6 @@ mod ticket_3375_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3388 pins (recon bucket C's `creation_args.rs` half): the created
 // row's type reader — the written `<...>` group's precedence, the send's
 // published solved instantiation, the instantiate-to-bounds fill for a raw
@@ -21318,7 +21059,6 @@ mod ticket_3388_tests;
 // snapshot (`types_for`). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3383 pins (the typedef-alias binder-bound feed): `flatten_rhs`'s
 // function arm minted fresh binder ids but dropped the signature's
 // written bounds (`ParamFacts { bound: None }`), so `typedef F<X> = void
@@ -21329,7 +21069,6 @@ mod ticket_3388_tests;
 // snapshot (`types_for`). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3383 pins (the typedef-alias binder-bound feed): `flatten_rhs`'s
 // function arm minted fresh binder ids but dropped the signature's
 // written bounds (`ParamFacts { bound: None }`), so `typedef F<X> = void
@@ -21340,7 +21079,6 @@ mod ticket_3388_tests;
 // snapshot (`types_for`). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3383 pins (the typedef-alias binder-bound feed): `flatten_rhs`'s
 // function arm minted fresh binder ids but dropped the signature's
 // written bounds (`ParamFacts { bound: None }`), so `typedef F<X> = void
@@ -21362,7 +21100,6 @@ mod ticket_3383_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3395 pins (L-D-1, the extension-applicability face of the
 // `unchecked_use_of_nullable_value` EXTRA cluster): the emit gates that
 // decided on the receiver's nullability alone now ask
@@ -21371,7 +21108,6 @@ mod ticket_3383_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3395 pins (L-D-1, the extension-applicability face of the
 // `unchecked_use_of_nullable_value` EXTRA cluster): the emit gates that
 // decided on the receiver's nullability alone now ask
@@ -21380,7 +21116,6 @@ mod ticket_3383_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3395 pins (L-D-1, the extension-applicability face of the
 // `unchecked_use_of_nullable_value` EXTRA cluster): the emit gates that
 // decided on the receiver's nullability alone now ask
@@ -21403,7 +21138,6 @@ mod ticket_3395_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3398 pins (L-D-E): `Receiver::Created` carries the creation's
 // resolved instance type (`ty: Option<Ty>`), so `member_formals_full`'s
 // Created arm walks `member_recv_env` exactly like `Receiver::Typed` —
@@ -21415,7 +21149,6 @@ mod ticket_3395_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3398 pins (L-D-E): `Receiver::Created` carries the creation's
 // resolved instance type (`ty: Option<Ty>`), so `member_formals_full`'s
 // Created arm walks `member_recv_env` exactly like `Receiver::Typed` —
@@ -21427,7 +21160,6 @@ mod ticket_3395_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3398 pins (L-D-E): `Receiver::Created` carries the creation's
 // resolved instance type (`ty: Option<Ty>`), so `member_formals_full`'s
 // Created arm walks `member_recv_env` exactly like `Receiver::Typed` —
@@ -21451,7 +21183,6 @@ mod ticket_3398_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3385 pins (the `arg_param_trailing_comma` family's recovered formal
 // slot): `end_formal_parameter` dropped the formal whose name token was a
 // parser-inserted synthetic (`void f(, a)`), so the signature's arity came
@@ -21461,7 +21192,6 @@ mod ticket_3398_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3385 pins (the `arg_param_trailing_comma` family's recovered formal
 // slot): `end_formal_parameter` dropped the formal whose name token was a
 // parser-inserted synthetic (`void f(, a)`), so the signature's arity came
@@ -21471,7 +21201,6 @@ mod ticket_3398_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3385 pins (the `arg_param_trailing_comma` family's recovered formal
 // slot): `end_formal_parameter` dropped the formal whose name token was a
 // parser-inserted synthetic (`void f(, a)`), so the signature's arity came
@@ -21492,7 +21221,6 @@ mod ticket_3385_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3404 pins (recon_3258 T-A/T-B): the `no_combined_super_signature`
 // gate — the combined-signature report plus the declared-face loop's skip —
 // and the declared-`covariant` induced-setter exemption on a field. Both
@@ -21501,7 +21229,6 @@ mod ticket_3385_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3404 pins (recon_3258 T-A/T-B): the `no_combined_super_signature`
 // gate — the combined-signature report plus the declared-face loop's skip —
 // and the declared-`covariant` induced-setter exemption on a field. Both
@@ -21510,7 +21237,6 @@ mod ticket_3385_tests;
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3404 pins (recon_3258 T-A/T-B): the `no_combined_super_signature`
 // gate — the combined-signature report plus the declared-face loop's skip —
 // and the declared-`covariant` induced-setter exemption on a field. Both
@@ -21533,7 +21259,6 @@ mod ticket_3404_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3394 pins (recon bucket C's `invocation.rs` half + the T2
 // cascade-receiver residual): a creation cascade target is the created
 // INSTANCE — `G.value(1)..gone()` names `G`, never the `Type` literal the
@@ -21545,7 +21270,6 @@ mod ticket_3404_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3394 pins (recon bucket C's `invocation.rs` half + the T2
 // cascade-receiver residual): a creation cascade target is the created
 // INSTANCE — `G.value(1)..gone()` names `G`, never the `Type` literal the
@@ -21557,7 +21281,6 @@ mod ticket_3404_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3394 pins (recon bucket C's `invocation.rs` half + the T2
 // cascade-receiver residual): a creation cascade target is the created
 // INSTANCE — `G.value(1)..gone()` names `G`, never the `Type` literal the
@@ -21580,7 +21303,6 @@ mod ticket_3394_tests;
 // resolves against. Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3406 pins (the `undefined_*` C2 cluster): a receiver that IS a call
 // result is modelled by the invocation's RETURN type, never by the callee's
 // own function type — `f(x).m`, `f(x)..m()` and `f<A>(x).m` resolved the
@@ -21589,7 +21311,6 @@ mod ticket_3394_tests;
 // resolves against. Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3406 pins (the `undefined_*` C2 cluster): a receiver that IS a call
 // result is modelled by the invocation's RETURN type, never by the callee's
 // own function type — `f(x).m`, `f(x)..m()` and `f<A>(x).m` resolved the
@@ -21598,7 +21319,6 @@ mod ticket_3394_tests;
 // resolves against. Registered here via `#[path]`; the module stays inside
 // the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3406 pins (the `undefined_*` C2 cluster): a receiver that IS a call
 // result is modelled by the invocation's RETURN type, never by the callee's
 // own function type — `f(x).m`, `f(x)..m()` and `f<A>(x).m` resolved the
@@ -21618,7 +21338,6 @@ mod ticket_3406_tests;
 // prefix's own table while leaving local declarations alone. Registered here
 // via `#[path]`; the module stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3407 pins (the `undefined_*` C6/C9/C12 cluster faces, pinned at the
 // model layer): an `augment` head declares no name of its own — the target
 // resolves to the introducing unit, and a target with no introduction stays
@@ -21627,7 +21346,6 @@ mod ticket_3406_tests;
 // prefix's own table while leaving local declarations alone. Registered here
 // via `#[path]`; the module stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3407 pins (the `undefined_*` C6/C9/C12 cluster faces, pinned at the
 // model layer): an `augment` head declares no name of its own — the target
 // resolves to the introducing unit, and a target with no introduction stays
@@ -21636,7 +21354,6 @@ mod ticket_3406_tests;
 // prefix's own table while leaving local declarations alone. Registered here
 // via `#[path]`; the module stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3407 pins (the `undefined_*` C6/C9/C12 cluster faces, pinned at the
 // model layer): an `augment` head declares no name of its own — the target
 // resolves to the introducing unit, and a target with no introduction stays
@@ -21656,7 +21373,6 @@ mod ticket_3407_tests;
 // keeps the silent `Unknown` face. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3374 pins (the implicit-`dynamic` static type at a read): an untyped
 // formal's element type is `dynamicType` upstream
 // (`resolver/resolution_visitor.dart:799-814`), so the read-type query must
@@ -21665,7 +21381,6 @@ mod ticket_3407_tests;
 // keeps the silent `Unknown` face. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3374 pins (the implicit-`dynamic` static type at a read): an untyped
 // formal's element type is `dynamicType` upstream
 // (`resolver/resolution_visitor.dart:799-814`), so the read-type query must
@@ -21674,7 +21389,6 @@ mod ticket_3407_tests;
 // keeps the silent `Unknown` face. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree.
 #[cfg(test)]
-
 // The #3374 pins (the implicit-`dynamic` static type at a read): an untyped
 // formal's element type is `dynamicType` upstream
 // (`resolver/resolution_visitor.dart:799-814`), so the read-type query must
@@ -21696,7 +21410,6 @@ mod ticket_3374_tests;
 // lands. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3384 residual pins (recon bucket A2's display face): a written
 // function type's own type-parameter group displays in DECLARATION order
 // with each bound's explicit type arguments spelled (`void Function<X
@@ -21707,7 +21420,6 @@ mod ticket_3374_tests;
 // lands. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3384 residual pins (recon bucket A2's display face): a written
 // function type's own type-parameter group displays in DECLARATION order
 // with each bound's explicit type arguments spelled (`void Function<X
@@ -21718,7 +21430,6 @@ mod ticket_3374_tests;
 // lands. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3384 residual pins (recon bucket A2's display face): a written
 // function type's own type-parameter group displays in DECLARATION order
 // with each bound's explicit type arguments spelled (`void Function<X
@@ -21742,7 +21453,6 @@ mod ticket_3384_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3392 pins (the equality/type-check operand faces over top-level
 // bare reads and completed sends): the verdicts already resolve both
 // operand shapes, and the invariant-null-comparison row anchors at the
@@ -21753,7 +21463,6 @@ mod ticket_3384_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3392 pins (the equality/type-check operand faces over top-level
 // bare reads and completed sends): the verdicts already resolve both
 // operand shapes, and the invariant-null-comparison row anchors at the
@@ -21764,7 +21473,6 @@ mod ticket_3384_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3392 pins (the equality/type-check operand faces over top-level
 // bare reads and completed sends): the verdicts already resolve both
 // operand shapes, and the invariant-null-comparison row anchors at the
@@ -21788,7 +21496,6 @@ mod ticket_3392_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3412 pins (the generic constructor send's static type): a dot-send
 // on a class head is an instance creation upstream, so the invocation
 // node's type is the CREATED instance — the arm reads the instantiation
@@ -21799,7 +21506,6 @@ mod ticket_3392_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3412 pins (the generic constructor send's static type): a dot-send
 // on a class head is an instance creation upstream, so the invocation
 // node's type is the CREATED instance — the arm reads the instantiation
@@ -21810,7 +21516,6 @@ mod ticket_3392_tests;
 // via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3412 pins (the generic constructor send's static type): a dot-send
 // on a class head is an instance creation upstream, so the invocation
 // node's type is the CREATED instance — the arm reads the instantiation
@@ -21835,7 +21540,6 @@ mod ticket_3412_tests;
 // leaves'). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3359 pins (the executable return latch and the augment field
 // group): an unannotated executable — an operator with no name event, a
 // host whose body completes a type after a nested closure — returns
@@ -21847,7 +21551,6 @@ mod ticket_3412_tests;
 // leaves'). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3359 pins (the executable return latch and the augment field
 // group): an unannotated executable — an operator with no name event, a
 // host whose body completes a type after a nested closure — returns
@@ -21859,7 +21562,6 @@ mod ticket_3412_tests;
 // leaves'). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3359 pins (the executable return latch and the augment field
 // group): an unannotated executable — an operator with no name event, a
 // host whose body completes a type after a nested closure — returns
@@ -21883,7 +21585,6 @@ mod ticket_3359_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3411 pins (the `@nonVirtual` override face and the setter
 // function-type arity): a member overriding an inherited CONCRETE member
 // that carries `@nonVirtual` reports at its own name and names the
@@ -21893,7 +21594,6 @@ mod ticket_3359_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3411 pins (the `@nonVirtual` override face and the setter
 // function-type arity): a member overriding an inherited CONCRETE member
 // that carries `@nonVirtual` reports at its own name and names the
@@ -21903,7 +21603,6 @@ mod ticket_3359_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3411 pins (the `@nonVirtual` override face and the setter
 // function-type arity): a member overriding an inherited CONCRETE member
 // that carries `@nonVirtual` reports at its own name and names the
@@ -21926,7 +21625,6 @@ mod ticket_3411_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3415 pins (the send close's staging source and the named-selector
 // creation's published instantiation): the flow send fold now reads the
 // same operand-static-type fact every verdict over the row reads, so a
@@ -21937,7 +21635,6 @@ mod ticket_3411_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3415 pins (the send close's staging source and the named-selector
 // creation's published instantiation): the flow send fold now reads the
 // same operand-static-type fact every verdict over the row reads, so a
@@ -21948,7 +21645,6 @@ mod ticket_3411_tests;
 // here via `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3415 pins (the send close's staging source and the named-selector
 // creation's published instantiation): the flow send fold now reads the
 // same operand-static-type fact every verdict over the row reads, so a
@@ -21973,7 +21669,6 @@ mod ticket_3415_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3420 pins (a member read off a created chain): the member merge's
 // non-`this`/`super`/`typed` receiver arm holds the receiver's STATIC TYPE
 // only, so a folded creation's declared accessor face was never consulted
@@ -21985,7 +21680,6 @@ mod ticket_3415_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3420 pins (a member read off a created chain): the member merge's
 // non-`this`/`super`/`typed` receiver arm holds the receiver's STATIC TYPE
 // only, so a folded creation's declared accessor face was never consulted
@@ -21997,7 +21691,6 @@ mod ticket_3415_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3420 pins (a member read off a created chain): the member merge's
 // non-`this`/`super`/`typed` receiver arm holds the receiver's STATIC TYPE
 // only, so a folded creation's declared accessor face was never consulted
@@ -22020,7 +21713,6 @@ mod ticket_3420_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3423 pins (a potentially nullable receiver's operator resolves
 // through the applicable extension before the nullability verdict): the fold
 // asks the covering `on ?` face first, so `extension on int? { int
@@ -22031,7 +21723,6 @@ mod ticket_3420_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3390 pins (the `??=` staged flush's non-local target arm): a pair
 // the local promotion table missed re-decides through the target row's
 // declared read face — upstream's `readType` answers a member target with
@@ -22043,7 +21734,6 @@ mod ticket_3420_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3417 pins (cluster C4/C7): the `Type` instance's member face is the
 // `Object` face plus every APPLICABLE extension of the import closure, a
 // cascade section's target is only the literal when it is written bare
@@ -22052,7 +21742,6 @@ mod ticket_3420_tests;
 // resolves `p.dynamic`. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3390 pins (the `??=` staged flush's non-local target arm): a pair
 // the local promotion table missed re-decides through the target row's
 // declared read face — upstream's `readType` answers a member target with
@@ -22064,7 +21753,6 @@ mod ticket_3420_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3418 pins (an augmented element's member face is the union of its
 // fragments'): `resolve_container` answers the merged face from either
 // anchor, so a member written in the introducing unit resolves inside an
@@ -22073,7 +21761,6 @@ mod ticket_3420_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3423 pins (a potentially nullable receiver's operator resolves
 // through the applicable extension before the nullability verdict): the fold
 // asks the covering `on ?` face first, so `extension on int? { int
@@ -22084,7 +21771,6 @@ mod ticket_3420_tests;
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3390 pins (the `??=` staged flush's non-local target arm): a pair
 // the local promotion table missed re-decides through the target row's
 // declared read face — upstream's `readType` answers a member target with
@@ -22096,7 +21782,6 @@ mod ticket_3420_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3417 pins (cluster C4/C7): the `Type` instance's member face is the
 // `Object` face plus every APPLICABLE extension of the import closure, a
 // cascade section's target is only the literal when it is written bare
@@ -22105,7 +21790,6 @@ mod ticket_3420_tests;
 // resolves `p.dynamic`. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // The #3390 pins (the `??=` staged flush's non-local target arm): a pair
 // the local promotion table missed re-decides through the target row's
 // declared read face — upstream's `readType` answers a member target with
@@ -22129,7 +21813,6 @@ mod ticket_3390_tests;
 // subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3418 pins (an augmented element's member face is the union of its
 // fragments'): `resolve_container` answers the merged face from either
 // anchor, so a member written in the introducing unit resolves inside an
@@ -22137,7 +21820,6 @@ mod ticket_3390_tests;
 // reports, and the merge is independent of the library's unit order.
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3418_tests.rs"]
 mod ticket_3418_tests;
@@ -22151,7 +21833,6 @@ mod ticket_3418_tests;
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3417 pins (cluster C4/C7): the `Type` instance's member face is the
 // `Object` face plus every APPLICABLE extension of the import closure, a
 // cascade section's target is only the literal when it is written bare
@@ -22159,7 +21840,6 @@ mod ticket_3418_tests;
 // statics, and a prefix whose own edge exports the built-in top type
 // resolves `p.dynamic`. Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3417_tests.rs"]
 mod ticket_3417_tests;
@@ -22175,7 +21855,6 @@ mod ticket_3417_tests;
 // resolves.
 
 #[cfg(test)]
-
 // The #3259 pins (the `@override` presence face's implicit supertype):
 // `face_member_any` now seeds `Object` for a superclass-less class or an
 // `on`-less mixin and `Enum` for an enum — the faces `element.supertype`
@@ -22185,7 +21864,6 @@ mod ticket_3417_tests;
 // no face carries still reports. Registered here via `#[path]`; the module
 // stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
-
 #[cfg(test)]
 #[path = "ticket_3259_tests.rs"]
 mod ticket_3259_tests;
@@ -22202,7 +21880,6 @@ mod ticket_3259_tests;
 // subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3432 pins (the named mixin application's forwarded constructor
 // face): `class X = S with M;` declares no constructor of its own — the
 // analyzer synthesizes one per generative constructor of `S`, so the
@@ -22213,7 +21890,6 @@ mod ticket_3259_tests;
 // row (the only marker telling the sugar form from `extends ... with`).
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3432_tests.rs"]
 mod ticket_3432_tests;
@@ -22230,7 +21906,6 @@ mod ticket_3432_tests;
 // subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3423 pins (a potentially nullable receiver's operator resolves
 // through the applicable extension before the nullability verdict): the fold
 // asks the covering `on ?` face first, so `extension on int? { int
@@ -22241,7 +21916,6 @@ mod ticket_3432_tests;
 // assignability.rs refinement) and is recorded as an ignored pin.
 // Registered here via `#[path]`; the module stays inside the `diagnose`
 // subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3423_tests.rs"]
 mod ticket_3423_tests;
@@ -22258,7 +21932,6 @@ mod ticket_3423_tests;
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // —— #3433 —— the dot-shorthand declaration-initializer pass: a
 // —— leading-dot selector never merges a receiver, so a member miss
 // —— against the declaration group's context went silently unreported
@@ -22269,7 +21942,6 @@ mod ticket_3423_tests;
 // —— `dot_shorthand_undefined_member` at the selector on a miss.
 // —— Registered here via `#[path]`; the module stays inside the
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3433_tests.rs"]
 mod ticket_3433_tests;
@@ -22285,7 +21957,6 @@ mod ticket_3433_tests;
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3443 pins (the undefined-ARGUMENT is-face rides the lattice): an
 // `is`-tested spelling whose head is a registered container but whose
 // written argument tree names an undefined id is the oracle's
@@ -22295,7 +21966,6 @@ mod ticket_3433_tests;
 // the pinned 3.13.7 oracle while `List<int> is List<String>` folds
 // nothing. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3443_tests.rs"]
 mod ticket_3443_tests;
@@ -22312,7 +21982,6 @@ mod ticket_3443_tests;
 // —— resolves.
 
 #[cfg(test)]
-
 // —— #3378 —— the augment fragment's member scope joins the introduced
 // —— element's across the library's units: upstream keys the duplicate
 // —— context on the merged element's first fragment
@@ -22323,7 +21992,6 @@ mod ticket_3443_tests;
 // —— declared its fragments in. Registered here via `#[path]`; the module
 // —— stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // —— resolves.
-
 #[cfg(test)]
 #[path = "ticket_3378_tests.rs"]
 mod ticket_3378_tests;
@@ -22343,7 +22011,6 @@ mod ticket_3378_tests;
 // —— resolves.
 
 #[cfg(test)]
-
 // —— #3429 —— the shape/object-pattern EXTRA-row suppression:
 // —— `resolveObjectPatternPropertyGet` is the ordinary property consult,
 // —— so a function pattern head resolves `call`, the extension pool, and
@@ -22357,7 +22024,6 @@ mod ticket_3378_tests;
 // —— receiver's aligned slots. Registered here via `#[path]`; the module
 // —— stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // —— resolves.
-
 #[cfg(test)]
 #[path = "ticket_3429_tests.rs"]
 mod ticket_3429_tests;
@@ -22369,13 +22035,11 @@ mod ticket_3429_tests;
 // —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // —— #3460 —— the application-order pins: an `augment` sees only the
 // —— fragments of units before its own unit in `unit_files` order (the
 // —— oracle's `allUnits` walk), plus the factory-body walk's matching
 // —— truncation. Registered here via `#[path]`; the module stays inside
 // —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3460_tests.rs"]
 mod ticket_3460_tests;
@@ -22386,12 +22050,10 @@ mod ticket_3460_tests;
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3461 pins (the `unnecessary_type_check` verdict legs): the
 // parameterized function-RHS typedef fold and the `p.T` checked-head
 // recovery. Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3461_tests.rs"]
 mod ticket_3461_tests;
@@ -22408,7 +22070,6 @@ mod ticket_3461_tests;
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // The #3428 pins (the live-prefix member miss's context routing): a
 // `p.C` whose prefix resolves but whose member is absent rides
 // `reportNullOrNonTypeElement`'s context chain exactly as a bare `C` does —
@@ -22419,7 +22080,6 @@ mod ticket_3461_tests;
 // `undefined_class` (the local-head silence and the broken-edge guard ride
 // its fields). Registered here via `#[path]`; the module stays inside the
 // `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3428_tests.rs"]
 mod ticket_3428_tests;
@@ -22433,7 +22093,6 @@ mod ticket_3428_tests;
 // —— so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // —— #3425 —— the declaring-formal member face for every primary-ctor
 // —— container kind (mixin/extension were missing from the gate) and the
 // —— implicit-type slot on unannotated instance fields: `var foo = "s"`
@@ -22441,7 +22100,6 @@ mod ticket_3428_tests;
 // —— the initializer (instance_member_inferrer.dart:104-135). Registered
 // —— here via `#[path]`; the module stays inside the `diagnose` subtree
 // —— so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3425_tests.rs"]
 mod ticket_3425_tests;
@@ -22454,14 +22112,12 @@ mod ticket_3425_tests;
 // —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // —— #3459 —— the ctor-initializer write face: a bare `name = e` inside a
 // —— constructor-initializer list resolves through `init_rows`' dedicated
 // —— world (`_checkForInvalidField`), never the implicit-`this`
 // —— setter-less-write arm — the corpus's dominant `assignment_to_final`
 // —— extra shape. Registered here via `#[path]`; the module stays inside
 // —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3459_tests.rs"]
 mod ticket_3459_tests;
@@ -22476,7 +22132,6 @@ mod ticket_3459_tests;
 // `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // —— #3482 —— the clause-element-kind check's per-DECLARATION identity:
 // `scan_header_clauses` keys each header on its declaring name token's
 // offset instead of the name, so a repeated container name reports each
@@ -22485,7 +22140,6 @@ mod ticket_3459_tests;
 // `implements_non_class` duplicate family). Registered here via `#[path]`;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3482_tests.rs"]
 mod ticket_3482_tests;
@@ -22498,7 +22152,6 @@ mod ticket_3482_tests;
 // module stays inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // resolves.
 #[cfg(test)]
-
 // The #3464 pins (duplicate_constructor keys follow the element chain and
 // the written head shape): an augment fragment shares the introduction's
 // constructor set, `factory`-adjacent heads (including the bare `factory(`,
@@ -22519,7 +22172,6 @@ mod ticket_3464_tests;
 // —— `crate::diagnose::test_rig` resolves.
 
 #[cfg(test)]
-
 // —— #3379 —— the `if-case` ELEMENT's pattern scope: the element fires a
 // —— disjoint parser event set (`begin/handle/end*ControlFlow`), so the
 // —— statement-only `pattern_scope` wiring never armed — the condition's
@@ -22527,7 +22179,6 @@ mod ticket_3464_tests;
 // —— overwrite outlived the element. Registered here via `#[path]`; the
 // —— module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
-
 #[cfg(test)]
 #[path = "ticket_3379_tests.rs"]
 mod ticket_3379_tests;
@@ -22539,7 +22190,6 @@ mod ticket_3379_tests;
 // —— miss. Registered here via `#[path]`; the module stays inside the
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3478 —— element/field credit by BARE NAME instead of declaration at
 // —— the library close: `A._m`/`B._m` collided on the one `consumed.used`
 // —— spelling; the close now re-decides member rows against the
@@ -22547,14 +22197,12 @@ mod ticket_3379_tests;
 // —— `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3479 —— writes counted as reads: statement-position `++`/compound,
 // —— constructor-initializer LHS, and initializing-formal writes carried
 // —— read credit into the unused-field pools the oracle never records.
 // —— Registered here via `#[path]`; the module stays inside the
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3479 —— writes counted as reads: statement-position `++`/compound,
 // —— constructor-initializer LHS, and initializing-formal writes carried
 // —— read credit into the unused-field pools the oracle never records.
@@ -22571,7 +22219,6 @@ mod ticket_3479_tests;
 // —— Registered here via `#[path]`; the module stays inside the
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3508 —— the three `finalize_usage` arms that iterated the drained
 // —— `self.rows`: the missing-write setter/top-level credit, the
 // —— `_isReadIdentifier` write-offsets gate, and the shorthand-ctor
@@ -22591,7 +22238,6 @@ mod ticket_3508_tests;
 // —— `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3455 —— the `undefined_*` code-choice faces: a `foo<int>` generic
 // —— instantiation head reports `undefined_method` naming `this`'s type
 // —— (an extension answers its `on` type) and keeps `undefined_identifier`
@@ -22612,7 +22258,6 @@ mod ticket_3455_tests;
 // —— the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3456 —— the `super` face's two-stage lookup: concrete-dispatch
 // —— misses retry through the inherited interface and report
 // —— `abstract_super_member_reference`, while `super` inside
@@ -22632,7 +22277,6 @@ mod ticket_3456_tests;
 // tail `;` extension). Registered here via `#[path]`; the module stays
 // inside the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3465 —— dead_code coverage for verdict-proven dead branches (the
 // semantic `unnecessary_type_check`/`unnecessary_null_comparison` row
 // decides the condition where the flow's fold never reaches — typedef
@@ -22645,13 +22289,11 @@ mod ticket_3456_tests;
 mod ticket_3465_tests;
 
 #[cfg(test)]
-
 #[cfg(test)]
 #[path = "ticket_3437_tests.rs"]
 mod ticket_3437_tests;
 
 #[cfg(test)]
-
 #[cfg(test)]
 #[path = "ticket_3438_tests.rs"]
 mod ticket_3438_tests;
@@ -22663,7 +22305,6 @@ mod ticket_3438_tests;
 // —— `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3434 —— an `augment` fragment's members join the merged element face
 // —— of the declaration it augments: the introduction's body reads the
 // —— fragment's fields/methods/statics, enum constants join the witness set,
@@ -22672,7 +22313,6 @@ mod ticket_3438_tests;
 // —— here via `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3434 —— an `augment` fragment's members join the merged element face
 // —— of the declaration it augments: the introduction's body reads the
 // —— fragment's fields/methods/statics, enum constants join the witness set,
@@ -22691,7 +22331,6 @@ mod ticket_3434_tests;
 // —— here via `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3475 —— the displayed-type boundary: `ty_display` fills
 // —— instantiate-to-bounds at every nesting depth (named arguments,
 // —— function return/formals, record fields), and the type-argument bounds
@@ -22710,7 +22349,6 @@ mod ticket_3475_tests;
 // `#[path]`; the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3469 — alias-headed bounds: the alias parameters' stored variance is
 // —— the typedef one (their occurrences in the aliased body), so the
 // —— instantiate-to-bound defaults ground the way the oracle's do, and a
@@ -22718,7 +22356,6 @@ mod ticket_3475_tests;
 // —— faces. Registered here via `#[path]`; the module stays inside the
 // —— `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3469 — alias-headed bounds: the alias parameters' stored variance is
 // —— the typedef one (their occurrences in the aliased body), so the
 // —— instantiate-to-bound defaults ground the way the oracle's do, and a
@@ -22737,7 +22374,6 @@ mod ticket_3469_tests;
 // —— here via `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3516 —— a cross-unit `augment` fragment's declarations join the merged
 // —— element face: enum constants (read face + switch witness set),
 // —— constructor selectors, `const`-constructor presence, the implicit
@@ -22756,7 +22392,6 @@ mod ticket_3516_tests;
 // —— `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3402 —— a call site's static type is the send's result, resolved
 // —— through the callee's declared return — an alias-typed local's
 // —— invocation answers the substituted signature's return, and the send
@@ -22774,7 +22409,6 @@ mod ticket_3402_tests;
 // —— inside the `diagnose` subtree so `crate::diagnose::test_rig`
 // —— resolves.
 #[cfg(test)]
-
 // —— #3449 —— a cascade section over a non-bare target (`f()..x`,
 // —— `C()..x`) checks members against the target's own value face. The
 // —— defined section stays silent; the missing one reports on the
@@ -22793,7 +22427,6 @@ mod ticket_3449_tests;
 // —— constraint. Registered here via `#[path]`; the module stays inside
 // —— the `diagnose` subtree so `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3457 —— the extension consult and instance-member faces route
 // —— receivers the named-container walk never owned: a type-variable
 // —— receiver resolves through its bound (`<unknown>` display, nullable
@@ -22813,7 +22446,6 @@ mod ticket_3457_tests;
 // —— via `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3400 —— a const constructor's `x = e` field-initializer RHS runs
 // —— the potentially-constant scan at the list's close: formals bound
 // —— opaque minus wildcards, instance-member reads report
@@ -22834,7 +22466,6 @@ mod ticket_3400_tests;
 // —— via `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3504 —— `return_of_invalid_type` inside an extension member reads
 // —— the member's own declared return annotation, never the extension's
 // —— `on` type: the operator member's `ret` latches before its annotation
@@ -22851,7 +22482,6 @@ mod ticket_3504_tests;
 // The const collection element verdict table: the landed `for`-element
 // face (live) and the element-family gaps routed to their owning files.
 #[cfg(test)]
-
 // —— #3507 ——
 // The const collection element verdict table: the landed `for`-element
 // face (live) and the element-family gaps routed to their owning files.
@@ -22867,7 +22497,6 @@ mod ticket_3507_tests;
 // —— `#[path]`; the module stays inside the `diagnose` subtree so
 // —— `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3502 —— an `on T?` extension applies to the operator and
 // —— compound-assignment faces of a nullable receiver: the operand row
 // —— carries a read intent, so the probe takes the adjacent token's base
@@ -22883,7 +22512,6 @@ mod ticket_3502_tests;
 // The null-aware element verdict reads the operand's tear-off face
 // (`untyped_operand_ty`'s ctor / member / bare-function fallback).
 #[cfg(test)]
-
 // —— #3503 ——
 // The null-aware element verdict reads the operand's tear-off face
 // (`untyped_operand_ty`'s ctor / member / bare-function fallback).
@@ -22896,7 +22524,6 @@ mod ticket_3503_tests;
 // relational-operand enclosing-scope resolution (referenced-before-decl +
 // non-constant), guard assignment, and the shared-case-scope join.
 #[cfg(test)]
-
 // —— #3519 ——
 // The guarded-pattern scope faces: irrefutable destructure mismatch,
 // relational-operand enclosing-scope resolution (referenced-before-decl +
@@ -22915,7 +22542,6 @@ mod ticket_3519_tests;
 // the module stays inside the `diagnose` subtree so
 // `crate::diagnose::test_rig` resolves.
 #[cfg(test)]
-
 // —— #3531 ——
 // The `...?x6` cross-pool panic: `FileElements::is_strictly_non_nullable`
 // read the unit `ArgPool` with an engine-minted `ArgListId`. The helper
@@ -23675,10 +23301,4 @@ mod ticket_3839_tests;
 #[path = "ticket_41983_tests.rs"]
 mod ticket_41983_tests;
 
-
 // —— #3856 (the duplicate_field_formal_parameter row swap) ——
-// The formal-parameter scope reports the pair code when BOTH colliding
-// claims are `this.x` formals; the capture bit rides `DuplicateDecl`.
-#[cfg(test)]
-#[path = "ticket_3856_tests.rs"]
-mod ticket_3856_tests;

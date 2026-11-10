@@ -98,10 +98,7 @@ fn primary_constructor_body_modifier_anchors_on_keyword() {
 /// row is oracle-silent (negative pin).
 #[test]
 fn primary_constructor_body_plain_body_silent() {
-    assert_eq!(
-        sorted_rows("class C(int x) {\n  this {}\n}\n"),
-        Vec::new(),
-    );
+    assert_eq!(sorted_rows("class C(int x) {\n  this {}\n}\n"), Vec::new(),);
 }
 
 /// The non-assignable assignment LHS reports `missingAssignableSelector`
@@ -122,12 +119,14 @@ fn non_assignable_lhs_faces_report_over_the_whole_run() {
     let mut rows = parser.listener.errors.clone();
     rows.sort();
     // `    a + b` — `a` at offset 25, `a + b` spans 25..30.
-    assert!(rows
-        .iter()
-        .any(|(c, s, e)| c == "missing_assignable_selector" && *s == 25 && *e == 30));
-    assert!(rows
-        .iter()
-        .any(|(c, s, e)| c == "illegal_assignment_to_non_assignable" && *s == 25 && *e == 30));
+    assert!(
+        rows.iter()
+            .any(|(c, s, e)| c == "missing_assignable_selector" && *s == 25 && *e == 30)
+    );
+    assert!(
+        rows.iter()
+            .any(|(c, s, e)| c == "illegal_assignment_to_non_assignable" && *s == 25 && *e == 30)
+    );
 }
 
 /// `PropertyAccess` and `IndexExpression` stay assignable (negative pins):
@@ -136,7 +135,9 @@ fn non_assignable_lhs_faces_report_over_the_whole_run() {
 #[test]
 fn assignable_lhs_shapes_stay_silent() {
     assert_eq!(
-        sorted_rows("class A {\n  test() {\n    a.b += c;\n    a[0] = 1;\n    x!.y = 1;\n    f().x = 1;\n  }\n}\n"),
+        sorted_rows(
+            "class A {\n  test() {\n    a.b += c;\n    a[0] = 1;\n    x!.y = 1;\n    f().x = 1;\n  }\n}\n"
+        ),
         Vec::new(),
         "PropertyAccess/IndexExpression LHS carries no assignability rows"
     );
@@ -189,20 +190,20 @@ fn for_updater_bare_super_reports_selector() {
     let mut rows = parser.listener.errors.clone();
     rows.sort();
     // `    for (;; super)` — `super` at utf-16 33..38.
-    assert!(rows
-        .iter()
-        .any(|(c, s, e)| c == "missing_assignable_selector" && *s == 33 && *e == 38));
+    assert!(
+        rows.iter()
+            .any(|(c, s, e)| c == "missing_assignable_selector" && *s == 33 && *e == 38)
+    );
     // Two bare-`super` updaters report once each.
-    let (table2, text2) =
-        scan_ok("class A {\n  test() {\n    for (;; super, super) {}\n  }\n}\n");
+    let (table2, text2) = scan_ok("class A {\n  test() {\n    for (;; super, super) {}\n  }\n}\n");
     let mut collector2 = super::collector::Collector::default();
-    let mut parser2 =
-        crate::Parser::new(text2, table2, latest_features(), &mut collector2);
+    let mut parser2 = crate::Parser::new(text2, table2, latest_features(), &mut collector2);
     parser2.parse_unit();
     let mut rows2 = parser2.listener.errors.clone();
     rows2.sort();
     assert_eq!(
-        rows2.iter()
+        rows2
+            .iter()
             .filter(|(c, _, _)| c == "missing_assignable_selector")
             .count(),
         2,

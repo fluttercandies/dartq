@@ -69,11 +69,7 @@ fn dead_rows(source: &str, staged: &[(u32, &str, bool)]) -> Vec<(u32, u32, Strin
 /// A `T?` staged at the declaration's identifier offset — the way the
 /// semantic layer answers `int? i` for the flow replay.
 fn int_q(source: &str, name: &str) -> (u32, &'static str, bool) {
-    (
-        source.find(name).expect("decl name") as u32,
-        "int",
-        true,
-    )
+    (source.find(name).expect("decl name") as u32, "int", true)
 }
 
 /// A definitely-unassigned nullable local's `?.` row is NOT the flow
@@ -140,7 +136,8 @@ fn paren_callee_call_anchors_at_open_paren() {
 /// the assignment end (`end - 4`) — never the `1:1` fallback.
 #[test]
 fn if_null_assign_null_literal_rhs_anchors_at_operand() {
-    let source = "void check(a, b, c) {}\nvoid f() {\n  final l = 1;\n  l ??= null;\n  check(1, 2, 3);\n}\n";
+    let source =
+        "void check(a, b, c) {}\nvoid f() {\n  final l = 1;\n  l ??= null;\n  check(1, 2, 3);\n}\n";
     let null_off = source.find("null").expect("null") as u32;
     let rows = dead_rows(source, &[]);
     assert_eq!(
@@ -280,4 +277,3 @@ fn multi_section_null_aware_cascade_rows() {
         "{rows:?}"
     );
 }
-

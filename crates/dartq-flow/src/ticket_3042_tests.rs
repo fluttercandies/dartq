@@ -105,14 +105,8 @@ fn for_false_init_and_updater_reports_both_rows() {
     // block); `9;` stays live — the exit join keeps the false branch.
     let dead = dead_of("void f() {\n  for (var i = 0; false; i++) { 1; }\n  9;\n}");
     assert_eq!(dead.len(), 2, "{dead:?}");
-    assert!(
-        dead.iter().any(|row| row.contains("i++")),
-        "{dead:?}"
-    );
-    assert!(
-        dead.iter().any(|row| row.contains("{ 1; }")),
-        "{dead:?}"
-    );
+    assert!(dead.iter().any(|row| row.contains("i++")), "{dead:?}");
+    assert!(dead.iter().any(|row| row.contains("{ 1; }")), "{dead:?}");
     nowhere_dead(&dead, "9");
 }
 
@@ -147,10 +141,7 @@ fn for_false_dead_body_break_keeps_tail_live() {
     // reachable.
     let dead = dead_of("void f() {\n  for (var i = 0; false;) { break; }\n  9;\n}");
     assert_eq!(dead.len(), 1, "{dead:?}");
-    assert!(
-        dead[0].contains("{ break; }"),
-        "{dead:?}"
-    );
+    assert!(dead[0].contains("{ break; }"), "{dead:?}");
     nowhere_dead(&dead, "9");
 }
 

@@ -3,8 +3,8 @@
 //! (`report_ops_imports`); every pin asserts the oracle verdict a corpus
 //! row pins, so a regression here is a face gap by construction.
 
-use super::*;
 use super::test_rig::{RigImport, report_ops_imports};
+use super::*;
 
 fn count_code(report: &FileReport, name: &str) -> usize {
     report

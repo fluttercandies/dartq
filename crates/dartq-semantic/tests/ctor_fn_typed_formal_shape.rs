@@ -112,5 +112,8 @@ fn named_ctor_function_typed_formal_carries_the_written_shape() {
         .expect("named selector table")
         .positional[0]
         .ty;
-    assert_eq!(ty.render(&strings, elements.type_args()), "void Function(X)");
+    assert_eq!(
+        ty.render(&strings, elements.type_args()),
+        "void Function(X)"
+    );
 }

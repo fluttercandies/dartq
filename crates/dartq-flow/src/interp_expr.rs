@@ -203,10 +203,8 @@ impl Interp<'_> {
                             // `y;`. Set at `InitializerEnd` when the
                             // declaration was final and the fold carried a
                             // `bool_value`; cleared by any write.
-                            expr.bool_value = self
-                                .vars
-                                .get(var as usize)
-                                .and_then(|meta| meta.const_bool);
+                            expr.bool_value =
+                                self.vars.get(var as usize).and_then(|meta| meta.const_bool);
                             // The by-construction non-null face: an
                             // implicitly typed local whose initializer can
                             // never be null (`final x = 0;`) reads as
@@ -1030,11 +1028,8 @@ impl Interp<'_> {
                     // official carries no `booleanLiteral` info for a logical
                     // operator, so this face feeds the branch-fold marker
                     // only (see [`Expr::proven_bool`]).
-                    expr.proven_bool = match (
-                        op,
-                        lhs_bool,
-                        right.bool_value.or(right.proven_bool),
-                    ) {
+                    expr.proven_bool = match (op, lhs_bool, right.bool_value.or(right.proven_bool))
+                    {
                         (BinOp::And, Some(false), _) | (BinOp::And, _, Some(false)) => Some(false),
                         (BinOp::Or, Some(true), _) | (BinOp::Or, _, Some(true)) => Some(true),
                         (BinOp::And, Some(left), Some(right)) => Some(left && right),
@@ -1383,8 +1378,8 @@ impl Interp<'_> {
                         // factor path must still see), never a spelling
                         // the lattice chose, so the split keeps the
                         // reference behavior there.
-                        let unspellable_tested = tested.base == Base::Unknown
-                            && !self.ops.is_resolved_seam();
+                        let unspellable_tested =
+                            tested.base == Base::Unknown && !self.ops.is_resolved_seam();
                         let promoted = if invalid_tested || unspellable_tested {
                             None
                         } else {
@@ -1396,10 +1391,7 @@ impl Interp<'_> {
                                 self.current.clone().set_unreachable(&mut self.reach),
                             )
                         } else if unspellable_tested {
-                            (
-                                self.current.clone(),
-                                self.current.clone(),
-                            )
+                            (self.current.clone(), self.current.clone())
                         } else {
                             self.branch_type_test(var, tested, tested_args, promoted)
                         };
@@ -1446,11 +1438,11 @@ impl Interp<'_> {
                         let cur = self.current.clone();
                         expr.branches = Some((cur.clone(), cur));
                     } else {
-                        let invalid_tested = self
-                            .ops
-                            .is_invalid_typed(tested, tested_args, self.args, self.names);
-                        let unspellable_tested = tested.base == Base::Unknown
-                            && !self.ops.is_resolved_seam();
+                        let invalid_tested =
+                            self.ops
+                                .is_invalid_typed(tested, tested_args, self.args, self.names);
+                        let unspellable_tested =
+                            tested.base == Base::Unknown && !self.ops.is_resolved_seam();
                         let promoted = if invalid_tested || unspellable_tested {
                             None
                         } else {
@@ -1462,10 +1454,7 @@ impl Interp<'_> {
                                 self.current.clone().set_unreachable(&mut self.reach),
                             )
                         } else if unspellable_tested {
-                            (
-                                self.current.clone(),
-                                self.current.clone(),
-                            )
+                            (self.current.clone(), self.current.clone())
                         } else {
                             self.branch_prop_type_test(slot, tested, tested_args, promoted)
                         };
@@ -1765,19 +1754,20 @@ impl Interp<'_> {
                     && self.dead.is_none()
                     && self.arm_dead_depth == 0
                     && !self.stmt_began_dead
-                    && self
-                        .exprs
-                        .last()
-                        .is_some_and(|left| {
-                            self.classify(left.ty) == Classification::NonNullable
-                                || left.non_null_literal
-                        });
+                    && self.exprs.last().is_some_and(|left| {
+                        self.classify(left.ty) == Classification::NonNullable
+                            || left.non_null_literal
+                    });
                 // The `??=` skip-path snapshot (official
                 // `ifNullExpression_rightBegin`'s split, flattened): the
                 // RHS runs inline below, so the live pre-RHS state is
                 // parked here for the exiting-RHS restore at the write.
-                self.if_null_skips
-                    .push((op.range.end(), self.current.clone(), rhs_dead_entry, None));
+                self.if_null_skips.push((
+                    op.range.end(),
+                    self.current.clone(),
+                    rhs_dead_entry,
+                    None,
+                ));
                 if rhs_dead_entry {
                     self.unreachable_cur();
                 }
@@ -1811,8 +1801,7 @@ impl Interp<'_> {
                 // a dead window the exit's polls opened inside the RHS
                 // drops with a live restore — that path was never dead.
                 if *if_null
-                    && let Some((_, skip, rhs_dead_entry, operand_start)) =
-                        self.if_null_skips.pop()
+                    && let Some((_, skip, rhs_dead_entry, operand_start)) = self.if_null_skips.pop()
                     && !self.reachable()
                 {
                     if rhs_dead_entry {
@@ -2266,9 +2255,8 @@ impl Interp<'_> {
                 // dead node, anchored at its head token, and the arms fold
                 // into that interval (`flowEnd(arm)` early-returns while
                 // `_firstDeadNode` sits outside it).
-                let cond_began_dead = self.stmt_began_dead
-                    || self.arm_dead_depth > 0
-                    || self.dead.is_some();
+                let cond_began_dead =
+                    self.stmt_began_dead || self.arm_dead_depth > 0 || self.dead.is_some();
                 let parent_live = !cond_began_dead;
                 if parent_live && !self.reachable() {
                     let head = cond.read_span.or(cond.callee_span);
@@ -2280,8 +2268,7 @@ impl Interp<'_> {
                 // (the arm itself is then the official first dead node); a
                 // dead-parent arm inherits and folds into the enclosing
                 // interval — no count, no row.
-                let then_dead_entry =
-                    parent_live && !self.reach.overall_reachable(if_true.reach);
+                let then_dead_entry = parent_live && !self.reach.overall_reachable(if_true.reach);
                 self.stack.push(Frame::Cond {
                     branch: if_false,
                     then_state: None,
@@ -2350,8 +2337,7 @@ impl Interp<'_> {
                 }) = self.stack.last_mut()
                 {
                     *then_state = Some(self.current.clone());
-                    *else_dead_entry =
-                        *parent_live && !self.reach.overall_reachable(branch.reach);
+                    *else_dead_entry = *parent_live && !self.reach.overall_reachable(branch.reach);
                     self.current = branch.clone();
                     // The else arm entered dead too: its own close row
                     // reports at `CondEnd` and interior polls fold the
@@ -2735,24 +2721,23 @@ impl Interp<'_> {
                             // the consumer's identity key. A non-`this`
                             // receiver is always a body-declared local,
                             // and every declaration carries its anchor.
-                            let receiver = if receiver == THIS_RECEIVER
-                                || receiver == SUPER_RECEIVER
-                            {
-                                // `SuperPropertyTarget` has no
-                                // [`PropReceiver`] variant — the tag only
-                                // identifies the receiver KIND for the
-                                // context face, and the consumer resolves
-                                // the member through the merge record's
-                                // `Receiver::Super` walk anyway, so the
-                                // keyword face is the honest spelling.
-                                PropReceiver::This
-                            } else {
-                                PropReceiver::Local(
-                                    self.vars[receiver as usize]
-                                        .decl_span
-                                        .expect("receiver local carries its declaration span"),
-                                )
-                            };
+                            let receiver =
+                                if receiver == THIS_RECEIVER || receiver == SUPER_RECEIVER {
+                                    // `SuperPropertyTarget` has no
+                                    // [`PropReceiver`] variant — the tag only
+                                    // identifies the receiver KIND for the
+                                    // context face, and the consumer resolves
+                                    // the member through the merge record's
+                                    // `Receiver::Super` walk anyway, so the
+                                    // keyword face is the honest spelling.
+                                    PropReceiver::This
+                                } else {
+                                    PropReceiver::Local(
+                                        self.vars[receiver as usize]
+                                            .decl_span
+                                            .expect("receiver local carries its declaration span"),
+                                    )
+                                };
                             self.emit(FlowFact::NonPromotedPropertyRead {
                                 span: member_span,
                                 name: field,
@@ -2895,7 +2880,9 @@ impl Interp<'_> {
                 // this exit at the send's `)`; re-running it here would
                 // move `exit_at` back over the member name.
                 if !post_send_tile
-                    && self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                    && self
+                        .ops
+                        .is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
                 {
                     // The same pre-exit capture the `Ident` arm keeps: a
                     // member read rooted in an identifier (`a.f`, `this.f`,
@@ -3127,7 +3114,9 @@ impl Interp<'_> {
                     // `Ev::Exit` for the resolved sends it tracks; this
                     // face covers the ones only the flow layer re-typed
                     // (a staged `Never` return adopted above).
-                    if self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                    if self
+                        .ops
+                        .is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
                         && let Ev::Send { end, .. } | Ev::SendNoArgs { end } = ev
                     {
                         // The identifier-rooted member read's pre-exit
@@ -3250,11 +3239,9 @@ impl Interp<'_> {
                     .last()
                     .and_then(|arg| arg.read_span.or(arg.callee_span))
                     .or_else(|| {
-                        let start = events[..i]
-                            .iter()
-                            .rposition(|ev| {
-                                matches!(ev, Ev::ArgumentEnd | Ev::ArgumentsBegin { .. })
-                            })?;
+                        let start = events[..i].iter().rposition(|ev| {
+                            matches!(ev, Ev::ArgumentEnd | Ev::ArgumentsBegin { .. })
+                        })?;
                         let region = &events[start + 1..i];
                         // A `throw` argument is its own death (official
                         // `parseThrowExpression` — the argument was live
@@ -3268,9 +3255,7 @@ impl Interp<'_> {
                     });
                 if let Some(arg_span) = arg_span
                     && !self.reachable()
-                    && !self
-                        .exit_at
-                        .is_some_and(|at| at >= arg_span.range.offset)
+                    && !self.exit_at.is_some_and(|at| at >= arg_span.range.offset)
                     && !self
                         .null_shorts
                         .last()
@@ -3506,10 +3491,8 @@ impl Interp<'_> {
                     // there and the `?..` poll below runs only for the
                     // reachability receivers (`null` literals, `Null`-typed
                     // and `Never`-typed reads).
-                    let (head_dead, head_unassigned) = self
-                        .null_shorts
-                        .last_mut()
-                        .map_or((false, false), |short| {
+                    let (head_dead, head_unassigned) =
+                        self.null_shorts.last_mut().map_or((false, false), |short| {
                             short.cascade_head = true;
                             (short.dead_at_open, short.unassigned_receiver)
                         });
@@ -3541,10 +3524,9 @@ impl Interp<'_> {
                         events.get(i.wrapping_add(1)),
                         Some(Ev::Send { .. } | Ev::SendNoArgs { .. } | Ev::ArgumentsBegin { .. })
                     );
-                    if head_dead && !head_unassigned && !self.stmt_began_dead && !recovered_section {
-                        if let Some(Ev::ParenBegin { span }) =
-                            events.get(i.wrapping_sub(1))
-                        {
+                    if head_dead && !head_unassigned && !self.stmt_began_dead && !recovered_section
+                    {
+                        if let Some(Ev::ParenBegin { span }) = events.get(i.wrapping_sub(1)) {
                             self.dead_code(*span);
                         }
                     }
@@ -3647,20 +3629,19 @@ impl Interp<'_> {
                             let history = self.current.prop(slot).history;
                             if history != crate::model::NIL {
                                 let entries = self.intern_non_promotion(None, history);
-                                let prop_receiver = if receiver == THIS_RECEIVER
-                                    || receiver == SUPER_RECEIVER
-                                {
-                                    // Same fold as `Ev::DotAccess`'s emit:
-                                    // `SuperPropertyTarget` spells the
-                                    // keyword receiver tag.
-                                    PropReceiver::This
-                                } else {
-                                    PropReceiver::Local(
-                                        self.vars[receiver as usize]
-                                            .decl_span
-                                            .expect("receiver local carries its declaration span"),
-                                    )
-                                };
+                                let prop_receiver =
+                                    if receiver == THIS_RECEIVER || receiver == SUPER_RECEIVER {
+                                        // Same fold as `Ev::DotAccess`'s emit:
+                                        // `SuperPropertyTarget` spells the
+                                        // keyword receiver tag.
+                                        PropReceiver::This
+                                    } else {
+                                        PropReceiver::Local(
+                                            self.vars[receiver as usize].decl_span.expect(
+                                                "receiver local carries its declaration span",
+                                            ),
+                                        )
+                                    };
                                 self.emit(FlowFact::NonPromotedPropertyRead {
                                     span,
                                     name: field,
@@ -3851,9 +3832,8 @@ impl Interp<'_> {
                 // (`[if (never()) y]` — the condition's own exit) leaves a
                 // LIVE parent and the then-element is the official's
                 // first dead node.
-                let cond_began_dead = self.stmt_began_dead
-                    || self.arm_dead_depth > 0
-                    || self.dead.is_some();
+                let cond_began_dead =
+                    self.stmt_began_dead || self.arm_dead_depth > 0 || self.dead.is_some();
                 let parent_live = !cond_began_dead;
                 // The element itself is the official's first dead node
                 // when its own condition killed the walk (`[f(n, if (c)
@@ -3876,8 +3856,7 @@ impl Interp<'_> {
                 // drops at `ElseControlFlow`. A dead-parent element's
                 // deadness is inherited — it folds into the enclosing
                 // interval and reports nothing of its own.
-                let then_dead_entry =
-                    parent_live && !self.reach.overall_reachable(if_true.reach);
+                let then_dead_entry = parent_live && !self.reach.overall_reachable(if_true.reach);
                 if then_dead_entry {
                     self.arm_dead_depth += 1;
                 }
@@ -3942,10 +3921,7 @@ impl Interp<'_> {
                     // way the then-element's did (only a live parent makes
                     // it an owned dead arm).
                     let else_dead_entry = !self.reach.overall_reachable(branch.reach)
-                        && self
-                            .coll_if
-                            .last()
-                            .is_some_and(|frame| frame.parent_live);
+                        && self.coll_if.last().is_some_and(|frame| frame.parent_live);
                     if else_dead_entry {
                         self.arm_dead_depth += 1;
                     }
@@ -4160,9 +4136,7 @@ impl Interp<'_> {
                     )
                 };
                 let promoted = self.promotion_step(tested, tested_args, previous, previous_args);
-                promoted.or_else(|| {
-                    self.type_parameter_promotion(previous, tested, tested_args)
-                })
+                promoted.or_else(|| self.type_parameter_promotion(previous, tested, tested_args))
             }
         }
     }
@@ -4203,10 +4177,14 @@ impl Interp<'_> {
         let boundary = self.boundaries.get(id as usize).copied().flatten()?;
         let (bound, bound_args) = boundary.bound;
         // `S <: U` — the official promotion gate (:1756-1757).
-        if !self
-            .ops
-            .is_subtype_typed(tested, tested_args, bound, bound_args, self.args, self.names)
-        {
+        if !self.ops.is_subtype_typed(
+            tested,
+            tested_args,
+            bound,
+            bound_args,
+            self.args,
+            self.names,
+        ) {
             return None;
         }
         // `isValidPromotionStep` (`flow_analysis.dart:5989-6007`): the
@@ -4736,8 +4714,7 @@ impl Interp<'_> {
             expr.bool_value = Some(!inverted);
             expr.branches = None;
         } else if self.sound_flow
-            && ((left_null && value_non_null(right))
-                || (right_null && value_non_null(left)))
+            && ((left_null && value_non_null(right)) || (right_null && value_non_null(left)))
         {
             // Disjoint by nullability: known not-equal — `==` kills the
             // then-branch, `!=` the else-branch. The verdict is

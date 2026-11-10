@@ -93,7 +93,10 @@ fn member_formal(
     // pool — the same pool `member_recv_env` reads the written arguments
     // and `substitute_formals` interns the substituted table through.
     let ty = recv_ty_args.map(|args| {
-        let args: Vec<Ty> = args.iter().map(|arg| Ty::named(strings.intern(arg))).collect();
+        let args: Vec<Ty> = args
+            .iter()
+            .map(|arg| Ty::named(strings.intern(arg)))
+            .collect();
         engine
             .boundary
             .args

@@ -241,7 +241,8 @@ fn ticket_3780_argument_conditional_void() {
 #[test]
 #[ignore = "held: parenthesized void-local argument — same `)`-group inner resolve in check_arguments (invocation.rs:~13521); do-not-touch file"]
 fn ticket_3780_argument_parenthesized_void_local() {
-    let fixture = "void use(Object? x) {}\nvoid v() {}\nvoid g() {\n  void x = v();\n  use((x));\n}";
+    let fixture =
+        "void use(Object? x) {}\nvoid v() {}\nvoid g() {\n  void x = v();\n  use((x));\n}";
     let report = report_ops(fixture);
     // The argument expression is `(x)` (the `use(` call's own parens are
     // the send's, not the operand's).

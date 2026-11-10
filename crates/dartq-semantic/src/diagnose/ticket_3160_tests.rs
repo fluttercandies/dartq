@@ -146,8 +146,7 @@ fn null_aware_element_reports() {
         vec![(
             28,
             1,
-            "The element can't be null, so the null-aware operator '?' is unnecessary."
-                .to_string()
+            "The element can't be null, so the null-aware operator '?' is unnecessary.".to_string()
         )]
     );
 }

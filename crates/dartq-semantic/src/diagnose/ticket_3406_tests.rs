@@ -128,9 +128,7 @@ fn t3406_tear_off_receiver_still_reports() {
 /// at worst the member face stays undecided and the access is silent.
 #[test]
 fn t3406_call_result_function_type_is_never_the_callee() {
-    let report = report_ops(
-        "void test(int Function() Function(int) make) { make(1).gone; }",
-    );
+    let report = report_ops("void test(int Function() Function(int) make) { make(1).gone; }");
     assert!(
         code_names(&report)
             .iter()

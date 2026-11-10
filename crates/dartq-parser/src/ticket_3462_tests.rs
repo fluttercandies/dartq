@@ -66,12 +66,7 @@ fn rows_at(source: &'static str, major: u32, minor: u32) -> BTreeSet<(String, u3
     rows
 }
 
-fn assert_rows_at(
-    source: &'static str,
-    major: u32,
-    minor: u32,
-    expected: &[(&str, u32, u32)],
-) {
+fn assert_rows_at(source: &'static str, major: u32, minor: u32, expected: &[(&str, u32, u32)]) {
     let expected: BTreeSet<(String, u32, u32)> = expected
         .iter()
         .map(|(c, s, e)| ((*c).to_owned(), *s, *e))
@@ -88,7 +83,12 @@ fn class_modifiers_reports_below_three_zero() {
     // Oracle 3.13.1 at @dart=2.19: `base class CM {}` reports exactly
     // `experiment_not_enabled` at `base` (1:1 len 4); the modifier is
     // dropped and the class parses clean.
-    assert_rows_at("base class CM {}\n", 2, 19, &[("experiment_not_enabled", 0, 4)]);
+    assert_rows_at(
+        "base class CM {}\n",
+        2,
+        19,
+        &[("experiment_not_enabled", 0, 4)],
+    );
     // Post-boundary: silent.
     assert_rows_at("base class CM {}\n", 3, 15, &[]);
 }
@@ -111,7 +111,12 @@ fn records_report_below_three_zero() {
     // Oracle 3.13.1 at @dart=2.19: `var rec = (1, 2);` reports once at
     // the `(` (1:11 len 1); the node degrades to the parenthesized
     // shape with no further rows.
-    assert_rows_at("var rec = (1, 2);\n", 2, 19, &[("experiment_not_enabled", 10, 11)]);
+    assert_rows_at(
+        "var rec = (1, 2);\n",
+        2,
+        19,
+        &[("experiment_not_enabled", 10, 11)],
+    );
     assert_rows_at("var rec = (1, 2);\n", 3, 15, &[]);
 }
 
@@ -119,7 +124,12 @@ fn records_report_below_three_zero() {
 fn digit_separators_report_below_three_six() {
     // Oracle 3.13.1 at @dart=3.5: `var ds = 1_000;` reports at the
     // literal (1:10 len 5).
-    assert_rows_at("var ds = 1_000;\n", 3, 5, &[("experiment_not_enabled", 9, 14)]);
+    assert_rows_at(
+        "var ds = 1_000;\n",
+        3,
+        5,
+        &[("experiment_not_enabled", 9, 14)],
+    );
     assert_rows_at("var ds = 1_000;\n", 3, 15, &[]);
 }
 

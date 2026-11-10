@@ -8,7 +8,7 @@
 //! carries the oracle's own answer (dart analyze 3.13.7,
 //! `--format=machine`).
 
-use super::test_rig::{code_names, report_ops_imports, rows, RigImport};
+use super::test_rig::{RigImport, code_names, report_ops_imports, rows};
 
 /// The co19 `Expect.throws` face verbatim: a class-static send whose
 /// optional `check` formal spells a PRIVATE function typedef of the

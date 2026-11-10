@@ -25,7 +25,7 @@
 //!   .isIdentifier` — a reserved keyword (`class`) takes the URI form and
 //!   reports `expectedString` at the keyword.
 
-use super::collector::{latest_features, scan_ok, Collector};
+use super::collector::{Collector, latest_features, scan_ok};
 
 /// `(code, start, end)` parser rows for `source` under latest features.
 fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {
@@ -263,19 +263,34 @@ fn library_name_tails() {
     assert!(rows_with("library\n").contains(&("expected_token".to_string(), 0, 7)));
 
     let rows = rows_with("library ==\n");
-    assert!(rows.contains(&("missing_identifier".to_string(), 8, 10)), "{rows:?}");
-    assert!(rows.contains(&("expected_token".to_string(), 8, 10)), "{rows:?}");
+    assert!(
+        rows.contains(&("missing_identifier".to_string(), 8, 10)),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("expected_token".to_string(), 8, 10)),
+        "{rows:?}"
+    );
 
     let rows = rows_with("library a.\n");
-    assert!(rows.contains(&("missing_identifier".to_string(), 11, 11)), "{rows:?}");
-    assert!(rows.contains(&("expected_token".to_string(), 9, 10)), "{rows:?}");
+    assert!(
+        rows.contains(&("missing_identifier".to_string(), 11, 11)),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("expected_token".to_string(), 9, 10)),
+        "{rows:?}"
+    );
 
     let rows = rows_with("library class\n");
     assert!(
         rows.contains(&("expected_identifier_but_got_keyword".to_string(), 8, 13)),
         "{rows:?}"
     );
-    assert!(rows.contains(&("expected_token".to_string(), 8, 13)), "{rows:?}");
+    assert!(
+        rows.contains(&("expected_token".to_string(), 8, 13)),
+        "{rows:?}"
+    );
 
     let rows = rows_with("library import\n");
     assert!(
@@ -284,7 +299,10 @@ fn library_name_tails() {
         }),
         "`import` consumes silently as the name, got {rows:?}"
     );
-    assert!(rows.contains(&("expected_token".to_string(), 8, 14)), "{rows:?}");
+    assert!(
+        rows.contains(&("expected_token".to_string(), 8, 14)),
+        "{rows:?}"
+    );
 }
 
 /// `part of` tails (`parsePartOf` :1315): junk and reserved keywords take
@@ -323,10 +341,18 @@ fn part_of_tails() {
     );
 
     let rows = rows_with("part of 'a'\n");
-    assert_eq!(rows, vec![("expected_token".to_string(), 8, 11)], "{rows:?}");
+    assert_eq!(
+        rows,
+        vec![("expected_token".to_string(), 8, 11)],
+        "{rows:?}"
+    );
 
     let rows = rows_with("part of a.b\n");
-    assert_eq!(rows, vec![("expected_token".to_string(), 10, 11)], "{rows:?}");
+    assert_eq!(
+        rows,
+        vec![("expected_token".to_string(), 10, 11)],
+        "{rows:?}"
+    );
 }
 
 /// Import tails: bare `import` (string at EOF 7, `;` on the keyword

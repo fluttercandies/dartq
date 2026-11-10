@@ -80,7 +80,7 @@ impl TypeParamOrArg {
             // `skipEndGroup` returns the split leading `>` (the compound's
             // position) and the remainder follows it.
             TypeParamOrArg::Simple1 { closer } => *closer != SimpleCloser::Gt,
-                    TypeParamOrArg::Complex(g) => g.end_raw_compound || g.end_eq_shared,
+            TypeParamOrArg::Complex(g) => g.end_raw_compound || g.end_eq_shared,
             TypeParamOrArg::None => false,
         }
     }
@@ -657,7 +657,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // Stopped at the closer directly: a compound closer's
                     // leading `>` is this group's own (raw); it is never
                     // shared with enclosing groups.
-                    return Some((self.real_id(scan), recovered, is_compound_closer(here), false));
+                    return Some((
+                        self.real_id(scan),
+                        recovered,
+                        is_compound_closer(here),
+                        false,
+                    ));
                 }
                 // Official computeType(required) recovery: `var` as a type
                 // entry, accepted before `<`/`,`/`>` (type_info.dart:210-217,
@@ -1146,7 +1151,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// [`TYPE_DEPTH_CRASH_GUARD`] stack discipline: the group probe recurses
     /// once per type-nesting level, mirroring the official unguarded
     /// `computeType` descent.
-    pub(crate) fn skip_type_len_in(&self, offset: usize, in_declaration: bool, depth: u32) -> usize {
+    pub(crate) fn skip_type_len_in(
+        &self,
+        offset: usize,
+        in_declaration: bool,
+        depth: u32,
+    ) -> usize {
         if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
             return 0;
         }
@@ -1193,7 +1203,11 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 match self.cursor.table_matching_end(self.real_id(offset)) {
                     Some(end) if !self.cursor.resolve(end).1 => {
                         if !in_declaration
-                            && !self.record_type_fields_valid(offset, self.offset_of(end), depth + 1)
+                            && !self.record_type_fields_valid(
+                                offset,
+                                self.offset_of(end),
+                                depth + 1,
+                            )
                         {
                             return 0;
                         }
@@ -1720,8 +1734,8 @@ impl ComplexTypeParamOrArg {
             // `>`-cascade is silenced (`void b<super int>() {}` carries only
             // the `missing_identifier` row). A recovered bound counts as the
             // group's row the same way.
-            let cascade_reported = bound_recovered
-                || starts.last().is_some_and(|s| s.range.length == 0);
+            let cascade_reported =
+                bound_recovered || starts.last().is_some_and(|s| s.range.length == 0);
             parser.parse_type_args_unexpected_end(self.in_declaration, cascade_reported, begin)
         };
         parser.listener.end_type_variables(begin, end);

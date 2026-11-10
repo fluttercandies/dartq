@@ -121,8 +121,7 @@ pub fn analyze(request: &Request) -> Outcome {
             sdk: Some(sdk),
         };
     }
-    let roots: Result<Vec<PathBuf>, _> =
-        request.roots.iter().map(std::fs::canonicalize).collect();
+    let roots: Result<Vec<PathBuf>, _> = request.roots.iter().map(std::fs::canonicalize).collect();
     let Ok(mut roots) = roots else {
         return Outcome::PerRun {
             reason: None,
@@ -191,9 +190,7 @@ pub fn analyze(request: &Request) -> Outcome {
                     // `Unavailable` are one path. A yielded pooled server
                     // is the same: the worktree's own daemon re-queues
                     // the job.
-                    Some(PoolAnswer::Unavailable) | None => {
-                        ask_gated(&own, &aims, face.as_ref())
-                    }
+                    Some(PoolAnswer::Unavailable) | None => ask_gated(&own, &aims, face.as_ref()),
                 }
             }
         } else {
@@ -246,7 +243,10 @@ fn up(dir: &Path) -> bool {
 enum Answered {
     Report(Report),
     /// The face answer's payload and counts.
-    Face { stdout: Vec<u8>, meta: FaceMeta },
+    Face {
+        stdout: Vec<u8>,
+        meta: FaceMeta,
+    },
     Budget(String),
     Cooling,
     /// The aims fall outside the daemon's one analysis context (a
@@ -314,7 +314,10 @@ fn ask_gated(spec: &Spec, aims: &[crate::Aim], face: Option<&Face>) -> Result<An
 #[cfg(unix)]
 enum PoolAnswer {
     Report(Report),
-    Face { stdout: Vec<u8>, meta: FaceMeta },
+    Face {
+        stdout: Vec<u8>,
+        meta: FaceMeta,
+    },
     Budget(String),
     /// No pooled serving happened: the join was refused at capacity, the
     /// pooled daemon never materialized, or the aims are not the pool's
@@ -480,14 +483,14 @@ fn start(spec: &Spec, dir: &Path, files: &Files) -> Result<std::os::unix::net::U
     // it. The cmdline match guards pid reuse — a recycled pid that now
     // names an unrelated process is never signaled; only this directory's
     // own `--resident-serve` daemon qualifies.
-    let dir_name = dir.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let dir_name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
     if let Some(pid) = std::fs::read_to_string(&files.state)
         .ok()
         .and_then(|pid| pid.trim().parse().ok())
-        && dartq_toolchain::proc::alive_and_cmdline(
-            pid,
-            &[crate::SERVE_FLAG, dir_name],
-        )
+        && dartq_toolchain::proc::alive_and_cmdline(pid, &[crate::SERVE_FLAG, dir_name])
     {
         dartq_toolchain::proc::kill_tree(pid);
     }
@@ -557,11 +560,7 @@ mod tests {
             None,
             "an over-cap announcement is refused before any allocation or read"
         );
-        assert_eq!(
-            refusing.position(),
-            0,
-            "a refused read consumes nothing"
-        );
+        assert_eq!(refusing.position(), 0, "a refused read consumes nothing");
 
         let payload = b"{v:1 diags:[]}\n".to_vec();
         let mut honest = Cursor::new(payload.clone());

@@ -45,7 +45,11 @@ void main() {
     assert!(
         rows.is_empty(),
         "{:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, &d.message)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -70,9 +74,16 @@ void main() {
 "#;
     let report = report_ops(source);
     assert!(
-        !report.diagnostics.iter().any(|d| d.code.name == "could_not_infer"),
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.name == "could_not_infer"),
         "{:?}",
-        report.diagnostics.iter().map(|d| (d.code.name, &d.message)).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 

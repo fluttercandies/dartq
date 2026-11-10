@@ -37,19 +37,32 @@ fn uf_field_formal_fires() {
     assert_eq!(rows.len(), 1, "{report:?}");
     assert_eq!(rows[0].severity, Severity::Warning);
     let at = main.find("final this").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 5 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 5
+        }
+    );
 }
 
 /// `final super.x` reports at the `final` keyword (upstream
 /// `visitSuperFormalParameter` → `_checkFinalParameter`).
 #[test]
 fn uf_super_formal_fires() {
-    let main = "class A {\n  final int x;\n  A(this.x);\n}\nclass B extends A {\n  B(final super.x);\n}\n";
+    let main =
+        "class A {\n  final int x;\n  A(this.x);\n}\nclass B extends A {\n  B(final super.x);\n}\n";
     let report = report_ops_bare(main);
     let rows = rows_named(&report, "unnecessary_final");
     assert_eq!(rows.len(), 1, "{report:?}");
     let at = main.find("final super").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 5 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 5
+        }
+    );
 }
 
 // —— silent arms: every other `final` inside a formal list ——————————————
@@ -135,5 +148,11 @@ fn uf_body_ctor_still_fires() {
     let rows = rows_named(&report, "unnecessary_final");
     assert_eq!(rows.len(), 1, "{report:?}");
     let at = main.find("final this").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 5 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 5
+        }
+    );
 }

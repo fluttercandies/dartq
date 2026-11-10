@@ -25,7 +25,11 @@ use super::test_rig::report_ops;
 use super::*;
 
 fn codes(folded: &FileReport) -> Vec<&str> {
-    folded.diagnostics.iter().map(|diag| diag.code.name).collect()
+    folded
+        .diagnostics
+        .iter()
+        .map(|diag| diag.code.name)
+        .collect()
 }
 
 /// Drops the `undefined_method` rows the rig's minimal `int`/`double`
@@ -57,14 +61,16 @@ const INDEX_CLASS: &str = "class A {\n\
 /// `argument_type_not_assignable` 'num' => 'int' at the index argument.
 #[test]
 fn compound_index_argument_reports_write_formal() {
-    let folded = report_ops(&format!(
-        "{INDEX_CLASS}void f(A a) {{\n  a[g()]++;\n}}\n"
-    ));
+    let folded = report_ops(&format!("{INDEX_CLASS}void f(A a) {{\n  a[g()]++;\n}}\n"));
     assert_eq!(
         codes(&folded),
         vec!["argument_type_not_assignable"],
         "`a[g()]++` infers `num` from the `[]` formal and rejects against `[]=`'s `int`: {:?}",
-        folded.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        folded
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -87,9 +93,7 @@ fn compound_index_assign_reports_write_formal() {
 /// `checkIndexExpressionIndex`'s `writeElement: null` arm).
 #[test]
 fn pure_read_index_argument_stays_silent() {
-    let folded = report_ops(&format!(
-        "{INDEX_CLASS}void f(A a) {{\n  a[g()];\n}}\n"
-    ));
+    let folded = report_ops(&format!("{INDEX_CLASS}void f(A a) {{\n  a[g()];\n}}\n"));
     assert_eq!(
         codes(&folded),
         Vec::<&str>::new(),
@@ -104,9 +108,7 @@ fn pure_read_index_argument_stays_silent() {
 /// over-report.
 #[test]
 fn pure_write_index_argument_infers_setter_formal() {
-    let folded = report_ops(&format!(
-        "{INDEX_CLASS}void f(A a) {{\n  a[g()] = 0;\n}}\n"
-    ));
+    let folded = report_ops(&format!("{INDEX_CLASS}void f(A a) {{\n  a[g()] = 0;\n}}\n"));
     assert_eq!(
         codes(&folded),
         Vec::<&str>::new(),

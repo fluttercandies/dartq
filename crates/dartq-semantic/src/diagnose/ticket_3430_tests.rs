@@ -73,7 +73,11 @@ void g(A x) {\n\
         report
             .diagnostics
             .iter()
-            .map(|row| (row.code.name.to_string(), row.range.offset, row.range.length))
+            .map(|row| (
+                row.code.name.to_string(),
+                row.range.offset,
+                row.range.length
+            ))
             .collect::<Vec<_>>()
     );
 }
@@ -95,7 +99,10 @@ void g(A x) {\n\
 \x20   x._f.isEven;\n\
 \x20 }\n\
 }\n";
-    assert_eq!(rows_of(source, "undefined_getter"), vec![at(source, "isEven")]);
+    assert_eq!(
+        rows_of(source, "undefined_getter"),
+        vec![at(source, "isEven")]
+    );
 }
 
 /// `this._f` inside the declaring class body promotes through the bare
@@ -120,7 +127,11 @@ class A {\n\
         report
             .diagnostics
             .iter()
-            .map(|row| (row.code.name.to_string(), row.range.offset, row.range.length))
+            .map(|row| (
+                row.code.name.to_string(),
+                row.range.offset,
+                row.range.length
+            ))
             .collect::<Vec<_>>()
     );
 }
@@ -150,7 +161,11 @@ extension E on A {\n\
         report
             .diagnostics
             .iter()
-            .map(|row| (row.code.name.to_string(), row.range.offset, row.range.length))
+            .map(|row| (
+                row.code.name.to_string(),
+                row.range.offset,
+                row.range.length
+            ))
             .collect::<Vec<_>>()
     );
 }
@@ -214,7 +229,11 @@ void g(A x) {\n\
         report
             .diagnostics
             .iter()
-            .map(|row| (row.code.name.to_string(), row.range.offset, row.range.length))
+            .map(|row| (
+                row.code.name.to_string(),
+                row.range.offset,
+                row.range.length
+            ))
             .collect::<Vec<_>>()
     );
 }

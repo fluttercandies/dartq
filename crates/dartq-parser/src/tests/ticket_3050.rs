@@ -33,7 +33,10 @@ fn rows_with(source: &'static str) -> Vec<(String, u32, u32)> {
 #[test]
 fn clean_mixin_on_is_silent() {
     let rows = rows_with("mixin O on A {}\n");
-    assert!(rows.is_empty(), "clean `mixin O on A {{}}` must be silent, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "clean `mixin O on A {{}}` must be silent, got {rows:?}"
+    );
 }
 
 /// The valid two-clause header `mixin M on A implements B {}` (oracle: zero
@@ -68,7 +71,8 @@ fn on_clause_builtin_type_junk_clears_to_body() {
         "the body must be found, no expected_body collapse, got {rows:?}"
     );
     assert!(
-        !rows.iter()
+        !rows
+            .iter()
             .any(|(code, _, _)| code == "missing_function_parameters"),
         "no member reparse collapse, got {rows:?}"
     );
@@ -99,7 +103,8 @@ fn on_clause_reserved_word_survives_recovery() {
         "recovery must not skip a keyword junk token, got {rows:?}"
     );
     assert!(
-        !rows.iter()
+        !rows
+            .iter()
             .any(|(code, _, _)| code == "missing_function_parameters"),
         "no member reparse collapse, got {rows:?}"
     );
@@ -123,7 +128,10 @@ fn identifier_junk_before_body_is_skipped() {
 #[test]
 fn skipped_junk_feeds_second_on_duplicate_check() {
     let rows = rows_with("mixin W on A junk on B {}\n");
-    assert!(rows.contains(&("unexpected_token".into(), 13, 17)), "got {rows:?}");
+    assert!(
+        rows.contains(&("unexpected_token".into(), 13, 17)),
+        "got {rows:?}"
+    );
     assert!(
         rows.contains(&("multiple_on_clauses".into(), 18, 20)),
         "got {rows:?}"

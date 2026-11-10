@@ -129,9 +129,11 @@ const MEMBER_CHECK_CODES: &[&str] = &[
 /// `isNonSubtypableClass` resolved-element rule).
 #[test]
 fn disallowed_extends_clause_suppresses_member_checks() {
-    let report = report_ops_bare("class C extends Null {\n\
+    let report = report_ops_bare(
+        "class C extends Null {\n\
          \x20 void m(dynamic x) {}\n\
-         }\n");
+         }\n",
+    );
     let names = code_names(&report);
     assert!(
         names.contains(&"subtype_of_disallowed_type"),
@@ -149,9 +151,11 @@ fn disallowed_extends_clause_suppresses_member_checks() {
 /// return, no member rows.
 #[test]
 fn disallowed_implements_clause_suppresses_member_checks() {
-    let report = report_ops_bare("class C implements FutureOr {\n\
+    let report = report_ops_bare(
+        "class C implements FutureOr {\n\
          \x20 void m(dynamic x) {}\n\
-         }\n");
+         }\n",
+    );
     let names = code_names(&report);
     assert!(
         names.contains(&"subtype_of_disallowed_type"),
@@ -289,7 +293,12 @@ fn the_last_applied_mixin_wins_the_concrete_seat() {
     // discriminator is the ORDER alone: both members legal, the row count
     // must be zero (a forward-walk seat names M1's member — still silent —
     // but the seat identity below pins M2 via the breaking pair).
-    assert_eq!(rows(fixture, &report), Vec::<String>::new(), "{:?}", report.diagnostics);
+    assert_eq!(
+        rows(fixture, &report),
+        Vec::<String>::new(),
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// The breaking counterpart, upstream-faithful: `M2.m(String)` conflicts
@@ -356,9 +365,5 @@ fn the_last_applied_mixin_names_the_broken_concrete_seat() {
         .filter(|d| d.code.name == "invalid_implementation_override")
         .collect();
     assert_eq!(impls.len(), 1, "{:?}", report.diagnostics);
-    assert!(
-        impls[0].message.contains("M2.m"),
-        "{:?}",
-        impls[0].message
-    );
+    assert!(impls[0].message.contains("M2.m"), "{:?}", impls[0].message);
 }

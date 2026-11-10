@@ -58,7 +58,9 @@ fn bare_own_parameter_extension_bound_fires() {
     );
     assert_eq!(
         rows,
-        ["'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."],
+        [
+            "'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."
+        ],
     );
 }
 
@@ -101,7 +103,9 @@ fn function_alias_bound_prints_its_alias_head() {
     );
     assert_eq!(
         rows,
-        ["'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."],
+        [
+            "'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."
+        ],
     );
 }
 
@@ -122,7 +126,9 @@ fn generic_on_clause_binds_the_receiver_argument() {
     );
     assert_eq!(
         rows,
-        ["'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."],
+        [
+            "'Exactly<String>' doesn't conform to the bound 'Exactly<int>' of the type parameter 'R'."
+        ],
     );
 }
 

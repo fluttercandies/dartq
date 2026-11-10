@@ -76,4 +76,3 @@ fn for_element_condition_death_shares_the_condition_anchor() {
     );
     assert_eq!(&analyzed(source)[start..start + 10], "1); 2) 0];");
 }
-

@@ -133,12 +133,8 @@ impl<'a> Engine<'a> {
                 recv: Receiver::Prefix { name: prefix },
             } => {
                 if matches!(
-                    self.namespaces.lookup_prefixed(
-                        self.graph,
-                        self.lib,
-                        *prefix,
-                        row.name
-                    ),
+                    self.namespaces
+                        .lookup_prefixed(self.graph, self.lib, *prefix, row.name),
                     dartq_resolution::Lookup::Found(_)
                 ) {
                     OperandFace::Gap
@@ -396,10 +392,10 @@ impl<'a> Engine<'a> {
             | dartq_scanner::TokenKind::MinusMinus
             | dartq_scanner::TokenKind::Keyword(
                 dartq_scanner::Keyword::This
-                    | dartq_scanner::Keyword::Super
-                    | dartq_scanner::Keyword::True
-                    | dartq_scanner::Keyword::False
-                    | dartq_scanner::Keyword::Null,
+                | dartq_scanner::Keyword::Super
+                | dartq_scanner::Keyword::True
+                | dartq_scanner::Keyword::False
+                | dartq_scanner::Keyword::Null,
             ) => Some(tail),
             _ => None,
         }
@@ -683,19 +679,15 @@ impl<'a> Engine<'a> {
         // extension's `""` placeholder finds no named face — the
         // under-report posture stands there (the frame-latched rank the
         // resolved arm reads died with the row).
-        if tokens[tail].kind
-            == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::This)
+        if tokens[tail].kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::This)
             && let Some(container) = self.enclosing_container_at(span.offset)
         {
-            let is_extension = self
-                .index
-                .get(self.file)
-                .is_some_and(|elements| {
-                    elements
-                        .extension_faces()
-                        .iter()
-                        .any(|face| face.name == Some(container))
-                });
+            let is_extension = self.index.get(self.file).is_some_and(|elements| {
+                elements
+                    .extension_faces()
+                    .iter()
+                    .any(|face| face.name == Some(container))
+            });
             let kind = if is_extension {
                 ContainerKind::Extension
             } else {
@@ -762,8 +754,7 @@ impl<'a> Engine<'a> {
                 .binary_search_by(|r| r.range.offset.cmp(&recv_span.offset))
                 .ok()
                 .is_some_and(|i| {
-                    self.refs[i].range == recv_span
-                        && self.refs[i].target == RefTarget::Missing
+                    self.refs[i].range == recv_span && self.refs[i].target == RefTarget::Missing
                 })
             {
                 return None;
@@ -924,13 +915,17 @@ impl<'a> Engine<'a> {
                     Receiver::Typed { ty, .. } => Some(*ty),
                     Receiver::This { container, .. }
                     | Receiver::Super { container, .. }
-                    | Receiver::Container { name: container, .. }
+                    | Receiver::Container {
+                        name: container, ..
+                    }
                     | Receiver::Created {
                         name: container, ..
                     } => Some(Ty::named(*container)),
                     _ => None,
                 });
-            if let Some(Ty::Named { name: container, .. }) = recv_ty
+            if let Some(Ty::Named {
+                name: container, ..
+            }) = recv_ty
                 && let Walk::Found(entry) = self.walk_members(container, read.name)
             {
                 let ty = self.member_invoke_result(&entry);
@@ -1054,9 +1049,11 @@ impl<'a> Engine<'a> {
         ];
         out.iter()
             .any(|d| d.range.offset == offset && CODES.contains(&d.code.name))
-            || self.report.diagnostics.iter().any(|d| {
-                d.range.offset == offset && CODES.contains(&d.code.name)
-            })
+            || self
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.range.offset == offset && CODES.contains(&d.code.name))
     }
 
     /// Whether `probe` (the operand's tail-token span) names a bare read
@@ -1101,15 +1098,13 @@ impl<'a> Engine<'a> {
         self.refs
             .binary_search_by(|reference| reference.range.offset.cmp(&probe.offset))
             .ok()
-            .is_some_and(|index| {
-                match self.refs[index].target {
-                    RefTarget::Local
-                    | RefTarget::Member { .. }
-                    | RefTarget::Decl { .. }
-                    | RefTarget::Opaque => true,
-                    RefTarget::This => binary,
-                    _ => false,
-                }
+            .is_some_and(|index| match self.refs[index].target {
+                RefTarget::Local
+                | RefTarget::Member { .. }
+                | RefTarget::Decl { .. }
+                | RefTarget::Opaque => true,
+                RefTarget::This => binary,
+                _ => false,
             })
     }
 

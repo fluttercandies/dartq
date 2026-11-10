@@ -20,8 +20,8 @@
 //!   their parameter type testing under `makeNullable` while the message
 //!   keeps the declared spelling (resolver.dart:1703-1711, 1742-1744).
 
-use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, report_ops, rows};
 
 /// The prelude shifts every offset; the fixtures below are ASCII.
 fn prelude_len() -> u32 {

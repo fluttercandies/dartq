@@ -134,10 +134,7 @@ fn t3635_value_face_is_alias_spelled() {
 #[test]
 fn t3635_expansion_equal_targets_stay_silent() {
     let report = case_report();
-    for target in [
-        "F<G<A<dynamic>, A<Never>>>",
-        "F<G<A<Never>, A<Never>>>",
-    ] {
+    for target in ["F<G<A<dynamic>, A<Never>>>", "F<G<A<Never>, A<Never>>>"] {
         assert!(
             !report
                 .diagnostics

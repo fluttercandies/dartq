@@ -83,18 +83,12 @@ fn unannotated_extension_member_keeps_dynamic() {
 #[test]
 fn mismatch_inside_an_extension_member_reports_the_member_return() {
     for (fixture, expected) in [
-        (
-            "extension E on int {\n  String m() => 1;\n}\n",
-            "'String'",
-        ),
+        ("extension E on int {\n  String m() => 1;\n}\n", "'String'"),
         (
             "class C {}\nextension E on C {\n  String m() => 1;\n}\n",
             "'String'",
         ),
-        (
-            "extension E on String {\n  int m() => \"s\";\n}\n",
-            "'int'",
-        ),
+        ("extension E on String {\n  int m() => \"s\";\n}\n", "'int'"),
     ] {
         let (report, _) = run(fixture);
         let messages: Vec<String> = report
@@ -104,10 +98,7 @@ fn mismatch_inside_an_extension_member_reports_the_member_return() {
             .map(|d| d.message.to_string())
             .collect();
         assert_eq!(messages.len(), 1, "{fixture:?}: {messages:?}");
-        assert!(
-            messages[0].contains(expected),
-            "{fixture:?}: {messages:?}"
-        );
+        assert!(messages[0].contains(expected), "{fixture:?}: {messages:?}");
     }
 }
 
@@ -115,9 +106,7 @@ fn mismatch_inside_an_extension_member_reports_the_member_return() {
 /// become `bool`'s return, and `on C` does not become `C`'s.
 #[test]
 fn extension_operator_reports_its_own_annotation() {
-    let (report, _) = run(
-        "extension E on bool {\n  bool operator <(Object o) => \"s\";\n}\n",
-    );
+    let (report, _) = run("extension E on bool {\n  bool operator <(Object o) => \"s\";\n}\n");
     let messages: Vec<String> = report
         .diagnostics
         .iter()
@@ -127,9 +116,8 @@ fn extension_operator_reports_its_own_annotation() {
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(messages[0].contains("'bool'"), "{messages:?}");
 
-    let (report, full) = run(
-        "class C {}\nextension E on C {\n  int operator <(Object o) => \"s\";\n}\n",
-    );
+    let (report, full) =
+        run("class C {}\nextension E on C {\n  int operator <(Object o) => \"s\";\n}\n");
     assert_eq!(
         invalid_type_rows(&report, &full),
         vec![(
@@ -161,8 +149,7 @@ fn sibling_member_annotations_do_not_bleed() {
 /// type is no return annotation.
 #[test]
 fn extension_type_member_reports_its_own_return() {
-    let (report, _) =
-        run("extension type ET(int v) {\n  String m() => 1;\n}\n");
+    let (report, _) = run("extension type ET(int v) {\n  String m() => 1;\n}\n");
     let messages: Vec<String> = report
         .diagnostics
         .iter()

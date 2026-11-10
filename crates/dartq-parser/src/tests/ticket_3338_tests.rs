@@ -64,7 +64,12 @@ fn var_key_anchors_on_the_modifier() {
     let key = at(source, "var a: 2");
     assert_eq!(
         colon_rows(source),
-        vec![("expected_token".to_string(), key, key + 3, COLON.to_string())],
+        vec![(
+            "expected_token".to_string(),
+            key,
+            key + 3,
+            COLON.to_string()
+        )],
         "`{{var a: 2}}` must report the missing ':' on `var`, not on `a`"
     );
 }
@@ -75,7 +80,12 @@ fn final_key_anchors_on_the_modifier() {
     let key = at(source, "final int c: 2");
     assert_eq!(
         colon_rows(source),
-        vec![("expected_token".to_string(), key, key + 5, COLON.to_string())],
+        vec![(
+            "expected_token".to_string(),
+            key,
+            key + 5,
+            COLON.to_string()
+        )],
         "`{{final int c: 2}}` must report on `final`, not on `int`"
     );
 }
@@ -88,7 +98,12 @@ fn identifier_key_keeps_the_follower_anchor() {
     let key = at(source, "d: 2");
     assert_eq!(
         colon_rows(source),
-        vec![("expected_token".to_string(), key, key + 1, COLON.to_string())],
+        vec![(
+            "expected_token".to_string(),
+            key,
+            key + 1,
+            COLON.to_string()
+        )],
         "`{{int d: 2}}` must report on `d`"
     );
 }

@@ -22,7 +22,10 @@ use crate::diagnose::test_rig::{code_names, report_ops, report_ops_bare, rows};
 fn ticket_2935_non_bool_operand_unimplemented_codes() {
     let report = report_ops("void main() {\n  bool b = 1 && 0;\n  b;\n}");
     let names = code_names(&report);
-    assert!(names.iter().all(|name| *name == "non_bool_operand"), "{names:?}");
+    assert!(
+        names.iter().all(|name| *name == "non_bool_operand"),
+        "{names:?}"
+    );
     assert_eq!(names.len(), 2, "{:?}", rows(&report));
     for diagnostic in &report.diagnostics {
         assert_eq!(
@@ -40,7 +43,10 @@ fn ticket_2935_non_bool_operand_lexeme_and_paren_anchor() {
     let fixture = "void main() {\n  bool b = (0) || false;\n  b;\n}";
     let report = report_ops(fixture);
     let names = code_names(&report);
-    assert!(names.iter().all(|name| *name == "non_bool_operand"), "{names:?}");
+    assert!(
+        names.iter().all(|name| *name == "non_bool_operand"),
+        "{names:?}"
+    );
     let diagnostic = &report.diagnostics[0];
     assert_eq!(
         diagnostic.message,
@@ -48,7 +54,12 @@ fn ticket_2935_non_bool_operand_lexeme_and_paren_anchor() {
     );
     // `(0)` — the parenthesized operand, parens included in the anchor.
     let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("(0)").unwrap();
-    assert_eq!(diagnostic.range.offset as usize, offset, "{:?}", rows(&report));
+    assert_eq!(
+        diagnostic.range.offset as usize,
+        offset,
+        "{:?}",
+        rows(&report)
+    );
     assert_eq!(diagnostic.range.length, 3, "{:?}", rows(&report));
 }
 
@@ -57,9 +68,7 @@ fn ticket_2935_non_bool_operand_lexeme_and_paren_anchor() {
 /// statement and the constructor-initializer faces.
 #[test]
 fn ticket_2935_non_bool_expression_assert_faces() {
-    let report = report_ops(
-        "class C {\n  C() : assert(1);\n}\nvoid main() {\n  assert('no');\n}",
-    );
+    let report = report_ops("class C {\n  C() : assert(1);\n}\nvoid main() {\n  assert('no');\n}");
     let names = code_names(&report);
     assert!(
         names.iter().all(|name| *name == "non_bool_expression"),
@@ -81,7 +90,12 @@ fn ticket_2935_non_bool_expression_assert_faces() {
 #[test]
 fn ticket_2935_non_bool_condition_type_literal_operand() {
     let report = report_ops("class A {}\nvoid main() {\n  do {} while (A);\n}");
-    assert_eq!(code_names(&report), ["non_bool_condition"], "{:?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["non_bool_condition"],
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// A `super` expression's static type is the superclass — untyped at
@@ -89,10 +103,14 @@ fn ticket_2935_non_bool_condition_type_literal_operand() {
 /// non-`bool` for the verdict.
 #[test]
 fn ticket_2935_non_bool_condition_super_operand() {
-    let report = report_ops(
-        "class B {}\nclass A extends B {\n  void m() {\n    if (super) {}\n  }\n}",
+    let report =
+        report_ops("class B {}\nclass A extends B {\n  void m() {\n    if (super) {}\n  }\n}");
+    assert_eq!(
+        code_names(&report),
+        ["non_bool_condition"],
+        "{:?}",
+        rows(&report)
     );
-    assert_eq!(code_names(&report), ["non_bool_condition"], "{:?}", rows(&report));
 }
 
 /// `null` is not assignable to `bool` — a `null ? a : b` conditional
@@ -117,7 +135,10 @@ fn ticket_2935_non_bool_condition_const_context() {
 fn ticket_2935_condition_face_bool_nullable_outranks_non_bool() {
     let report = report_ops("void main(bool? x) {\n  if (x) {}\n}");
     let names = code_names(&report);
-    assert!(names.contains(&"unchecked_use_of_nullable_value"), "{names:?}");
+    assert!(
+        names.contains(&"unchecked_use_of_nullable_value"),
+        "{names:?}"
+    );
     assert!(!names.contains(&"non_bool_condition"), "{names:?}");
 }
 
@@ -128,7 +149,12 @@ fn ticket_2935_condition_face_bool_nullable_outranks_non_bool() {
 #[test]
 fn ticket_2935_non_bool_condition_for_segment_arm() {
     let report = report_ops("class C {}\nvoid main() {\n  for (; C;) {}\n}");
-    assert_eq!(code_names(&report), ["non_bool_condition"], "{:?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["non_bool_condition"],
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// A do-while tail arms the `(condition)` window — the verdict fires at
@@ -136,7 +162,12 @@ fn ticket_2935_non_bool_condition_for_segment_arm() {
 #[test]
 fn ticket_2935_non_bool_condition_do_while_tail() {
     let report = report_ops("class C {}\nvoid main() {\n  do {} while (C);\n}");
-    assert_eq!(code_names(&report), ["non_bool_condition"], "{:?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["non_bool_condition"],
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// A const-collection `if` element reports its non-`bool` condition
@@ -155,7 +186,12 @@ fn ticket_2935_non_bool_condition_if_element_const() {
 #[test]
 fn ticket_2935_non_bool_condition_while_literal_list() {
     let report = report_ops("void main() {\n  while ([1, 2, 3]) {}\n}");
-    assert_eq!(code_names(&report), ["non_bool_condition"], "{:?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["non_bool_condition"],
+        "{:?}",
+        rows(&report)
+    );
 }
 
 /// A `&&` operand inside a statement condition reports the operand
@@ -165,7 +201,12 @@ fn ticket_2935_non_bool_condition_while_literal_list() {
 #[test]
 fn ticket_2935_non_bool_operand_inside_if_condition() {
     let report = report_ops("void main() {\n  if (true && 0) {}\n}");
-    assert_eq!(code_names(&report), ["non_bool_operand"], "{:?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["non_bool_operand"],
+        "{:?}",
+        rows(&report)
+    );
     assert_eq!(
         report.diagnostics[0].message,
         "The operands of the operator '&&' must be assignable to 'bool'."
@@ -179,11 +220,7 @@ fn ticket_2935_condition_bool_operands_stay_silent() {
     let report = report_ops(
         "void main(bool a, bool b) {\n  if (a && b) {}\n  if (a || b) {}\n  while (a) {}\n  assert(b);\n}",
     );
-    assert!(
-        report.diagnostics.is_empty(),
-        "{:?}",
-        rows(&report)
-    );
+    assert!(report.diagnostics.is_empty(), "{:?}", rows(&report));
 }
 
 /// `dynamic` stays silent under the default mode and reports
@@ -220,7 +257,10 @@ fn ticket_2935_boolean_conditional_a02_t02_pin() {
         .iter()
         .find(|d| d.code.name == "invalid_assignment");
     let Some(diagnostic) = invalid else {
-        panic!("expected an invalid_assignment row, got {:?}", rows(&report));
+        panic!(
+            "expected an invalid_assignment row, got {:?}",
+            rows(&report)
+        );
     };
     // Oracle: 'Object' (the promoted non-null face). dartq: 'Object?'.
     assert_eq!(

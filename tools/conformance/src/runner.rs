@@ -313,17 +313,15 @@ fn attribute(
             .filter(|root| !root.is_empty())
             .unwrap_or_else(|| format!("{}/{}", chunk_dir.to_string_lossy(), rel.0));
         let message = diag.message.replace(root.as_str(), "<chunk>");
-        rows.get_mut(&rel.0)
-            .expect("checked above")
-            .push(Row::new(
-                diag.severity.clone(),
-                diag.code.clone(),
-                rel.1.join("/"),
-                diag.line,
-                diag.column,
-                diag.length,
-                message,
-            ));
+        rows.get_mut(&rel.0).expect("checked above").push(Row::new(
+            diag.severity.clone(),
+            diag.code.clone(),
+            rel.1.join("/"),
+            diag.line,
+            diag.column,
+            diag.length,
+            message,
+        ));
     }
     if outside > 0 {
         warn(&format!(
@@ -377,7 +375,11 @@ pub fn oracle_command(sdk_bin: &Path, chunk_dir: &Path) -> Command {
 /// The dartq command: `<bin> analyze --engine --cold --format=json [--sdk-path S] <chunk>`.
 pub fn dartq_command(bin: &Path, sdk: Option<&Path>, chunk_dir: &Path) -> Command {
     let mut command = Command::new(bin);
-    command.arg("analyze").arg("--engine").arg("--cold").arg("--format=json");
+    command
+        .arg("analyze")
+        .arg("--engine")
+        .arg("--cold")
+        .arg("--format=json");
     if let Some(sdk) = sdk {
         command.arg(format!("--sdk-path={}", sdk.display()));
     }

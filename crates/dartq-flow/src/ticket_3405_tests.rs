@@ -20,7 +20,7 @@
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
-use crate::ty::{ArgTy, Base, Classification, Ty, TypeOps, EMPTY_ARGS};
+use crate::ty::{ArgTy, Base, Classification, EMPTY_ARGS, Ty, TypeOps};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -155,8 +155,8 @@ fn read_types<'a>(source: &'a str, facts: &[FlowFact]) -> Vec<(&'a str, Ty)> {
         .iter()
         .filter_map(|fact| match fact {
             FlowFact::ReadType { span, ty, .. } => Some((
-                &source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize],
+                &source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize],
                 *ty,
             )),
             _ => None,
@@ -170,8 +170,8 @@ fn promoted_reads<'a>(source: &'a str, facts: &[FlowFact]) -> Vec<(&'a str, Ty)>
         .iter()
         .filter_map(|fact| match fact {
             FlowFact::PromotedRead { span, ty, .. } => Some((
-                &source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize],
+                &source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize],
                 *ty,
             )),
             _ => None,
@@ -197,12 +197,24 @@ fn type_parameter_if_case_promotes_to_the_intersection() {
     let reads = read_types(source, &facts);
     assert_eq!(
         reads.last(),
-        Some(&("value", Ty { base: Base::Name(int), nullable: false })),
+        Some(&(
+            "value",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )),
         "the guarded read answers `int`, the `T & int` head: {reads:?}"
     );
     assert_eq!(
         promoted_reads(source, &facts),
-        [("value", Ty { base: Base::Name(int), nullable: false })],
+        [(
+            "value",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )],
         "the promotion fact rides the guarded read"
     );
 }
@@ -221,16 +233,34 @@ fn switch_case_over_type_parameter_promotes_to_the_intersection() {
     let reads = read_types(source, &facts);
     assert_eq!(
         reads.last(),
-        Some(&("value", Ty { base: Base::Name(int), nullable: false })),
+        Some(&(
+            "value",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )),
         "the arm-body read spells the `T & int` head: {reads:?}"
     );
     assert!(
-        reads.contains(&("value", Ty { base: Base::Name(t), nullable: false })),
+        reads.contains(&(
+            "value",
+            Ty {
+                base: Base::Name(t),
+                nullable: false
+            }
+        )),
         "the scrutinee outside the arm stays `T`: {reads:?}"
     );
     assert_eq!(
         promoted_reads(source, &facts),
-        [("value", Ty { base: Base::Name(int), nullable: false })]
+        [(
+            "value",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )]
     );
 }
 
@@ -249,11 +279,21 @@ fn null_pattern_over_type_parameter_promotes_nothing() {
     let reads = read_types(source, &facts);
     assert_eq!(
         reads.last(),
-        Some(&("value", Ty { base: Base::Name(t), nullable: false })),
+        Some(&(
+            "value",
+            Ty {
+                base: Base::Name(t),
+                nullable: false
+            }
+        )),
         "the else-arm read stays `T`: {reads:?}"
     );
     assert!(
-        reads.iter().all(|(s, ty)| *ty != Ty { base: Base::Name(ids[3]), nullable: false }),
+        reads.iter().all(|(s, ty)| *ty
+            != Ty {
+                base: Base::Name(ids[3]),
+                nullable: false
+            }),
         "no read claims `Null` — the arm promoted nothing: {reads:?}"
     );
     assert!(promoted_reads(source, &facts).is_empty());
@@ -276,12 +316,24 @@ fn non_type_parameter_scrutinee_promotes_through_the_plain_gate() {
     let reads = read_types(source, &facts);
     assert_eq!(
         reads.last(),
-        Some(&("value", Ty { base: Base::Name(int), nullable: false })),
+        Some(&(
+            "value",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )),
         "the plain gate's promotion is unchanged: {reads:?}"
     );
     assert_eq!(
         promoted_reads(source, &facts),
-        [("value", Ty { base: Base::Name(int), nullable: false })]
+        [(
+            "value",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )]
     );
 }
 
@@ -300,11 +352,21 @@ fn bound_gates_the_pattern_intersection() {
     let reads = read_types(source, &facts);
     assert_eq!(
         reads.last(),
-        Some(&("value", Ty { base: Base::Name(t), nullable: false })),
+        Some(&(
+            "value",
+            Ty {
+                base: Base::Name(t),
+                nullable: false
+            }
+        )),
         "an out-of-bound pattern promotes nothing: {reads:?}"
     );
     assert!(
-        reads.iter().all(|(_, ty)| *ty != Ty { base: Base::Name(ids[3]), nullable: false }),
+        reads.iter().all(|(_, ty)| *ty
+            != Ty {
+                base: Base::Name(ids[3]),
+                nullable: false
+            }),
         "no read claims `String`: {reads:?}"
     );
     assert!(promoted_reads(source, &facts).is_empty());

@@ -30,7 +30,7 @@
 //! ([`Engine::check_explicit_creation_arguments`]) now runs the
 //! per-argument verdict the callee-linked spellings already ran.
 
-use super::test_rig::{report_ops, assert_silent};
+use super::test_rig::{assert_silent, report_ops};
 use super::*;
 
 /// Every `code` row of `report` as `(offset, length, message)`.
@@ -75,7 +75,12 @@ fn generic_named_creation_cascade_miss_names_the_class() {
         "class G<T> { G.value(T t); } \
          void f() { G.value(1)..gone(); }",
     );
-    assert_eq!(count(&report, "undefined_method"), 1, "rows: {:?}", names(&report));
+    assert_eq!(
+        count(&report, "undefined_method"),
+        1,
+        "rows: {:?}",
+        names(&report)
+    );
     let rows = rows_of(&report, "undefined_method");
     assert!(
         rows[0].2.contains("isn't defined for the type 'G'."),
@@ -92,7 +97,12 @@ fn plain_chain_over_generic_named_creation_names_the_class() {
         "class G<T> { G.value(T t); } \
          void f() { G.value(1).gone(); }",
     );
-    assert_eq!(count(&report, "undefined_method"), 1, "rows: {:?}", names(&report));
+    assert_eq!(
+        count(&report, "undefined_method"),
+        1,
+        "rows: {:?}",
+        names(&report)
+    );
     let rows = rows_of(&report, "undefined_method");
     assert!(
         rows[0].2.contains("isn't defined for the type 'G'."),
@@ -155,7 +165,12 @@ fn context_seeded_creation_agrees_silently() {
         "class A<T, U> { A(T t, U u); } \
          void f() { A<int, String> a = new A(1, 'x'); }",
     );
-    assert_eq!(count(&report, "argument_type_not_assignable"), 0, "rows: {:?}", names(&report));
+    assert_eq!(
+        count(&report, "argument_type_not_assignable"),
+        0,
+        "rows: {:?}",
+        names(&report)
+    );
 }
 
 /// The explicit-keyword spelling outside any context: the argument verdict

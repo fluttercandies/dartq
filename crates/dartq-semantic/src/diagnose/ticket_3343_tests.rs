@@ -70,8 +70,8 @@
 //! (code name, then offset): the helper sorts, so a semantic ordering
 //! ("primary row first") silently fails the equality.
 
-use super::*;
 use super::test_rig::{CORE_PRELUDE, report_ops_bare};
+use super::*;
 
 /// `(code, offset, written text at the row)` — the span-exact projection:
 /// code + offset + text pin a row's code, anchor, and length together.
@@ -116,7 +116,11 @@ fn for_element_reports_at_the_element_and_the_literal() {
     assert_eq!(
         oracle_rows(&rep, &source),
         vec![
-            ("const_eval_for_element", for_element, "for (var i = 0; i < 3; i++) i"),
+            (
+                "const_eval_for_element",
+                for_element,
+                "for (var i = 0; i < 3; i++) i"
+            ),
             (
                 "const_initialized_with_non_constant_value",
                 literal,
@@ -191,7 +195,11 @@ fn shorthand_property_without_context_reports_at_the_shorthand() {
     assert_eq!(
         oracle_rows(&rep, source),
         vec![
-            ("const_initialized_with_non_constant_value", shorthand, ".id"),
+            (
+                "const_initialized_with_non_constant_value",
+                shorthand,
+                ".id"
+            ),
             ("dot_shorthand_missing_context", shorthand, ".id"),
         ],
         "{:#?}",
@@ -256,7 +264,8 @@ fn non_const_creation_lhs_reports_at_the_creation() {
 // list's close, with `ctor_init_formals` not binding a wildcard formal.
 #[ignore = "wildcard face: the initializer walk must not bind a wildcard formal over the same-named instance field"]
 fn wildcard_field_read_in_initializer_list_reports_at_the_read() {
-    let source = "class T {}\nclass A {\n  final T _;\n  final T y;\n  const A(this._): y = _;\n}\n";
+    let source =
+        "class T {}\nclass A {\n  final T _;\n  final T y;\n  const A(this._): y = _;\n}\n";
     // The read sits at the fixture's LAST `_` (the initializer RHS), never
     // at the formal's `_` earlier on the same line.
     let read = source.rfind('_').expect("fixture carries the RHS _") as u32;

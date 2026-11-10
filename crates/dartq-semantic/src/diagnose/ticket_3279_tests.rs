@@ -47,7 +47,10 @@ fn conflicts(report: &FileReport) -> Vec<String> {
 fn plain_enum_constants_stay_silent() {
     let report = report_ops("enum E { one, two }\n");
     let rows = conflicts(&report);
-    assert!(rows.is_empty(), "a constant never collides with itself: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "a constant never collides with itself: {rows:?}"
+    );
 }
 
 /// A constant with an explicit `;` and a mixed batch of values stays
@@ -62,7 +65,10 @@ fn enum_constants_with_bodies_stay_silent() {
          }\n",
     );
     let rows = conflicts(&report);
-    assert!(rows.is_empty(), "no instance surface exists to collide with: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "no instance surface exists to collide with: {rows:?}"
+    );
 }
 
 /// `ConflictClassEnumValueStaticSetter`: a static member named after a
@@ -249,5 +255,8 @@ fn class_static_index_stays_silent() {
          }\n",
     );
     let rows = conflicts(&report);
-    assert!(rows.is_empty(), "a class has no inherited 'index': {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "a class has no inherited 'index': {rows:?}"
+    );
 }

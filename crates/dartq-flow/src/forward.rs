@@ -651,9 +651,12 @@ impl ParserListener for SharedFlow<'_> {
         end: Token,
         is_expression: bool,
     ) {
-        self.0
-            .borrow_mut()
-            .end_anonymous_method_invocation(begin, function_definition, end, is_expression);
+        self.0.borrow_mut().end_anonymous_method_invocation(
+            begin,
+            function_definition,
+            end,
+            is_expression,
+        );
     }
 
     fn handle_implicit_formal_parameters(&mut self, token: Token) {

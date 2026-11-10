@@ -37,9 +37,7 @@
 //!   `collector.rs`/`resolution.rs` (`resolve_bare`'s `type_params` arm;
 //!   upstream a wildcard `_` declaration introduces no element).
 
-use super::test_rig::{
-    CORE_PRELUDE, code_names, report_ops, report_ops_augment_intro_experiments,
-};
+use super::test_rig::{CORE_PRELUDE, code_names, report_ops, report_ops_augment_intro_experiments};
 
 /// Absolute offset of `needle`'s first byte in a `report_ops` fixture (the
 /// rig prepends [`CORE_PRELUDE`]).
@@ -57,12 +55,7 @@ fn undefined_rows(report: &super::FileReport) -> Vec<String> {
         .diagnostics
         .iter()
         .filter(|d| d.code.name.starts_with("undefined_"))
-        .map(|d| {
-            format!(
-                "{} @{}+{}",
-                d.code.name, d.range.offset, d.range.length
-            )
-        })
+        .map(|d| format!("{} @{}+{}", d.code.name, d.range.offset, d.range.length))
         .collect()
 }
 
@@ -87,7 +80,12 @@ fn if_case_binder_reaches_an_if_element_in_its_then_branch() {
                    }\n\
                    }\n";
     let report = report_ops(fixture);
-    assert_eq!(undefined_rows(&report), Vec::<String>::new(), "{:?}", code_names(&report));
+    assert_eq!(
+        undefined_rows(&report),
+        Vec::<String>::new(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 /// The `when` guard runs inside the case scope: the binder it guards is
@@ -101,7 +99,12 @@ fn if_case_guard_reads_its_own_binder() {
                    }\n\
                    }\n";
     let report = report_ops(fixture);
-    assert_eq!(undefined_rows(&report), Vec::<String>::new(), "{:?}", code_names(&report));
+    assert_eq!(
+        undefined_rows(&report),
+        Vec::<String>::new(),
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 // — C10 gap: the if-case ELEMENT closes its case scope (oracle
@@ -124,7 +127,12 @@ fn if_case_element_else_does_not_see_the_binder() {
                    }\n";
     let report = report_ops(fixture);
     let want = format!("undefined_identifier @{}+2", at(fixture, "else vv") + 5);
-    assert_eq!(undefined_rows(&report), vec![want], "{:?}", code_names(&report));
+    assert_eq!(
+        undefined_rows(&report),
+        vec![want],
+        "{:?}",
+        code_names(&report)
+    );
 }
 
 // — C6 gap: augmentation members join the introduced declaration's member
@@ -141,12 +149,14 @@ fn if_case_element_else_does_not_see_the_binder() {
 fn augment_declared_members_join_the_introduced_class() {
     let main = "class C {\n  void test() {\n    baz;\n  }\n}\n";
     let aug = "augment class C {\n  static const baz = 2;\n}\n";
-    let report = report_ops_augment_intro_experiments(
-        main,
-        aug,
-        &[dartq_language::Feature::Augmentations],
+    let report =
+        report_ops_augment_intro_experiments(main, aug, &[dartq_language::Feature::Augmentations]);
+    assert_eq!(
+        undefined_rows(&report),
+        Vec::<String>::new(),
+        "{:?}",
+        code_names(&report)
     );
-    assert_eq!(undefined_rows(&report), Vec::<String>::new(), "{:?}", code_names(&report));
 }
 
 // — C11 gap: a wildcard declaration binds nothing (oracle
@@ -162,5 +172,10 @@ fn wildcard_type_parameter_does_not_bind() {
     let fixture = "void test<_>() {\n  _;\n}\n";
     let report = report_ops(fixture);
     let want = format!("undefined_identifier @{}+1", at(fixture, "  _;") + 2);
-    assert_eq!(undefined_rows(&report), vec![want], "{:?}", code_names(&report));
+    assert_eq!(
+        undefined_rows(&report),
+        vec![want],
+        "{:?}",
+        code_names(&report)
+    );
 }

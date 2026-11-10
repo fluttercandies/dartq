@@ -38,7 +38,15 @@ fn code(c: &str, start: u32, end: u32) -> (String, u32, u32) {
 #[test]
 fn enum_value_builtin_top_level_heads_are_plain_names() {
     for member in [
-        "mixin", "typedef", "extension", "export", "import", "library", "part", "get", "set",
+        "mixin",
+        "typedef",
+        "extension",
+        "export",
+        "import",
+        "library",
+        "part",
+        "get",
+        "set",
     ] {
         let source = format!("enum E {{ {member} }}\n").leak();
         assert_eq!(

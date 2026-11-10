@@ -102,7 +102,12 @@ fn decrement_statements_report() {
 #[test]
 fn if_null_assign_statement_spares() {
     let source = "void f() { int? l; l ??= 5; }";
-    assert_eq!(ulv(source), vec![], "rows: {:#?}", rows(&report_ops(source)));
+    assert_eq!(
+        ulv(source),
+        vec![],
+        "rows: {:#?}",
+        rows(&report_ops(source))
+    );
 }
 
 /// `++`/`--` in a NON-statement position reads the variable upstream —
@@ -112,7 +117,12 @@ fn if_null_assign_statement_spares() {
 #[test]
 fn for_updater_increment_spares() {
     let source = "void f() { int l = 0; for (; l < 10; l++) {} }";
-    assert_eq!(ulv(source), vec![], "rows: {:#?}", rows(&report_ops(source)));
+    assert_eq!(
+        ulv(source),
+        vec![],
+        "rows: {:#?}",
+        rows(&report_ops(source))
+    );
 }
 
 /// A plain `=` reassignment is never a read — the write-only life
@@ -153,7 +163,12 @@ fn discarded_compound_then_read_spares() {
 #[test]
 fn bare_identifier_statement_spares() {
     let source = "void f() { int l = 0; l; }";
-    assert_eq!(ulv(source), vec![], "rows: {:#?}", rows(&report_ops(source)));
+    assert_eq!(
+        ulv(source),
+        vec![],
+        "rows: {:#?}",
+        rows(&report_ops(source))
+    );
 }
 
 /// A write-only life through the for-in head: `for (l in xs)` assigns
@@ -171,8 +186,7 @@ fn for_in_existing_variable_target_reports() {
 /// reports at the declaration.
 #[test]
 fn await_for_in_existing_variable_target_reports() {
-    let source =
-        "void f(Stream<int> s) async { int l = 0; await for (l in s) {} }";
+    let source = "void f(Stream<int> s) async { int l = 0; await for (l in s) {} }";
     let at = source.find("l = 0").unwrap() as u32;
     assert_eq!(ulv(source), vec![(at, 1)]);
 }

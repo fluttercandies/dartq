@@ -143,9 +143,7 @@ fn binary_minus_takes_no_prefix_face() {
     let fixture = "f(void x, int y) {\n  y - x;\n}\n";
     let report = report_ops(fixture);
     assert!(
-        !rows(&report)
-            .iter()
-            .any(|r| r.contains("unary-")),
+        !rows(&report).iter().any(|r| r.contains("unary-")),
         "binary minus took the prefix face: {:#?}",
         rows(&report)
     );
@@ -219,4 +217,3 @@ fn await_for_void_iterable_reports() {
         "A nullable expression can't be used as an iterator in a for-in loop.",
     );
 }
-

@@ -118,9 +118,8 @@ fn null_initialized_model_slots_oracle_shape() {
     );
     assert_eq!(found.len(), 3, "{found:?}");
     assert!(
-        found.iter().all(|row| row.ends_with(
-            "A value of type 'String' can't be assigned to a variable of type 'int'."
-        )),
+        found.iter().all(|row| row
+            .ends_with("A value of type 'String' can't be assigned to a variable of type 'int'.")),
         "{found:?}"
     );
 }
@@ -154,9 +153,8 @@ fn written_null_local_write_still_reports() {
          }\n",
     );
     assert!(
-        found.iter().any(|row| row.ends_with(
-            "A value of type 'String' can't be assigned to a variable of type 'Null'."
-        )),
+        found.iter().any(|row| row
+            .ends_with("A value of type 'String' can't be assigned to a variable of type 'Null'.")),
         "{found:?}"
     );
 }
@@ -173,9 +171,8 @@ fn written_null_local_read_still_reports() {
          }\n",
     );
     assert!(
-        found.iter().any(|row| row.ends_with(
-            "A value of type 'Null' can't be assigned to a variable of type 'String'."
-        )),
+        found.iter().any(|row| row
+            .ends_with("A value of type 'Null' can't be assigned to a variable of type 'String'.")),
         "{found:?}"
     );
 }
@@ -192,9 +189,8 @@ fn written_null_field_write_still_reports() {
          }\n",
     );
     assert!(
-        found.iter().any(|row| row.ends_with(
-            "A value of type 'String' can't be assigned to a variable of type 'Null'."
-        )),
+        found.iter().any(|row| row
+            .ends_with("A value of type 'String' can't be assigned to a variable of type 'Null'.")),
         "{found:?}"
     );
 }
@@ -211,9 +207,8 @@ fn non_null_initializer_keeps_its_type() {
          }\n",
     );
     assert!(
-        found.iter().any(|row| row.ends_with(
-            "A value of type 'String' can't be assigned to a variable of type 'int'."
-        )),
+        found.iter().any(|row| row
+            .ends_with("A value of type 'String' can't be assigned to a variable of type 'int'.")),
         "{found:?}"
     );
 }

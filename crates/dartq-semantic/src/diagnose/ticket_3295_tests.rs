@@ -234,9 +234,7 @@ fn top_level_underscore_read_resolves_under_the_feature() {
 /// `undefined_identifier` row.
 #[test]
 fn label_reference_resolves_silently() {
-    let report = report_ops(
-        "void f() { outer: for (var i = 0; i < 1; i++) { break outer; } }\n",
-    );
+    let report = report_ops("void f() { outer: for (var i = 0; i < 1; i++) { break outer; } }\n");
     assert!(
         identifier_rows(&report).is_empty(),
         "{:?}",

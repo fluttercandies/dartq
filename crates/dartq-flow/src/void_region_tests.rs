@@ -44,7 +44,7 @@ fn dead_of(source: &str) -> Vec<String> {
             FlowFact::DeadCode { span } => Some(
                 source
                     [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
-                        .to_string(),
+                    .to_string(),
             ),
             _ => None,
         })

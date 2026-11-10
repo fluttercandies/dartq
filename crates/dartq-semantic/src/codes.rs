@@ -2507,19 +2507,17 @@ impl SemanticCode {
                 "TYPE_ALIAS_CANNOT_REFERENCE_ITSELF",
             ),
             Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
-            Self::EnumWithAbstractMember => (
-                "enum_with_abstract_member",
-                "ENUM_WITH_ABSTRACT_MEMBER",
-            ),
+            Self::EnumWithAbstractMember => {
+                ("enum_with_abstract_member", "ENUM_WITH_ABSTRACT_MEMBER")
+            }
             Self::IllegalConcreteEnumMember => (
                 "illegal_concrete_enum_member",
                 "ILLEGAL_CONCRETE_ENUM_MEMBER",
             ),
             Self::IllegalEnumValues => ("illegal_enum_values", "ILLEGAL_ENUM_VALUES"),
-            Self::ValuesDeclarationInEnum => (
-                "values_declaration_in_enum",
-                "VALUES_DECLARATION_IN_ENUM",
-            ),
+            Self::ValuesDeclarationInEnum => {
+                ("values_declaration_in_enum", "VALUES_DECLARATION_IN_ENUM")
+            }
             Self::MixinApplicationNoConcreteSuperInvokedMember => (
                 "mixin_application_no_concrete_super_invoked_member",
                 "MIXIN_APPLICATION_NO_CONCRETE_SUPER_INVOKED_MEMBER",
@@ -2530,10 +2528,9 @@ impl SemanticCode {
             ),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
             Self::AssignmentToFinal => ("assignment_to_final", "ASSIGNMENT_TO_FINAL"),
-            Self::AssignmentToFinalLocal => (
-                "assignment_to_final_local",
-                "ASSIGNMENT_TO_FINAL_LOCAL",
-            ),
+            Self::AssignmentToFinalLocal => {
+                ("assignment_to_final_local", "ASSIGNMENT_TO_FINAL_LOCAL")
+            }
             Self::AssignmentToFinalNoSetter => (
                 "assignment_to_final_no_setter",
                 "ASSIGNMENT_TO_FINAL_NO_SETTER",
@@ -2587,10 +2584,9 @@ impl SemanticCode {
                 "CONST_WITH_NON_CONSTANT_ARGUMENT",
             ),
             Self::ConstWithNonConst => ("const_with_non_const", "CONST_WITH_NON_CONST"),
-            Self::ConstWithTypeParameters => (
-                "const_with_type_parameters",
-                "CONST_WITH_TYPE_PARAMETERS",
-            ),
+            Self::ConstWithTypeParameters => {
+                ("const_with_type_parameters", "CONST_WITH_TYPE_PARAMETERS")
+            }
             Self::NonConstantListElement => {
                 ("non_constant_list_element", "NON_CONSTANT_LIST_ELEMENT")
             }
@@ -2603,9 +2599,7 @@ impl SemanticCode {
             }
             Self::InvalidFieldNamePrivate
             | Self::InvalidFieldNamePositional
-            | Self::InvalidFieldNameFromObject => {
-                ("invalid_field_name", "INVALID_FIELD_NAME")
-            }
+            | Self::InvalidFieldNameFromObject => ("invalid_field_name", "INVALID_FIELD_NAME"),
             Self::NonConstantCaseExpression => (
                 "non_constant_case_expression",
                 "NON_CONSTANT_CASE_EXPRESSION",
@@ -2638,10 +2632,9 @@ impl SemanticCode {
                 "constant_pattern_with_non_constant_expression",
                 "CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
             ),
-            Self::EqualKeysInMapPattern => (
-                "equal_keys_in_map_pattern",
-                "EQUAL_KEYS_IN_MAP_PATTERN",
-            ),
+            Self::EqualKeysInMapPattern => {
+                ("equal_keys_in_map_pattern", "EQUAL_KEYS_IN_MAP_PATTERN")
+            }
             Self::PatternConstantFromDeferredLibrary => (
                 "pattern_constant_from_deferred_library",
                 "PATTERN_CONSTANT_FROM_DEFERRED_LIBRARY",
@@ -2658,31 +2651,25 @@ impl SemanticCode {
                 "positional_field_in_object_pattern",
                 "POSITIONAL_FIELD_IN_OBJECT_PATTERN",
             ),
-            Self::MissingVariablePattern => (
-                "missing_variable_pattern",
-                "MISSING_VARIABLE_PATTERN",
-            ),
+            Self::MissingVariablePattern => {
+                ("missing_variable_pattern", "MISSING_VARIABLE_PATTERN")
+            }
             Self::PatternAssignmentNotLocalVariable => (
                 "pattern_assignment_not_local_variable",
                 "PATTERN_ASSIGNMENT_NOT_LOCAL_VARIABLE",
             ),
-            Self::DuplicateVariablePattern => (
-                "duplicate_variable_pattern",
-                "DUPLICATE_VARIABLE_PATTERN",
-            ),
-            Self::DuplicatePatternField => (
-                "duplicate_pattern_field",
-                "DUPLICATE_PATTERN_FIELD",
-            ),
+            Self::DuplicateVariablePattern => {
+                ("duplicate_variable_pattern", "DUPLICATE_VARIABLE_PATTERN")
+            }
+            Self::DuplicatePatternField => ("duplicate_pattern_field", "DUPLICATE_PATTERN_FIELD"),
             Self::InconsistentPatternVariableLogicalOr => (
                 "inconsistent_pattern_variable_logical_or",
                 "INCONSISTENT_PATTERN_VARIABLE_LOGICAL_OR",
             ),
             Self::EmptyMapPattern => ("empty_map_pattern", "EMPTY_MAP_PATTERN"),
-            Self::RestElementInMapPattern => (
-                "rest_element_in_map_pattern",
-                "REST_ELEMENT_IN_MAP_PATTERN",
-            ),
+            Self::RestElementInMapPattern => {
+                ("rest_element_in_map_pattern", "REST_ELEMENT_IN_MAP_PATTERN")
+            }
             Self::ExpectedTwoMapPatternTypeArguments => (
                 "expected_two_map_pattern_type_arguments",
                 "EXPECTED_TWO_MAP_PATTERN_TYPE_ARGUMENTS",
@@ -2819,9 +2806,10 @@ impl SemanticCode {
             Self::InconsistentInheritance => {
                 ("inconsistent_inheritance", "INCONSISTENT_INHERITANCE")
             }
-            Self::ConflictingGenericInterfaces => {
-                ("conflicting_generic_interfaces", "CONFLICTING_GENERIC_INTERFACES")
-            }
+            Self::ConflictingGenericInterfaces => (
+                "conflicting_generic_interfaces",
+                "CONFLICTING_GENERIC_INTERFACES",
+            ),
             Self::InconsistentInheritanceGetterAndMethod => (
                 "inconsistent_inheritance_getter_and_method",
                 "INCONSISTENT_INHERITANCE_GETTER_AND_METHOD",
@@ -3342,10 +3330,9 @@ impl SemanticCode {
             Self::SubtypeOfDisallowedTypeInExtends
             | Self::SubtypeOfDisallowedTypeInWith
             | Self::SubtypeOfDisallowedTypeInImplements
-            | Self::SubtypeOfDisallowedTypeInOn => (
-                "subtype_of_disallowed_type",
-                "SUBTYPE_OF_DISALLOWED_TYPE",
-            ),
+            | Self::SubtypeOfDisallowedTypeInOn => {
+                ("subtype_of_disallowed_type", "SUBTYPE_OF_DISALLOWED_TYPE")
+            }
             // The #1314 FAM18 uninitialized-non-nullable faces.
             Self::NotInitializedNonNullableVariable => (
                 "not_initialized_non_nullable_variable",
@@ -3355,9 +3342,7 @@ impl SemanticCode {
                 "not_initialized_non_nullable_instance_field",
                 "NOT_INITIALIZED_NON_NULLABLE_INSTANCE_FIELD",
             ),
-            Self::ConstNotInitialized => {
-                ("const_not_initialized", "CONST_NOT_INITIALIZED")
-            }
+            Self::ConstNotInitialized => ("const_not_initialized", "CONST_NOT_INITIALIZED"),
             Self::ImplicitSuperInitializerMissingArguments => (
                 "implicit_super_initializer_missing_arguments",
                 "IMPLICIT_SUPER_INITIALIZER_MISSING_ARGUMENTS",
@@ -3526,19 +3511,14 @@ impl SemanticCode {
             Self::InvalidAnnotationTarget => {
                 ("invalid_annotation_target", "INVALID_ANNOTATION_TARGET")
             }
-            Self::UnnecessarySetLiteral => {
-                ("unnecessary_set_literal", "UNNECESSARY_SET_LITERAL")
-            }
+            Self::UnnecessarySetLiteral => ("unnecessary_set_literal", "UNNECESSARY_SET_LITERAL"),
             Self::UnnecessaryFinal => ("unnecessary_final", "UNNECESSARY_FINAL"),
             Self::UnnecessaryImport => ("unnecessary_import", "UNNECESSARY_IMPORT"),
-            Self::MissingRequiredParam(_) => {
-                ("missing_required_param", "MISSING_REQUIRED_PARAM")
-            }
+            Self::MissingRequiredParam(_) => ("missing_required_param", "MISSING_REQUIRED_PARAM"),
             // The #3768 private-named-parameter and colon-default rows.
-            Self::PrivateOptionalParameter => (
-                "private_optional_parameter",
-                "PRIVATE_OPTIONAL_PARAMETER",
-            ),
+            Self::PrivateOptionalParameter => {
+                ("private_optional_parameter", "PRIVATE_OPTIONAL_PARAMETER")
+            }
             Self::ExperimentNotEnabled => ("experiment_not_enabled", "EXPERIMENT_NOT_ENABLED"),
             Self::PrivateNamedNonFieldParameter => (
                 "private_named_non_field_parameter",

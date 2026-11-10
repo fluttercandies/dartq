@@ -91,10 +91,7 @@ fn two_if_cases_different_names_used_stay_silent() {
     let source = "void g(Object o) {}\nvoid main() {\n  if (123 as dynamic case int a) { g(a); }\n  if ('s' as dynamic case int b) { g(b); }\n}\n";
     let report = report_ops(source);
     let hits = unused_local_rows(&report);
-    assert!(
-        hits.is_empty(),
-        "used binders must not report: {hits:#?}"
-    );
+    assert!(hits.is_empty(), "used binders must not report: {hits:#?}");
 }
 
 /// Negative control: a single if-case whose binder is never read still

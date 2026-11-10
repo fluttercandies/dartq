@@ -97,7 +97,10 @@ fn unit_class_repeat_reports_the_second() {
 #[test]
 fn unit_variable_repeat_reports_the_second() {
     let report = report_ops("var f = 1;\nvar f = 2;\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'f' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'f' is already defined.".to_string()]
+    );
     let offsets = dup_offsets(&report);
     assert_eq!(offsets.len(), 1, "one row for the repeat: {offsets:?}");
 }
@@ -150,14 +153,20 @@ fn unit_late_final_without_initializer_claims_its_setter() {
 #[test]
 fn unit_typedef_repeat_reports_the_second() {
     let report = report_ops("typedef A = int;\ntypedef A = String;\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'A' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'A' is already defined.".to_string()]
+    );
 }
 
 /// A repeated top-level mixin/extension-type name collides like a class.
 #[test]
 fn unit_extension_type_repeat_reports_the_second() {
     let report = report_ops("extension type A(int it) {}\nextension type A(int it) {}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'A' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'A' is already defined.".to_string()]
+    );
 }
 
 // —— member scope ——
@@ -180,7 +189,10 @@ fn member_field_repeat_reports_one_row() {
 #[test]
 fn member_final_field_then_getter_reports() {
     let report = report_ops("class C {\n  final int foo = 0;\n  int get foo => 0;\n}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'foo' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'foo' is already defined.".to_string()]
+    );
 }
 
 #[test]
@@ -194,16 +206,21 @@ fn member_final_field_then_setter_stays_silent() {
 #[test]
 fn member_method_then_setter_reports() {
     let report = report_ops("class C {\n  void foo() {}\n  set foo(int v) {}\n}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'foo' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'foo' is already defined.".to_string()]
+    );
 }
 
 /// Operators collide under the operator's own lexeme.
 #[test]
 fn member_operator_repeat_reports_under_the_operator() {
-    let report = report_ops(
-        "class C {\n  int operator +(int o) => 0;\n  int operator +(int o) => 0;\n}\n",
+    let report =
+        report_ops("class C {\n  int operator +(int o) => 0;\n  int operator +(int o) => 0;\n}\n");
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name '+' is already defined.".to_string()]
     );
-    assert_eq!(dup_messages(&report), vec!["The name '+' is already defined.".to_string()]);
 }
 
 /// A member `_` is an ordinary name, not a wildcard: the feature's other-
@@ -264,7 +281,10 @@ fn duplicate_container_members_do_not_cross_collide() {
 #[test]
 fn params_plain_repeat_reports() {
     let report = report_ops("void f(int a, int a) {}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'a' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'a' is already defined.".to_string()]
+    );
 }
 
 /// The formal scope is shared across the positional and the named section: a
@@ -272,7 +292,10 @@ fn params_plain_repeat_reports() {
 #[test]
 fn params_named_collides_with_positional() {
     let report = report_ops("void f(int a, {int? a}) {}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'a' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'a' is already defined.".to_string()]
+    );
 }
 
 /// An optional positional and a required positional of the same name share
@@ -280,7 +303,10 @@ fn params_named_collides_with_positional() {
 #[test]
 fn params_optional_collides_with_required() {
     let report = report_ops("void f(int a, [int a = 0]) {}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'a' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'a' is already defined.".to_string()]
+    );
 }
 
 /// A wildcard formal is exempt under the wildcard-variables feature.
@@ -296,14 +322,20 @@ fn params_wildcard_repeat_stays_silent() {
 #[test]
 fn params_wildcard_repeat_reports_pre_wildcards() {
     let report = report_ops_wildcards("void f(int _, int _) {}\n", false);
-    assert_eq!(dup_messages(&report), vec!["The name '_' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name '_' is already defined.".to_string()]
+    );
 }
 
 /// Type parameters are an ordinary duplicate scope.
 #[test]
 fn type_params_repeat_reports() {
     let report = report_ops("class C<T, T> {}\n");
-    assert_eq!(dup_messages(&report), vec!["The name 'T' is already defined.".to_string()]);
+    assert_eq!(
+        dup_messages(&report),
+        vec!["The name 'T' is already defined.".to_string()]
+    );
 }
 
 /// A type-parameter wildcard is exempt under the feature and reports without

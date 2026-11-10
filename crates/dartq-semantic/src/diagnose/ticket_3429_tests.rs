@@ -210,8 +210,7 @@ fn nullable_fn_receiver_miss_reports_unchecked() {
 /// function type), which the wave's promoted-receiver read fixed.
 #[test]
 fn guarded_fn_receiver_miss_reports_undefined_getter() {
-    let report =
-        report_ops("void f(void Function()? g) { if (g != null) { g.bar; } }\n");
+    let report = report_ops("void f(void Function()? g) { if (g != null) { g.bar; } }\n");
     let names = code_names(&report);
     assert_eq!(names.len(), 1, "{:?}", rows(&report));
     assert!(

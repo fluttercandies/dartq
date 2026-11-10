@@ -12,9 +12,10 @@ use dartq_scanner::{ScanConfig, TokenTable};
 
 /// Dead-code facts of `source` as the exact source text they cover.
 fn dead_of(source: &str) -> Vec<String> {
-    dead_of_features(FeatureSet::for_language_version(
-        LanguageVersion::new(3, 15),
-    ), source)
+    dead_of_features(
+        FeatureSet::for_language_version(LanguageVersion::new(3, 15)),
+        source,
+    )
 }
 
 /// [`dead_of`] over a caller-supplied [`FeatureSet`] — the anonymous-methods
@@ -47,7 +48,8 @@ fn dead_of_features(set: FeatureSet, source: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|fact| match fact {
             FlowFact::DeadCode { span } => Some(
-                source[span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
                     .to_string(),
             ),
             _ => None,
@@ -67,7 +69,8 @@ fn dead_of_anonymous(source: &str) -> Vec<String> {
 
 #[test]
 fn probe_typedef_is_not() {
-    let src = "typedef fx(x);\nvoid topx(x) {}\nvoid main() {\n  if (topx is! fx) throw \"bad\";\n}\n";
+    let src =
+        "typedef fx(x);\nvoid topx(x) {}\nvoid main() {\n  if (topx is! fx) throw \"bad\";\n}\n";
     assert_eq!(dead_of(src), vec!["throw \"bad\";".to_string()]);
 }
 
@@ -287,8 +290,7 @@ fn probe_do_while_break_suppresses_tail() {
     // test_doWhile_break: a break exits the do, so `print('')` after it
     // is reachable — only the `while (c);` part reports
     // (`hasBreakStatement`, dead_code_verifier.dart:306-308).
-    let src =
-        "void f(bool c) {\n  do {\n    if (c) { break; }\n    return;\n  } while (c);\n  print('');\n}\n";
+    let src = "void f(bool c) {\n  do {\n    if (c) { break; }\n    return;\n  } while (c);\n  print('');\n}\n";
     assert_eq!(dead_of(src), vec!["} while (c);".to_string()]);
 }
 

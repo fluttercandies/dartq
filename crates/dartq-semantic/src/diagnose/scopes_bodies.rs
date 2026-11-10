@@ -652,7 +652,9 @@ impl<'a> Engine<'a> {
     /// The token index at/after a UTF-16 offset (the table is
     /// offset-ordered; EOF closes every walk).
     pub(crate) fn token_at_offset(&self, offset: u32) -> usize {
-        self.tokens.as_slice().partition_point(|t| t.utf16_offset < offset)
+        self.tokens
+            .as_slice()
+            .partition_point(|t| t.utf16_offset < offset)
     }
 
     /// The written on-clause type as a [`Ty`] (`dynamic`/`Null` keep their
@@ -1495,10 +1497,7 @@ impl<'a> Engine<'a> {
         // unknown one upstream (test_postfixOperator's `C c = .new()++`
         // reports `'_'`).
         if let Some(end) = self.shorthand_chain_end(name_idx)
-            && matches!(
-                toks[end].kind,
-                TK::PlusPlus | TK::MinusMinus
-            )
+            && matches!(toks[end].kind, TK::PlusPlus | TK::MinusMinus)
         {
             return Some((None, "_".to_string()));
         }
@@ -1514,9 +1513,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .take(before)
                 .rev()
-                .find(|c| {
-                    engine.trivia_between(engine.staged_expression_span(c.range).end(), end)
-                })
+                .find(|c| engine.trivia_between(engine.staged_expression_span(c.range).end(), end))
                 .or_else(|| {
                     engine.deferred_miss_rows.iter().rev().find(|c| {
                         engine.trivia_between(engine.staged_expression_span(c.range).end(), end)
@@ -1557,10 +1554,7 @@ impl<'a> Engine<'a> {
                         .iter()
                         .rev()
                         .find(|c| {
-                            engine.trivia_between(
-                                engine.staged_expression_span(c.range).end(),
-                                end,
-                            )
+                            engine.trivia_between(engine.staged_expression_span(c.range).end(), end)
                         })
                         .cloned()
                         .or_else(|| operand_row_before(engine, end, before))
@@ -1607,9 +1601,9 @@ impl<'a> Engine<'a> {
             // matched type (`if (e case .one || .two)` — patterns_A02).
             // `!` always arms `bool` (a negation operand, never a pattern
             // position).
-            TK::AmpersandAmpersand | TK::BarBar => self
-                .pattern_case_ctx(prev_idx)
-                .or_else(|| self.bool_ctx()),
+            TK::AmpersandAmpersand | TK::BarBar => {
+                self.pattern_case_ctx(prev_idx).or_else(|| self.bool_ctx())
+            }
             TK::Bang => self.bool_ctx(),
             // `... .x` / `...? .x` — a spread element resolves against the
             // collection the literal builds: `Iterable` for a list/set,
@@ -1641,9 +1635,7 @@ impl<'a> Engine<'a> {
             // Prefix `-`/`~`/`++`/`--` operands — no language-defined
             // operand schema: the unknown schema (`o = -.two()` reports
             // `'_'`; an infix right operand `- .a` shares the answer).
-            TK::Minus | TK::Tilde | TK::PlusPlus | TK::MinusMinus => {
-                Some((None, "_".to_string()))
-            }
+            TK::Minus | TK::Tilde | TK::PlusPlus | TK::MinusMinus => Some((None, "_".to_string())),
             // A list/set literal's first element: the element schema
             // (equality_A02_t01's `if ([C(0)] == [.id(1)])` reports `'_'`).
             TK::OpenSquare => self.literal_elem_ctx(prev_idx),
@@ -1773,12 +1765,7 @@ impl<'a> Engine<'a> {
         }
         (!matches!(
             toks[open - 1].kind,
-            TK::Identifier
-                | TK::CloseParen
-                | TK::CloseSquare
-                | TK::Gt
-                | TK::GtGt
-                | TK::GtGtGt
+            TK::Identifier | TK::CloseParen | TK::CloseSquare | TK::Gt | TK::GtGt | TK::GtGtGt
         ))
         .then_some(open)
     }
@@ -1796,10 +1783,7 @@ impl<'a> Engine<'a> {
         let Some(before) = open.checked_sub(1) else {
             return false;
         };
-        matches!(
-            self.tokens.as_slice()[before].kind,
-            TK::EqEq | TK::BangEq
-        )
+        matches!(self.tokens.as_slice()[before].kind, TK::EqEq | TK::BangEq)
     }
 
     /// The index of the opener matching the closer at `close_idx` — the
@@ -1861,7 +1845,11 @@ impl<'a> Engine<'a> {
     /// annotation, an `==`-nested conditional the unknown schema. A `:`
     /// with no `?` behind it is a map entry's value — the enclosing
     /// literal's element face answers.
-    fn conditional_branch_ctx(&self, branch_idx: usize, live: bool) -> Option<(Option<Ty>, String)> {
+    fn conditional_branch_ctx(
+        &self,
+        branch_idx: usize,
+        live: bool,
+    ) -> Option<(Option<Ty>, String)> {
         use dartq_scanner::{Keyword as Kw, TokenKind as TK};
         let toks = self.tokens.as_slice();
         let is_colon = toks.get(branch_idx).is_some_and(|t| t.kind == TK::Colon);
@@ -1985,9 +1973,7 @@ impl<'a> Engine<'a> {
                 .and_then(|i| toks.get(i))
                 .map(|t| t.kind)
             {
-                Some(TK::Keyword(Kw::If | Kw::While | Kw::Assert)) => {
-                    Some((None, "_".to_string()))
-                }
+                Some(TK::Keyword(Kw::If | Kw::While | Kw::Assert)) => Some((None, "_".to_string())),
                 _ => None,
             },
             _ => None,
@@ -2145,8 +2131,13 @@ impl<'a> Engine<'a> {
             // nested pattern inside one): the scrutinee is the enclosing
             // `switch`/`if-case` group's own value. Scan back for the
             // `switch`/`if` keyword whose `(` encloses the value.
-            TK::OpenCurly | TK::Colon | TK::Function | TK::AmpersandAmpersand
-            | TK::BarBar | TK::OpenParen | TK::Comma => {
+            TK::OpenCurly
+            | TK::Colon
+            | TK::Function
+            | TK::AmpersandAmpersand
+            | TK::BarBar
+            | TK::OpenParen
+            | TK::Comma => {
                 let mut depth = 0i32;
                 for idx in (0..=before_idx).rev() {
                     match toks[idx].kind {
@@ -2171,9 +2162,7 @@ impl<'a> Engine<'a> {
                                 .rows
                                 .iter()
                                 .chain(self.deferred_miss_rows.iter())
-                                .filter(|c| {
-                                    c.range.offset > open && c.range.end() <= end
-                                })
+                                .filter(|c| c.range.offset > open && c.range.end() <= end)
                                 .last()
                                 .map(|c| self.operand_static_ty(c))
                                 .filter(|ty| *ty != Ty::UNKNOWN)?;
@@ -2203,12 +2192,16 @@ impl<'a> Engine<'a> {
     /// DECLARED `dynamic`/`void` return still spells itself
     /// (semantics_A02: `'void'`).
     fn return_ctx(&self) -> Option<(Option<Ty>, String)> {
-        let ty = self.frames.iter().rev().find_map(|frame| match &frame.kind {
-            FrameKind::Executable { ret, ctx_ret, .. } => {
-                ret.as_ref().map(|exec| exec.ty).or(*ctx_ret)
-            }
-            _ => None,
-        });
+        let ty = self
+            .frames
+            .iter()
+            .rev()
+            .find_map(|frame| match &frame.kind {
+                FrameKind::Executable { ret, ctx_ret, .. } => {
+                    ret.as_ref().map(|exec| exec.ty).or(*ctx_ret)
+                }
+                _ => None,
+            });
         match ty {
             Some(ty) if ty != Ty::UNKNOWN => {
                 let folded = self.fold_alias_ty(ty);
@@ -2267,7 +2260,9 @@ impl<'a> Engine<'a> {
                         _ => {}
                     }
                 }
-                if found.is_none() && let Some(literal_open) = literal {
+                if found.is_none()
+                    && let Some(literal_open) = literal
+                {
                     return self.literal_elem_ctx(literal_open);
                 }
                 found
@@ -2306,12 +2301,7 @@ impl<'a> Engine<'a> {
         if !matches!(
             before_open.and_then(|i| toks.get(i)).map(|t| t.kind),
             Some(
-                TK::Identifier
-                    | TK::CloseParen
-                    | TK::CloseSquare
-                    | TK::Gt
-                    | TK::GtGt
-                    | TK::GtGtGt
+                TK::Identifier | TK::CloseParen | TK::CloseSquare | TK::Gt | TK::GtGt | TK::GtGtGt
             )
         ) {
             return self.expr_boundary_ctx(open_idx, live);
@@ -2386,8 +2376,8 @@ impl<'a> Engine<'a> {
     /// `'C'` — semantics_A02's futureOrBase).
     fn shorthand_ctx_formal(&self, ty: Ty) -> Option<(Option<Ty>, String)> {
         if let Ty::Named { name, .. } = ty {
-            let is_param = self.type_params.contains(&name)
-                || self.pending_type_params.contains(&name);
+            let is_param =
+                self.type_params.contains(&name) || self.pending_type_params.contains(&name);
             if is_param || !matches!(self.type_resolution(name).0, TypeResolution::Type) {
                 return None;
             }
@@ -2460,19 +2450,17 @@ impl<'a> Engine<'a> {
             // `C<int> c =`) ends the declarator's type the same way an
             // identifier does; `dynamic`/`void`/bare `Function` spell
             // their annotation through a keyword token.
-            Some(
-                TK::Identifier | TK::CloseParen | TK::Gt | TK::GtGt | TK::GtGtGt,
-            )
+            Some(TK::Identifier | TK::CloseParen | TK::Gt | TK::GtGt | TK::GtGtGt)
             | Some(TK::Keyword(
                 Kw::Var
-                    | Kw::Final
-                    | Kw::Const
-                    | Kw::Late
-                    | Kw::Static
-                    | Kw::Covariant
-                    | Kw::Dynamic
-                    | Kw::Void
-                    | Kw::Function,
+                | Kw::Final
+                | Kw::Const
+                | Kw::Late
+                | Kw::Static
+                | Kw::Covariant
+                | Kw::Dynamic
+                | Kw::Void
+                | Kw::Function,
             )) => self.shorthand_decl_ctx(),
             _ => None,
         }
@@ -2510,19 +2498,13 @@ impl<'a> Engine<'a> {
             RowShape::Bare(_) => {
                 // An unqualified call inside a container resolves the
                 // member through `this`.
-                let this_recv = self
-                    .frames
-                    .iter()
-                    .rev()
-                    .find_map(|f| match &f.kind {
-                        FrameKind::Container { name, kind, .. } => {
-                            Some(Receiver::This {
-                                container: *name,
-                                kind: *kind,
-                            })
-                        }
-                        _ => None,
-                    });
+                let this_recv = self.frames.iter().rev().find_map(|f| match &f.kind {
+                    FrameKind::Container { name, kind, .. } => Some(Receiver::This {
+                        container: *name,
+                        kind: *kind,
+                    }),
+                    _ => None,
+                });
                 if let Some(recv) = this_recv
                     && let Some(f) = self.member_formals_full(&recv, callee.name)
                 {
@@ -2541,7 +2523,13 @@ impl<'a> Engine<'a> {
     /// The deferred row's verdict — the shared rule applied to a row that
     /// already left the live stack (the upgrade writes the deferred slot,
     /// not `self.rows`).
-    fn verdict_deferred_shorthand(&mut self, index: usize, row: &Row, resolve: Option<Ty>, schema: String) {
+    fn verdict_deferred_shorthand(
+        &mut self,
+        index: usize,
+        row: &Row,
+        resolve: Option<Ty>,
+        schema: String,
+    ) {
         if let Some(ty) = self.verdict_shorthand_miss(row, resolve, schema) {
             self.deferred_miss_rows[index].shape = RowShape::Bare(BareInfo::Plain { ty });
             self.deferred_miss_rows[index].ty = ty;
@@ -2649,8 +2637,7 @@ impl<'a> Engine<'a> {
                     // `>` byte distinguishes the type-arguments group from
                     // an index `[]`/`?[]` face (a nullable `V?` read, never
                     // a `Type` literal) and from arithmetic operators.
-                    let (Intent::Operator(_, bracket), RowShape::Value) =
-                        (&row.intent, &row.shape)
+                    let (Intent::Operator(_, bracket), RowShape::Value) = (&row.intent, &row.shape)
                     else {
                         return false;
                     };
@@ -2748,7 +2735,10 @@ impl<'a> Engine<'a> {
         // A real group's closer: the next token re-anchors `[..]`/`{..}`/`(..)`
         // to the operand's whole extent.
         if let Some(close) = toks.get(index + 1)
-            && matches!(close.kind, TK::CloseSquare | TK::CloseCurly | TK::CloseParen)
+            && matches!(
+                close.kind,
+                TK::CloseSquare | TK::CloseCurly | TK::CloseParen
+            )
         {
             return self.staged_expression_span(SourceRange {
                 offset: close.utf16_offset,
@@ -2923,7 +2913,11 @@ impl<'a> Engine<'a> {
         // at all — the official report then anchors the SYNTHETIC empty
         // node at the value's position, a zero-length span the row model
         // spells as the operator's first-token offset.
-        let range = match self.rows.last().filter(|row| row.range.offset >= rhs_offset) {
+        let range = match self
+            .rows
+            .last()
+            .filter(|row| row.range.offset >= rhs_offset)
+        {
             Some(value) => {
                 let span = self.staged_expression_span(value.range);
                 let offset = span.offset.min(rhs_offset);
@@ -2964,8 +2958,7 @@ impl<'a> Engine<'a> {
     /// `x++ ??= y` latches the `x` row, an inner operand of a larger
     /// expression, never that expression's own row.
     fn is_assignment_target(&self, row: &Row, limit: u32) -> bool {
-        if row.range.end() > limit || matches!(row.intent, Intent::Operator(..) | Intent::Invoke)
-        {
+        if row.range.end() > limit || matches!(row.intent, Intent::Operator(..) | Intent::Invoke) {
             return false;
         }
         let named = match &row.shape {
@@ -3282,10 +3275,8 @@ impl<'a> Engine<'a> {
         if matched == Ty::UNKNOWN || self.is_invalid_ty(matched) {
             return;
         }
-        let (Some(lo), Some(hi)) = (
-            self.token_source_range(kw + 1),
-            self.token_source_range(eq),
-        ) else {
+        let (Some(lo), Some(hi)) = (self.token_source_range(kw + 1), self.token_source_range(eq))
+        else {
             return;
         };
         self.irrefutable_walk_between(lo, hi, matched);
@@ -3342,9 +3333,9 @@ impl<'a> Engine<'a> {
                     TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
                         depth += 1;
                     }
-                    TokenKind::CloseParen
-                    | TokenKind::CloseSquare
-                    | TokenKind::CloseCurly => depth -= 1,
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth -= 1
+                    }
                     TokenKind::Keyword(Keyword::As) if depth == 0 => cast = Some(i),
                     _ => {}
                 }
@@ -3395,9 +3386,9 @@ impl<'a> Engine<'a> {
                     TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
                         depth += 1;
                     }
-                    TokenKind::CloseParen
-                    | TokenKind::CloseSquare
-                    | TokenKind::CloseCurly => depth -= 1,
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        depth -= 1
+                    }
                     TokenKind::Lt if depth == 0 => {
                         // Typed-collection head (`<T>[...]`/`<K,V>{...}`)
                         // or a typed object head (`Square<C>(…)`)? Scan
@@ -3437,7 +3428,10 @@ impl<'a> Engine<'a> {
                     }
                     TokenKind::BarBar if depth == 0 => logical_or = true,
                     TokenKind::AmpersandAmpersand if depth == 0 => logical_and = Some(i),
-                    TokenKind::EqEq | TokenKind::BangEq | TokenKind::Gt | TokenKind::GtEq
+                    TokenKind::EqEq
+                    | TokenKind::BangEq
+                    | TokenKind::Gt
+                    | TokenKind::GtEq
                     | TokenKind::LtEq
                         if depth == 0 =>
                     {
@@ -3480,9 +3474,9 @@ impl<'a> Engine<'a> {
                         TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
                             depth += 1;
                         }
-                        TokenKind::CloseParen
-                        | TokenKind::CloseSquare
-                        | TokenKind::CloseCurly => depth -= 1,
+                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                            depth -= 1
+                        }
                         TokenKind::Comma | TokenKind::Colon if depth == 0 => is_record = true,
                         _ => {}
                     }
@@ -3578,8 +3572,7 @@ impl<'a> Engine<'a> {
                 // List `[...]` / `<T>[...]` or map `{...}` / `<K,V>{...}`.
                 let (mut cursor, written) = if toks[lo].kind == TokenKind::Lt {
                     let mut carry = 0u32;
-                    let Some((first, mut next)) = self.reconstruct_ty_at(lo + 1, &mut carry)
-                    else {
+                    let Some((first, mut next)) = self.reconstruct_ty_at(lo + 1, &mut carry) else {
                         return;
                     };
                     let mut args = vec![first];
@@ -3631,7 +3624,10 @@ impl<'a> Engine<'a> {
                             });
                         let required = {
                             let list = self.intern("List");
-                            self.boundary.args.borrow_mut().named(list, false, &[element])
+                            self.boundary
+                                .args
+                                .borrow_mut()
+                                .named(list, false, &[element])
                         };
                         if let Some(at) = self.token_span(lo, hi) {
                             self.emit_irrefutable(at, matched, required);
@@ -3652,9 +3648,7 @@ impl<'a> Engine<'a> {
                         let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
                         let (key_ty, val_ty) = match written.as_ref() {
                             Some(args) if args.len() >= 2 => (args[0], args[1]),
-                            _ => self
-                                .map_entries_of(matched)
-                                .unwrap_or((object_q, object_q)),
+                            _ => self.map_entries_of(matched).unwrap_or((object_q, object_q)),
                         };
                         let required = {
                             let map = self.intern("Map");
@@ -3691,9 +3685,7 @@ impl<'a> Engine<'a> {
                 }
                 let fields = self.pattern_fields(lo + 1, close);
                 let object_q = Self::nullable_form(Ty::named(self.intern("Object")));
-                let (key_ty, val_ty) = self
-                    .map_entries_of(matched)
-                    .unwrap_or((object_q, object_q));
+                let (key_ty, val_ty) = self.map_entries_of(matched).unwrap_or((object_q, object_q));
                 let required = {
                     let map = self.intern("Map");
                     self.boundary
@@ -3779,9 +3771,7 @@ impl<'a> Engine<'a> {
                             Ty::Named { name, .. } => Some(name),
                             _ => None,
                         };
-                        for (getter, fld_lo, fld_hi, _) in
-                            self.pattern_fields(next + 1, close)
-                        {
+                        for (getter, fld_lo, fld_hi, _) in self.pattern_fields(next + 1, close) {
                             let column = head
                                 .and_then(|head| {
                                     getter.and_then(|g| self.object_pattern_binder_ty(head, g))
@@ -3951,7 +3941,12 @@ impl<'a> Engine<'a> {
                 None => return open,
             }
         }
-        if j == 0 || !matches!(toks[j - 1].kind, TokenKind::Identifier | TokenKind::Keyword(_)) {
+        if j == 0
+            || !matches!(
+                toks[j - 1].kind,
+                TokenKind::Identifier | TokenKind::Keyword(_)
+            )
+        {
             return open;
         }
         j -= 1;
@@ -4053,9 +4048,9 @@ impl<'a> Engine<'a> {
                         TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
                             inner_depth += 1;
                         }
-                        TokenKind::CloseParen
-                        | TokenKind::CloseSquare
-                        | TokenKind::CloseCurly => inner_depth -= 1,
+                        TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                            inner_depth -= 1
+                        }
                         TokenKind::Colon if inner_depth == 0 => {
                             colon = Some(j);
                             break;
@@ -4526,15 +4521,12 @@ impl<'a> Engine<'a> {
                 .iter()
                 .all(|elem| self.const_value_primitive_equality(elem)),
             ConstantValue::Map(pairs) => pairs.iter().all(|(key, val)| {
-                self.const_value_primitive_equality(key)
-                    && self.const_value_primitive_equality(val)
+                self.const_value_primitive_equality(key) && self.const_value_primitive_equality(val)
             }),
-            ConstantValue::Record { positional, named } => {
-                positional
-                    .iter()
-                    .chain(named.iter().map(|(_, val)| val))
-                    .all(|elem| self.const_value_primitive_equality(elem))
-            }
+            ConstantValue::Record { positional, named } => positional
+                .iter()
+                .chain(named.iter().map(|(_, val)| val))
+                .all(|elem| self.const_value_primitive_equality(elem)),
             ConstantValue::Created(name) => self.created_primitive_equality(*name),
             ConstantValue::Instance(kind) => matches!(kind, InstanceKind::Function),
         }
@@ -7057,11 +7049,7 @@ impl<'a> Engine<'a> {
                         !names.is_empty() && self.ty_names_any(slot_ty, &names)
                     })
                     .unwrap_or(false);
-                if has_open_param {
-                    None
-                } else {
-                    Some(slot_ty)
-                }
+                if has_open_param { None } else { Some(slot_ty) }
             }
         }
     }
@@ -7336,10 +7324,13 @@ impl<'a> Engine<'a> {
                 // alias-fold rebuild).
                 let return_ty = self.closure_subst_param_ty(return_ty, map);
                 if names.is_empty() && type_params > 0 {
-                    self.boundary
-                        .args
-                        .borrow_mut()
-                        .function(type_params, return_ty, &positional, &named, nullable)
+                    self.boundary.args.borrow_mut().function(
+                        type_params,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
                 } else {
                     self.boundary.args.borrow_mut().function_generic(
                         &names,
@@ -8013,8 +8004,7 @@ impl<'a> Engine<'a> {
         let Some(end) = toks
             .get(at)
             .filter(|t| {
-                t.utf16_offset == brace.offset
-                    && t.kind == dartq_scanner::TokenKind::OpenCurly
+                t.utf16_offset == brace.offset && t.kind == dartq_scanner::TokenKind::OpenCurly
             })
             .and_then(|_| self.tokens.matching_end(at))
             .and_then(|close| self.tokens.get(close))
@@ -8153,8 +8143,7 @@ impl<'a> Engine<'a> {
                 name,
                 nullable: false,
                 ..
-            } if name == self.intern("FutureOr") =>
-            {
+            } if name == self.intern("FutureOr") => {
                 if !self.named_type_is_type(name) && !*is_async {
                     return None;
                 }

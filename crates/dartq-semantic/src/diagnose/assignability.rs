@@ -120,7 +120,12 @@ impl<'a> Engine<'a> {
             && spells_void(bytes, open + 1, close)
         {
             let list = self.intern("List");
-            return Some(self.boundary.args.borrow_mut().named(list, false, &[Ty::Void]));
+            return Some(
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(list, false, &[Ty::Void]),
+            );
         }
         let (name_range, name) = self
             .type_uses
@@ -239,36 +244,37 @@ impl<'a> Engine<'a> {
         if segments.len() > 2 {
             return None;
         }
-        let args: Vec<Ty> = segments
-            .iter()
-            .map(|(start, end)| {
-                // Segment bounds are bytes; `type_uses` ranges are UTF-16.
-                let (start16, end16) = (self.utf16_of(*start), self.utf16_of(*end));
-                match self
-                    .type_uses
-                    .iter()
-                    .rev()
-                    .find(|(range, _)| range.offset >= start16 && range.end() <= end16)
-                    .copied()
-                {
-                    Some((name_range, name)) => {
-                        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
-                            return None;
+        let args: Vec<Ty> =
+            segments
+                .iter()
+                .map(|(start, end)| {
+                    // Segment bounds are bytes; `type_uses` ranges are UTF-16.
+                    let (start16, end16) = (self.utf16_of(*start), self.utf16_of(*end));
+                    match self
+                        .type_uses
+                        .iter()
+                        .rev()
+                        .find(|(range, _)| range.offset >= start16 && range.end() <= end16)
+                        .copied()
+                    {
+                        Some((name_range, name)) => {
+                            if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+                                return None;
+                            }
+                            Some(self.literal_arg_leaf(
+                                name,
+                                self.written_nullable_suffix(name_range.end()),
+                            ))
                         }
-                        Some(self.literal_arg_leaf(
-                            name,
-                            self.written_nullable_suffix(name_range.end()),
-                        ))
+                        // A written `void` argument fires no type-use row (the
+                        // parser routes the keyword through
+                        // `handle_void_keyword`, never `handle_type`): the
+                        // segment's own bytes answer (`<void>{}` → `Set<void>`,
+                        // `<int, void>{}` → `Map<int, void>` — #3361).
+                        None => spells_void(bytes, *start, *end).then_some(Ty::Void),
                     }
-                    // A written `void` argument fires no type-use row (the
-                    // parser routes the keyword through
-                    // `handle_void_keyword`, never `handle_type`): the
-                    // segment's own bytes answer (`<void>{}` → `Set<void>`,
-                    // `<int, void>{}` → `Map<int, void>` — #3361).
-                    None => spells_void(bytes, *start, *end).then_some(Ty::Void),
-                }
-            })
-            .collect::<Option<Vec<_>>>()?;
+                })
+                .collect::<Option<Vec<_>>>()?;
         let (set, map) = (self.collection_heads[1], self.collection_heads[2]);
         let ty = if args.len() == 1 {
             self.boundary.args.borrow_mut().named(set, false, &args)
@@ -401,7 +407,9 @@ impl<'a> Engine<'a> {
                 let Some((name_range, name)) = self
                     .type_uses
                     .iter()
-                    .filter(|(range, _)| range.offset >= head_start16 && range.end() <= group_close16)
+                    .filter(|(range, _)| {
+                        range.offset >= head_start16 && range.end() <= group_close16
+                    })
                     .min_by_key(|(range, _)| range.offset)
                     .copied()
                 else {
@@ -1308,14 +1316,12 @@ impl<'a> Engine<'a> {
             let bytes = self.source.as_bytes();
             // The byte past the arg's whitespace: the `)` that closes `E(`.
             let close = self.byte_of(self.skip_whitespace(arg_range.end()));
-            bytes.get(close) == Some(&b')')
-                && {
-                    // One past `)`, skipping whitespace: `?.` is the
-                    // null-aware arm; `,`/`.`/`[`/`)` decline the promotion.
-                    let op =
-                        self.byte_of(self.skip_whitespace(self.utf16_of(close) + 1));
-                    bytes.get(op..op + 2) == Some(b"?.")
-                }
+            bytes.get(close) == Some(&b')') && {
+                // One past `)`, skipping whitespace: `?.` is the
+                // null-aware arm; `,`/`.`/`[`/`)` decline the promotion.
+                let op = self.byte_of(self.skip_whitespace(self.utf16_of(close) + 1));
+                bytes.get(op..op + 2) == Some(b"?.")
+            }
         };
         let arg_ty = if null_aware {
             self.non_null_face(*arg_ty)
@@ -1715,7 +1721,8 @@ impl<'a> Engine<'a> {
                             Walk::Found(entry)
                                 if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                             {
-                                let declared = self.accessor_declared_ty(declaring, row.name, &entry);
+                                let declared =
+                                    self.accessor_declared_ty(declaring, row.name, &entry);
                                 let inherited = match &recv {
                                     Receiver::Typed { ty, .. } if declaring != container => self
                                         .member_recv_env(*ty, declaring, &entry)
@@ -2974,9 +2981,7 @@ impl<'a> Engine<'a> {
                     RefTarget::Decl { .. } => self.top_level_write_ty(row.name),
                 }
             }
-            RowShape::Bare(BareInfo::Missing { this_type, .. })
-                if row.intent == Intent::Write =>
-            {
+            RowShape::Bare(BareInfo::Missing { this_type, .. }) if row.intent == Intent::Write => {
                 // A setter-only implicit-`this` write (`set only(T v)` with
                 // no getter): the tentative read missed the getter
                 // namespace, so the row carries no `Plain` face, yet the
@@ -3275,8 +3280,8 @@ impl<'a> Engine<'a> {
                     }
                 }
                 if let Some(index) = opener
-                    && let Some(length) = (close.utf16_offset + close.byte_len)
-                        .checked_sub(toks[index].utf16_offset)
+                    && let Some(length) =
+                        (close.utf16_offset + close.byte_len).checked_sub(toks[index].utf16_offset)
                 {
                     span = SourceRange {
                         offset: toks[index].utf16_offset,
@@ -3518,9 +3523,7 @@ impl<'a> Engine<'a> {
     /// the bounded scan never walks the right-hand tail.
     #[cfg(not(test))]
     fn assignment_target_index(&self, limit: u32) -> Option<usize> {
-        let bound = self
-            .rows
-            .partition_point(|row| row.range.offset <= limit);
+        let bound = self.rows.partition_point(|row| row.range.offset <= limit);
         self.rows[..bound]
             .iter()
             .rposition(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
@@ -3529,19 +3532,15 @@ impl<'a> Engine<'a> {
     /// [`Self::assignment_target_index`]'s instrumented twin (see its doc).
     #[cfg(test)]
     fn assignment_target_index(&self, limit: u32) -> Option<usize> {
-        let bound = self
-            .rows
-            .partition_point(|row| row.range.offset <= limit);
+        let bound = self.rows.partition_point(|row| row.range.offset <= limit);
         ASSIGNMENT_TARGET_MAX_TAIL.fetch_max(
             self.rows.len() - bound,
             std::sync::atomic::Ordering::Relaxed,
         );
-        self.rows[..bound]
-            .iter()
-            .rposition(|row| {
-                ASSIGNMENT_TARGET_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                row.range.end() <= limit && !matches!(row.shape, RowShape::Value)
-            })
+        self.rows[..bound].iter().rposition(|row| {
+            ASSIGNMENT_TARGET_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            row.range.end() <= limit && !matches!(row.shape, RowShape::Value)
+        })
     }
 
     /// The two operand rows of a `??` or conditional tail ending at `last`:
@@ -3663,10 +3662,9 @@ impl<'a> Engine<'a> {
         };
         // Nullability merge (:562-571): `UP(T1?, T2) = UP(T1, T2)?`.
         if Self::potentially_nullable_ty(left) || Self::potentially_nullable_ty(right) {
-            return Self::nullable_form(self.join_stripped(
-                Self::non_null_form(left),
-                Self::non_null_form(right),
-            ));
+            return Self::nullable_form(
+                self.join_stripped(Self::non_null_form(left), Self::non_null_form(right)),
+            );
         }
         self.join_stripped(left, right)
     }
@@ -3682,7 +3680,9 @@ impl<'a> Engine<'a> {
     fn potentially_nullable_ty(ty: Ty) -> bool {
         matches!(
             ty,
-            Ty::Named { nullable: true, .. } | Ty::Function { nullable: true, .. } | Ty::Record { nullable: true, .. }
+            Ty::Named { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+                | Ty::Record { nullable: true, .. }
         )
     }
 
@@ -3700,20 +3700,20 @@ impl<'a> Engine<'a> {
         // rule's `is_bare_function_id` arm, least_upper_bound.dart:611-635).
         if self.is_bare_function_head(left) || self.is_bare_function_head(right) {
             if matches!(left, Ty::Function { .. }) || matches!(right, Ty::Function { .. }) {
-                return if self.is_bare_function_head(left) { left } else { right };
+                return if self.is_bare_function_head(left) {
+                    left
+                } else {
+                    right
+                };
             }
         }
         match (left, right) {
             (
                 Ty::Named {
-                    name: l,
-                    args: la,
-                    ..
+                    name: l, args: la, ..
                 },
                 Ty::Named {
-                    name: r,
-                    args: ra,
-                    ..
+                    name: r, args: ra, ..
                 },
             ) => {
                 let world = self.name_world();
@@ -3728,10 +3728,7 @@ impl<'a> Engine<'a> {
                         let pool = self.boundary.pool();
                         (pool.get(la).to_vec(), pool.get(ra).to_vec())
                     };
-                    if la != ra
-                        && left_args.len() == right_args.len()
-                        && !left_args.is_empty()
-                    {
+                    if la != ra && left_args.len() == right_args.len() && !left_args.is_empty() {
                         let joined: Vec<Ty> = left_args
                             .iter()
                             .zip(right_args.iter())
@@ -3750,18 +3747,14 @@ impl<'a> Engine<'a> {
                 // full types, so a same-head instantiation the name walk
                 // cannot compare (`Iterable<int>` vs `List<num>`) falls to
                 // the common-supertype walk below.
-                if world.named_sub(r, l)
-                    && (ra == ArgListId::EMPTY || ra == la)
-                {
+                if world.named_sub(r, l) && (ra == ArgListId::EMPTY || ra == la) {
                     return Ty::Named {
                         name: l,
                         nullable: false,
                         args: la,
                     };
                 }
-                if world.named_sub(l, r)
-                    && (la == ArgListId::EMPTY || la == ra)
-                {
+                if world.named_sub(l, r) && (la == ArgListId::EMPTY || la == ra) {
                     return Ty::Named {
                         name: r,
                         nullable: false,
@@ -3815,8 +3808,19 @@ impl<'a> Engine<'a> {
         // core; a name neither side reaches never joins anyway).
         let mut heads: Vec<StringId> = vec![l, r, self.intern("Object")];
         for name in [
-            "num", "Comparable", "Iterable", "List", "Set", "Map", "String", "Pattern", "bool",
-            "Enum", "Function", "Future", "Record",
+            "num",
+            "Comparable",
+            "Iterable",
+            "List",
+            "Set",
+            "Map",
+            "String",
+            "Pattern",
+            "bool",
+            "Enum",
+            "Function",
+            "Future",
+            "Record",
         ] {
             heads.push(self.intern(name));
         }
@@ -4180,14 +4184,9 @@ impl<'a> Engine<'a> {
         // own composite folds in between, so the left is not the
         // composite's head row).
         if ty == Ty::UNKNOWN && matches!(row.shape, RowShape::Value) {
-            let right = self
-                .deferred_miss_rows
-                .iter()
-                .rev()
-                .find(|operand| {
-                    operand.range.offset > row.range.offset
-                        && operand.range.end() <= row.range.end()
-                });
+            let right = self.deferred_miss_rows.iter().rev().find(|operand| {
+                operand.range.offset > row.range.offset && operand.range.end() <= row.range.end()
+            });
             if let Some(right) = right {
                 let toks = self.tokens.as_slice();
                 let lo = toks.partition_point(|t| t.utf16_offset < row.range.offset);
@@ -4561,7 +4560,9 @@ impl<'a> Engine<'a> {
                 self.emit_use_of_void_result(from, &rhs_row);
             } else {
                 let (from_text, to_text) = (self.ty_display(from), self.ty_display(to));
-                let range = self.property_access_span(rhs_row.range).unwrap_or(rhs_row.range);
+                let range = self
+                    .property_access_span(rhs_row.range)
+                    .unwrap_or(rhs_row.range);
                 self.emit_non_promotion(
                     SemanticCode::FieldInitializerNotAssignable,
                     range,
@@ -4730,7 +4731,14 @@ impl<'a> Engine<'a> {
         } else {
             right_ty
         };
-        let from = self.compound_result_ty(op, read_ty, &rhs_row, right_ty, declared, extension_resolved);
+        let from = self.compound_result_ty(
+            op,
+            read_ty,
+            &rhs_row,
+            right_ty,
+            declared,
+            extension_resolved,
+        );
         if matches!(from, Ty::Unknown | Ty::Void | Ty::Dynamic) || self.written_ty_invalid(from) {
             return;
         }
@@ -4791,11 +4799,7 @@ impl<'a> Engine<'a> {
     /// know which arm answered, so the extension consult stands alone here
     /// and the generic path (which re-consults it internally and returns
     /// `None` only when no arm did) carries the refine flag.
-    fn compound_operator_sig(
-        &mut self,
-        op: &str,
-        target_row: &Row,
-    ) -> Option<(Ty, Ty, bool)> {
+    fn compound_operator_sig(&mut self, op: &str, target_row: &Row) -> Option<(Ty, Ty, bool)> {
         let spelling = self.intern(op);
         let recv = self.bound_face(self.equality_operand_ty(target_row));
         if let Some((param, declared)) = self.nullable_extension_operator_sig(recv, spelling) {
@@ -4863,7 +4867,14 @@ impl<'a> Engine<'a> {
         }
         let (_, declared, extension_resolved) = self.compound_operator_sig(op, &target_row)?;
         let right_ty = self.equality_operand_ty(&rhs_row);
-        let result = self.compound_result_ty(op, read_ty, &rhs_row, right_ty, declared, extension_resolved);
+        let result = self.compound_result_ty(
+            op,
+            read_ty,
+            &rhs_row,
+            right_ty,
+            declared,
+            extension_resolved,
+        );
         (!matches!(result, Ty::Unknown | Ty::Void)).then_some(result)
     }
 
@@ -5249,9 +5260,12 @@ impl<'a> Engine<'a> {
                 false,
             ) == Some(true)
         };
-        let iterable_side = world
-            .decide_subtype(name, iterable)
-            .or_else(|| [iterable, set, list].into_iter().any(core_hit).then_some(true));
+        let iterable_side = world.decide_subtype(name, iterable).or_else(|| {
+            [iterable, set, list]
+                .into_iter()
+                .any(core_hit)
+                .then_some(true)
+        });
         let map_side = world
             .decide_subtype(name, map)
             .or_else(|| core_hit(map).then_some(true));
@@ -5506,9 +5520,7 @@ impl<'a> Engine<'a> {
                     "RETURN_IN_GENERATIVE_CONSTRUCTOR",
                     self.staged_expression_span(range),
                     "Constructors can't return values.",
-                    Some(
-                        "Try removing the return statement or using a factory constructor.",
-                    ),
+                    Some("Try removing the return statement or using a factory constructor."),
                 );
             }
             return;
@@ -6225,12 +6237,7 @@ impl<'a> Engine<'a> {
                 };
                 for (from_arg, to_arg) in from_args.iter().zip(to_args.iter()) {
                     self.bind_sig_leaves(
-                        *from_arg,
-                        *to_arg,
-                        candidates,
-                        binding_ok,
-                        bindings,
-                        failed,
+                        *from_arg, *to_arg, candidates, binding_ok, bindings, failed,
                     );
                 }
             }
@@ -7090,11 +7097,11 @@ impl<'a> Engine<'a> {
                 // `S <: T` iff `bound(S) <: T`, and `bound(S) == T` is the
                 // same-head reflexive arm), so `S extends T` no longer rides
                 // the interface refusal (the over-report this ticket lifts).
-                Ty::Named { name: from_name, .. } if self.is_scope_param(from_name) => {
+                Ty::Named {
+                    name: from_name, ..
+                } if self.is_scope_param(from_name) => {
                     match self.param_bound(from_name) {
-                        Some(bound) if bound != Ty::Unknown => {
-                            self.assignable(bound, to, false)
-                        }
+                        Some(bound) if bound != Ty::Unknown => self.assignable(bound, to, false),
                         // No written bound captured: the interface refusal
                         // stands (the under-report-safe side).
                         _ => Some(false),
@@ -7180,7 +7187,9 @@ impl<'a> Engine<'a> {
         // so it stays open; a target that resolves to no container and is
         // no core primitive could still be an alias or an unseen edge —
         // the under-report direction keeps it undecidable.
-        if let Ty::Record { nullable: false, .. } = from
+        if let Ty::Record {
+            nullable: false, ..
+        } = from
             && let Ty::Named {
                 name: to_name,
                 nullable: false,
@@ -7656,8 +7665,8 @@ impl<'a> Engine<'a> {
             }
             _ => false,
         };
-        let must_be_exhaustive = (ctx.is_expression && expression_face_decides)
-            || is_always_exhaustive(&world, value);
+        let must_be_exhaustive =
+            (ctx.is_expression && expression_face_decides) || is_always_exhaustive(&world, value);
         if let Exhaustiveness::NonExhaustive(_) = report.exhaustiveness {
             if must_be_exhaustive && ctx.default_kw.is_none() {
                 let code = if ctx.is_expression {
@@ -8390,9 +8399,7 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
-                if !divergent
-                    && let Some(rhs) = hit
-                {
+                if !divergent && let Some(rhs) = hit {
                     folded = Self::join_nullable(rhs, nullable);
                 }
             }
@@ -8481,7 +8488,8 @@ impl<'a> Engine<'a> {
     /// against `int Function(int)` — two required positionals where one is
     /// wanted) reports through the same shape rules.
     fn fn_shape_pair_verdict(&self, from_fn: &FnVarSig, to_fn: &FnVarSig) -> Option<bool> {
-        if from_fn.params.len() > to_fn.params.len() && to_fn.params.is_empty()
+        if from_fn.params.len() > to_fn.params.len()
+            && to_fn.params.is_empty()
             && let Some(verdict) = self.instantiated_fn_sig_subtype(from_fn, to_fn, false)
         {
             return Some(verdict);
@@ -8502,11 +8510,7 @@ impl<'a> Engine<'a> {
         // genericity mismatch (`void Function()` into
         // `void Function<Y extends num>()`).
         let quantifier_lost = |sig: &FnVarSig| {
-            sig.params.is_empty()
-                || sig
-                    .params
-                    .iter()
-                    .any(|(name, _)| *name == StringId::NONE)
+            sig.params.is_empty() || sig.params.iter().any(|(name, _)| *name == StringId::NONE)
         };
         if (quantifier_lost(from_fn) || quantifier_lost(to_fn))
             && let Some(verdict) =
@@ -9500,7 +9504,8 @@ impl<'a> Engine<'a> {
         // String` solve violates `extends num`, and the reported face is
         // the bound `num`), `void Function() f = C()` reads `dynamic
         // Function(dynamic)` (no positional pairs the context).
-        if !call_sig.params.is_empty() && to_fn.params.is_empty()
+        if !call_sig.params.is_empty()
+            && to_fn.params.is_empty()
             && let Some(verdict) = self.instantiated_fn_sig_subtype(&call_sig, to_fn, false)
         {
             return Some(verdict);
@@ -9524,9 +9529,7 @@ impl<'a> Engine<'a> {
                 named: call_sig
                     .named
                     .iter()
-                    .map(|(name, ty, required)| {
-                        (*name, self.subst_ty(*ty, &bounds), *required)
-                    })
+                    .map(|(name, ty, required)| (*name, self.subst_ty(*ty, &bounds), *required))
                     .collect(),
                 return_ty: self.subst_ty(call_sig.return_ty, &bounds),
             }
@@ -9899,10 +9902,13 @@ impl<'a> Engine<'a> {
                 // alias-fold rebuild).
                 let return_ty = self.subst_ty(return_ty, map);
                 if names.is_empty() && type_params > 0 {
-                    self.boundary
-                        .args
-                        .borrow_mut()
-                        .function(type_params, return_ty, &positional, &named, nullable)
+                    self.boundary.args.borrow_mut().function(
+                        type_params,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
                 } else {
                     self.boundary.args.borrow_mut().function_generic(
                         &names,

@@ -31,7 +31,7 @@
 use crate::facts::FlowFact;
 use crate::forward::SharedFlow;
 use crate::record::Flow;
-use crate::ty::{ArgTy, Base, Classification, Ty, TypeOps, EMPTY_ARGS};
+use crate::ty::{ArgTy, Base, Classification, EMPTY_ARGS, Ty, TypeOps};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
@@ -102,14 +102,7 @@ impl TypeOps for HierarchyOps {
     }
 
     fn try_promote_to(&self, to: Ty, from: Ty) -> Option<Ty> {
-        self.try_promote_to_typed(
-            to,
-            EMPTY_ARGS,
-            from,
-            EMPTY_ARGS,
-            &[],
-            &[],
-        )
+        self.try_promote_to_typed(to, EMPTY_ARGS, from, EMPTY_ARGS, &[], &[])
     }
 
     fn promote_to_non_null(&self, t: Ty) -> Ty {
@@ -194,8 +187,8 @@ fn read_types<'a>(source: &'a str, facts: &[FlowFact]) -> Vec<(&'a str, Ty)> {
         .iter()
         .filter_map(|fact| match fact {
             FlowFact::ReadType { span, ty, .. } => Some((
-                &source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize],
+                &source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize],
                 *ty,
             )),
             _ => None,
@@ -209,8 +202,8 @@ fn promoted_reads<'a>(source: &'a str, facts: &[FlowFact]) -> Vec<(&'a str, Ty)>
         .iter()
         .filter_map(|fact| match fact {
             FlowFact::PromotedRead { span, ty, .. } => Some((
-                &source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize],
+                &source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize],
                 *ty,
             )),
             _ => None,
@@ -224,8 +217,8 @@ fn promoted_property_reads<'a>(source: &'a str, facts: &[FlowFact]) -> Vec<&'a s
         .iter()
         .filter_map(|fact| match fact {
             FlowFact::PromotedPropertyRead { span } => Some(
-                &source[span.range.offset as usize
-                    ..(span.range.offset + span.range.length) as usize],
+                &source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize],
             ),
             _ => None,
         })
@@ -314,7 +307,13 @@ fn nullable_without_initializer_stays_declared() {
     let reads = read_types(source, &facts);
     assert_eq!(
         reads,
-        [("n", Ty { base: Base::Name(num), nullable: true })],
+        [(
+            "n",
+            Ty {
+                base: Base::Name(num),
+                nullable: true
+            }
+        )],
         "an unwritten nullable local stays nullable: {reads:?}"
     );
     assert!(promoted_reads(source, &facts).is_empty());
@@ -338,14 +337,32 @@ fn type_parameter_is_test_promotes_to_the_intersection() {
     assert_eq!(
         reads,
         [
-            ("i", Ty { base: Base::Name(t), nullable: false }),
-            ("i", Ty { base: Base::Name(int), nullable: false }),
+            (
+                "i",
+                Ty {
+                    base: Base::Name(t),
+                    nullable: false
+                }
+            ),
+            (
+                "i",
+                Ty {
+                    base: Base::Name(int),
+                    nullable: false
+                }
+            ),
         ],
         "the guarded read answers `int`, the `T & int` head: {reads:?}"
     );
     assert_eq!(
         promoted_reads(source, &facts),
-        [("i", Ty { base: Base::Name(int), nullable: false })]
+        [(
+            "i",
+            Ty {
+                base: Base::Name(int),
+                nullable: false
+            }
+        )]
     );
 }
 
@@ -358,18 +375,26 @@ fn type_parameter_bound_gates_the_intersection() {
         edges: &[(0, 1), (1, 2), (3, 2)],
     };
     let source = "void f<T extends String>(T i) {\n  if (i is! int) throw 'x';\n  i;\n}";
-    let (ids, facts) = analyze(
-        source,
-        &["int", "num", "Object", "String", "T"],
-        Some(&ops),
-    );
+    let (ids, facts) = analyze(source, &["int", "num", "Object", "String", "T"], Some(&ops));
     let (int, t) = (ids[0], ids[4]);
     let reads = read_types(source, &facts);
     assert_eq!(
         reads,
         [
-            ("i", Ty { base: Base::Name(t), nullable: false }),
-            ("i", Ty { base: Base::Name(t), nullable: false }),
+            (
+                "i",
+                Ty {
+                    base: Base::Name(t),
+                    nullable: false
+                }
+            ),
+            (
+                "i",
+                Ty {
+                    base: Base::Name(t),
+                    nullable: false
+                }
+            ),
         ],
         "an out-of-bound test promotes nothing: {reads:?}"
     );

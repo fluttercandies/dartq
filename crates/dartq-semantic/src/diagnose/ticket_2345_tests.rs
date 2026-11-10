@@ -30,9 +30,8 @@ use crate::diagnose::test_rig::{code_names, report_ops};
 /// verbatim before this pass).
 #[test]
 fn ticket_2345_is_narrowed_scrutinee_expression_silent() {
-    let report = report_ops(
-        "void f(dynamic x) { if (x is int) { var y = switch (x) { int i => 1 }; } }",
-    );
+    let report =
+        report_ops("void f(dynamic x) { if (x is int) { var y = switch (x) { int i => 1 }; } }");
     assert!(
         !code_names(&report)
             .iter()
@@ -48,8 +47,7 @@ fn ticket_2345_is_narrowed_scrutinee_expression_silent() {
 /// parse-time emission verbatim).
 #[test]
 fn ticket_2345_unpromoted_scrutinee_expression_reports() {
-    let report =
-        report_ops("void f(dynamic x) { var y = switch (x) { int i => 1 }; }");
+    let report = report_ops("void f(dynamic x) { var y = switch (x) { int i => 1 }; }");
     let names = code_names(&report);
     assert!(
         names
@@ -120,9 +118,7 @@ fn ticket_2345_narrowed_scrutinee_unreachable_case_reports() {
     );
     let names = code_names(&report);
     assert!(
-        names
-            .iter()
-            .any(|name| *name == "unreachable_switch_case"),
+        names.iter().any(|name| *name == "unreachable_switch_case"),
         "{names:?}"
     );
 }

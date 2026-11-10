@@ -8749,10 +8749,7 @@ fn null_promoted_field_equality_deads_the_else() {
     let dead = dead_snippets(source);
     assert_eq!(
         dead,
-        vec![
-            "{ print(2); }".to_string(),
-            "{ print(3); }".to_string()
-        ],
+        vec!["{ print(2); }".to_string(), "{ print(3); }".to_string()],
         "promoted-Null field reads fold both equality arms"
     );
 }

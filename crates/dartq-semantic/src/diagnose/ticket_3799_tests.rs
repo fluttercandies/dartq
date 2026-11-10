@@ -87,7 +87,8 @@ fn ticket_3799_equality_both_operands_spelled_void() {
 // —— `checkForArgumentTypeNotAssignableForArgument`'s void arm).
 #[test]
 fn ticket_3799_binary_argument_typedef_void() {
-    let fixture = "typedef V = void;\nV top() => throw 0;\nvoid main() {\n  V x = top();\n  3 + x;\n}";
+    let fixture =
+        "typedef V = void;\nV top() => throw 0;\nvoid main() {\n  V x = top();\n  3 + x;\n}";
     let report = report_ops(fixture);
     let at = fixture.find("x;").unwrap();
     assert_void_rows(&report, fixture, &[(at, 1)]);
@@ -107,7 +108,8 @@ fn ticket_3799_postfix_bang_typedef_void() {
 // —— junction/condition path reads the same spelled gate.
 #[test]
 fn ticket_3799_condition_typedef_void() {
-    let fixture = "typedef V = void;\nV top() => throw 0;\nvoid main() {\n  V x = top();\n  if (x) {}\n}";
+    let fixture =
+        "typedef V = void;\nV top() => throw 0;\nvoid main() {\n  V x = top();\n  if (x) {}\n}";
     let report = report_ops(fixture);
     let at = fixture.find("(x)").unwrap() + 1;
     assert_void_rows(&report, fixture, &[(at, 1)]);
@@ -138,7 +140,8 @@ fn ticket_3799_junction_typedef_void() {
 // —— `sequenceElementType is VoidType && variableType is! VoidType`).
 #[test]
 fn ticket_3799_for_in_typedef_void_element() {
-    let fixture = "typedef V = void;\nvoid main(List<V> values) {\n  for (Object? _ in values) {}\n}";
+    let fixture =
+        "typedef V = void;\nvoid main(List<V> values) {\n  for (Object? _ in values) {}\n}";
     let report = report_ops(fixture);
     let at = fixture.find("values) {}").unwrap();
     assert_void_rows(&report, fixture, &[(at, "values".len() as u32)]);
@@ -196,7 +199,11 @@ fn assert_no_bound_rows(report: &crate::diagnose::FileReport, fixture: &str) {
         .filter(|d| d.code.name == "type_argument_not_matching_bounds")
         .map(|d| (d.range.offset, d.range.length))
         .collect();
-    assert!(got.is_empty(), "fixture={fixture:?}\nrows={:?}", rows(report));
+    assert!(
+        got.is_empty(),
+        "fixture={fixture:?}\nrows={:?}",
+        rows(report)
+    );
 }
 
 // —— `??=` over two function-typed operands: `C1<int> Function()` and

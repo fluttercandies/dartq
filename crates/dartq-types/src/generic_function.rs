@@ -118,7 +118,15 @@ pub fn replace_top_bottom(sys: &TypeSystem<'_>, ty: TypeId) -> TypeId {
     );
     let never = sys.table().intern(UninternedType::Never, false);
     let facts = ParamFactsTable::new();
-    process_top_bottom(sys, &facts, ty, Variance::Covariant, object_question, never, 0)
+    process_top_bottom(
+        sys,
+        &facts,
+        ty,
+        Variance::Covariant,
+        object_question,
+        never,
+        0,
+    )
 }
 
 /// The facts-carrying form of [`replace_top_bottom`]: each interface
@@ -146,7 +154,15 @@ pub fn replace_top_bottom_with_facts(
         true,
     );
     let never = sys.table().intern(UninternedType::Never, false);
-    process_top_bottom(sys, facts, ty, Variance::Covariant, object_question, never, 0)
+    process_top_bottom(
+        sys,
+        facts,
+        ty,
+        Variance::Covariant,
+        object_question,
+        never,
+        0,
+    )
 }
 
 /// `S <: Never` — the official probe's test: `ReplaceTopBottomVisitor`
@@ -249,8 +265,7 @@ fn process_top_bottom(
         // (type.dart:518): the base is processed with the incoming
         // variance.
         TypeKind::FutureOr { base } => {
-            let new_base =
-                process_top_bottom(sys, facts, base, variance, top, bottom, depth + 1);
+            let new_base = process_top_bottom(sys, facts, base, variance, top, bottom, depth + 1);
             if new_base == base {
                 ty
             } else {

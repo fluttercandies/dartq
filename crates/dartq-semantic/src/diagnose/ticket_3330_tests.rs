@@ -51,7 +51,10 @@ fn dup_rows(report: &crate::diagnose::FileReport) -> Vec<(String, u32)> {
 
 /// Every `duplicate_definition` row's message.
 fn dup_messages(report: &crate::diagnose::FileReport) -> Vec<String> {
-    dup_rows(report).into_iter().map(|(message, _)| message).collect()
+    dup_rows(report)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect()
 }
 
 /// The unit offset of `needle`'s first hit: the rig prepends
@@ -118,9 +121,15 @@ fn unmarked_fields_stay_plain() {
     let container = collected
         .container(strings.intern("B"))
         .expect("class B collected");
-    let field = container.members.get(&strings.intern("z")).expect("field z");
+    let field = container
+        .members
+        .get(&strings.intern("z"))
+        .expect("field z");
     assert!(!field.covariant, "an unmarked field is not covariant");
-    let method = container.members.get(&strings.intern("m")).expect("method m");
+    let method = container
+        .members
+        .get(&strings.intern("m"))
+        .expect("method m");
     assert!(!method.covariant, "a parameter's mark stays on the formal");
 }
 
@@ -135,7 +144,9 @@ fn augment_member_claims_into_the_introduction_scope() {
     let report = report_ops(fixture);
     let rows = dup_rows(&report);
     assert_eq!(
-        rows.iter().map(|(message, _)| message.as_str()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|(message, _)| message.as_str())
+            .collect::<Vec<_>>(),
         vec!["The name 'foo' is already defined."],
         "the augmentation's repeat reports once: {rows:?}"
     );

@@ -190,6 +190,7 @@ fn main() {
                 target: Some(libs[0]),
                 prefix: None,
                 deferred: false,
+                non_library: false,
                 combinators: Combinators::unfiltered(),
             },
         );

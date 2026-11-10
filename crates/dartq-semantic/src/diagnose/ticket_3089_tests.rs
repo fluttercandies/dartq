@@ -38,13 +38,7 @@ fn getter_rows(source: &str) -> Vec<String> {
         .diagnostics
         .iter()
         .filter(|diag| diag.code.name == "undefined_getter")
-        .map(|diag| {
-            format!(
-                "@{}: {}",
-                diag.range.offset as usize - base,
-                diag.message
-            )
-        })
+        .map(|diag| format!("@{}: {}", diag.range.offset as usize - base, diag.message))
         .collect()
 }
 

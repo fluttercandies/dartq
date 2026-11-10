@@ -47,7 +47,9 @@ fn assignment_rows(fixture: &str) -> Vec<(&'static str, u32, u32)> {
 /// Offset of `needle` inside the first occurrence of `line` within
 /// `source` (the prelude-prefixed text the report offsets index into).
 fn at(source: &str, line: &str, needle: &str) -> u32 {
-    let line_at = source.find(line).unwrap_or_else(|| panic!("fixture has {line:?}"));
+    let line_at = source
+        .find(line)
+        .unwrap_or_else(|| panic!("fixture has {line:?}"));
     let needle_at = line
         .find(needle)
         .unwrap_or_else(|| panic!("{line:?} has {needle:?}"));

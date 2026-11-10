@@ -57,11 +57,7 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    assert!(
-        reports_value(&report, "C<int>"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(reports_value(&report, "C<int>"), "{:?}", report.diagnostics);
 }
 
 /// The `const` spelling takes the same arm: `const C(0)` answers
@@ -78,11 +74,7 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    assert!(
-        reports_value(&report, "C<int>"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(reports_value(&report, "C<int>"), "{:?}", report.diagnostics);
 }
 
 /// The named-selector creation infers through the selected
@@ -99,11 +91,7 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    assert!(
-        reports_value(&report, "C<int>"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(reports_value(&report, "C<int>"), "{:?}", report.diagnostics);
 }
 
 /// The class-typed named-selector spelling (`C<int>.of(0)`) keeps its
@@ -121,11 +109,7 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    assert!(
-        reports_value(&report, "C<int>"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(reports_value(&report, "C<int>"), "{:?}", report.diagnostics);
 }
 
 /// The keyword-less generic named spelling (`C.of(0)` without `new`) is
@@ -235,11 +219,7 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    assert!(
-        reports_value(&report, "F<int>"),
-        "{:?}",
-        report.diagnostics
-    );
+    assert!(reports_value(&report, "F<int>"), "{:?}", report.diagnostics);
 }
 
 /// Disagreeing candidates keep no binding: `D(0, "x")` binds `T := int`

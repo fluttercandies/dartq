@@ -55,9 +55,7 @@ impl Engine<'_> {
                 head_mark: self.locals.len(),
                 head_rows_mark: self.rows.len(),
                 head_vars: Vec::new(),
-                head_offset: self
-                    .clause_anchor
-                    .map_or(u32::MAX, |anchor| anchor.offset),
+                head_offset: self.clause_anchor.map_or(u32::MAX, |anchor| anchor.offset),
                 member_body: false,
                 member_ended: false,
                 is_default: false,
@@ -87,9 +85,7 @@ impl Engine<'_> {
                 head_mark: self.locals.len(),
                 head_rows_mark: self.rows.len(),
                 head_vars: Vec::new(),
-                head_offset: self
-                    .clause_anchor
-                    .map_or(u32::MAX, |anchor| anchor.offset),
+                head_offset: self.clause_anchor.map_or(u32::MAX, |anchor| anchor.offset),
                 member_body: false,
                 member_ended: false,
                 is_default: false,
@@ -107,9 +103,7 @@ impl Engine<'_> {
         // The clause anchor latches AFTER `switch_member_head_begin` (the
         // listener sets it once `case_kw` parses), so the head's keyword
         // offset lands here — `u32::MAX` at begin is only a placeholder.
-        let head_offset = self
-            .clause_anchor
-            .map_or(u32::MAX, |anchor| anchor.offset);
+        let head_offset = self.clause_anchor.map_or(u32::MAX, |anchor| anchor.offset);
         let mark = {
             let Some(top) = self.switch_arm_scopes.last_mut() else {
                 return;
@@ -175,9 +169,7 @@ impl Engine<'_> {
                     head_mark: self.locals.len(),
                     head_rows_mark: self.rows.len(),
                     head_vars: Vec::new(),
-                    head_offset: self
-                        .clause_anchor
-                        .map_or(u32::MAX, |anchor| anchor.offset),
+                    head_offset: self.clause_anchor.map_or(u32::MAX, |anchor| anchor.offset),
                     member_body: true,
                     member_ended: true,
                     is_default: true,
@@ -276,7 +268,9 @@ impl Engine<'_> {
                 let index = lo + index;
                 if !matches!(decl.kind, LocalKind::PatternVariable)
                     || !shadows.iter().any(|(name, ..)| *name == decl.name)
-                    || decl.group.is_some_and(|group| group % 2 == 0 || arm_scoped(group))
+                    || decl
+                        .group
+                        .is_some_and(|group| group % 2 == 0 || arm_scoped(group))
                     || binders.iter().any(|&(known, _)| known == index)
                 {
                     continue;

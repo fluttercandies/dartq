@@ -22,7 +22,7 @@
 //! clear once their owners route the reads through
 //! `effective_ctor_container`.
 
-use super::test_rig::{assert_silent, report_ops, report_ops_with, RigImport};
+use super::test_rig::{RigImport, assert_silent, report_ops, report_ops_with};
 use super::*;
 
 /// Every `code` row of `report` as `(offset, length, message)`.

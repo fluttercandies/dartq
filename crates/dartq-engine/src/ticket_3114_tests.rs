@@ -106,9 +106,6 @@ fn a_name_token_without_a_period_does_not_continue_the_name() {
 fn unterminated_part_of_keeps_the_following_library() {
     assert_eq!(
         facts("part of a library b;"),
-        vec![
-            (DirectiveKind::PartOf, Some("a".to_owned())),
-            library("b"),
-        ]
+        vec![(DirectiveKind::PartOf, Some("a".to_owned())), library("b"),]
     );
 }

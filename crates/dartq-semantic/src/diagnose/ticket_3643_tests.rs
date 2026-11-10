@@ -60,11 +60,8 @@ struct Aux {
 /// sole analyzed file, each [`Aux`] collected+declared into its own graph
 /// library and wired through a plain import edge owned by `main.dart`.
 fn report_with_imports(source: &str, aux: &[Aux]) -> FileReport {
-    let main_imports: Vec<(usize, Option<&'static str>)> = aux
-        .iter()
-        .enumerate()
-        .map(|(i, a)| (i, a.prefix))
-        .collect();
+    let main_imports: Vec<(usize, Option<&'static str>)> =
+        aux.iter().enumerate().map(|(i, a)| (i, a.prefix)).collect();
     report_with_part_file_imports(source, None, &main_imports, &[], aux)
 }
 
@@ -385,8 +382,7 @@ fn part_own_import_credits_the_part_file_use() {
         prefix: None,
         body: "class Random {}\n",
     }];
-    let report =
-        report_with_part_file_imports(source, Some(part_source), &[], &[(0, None)], &aux);
+    let report = report_with_part_file_imports(source, Some(part_source), &[], &[(0, None)], &aux);
     assert_eq!(
         import_rows(&report),
         Vec::<(u32, u32)>::new(),
@@ -413,8 +409,7 @@ fn part_own_import_does_not_credit_the_library_scope() {
         prefix: None,
         body: "class Random {}\n",
     }];
-    let report =
-        report_with_part_file_imports(source, Some(part_source), &[], &[(0, None)], &aux);
+    let report = report_with_part_file_imports(source, Some(part_source), &[], &[(0, None)], &aux);
     let uri = part_source.find("'a0.dart'").unwrap() as u32;
     assert_eq!(
         import_rows(&report),

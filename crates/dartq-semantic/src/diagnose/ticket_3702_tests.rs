@@ -106,9 +106,7 @@ void f(void x) {
     );
     assert_eq!(
         messages(&report, "unchecked_use_of_nullable_value"),
-        vec![
-            "The method '~' can't be unconditionally invoked because the receiver can be 'null'."
-        ],
+        vec!["The method '~' can't be unconditionally invoked because the receiver can be 'null'."],
     );
 }
 
@@ -160,9 +158,7 @@ void test(void f()) {
     );
     assert_eq!(
         messages(&report, "unchecked_use_of_nullable_value"),
-        vec![
-            "The method '~' can't be unconditionally invoked because the receiver can be 'null'."
-        ],
+        vec!["The method '~' can't be unconditionally invoked because the receiver can be 'null'."],
     );
 }
 

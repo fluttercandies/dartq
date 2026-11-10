@@ -13,8 +13,8 @@
 //! resolver/extension_member_resolver.dart:119-124): a named extension
 //! contributes `extension 'E'` alone, an unnamed one the full extended type.
 
-use super::test_rig::{code_names, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{code_names, report_ops, rows};
 
 const AMBIGUOUS: &str = "ambiguous_extension_member_access";
 

@@ -93,7 +93,12 @@ fn identical_instantiation_keeps_reporting() {
         r#"
   List<bool> test() => [f15 is F15<int>];"#,
     );
-    assert_eq!(code_names(&report), ["unnecessary_type_check"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["unnecessary_type_check"],
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// `m15`'s declared type IS the written `F15<T>` — constant-true through
@@ -104,7 +109,12 @@ fn identical_parameterized_instantiation_keeps_reporting() {
         r#"
   List<bool> test() => [m15 is F15<T>];"#,
     );
-    assert_eq!(code_names(&report), ["unnecessary_type_check"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["unnecessary_type_check"],
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// The `is!` polarity of the constant-true pair is the constant-FALSE row
@@ -116,7 +126,12 @@ fn negated_identical_instantiation_reports_the_false_polarity() {
         r#"
   List<bool> test() => [f15 is! F15<int>];"#,
     );
-    assert_eq!(code_names(&report), ["unnecessary_type_check"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["unnecessary_type_check"],
+        "{:#?}",
+        rows(&report)
+    );
     assert!(
         rows(&report)[0].contains("always 'false'"),
         "expected the false polarity, got {:#?}",
@@ -132,7 +147,12 @@ fn widened_nested_argument_keeps_reporting() {
         r#"
   List<bool> test() => [f15 is F15<dynamic>];"#,
     );
-    assert_eq!(code_names(&report), ["unnecessary_type_check"], "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        ["unnecessary_type_check"],
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// The same family spelled WITHOUT the qualified leaf — the capture is

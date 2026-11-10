@@ -1303,7 +1303,9 @@ mod tests {
         fs::create_dir_all(orphan_path.parent().expect("shard")).expect("orphan shard");
         fs::write(&orphan_path, b"orphan payload").expect("orphan blob");
         set_file_mtime(&orphan_path, epoch).expect("age orphan");
-        let tmp_old = store_dir.join(&orphan_hex[..2]).join(format!("{orphan_hex}.tmp"));
+        let tmp_old = store_dir
+            .join(&orphan_hex[..2])
+            .join(format!("{orphan_hex}.tmp"));
         fs::write(&tmp_old, b"half-written").expect("aged tmp");
         set_file_mtime(&tmp_old, epoch).expect("age tmp");
 
@@ -1313,7 +1315,9 @@ mod tests {
         let fresh_path = store_dir.join(&fresh_hex[..2]).join(&fresh_hex);
         fs::create_dir_all(fresh_path.parent().expect("shard")).expect("fresh shard");
         fs::write(&fresh_path, b"fresh orphan").expect("young blob");
-        let tmp_young = store_dir.join(&fresh_hex[..2]).join(format!("{fresh_hex}.tmp"));
+        let tmp_young = store_dir
+            .join(&fresh_hex[..2])
+            .join(format!("{fresh_hex}.tmp"));
         fs::write(&tmp_young, b"half-written").expect("young tmp");
 
         let report = store.sweep_debris();
@@ -1328,7 +1332,10 @@ mod tests {
             },
             "one aged blob and one aged tmp reclaimed, both counted with bytes"
         );
-        assert!(!orphan_path.exists() && !tmp_old.exists(), "aged debris gone");
+        assert!(
+            !orphan_path.exists() && !tmp_old.exists(),
+            "aged debris gone"
+        );
         assert!(
             fresh_path.is_file() && tmp_young.is_file(),
             "young debris survives the grace guard"
@@ -1344,7 +1351,10 @@ mod tests {
         let reopened = ContentStore::open(&scratch.config(u64::MAX)).expect("reopen");
         assert!(reopened.contains(&booked));
         assert_eq!(reopened.total_bytes(), bytes(payload));
-        assert!(!reopened.contains(&fresh), "young debris stays off the books");
+        assert!(
+            !reopened.contains(&fresh),
+            "young debris stays off the books"
+        );
     }
 
     /// The manifest bytes are a pure function of the books (ascending-id

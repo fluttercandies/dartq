@@ -841,7 +841,10 @@ fn read_runtime_inputs(
                     ("Process", "run" | "runSync" | "start")
                         | ("Platform", "localHostname")
                         | ("Socket" | "RawSocket", "connect" | "startConnect")
-                        | ("SecureSocket" | "RawSecureSocket", "connect" | "startConnect" | "secure" | "secureServer")
+                        | (
+                            "SecureSocket" | "RawSecureSocket",
+                            "connect" | "startConnect" | "secure" | "secureServer"
+                        )
                         | (
                             "ServerSocket"
                                 | "RawServerSocket"

@@ -194,7 +194,8 @@ fn promoted_lhs_inside_collection_element() {
 /// not the operand row's head.
 #[test]
 fn promoted_lhs_reports_at_call_rhs_span() {
-    let fixture = "int g() => 0;\nvoid f(int? x) {\n  if (x != null) {\n    var y = x ?? g();\n  }\n}";
+    let fixture =
+        "int g() => 0;\nvoid f(int? x) {\n  if (x != null) {\n    var y = x ?? g();\n  }\n}";
     let report = report_ops(fixture);
     assert_dead_coalesce_at(&report, fixture_offset(fixture, "g()"));
 }

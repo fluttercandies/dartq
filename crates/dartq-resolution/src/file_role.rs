@@ -188,8 +188,15 @@ mod tests {
     fn classification_precedence_mirrors_update_kind() {
         // A `library` directive wins over any part-of.
         assert_eq!(
-            FileRole::of(true, Some("my.lib"), Some("other.lib"), Some(ResolvedTarget::Missing)),
-            FileRole::Library { name: Some("my.lib") }
+            FileRole::of(
+                true,
+                Some("my.lib"),
+                Some("other.lib"),
+                Some(ResolvedTarget::Missing)
+            ),
+            FileRole::Library {
+                name: Some("my.lib")
+            }
         );
         // A bare `library;` is a named-less library all the same.
         assert_eq!(
@@ -216,7 +223,10 @@ mod tests {
             FileRole::PartOfUriUnknown
         );
         // No part-of at all: the unnamed library.
-        assert_eq!(FileRole::of(false, None, None, None), FileRole::Library { name: None });
+        assert_eq!(
+            FileRole::of(false, None, None, None),
+            FileRole::Library { name: None }
+        );
         // `is_part` is exactly "not a library".
         assert!(!FileRole::of(false, None, None, None).is_part());
         assert!(FileRole::of(false, None, Some("a"), None).is_part());
@@ -238,7 +248,9 @@ mod tests {
         assert_eq!(
             part_of_row(
                 FileRole::of_sdk(&uri_part),
-                FileRole::Library { name: Some("dart.async") },
+                FileRole::Library {
+                    name: Some("dart.async")
+                },
                 includer_file,
                 Some("dart.async"),
                 false,
@@ -353,7 +365,9 @@ mod tests {
         assert_eq!(
             part_of_row(
                 FileRole::PartOfName { name: "my.lib" },
-                FileRole::Library { name: Some("other.lib") },
+                FileRole::Library {
+                    name: Some("other.lib")
+                },
                 defining,
                 Some("other.lib"),
                 true,

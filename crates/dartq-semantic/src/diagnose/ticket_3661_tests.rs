@@ -76,7 +76,10 @@ fn enum_implementing_base_class_stays_silent() {
          enum Bar implements Foo { v }\n",
     );
     assert_eq!(
-        code_count(&report, "subtype_of_base_or_final_is_not_base_final_or_sealed"),
+        code_count(
+            &report,
+            "subtype_of_base_or_final_is_not_base_final_or_sealed"
+        ),
         0,
         "an enum never runs the base/final verifier: {:?}",
         rows(&report)
@@ -92,7 +95,10 @@ fn enum_with_base_mixin_stays_silent() {
          enum Bar with M { v }\n",
     );
     assert_eq!(
-        code_count(&report, "subtype_of_base_or_final_is_not_base_final_or_sealed"),
+        code_count(
+            &report,
+            "subtype_of_base_or_final_is_not_base_final_or_sealed"
+        ),
         0,
         "an enum's `with` clause never reports this family: {:?}",
         rows(&report)
@@ -110,7 +116,10 @@ fn mixin_on_enum_constraint_stays_silent() {
          mixin M on E {}\n",
     );
     assert_eq!(
-        code_count(&report, "subtype_of_base_or_final_is_not_base_final_or_sealed"),
+        code_count(
+            &report,
+            "subtype_of_base_or_final_is_not_base_final_or_sealed"
+        ),
         0,
         "an enum entry drops out of `superclassConstraints`: {:?}",
         rows(&report)
@@ -131,7 +140,10 @@ fn class_extends_mixin_supertype_stays_out_of_extends_arm() {
     // extends arm reports nothing. (The `with`-position faces would
     // still fire; none are written here.)
     assert_eq!(
-        code_count(&report, "subtype_of_base_or_final_is_not_base_final_or_sealed"),
+        code_count(
+            &report,
+            "subtype_of_base_or_final_is_not_base_final_or_sealed"
+        ),
         0,
         "a mixin in extends position never joins `element.supertype`: {:?}",
         rows(&report)
@@ -148,7 +160,10 @@ fn plain_class_extending_base_still_reports() {
          class C extends Base {}\n",
     );
     assert_eq!(
-        code_count(&report, "subtype_of_base_or_final_is_not_base_final_or_sealed"),
+        code_count(
+            &report,
+            "subtype_of_base_or_final_is_not_base_final_or_sealed"
+        ),
         1,
         "a non-base/final/sealed class extending `base` still reports: {:?}",
         rows(&report)
@@ -164,7 +179,10 @@ fn plain_mixin_on_base_still_reports() {
          mixin M on Base {}\n",
     );
     assert_eq!(
-        code_count(&report, "subtype_of_base_or_final_is_not_base_final_or_sealed"),
+        code_count(
+            &report,
+            "subtype_of_base_or_final_is_not_base_final_or_sealed"
+        ),
         1,
         "a non-base/final/sealed mixin on `base` still reports: {:?}",
         rows(&report)

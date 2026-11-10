@@ -38,18 +38,27 @@ pub enum Ev {
     /// A block function body's `{` (named members: functions, methods,
     /// constructors, accessors — closure bodies frame through their own
     /// `ExecBegin`). `span`: the body's `{` token.
-    BlockBodyBegin { span: TokenSpan },
+    BlockBodyBegin {
+        span: TokenSpan,
+    },
     /// The body's `}`: `begin` repeats the `{` token (the body-anchored-row
     /// check), `end` is the `}` token's end offset.
-    BlockBodyEnd { begin: TokenSpan, end: u32 },
+    BlockBodyEnd {
+        begin: TokenSpan,
+        end: u32,
+    },
     /// A constructor-initializer entry's head token (`y`, `assert`, `this`,
     /// `super` — `begin_initializer`): the entry-extent dead row's begin.
-    CtorInitBegin { span: TokenSpan },
+    CtorInitBegin {
+        span: TokenSpan,
+    },
     /// A constructor-initializer entry's last-token end
     /// (`end_initializer`): the entry-extent dead row's end. A
     /// redirecting `super(...)`/`this(...)` entry fires no end — its dead
     /// window falls through to the executable's covering close.
-    CtorInitEnd { end: u32 },
+    CtorInitEnd {
+        end: u32,
+    },
     /// `=>` body: consumes the body's value; the function's own value for
     /// the consumer is netted at `ExecEnd { is_expr: true }`.
     ExprBody,
@@ -644,7 +653,9 @@ pub enum Ev {
     /// `beginToken`, dead_code_verifier.dart:361-375) — and a spanned
     /// region event everywhere else an offset anchor is read
     /// ([`Ev::span`]).
-    ParenBegin { span: TokenSpan },
+    ParenBegin {
+        span: TokenSpan,
+    },
     ParenEnd,
     RecordLitEnd {
         count: usize,

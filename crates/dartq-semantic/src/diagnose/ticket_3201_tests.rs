@@ -20,10 +20,10 @@
 //! `factory` keyword through the name, the unnamed spellings collapsing to
 //! the single token that is present.
 
+use crate::FileReport;
 use crate::diagnose::test_rig::{
     CORE_PRELUDE, report_ops, report_ops_augment_intro_experiments, report_ops_experiments_with,
 };
-use crate::FileReport;
 use dartq_language::Feature;
 
 /// The fixture's rows of one code as `(offset, length)`, ascending.
@@ -145,8 +145,7 @@ fn factory_without_body_needs_the_augmentations_experiment() {
 fn factory_not_complete_after_augmentations_names_the_selector() {
     let main = "class A {\n  factory named();\n}\n";
     let aug = "augment class A {\n  augment factory named();\n}\n";
-    let report =
-        report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
+    let report = report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
     assert_eq!(
         rows(&report, "factory_not_complete_after_augmentations"),
         vec![(at(main, "factory named"), 13)],
@@ -154,7 +153,12 @@ fn factory_not_complete_after_augmentations_names_the_selector() {
         report
             .diagnostics
             .iter()
-            .map(|d| (d.code.name, d.range.offset, d.range.length, d.message.as_str()))
+            .map(|d| (
+                d.code.name,
+                d.range.offset,
+                d.range.length,
+                d.message.as_str()
+            ))
             .collect::<Vec<_>>()
     );
     let message = report
@@ -174,8 +178,7 @@ fn factory_not_complete_after_augmentations_names_the_selector() {
 fn factory_not_complete_after_augmentations_names_new() {
     let main = "class A {\n  factory A();\n}\n";
     let aug = "augment class A {\n  augment factory A();\n}\n";
-    let report =
-        report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
+    let report = report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
     let message = report
         .diagnostics
         .iter()
@@ -196,8 +199,7 @@ fn factory_not_complete_after_augmentations_names_new() {
 fn completing_augment_leaves_no_row() {
     let main = "class A {\n  factory named();\n}\n";
     let aug = "augment class A {\n  augment factory named() => throw 0;\n}\n";
-    let report =
-        report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
+    let report = report_ops_augment_intro_experiments(main, aug, &[Feature::Augmentations]);
     assert!(
         rows(&report, "factory_without_body").is_empty()
             && rows(&report, "factory_not_complete_after_augmentations").is_empty(),

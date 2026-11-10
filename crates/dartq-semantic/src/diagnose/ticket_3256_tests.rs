@@ -79,8 +79,10 @@ fn field_over_field_reports_both_faces() {
     );
     assert_eq!(
         setter_rows(&report),
-        ["The setter 'M.foo' ('void Function(int)') isn't a valid override of \
-          'A.foo' ('void Function(String)')."]
+        [
+            "The setter 'M.foo' ('void Function(int)') isn't a valid override of \
+          'A.foo' ('void Function(String)')."
+        ]
     );
 }
 
@@ -98,7 +100,11 @@ fn getter_over_abstract_field_reports_getter_face_only() {
         getter_rows(&report),
         ["'B.x' ('num Function()') isn't a valid override of 'A.x' ('int Function()')."]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_setter_overrides_abstract_field_invalid`: the setter face narrows
@@ -110,11 +116,17 @@ fn setter_over_abstract_field_reports_setter_face_only() {
         "abstract class A { abstract num x; } \
          abstract class B implements A { int get x; void set x(int value); }",
     );
-    assert!(getter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        getter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
     assert_eq!(
         setter_rows(&report),
-        ["The setter 'B.x' ('void Function(int)') isn't a valid override of \
-          'A.x' ('void Function(num)')."]
+        [
+            "The setter 'B.x' ('void Function(int)') isn't a valid override of \
+          'A.x' ('void Function(num)')."
+        ]
     );
 }
 
@@ -131,21 +143,28 @@ fn final_abstract_field_has_no_setter_face() {
         getter_rows(&report),
         ["'B.x' ('num Function()') isn't a valid override of 'A.x' ('int Function()')."]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// A field over a getter-only super: the getter face compares (and
 /// reports), the setter face finds no candidate and stays silent.
 #[test]
 fn field_over_getter_only_super_checks_getter_face() {
-    let report = report_ops(
-        "abstract class A { String get foo; } class B implements A { int foo = 0; }",
-    );
+    let report =
+        report_ops("abstract class A { String get foo; } class B implements A { int foo = 0; }");
     assert_eq!(
         getter_rows(&report),
         ["'B.foo' ('int Function()') isn't a valid override of 'A.foo' ('String Function()')."]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// A field over a setter-only super: only the setter face has a candidate,
@@ -153,14 +172,19 @@ fn field_over_getter_only_super_checks_getter_face() {
 /// stays silent.
 #[test]
 fn field_over_setter_only_super_checks_setter_face() {
-    let report = report_ops(
-        "abstract class A { set foo(String v); } class B implements A { int foo = 0; }",
+    let report =
+        report_ops("abstract class A { set foo(String v); } class B implements A { int foo = 0; }");
+    assert!(
+        getter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
     );
-    assert!(getter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
     assert_eq!(
         setter_rows(&report),
-        ["The setter 'B.foo' ('void Function(int)') isn't a valid override of \
-          'A.foo' ('void Function(String)')."]
+        [
+            "The setter 'B.foo' ('void Function(int)') isn't a valid override of \
+          'A.foo' ('void Function(String)')."
+        ]
     );
 }
 
@@ -187,7 +211,11 @@ fn inferred_field_both_faces_differ_is_dynamic() {
             "'X.foo' ('dynamic Function()') isn't a valid override of 'B.foo' ('int Function()').",
         ]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_gettersSetters_notFinal_combined_same`: the same
@@ -201,7 +229,11 @@ fn inferred_field_both_faces_equal_infers_getter_type() {
          class C { set foo(int _) {} } \
          class X implements A, B, C { var foo; }",
     );
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_getters_combined`: getters-only infers the combined
@@ -213,7 +245,11 @@ fn inferred_field_getters_only_merges_most_specific() {
          class B { int get foo => throw 0; } \
          class C implements A, B { var foo; }",
     );
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_getters_incompatible`: a getter set with no common
@@ -234,7 +270,11 @@ fn inferred_field_getters_incompatible_is_dynamic() {
             "'C.foo' ('dynamic Function()') isn't a valid override of 'B.foo' ('int Function()').",
         ]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_setters_combined`: setters-only infers the combined
@@ -247,7 +287,11 @@ fn inferred_field_setters_only_merges_common_supertype() {
          class B { set foo(int _) {} } \
          class C implements A, B { var foo; }",
     );
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_setters_incompatible`: an unrelated setter
@@ -260,7 +304,11 @@ fn inferred_field_setters_incompatible_is_dynamic() {
          class B { set foo(int _) {} } \
          class C implements A, B { var foo; }",
     );
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_fields_incompatible`: two conflicting fields pair
@@ -281,7 +329,11 @@ fn inferred_field_over_conflicting_fields_is_dynamic() {
              'B.foo' ('String Function()').",
         ]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_gettersSetters_final_combined`: a FINAL field over
@@ -295,7 +347,11 @@ fn inferred_final_field_ignores_setter_candidates() {
          class C { set foo(String _) {} } \
          class X implements A, B, C { final foo; }",
     );
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// `test_field_multiple_gettersSetters_final_incompatible`: a final field
@@ -317,7 +373,11 @@ fn inferred_final_field_conflicting_getters_is_dynamic() {
             "'X.foo' ('dynamic Function()') isn't a valid override of 'B.foo' ('int Function()').",
         ]
     );
-    assert!(setter_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        setter_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 // —— the covariance propagation into a field's induced setter ————
@@ -329,8 +389,13 @@ fn inferred_final_field_conflicting_getters_is_dynamic() {
 /// runtime-checked covariant narrowing, not an override break.
 #[test]
 fn field_covariant_from_super_setter_is_valid() {
-    let report = report_ops("class A { set foo(covariant num _) {} } class B implements A { int foo = 0; }");
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    let report =
+        report_ops("class A { set foo(covariant num _) {} } class B implements A { int foo = 0; }");
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }
 
 /// The same propagation one hop further out: the mark rides the chain, so a
@@ -342,5 +407,9 @@ fn field_covariant_propagates_through_a_field_hop() {
          class B implements A { int foo = 0; } \
          class C implements B { int foo = 0; }",
     );
-    assert!(override_rows(&report).is_empty(), "{:#?}", override_rows(&report));
+    assert!(
+        override_rows(&report).is_empty(),
+        "{:#?}",
+        override_rows(&report)
+    );
 }

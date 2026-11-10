@@ -2483,7 +2483,9 @@ impl FileElements {
             return pool
                 .get_checked(args)
                 .and_then(|list| list.first())
-                .is_some_and(|&arg| self.strictly_non_nullable_within(strings, arg, pool, depth - 1));
+                .is_some_and(|&arg| {
+                    self.strictly_non_nullable_within(strings, arg, pool, depth - 1)
+                });
         }
         match self.container(name) {
             // A non-extension-type head (class, enum, mixin, extension) is

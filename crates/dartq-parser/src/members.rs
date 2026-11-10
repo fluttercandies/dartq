@@ -496,8 +496,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     // no re-report (the head-scan's `missing_identifier` is
                     // the only name-slot row). The span survives the reset's
                     // queue truncate (events carry ids, not queue entries).
-                    self.listener
-                        .handle_identifier(synthetic, IdentifierContext::TopLevelFunctionDeclaration);
+                    self.listener.handle_identifier(
+                        synthetic,
+                        IdentifierContext::TopLevelFunctionDeclaration,
+                    );
                     synthetic
                 } else if name_is_recovered {
                     self.ensure_identifier_recovered(IdentifierContext::TopLevelFunctionDeclaration)
@@ -665,7 +667,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // return-type re-parse to bound a recovered group's overshoot.
         // Only the range and the name-shape flag survive past the re-parse's
         // `reset(before_type)`; the id is never dereferenced afterwards.
-        self.member_scan_name = Some((self.peek_span(), is_keyword_or_identifier(self.peek_kind())));
+        self.member_scan_name =
+            Some((self.peek_span(), is_keyword_or_identifier(self.peek_kind())));
 
         // `new` (primary constructor shape) or get/set names.
         let mut new_kw: Option<TokenSpan> = None;
@@ -1295,7 +1298,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 if triple_shift_split {
                     let gt = self.peek_span();
                     self.report_with_end(msg::experiment_not_enabled("triple-shift"), op, gt);
-                    let syn = self.cursor.insert_synthetic(TokenKind::GtGtGt, op.range.offset);
+                    let syn = self
+                        .cursor
+                        .insert_synthetic(TokenKind::GtGtGt, op.range.offset);
                     op = self.span_of(syn);
                     self.cursor.advance(); // the synthetic `>>>`
                     self.cursor.advance(); // the real `>`
@@ -2229,10 +2234,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     // upstream's `name.next` (`rewriter.
                     // insertSyntheticIdentifier(identifier)` shape).
                     self.cursor.advance();
-                    let id = self.cursor.insert_synthetic(
-                        TokenKind::Identifier,
-                        at.range.offset + at.range.length,
-                    );
+                    let id = self
+                        .cursor
+                        .insert_synthetic(TokenKind::Identifier, at.range.offset + at.range.length);
                     self.cursor.drain_to(id);
                     id
                 };
@@ -2304,10 +2308,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // oracle, member_declarations.dart line 14). Fire the NamedType
         // event for the written name so the reparsed reference reaches
         // resolution.
-        if !had_semicolon
-            && self.peek_kind() == TokenKind::Identifier
-            && !first_name_is_synthetic
-        {
+        if !had_semicolon && self.peek_kind() == TokenKind::Identifier && !first_name_is_synthetic {
             self.listener.handle_type(first_name, None);
         }
         self.listener
@@ -3073,7 +3074,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         let end = self.parse_initializer_expression_rest();
         if reject {
-            self.report(msg::invalid_initializer(), initializer_entry_span(head, end));
+            self.report(
+                msg::invalid_initializer(),
+                initializer_entry_span(head, end),
+            );
         }
         let after = self.peek_kind();
         if after == TokenKind::OpenCurly || after == TokenKind::Function {
@@ -3331,15 +3335,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                             kw_span,
                         );
                         self.cursor.advance();
-                        self.listener.handle_identifier(
-                            kw_span,
-                            IdentifierContext::ExpressionContinuation,
-                        );
+                        self.listener
+                            .handle_identifier(kw_span, IdentifierContext::ExpressionContinuation);
                         kw_span
                     } else {
-                        self.parse_primary(
-                            IdentifierContext::ExpressionContinuation,
-                        )
+                        self.parse_primary(IdentifierContext::ExpressionContinuation)
                     };
                     let junk_literal = matches!(
                         operand_kind,
@@ -3443,7 +3443,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 // initializer recovery reports `invalid_super_in_initializer` at
                 // `super` (ast_builder.dart:786-800).
                 self.report(msg::invalid_super_in_initializer(), head);
-            } else if matches!(after, TokenKind::Eq | TokenKind::Bang | TokenKind::OpenParen) {
+            } else if matches!(
+                after,
+                TokenKind::Eq | TokenKind::Bang | TokenKind::OpenParen
+            ) {
                 // `super()` followed by `=`/`!`/`(` (`super() = 0`, `super()!`,
                 // `super()()`): the parsed node leaves no representable
                 // initializer (`buildInitializer` `default: return null`,
@@ -3475,7 +3478,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         let end = self.parse_initializer_expression_rest();
         if reject {
-            self.report(msg::invalid_initializer(), initializer_entry_span(head, end));
+            self.report(
+                msg::invalid_initializer(),
+                initializer_entry_span(head, end),
+            );
         }
         end
     }

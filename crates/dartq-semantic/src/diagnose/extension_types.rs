@@ -392,9 +392,7 @@ impl Engine<'_> {
 /// (`extension_type.dart:41-57`).
 fn collect_named_heads(ty: Ty, args: &ArgPool, out: &mut Vec<StringId>) {
     if let Ty::Named {
-        name,
-        args: list,
-        ..
+        name, args: list, ..
     } = ty
     {
         out.push(name);

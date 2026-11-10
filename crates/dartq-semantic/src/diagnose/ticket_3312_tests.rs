@@ -51,18 +51,15 @@ fn rows<'a>(report: &'a FileReport, code: &str) -> Vec<&'a str> {
 
 /// Every diagnostic name, in report order — the silence checks' own face.
 fn codes(report: &FileReport) -> Vec<&str> {
-    report
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect()
+    report.diagnostics.iter().map(|d| d.code.name).collect()
 }
 
 /// A generic `call` at an argument position instantiates toward the
 /// formal and accepts — `take(C())` asks the context signature
 /// `int Function(int)`, solves `T := int`, silent.
 #[test]
-fn callable_class_argument_solves_to_the_formal_context() {    let fixture = "\
+fn callable_class_argument_solves_to_the_formal_context() {
+    let fixture = "\
 class C {
   T call<T>(T t) => t;
 }
@@ -235,7 +232,8 @@ void m() {
 /// this pin proves the per-argument walk reaches the shared verdict, so a
 /// silent creation argument is the creation's own face, not the walk.
 #[test]
-fn send_argument_is_checked() {    let fixture = "\
+fn send_argument_is_checked() {
+    let fixture = "\
 String g() => 'x';
 
 void take(int Function(int) f) {}

@@ -69,7 +69,10 @@ fn index_lt_junk_lands_both_rows_on_semicolon() {
     let rows = sorted_rows("void f() {\n  a[<junk>;\n}\n");
     assert_eq!(
         rows,
-        vec![code("expected_token", 21, 22), code("expected_token", 21, 22)],
+        vec![
+            code("expected_token", 21, 22),
+            code("expected_token", 21, 22)
+        ],
         "`a[<junk>;` must close the index at the `;`"
     );
 }

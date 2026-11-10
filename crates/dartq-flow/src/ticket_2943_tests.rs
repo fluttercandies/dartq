@@ -49,9 +49,10 @@ impl TypeOps for LiteralOps {
     fn is_subtype(&self, left: Ty, right: Ty) -> bool {
         if let (Base::Name(l), Base::Name(r)) = (left.base, right.base) {
             let ids = self.ids.borrow();
-            let hit = self.edges.iter().any(|(sub, sup)| {
-                ids.get(*sub) == Some(&l) && ids.get(*sup) == Some(&r)
-            });
+            let hit = self
+                .edges
+                .iter()
+                .any(|(sub, sup)| ids.get(*sub) == Some(&l) && ids.get(*sup) == Some(&r));
             if hit {
                 return !left.nullable || right.nullable;
             }
@@ -176,11 +177,9 @@ fn int_literal_initializer_promotes_to_declared_non_null() {
         "`num? n = 1` promotes `n` to `num`: {read:?}"
     );
     assert!(
-        promoted
-            .iter()
-            .any(|(snippet, ty, _)| *snippet == "n"
-                && ty.base == Base::Name(ids[1])
-                && !ty.nullable),
+        promoted.iter().any(|(snippet, ty, _)| *snippet == "n"
+            && ty.base == Base::Name(ids[1])
+            && !ty.nullable),
         "the promotion row stands on `n`: {promoted:?}"
     );
 }
@@ -210,11 +209,9 @@ fn double_literal_initializer_promotes_to_declared_non_null() {
         "`num? d = 1.5` promotes `d` to `num`: {read:?}"
     );
     assert!(
-        promoted
-            .iter()
-            .any(|(snippet, ty, _)| *snippet == "d"
-                && ty.base == Base::Name(ids[1])
-                && !ty.nullable),
+        promoted.iter().any(|(snippet, ty, _)| *snippet == "d"
+            && ty.base == Base::Name(ids[1])
+            && !ty.nullable),
         "the promotion row stands on `d`: {promoted:?}"
     );
 }
@@ -245,11 +242,9 @@ fn string_literal_initializer_promotes_to_declared_non_null() {
         "`Object? s = 'x'` promotes `s` to `Object`: {read:?}"
     );
     assert!(
-        promoted
-            .iter()
-            .any(|(snippet, ty, _)| *snippet == "s"
-                && ty.base == Base::Name(ids[1])
-                && !ty.nullable),
+        promoted.iter().any(|(snippet, ty, _)| *snippet == "s"
+            && ty.base == Base::Name(ids[1])
+            && !ty.nullable),
         "the promotion row stands on `s`: {promoted:?}"
     );
 }

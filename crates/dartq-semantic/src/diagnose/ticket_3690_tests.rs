@@ -99,8 +99,7 @@ const SHAPES: &str = "abstract class MetricUnits {}\n\
 fn dynamic_scrutinee_types_leaf_stays_silent() {
     let report = report_ops("void f(dynamic o) {\n  var (int v1, num _) = o;\n}\n");
     assert!(
-        !code_names(&report)
-            .contains(&"pattern_type_mismatch_in_irrefutable_context"),
+        !code_names(&report).contains(&"pattern_type_mismatch_in_irrefutable_context"),
         "a `dynamic` matched type is upstream's own silence gate: {:#?}",
         rows(&report)
     );
@@ -138,8 +137,7 @@ fn unresolved_getter_column_is_dynamic_not_object() {
                    }\n";
     let report = report_ops(fixture);
     assert!(
-        !code_names(&report)
-            .contains(&"pattern_type_mismatch_in_irrefutable_context"),
+        !code_names(&report).contains(&"pattern_type_mismatch_in_irrefutable_context"),
         "an unresolved getter column is `dynamic`, never `Object?`: {:#?}",
         rows(&report)
     );
@@ -158,8 +156,7 @@ fn shorthand_field_infers_the_variable_name() {
         "{SHAPES}void f() {{\n  var Square(:areaAsList) = Square<Meter>();\n}}\n"
     ));
     assert!(
-        !code_names(&report)
-            .contains(&"pattern_type_mismatch_in_irrefutable_context"),
+        !code_names(&report).contains(&"pattern_type_mismatch_in_irrefutable_context"),
         "`:name` infers `name`, so the getter column resolves: {:#?}",
         rows(&report)
     );
@@ -267,8 +264,7 @@ fn duplicate_named_field_node_is_silent_and_leaves_read_object() {
 fn shorthand_named_record_field_is_named_not_positional() {
     let report = report_ops("void f() {\n  var (:n1 as num) = (n1: 42);\n}\n");
     assert!(
-        !code_names(&report)
-            .contains(&"pattern_type_mismatch_in_irrefutable_context"),
+        !code_names(&report).contains(&"pattern_type_mismatch_in_irrefutable_context"),
         "`:n1` is a named field: {:#?}",
         rows(&report)
     );
@@ -318,9 +314,8 @@ fn object_pattern_head_mismatch_reports() {
 /// leaf's own span with the getter's type as matched).
 #[test]
 fn getter_column_mismatch_reports_the_leaf() {
-    let fixture = format!(
-        "{SHAPES}void f() {{\n  var Square(:double areaAsInt) = Square<Meter>();\n}}\n"
-    );
+    let fixture =
+        format!("{SHAPES}void f() {{\n  var Square(:double areaAsInt) = Square<Meter>();\n}}\n");
     let report = report_ops(&fixture);
     let got = mismatch_rows(&report);
     assert_eq!(got.len(), 1, "{:#?}", rows(&report));
@@ -344,8 +339,7 @@ fn refutable_contexts_stay_silent() {
     ] {
         let report = report_ops(src);
         assert!(
-            !code_names(&report)
-                .contains(&"pattern_type_mismatch_in_irrefutable_context"),
+            !code_names(&report).contains(&"pattern_type_mismatch_in_irrefutable_context"),
             "{src:?} rows: {:#?}",
             rows(&report)
         );
@@ -363,7 +357,12 @@ fn agreeing_irrefutable_patterns_stay_silent() {
         "void f() {\n  var (a, b) = (1, 's');\n}\n",
     ] {
         let report = report_ops(src);
-        assert_eq!(mismatch_rows(&report), vec![], "{src:?}: {:#?}", rows(&report));
+        assert_eq!(
+            mismatch_rows(&report),
+            vec![],
+            "{src:?}: {:#?}",
+            rows(&report)
+        );
     }
 }
 

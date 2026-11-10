@@ -54,9 +54,7 @@ fn dead_offsets(source: &str) -> Vec<(u32, u32)> {
 fn dead_of(source: &str) -> Vec<String> {
     dead_offsets(source)
         .into_iter()
-        .map(|(offset, length)| {
-            source[offset as usize..(offset + length) as usize].to_string()
-        })
+        .map(|(offset, length)| source[offset as usize..(offset + length) as usize].to_string())
         .collect()
 }
 

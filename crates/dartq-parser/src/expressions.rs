@@ -269,7 +269,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let gt_gt = self.peek_span();
         let gt = self.look_span_at(1);
         self.report_with_end(msg::experiment_not_enabled("triple-shift"), gt_gt, gt);
-        let syn = self.cursor.insert_synthetic(TokenKind::GtGtGt, gt_gt.range.offset);
+        let syn = self
+            .cursor
+            .insert_synthetic(TokenKind::GtGtGt, gt_gt.range.offset);
         let operator = self.span_of(syn);
         self.cursor.advance(); // the synthetic `>>>`
         self.cursor.advance(); // the real `>>`
@@ -297,7 +299,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let gt_gt = self.peek_span();
         let gt_eq = self.look_span_at(1);
         self.report_with_end(msg::experiment_not_enabled("triple-shift"), gt_gt, gt_eq);
-        let syn = self.cursor.insert_synthetic(TokenKind::GtGtGtEq, gt_gt.range.offset);
+        let syn = self
+            .cursor
+            .insert_synthetic(TokenKind::GtGtGtEq, gt_gt.range.offset);
         let operator = self.span_of(syn);
         self.cursor.advance(); // the synthetic `>>>=`
         self.cursor.advance(); // the real `>>`
@@ -566,9 +570,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let mut lhs_assignable = self
             .cursor
             .last_consumed_id()
-            .is_some_and(|end_id| {
-                end_id == lhs_begin.id && is_identifier(self.span_kind(end_id))
-            });
+            .is_some_and(|end_id| end_id == lhs_begin.id && is_identifier(self.span_kind(end_id)));
         // An identifier here has no precedence (`NO_PRECEDENCE`, :7079) —
         // both the `Some`-below-floor and `None` cases land in the entry
         // recovery attempt (:6644-6659). An accepted written-out operator
@@ -676,9 +678,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // and that formation is exactly the one whose DIRECTLY
                     // enclosing assignment spliced its operator
                     // ([`Parser::assignment_op_spliced`]).
-                    Some(TokenKind::Keyword(Keyword::This))
-                        if !self.assignment_op_spliced =>
-                    {
+                    Some(TokenKind::Keyword(Keyword::This)) if !self.assignment_op_spliced => {
                         self.report(msg::missing_assignable_selector(), left);
                     }
                     Some(TokenKind::Keyword(Keyword::This)) => {}
@@ -1004,8 +1004,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             let next_level: u8 = match self.precedence_of(self.peek_kind()) {
                 Some(l) => l,
                 None => {
-                    if let Some((new_left, _replacement_level)) = self
-                        .attempt_written_out_operator(precedence, Some(level), allow_cascades)
+                    if let Some((new_left, _replacement_level)) =
+                        self.attempt_written_out_operator(precedence, Some(level), allow_cascades)
                     {
                         left = new_left;
                         lhs_ends_index = false;
@@ -1538,12 +1538,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         // real-`]` and no-pair branches carry their own
                         // `expectedButGot`; the synthetic path needs it here.
                         self.report(msg::expected_but_got("]"), self.peek_span());
-                        close = self.move_synthetic_close(
-                            open,
-                            close_id,
-                            TokenKind::CloseSquare,
-                            "]",
-                        );
+                        close =
+                            self.move_synthetic_close(open, close_id, TokenKind::CloseSquare, "]");
                     } else {
                         self.report(msg::expected_but_got("]"), self.peek_span());
                         self.skip_to_token(close_id);
@@ -2435,7 +2431,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         if end.id == open.id + 2
             && self.span_kind(open.id + 1) == TokenKind::Keyword(Keyword::Super)
         {
-            self.report(msg::missing_assignable_selector(), self.span_of(open.id + 1));
+            self.report(
+                msg::missing_assignable_selector(),
+                self.span_of(open.id + 1),
+            );
         }
         end
     }
@@ -2589,8 +2588,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let _ = self.ensure_identifier(IdentifierContext::NamedArgumentReference);
                 colon = Some(self.expect_lexeme_but_got(":"));
             }
-            let argument_starts_super =
-                self.peek_kind() == TokenKind::Keyword(Keyword::Super);
+            let argument_starts_super = self.peek_kind() == TokenKind::Keyword(Keyword::Super);
             let argument_begin = self.peek_span();
             let argument_end = self.parse_expression();
             // `reportErrorIfSuper` per argument (ast_builder.dart:961): a

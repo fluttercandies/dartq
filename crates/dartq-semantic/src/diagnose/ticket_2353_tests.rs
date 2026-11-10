@@ -227,11 +227,7 @@ fn unknown_inferred_formal_read_reports_property_variant() {
 #[test]
 fn dynamic_receiver_stays_silent() {
     let src = "void m() {\n  var x;\n  x.run();\n  x.state;\n}";
-    assert!(
-        unchecked(src).is_empty(),
-        "{:?}",
-        unchecked(src)
-    );
+    assert!(unchecked(src).is_empty(), "{:?}", unchecked(src));
 }
 
 /// An `InvalidType` receiver stays silent: a member send on a receiver
@@ -242,16 +238,8 @@ fn dynamic_receiver_stays_silent() {
 #[test]
 fn invalid_receiver_stays_silent() {
     let src = "void m(Missing t) {\n  t.run();\n}";
-    assert!(
-        unchecked(src).is_empty(),
-        "{:?}",
-        unchecked(src)
-    );
-    assert!(
-        codes(src).contains(&"undefined_class"),
-        "{:?}",
-        codes(src)
-    );
+    assert!(unchecked(src).is_empty(), "{:?}", unchecked(src));
+    assert!(codes(src).contains(&"undefined_class"), "{:?}", codes(src));
 }
 
 /// An unresolved name's member send stays silent on the member face —
@@ -278,9 +266,5 @@ fn null_aware_access_stays_silent() {
     let src = "typedef Writer<T> = T Function(Qex e, String sql);\n\
                void bind(Writer<int> w) {}\n\
                void m() {\n  bind((e, sql) => e?.run(sql));\n}";
-    assert!(
-        unchecked(src).is_empty(),
-        "{:?}",
-        unchecked(src)
-    );
+    assert!(unchecked(src).is_empty(), "{:?}", unchecked(src));
 }

@@ -27,12 +27,7 @@ fn rows_of(source: &str) -> Vec<(&'static str, usize)> {
     report
         .diagnostics
         .iter()
-        .map(|d| {
-            (
-                d.code.name,
-                d.range.offset as usize - CORE_PRELUDE.len(),
-            )
-        })
+        .map(|d| (d.code.name, d.range.offset as usize - CORE_PRELUDE.len()))
         .collect()
 }
 
@@ -118,7 +113,9 @@ fn ticket_3179_nullable_object_head_takes_the_subtype_arm() {
     );
     let report = report_ops(fixture);
     assert!(
-        code_names(&report).iter().all(|code| *code == "dead_code_on_catch_subtype"),
+        code_names(&report)
+            .iter()
+            .all(|code| *code == "dead_code_on_catch_subtype"),
         "{:#?}",
         rows
     );

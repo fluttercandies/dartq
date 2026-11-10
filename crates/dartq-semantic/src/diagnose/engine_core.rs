@@ -702,8 +702,7 @@ impl<'a> Engine<'a> {
         // span: the row the consuming seam reads IS the operand node.
         let range = self.use_site_range(operand);
         if self.report.diagnostics.iter().any(|d| {
-            (d.range == range || d.range == operand.range)
-                && d.code.name == "use_of_void_result"
+            (d.range == range || d.range == operand.range) && d.code.name == "use_of_void_result"
         }) {
             return;
         }
@@ -759,14 +758,10 @@ impl<'a> Engine<'a> {
             let has_group_row = self.rows.iter().any(|row| {
                 row.range.offset == range.end()
                     && row.range.length == 1
-                    && self
-                        .tokens
-                        .as_slice()
-                        .iter()
-                        .any(|t| {
-                            t.utf16_offset == row.range.offset
-                                && matches!(t.kind, dartq_scanner::TokenKind::CloseParen)
-                        })
+                    && self.tokens.as_slice().iter().any(|t| {
+                        t.utf16_offset == row.range.offset
+                            && matches!(t.kind, dartq_scanner::TokenKind::CloseParen)
+                    })
             });
             if !has_group_row {
                 return range;
@@ -804,12 +799,7 @@ impl<'a> Engine<'a> {
         while let Some(index) = tokens
             .iter()
             .position(|t| t.utf16_offset == range.offset && t.byte_len == range.length)
-            .filter(|index| {
-                matches!(
-                    tokens[*index].kind,
-                    dartq_scanner::TokenKind::CloseParen
-                )
-            })
+            .filter(|index| matches!(tokens[*index].kind, dartq_scanner::TokenKind::CloseParen))
         {
             let mut depth = 1u32;
             let mut open = None;
@@ -928,14 +918,9 @@ impl<'a> Engine<'a> {
             }
             _ => {
                 self.fn_var_sigs.contains_key(&row.name)
-                    || (self
-                        .frames
-                        .iter()
-                        .any(|f| {
-                            f.locals.contains(&row.name)
-                                || f.fn_formal_rets.contains_key(&row.name)
-                        })
-                        && self.local_fn_sig(row.name).is_none())
+                    || (self.frames.iter().any(|f| {
+                        f.locals.contains(&row.name) || f.fn_formal_rets.contains_key(&row.name)
+                    }) && self.local_fn_sig(row.name).is_none())
             }
         }
     }
@@ -1835,8 +1820,7 @@ impl<'a> Engine<'a> {
                     if spread_inside {
                         continue;
                     }
-                    let Some((ty, range)) =
-                        self.operand_expression_ty(start, end, close_idx)
+                    let Some((ty, range)) = self.operand_expression_ty(start, end, close_idx)
                     else {
                         continue;
                     };
@@ -1854,8 +1838,7 @@ impl<'a> Engine<'a> {
                     let Some((start, end, boundary_idx)) = self.spread_operand_window(i) else {
                         continue;
                     };
-                    let Some((ty, range)) =
-                        self.operand_expression_ty(start, end, boundary_idx)
+                    let Some((ty, range)) = self.operand_expression_ty(start, end, boundary_idx)
                     else {
                         continue;
                     };
@@ -1881,8 +1864,7 @@ impl<'a> Engine<'a> {
                     let Some((start, end, boundary_idx)) = self.yield_each_window(i) else {
                         continue;
                     };
-                    let Some((ty, range)) =
-                        self.operand_expression_ty(start, end, boundary_idx)
+                    let Some((ty, range)) = self.operand_expression_ty(start, end, boundary_idx)
                     else {
                         continue;
                     };
@@ -1908,13 +1890,13 @@ impl<'a> Engine<'a> {
                         continue;
                     };
                     self.emit_operand_face_row(
-                        UncheckedOperandFace::Operator(if tokens[i].kind
-                            == dartq_scanner::TokenKind::Minus
-                        {
-                            "unary-"
-                        } else {
-                            "~"
-                        }),
+                        UncheckedOperandFace::Operator(
+                            if tokens[i].kind == dartq_scanner::TokenKind::Minus {
+                                "unary-"
+                            } else {
+                                "~"
+                            },
+                        ),
                         ty,
                         at,
                         promotions,
@@ -1946,10 +1928,7 @@ impl<'a> Engine<'a> {
         // The operand's last content token: recovery synthetics never
         // stand for the expression's own tail.
         let mut last = boundary_idx.checked_sub(1)?;
-        while last > 0
-            && tokens[last].is_synthetic()
-            && tokens[last].utf16_offset >= start
-        {
+        while last > 0 && tokens[last].is_synthetic() && tokens[last].utf16_offset >= start {
             last -= 1;
         }
         if tokens[last].utf16_offset < start {
@@ -2017,7 +1996,10 @@ impl<'a> Engine<'a> {
         //    chain's own record (`c.bad` keys at the member token's end),
         //    the parenthesized group's close-paren row, the compound
         //    `??`/`?:` arms' re-derivation.
-        if let Some(ty) = self.recv_expression_ty(last_span).filter(|ty| *ty != Ty::Unknown) {
+        if let Some(ty) = self
+            .recv_expression_ty(last_span)
+            .filter(|ty| *ty != Ty::Unknown)
+        {
             return Some((ty, anchor));
         }
         // 3. A window closing in `)` that neither leg answered is a call:
@@ -2083,9 +2065,7 @@ impl<'a> Engine<'a> {
                 let mut callee = at;
                 while callee > 0 {
                     callee -= 1;
-                    if !tokens[callee].is_synthetic()
-                        && tokens[callee].utf16_offset >= start
-                    {
+                    if !tokens[callee].is_synthetic() && tokens[callee].utf16_offset >= start {
                         break;
                     }
                 }
@@ -2174,7 +2154,8 @@ impl<'a> Engine<'a> {
                 .recv_expression_ty(self.token_utf16_span(close)?)
                 .filter(|ty| *ty == Ty::Void)
                 .or_else(|| {
-                    self.void_read_ty_at(inner_span).filter(|ty| *ty == Ty::Void)
+                    self.void_read_ty_at(inner_span)
+                        .filter(|ty| *ty == Ty::Void)
                 });
             return ty.map(|ty| (ty, op_span));
         }
@@ -2295,8 +2276,7 @@ impl<'a> Engine<'a> {
     /// A token's UTF-16 span (the engine's external position convention).
     fn token_utf16_span(&self, idx: usize) -> Option<SourceRange> {
         let token = self.tokens.get(idx)?;
-        let end = self
-            .utf16_of(token.byte_offset as usize + token.byte_len as usize);
+        let end = self.utf16_of(token.byte_offset as usize + token.byte_len as usize);
         Some(SourceRange {
             offset: token.utf16_offset,
             length: end.saturating_sub(token.utf16_offset),
@@ -2512,9 +2492,7 @@ impl<'a> Engine<'a> {
         let mut writes = FxHashSet::default();
         let tokens = self.tokens.as_slice();
         for i in 0..tokens.len() {
-            if tokens[i].kind
-                != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::For)
-            {
+            if tokens[i].kind != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::For) {
                 continue;
             }
             // The `(` opens immediately after `for` (`await for` parks the
@@ -2522,9 +2500,10 @@ impl<'a> Engine<'a> {
             // non-paren token here is a `for`-element keyword or recovery —
             // never a loop-variable head.
             let open_idx = i + 1;
-            if tokens.get(open_idx).is_none_or(|t| {
-                t.is_synthetic() || t.kind != dartq_scanner::TokenKind::OpenParen
-            }) {
+            if tokens
+                .get(open_idx)
+                .is_none_or(|t| t.is_synthetic() || t.kind != dartq_scanner::TokenKind::OpenParen)
+            {
                 continue;
             }
             // The head's `in` keyword before the paren's close — the loop
@@ -2532,13 +2511,9 @@ impl<'a> Engine<'a> {
             let Some(close_idx) = self.tokens.matching_end(open_idx) else {
                 continue;
             };
-            let Some(in_rel) = tokens[open_idx + 1..close_idx]
-                .iter()
-                .position(|t| {
-                    t.kind
-                        == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
-                })
-            else {
+            let Some(in_rel) = tokens[open_idx + 1..close_idx].iter().position(|t| {
+                t.kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
+            }) else {
                 continue;
             };
             let in_idx = open_idx + 1 + in_rel;
@@ -2601,9 +2576,7 @@ impl<'a> Engine<'a> {
         let mut spans = Vec::new();
         let tokens = self.tokens.as_slice();
         for i in 0..tokens.len() {
-            if tokens[i].kind
-                != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::When)
-            {
+            if tokens[i].kind != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::When) {
                 continue;
             }
             let mut end = tokens[i].utf16_offset;
@@ -2816,7 +2789,10 @@ impl<'a> Engine<'a> {
     /// pkg/analyzer/lib/src/dart/resolver/record_literal_resolver.dart
     /// :208-212 — the records feature specification's member-name clause).
     pub(crate) fn is_forbidden_record_field_name(name: &str) -> bool {
-        matches!(name, "hashCode" | "runtimeType" | "noSuchMethod" | "toString")
+        matches!(
+            name,
+            "hashCode" | "runtimeType" | "noSuchMethod" | "toString"
+        )
     }
 
     /// Upstream `RecordTypeExtension.positionalFieldIndex`
@@ -3017,15 +2993,16 @@ impl<'a> Engine<'a> {
         names: &[Option<StringId>],
         engine: &Self,
     ) -> bool {
-        entries.iter().zip(names.iter()).all(|(entry, name)| {
-            match (entry.last(), name) {
+        entries
+            .iter()
+            .zip(names.iter())
+            .all(|(entry, name)| match (entry.last(), name) {
                 (Some(&last), Some(id)) => {
                     &engine.source[toks[last].byte_range()] == engine.strings.resolve(*id)
                 }
                 (_, None) => true,
                 (None, Some(_)) => false,
-            }
-        })
+            })
     }
 
     // —— scope frames ————————————————————————————————————————————————
@@ -3361,10 +3338,7 @@ impl<'a> Engine<'a> {
                     .count() as u32
             };
             let body_read = self.local_hits.iter().any(|(o, hit)| {
-                *hit as usize == index
-                    && !guard_spans
-                        .iter()
-                        .any(|(s, e)| *o >= *s && *o < *e)
+                *hit as usize == index && !guard_spans.iter().any(|(s, e)| *o >= *s && *o < *e)
             });
             effective_uses.push((decl.uses.saturating_sub(write_hits), body_read));
         }
@@ -4296,13 +4270,16 @@ impl<'a> Engine<'a> {
         // `C<void___int>` vs `C<void_>` asks `void Function([int]) <:
         // void Function()`, invisible under the typedef leaf. The fold
         // instantiates the alias to its declaration's argument frame.
-        sub_list.iter().zip(sup_list.iter()).all(|(&sub_arg, &sup_arg)| {
-            self.strict_subtype(
-                self.fold_alias_ty(sub_arg),
-                self.fold_alias_ty(sup_arg),
-                depth + 1,
-            )
-        })
+        sub_list
+            .iter()
+            .zip(sup_list.iter())
+            .all(|(&sub_arg, &sup_arg)| {
+                self.strict_subtype(
+                    self.fold_alias_ty(sub_arg),
+                    self.fold_alias_ty(sup_arg),
+                    depth + 1,
+                )
+            })
     }
 
     /// The source span of the token group `open` opened — `open` through its
@@ -4312,7 +4289,9 @@ impl<'a> Engine<'a> {
     /// (`case (a, b) || (c, d):`). `None` for an unclosed group (recovery) or
     /// a parser-inserted opener; the caller keeps its own fallback span.
     pub(crate) fn group_span(&self, open: Token) -> Option<SourceRange> {
-        let close = self.tokens.get(self.tokens.matching_end(open.id as usize)?)?;
+        let close = self
+            .tokens
+            .get(self.tokens.matching_end(open.id as usize)?)?;
         // The closer is one UTF-16 unit (`)`/`]`/`}`).
         Some(SourceRange {
             offset: open.range.offset,
@@ -4816,7 +4795,12 @@ impl<'a> Engine<'a> {
             .iter()
             .rev()
             .find(|row| in_span(row))
-            .or_else(|| self.deferred_miss_rows.iter().rev().find(|row| in_span(row)))?;
+            .or_else(|| {
+                self.deferred_miss_rows
+                    .iter()
+                    .rev()
+                    .find(|row| in_span(row))
+            })?;
         if spread {
             // The spread's element face: `Iterable`'s first argument where
             // the operand's head reaches it, `dynamic` where it does not
@@ -5439,19 +5423,14 @@ impl<'a> Engine<'a> {
                 if type_params.iter().any(|(name, _)| *name == StringId::NONE) {
                     return None;
                 }
-                Some(
-                    self.boundary
-                        .args
-                        .borrow_mut()
-                        .function_generic_required(
-                            &type_params,
-                            required,
-                            return_ty,
-                            &positional,
-                            &named,
-                            false,
-                        ),
-                )
+                Some(self.boundary.args.borrow_mut().function_generic_required(
+                    &type_params,
+                    required,
+                    return_ty,
+                    &positional,
+                    &named,
+                    false,
+                ))
             }
             MemberKind::Getter if entry.return_ty != Ty::Unknown => {
                 Some(self.fold_alias_ty(entry.return_ty))
@@ -5807,10 +5786,14 @@ impl<'a> Engine<'a> {
             .filter(|formal| formal.required)
             .count() as u16;
         let ty = if sig_params.is_empty() {
-            self.boundary
-                .args
-                .borrow_mut()
-                .function_required(0, required, return_ty, &positional, &named, false)
+            self.boundary.args.borrow_mut().function_required(
+                0,
+                required,
+                return_ty,
+                &positional,
+                &named,
+                false,
+            )
         } else {
             self.boundary.args.borrow_mut().function_generic_required(
                 &sig_params,
@@ -5933,17 +5916,14 @@ impl<'a> Engine<'a> {
         {
             let required = required_positional;
             let ret = ret.map_or(Ty::Dynamic, |tree| self.tree_ty(tree));
-            let positional: Vec<Ty> =
-                positional.iter().map(|tree| self.tree_ty(tree)).collect();
+            let positional: Vec<Ty> = positional.iter().map(|tree| self.tree_ty(tree)).collect();
             let named: Vec<(StringId, Ty)> = named
                 .iter()
                 .map(|(name, tree, _)| (*name, self.tree_ty(tree)))
                 .collect();
             let type_params: Vec<(StringId, Option<Ty>)> = type_params
                 .iter()
-                .map(|(name, bound, _)| {
-                    (*name, bound.as_ref().map(|b| self.tree_ty(b)))
-                })
+                .map(|(name, bound, _)| (*name, bound.as_ref().map(|b| self.tree_ty(b))))
                 .collect();
             let ty = self.boundary.args.borrow_mut().function_generic(
                 &type_params,
@@ -6032,19 +6012,11 @@ impl<'a> Engine<'a> {
     /// map's record for the old id.
     fn canonical_function_ty(&mut self, ty: Ty) -> Ty {
         let before = match ty {
-            Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => {
-                Some(shape)
-            }
+            Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => Some(shape),
             _ => None,
         };
         let rewritten = self.boundary.canonical_dotted_ty(ty);
-        let (
-            Some(before),
-            Ty::Function {
-                shape: after, ..
-            },
-        ) = (before, rewritten)
-        else {
+        let (Some(before), Ty::Function { shape: after, .. }) = (before, rewritten) else {
             return rewritten;
         };
         if after != before
@@ -6525,11 +6497,7 @@ impl<'a> Engine<'a> {
     /// Function(int)` under `x is F2<bool>` — the RHS's `T` IS `bool`),
     /// at any argument depth. Everything else matches the unprefixed
     /// parser verbatim.
-    fn parse_spelled_leaf(
-        &self,
-        text: &str,
-        subst: &FxHashMap<StringId, Ty>,
-    ) -> Option<Ty> {
+    fn parse_spelled_leaf(&self, text: &str, subst: &FxHashMap<StringId, Ty>) -> Option<Ty> {
         let text = text.trim();
         let (text, nullable) = text.strip_suffix('?').map_or((text, false), |t| (t, true));
         // A whole-leaf substitution must be the bare parameter spelling.
@@ -6637,7 +6605,10 @@ impl<'a> Engine<'a> {
             if depth == 0
                 && byte == b'F'
                 && text[index..].starts_with("Function")
-                && !matches!(bytes.get(index.wrapping_sub(1)), Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'))
+                && !matches!(
+                    bytes.get(index.wrapping_sub(1)),
+                    Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
+                )
             {
                 let mut after = index + "Function".len();
                 while after < bytes.len() && bytes[after].is_ascii_whitespace() {
@@ -6825,7 +6796,8 @@ impl<'a> Engine<'a> {
                             .into_iter()
                             .filter(|piece| !piece.trim().is_empty())
                             .map(|piece| {
-                                self.parse_formal_ty(piece, subst, false, decl).map(|(_, ty)| ty)
+                                self.parse_formal_ty(piece, subst, false, decl)
+                                    .map(|(_, ty)| ty)
                             })
                             .collect::<Option<Vec<_>>>()?,
                     );
@@ -6868,7 +6840,9 @@ impl<'a> Engine<'a> {
         // The default tail splits at the FIRST depth-0 `=` — a default
         // expression's own `=`s, commas, and strings sit inside the
         // groups the depth walk carries.
-        if let Some(eq) = Self::depth0_eq(head) && !head[..eq].trim_end().is_empty() {
+        if let Some(eq) = Self::depth0_eq(head)
+            && !head[..eq].trim_end().is_empty()
+        {
             head = head[..eq].trim();
         }
         let bytes = head.as_bytes();
@@ -6997,13 +6971,46 @@ impl<'a> Engine<'a> {
     /// top-level occurrence scan works in bytes).
     fn backward_type_text_at_byte(&self, name_end: usize) -> Option<String> {
         const MODIFIERS: &[&str] = &[
-            "static", "final", "const", "late", "var", "external", "covariant", "factory",
+            "static",
+            "final",
+            "const",
+            "late",
+            "var",
+            "external",
+            "covariant",
+            "factory",
             "abstract",
         ];
         const KEYWORDS: &[&str] = &[
-            "return", "throw", "new", "await", "yield", "assert", "else", "case", "in", "is",
-            "as", "do", "on", "when", "get", "set", "operator", "extension", "typedef", "class",
-            "enum", "mixin", "switch", "default", "while", "for", "if", "try", "catch",
+            "return",
+            "throw",
+            "new",
+            "await",
+            "yield",
+            "assert",
+            "else",
+            "case",
+            "in",
+            "is",
+            "as",
+            "do",
+            "on",
+            "when",
+            "get",
+            "set",
+            "operator",
+            "extension",
+            "typedef",
+            "class",
+            "enum",
+            "mixin",
+            "switch",
+            "default",
+            "while",
+            "for",
+            "if",
+            "try",
+            "catch",
         ];
         let bytes = self.source.as_bytes();
         let mut end = name_end;
@@ -7100,7 +7107,13 @@ impl<'a> Engine<'a> {
     fn source_member_signature(
         &self,
         entry: &MemberEntry,
-    ) -> Option<(Vec<(StringId, Option<Ty>)>, Ty, Vec<Ty>, u16, Vec<(StringId, Ty)>)> {
+    ) -> Option<(
+        Vec<(StringId, Option<Ty>)>,
+        Ty,
+        Vec<Ty>,
+        u16,
+        Vec<(StringId, Ty)>,
+    )> {
         let name_end = self.byte_of(entry.name_range.end());
         let bytes = self.source.as_bytes();
         let mut index = name_end;
@@ -7249,12 +7262,7 @@ impl<'a> Engine<'a> {
     /// parameter's written bound (the
     /// `instantiateTypeFormalsToBounds` face); a boundless bare
     /// parameter or a non-function RHS declines (under-report).
-    fn source_alias_fn_ty(
-        &self,
-        name: StringId,
-        args: ArgListId,
-        nullable: bool,
-    ) -> Option<Ty> {
+    fn source_alias_fn_ty(&self, name: StringId, args: ArgListId, nullable: bool) -> Option<Ty> {
         let name_text = self.strings.resolve(name);
         let bytes = self.source.as_bytes();
         let mut search = 0;
@@ -7418,8 +7426,14 @@ impl<'a> Engine<'a> {
         // to discard: a type-less formal is an honest capture.
         if let Some(sig) = self.tear_off_sig(operand) {
             let captured_broken = self.has_prefix_leaf(sig.return_ty)
-                || sig.positional.iter().any(|formal| self.has_prefix_leaf(*formal))
-                || sig.named.iter().any(|(_, formal, _)| self.has_prefix_leaf(*formal));
+                || sig
+                    .positional
+                    .iter()
+                    .any(|formal| self.has_prefix_leaf(*formal))
+                || sig
+                    .named
+                    .iter()
+                    .any(|(_, formal, _)| self.has_prefix_leaf(*formal));
             let face_recovered =
                 matches!(operand_ty, Ty::Function { .. }) && !self.needs_recovery(operand_ty);
             if !captured_broken || !face_recovered {
@@ -7612,7 +7626,11 @@ impl<'a> Engine<'a> {
             return Some(false);
         }
         for (index, to_formal) in to_pos.iter().enumerate() {
-            match ask(self, *to_formal, self.subst_named_leaves(from_pos[index], &unify)) {
+            match ask(
+                self,
+                *to_formal,
+                self.subst_named_leaves(from_pos[index], &unify),
+            ) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -7631,7 +7649,11 @@ impl<'a> Engine<'a> {
             else {
                 return Some(false);
             };
-            match ask(self, *to_formal, self.subst_named_leaves(from_formal, &unify)) {
+            match ask(
+                self,
+                *to_formal,
+                self.subst_named_leaves(from_formal, &unify),
+            ) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -8017,9 +8039,7 @@ impl<'a> Engine<'a> {
         // signature's required count — the per-site answer the shared
         // `FnShapeId` map cannot give (`fn_face_sig` at the verdict).
         let checked_shape0 = match armed {
-            Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => {
-                Some(shape)
-            }
+            Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => Some(shape),
             _ => None,
         };
         // The `this`/`super` keyword operand (`this is C` in `C`), resolved
@@ -8182,14 +8202,14 @@ impl<'a> Engine<'a> {
                             // A count-only `<...>` group keeps anonymous
                             // entries — the same face `fn_face_sig`'s rebuild
                             // carries for unwritten parameter spellings.
-                            let params: Vec<(StringId, Option<Ty>)> = if type_params_named.is_empty()
-                            {
-                                (0..usize::from(type_params))
-                                    .map(|_| (StringId::NONE, None))
-                                    .collect()
-                            } else {
-                                type_params_named
-                            };
+                            let params: Vec<(StringId, Option<Ty>)> =
+                                if type_params_named.is_empty() {
+                                    (0..usize::from(type_params))
+                                        .map(|_| (StringId::NONE, None))
+                                        .collect()
+                                } else {
+                                    type_params_named
+                                };
                             let rebuilt = self.boundary.args.borrow_mut().function_generic(
                                 &params,
                                 recovered,
@@ -8206,11 +8226,8 @@ impl<'a> Engine<'a> {
                                     nullable,
                                 } = rebuilt
                             {
-                                if let Some(required) = self
-                                    .fn_shape_required
-                                    .get(&before)
-                                    .copied()
-                                    .or_else(|| {
+                                if let Some(required) =
+                                    self.fn_shape_required.get(&before).copied().or_else(|| {
                                         self.last_fn_seal.and_then(|(sealed, count)| {
                                             (sealed == before).then_some(count)
                                         })
@@ -8250,7 +8267,10 @@ impl<'a> Engine<'a> {
             // — the prefix token's own spelling is the head candidate.
             let span_text = self.source[start..end].trim_end_matches('?');
             if self.strings.resolve(name) != span_text
-                && matches!(self.resolve_bare(self.intern(span_text)).1, RefTarget::Prefix)
+                && matches!(
+                    self.resolve_bare(self.intern(span_text)).1,
+                    RefTarget::Prefix
+                )
             {
                 let joined = self.intern(&format!("{}.{}", span_text, self.strings.resolve(name)));
                 checked = Ty::Named {
@@ -8369,13 +8389,19 @@ impl<'a> Engine<'a> {
             let is_at = span_text
                 .rfind(" is! ")
                 .or_else(|| span_text.rfind(" is "))
-                .map(|pos| pos + if span_text[pos..].starts_with(" is! ") { 5 } else { 4 });
+                .map(|pos| {
+                    pos + if span_text[pos..].starts_with(" is! ") {
+                        5
+                    } else {
+                        4
+                    }
+                });
             if let Some(keyword_end) = is_at {
                 let tail = &span_text[keyword_end..];
                 let trimmed = tail.trim_start();
                 let skip = tail.len() - trimmed.len();
-                if let Some((recovered, _)) =
-                    self.parse_fn_literal_at(&span_text[keyword_end + skip..], &FxHashMap::default())
+                if let Some((recovered, _)) = self
+                    .parse_fn_literal_at(&span_text[keyword_end + skip..], &FxHashMap::default())
                 {
                     checked = self.canonical_function_ty(recovered);
                 }
@@ -8688,12 +8714,10 @@ impl<'a> Engine<'a> {
                         // `checked_shape0` match keeps the read on the
                         // literal target alone: a folded alias's shape is
                         // not the seal's.
-                        let checked_required = checked_shape0
-                            .and_then(|shape0| {
-                                self.last_fn_seal.and_then(|(sealed, count)| {
-                                    (sealed == shape0).then_some(count)
-                                })
-                            });
+                        let checked_required = checked_shape0.and_then(|shape0| {
+                            self.last_fn_seal
+                                .and_then(|(sealed, count)| (sealed == shape0).then_some(count))
+                        });
                         let checked_sig = self.fn_face_sig(checked, checked_required);
                         operand_sig
                             .zip(checked_sig)
@@ -8880,11 +8904,12 @@ impl<'a> Engine<'a> {
     /// still binds the face in scope.
     fn bare_invoke_ty_is_result(&self, row: &Row) -> bool {
         match row.ty {
-            Ty::Function { nullable: false, .. } => true,
-            Ty::Function { nullable: true, .. } => !self
-                .frames
-                .iter()
-                .any(|f| f.locals.contains(&row.name)),
+            Ty::Function {
+                nullable: false, ..
+            } => true,
+            Ty::Function { nullable: true, .. } => {
+                !self.frames.iter().any(|f| f.locals.contains(&row.name))
+            }
             _ => false,
         }
     }
@@ -8926,8 +8951,7 @@ impl<'a> Engine<'a> {
             RowShape::Receiver(Receiver::Created { name, kind, .. })
                 if *kind == ContainerKind::Class
                     || (*kind == ContainerKind::Extension
-                        && self.container_kind_of(*name)
-                            == Some(ContainerKind::ExtensionType)) =>
+                        && self.container_kind_of(*name) == Some(ContainerKind::ExtensionType)) =>
             {
                 self.creation_row_ty(*name, false, row.range.offset)
                     .filter(|ty| *ty != Ty::UNKNOWN)
@@ -9955,10 +9979,10 @@ impl<'a> Engine<'a> {
             // before the null-check faces ever ask their question. The
             // span opens at the operand EXPRESSION's head — a member
             // operand's `x.m()!` spans from `x`, not the `m` selector.
-            let head = self.rows.last().and_then(|row| {
-                self.property_access_span(row.range)
-                    .map(|span| span.offset)
-            });
+            let head = self
+                .rows
+                .last()
+                .and_then(|row| self.property_access_span(row.range).map(|span| span.offset));
             let range = SourceRange {
                 offset: head.unwrap_or(read_span.offset),
                 length: at.end() - head.unwrap_or(read_span.offset),
@@ -10462,7 +10486,11 @@ impl<'a> Engine<'a> {
     /// RESOLVED, and the member faces below would invent
     /// `undefined_operator`/`argument_type_not_assignable` rows against a
     /// face the oracle never consults.
-    pub(crate) fn nullable_extension_operator_sig(&mut self, recv: Ty, op: StringId) -> Option<(Ty, Ty)> {
+    pub(crate) fn nullable_extension_operator_sig(
+        &mut self,
+        recv: Ty,
+        op: StringId,
+    ) -> Option<(Ty, Ty)> {
         let Ty::Named {
             name,
             nullable: true,
@@ -11155,7 +11183,9 @@ impl<'a> Engine<'a> {
         let head = self.rows[..then_index]
             .iter()
             .rev()
-            .find(|row| !matches!(row.shape, RowShape::TypeUse(..)) && row.range.end() <= question.offset)
+            .find(|row| {
+                !matches!(row.shape, RowShape::TypeUse(..)) && row.range.end() <= question.offset
+            })
             .map(|row| row.range.offset)
             .unwrap_or(question.offset);
         // The arm rows STAY live: their own verdicts (the dot-shorthand
@@ -11248,11 +11278,9 @@ impl<'a> Engine<'a> {
         _end: SourceRange,
         promoted_target: Option<Ty>,
     ) {
-        let rhs_index = match self
-            .rows
-            .iter()
-            .rposition(|row| !matches!(row.shape, RowShape::TypeUse(..)) && row.range.offset >= op_range.end())
-        {
+        let rhs_index = match self.rows.iter().rposition(|row| {
+            !matches!(row.shape, RowShape::TypeUse(..)) && row.range.offset >= op_range.end()
+        }) {
             Some(index) => index,
             None => return,
         };
@@ -11265,8 +11293,8 @@ impl<'a> Engine<'a> {
         }) else {
             return;
         };
-        let target_ty = promoted_target
-            .unwrap_or_else(|| self.operand_static_ty(&self.rows[target_index]));
+        let target_ty =
+            promoted_target.unwrap_or_else(|| self.operand_static_ty(&self.rows[target_index]));
         let rhs_ty = self.operand_static_ty(&self.rows[rhs_index]);
         if target_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN {
             return;
@@ -11330,13 +11358,11 @@ impl<'a> Engine<'a> {
             .iter()
             .rev()
             .find(|t| t.kind == dartq_scanner::TokenKind::Colon)?;
-        let then_index = self.rows[..else_index]
-            .iter()
-            .rposition(|row| {
-                !matches!(row.shape, RowShape::TypeUse(..))
-                    && row.range.end() <= colon.utf16_offset
-                    && !self.interpolation_child_rows.contains(&row.range.offset)
-            })?;
+        let then_index = self.rows[..else_index].iter().rposition(|row| {
+            !matches!(row.shape, RowShape::TypeUse(..))
+                && row.range.end() <= colon.utf16_offset
+                && !self.interpolation_child_rows.contains(&row.range.offset)
+        })?;
         let then_row = &self.rows[then_index];
         // The matching `?` sits before the then arm (a named-argument or
         // map-literal `:` pairs no `?` between the prior row's end and
@@ -11408,10 +11434,9 @@ impl<'a> Engine<'a> {
         };
         // Nullability merge: `UP(T1?, T2) = UP(T1, T2)?`.
         if Self::nullable_lub_leg(left) || Self::nullable_lub_leg(right) {
-            return Self::nullable_form(self.composite_lub_stripped(
-                Self::non_null_form(left),
-                Self::non_null_form(right),
-            ));
+            return Self::nullable_form(
+                self.composite_lub_stripped(Self::non_null_form(left), Self::non_null_form(right)),
+            );
         }
         self.composite_lub_stripped(left, right)
     }
@@ -11437,8 +11462,7 @@ impl<'a> Engine<'a> {
         }
         // A bare `Function` head is the supertype every function type
         // shares — the pair collapses onto it.
-        let bare_function =
-            |ty: Ty| matches!(ty, Ty::Named { name, nullable: false, args } if name == self.intern("Function") && args == ArgListId::EMPTY);
+        let bare_function = |ty: Ty| matches!(ty, Ty::Named { name, nullable: false, args } if name == self.intern("Function") && args == ArgListId::EMPTY);
         if bare_function(left) || bare_function(right) {
             if matches!(left, Ty::Function { .. }) || matches!(right, Ty::Function { .. }) {
                 return if bare_function(left) { left } else { right };
@@ -11507,10 +11531,7 @@ impl<'a> Engine<'a> {
             // undecidable formal type) falls back to the bare `Function`
             // head — the same under-report direction the arm answered
             // before the lift, never a fabricated rejection.
-            (
-                Ty::Function { shape: l, .. },
-                Ty::Function { shape: r, .. },
-            ) => self
+            (Ty::Function { shape: l, .. }, Ty::Function { shape: r, .. }) => self
                 .function_type_lub(l, r)
                 .unwrap_or_else(|| Ty::named(self.intern("Function"))),
             (Ty::Function { .. }, _) | (_, Ty::Function { .. }) => Ty::named(self.intern("Object")),
@@ -11647,8 +11668,19 @@ impl<'a> Engine<'a> {
         let world = self.name_world();
         let mut heads: Vec<StringId> = vec![l, r, self.intern("Object")];
         for name in [
-            "num", "Comparable", "Iterable", "List", "Set", "Map", "String", "Pattern", "bool",
-            "Enum", "Function", "Future", "Record",
+            "num",
+            "Comparable",
+            "Iterable",
+            "List",
+            "Set",
+            "Map",
+            "String",
+            "Pattern",
+            "bool",
+            "Enum",
+            "Function",
+            "Future",
+            "Record",
         ] {
             heads.push(self.intern(name));
         }
@@ -11839,7 +11871,13 @@ impl<'a> Engine<'a> {
         if !self.switch.case_sink_open || self.switch.pattern_stack.is_empty() {
             return None;
         }
-        if !self.switch.pattern_stack.iter().skip(1).all(|f| f.binary.is_some()) {
+        if !self
+            .switch
+            .pattern_stack
+            .iter()
+            .skip(1)
+            .all(|f| f.binary.is_some())
+        {
             return None;
         }
         self.switch.switches.last().map(|ctx| ctx.scrutinee)
@@ -11888,7 +11926,10 @@ impl<'a> Engine<'a> {
     fn list_pattern_required_ty(&mut self) -> Ty {
         let element = Self::nullable_form(Ty::named(self.intern("Object")));
         let head = self.intern("List");
-        self.boundary.args.borrow_mut().named(head, false, &[element])
+        self.boundary
+            .args
+            .borrow_mut()
+            .named(head, false, &[element])
     }
 
     /// `checkPatternNeverMatchesValueType`'s Map kind (upstream Dart SDK
@@ -11966,7 +12007,11 @@ impl<'a> Engine<'a> {
         let object = Self::nullable_form(Ty::named(self.intern("Object")));
         let slots = vec![object; positional];
         let names: Vec<(StringId, Ty)> = named.iter().map(|name| (*name, object)).collect();
-        let required = self.boundary.args.borrow_mut().record(&slots, &names, false);
+        let required = self
+            .boundary
+            .args
+            .borrow_mut()
+            .record(&slots, &names, false);
         let a0 = self.ty_display(matched);
         let a1 = self.ty_display(required);
         self.stage_typed(SemanticCode::PatternNeverMatchesValueType, at, &a0, &a1);
@@ -11979,12 +12024,7 @@ impl<'a> Engine<'a> {
     /// compare their field shapes. An opaque or undecidable left keeps the
     /// official's conservative `true` (a type parameter, a non-interface
     /// shape).
-    fn record_pattern_disjoint(
-        &self,
-        matched: Ty,
-        positional: usize,
-        named: &[StringId],
-    ) -> bool {
+    fn record_pattern_disjoint(&self, matched: Ty, positional: usize, named: &[StringId]) -> bool {
         match matched {
             // The `Null` arm decides before the record arms
             // (type_system.dart:150-154): the required record type is never
@@ -12048,7 +12088,14 @@ impl<'a> Engine<'a> {
         // as a non-nullable interface head.
         let cast = self.normalized_null(cast);
         let matched = self.normalized_null(matched);
-        let null_face = matched == Ty::Null && matches!(cast, Ty::Named { nullable: false, .. });
+        let null_face = matched == Ty::Null
+            && matches!(
+                cast,
+                Ty::Named {
+                    nullable: false,
+                    ..
+                }
+            );
         if self.name_subtype(matched, cast) {
             // The official gate is `isSubtypeOf && castType is not
             // InvalidType` — a `dynamic` target reports like any other.
@@ -12091,7 +12138,9 @@ impl<'a> Engine<'a> {
             return None;
         }
         let Some(matched) = self.pattern_matched_ty() else {
-            return self.pattern_reads_container_column().then_some((at, required));
+            return self
+                .pattern_reads_container_column()
+                .then_some((at, required));
         };
         self.judge_pattern_never_matches(at, required, matched);
         None
@@ -12616,12 +12665,7 @@ impl<'a> Engine<'a> {
             while let Some(index) = tokens
                 .iter()
                 .position(|t| t.utf16_offset == at.offset && t.byte_len == at.length)
-                .filter(|index| {
-                    matches!(
-                        tokens[*index].kind,
-                        dartq_scanner::TokenKind::CloseParen
-                    )
-                })
+                .filter(|index| matches!(tokens[*index].kind, dartq_scanner::TokenKind::CloseParen))
             {
                 let mut depth = 1u32;
                 let mut open = None;
@@ -12699,9 +12743,7 @@ impl<'a> Engine<'a> {
         loop_var_ty: Option<Ty>,
     ) -> Option<SourceRange> {
         match loop_var_ty {
-            Some(ty)
-                if ty != Ty::UNKNOWN
-                    && !self.is_void_spelling(self.fold_alias_ty(ty)) => {}
+            Some(ty) if ty != Ty::UNKNOWN && !self.is_void_spelling(self.fold_alias_ty(ty)) => {}
             _ => return None,
         }
         let (ty, _, range) = self.single_row_since(mark)?;
@@ -13973,11 +14015,10 @@ impl<'a> Engine<'a> {
         // while the element index and the classifier read shared state.
         let mut faces: Vec<(SemanticCode, SourceRange)> = Vec::new();
         for (decl_name, container) in elements.containers() {
-            let Some(site) = self
-                .decl_sites
-                .iter()
-                .rev()
-                .find(|site| matches!(site.kind, DeclKind::Container) && site.name == decl_name)
+            let Some(site) =
+                self.decl_sites.iter().rev().find(|site| {
+                    matches!(site.kind, DeclKind::Container) && site.name == decl_name
+                })
             else {
                 continue;
             };
@@ -13994,7 +14035,10 @@ impl<'a> Engine<'a> {
                             .map(|mixin| (SemanticCode::SubtypeOfDisallowedTypeInWith, *mixin)),
                     );
                     entries.extend(container.implements_clause.iter().map(|interface| {
-                        (SemanticCode::SubtypeOfDisallowedTypeInImplements, *interface)
+                        (
+                            SemanticCode::SubtypeOfDisallowedTypeInImplements,
+                            *interface,
+                        )
                     }));
                 }
                 ContainerKind::Enum => {
@@ -14005,18 +14049,21 @@ impl<'a> Engine<'a> {
                             .map(|mixin| (SemanticCode::SubtypeOfDisallowedTypeInWith, *mixin)),
                     );
                     entries.extend(container.implements_clause.iter().map(|interface| {
-                        (SemanticCode::SubtypeOfDisallowedTypeInImplements, *interface)
+                        (
+                            SemanticCode::SubtypeOfDisallowedTypeInImplements,
+                            *interface,
+                        )
                     }));
                 }
                 ContainerKind::Mixin => {
-                    entries.extend(
-                        container
-                            .on_clause
-                            .iter()
-                            .map(|constraint| (SemanticCode::SubtypeOfDisallowedTypeInOn, *constraint)),
-                    );
+                    entries.extend(container.on_clause.iter().map(|constraint| {
+                        (SemanticCode::SubtypeOfDisallowedTypeInOn, *constraint)
+                    }));
                     entries.extend(container.implements_clause.iter().map(|interface| {
-                        (SemanticCode::SubtypeOfDisallowedTypeInImplements, *interface)
+                        (
+                            SemanticCode::SubtypeOfDisallowedTypeInImplements,
+                            *interface,
+                        )
                     }));
                 }
                 // Extension types carry their own code
@@ -14029,8 +14076,7 @@ impl<'a> Engine<'a> {
             // pushed row for `entry` under `code` anchors the n-th written
             // `entry` under that clause keyword in source (the model's
             // clause lists are in written order).
-            let mut ordinals: FxHashMap<(SemanticCode, StringId), usize> =
-                FxHashMap::default();
+            let mut ordinals: FxHashMap<(SemanticCode, StringId), usize> = FxHashMap::default();
             for (code, entry) in entries {
                 // `Enum` never reaches this table (filtered inside
                 // `disallowed_subtype_head` — upstream's `isDartCoreEnum`
@@ -14100,8 +14146,7 @@ impl<'a> Engine<'a> {
                     // their own clause keyword.
                     if alias_head {
                         let head_at = self.skip_ws_bytes(probe + 1);
-                        let (span, next) =
-                            self.scan_clause_type_at(head_at, entry_text);
+                        let (span, next) = self.scan_clause_type_at(head_at, entry_text);
                         if let Some(span) = span {
                             if matched == ordinal {
                                 return Some(span);

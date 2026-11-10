@@ -86,9 +86,7 @@ fn cascade_repeat_getter_reads_resolve_against_target() {
 /// rather than a creation.
 #[test]
 fn cascade_repeat_reads_in_body_resolve_against_target() {
-    let report = report_ops(
-        "void f(A a) {\n  a..x..x..x;\n}\nclass A { final int x = 0; }\n",
-    );
+    let report = report_ops("void f(A a) {\n  a..x..x..x;\n}\nclass A { final int x = 0; }\n");
     assert_eq!(rows(&report), Vec::<(String, String)>::new());
 }
 

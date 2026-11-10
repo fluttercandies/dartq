@@ -2387,10 +2387,7 @@ mod tests {
                 "lib/core/raw.dart",
                 "// License.\nimport 'dart:core';\n\npart of r'dart:core';\n",
             );
-            write(
-                "lib/core/adjacent.dart",
-                "part of 'dart:' 'core';\n",
-            );
+            write("lib/core/adjacent.dart", "part of 'dart:' 'core';\n");
             write(
                 "lib/io/patch.dart",
                 "// Patch file for dart:io.\n\nimport 'dart:async';\n\nvoid f() {}\n",

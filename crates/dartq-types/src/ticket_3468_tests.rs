@@ -21,9 +21,7 @@ use crate::instantiate_to_bound::{
 };
 use crate::table::TypeTable;
 use crate::ty::{TypeKind, UninternedFunction, UninternedType};
-use crate::variance::{
-    ParamFacts, ParamFactsTable, Variance, typedef_parameter_variances,
-};
+use crate::variance::{ParamFacts, ParamFactsTable, Variance, typedef_parameter_variances};
 
 const A: TypeDeclId = TypeDeclId::from_raw(5);
 const NUM: TypeDeclId = TypeDeclId::from_raw(7);
@@ -144,7 +142,10 @@ fn show(table: &TypeTable, ty: TypeId) -> String {
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{} Function({formals}){suffix}", show(table, sig.return_type))
+            format!(
+                "{} Function({formals}){suffix}",
+                show(table, sig.return_type)
+            )
         }
         TypeKind::Record { shape } => {
             let shape = table.record_shape(shape);
@@ -190,8 +191,7 @@ fn typedef_g_contravariant_x_grounds_to_a_never() {
     let (x, y) = (TypeParamId::from_raw(10), TypeParamId::from_raw(11));
     let body = fn_type(&table, param(&table, y), vec![param(&table, x)]);
     let facts = ParamFactsTable::new();
-    let variances =
-        typedef_parameter_variances(&table, &facts, &[x, y], body, arg_variances);
+    let variances = typedef_parameter_variances(&table, &facts, &[x, y], body, arg_variances);
     assert_eq!(
         variances,
         vec![Variance::Contravariant, Variance::Covariant],

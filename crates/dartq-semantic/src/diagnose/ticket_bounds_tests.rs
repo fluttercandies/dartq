@@ -62,7 +62,11 @@ void main() {
 ";
     let report = report_ops(fixture);
     let assign = offsets(&report, "invalid_assignment");
-    assert_eq!(assign.len(), 1, "expected one invalid_assignment: {report:#?}");
+    assert_eq!(
+        assign.len(),
+        1,
+        "expected one invalid_assignment: {report:#?}"
+    );
     let msg = &report
         .diagnostics
         .iter()

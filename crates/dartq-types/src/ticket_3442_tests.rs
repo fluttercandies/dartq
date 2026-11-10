@@ -50,11 +50,17 @@ fn plain(table: &TypeTable, decl: TypeDeclId) -> TypeId {
 /// Asserts `ty` is exactly `A<dynamic>`.
 fn assert_a_of_dynamic(table: &TypeTable, ty: TypeId, who: &str) {
     let TypeKind::Interface { decl, args } = table.get(ty).kind() else {
-        panic!("{who}: expected `A<dynamic>`, got {:?}", table.get(ty).kind());
+        panic!(
+            "{who}: expected `A<dynamic>`, got {:?}",
+            table.get(ty).kind()
+        );
     };
     assert!(decl == A && args.len() == 1, "{who}: expected `A<dynamic>`");
     assert!(
-        matches!(table.get(table.arg(args.offset())).kind(), TypeKind::Dynamic),
+        matches!(
+            table.get(table.arg(args.offset())).kind(),
+            TypeKind::Dynamic
+        ),
         "{who}: expected `A<dynamic>`"
     );
 }

@@ -96,7 +96,12 @@ fn rig_report(main: &str, mocks: &[(&str, &str, &str)]) -> FileReport {
         let mock_file = files.intern(Path::new(uri));
         let mock_lib = builder.intern(uri);
         builder.library_name(mock_lib, lib_name);
-        let elements = crate::collector::collect(source, &scan_fixture(source, mock_file).tokens, features, &strings);
+        let elements = crate::collector::collect(
+            source,
+            &scan_fixture(source, mock_file).tokens,
+            features,
+            &strings,
+        );
         for (name, decl) in elements.declarations() {
             if decl.kind == MicroKind::TypeParam {
                 continue;
@@ -174,7 +179,13 @@ fn iat_ctor_annotation_on_mixin() {
         "The annotation 'A.new' can only be used on classes."
     );
     let at = main.find("@A()").expect("fixture anchor") + 1;
-    assert_eq!(rows[0].range, SourceRange { offset: at as u32, length: 1 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at as u32,
+            length: 1
+        }
+    );
 }
 
 /// A `@Target`-carrying top-level constant's bare annotation on a
@@ -192,7 +203,13 @@ fn iat_constant_annotation_on_top_level_variable() {
         "The annotation 'a' can only be used on classes."
     );
     let at = main.find("@a\n").expect("fixture anchor") + 1;
-    assert_eq!(rows[0].range, SourceRange { offset: at as u32, length: 1 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at as u32,
+            length: 1
+        }
+    );
 }
 
 /// The dart:core `@override` face on a top-level variable: the hardcoded
@@ -209,7 +226,13 @@ fn iat_override_on_top_level_variable() {
         "The annotation 'override' can only be used on fields, getters, methods, or setters."
     );
     let at = main.find("@override").expect("fixture anchor") + 1;
-    assert_eq!(rows[0].range, SourceRange { offset: at as u32, length: 8 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at as u32,
+            length: 8
+        }
+    );
 }
 
 /// An allowed target is silent: the same `@A()` on a class
@@ -245,7 +268,13 @@ fn usl_declared_return_face() {
         Some("Try removing the set literal around the expression.")
     );
     let at = main.find("{1}").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 3 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 3
+        }
+    );
 }
 
 /// A closure argument under a void-returning formal type reports at its
@@ -261,7 +290,13 @@ fn usl_closure_argument_face() {
         "Braces unnecessarily wrap this expression in a set literal."
     );
     let at = main.rfind("{1}").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 3 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 3
+        }
+    );
 }
 
 /// A non-void declared return is silent (a set literal is the point of
@@ -298,7 +333,13 @@ fn uf_final_parameter() {
         Some("Try removing the 'final'.")
     );
     let at = main.find("final").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 5 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 5
+        }
+    );
 }
 
 /// Statement-level `final`s are silent: a block-local declaration and a
@@ -325,7 +366,13 @@ fn mrp_plain_required() {
     assert_eq!(rows[0].severity, Severity::Warning);
     assert_eq!(rows[0].message, "The parameter 'x' is required.");
     let at = main.rfind("f()").expect("fixture anchor") as u32;
-    assert_eq!(rows[0].range, SourceRange { offset: at, length: 1 });
+    assert_eq!(
+        rows[0].range,
+        SourceRange {
+            offset: at,
+            length: 1
+        }
+    );
 }
 
 /// A `@Required('reason')` class star reports the with-details text.

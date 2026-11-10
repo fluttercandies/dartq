@@ -117,8 +117,7 @@ fn updaters_method_invocation_reports_whole_region() {
 
 #[test]
 fn updaters_prefixed_identifier_reports_whole_region() {
-    let src =
-        "import 'dart:math' as m;\n\nvoid f() {\n  for (;; m.Point) {\n    return;\n  }\n}";
+    let src = "import 'dart:math' as m;\n\nvoid f() {\n  for (;; m.Point) {\n    return;\n  }\n}";
     assert_eq!(dead_of(src), vec!["m.Point".to_string()]);
 }
 

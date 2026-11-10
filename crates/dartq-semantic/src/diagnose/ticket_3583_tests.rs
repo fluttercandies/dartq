@@ -59,8 +59,8 @@
 //! the keyword inside an `augment` body is an introduction that still
 //! claims and still reports.
 
-use super::test_rig::{report_ops, report_ops_experiments_with};
 use super::FileReport;
+use super::test_rig::{report_ops, report_ops_experiments_with};
 use dartq_language::Feature;
 
 fn conflicts(report: &FileReport) -> Vec<(u32, u32, String)> {
@@ -326,5 +326,3 @@ fn class_own_static_vs_instance_still_reports() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].2.contains("'A.foo'"), "{rows:?}");
 }
-
-

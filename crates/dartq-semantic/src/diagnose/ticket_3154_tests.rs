@@ -130,7 +130,8 @@ fn report_ops_with(source: &str) -> FileReport {
     );
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
-    let types = LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
+    let types =
+        LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
     let ops = ResolvedTypeOps::new(&types, &strings, file);
     let fold = fold_unit_with_ops(
         source,
@@ -344,11 +345,7 @@ fn clean_shapes_stay_silent() {
     );
     // A user element satisfies every clause.
     let clean = report_ops_bare("class B {}\nclass A extends B implements B {}");
-    assert!(
-        clean.diagnostics.is_empty(),
-        "{:?}",
-        clean.diagnostics
-    );
+    assert!(clean.diagnostics.is_empty(), "{:?}", clean.diagnostics);
     // An unresolved non-table spelling keeps the no-SDK-face verdict.
     let unres = report_ops_bare("class A extends UnresolvedType {}");
     assert!(

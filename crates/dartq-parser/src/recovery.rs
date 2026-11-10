@@ -748,13 +748,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         | Keyword::Typedef
                 )
             ) && !matches!(
-                    self.cursor.look_kind(1),
-                    TokenKind::Period
-                        | TokenKind::EqEq
-                        | TokenKind::CloseParen
-                        | TokenKind::Eof
-                )
-            {
+                self.cursor.look_kind(1),
+                TokenKind::Period | TokenKind::EqEq | TokenKind::CloseParen | TokenKind::Eof
+            ) {
                 self.report(msg::missing_identifier(), peek.span);
                 let id = self
                     .cursor
@@ -822,12 +818,11 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                         | Keyword::Mixin
                         | Keyword::Part
                         | Keyword::Typedef
-                )
-            // The follower keep-set is the context's `followingValues`
-            // (`identifier_context.dart:143`: `=` `,` `;` EOF — a `mixin`/
-            // `typedef` head at statement end IS the variable name, oracle
-            // `int mixin` + EOF reports `expected_token ';'` at `mixin`,
-            // never `missing_identifier`).
+                ) // The follower keep-set is the context's `followingValues`
+                  // (`identifier_context.dart:143`: `=` `,` `;` EOF — a `mixin`/
+                  // `typedef` head at statement end IS the variable name, oracle
+                  // `int mixin` + EOF reports `expected_token ';'` at `mixin`,
+                  // never `missing_identifier`).
             ) && !matches!(
                 self.cursor.look_kind(1),
                 TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon | TokenKind::Eof
@@ -906,9 +901,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 peek.kind,
                 TokenKind::Semicolon
                     | TokenKind::Comma
-                    | TokenKind::Keyword(
-                        Keyword::If | Keyword::As | Keyword::Show | Keyword::Hide
-                    )
+                    | TokenKind::Keyword(Keyword::If | Keyword::As | Keyword::Show | Keyword::Hide)
                     | TokenKind::Eof
             )
         } else if context == crate::listener::IdentifierContext::MetadataReference {
@@ -980,10 +973,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             // no consume-in-doubt).
             matches!(
                 peek.kind,
-                TokenKind::Period
-                    | TokenKind::EqEq
-                    | TokenKind::CloseParen
-                    | TokenKind::Eof
+                TokenKind::Period | TokenKind::EqEq | TokenKind::CloseParen | TokenKind::Eof
             ) || self.looks_like_start_of_next_top_level_declaration_at(0)
         } else if matches!(
             context,
@@ -1822,9 +1812,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             // included — take `expectedIdentifierButGotKeyword` (:1473-1474).
             if kw.style() != dartq_scanner::KeywordStyle::Pseudo {
                 self.report(
-                    msg::expected_identifier_but_got_keyword(
-                        self.cursor.lexeme(peek.span.id),
-                    ),
+                    msg::expected_identifier_but_got_keyword(self.cursor.lexeme(peek.span.id)),
                     peek.span,
                 );
             }
@@ -2299,7 +2287,10 @@ fn keyword_as_name_message(
                 Some(msg::built_in_identifier_as_type(lexeme))
             }
             dartq_scanner::KeywordStyle::Reserved
-                if !matches!(kw, dartq_scanner::Keyword::Void | dartq_scanner::Keyword::Var) =>
+                if !matches!(
+                    kw,
+                    dartq_scanner::Keyword::Void | dartq_scanner::Keyword::Var
+                ) =>
             {
                 Some(msg::expected_type_name())
             }

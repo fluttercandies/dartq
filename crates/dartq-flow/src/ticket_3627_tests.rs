@@ -79,9 +79,13 @@ fn read_types(source: &str) -> Vec<(u32, crate::ty::Ty)> {
 /// The `ReadType` at `needle`'s offset (the needle must occur exactly
 /// once in `source`).
 fn ty_at(source: &str, needle: &str) -> crate::ty::Ty {
-    assert_eq!(source.matches(needle).count(), 1, "{needle:?} in {source:?}");
-    let offset = u32::try_from(source.find(needle).expect("needle present"))
-        .expect("offset fits u32");
+    assert_eq!(
+        source.matches(needle).count(),
+        1,
+        "{needle:?} in {source:?}"
+    );
+    let offset =
+        u32::try_from(source.find(needle).expect("needle present")).expect("offset fits u32");
     read_types(source)
         .into_iter()
         .find(|(at, _)| *at == offset)

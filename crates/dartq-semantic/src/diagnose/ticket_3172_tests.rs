@@ -26,8 +26,7 @@ fn ticket_3172_unassigned_property_access() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 6, "{:?}", rows(&report));
 }
@@ -102,8 +101,7 @@ fn ticket_3172_unassigned_property_access_property_access() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 11, "{:?}", rows(&report));
 }
@@ -121,8 +119,7 @@ fn ticket_3172_unassigned_parenthesized_property_access() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 6, "{:?}", rows(&report));
 }
@@ -140,8 +137,7 @@ fn ticket_3172_unassigned_parenthesized_property_access_property_access() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.sign").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 11, "{:?}", rows(&report));
 }
@@ -159,8 +155,7 @@ fn ticket_3172_unassigned_index_expression() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 4, "{:?}", rows(&report));
 }
@@ -178,8 +173,7 @@ fn ticket_3172_unassigned_index_expression_index_expression() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 7, "{:?}", rows(&report));
 }
@@ -198,8 +192,7 @@ fn ticket_3172_unassigned_index_index_aware() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?[0]").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 8, "{:?}", rows(&report));
 }
@@ -217,8 +210,7 @@ fn ticket_3172_unassigned_cascade_property_access() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..sign").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..sign").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 7, "{:?}", rows(&report));
 }
@@ -237,8 +229,7 @@ fn ticket_3172_unassigned_cascade_two_sections() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..sign").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..sign").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 15, "{:?}", rows(&report));
 }
@@ -256,8 +247,7 @@ fn ticket_3172_unassigned_cascade_method_invocation() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..toInt").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..toInt").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 18, "{:?}", rows(&report));
 }
@@ -275,8 +265,7 @@ fn ticket_3172_unassigned_cascade_index_expression() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..[0]").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?..[0]").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 14, "{:?}", rows(&report));
 }
@@ -309,8 +298,7 @@ fn ticket_3172_unassigned_parenthesized_method_invocation() {
         .filter(|d| d.code.name == "dead_code")
         .collect();
     assert_eq!(dead.len(), 1, "{:?}", rows(&report));
-    let offset =
-        crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.abs()").unwrap();
+    let offset = crate::diagnose::test_rig::CORE_PRELUDE.len() + fixture.find("?.abs()").unwrap();
     assert_eq!(dead[0].range.offset as usize, offset, "{:?}", rows(&report));
     assert_eq!(dead[0].range.length, 7, "{:?}", rows(&report));
 }

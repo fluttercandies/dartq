@@ -24,9 +24,9 @@
 //! for the undefined, registered, kind-spelling, and scoped-parameter
 //! faces through the mounted `ResolvedTypeOps`.
 
-use super::{ASSIGNMENT_TARGET_MAX_TAIL, ASSIGNMENT_TARGET_VISITS};
-use super::async_return_tests::{code_names, report};
 use super::super::types::FileReport;
+use super::async_return_tests::{code_names, report};
+use super::{ASSIGNMENT_TARGET_MAX_TAIL, ASSIGNMENT_TARGET_VISITS};
 use crate::diagnose::test_rig::report_ops;
 
 fn rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
@@ -100,11 +100,7 @@ fn index_assignment_skips_the_folded_value_row() {
                     \x20 }}"
     );
     let report = report(&source);
-    assert!(
-        code_names(&report).is_empty(),
-        "{:?}",
-        code_names(&report)
-    );
+    assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
 }
 
 /// The bounded scan's instruction count: the last assignment's

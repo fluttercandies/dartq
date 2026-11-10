@@ -100,7 +100,9 @@ const BINARY: SourceRange = SourceRange {
     length: 9,
 };
 
-use BinOp::{Add, BitAnd, BitOr, BitXor, Div, Ge, Gt, IntDiv, Le, Lt, Mod, Mul, Shl, Shr, Sub, Ushr};
+use BinOp::{
+    Add, BitAnd, BitOr, BitXor, Div, Ge, Gt, IntDiv, Le, Lt, Mod, Mul, Shl, Shr, Sub, Ushr,
+};
 
 // —— (1) a null operand in an arithmetic / relational operator ————————
 
@@ -203,7 +205,11 @@ fn ticket_3852_null_bitwise_answers_the_bool_or_int_face() {
     }
     // The real bool/int pairs still evaluate.
     assert_eq!(
-        world.bin(BitAnd, ConstantValue::Bool(true), ConstantValue::Bool(false)),
+        world.bin(
+            BitAnd,
+            ConstantValue::Bool(true),
+            ConstantValue::Bool(false)
+        ),
         Verdict::Value(ConstantValue::Bool(false))
     );
     assert_eq!(
@@ -345,19 +351,23 @@ fn ticket_3852_lazy_inner_fault_is_reanchored_at_the_binary() {
 fn ticket_3852_lazy_clean_paths_stay_silent() {
     let world = w();
     assert_eq!(
-        world.bin(BinOp::And, ConstantValue::Bool(true), ConstantValue::Bool(false)),
+        world.bin(
+            BinOp::And,
+            ConstantValue::Bool(true),
+            ConstantValue::Bool(false)
+        ),
         Verdict::Value(ConstantValue::Bool(false))
     );
     assert_eq!(
-        world.bin(BinOp::Or, ConstantValue::Bool(false), ConstantValue::Bool(true)),
+        world.bin(
+            BinOp::Or,
+            ConstantValue::Bool(false),
+            ConstantValue::Bool(true)
+        ),
         Verdict::Value(ConstantValue::Bool(true))
     );
     assert_eq!(
-        world.bin(
-            BinOp::IfNull,
-            ConstantValue::Null,
-            ConstantValue::Int(2)
-        ),
+        world.bin(BinOp::IfNull, ConstantValue::Null, ConstantValue::Int(2)),
         Verdict::Value(ConstantValue::Int(2))
     );
     // A skipped right operand that is provably non-const replaces the

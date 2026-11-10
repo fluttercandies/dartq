@@ -57,8 +57,7 @@ fn unresolved_operand_reports_only_its_own_row() {
         "expected undefined_identifier on x, got {names:?}"
     );
     assert!(
-        !names.contains(&"not_iterable_spread")
-            && !names.contains(&"not_map_spread"),
+        !names.contains(&"not_iterable_spread") && !names.contains(&"not_map_spread"),
         "the undecidable operand must abstain, got {names:?}"
     );
 }
@@ -76,8 +75,7 @@ fn generic_call_result_operand_abstains() {
     ] {
         let names = code_names(&report_ops(src));
         assert!(
-            !names.contains(&"not_iterable_spread")
-                && !names.contains(&"not_map_spread"),
+            !names.contains(&"not_iterable_spread") && !names.contains(&"not_map_spread"),
             "{src:?}: the callee-side parameter is undecidable, got {names:?}"
         );
     }
@@ -89,8 +87,7 @@ fn generic_call_result_operand_abstains() {
 /// resolution).
 #[test]
 fn bounded_type_parameter_operand_silent() {
-    let fixture =
-        "void f<T extends List<int>>(T t) { var a = [...t]; }\n";
+    let fixture = "void f<T extends List<int>>(T t) { var a = [...t]; }\n";
     let names = code_names(&report_ops(fixture));
     assert!(
         !names.contains(&"not_iterable_spread"),
@@ -167,11 +164,7 @@ fn expression_beside_map_spread_is_ambiguous_not_a_map() {
 fn dynamic_spread_literal_is_either_and_silent() {
     let fixture = "Object f(dynamic d) { var e = {...d}; return e; }\n";
     let names = code_names(&report_ops(fixture));
-    assert_eq!(
-        names,
-        ["ambiguous_set_or_map_literal_either"],
-        "{names:?}"
-    );
+    assert_eq!(names, ["ambiguous_set_or_map_literal_either"], "{names:?}");
 }
 
 /// A spread-decided const literal asks the const shape of the right
@@ -280,7 +273,10 @@ fn list_element_ask_abstains_on_non_iterable_spread_operands() {
         ),
         // A raw `Iterable` donates a `dynamic` element — assignable,
         // silent.
-        ("void f(Iterable it) { var l = <int>[0, ...it]; }\n", &[][..]),
+        (
+            "void f(Iterable it) { var l = <int>[0, ...it]; }\n",
+            &[][..],
+        ),
     ] {
         let names = code_names(&report_ops(src));
         assert!(

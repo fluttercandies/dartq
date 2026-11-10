@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use super::collector::{latest_features, Collector};
+use super::collector::{Collector, latest_features};
 use crate::ParserFeatures;
 use crate::parser::Parser;
 use dartq_scanner::ScanConfig;
@@ -248,10 +248,7 @@ fn assert_end_group_quotes_junk() {
     // the group's real `)` is reported with `unexpectedToken` at its own
     // face and the `)` is consumed (parser_impl.dart:11091-11102) — one row
     // per shape.
-    assert_rows(
-        "void f() { assert(x 1); }",
-        &[("unexpected_token", 20, 21)],
-    );
+    assert_rows("void f() { assert(x 1); }", &[("unexpected_token", 20, 21)]);
     // Junk after the message expression reads the same way.
     assert_rows(
         "void f() { assert(x, 1 2); }",

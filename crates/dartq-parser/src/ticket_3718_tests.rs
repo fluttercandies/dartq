@@ -77,7 +77,9 @@ fn extra_gt_reports_body_on_the_real_gt() {
         "expected missing_function_body at (5,6), got {rows:?}"
     );
     assert!(
-        !rows.iter().any(|(c, s, e)| c == "missing_function_body" && e == s),
+        !rows
+            .iter()
+            .any(|(c, s, e)| c == "missing_function_body" && e == s),
         "length-0 missing_function_body survived the splice: {rows:?}"
     );
     // The `>` remainder stays the top-level follower, so the oracle's
@@ -107,7 +109,8 @@ fn unclosed_angle_member_reports_at_real_tokens() {
     // can't regress into synthetic anchors here.
     let rows = rows_at("class C {\n  C<\n}\n\nmain() {\n  C<\n}\n", augment_set());
     assert!(
-        rows.iter().all(|(c, s, e)| c != "missing_function_body" || e > s),
+        rows.iter()
+            .all(|(c, s, e)| c != "missing_function_body" || e > s),
         "length-0 missing_function_body row: {rows:?}"
     );
 }
@@ -119,7 +122,8 @@ fn eof_anchored_report_keeps_eof_span() {
     // zero-width EOF token — the walk must not manufacture a span.
     let rows = rows_at("void f()", augment_set());
     assert!(
-        rows.iter().any(|(c, s, e)| c == "missing_function_body" && e - s <= 1),
+        rows.iter()
+            .any(|(c, s, e)| c == "missing_function_body" && e - s <= 1),
         "expected an EOF-anchored missing_function_body, got {rows:?}"
     );
 }

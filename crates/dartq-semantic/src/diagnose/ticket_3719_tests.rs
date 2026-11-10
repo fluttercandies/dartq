@@ -33,8 +33,8 @@
 //! receiver's type arguments at lookup; `pkg/analyzer`'s
 //! `InterfaceType.asInstanceOf` composes it for inherited hits).
 
-use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 use super::FileReport;
+use super::test_rig::{CORE_PRELUDE, code_names, report_ops, rows};
 
 /// The absolute offset of the first `needle` in `fixture` as the rig
 /// analyzes it: `report_ops` prefixes [`CORE_PRELUDE`], so every
@@ -158,8 +158,7 @@ fn non_generic_container_equals_formal_unchanged() {
         vec![(
             at(source, "\"s\""),
             3,
-            "The argument type 'String' can't be assigned to the parameter type 'D?'. "
-                .to_string(),
+            "The argument type 'String' can't be assigned to the parameter type 'D?'. ".to_string(),
         )],
         "the non-generic `==` formal stands: {:?}",
         rows(&r)

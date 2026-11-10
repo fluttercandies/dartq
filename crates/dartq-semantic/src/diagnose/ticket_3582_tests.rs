@@ -4,7 +4,9 @@
 //! extra. Each pin below reproduces one clustered shape with the oracle's
 //! own answer written beside it (dart 3.13.7, `--format=machine`).
 
-use crate::diagnose::test_rig::{assert_silent, code_names, report_ops, report_ops_imports, rows, RigImport};
+use crate::diagnose::test_rig::{
+    RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows,
+};
 
 /// Probe A — foreign old-style function typedef used nullable: the co19
 /// `_CheckExceptionFn` family (70 extra rows). `typedef bool F(x)` is the
@@ -98,9 +100,7 @@ fn t3582_param_source_against_nullable_target_reads_bound() {
 fn t3582_bounded_param_still_rejects() {
     // dart analyze on `void s(String? a) {} void f<T extends num>(T t) {
     // s(t); }` reports argument_type_not_assignable `num => String?`.
-    let report = report_ops(
-        "void s(String? a) {} void f<T extends num>(T t) { s(t); }",
-    );
+    let report = report_ops("void s(String? a) {} void f<T extends num>(T t) { s(t); }");
     assert_eq!(
         code_names(&report),
         vec!["argument_type_not_assignable"],
@@ -117,9 +117,7 @@ fn t3582_bounded_param_still_rejects() {
 fn t3582_null_into_potentially_nullable_param_silent() {
     // dart analyze on `void f<T>(T t) { f(null); }` — `Null <: T` where
     // `T`'s bound is `Object?`: silent. Same for `T extends int?`.
-    let report = report_ops(
-        "void f<T>(T t) { f(null); } void g<S extends int?>(S s) { g(null); }",
-    );
+    let report = report_ops("void f<T>(T t) { f(null); } void g<S extends int?>(S s) { g(null); }");
     assert_silent(&report);
 }
 
@@ -130,9 +128,7 @@ fn t3582_null_into_potentially_nullable_param_silent() {
 /// pinned as the arg-check row the current face emits.
 #[test]
 fn t3582_null_into_nonnullable_param_reports() {
-    let report = report_ops(
-        "void g<S extends num>(S s) { g(null); }",
-    );
+    let report = report_ops("void g<S extends num>(S s) { g(null); }");
     assert_eq!(
         code_names(&report),
         vec!["argument_type_not_assignable"],

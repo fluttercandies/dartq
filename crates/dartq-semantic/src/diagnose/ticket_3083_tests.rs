@@ -170,7 +170,10 @@ fn primary_ctor_formal_hidden_from_member_bodies() {
     let report = report_ops(source);
     assert_eq!(
         offsets(&report, "undefined_identifier"),
-        vec![at(source, "print(foo)") + 6, at(source, "int get g => foo;") + 13],
+        vec![
+            at(source, "print(foo)") + 6,
+            at(source, "int get g => foo;") + 13
+        ],
         "{:?}",
         report.diagnostics
     );

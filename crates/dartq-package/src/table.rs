@@ -16,9 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 
-use dartq_pub::{
-    LanguageVersion, PackageConfig, ResolvedPackage, ResolvedPackageGraph, normalize,
-};
+use dartq_pub::{LanguageVersion, PackageConfig, ResolvedPackage, ResolvedPackageGraph, normalize};
 use dartq_source::normalize_path;
 use rustc_hash::FxHashMap;
 

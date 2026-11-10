@@ -92,8 +92,8 @@ fn pin_engine() -> (PathBuf, Engine) {
         )
         .expect("valid config"),
     );
-    let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
-        .expect("valid lock");
+    let lock =
+        LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n").expect("valid lock");
     let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
         .expect("valid pubspec");
     let graph = build_graph(
@@ -147,11 +147,7 @@ fn unknown_dart_library_reports_at_the_literal() {
     let (_root, diagnostics) = analyze_files(&[("test.dart", "import 'dart:foo';\n")]);
     assert_eq!(
         rows(&diagnostics, "uri_does_not_exist"),
-        vec![(
-            7,
-            10,
-            "Target of URI doesn't exist: 'dart:foo'.".to_owned()
-        )],
+        vec![(7, 10, "Target of URI doesn't exist: 'dart:foo'.".to_owned())],
         "the unknown dart: library: {diagnostics:?}"
     );
     let _ = std::fs::remove_dir_all(&_root);
@@ -195,7 +191,10 @@ fn unknown_scheme_reports_at_the_literal() {
 #[test]
 fn existing_targets_stay_silent() {
     let (_root, diagnostics) = analyze_files(&[
-        ("test.dart", "import 'a.dart';\nimport 'dart:core';\nint f() => 1;\n"),
+        (
+            "test.dart",
+            "import 'a.dart';\nimport 'dart:core';\nint f() => 1;\n",
+        ),
         ("a.dart", "library a;\n"),
     ]);
     assert!(

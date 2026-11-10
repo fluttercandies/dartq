@@ -60,8 +60,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::collector::{DUP_GETTER, DUP_OTHER, DUP_PAIR, DUP_SETTER};
 use crate::model::{
-    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, DuplicateDecl, FileElements, Formals,
-    FnShapeId, MemberEntry, MemberKind, MicroKind, NameMap, RecordShapeId, TopDecl, Ty,
+    ArgListId, AugKind, AugmentDecl, Container, ContainerKind, DuplicateDecl, FileElements,
+    FnShapeId, Formals, MemberEntry, MemberKind, MicroKind, NameMap, RecordShapeId, TopDecl, Ty,
 };
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
@@ -157,7 +157,10 @@ impl ElementIndex {
         let lib = graph.library_of_file(owner).unwrap_or(lib);
         let elements = self.library_fragments(graph, lib)?;
         let element = &elements[elements.binary_search_by_key(&name, |e| e.name).ok()?];
-        let at = element.faces.binary_search_by_key(&owner, |(file, _)| *file).ok()?;
+        let at = element
+            .faces
+            .binary_search_by_key(&owner, |(file, _)| *file)
+            .ok()?;
         Some(&element.faces[at].1)
     }
 
@@ -188,9 +191,12 @@ impl ElementIndex {
     /// Whether any indexed unit writes a container `augment` head.
     fn has_augmented_containers(&self) -> bool {
         *self.augmented.get_or_init(|| {
-            self.files
-                .values()
-                .any(|elements| elements.augmentations().iter().any(writes_container_fragment))
+            self.files.values().any(|elements| {
+                elements
+                    .augmentations()
+                    .iter()
+                    .any(writes_container_fragment)
+            })
         })
     }
 
@@ -209,11 +215,15 @@ impl ElementIndex {
             .get_or_init(|| {
                 let (fragments, enriched) = build_fragments(graph, self, lib)?;
                 // Populate the per-lib enriched cell for `get` (#3378).
-                let enriched_cells = self.enriched_by_file.get_or_init(|| {
-                    (0..graph.len()).map(|_| OnceLock::new()).collect()
-                });
+                let enriched_cells = self
+                    .enriched_by_file
+                    .get_or_init(|| (0..graph.len()).map(|_| OnceLock::new()).collect());
                 if let Some(cell) = enriched_cells.get(lib.index() as usize) {
-                    let _ = cell.set(if enriched.is_empty() { None } else { Some(enriched) });
+                    let _ = cell.set(if enriched.is_empty() {
+                        None
+                    } else {
+                        Some(enriched)
+                    });
                 }
                 Some(fragments)
             })
@@ -566,8 +576,7 @@ fn build_fragments(
         for (unit, dups) in appended {
             let elements = if let Some(existing) = enriched.get(&unit) {
                 let mut elements = (**existing).clone();
-                let mut all: Vec<DuplicateDecl> =
-                    elements.duplicates.iter().copied().collect();
+                let mut all: Vec<DuplicateDecl> = elements.duplicates.iter().copied().collect();
                 all.extend(dups);
                 all.sort_by_key(|d| d.range.offset);
                 elements.duplicates = all.into_boxed_slice();
@@ -577,8 +586,7 @@ fn build_fragments(
                     continue;
                 };
                 let mut elements = (**raw).clone();
-                let mut all: Vec<DuplicateDecl> =
-                    elements.duplicates.iter().copied().collect();
+                let mut all: Vec<DuplicateDecl> = elements.duplicates.iter().copied().collect();
                 all.extend(dups);
                 all.sort_by_key(|d| d.range.offset);
                 elements.duplicates = all.into_boxed_slice();
@@ -609,11 +617,7 @@ fn ty_is_pool_free(ty: Ty) -> bool {
 fn entry_is_portable(entry: &MemberEntry) -> bool {
     ty_is_pool_free(entry.var_ty)
         && ty_is_pool_free(entry.return_ty)
-        && entry
-            .type_param_bounds
-            .iter()
-            .copied()
-            .all(ty_is_pool_free)
+        && entry.type_param_bounds.iter().copied().all(ty_is_pool_free)
         && entry.formals.as_ref().is_none_or(|formals| {
             formals
                 .positional
@@ -646,7 +650,11 @@ fn sanitize_entry(entry: &MemberEntry) -> MemberEntry {
         }
     }
     if let Some(formals) = entry.formals.as_mut() {
-        for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+        for formal in formals
+            .positional
+            .iter_mut()
+            .chain(formals.named.iter_mut())
+        {
             if !ty_is_pool_free(formal.ty) {
                 formal.ty = Ty::Unknown;
             }
@@ -662,7 +670,11 @@ fn sanitize_entry(entry: &MemberEntry) -> MemberEntry {
 /// member gate takes.
 fn sanitize_formals(formals: &Formals) -> Box<Formals> {
     let mut formals = formals.clone();
-    for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+    for formal in formals
+        .positional
+        .iter_mut()
+        .chain(formals.named.iter_mut())
+    {
         if !ty_is_pool_free(formal.ty) {
             formal.ty = Ty::Unknown;
         }

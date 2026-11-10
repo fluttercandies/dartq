@@ -67,8 +67,8 @@
 //! longer masquerades as the introduction).
 
 use super::test_rig::{
-    code_names, report_ops_augment, report_ops_augment_experiments,
-    report_ops_experiments_with, rows,
+    code_names, report_ops_augment, report_ops_augment_experiments, report_ops_experiments_with,
+    rows,
 };
 
 /// ①a Cross-unit: the fragment's `augment int x` repeating the

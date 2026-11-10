@@ -15,7 +15,7 @@
 //! (the `if (.one is C)` family) and on a reduced `(C c) => c == .one`
 //! probe for the retained equality face.
 
-use super::test_rig::{report_ops, CORE_PRELUDE};
+use super::test_rig::{CORE_PRELUDE, report_ops};
 use crate::diagnose::FileReport;
 
 /// Fixture-local byte offset of the first `needle`, shifted by the prelude
@@ -69,9 +69,8 @@ fn is_operand_shorthand_reports_missing_context() {
 /// `.one as C` — the cast operand arms no context either.
 #[test]
 fn as_operand_shorthand_reports_missing_context() {
-    let fixture = format!(
-        "{SHORTHAND_CLASS}\nvoid main() {{\n  if ((.one as C) == .two) {{}}\n}}\n"
-    );
+    let fixture =
+        format!("{SHORTHAND_CLASS}\nvoid main() {{\n  if ((.one as C) == .two) {{}}\n}}\n");
     let report = report_ops(&fixture);
     assert_eq!(
         rows_of(&report, "dot_shorthand_missing_context"),

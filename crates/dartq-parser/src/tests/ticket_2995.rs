@@ -129,14 +129,20 @@ fn report_error_if_super_faces_match_oracle() {
         "oracle: await face (24,5)"
     );
     assert!(
-        sorted_rows("void f() { c ? super : 1; }\n")
-            .contains(&code("missing_assignable_selector", 15, 20)),
+        sorted_rows("void f() { c ? super : 1; }\n").contains(&code(
+            "missing_assignable_selector",
+            15,
+            20
+        )),
         "oracle: then-arm face (16,5); a pre-existing extra \
          `missing_identifier` on the kept `super` predates #2995"
     );
     assert!(
-        sorted_rows("void f() { c ? 1 : super; }\n")
-            .contains(&code("missing_assignable_selector", 19, 24)),
+        sorted_rows("void f() { c ? 1 : super; }\n").contains(&code(
+            "missing_assignable_selector",
+            19,
+            24
+        )),
         "oracle: else-arm face (20,5)"
     );
     assert_eq!(
@@ -177,10 +183,12 @@ fn builtin_type_variable_heads_take_the_keep_face() {
     // #2995 (present on the pre-edit tree) and ride the class-header
     // cascade owner.
     assert!(
-        sorted_rows("class A<get extends int> {}\n")
-            .contains(&code("missing_identifier", 8, 11))
-            && !sorted_rows("class A<get extends int> {}\n")
-                .contains(&code("built_in_identifier_in_declaration", 8, 11)),
+        sorted_rows("class A<get extends int> {}\n").contains(&code("missing_identifier", 8, 11))
+            && !sorted_rows("class A<get extends int> {}\n").contains(&code(
+                "built_in_identifier_in_declaration",
+                8,
+                11
+            )),
         "oracle: keep face, the bound parses, the `>` closes"
     );
 }

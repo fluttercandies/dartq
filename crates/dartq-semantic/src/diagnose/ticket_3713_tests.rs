@@ -21,7 +21,12 @@ fn unchecked(source: &str) -> Vec<String> {
 #[test]
 fn repro_local_promoted_member() {
     let src = "void f() {\n  int? x = 5;\n  if (x != null) {\n    x.abs();\n  }\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }
 
 /// `({int i, String s})? r1; if (r1 != null) r1.i;` — promoted record
@@ -29,7 +34,12 @@ fn repro_local_promoted_member() {
 #[test]
 fn repro_record_field_promoted() {
     let src = "void f() {\n  ({int i, String s})? r1;\n  r1 = (i: 42, s: 'x');\n  if (r1 != null) {\n    r1.i;\n  }\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }
 
 /// Private final field `int? _x` promoted by `_x != null` inside the
@@ -37,7 +47,12 @@ fn repro_record_field_promoted() {
 #[test]
 fn repro_private_field_promoted() {
     let src = "class A {\n  final int? _x;\n  A(this._x);\n  void test() {\n    if (_x != null) {\n      _x.isOdd;\n    }\n  }\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }
 
 /// `a._x is int` then `a._x.isEven` — property promotion on a foreign
@@ -45,7 +60,12 @@ fn repro_private_field_promoted() {
 #[test]
 fn repro_foreign_field_promoted() {
     let src = "class A {\n  final int? _x;\n  A(this._x);\n}\nvoid f() {\n  A a = A(42);\n  if (a._x is int) {\n    a._x.isEven;\n  }\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }
 
 /// `T extends C?` calling `t.foo()` where `foo` is an `extension on C?`
@@ -53,7 +73,12 @@ fn repro_foreign_field_promoted() {
 #[test]
 fn repro_extension_on_nullable() {
     let src = "class C {}\nextension on C? {\n  int foo() => 1;\n}\nclass A<T extends C?> {\n  T t;\n  A(this.t);\n  void test() {\n    t.foo();\n  }\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }
 
 /// `-x` on `Object?` — the `unary-` operator spelling resolves through the
@@ -61,8 +86,14 @@ fn repro_extension_on_nullable() {
 /// `-`, not `unary-`). Oracle: silent.
 #[test]
 fn repro_unary_minus_extension() {
-    let src = "class C {\n  Object? operator -() => this;\n}\nvoid f() {\n  Object? x = C();\n  -x;\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    let src =
+        "class C {\n  Object? operator -() => this;\n}\nvoid f() {\n  Object? x = C();\n  -x;\n}\n";
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }
 
 /// `x++` on `Object?` — `++` resolves through the extension's `+` operator
@@ -70,5 +101,10 @@ fn repro_unary_minus_extension() {
 #[test]
 fn repro_prefix_increment_extension() {
     let src = "class C {\n  Object? operator +(Object? other) => this;\n}\nvoid f() {\n  Object? x = C();\n  ++x;\n}\n";
-    assert_eq!(unchecked(src), Vec::<String>::new(), "{:#?}", rows(&report_ops(src)));
+    assert_eq!(
+        unchecked(src),
+        Vec::<String>::new(),
+        "{:#?}",
+        rows(&report_ops(src))
+    );
 }

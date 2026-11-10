@@ -183,7 +183,12 @@ fn t3588_member_callee_faces_unwrap_once() {
         .filter(|d| d.code.name == "invalid_assignment")
         .map(|d| d.message.as_str())
         .collect();
-    assert_eq!(misses.len(), 3, "expected three rows, got {:?}", rows(&report));
+    assert_eq!(
+        misses.len(),
+        3,
+        "expected three rows, got {:?}",
+        rows(&report)
+    );
     assert!(
         misses[0].contains("'int Function(int)'") && !misses[0].contains("Function(int) Function"),
         "the field callee's miss must name the signature return, got {:?}",

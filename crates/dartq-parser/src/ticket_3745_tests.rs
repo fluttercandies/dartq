@@ -124,7 +124,9 @@ fn base_extension_reparses_as_extension() {
         "expected missing_identifier at (5,14), got {rows:?}"
     );
     assert!(
-        !rows.iter().any(|(c, _, _)| c == "missing_const_final_var_or_type"),
+        !rows
+            .iter()
+            .any(|(c, _, _)| c == "missing_const_final_var_or_type"),
         "unexpected missing_const_final_var_or_type row: {rows:?}"
     );
 }
@@ -136,7 +138,10 @@ fn interface_extension_reports_field_rows() {
     // `missing_const_final_var_or_type` at `interface` (0,9) +
     // `expected_token ';'` at `interface` (0,9); `extension E4 ...` is
     // reparsed as an extension declaration.
-    let rows = rows_at("interface extension E4 on C {}\nclass C {}\n", augment_set());
+    let rows = rows_at(
+        "interface extension E4 on C {}\nclass C {}\n",
+        augment_set(),
+    );
     assert!(
         rows.contains(&("missing_const_final_var_or_type".to_owned(), 0, 9)),
         "expected missing_const_final_var_or_type at (0,9), got {rows:?}"

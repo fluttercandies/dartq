@@ -45,7 +45,12 @@ fn cast_pattern_over_an_or_pattern_covers_the_whole_context() {
                     (A() || B()) as M => 0,\n\
                   };\n";
     let report = report_ops(source);
-    assert_eq!(code_names(&report), Vec::<&str>::new(), "{:#?}", rows(&report));
+    assert_eq!(
+        code_names(&report),
+        Vec::<&str>::new(),
+        "{:#?}",
+        rows(&report)
+    );
 }
 
 /// A written `Null` type test and the `null` constant cover one space: the
@@ -84,7 +89,9 @@ fn null_constant_subsumes_the_null_type_test() {
     let arrow = subsumed + full[subsumed as usize..].find("=>").unwrap() as u32;
     assert_eq!(unreachable, [arrow], "{:#?}", rows(&report));
     assert!(
-        !names.iter().any(|name| *name == "non_exhaustive_switch_expression"),
+        !names
+            .iter()
+            .any(|name| *name == "non_exhaustive_switch_expression"),
         "{:#?}",
         rows(&report)
     );

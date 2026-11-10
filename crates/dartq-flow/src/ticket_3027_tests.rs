@@ -107,7 +107,10 @@ fn join_potentially_unassigned_non_final() {
     // path only, so neither definitely-unassigned nor assigned (oracle:
     // not_assigned_potentially_non_nullable_local_variable at the read).
     let src = "void f(bool b) {\n  int x;\n  if (b) {\n    x = 1;\n  }\n  print(x);\n}";
-    assert_eq!(unassigned_rows(src), vec![row("x", false, false, false, true)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("x", false, false, false, true)]
+    );
 }
 
 #[test]
@@ -116,14 +119,20 @@ fn final_potentially_unassigned_join() {
     // is_final routes the consumer to read_potentially_unassigned_final
     // (no nullability gate needed).
     let src = "void f(bool b) {\n  final int y;\n  if (b) {\n    y = 1;\n  }\n  print(y);\n}";
-    assert_eq!(unassigned_rows(src), vec![row("y", false, true, false, true)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("y", false, true, false, true)]
+    );
 }
 
 #[test]
 fn final_definitely_unassigned() {
     // `final int y; print(y)` — never written: both bits stand.
     let src = "void f() {\n  final int y;\n  print(y);\n}";
-    assert_eq!(unassigned_rows(src), vec![row("y", false, true, true, true)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("y", false, true, true, true)]
+    );
 }
 
 #[test]
@@ -141,7 +150,10 @@ fn late_definitely_unassigned() {
     // `late int w; print(w)` — the late gate's own bit: the consumer
     // reports definitely_unassigned_late_local_variable.
     let src = "void f() {\n  late int w;\n  print(w);\n}";
-    assert_eq!(unassigned_rows(src), vec![row("w", true, false, true, true)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("w", true, false, true, true)]
+    );
 }
 
 #[test]
@@ -158,7 +170,10 @@ fn late_potentially_assigned_carries_false_bit() {
     // late consumer stays SILENT (its gate reads the unassigned bit
     // only), so the row must carry definitely_unassigned = false.
     let src = "void f(bool b) {\n  late int w;\n  if (b) {\n    w = 1;\n  }\n  print(w);\n}";
-    assert_eq!(unassigned_rows(src), vec![row("w", true, false, false, true)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("w", true, false, false, true)]
+    );
 }
 
 // —— the shared-body plain local ——————————————————————————————————————
@@ -169,7 +184,10 @@ fn shared_case_plain_local_definitely_unassigned() {
     // the shared body starts unassigned on the merged body state (oracle:
     // not_assigned_potentially_non_nullable_local_variable).
     let src = "void f(int v) {\n  switch (v) {\n    case 1:\n    case 2:\n      int z;\n      print(z);\n  }\n}";
-    assert_eq!(unassigned_rows(src), vec![row("z", false, false, true, true)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("z", false, false, true, true)]
+    );
 }
 
 // —— the stacked-head binder alias (copyPromotionData) ————————————————
@@ -220,7 +238,10 @@ fn labeled_shared_case_var_binder_is_not_final() {
     // (`invalid_pattern_variable_in_shared_case_scope`, label face); the
     // flow model beneath the mask is what this row pins.
     let src = "void f(Object v) {\n  switch (v) {\n    case var a:\n    L: case var b:\n      print(a);\n  }\n}";
-    assert_eq!(unassigned_rows(src), vec![row("a", false, false, true, false)]);
+    assert_eq!(
+        unassigned_rows(src),
+        vec![row("a", false, false, true, false)]
+    );
 }
 
 #[test]

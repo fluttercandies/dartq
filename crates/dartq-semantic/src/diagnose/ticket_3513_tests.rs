@@ -208,12 +208,7 @@ fn dmu_path_dependency_variable_read_in_condition() {
                 \x20   print('legacy');\n\
                 \x20 }\n\
                 }\n";
-    let report = dep_member_use_report(
-        main,
-        "package:pkg_b/b.dart",
-        dep,
-        "package:pkg_a/a.dart",
-    );
+    let report = dep_member_use_report(main, "package:pkg_b/b.dart", dep, "package:pkg_a/a.dart");
     let rows = code_rows(&report, "deprecated_member_use");
     assert_eq!(rows.len(), 1, "{report:?}");
     assert_eq!(
@@ -237,12 +232,7 @@ fn dmu_same_package_use_stays_silent() {
                 void probe() {\n\
                 \x20 if (hasUnsoundNullSafety) {}\n\
                 }\n";
-    let report = dep_member_use_report(
-        main,
-        "package:pkg_a/b.dart",
-        dep,
-        "package:pkg_a/a.dart",
-    );
+    let report = dep_member_use_report(main, "package:pkg_a/b.dart", dep, "package:pkg_a/a.dart");
     assert!(
         code_rows(&report, "deprecated_member_use").is_empty(),
         "{report:?}"
@@ -260,12 +250,7 @@ fn dmu_plain_tag_getter_reports_the_plain_shape() {
                 void probe() {\n\
                 \x20 while (oldFlag) {}\n\
                 }\n";
-    let report = dep_member_use_report(
-        main,
-        "package:app/main.dart",
-        dep,
-        "package:s/kit.dart",
-    );
+    let report = dep_member_use_report(main, "package:app/main.dart", dep, "package:s/kit.dart");
     let rows = code_rows(&report, "deprecated_member_use");
     assert_eq!(rows.len(), 1, "{report:?}");
     assert_eq!(
@@ -286,12 +271,7 @@ fn dmu_directive_and_member_faces_report_independently() {
                 void probe() {\n\
                 \x20 if (oldFlag) {}\n\
                 }\n";
-    let report = dep_member_use_report(
-        main,
-        "package:app/main.dart",
-        dep,
-        "package:s/kit.dart",
-    );
+    let report = dep_member_use_report(main, "package:app/main.dart", dep, "package:s/kit.dart");
     let rows = code_rows(&report, "deprecated_member_use");
     assert_eq!(rows.len(), 2, "{report:?}");
     let directive = rows

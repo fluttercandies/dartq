@@ -173,7 +173,12 @@ void main() {{
         "genuine receiver row lost: {:#?}",
         rows(&report)
     );
-    assert_eq!(names.len(), 1, "unexpected extra rows: {:#?}", rows(&report));
+    assert_eq!(
+        names.len(),
+        1,
+        "unexpected extra rows: {:#?}",
+        rows(&report)
+    );
 }
 
 /// The super-bounded acceptance family (`super_bounded_types_test` /
@@ -209,10 +214,7 @@ void testCovariantSuperbound<N extends Never>() {
         .into_iter()
         .filter(|row| row.contains("type_argument_not_matching_bounds"))
         .collect();
-    assert!(
-        bounds_rows.is_empty(),
-        "fabricated rows: {bounds_rows:#?}"
-    );
+    assert!(bounds_rows.is_empty(), "fabricated rows: {bounds_rows:#?}");
 }
 
 /// The composite-receiver family (`number_operator_typing_test`, 55

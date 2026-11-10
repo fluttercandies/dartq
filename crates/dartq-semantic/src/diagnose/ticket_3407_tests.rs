@@ -466,9 +466,7 @@ fn prefixed_import_registers_the_prefix_and_filters_its_table() {
     let a_file = fixture.dep_file("a.dart");
     let b_file = fixture.dep_file("b.dart");
     let scopes = LibraryScopes::build(&fixture.graph, &fixture.index, &[fixture.main_lib]);
-    let face = scopes
-        .face(fixture.main_lib)
-        .expect("the face is built");
+    let face = scopes.face(fixture.main_lib).expect("the face is built");
     let kind = |text: &str| face.kind(fixture.id(text));
     assert_eq!(kind("p"), Some(ScopeKind::Kind(MicroKind::Prefix)));
     assert_eq!(kind("q"), Some(ScopeKind::Kind(MicroKind::Prefix)));

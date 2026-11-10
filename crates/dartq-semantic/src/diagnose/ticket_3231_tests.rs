@@ -34,7 +34,11 @@ fn ticket_3231_conditional_receiver_absent_getter_reports() {
     let fixture = format!("{C_FIXTURE}void g(bool c, C a, C b) {{\n  (c ? a : b).gone;\n}}");
     let report = report_ops(&fixture);
     let shown = rows(&report);
-    assert_eq!(code_names(&report), ["undefined_getter"], "rows: {shown:#?}");
+    assert_eq!(
+        code_names(&report),
+        ["undefined_getter"],
+        "rows: {shown:#?}"
+    );
     assert_eq!(
         report
             .diagnostics
@@ -52,7 +56,11 @@ fn ticket_3231_if_null_receiver_absent_getter_reports() {
     let fixture = format!("{C_FIXTURE}void g(C? a, C b) {{\n  (a ?? b).gone;\n}}");
     let report = report_ops(&fixture);
     let shown = rows(&report);
-    assert_eq!(code_names(&report), ["undefined_getter"], "rows: {shown:#?}");
+    assert_eq!(
+        code_names(&report),
+        ["undefined_getter"],
+        "rows: {shown:#?}"
+    );
     assert_eq!(
         report
             .diagnostics

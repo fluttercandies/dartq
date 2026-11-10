@@ -178,4 +178,3 @@ f() {
 ";
     assert_eq!(dead_of(source), Vec::<String>::new());
 }
-

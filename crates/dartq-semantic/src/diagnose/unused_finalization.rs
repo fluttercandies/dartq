@@ -84,9 +84,7 @@ impl<'a> Engine<'a> {
             let (resolved, element) = match resolved {
                 Some(face) => (Some(face), head),
                 None => match self.mixin_use_alias_fold(head) {
-                    Some((container, owner, folded)) => {
-                        (Some((container, owner)), folded)
-                    }
+                    Some((container, owner, folded)) => (Some((container, owner)), folded),
                     None => (None, head),
                 },
             };
@@ -1407,11 +1405,23 @@ impl<'a> Engine<'a> {
                         } else {
                             self.intern("[]")
                         };
-                        self.credit_face_member(&faces, &declarers, member, head, &mut index_read_used);
+                        self.credit_face_member(
+                            &faces,
+                            &declarers,
+                            member,
+                            head,
+                            &mut index_read_used,
+                        );
                     }
                     // An implicit-`call` invocation (`0()`).
                     Some(b'(') => {
-                        self.credit_face_member(&faces, &declarers, call_spelling, head, &mut index_read_used);
+                        self.credit_face_member(
+                            &faces,
+                            &declarers,
+                            call_spelling,
+                            head,
+                            &mut index_read_used,
+                        );
                     }
                     _ => {}
                 }
@@ -1507,7 +1517,13 @@ impl<'a> Engine<'a> {
                     end += 1;
                 }
                 if let Some(op) = self.binary_operator_after(end.saturating_add(1)) {
-                    self.credit_face_member(&faces, &declarers, op, string_head, &mut index_read_used);
+                    self.credit_face_member(
+                        &faces,
+                        &declarers,
+                        op,
+                        string_head,
+                        &mut index_read_used,
+                    );
                 }
                 scan = end.saturating_add(1);
                 continue;
@@ -1540,7 +1556,13 @@ impl<'a> Engine<'a> {
                             None
                         };
                         if let Some(head) = head {
-                            self.credit_face_member(&faces, &declarers, op, head, &mut index_read_used);
+                            self.credit_face_member(
+                                &faces,
+                                &declarers,
+                                op,
+                                head,
+                                &mut index_read_used,
+                            );
                         }
                     }
                 }
@@ -1576,7 +1598,13 @@ impl<'a> Engine<'a> {
                         && self.source_member_access(self.strings.resolve(head), &member_text)
                 });
                 if applied {
-                    self.credit_face_member(&faces, &declarers, *member, self.intern("Function"), &mut index_read_used);
+                    self.credit_face_member(
+                        &faces,
+                        &declarers,
+                        *member,
+                        self.intern("Function"),
+                        &mut index_read_used,
+                    );
                 }
             }
         }
@@ -1637,9 +1665,21 @@ impl<'a> Engine<'a> {
             if let Some(member) = self.adjacent_write_member_at(read.offset, name_units)
                 && let Some(receiver) = receiver
             {
-                self.credit_face_member_ty(&faces, &declarers, member, receiver, &mut index_read_used);
+                self.credit_face_member_ty(
+                    &faces,
+                    &declarers,
+                    member,
+                    receiver,
+                    &mut index_read_used,
+                );
                 let setter = self.setter_spelling(member);
-                self.credit_face_member_ty(&faces, &declarers, setter, receiver, &mut index_read_used);
+                self.credit_face_member_ty(
+                    &faces,
+                    &declarers,
+                    setter,
+                    receiver,
+                    &mut index_read_used,
+                );
             }
             // The operator half (`x.f += 1`/`x.f++`): the application
             // resolves `operator<op>` on the member's DECLARED value type,
@@ -1691,21 +1731,27 @@ impl<'a> Engine<'a> {
                     _ => None,
                 };
                 if let Some(receiver) = owner_ty {
-                    self.credit_face_member_ty(&faces, &declarers, member, receiver, &mut index_read_used);
+                    self.credit_face_member_ty(
+                        &faces,
+                        &declarers,
+                        member,
+                        receiver,
+                        &mut index_read_used,
+                    );
                     let setter = self.setter_spelling(member);
-                    self.credit_face_member_ty(&faces, &declarers, setter, receiver, &mut index_read_used);
+                    self.credit_face_member_ty(
+                        &faces,
+                        &declarers,
+                        setter,
+                        receiver,
+                        &mut index_read_used,
+                    );
                 }
             }
             if let Some(op) = self.adjacent_operator_at(unit_ref.range.offset, name_units)
                 && let Some(operand) = self.operand_ty_of_ref(&unit_ref)
             {
-                self.credit_face_member_ty(
-                    &faces,
-                    &declarers,
-                    op,
-                    operand,
-                    &mut index_read_used,
-                );
+                self.credit_face_member_ty(&faces, &declarers, op, operand, &mut index_read_used);
             }
             // The implicit-`call` arm (`visitFunctionExpressionInvocation`,
             // unused_local_elements_verifier.dart:175-180): a bare callee
@@ -2708,12 +2754,16 @@ impl<'a> Engine<'a> {
             .iter()
             .rev()
             .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
-            .map_or(SourceRange { offset: 0, length: 0 }, |site| {
+            .map_or(
                 SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+                |site| SourceRange {
                     offset: site.range.offset,
                     length: 0,
-                }
-            })
+                },
+            )
     }
 
     /// Whether a `member_reads` entry's read sat in a discarded statement
@@ -3271,11 +3321,13 @@ impl<'a> Engine<'a> {
             .refs
             .iter()
             .filter(|r| {
-                executable_spans.iter().any(|&(spelling, bare, start, end)| {
-                    (r.name == spelling || r.name == bare)
-                        && r.range.offset > start
-                        && r.range.offset < end
-                })
+                executable_spans
+                    .iter()
+                    .any(|&(spelling, bare, start, end)| {
+                        (r.name == spelling || r.name == bare)
+                            && r.range.offset > start
+                            && r.range.offset < end
+                    })
             })
             .map(|r| r.range.offset)
             .collect();
@@ -3672,8 +3724,7 @@ impl<'a> Engine<'a> {
             .filter(|site| matches!(site.kind, DeclKind::TypeAlias))
             .filter_map(|site| self.typedef_rhs_head(site).map(|rhs| (site.name, rhs)))
             .collect();
-        let mut alias_used_ctors: FxHashSet<(FileId, StringId, StringId)> =
-            FxHashSet::default();
+        let mut alias_used_ctors: FxHashSet<(FileId, StringId, StringId)> = FxHashSet::default();
         for site in &self.decl_sites {
             if !matches!(site.kind, DeclKind::TypeAlias) || self.is_private_name(site.name) {
                 continue;
@@ -3696,14 +3747,9 @@ impl<'a> Engine<'a> {
             }
             let (leaf, prefix) = rhs;
             let target = match prefix {
-                Some(p) => prefixed_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    p,
-                    leaf,
-                ),
+                Some(p) => {
+                    prefixed_container(self.graph, self.namespaces, self.index, self.lib, p, leaf)
+                }
                 None => resolve_container(
                     self.graph,
                     self.namespaces,
@@ -3752,9 +3798,7 @@ impl<'a> Engine<'a> {
             // tail — an augment fragment's own formals never carry the row
             // (the introductory parameter's element owns the verdict and
             // reports at its own site through its own site entry).
-            if site.is_augment
-                || augment_ranges.contains(&(site.range.offset, site.range.length))
-            {
+            if site.is_augment || augment_ranges.contains(&(site.range.offset, site.range.length)) {
                 continue;
             }
             let bare = self.bare_name(site.name);
@@ -4186,8 +4230,7 @@ impl<'a> Engine<'a> {
                                 member_used_elements.contains(&(file, decl_container, name))
                                     || (file == self.file
                                         && (self.member_was_read(decl_container, &name)
-                                            || ref_member_reads
-                                                .contains(&(decl_container, name))))
+                                            || ref_member_reads.contains(&(decl_container, name))))
                                     || (!self.is_wildcard(name)
                                         && member_element_used.contains(&name))
                             },
@@ -5091,8 +5134,7 @@ impl<'a> Engine<'a> {
         // prefix table — return both sides so the caller walks
         // `prefixed_container` instead of the bare scope.
         if tokens.get(index + 2).map(|t| t.kind) == Some(dartq_scanner::TokenKind::Period)
-            && tokens.get(index + 3).map(|t| t.kind)
-                == Some(dartq_scanner::TokenKind::Identifier)
+            && tokens.get(index + 3).map(|t| t.kind) == Some(dartq_scanner::TokenKind::Identifier)
         {
             let leaf = tokens.get(index + 3)?;
             let byte = leaf.byte_offset as usize;
@@ -6889,9 +6931,9 @@ impl<'a> Engine<'a> {
             // scope the push-time `type_resolution` walked (a part's own
             // imports are invisible to the defining unit's scope, and the
             // oracle walks `fileAnalysis.unit`'s per-file scope chain).
-            if let Lookup::Found(NamespaceEntry::Decl(file)) = self
-                .namespaces
-                .lookup_in_file(self.graph, self.lib, Some(self.file), name)
+            if let Lookup::Found(NamespaceEntry::Decl(file)) =
+                self.namespaces
+                    .lookup_in_file(self.graph, self.lib, Some(self.file), name)
             {
                 bare_decls.entry(name).or_default().insert(file);
             }
@@ -6904,9 +6946,9 @@ impl<'a> Engine<'a> {
         // The same per-file scope answers the declaring file exactly as it
         // does for the type-use loop.
         for &name in &self.annotation_uses {
-            if let Lookup::Found(NamespaceEntry::Decl(file)) = self
-                .namespaces
-                .lookup_in_file(self.graph, self.lib, Some(self.file), name)
+            if let Lookup::Found(NamespaceEntry::Decl(file)) =
+                self.namespaces
+                    .lookup_in_file(self.graph, self.lib, Some(self.file), name)
             {
                 bare_decls.entry(name).or_default().insert(file);
             }
@@ -7271,7 +7313,9 @@ impl<'a> Engine<'a> {
             dartq_scanner::TokenKind::LtLt | dartq_scanner::TokenKind::LtLtEq => Some("<<"),
             dartq_scanner::TokenKind::GtGt | dartq_scanner::TokenKind::GtGtEq => Some(">>"),
             dartq_scanner::TokenKind::GtGtGt | dartq_scanner::TokenKind::GtGtGtEq => Some(">>>"),
-            dartq_scanner::TokenKind::Ampersand | dartq_scanner::TokenKind::AmpersandEq => Some("&"),
+            dartq_scanner::TokenKind::Ampersand | dartq_scanner::TokenKind::AmpersandEq => {
+                Some("&")
+            }
             dartq_scanner::TokenKind::Bar | dartq_scanner::TokenKind::BarEq => Some("|"),
             dartq_scanner::TokenKind::Caret | dartq_scanner::TokenKind::CaretEq => Some("^"),
             _ => None,
@@ -7872,10 +7916,13 @@ impl<'a> Engine<'a> {
         // frame is innermost — the depth keeps a nested executable's
         // header events out (fields never need the face: their arms keep
         // the name anchor).
-        if matches!(kind, DeclKind::Member {
-            kind: MemberKind::Method,
-            ..
-        }) {
+        if matches!(
+            kind,
+            DeclKind::Member {
+                kind: MemberKind::Method,
+                ..
+            }
+        ) {
             self.open_member_face = Some(MemberFaceSpans {
                 site,
                 depth: self.frames.len().saturating_sub(1),

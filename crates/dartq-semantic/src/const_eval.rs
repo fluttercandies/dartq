@@ -836,16 +836,12 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                     Verdict::Constant
                 }
                 (
-                    other @ (Verdict::Fault(..)
-                    | Verdict::NotConstant(_)
-                    | Verdict::Unresolved(_)),
+                    other @ (Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_)),
                     _,
                 )
                 | (
                     _,
-                    other @ (Verdict::Fault(..)
-                    | Verdict::NotConstant(_)
-                    | Verdict::Unresolved(_)),
+                    other @ (Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_)),
                 ) => other,
                 _ => Verdict::Constant,
             }
@@ -1054,13 +1050,12 @@ fn eval_map_parts(parts: &[Node], lookup: &dyn ConstLookup, depth: u32) -> Verdi
             Expr::Entry(..) | Expr::IfElement { .. } => fold(node, lookup, depth),
             Expr::Faulted(_) => fold(node, lookup, depth),
             Expr::Spread {
-                operand, null_aware,
+                operand,
+                null_aware,
             } => match fold(operand, lookup, depth) {
                 Verdict::Value(ConstantValue::Null) if *null_aware => Verdict::Constant,
                 Verdict::Value(ConstantValue::Map(_)) | Verdict::Constant => Verdict::Constant,
-                Verdict::Value(_) => {
-                    Verdict::Fault(ConstFault::SpreadExpectedMap, operand.span)
-                }
+                Verdict::Value(_) => Verdict::Fault(ConstFault::SpreadExpectedMap, operand.span),
                 other => other,
             },
             // A bare expression in a map literal (`{x}` where the context
@@ -2462,7 +2457,9 @@ impl ConstCapture {
         }
         self.apply_unaries();
         let base = self.base();
-        self.stack.get(base.max(self.stack.len().saturating_sub(1))).cloned()
+        self.stack
+            .get(base.max(self.stack.len().saturating_sub(1)))
+            .cloned()
     }
 
     /// Widens the in-flight constant-pattern root's span when its expression
@@ -2754,8 +2751,7 @@ impl ConstCapture {
         // literal (a recovery skipped its end event) drops here too — a
         // stale mark would fold a later literal's operands into a node it
         // does not own.
-        self.ctl_marks
-            .retain(|(_, _, head)| head.offset <= left);
+        self.ctl_marks.retain(|(_, _, head)| head.offset <= left);
         taken.sort_by_key(|span| span.offset);
         taken
     }
@@ -4855,7 +4851,10 @@ mod tests {
         use BinOp::*;
         let world = w();
         // `World::bin` builds every binary node at offset 7 with length 1.
-        let at = SourceRange { offset: 7, length: 1 };
+        let at = SourceRange {
+            offset: 7,
+            length: 1,
+        };
         assert_eq!(
             world.bin(Mul, ConstantValue::Str("ab".into()), ConstantValue::Int(3)),
             Verdict::Fault(ConstFault::TypeNum, at)
@@ -5138,7 +5137,9 @@ mod tests {
         capture.identifier(world.id("nc"), span(2));
         capture.literal_map_entry(span(2));
         assert!(
-            capture.literal_set_or_map(1, span(3), false, true).is_none(),
+            capture
+                .literal_set_or_map(1, span(3), false, true)
+                .is_none(),
             "a non-const creation's map argument is no element-checked face"
         );
         capture.positional_argument();
@@ -5170,7 +5171,9 @@ mod tests {
         capture.literal(span(1), ConstantValue::Int(1));
         capture.literal(span(2), ConstantValue::Int(2));
         assert!(
-            capture.literal_set_or_map(2, span(3), true, false).is_none(),
+            capture
+                .literal_set_or_map(2, span(3), true, false)
+                .is_none(),
             "a non-const creation's set argument is no element-checked face"
         );
         capture.positional_argument();

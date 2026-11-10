@@ -741,9 +741,7 @@ fn estimate(dir: &Path, face: Face, source_bytes: Option<u64>) -> Option<u64> {
     let bound = face_peak_entries(dir, face)
         .filter_map(|(peak, src)| src.map(|src| (peak, src)))
         .filter(|(_, src)| {
-            *src > 0
-                && *src >= my_source.div_ceil(4)
-                && *src <= my_source.saturating_mul(4)
+            *src > 0 && *src >= my_source.div_ceil(4) && *src <= my_source.saturating_mul(4)
         })
         .map(|(peak, src)| {
             let scale = (my_source as u128).div_ceil(src as u128);
@@ -751,12 +749,14 @@ fn estimate(dir: &Path, face: Face, source_bytes: Option<u64>) -> Option<u64> {
         })
         .max()?;
     let estimate = u64::try_from(bound).unwrap_or(u64::MAX);
-    let cap = total_memory().saturating_sub(Figures {
-        total: total_memory(),
-        available: None,
-        max_percent: DEFAULT_MAX_PERCENT,
-    }
-    .reserve());
+    let cap = total_memory().saturating_sub(
+        Figures {
+            total: total_memory(),
+            available: None,
+            max_percent: DEFAULT_MAX_PERCENT,
+        }
+        .reserve(),
+    );
     (estimate <= cap).then_some(estimate)
 }
 
@@ -2549,7 +2549,7 @@ mod tests {
             dir.path(),
             "repo:small",
             Face::AnalysisServer,
-            1_200_000_000,   // 1.2 GB peak
+            1_200_000_000,     // 1.2 GB peak
             Some(250_000_000), // on 250 MB of Dart source
         );
         // A 500 MB Dart source job: 250 MB is inside [125 MB, 2 GB], the
@@ -2587,7 +2587,13 @@ mod tests {
         );
         // Without source bytes the estimate is the raw peak.
         assert_eq!(
-            sized_in(dir.path(), Some("repo:big"), Face::AnalysisServer, &[], None),
+            sized_in(
+                dir.path(),
+                Some("repo:big"),
+                Face::AnalysisServer,
+                &[],
+                None
+            ),
             Some(3_000_000_000),
             "the recorded peak itself"
         );
@@ -2669,7 +2675,13 @@ mod tests {
         );
         // Unknown source → the recorded peak stands in as before.
         assert_eq!(
-            sized_in(dir.path(), Some("repo:new"), Face::AnalysisServer, &[], None),
+            sized_in(
+                dir.path(),
+                Some("repo:new"),
+                Face::AnalysisServer,
+                &[],
+                None
+            ),
             Some(2 * GIB),
             "the largest recorded peak"
         );
@@ -2719,7 +2731,13 @@ mod tests {
         record_peak_floor_at(dir.path(), key, Face::AnalysisServer, 2_200_000_000, GIB);
         assert_eq!(peak_in(dir.path(), key), Some(3 * GIB));
         // A later normal completion at 1.5 GB still books less.
-        record_peak_in(dir.path(), key, Face::AnalysisServer, 3 * GIB / 2, Some(GIB));
+        record_peak_in(
+            dir.path(),
+            key,
+            Face::AnalysisServer,
+            3 * GIB / 2,
+            Some(GIB),
+        );
         assert_eq!(peak_in(dir.path(), key), Some(3 * GIB / 2));
         // A yield above the record books the higher bound.
         record_peak_floor_at(dir.path(), key, Face::AnalysisServer, 2 * GIB, GIB);
@@ -2779,10 +2797,7 @@ mod tests {
             label: name.into(),
             bytes: 1 << 20,
             pid: None,
-            release: Some(Releasable {
-                pid: owner,
-                busy,
-            }),
+            release: Some(Releasable { pid: owner, busy }),
             slot: true,
             cap: 0,
             sized: true,
@@ -2829,13 +2844,11 @@ mod tests {
             .max_by_key(|holder| holder.since)
             .expect("an active holder");
         assert_eq!(youngest.label, "younger", "the youngest active holder");
-        let mut labels: Vec<&str> = active
-            .iter()
-            .map(|holder| holder.label.as_str())
-            .collect();
+        let mut labels: Vec<&str> = active.iter().map(|holder| holder.label.as_str()).collect();
         labels.sort_unstable();
         assert_eq!(
-            labels, ["older", "younger"],
+            labels,
+            ["older", "younger"],
             "an idle releasable is never an active holder"
         );
     }

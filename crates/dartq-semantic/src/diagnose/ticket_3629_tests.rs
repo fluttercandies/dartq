@@ -90,8 +90,10 @@ void f(x) {
     );
     assert_eq!(
         messages(&report, "missing_named_pattern_field_name"),
-        vec!["The getter name is not specified explicitly, and the pattern is not a variable."
-            .to_string()]
+        vec![
+            "The getter name is not specified explicitly, and the pattern is not a variable."
+                .to_string()
+        ]
     );
 }
 
@@ -234,8 +236,10 @@ void f(({int foo}) x) {
     );
     assert_eq!(
         messages(&report, "missing_named_pattern_field_name"),
-        vec!["The getter name is not specified explicitly, and the pattern is not a variable."
-            .to_string()]
+        vec![
+            "The getter name is not specified explicitly, and the pattern is not a variable."
+                .to_string()
+        ]
     );
 }
 
@@ -304,7 +308,9 @@ void f(x) {
 }
 ";
     let report = report_ops(fixture);
-    let second = fixture.find("foo: 1").expect("written duplicate in fixture");
+    let second = fixture
+        .find("foo: 1")
+        .expect("written duplicate in fixture");
     assert_eq!(
         rows(&report, "duplicate_pattern_field"),
         vec![(CORE_PRELUDE.len() as u32 + second as u32, 3)],
@@ -337,7 +343,11 @@ void f(Object? x) {
         "positional_field_in_object_pattern",
         "duplicate_pattern_field",
     ] {
-        assert_eq!(rows(&report, code), vec![], "{code} fired on a legal record pattern");
+        assert_eq!(
+            rows(&report, code),
+            vec![],
+            "{code} fired on a legal record pattern"
+        );
     }
 }
 
@@ -363,7 +373,11 @@ void f(Object? x, List<int> xs) {
         "rest_element_in_map_pattern",
         "duplicate_rest_element_in_pattern",
     ] {
-        assert_eq!(rows(&report, code), vec![], "{code} fired on a clean pattern");
+        assert_eq!(
+            rows(&report, code),
+            vec![],
+            "{code} fired on a clean pattern"
+        );
     }
 }
 
@@ -501,7 +515,8 @@ fn pattern_assignment_not_local_variable_anchors_the_target() {
 /// its own operand.
 #[test]
 fn missing_variable_pattern_anchors_each_omitting_branch() {
-    let fixture = "void f(Object? x) {\n  if (x case int a || 2 || 3 when a > 0) {\n    a;\n  }\n}\n";
+    let fixture =
+        "void f(Object? x) {\n  if (x case int a || 2 || 3 when a > 0) {\n    a;\n  }\n}\n";
     let report = report_ops(fixture);
     let two = at("|| 2", fixture) + 3;
     let three = at("|| 3", fixture) + 3;

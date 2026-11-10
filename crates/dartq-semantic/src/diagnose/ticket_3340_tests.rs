@@ -114,7 +114,11 @@ fn enum_index_field_carries_no_initialization_obligation() {
     assert!(
         spans_of(&report, &full, "final_not_initialized_constructor").is_empty(),
         "the implicit enum index owns no initializer: {:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -123,17 +127,16 @@ fn enum_index_field_carries_no_initialization_obligation() {
 /// other fields.
 #[test]
 fn initializer_list_coverage_stays_silent() {
-    let fixture = concat!(
-        "class C {\n",
-        "  final int v;\n",
-        "  C() : v = 1;\n",
-        "}\n",
-    );
+    let fixture = concat!("class C {\n", "  final int v;\n", "  C() : v = 1;\n", "}\n",);
     let full = format!("{CORE_PRELUDE}{fixture}");
     let report = report_ops(fixture);
     assert!(
         spans_of(&report, &full, "final_not_initialized_constructor").is_empty(),
         "{:?}",
-        report.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
     );
 }
