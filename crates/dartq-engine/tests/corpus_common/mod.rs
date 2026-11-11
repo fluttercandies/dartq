@@ -980,6 +980,26 @@ fn run_case(case: &Case, case_root: &Path, sdk: &Path, mocks_abs: &Path) -> Case
 /// with the error text). The assertion collects ALL divergences before
 /// failing — never panic-loops on the first.
 pub fn run_family(prefix: &str) {
+    // The family's case root: the extracted corpus for `diagnostics/*`
+    // families, the tracked `conformance/manual` tree for `manual/*`.
+    // CI's rust job cannot run `conformance extract` — the extract
+    // source is the pinned upstream SDK tree, absent on the runner —
+    // so a wholly absent root self-skips loudly, the same posture as
+    // ci.yml's dart-gated plugin fixtures. A root that exists while
+    // this family's slice is missing stays a hard panic below: that is
+    // real extraction drift, not a missing corpus.
+    let root = if prefix.starts_with("manual/") {
+        manual_dir()
+    } else {
+        cases_dir()
+    };
+    if !root.is_dir() {
+        eprintln!(
+            "corpus root {} absent; skipping family {prefix} (run `conformance extract` to enable)",
+            root.display()
+        );
+        return;
+    }
     let cases = load_family_cases(prefix).unwrap_or_else(|e| panic!("family {prefix}: {e}"));
     assert!(!cases.is_empty(), "family {prefix}: no cases found");
     let expected = expected_map();
