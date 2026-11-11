@@ -459,15 +459,15 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
             return exit::USAGE;
         }
     };
-    let (config, _dir, advisory) = match crate::engine_config_with_advisory(&root, Some(&sdk_root))
-    {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("dartq: session serve: {error}");
-            cleanup(&layout, &root);
-            return exit::USAGE;
-        }
-    };
+    let (config, _dir, advisory) =
+        match crate::engine_config_with_advisory(&root, Some(&sdk_root)) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("dartq: session serve: {error}");
+                cleanup(&layout, &root);
+                return exit::USAGE;
+            }
+        };
     // The engine trace — the cold-analysis progress substrate
     // (`dartq events progress` reads it; the file truncates per serve, so
     // each resident generation's sweep starts at zero).
@@ -1941,7 +1941,9 @@ pub(crate) mod tests {
             root.display(),
             root.join("sdk").display()
         );
-        let mut starter = Command::new("zsh");
+        // `bash`, not a dev-shell habit: CI runners ship no zsh, while
+        // the script body is plain POSIX grammar either way.
+        let mut starter = Command::new("bash");
         starter
             .arg("-c")
             .arg(&script)
