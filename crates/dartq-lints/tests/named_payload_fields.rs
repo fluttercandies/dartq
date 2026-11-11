@@ -10,7 +10,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 /// The banned raw-read call forms (both address words positionally).
-const BANNED: [&str; 2] = ["payload(", "payload_word("];
+/// Receiver-call spelling only: the positional APIs are methods
+/// (`SyntaxTable::payload`, table.rs:188), so a bare `payload_word(`
+/// substring would trip on inline `#[test]` fn names carrying the
+/// phrase (a definition reads nothing) — the scan bans calls, not
+/// words.
+const BANNED: [&str; 2] = [".payload(", ".payload_word("];
 
 fn rust_files_under(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
