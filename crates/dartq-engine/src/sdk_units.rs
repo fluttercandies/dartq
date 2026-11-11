@@ -103,6 +103,13 @@ pub(crate) fn load_sdk_units(state: &mut EngineState) {
 /// import/export target is the external face (the graph build maps it onto
 /// the library's node by name); nothing else resolves. Unreadable files
 /// count as load failures and skip silently.
+///
+/// The interface-only tier ([`l1::compute_dep_unit`]) serves SDK files
+/// exactly as it serves pub-cache files: an SDK source is never an engine
+/// library, so the diagnostic, signature, and doc-import faces are dead
+/// columns and the capture runs declaration-only. The source bytes are not
+/// adopted into the store; the clause trees are captured once here, the
+/// same derived product the pub-cache tier retains.
 fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>> {
     if let Some(unit) = state.deps.units.get(&file) {
         return Some(Arc::clone(&unit.facts));
@@ -113,13 +120,20 @@ fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>
         return None;
     };
     let text = SourceText::canonical(&bytes);
-    let content = state.store.put_text(&text);
+    let content = text.content_id();
     let version = state.sdk.language_metadata;
-    let (facts, capture, scanned) = l1::compute_unit(
+    let (facts, capture, settled) = l1::compute_dep_unit(
         file,
         content,
         text.as_str(),
         version,
+        &state.strings,
+        &state.grants(),
+    );
+    let clauses = l1::capture_dep_clauses(
+        file,
+        text.as_str(),
+        settled,
         &state.strings,
         &state.grants(),
     );
@@ -141,12 +155,13 @@ fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>
     let facts = Arc::new(facts);
     state.deps.insert(
         file,
-        DepUnit {
-            facts: Arc::clone(&facts),
-            capture: Arc::new(capture.without_sites()),
-            version: scanned.version,
-            targets: targets.into_boxed_slice(),
-        },
+        DepUnit::new(
+            Arc::clone(&facts),
+            capture,
+            settled,
+            targets.into_boxed_slice(),
+            clauses,
+        ),
     );
     state.deps.sdk_file_count += 1;
     Some(facts)

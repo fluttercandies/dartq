@@ -291,14 +291,13 @@ fn prefix_report(main: &str, prefix_name: &str, lib_src: &str) -> FileReport {
 /// typedef RHS's `core.`-prefixed leaves must subtype-match the operand's
 /// identically spelled signature.
 ///
-/// Blocked on the collector's `pending_qualified` clobber (#3097): a
-/// `p.T<p.U>` spelling inside the typedef's Function RHS lets the inner
-/// `p` overwrite the outer join state, so `F`'s captured `var_ty` degrades
-/// to `Named{"core"}` and `F<int>` cannot fold to the signature. The
-/// spelled-site half already emits today (the operand's own `core.List`
-/// args match the written `core.List` leaves head-for-head).
+/// The collector's `pending_qualified` latch is a stack (#4009): a
+/// `p.T<p.U>` spelling inside the typedef's Function RHS latches the inner
+/// `p` above the outer entry instead of overwriting it, so `F`'s captured
+/// `var_ty` keeps the whole signature (a single slot degraded it to
+/// `Named{"core"}` and `F<int>` could not fold). The spelled-site half
+/// matches the operand's own `core.List` args head-for-head.
 #[test]
-#[ignore = "blocked on #3097: typedef Function-RHS var_ty degrades to the bare prefix"]
 fn prefixed_typedef_fold_is_same_signature_fires() {
     let core_lib = "class List<E> {}\nclass int {}\nclass bool {}\n";
     let report = prefix_report(
@@ -344,15 +343,14 @@ fn local_fn_prefixed_typedef_fold_fires() {
 /// `x: core.List<core.int>` — isolates whether `F<int>` folding itself
 /// resolves through a `core.`-prefixed leaf (vs the Function-RHS arm).
 ///
-/// Blocked on the same #3097 clobber: `p.T<p.U>` — here both the typedef
-/// RHS AND the parameter annotation `core.List<core.int>` capture as
-/// `Named{"core"}` (the inner `p` identifier's `handle_identifier` fires
-/// `PrefixedTypeReference` before the outer `handle_type` can join), so
-/// neither face survives to the verdict. The bare-`p.T` arm
-/// (`prefixed_typedef_bare_rhs_fold_fires`) proves the canonicalized fold
-/// itself once the capture is intact.
+/// The same latch stack (#4009) keeps both faces: the typedef RHS AND the
+/// parameter annotation `core.List<core.int>` intern the joined
+/// `core.List` head with its argument (the inner `p` identifier's
+/// `PrefixedTypeReference` fires before the outer `handle_type` joins —
+/// a single slot captured both as `Named{"core"}`). The bare-`p.T` arm
+/// (`prefixed_typedef_bare_rhs_fold_fires`) is the canonicalized fold's
+/// nest-free twin.
 #[test]
-#[ignore = "blocked on #3097: p.T<p.U> captures as the bare prefix name"]
 fn prefixed_typedef_named_rhs_fold_fires() {
     let core_lib = "class List<E> {}\nclass int {}\nclass bool {}\n";
     let report = prefix_report(
@@ -388,10 +386,10 @@ fn unprefixed_typedef_fn_rhs_fold_fires() {
     assert_eq!(utc.len(), 1, "{:?}", report.diagnostics);
 }
 
-/// Bare `p.T` typedef RHS (no nested prefix inside args): isolates whether
-/// the corrupt RHS face is specific to `p.T<p.U>` nestings (the inner
-/// prefix's `handle_identifier` clobbering `pending_qualified` before the
-/// outer `handle_type` joins).
+/// Bare `p.T` typedef RHS (no nested prefix inside args): the nest-free
+/// twin of the `p.T<p.U>` pins above (the inner prefix's latch entry
+/// nests above the outer head's — the #4009 stack — where a single slot
+/// let it clobber the outer join).
 #[test]
 fn prefixed_typedef_bare_rhs_fold_fires() {
     let core_lib = "class List<E> {}\nclass int {}\nclass bool {}\n";

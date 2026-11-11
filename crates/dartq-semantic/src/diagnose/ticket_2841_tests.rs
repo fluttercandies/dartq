@@ -60,10 +60,10 @@ const ALIAS_INFER_MESSAGE: &str = "Couldn't infer type parameter 'X'.\n\nTried t
 
 /// The corpus shape (`nonfunction_l1_t01`): the unsatisfiable self-bound
 /// alias creation reports `could_not_infer` at the spelling over the
-/// ALIAS's parameter, and no invocation row misroutes. The oracle's
-/// creation-site `type_argument_not_matching_bounds` twin is the expanded
-/// class-side check — no twin here (the oracle has none for this shape
-/// either).
+/// ALIAS's parameter, and no invocation row misroutes. The creation-site
+/// `type_argument_not_matching_bounds` twin is the expanded class-side
+/// check over `C`'s own `X` (probed: `dart analyze` 3.13.7 reports it at
+/// the same 4:3 anchor for this exact fixture).
 #[test]
 fn grounded_alias_creation_infers_the_alias_parameters() {
     let src = r#"
@@ -78,7 +78,13 @@ main() {
     assert_row(&report, "could_not_infer", offset, 1, ALIAS_INFER_MESSAGE);
     assert_none(&report, "invocation_of_non_function_expression");
     assert_none(&report, "invocation_of_non_function");
-    assert_none(&report, "type_argument_not_matching_bounds");
+    assert_row(
+        &report,
+        "type_argument_not_matching_bounds",
+        offset,
+        1,
+        "'C<Object?>' doesn't conform to the bound 'C<C<Object?>>' of the type parameter 'X'.",
+    );
 }
 
 /// The materialized registry shape (`_misc`

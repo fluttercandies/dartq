@@ -100,8 +100,14 @@ impl<'a> Engine<'a> {
     /// nameless ghost row retires into a silent parameter. A junk keyword
     /// the re-parse consumed as its own second name (`catch (e, do …`) is
     /// the slot's junk itself, never a recovered binding: the ghost keeps
-    /// the face. The flip never firing (a synthetic comma) routes to the
-    /// typed-catch handoff below.
+    /// the face. The two ghost placements tell the shapes apart: the
+    /// statement-start route plants the ghost AT the junk the re-parse
+    /// then names, while the consume-in-doubt route plants it at the
+    /// consumed junk's END (`insertSyntheticIdentifier(identifier)`,
+    /// token_stream_rewriter.dart:238-248) — the recovered name's own
+    /// offset when the two are glued (`{st}`: oracle 3.13.7 anchors
+    /// `unused_catch_stack` on `st`). The flip never firing (a synthetic
+    /// comma) routes to the typed-catch handoff below.
     ///
     /// Every close also zeroes the catch rows' use counts: the formal
     /// re-parse resolves its own tokens against the live scope, and a
@@ -143,9 +149,9 @@ impl<'a> Engine<'a> {
             // auto-uses it at `finish_catch_clause`; a sibling presence
             // auto-uses it through the CatchStack check). A first slot the
             // re-parse consumed as a MODIFIER (`catch (var e)` — `var`
-            // arms no written type; the official list collapses to `[e]`)
-            // leaves the rows untouched: both scan rows keep the exception
-            // face and stay silent.
+            // arms no written type) never confirms the pair this way;
+            // there both ensure routes planted nameless synthetics, which
+            // the arm below reads directly.
             let twin_ty = exc_row
                 .filter(|&row| matches!(self.locals[row].kind, LocalKind::Parameter { .. }))
                 .and_then(|row| {
@@ -170,6 +176,21 @@ impl<'a> Engine<'a> {
             {
                 self.locals[second].kind = LocalKind::CatchStack;
             }
+            // Both ensure routes synthetic (`catch (var e)`: the reserved
+            // `var` starts a statement, so the exception ensure and the
+            // trace ensure behind the rewriter's synthetic comma each plant
+            // a nameless identifier): the official list reads `[<syn>,
+            // <syn>]`, so `catchParameters[1]` is a nameless stack trace —
+            // oracle 3.13.7 reports `unused_catch_stack` '<unnamed>' (and
+            // `duplicate_definition` '') for `catch (var e) {}` and for
+            // `on int catch (var e) {}` alike, the exception staying
+            // auto-used through its trace sibling.
+            if let Some((first, second)) = slots
+                && self.is_nameless(self.locals[first].name)
+                && self.is_nameless(self.locals[second].name)
+            {
+                self.locals[second].kind = LocalKind::CatchStack;
+            }
             return;
         }
         let mut ghost_offset: Option<u32> = None;
@@ -191,7 +212,7 @@ impl<'a> Engine<'a> {
             return;
         };
         let range = self.locals[row].range;
-        if ghost_offset.is_some_and(|offset| offset == range.offset) {
+        if ghost_offset.is_some_and(|offset| offset == range.offset && !self.junk_ends_at(offset)) {
             return;
         }
         self.locals[row].kind = LocalKind::CatchStack;
@@ -214,6 +235,22 @@ impl<'a> Engine<'a> {
         let first = slots.next()?;
         let second = slots.next()?;
         slots.next().is_none().then_some((first, second))
+    }
+
+    /// Whether a scanned token other than the slot's comma ends exactly at
+    /// `offset` (UTF-16) — the consumed junk a consume-in-doubt catch ghost
+    /// was spliced behind ([`Self::reconcile_catch_slots`]). A statement-
+    /// start ghost sits at its junk's own start, after whitespace or the
+    /// written comma, so no such token ends there.
+    fn junk_ends_at(&self, offset: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < offset);
+        at.checked_sub(1)
+            .and_then(|index| tokens.get(index))
+            .is_some_and(|token| {
+                token.kind != TokenKind::Comma
+                    && self.utf16_of((token.byte_offset + token.byte_len) as usize) == offset
+            })
     }
 
     /// A named local function (reports as `unused_element`). The name
@@ -494,13 +531,16 @@ impl<'a> Engine<'a> {
             // by exact match.
             return;
         };
-        // A record-typed (or otherwise paren-headed) `on` head resolves to
-        // a null/record `exceptionType` upstream — never `isDartCoreObject`
-        // — so the clause joins the list as the catch-all face (bare
-        // `catch`), which is what makes the FOLLOWING clauses report
-        // `dead_code_catch_following_catch`. The head's own name references
-        // (a valid record type's field types) already ran their rows; they
-        // must not turn the clause into a named on-clause.
+        // A record-typed (or otherwise paren-headed) `on` head carries no
+        // named `on` type: the clause joins the list with `on_type: None`,
+        // and [`Self::finish_try_statement`]'s `catch_head_is_on` keeps it
+        // out of the catch-all arm — upstream resolves the head to a
+        // `RecordType` (never null, never `isDartCoreObject`), so the
+        // clause takes the subtype arm, silent against named heads
+        // (oracle 3.13.7: `on (int, String) {} on int {}` reports
+        // nothing). The head's own name references (a valid record
+        // type's field types) already ran their rows; they must not turn
+        // the clause into a named on-clause.
         let on_type = self.catch_on_type.take().filter(|_| !record_head);
         let on_nullable = self.catch_on_nullable.take().unwrap_or(false);
         // A clause whose body block never materialized (`on X;` —
@@ -997,10 +1037,23 @@ impl<'a> Engine<'a> {
     /// ([`Self::ctor_face_exists`]): a context head declared in a sibling
     /// unit owns no decl site here, so the local-only probe would
     /// misreport the shorthand `.named()` that resolves upstream.
+    ///
+    /// The answered face never carries the context's `?`. Upstream returns
+    /// the ELEMENT's type, not the context's: a constructor spelling hands
+    /// `PropertyElementResolverResult(getType: element.returnType)` —
+    /// `C<int>`, the substituted interface type — and an enum constant the
+    /// static field's own declared face (`Color`, never `Color?`)
+    /// (property_element_resolver.dart:92-124, `_resolveDotShorthand`'s
+    /// constructor arm and its `_resolveTargetInterfaceElement`
+    /// fall-through). Propagating the context's `?` here invented a
+    /// nullable result for `C? c = .new()` and the downstream member read
+    /// then reported `unchecked_use_of_nullable_value` on a receiver the
+    /// oracle promotes to non-null (the co19 `type_inference_A01_t01/t02/
+    /// t08/t14`, `type_inference_A02_t01/t02`, `semantics_A05_t01` rows).
     fn shorthand_member_ty(
         &self,
         context: StringId,
-        nullable: bool,
+        _nullable: bool,
         args: ArgListId,
         name: StringId,
     ) -> Option<Ty> {
@@ -1017,7 +1070,7 @@ impl<'a> Engine<'a> {
         if ctor_hit {
             return Some(Ty::Named {
                 name: context,
-                nullable,
+                nullable: false,
                 args,
             });
         }
@@ -1040,7 +1093,7 @@ impl<'a> Engine<'a> {
         }) {
             return Some(Ty::Named {
                 name: context,
-                nullable,
+                nullable: false,
                 args,
             });
         }
@@ -1203,6 +1256,22 @@ impl<'a> Engine<'a> {
         // `++`/`--`-demoted invocation chain (`.new()++`) keeps the
         // invocation arm's `'_'` verdict.
         let invoke = row.intent == Intent::Invoke || self.selector_invokes_at(row.range.offset);
+        // An INVOKED `.id<typeArgs>` whose `id` names a constructor is a
+        // compile-time error before the member verdict runs: type
+        // parameters can never apply to a dot-shorthand constructor
+        // invocation (instance_creation_expression_resolver.dart:105-114
+        // — `wrongNumberOfTypeArgumentsDotShorthandConstructor` under the
+        // shared `_constructor` code, `.at(typeArguments)`). The gate is
+        // the INVOKED spelling only — the rewritten node kind is the
+        // invocation; a tear-off `.id<typeArgs>` resolves as a
+        // constructor tear-off whose group validates against the torn
+        // function type (`wrong_number_of_type_arguments_function`),
+        // never this code. The report does NOT suppress the expression's
+        // own resolution, so the member verdict below still types the
+        // row.
+        if invoke && let Some(Ty::Named { name: head, .. }) = resolve {
+            self.emit_shorthand_ctor_type_args(row, head);
+        }
         let resolved = resolve.and_then(|ctx| {
             let Ty::Named {
                 name: head,
@@ -1244,6 +1313,111 @@ impl<'a> Engine<'a> {
                 None
             }
         }
+    }
+
+    /// `wrong_number_of_type_arguments_constructor` for a dot-shorthand
+    /// constructor invocation that wrote a `<...>` group — the shared
+    /// `_constructor` code under the dot-shorthand face's own text
+    /// (messages.yaml's `wrongNumberOfTypeArgumentsDotShorthandConstructor`
+    /// `sharedName`, :19930; `instance_creation_expression_resolver.dart`
+    /// :105-114 reports it `.at(typeArguments)` whenever the shorthand's
+    /// context denotes an accessible class, unconditionally — the group's
+    /// own arity never enters).
+    ///
+    /// The gate is the RESOLVED selector, not the written spelling: `id`
+    /// must name a constructor of the context head (`.new`/`.id`), a plain
+    /// static member keeps the member face (`.staticMethod<int>()` is a
+    /// valid generic-method instantiation — `type_inference_A09_t01`'s
+    /// `cContextProvider(.staticMethod<int>())` reports nothing). The
+    /// group is the balanced `<...>` the selector's own span is followed
+    /// by; a selector with no group is the silent face.
+    ///
+    /// Upstream's abstract arm REPLACES this row for an abstract class
+    /// whose resolved constructor is generative
+    /// (`instance_creation_expression_resolver.dart:96-101`:
+    /// `contextElement.isAbstract && constructorElement != null &&
+    /// !constructorElement.isFactory` reports `instantiateAbstractClass`
+    /// instead, the else-if never reaching the type-arguments report) —
+    /// the gate suppresses so that face's owner owns the report alone.
+    fn emit_shorthand_ctor_type_args(&mut self, row: &Row, head: StringId) {
+        let Some(group) = self.shorthand_type_args_span(row.range) else {
+            return;
+        };
+        let site = self.ctor_decl_site(head, row.name);
+        let container = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        );
+        let ctor_hit = site.is_some()
+            || container
+                .as_ref()
+                .is_some_and(|(decl, _)| self.ctor_face_exists(decl, head, row.name));
+        if !ctor_hit {
+            return;
+        }
+        // The unnamed factory keys the class's own name; a named factory
+        // its selector.
+        let unnamed = row.name == head || row.name == self.intern("new");
+        let factory = site.is_some_and(|s| s.is_factory)
+            || container.as_ref().is_some_and(|(decl, _)| {
+                decl.factory_formals
+                    .contains_key(&if unnamed { head } else { row.name })
+            });
+        if !factory
+            && container
+                .is_some_and(|(decl, _)| decl.kind == ContainerKind::Class && decl.is_abstract)
+        {
+            return;
+        }
+        // The oracle's `.at(typeArguments)` anchor is the `<...>` group.
+        let class = self.strings.resolve(head).to_string();
+        let ctor = self.strings.resolve(row.name).to_string();
+        self.emit_shorthand_ctor_type_args_at(group, &class, &ctor);
+    }
+
+    /// The `<...>` group following the selector at `selector` — the
+    /// balanced run starting at the first non-trivia `<`. `None` when the
+    /// selector carries no group (or the group never closes: the parser's
+    /// own recovery owns that shape).
+    fn shorthand_type_args_span(&self, selector: SourceRange) -> Option<SourceRange> {
+        use dartq_scanner::TokenKind as TK;
+        let toks = self.tokens.as_slice();
+        let idx = toks.partition_point(|t| t.utf16_offset < selector.end());
+        let lt = toks.get(idx).filter(|t| t.kind == TK::Lt)?;
+        let close = self.tokens.matching_end(idx)?;
+        let close = toks.get(close)?;
+        Some(SourceRange {
+            offset: lt.utf16_offset,
+            length: (close.utf16_offset + close.byte_len).saturating_sub(lt.utf16_offset),
+        })
+    }
+
+    /// The `wrong_number_of_type_arguments_constructor` row under the
+    /// dot-shorthand text (`sharedName` reuse: the code name and machine
+    /// form stay the shared `_constructor` face, the message is the
+    /// dot-shorthand variant's).
+    fn emit_shorthand_ctor_type_args_at(&mut self, range: SourceRange, class: &str, ctor: &str) {
+        if self.report.diagnostics.iter().any(|d| {
+            d.range == range && d.code.name == "wrong_number_of_type_arguments_constructor"
+        }) {
+            return;
+        }
+        let message = format!(
+            "The dot shorthand resolves to the constructor '{class}.{ctor}', and type \
+             parameters can't be applied to dot shorthand constructor invocations."
+        );
+        self.report.diagnostics.push(Diagnostic::new(
+            SemanticCode::WrongNumberOfTypeArgumentsConstructor.severity(),
+            SemanticCode::WrongNumberOfTypeArgumentsConstructor.code_info(),
+            message,
+            self.file,
+            range,
+            None,
+        ));
     }
 
     /// Whether a `Named` context head names a type THIS unit can see: a
@@ -1547,17 +1721,25 @@ impl<'a> Engine<'a> {
                 // the oracle resolves `C`). The real operand is the last
                 // `deferred_miss_rows` entry; `self.rows` is the fallback
                 // for shapes that leave no composite (unfolded literals
-                // in a `??` tail, a shorthand's own right operand).
+                // in a `??` tail, a shorthand's own right operand). Every
+                // candidate must END before the operator: inside an
+                // argument group the composite itself drains to
+                // `deferred_miss_rows` too, and its staged span (keyed at
+                // the shared start) aliases the left operand's
+                // (`take(C(1) == .missing)` read `'bool'`).
                 let eq_operand = |engine: &Self, end: u32, before: usize| -> Option<Row> {
+                    let left_of = |c: &&Row| {
+                        c.range.end() <= end
+                            && engine
+                                .trivia_between(engine.staged_expression_span(c.range).end(), end)
+                    };
                     engine
                         .deferred_miss_rows
                         .iter()
                         .rev()
-                        .find(|c| {
-                            engine.trivia_between(engine.staged_expression_span(c.range).end(), end)
-                        })
+                        .find(left_of)
+                        .or_else(|| engine.rows.iter().take(before).rev().find(left_of))
                         .cloned()
-                        .or_else(|| operand_row_before(engine, end, before))
                 };
                 match eq_operand(self, prev.utf16_offset, self_index) {
                     // A shorthand as the LEFT operand arms no context for
@@ -1952,8 +2134,12 @@ impl<'a> Engine<'a> {
     /// LITERAL's own position arms — an `==`/`!=` operand and a condition
     /// position arm the unknown schema (`if ([C(0)] == [.id(1)])` reports
     /// `'_'`; `if ({"key": C(0)} != {"key": .intOne})` reports
-    /// `missing_context`). A declaration-typed literal's element type
-    /// lives in the annotation's type arguments (under-reported); an
+    /// `missing_context`); a statement-level collection arms the unknown
+    /// element schema; and the declaration initializer's own literal arms
+    /// the group's inference face — an UNANNOTATED group (`var l = [.a]`)
+    /// arms the unknown schema (the oracle reports the whole-span
+    /// `dot_shorthand_missing_context`; an annotated group's element type
+    /// lives in the annotation's type arguments, under-reported). An
     /// index access `a[...]` (an identifier/`)`/`]` before the bracket)
     /// keeps the under-report.
     fn literal_elem_ctx(&self, open_idx: usize) -> Option<(Option<Ty>, String)> {
@@ -1976,8 +2162,93 @@ impl<'a> Engine<'a> {
                 Some(TK::Keyword(Kw::If | Kw::While | Kw::Assert)) => Some((None, "_".to_string())),
                 _ => None,
             },
+            // A statement-level collection (`[.a];`, a block's first
+            // expression) arms the unknown element schema — the same
+            // statement face [`Self::shorthand_ctx_at`]'s own `;`/`}`
+            // arm runs (no_context's read shapes report
+            // `missing_context`).
+            TK::Semicolon | TK::OpenCurly | TK::CloseCurly => Some((None, "_".to_string())),
+            // A nested collection's element inherits the enclosing
+            // literal's own element face (`[[.a]]` classifies the outer
+            // literal; a map value `{k: [.a]}` classifies the map).
+            TK::OpenSquare => self.literal_elem_ctx(open_idx - 1),
+            TK::Colon => self
+                .enclosing_group_open(open_idx)
+                .and_then(|open| self.literal_elem_ctx(open)),
+            // The declaration initializer's own literal: an inference
+            // group (`var`/`final`, no written type) arms the unknown
+            // element schema — see [`Self::inference_group_literal_ctx`].
+            TK::Eq => self.inference_group_literal_ctx(open_idx),
             _ => None,
         }
+    }
+
+    /// Whether the literal at `open_idx` is the initializer of an
+    /// inference group's declarator (`var`/`final`, no written type): the
+    /// declarator head classifies positionally (stable across the
+    /// deferred re-verdicts, which run after the declaration window
+    /// closed) — `name =` directly, or — for a later declarator after
+    /// `,` — the balanced back-scan over the sibling's initializer to
+    /// the previous `=`'s name and the group head beyond it. Such groups
+    /// arm the unknown element schema (the oracle's whole-span
+    /// `dot_shorthand_missing_context`); an annotated group
+    /// (`List<A> l = [.a]`), a `const` group (the const face's own
+    /// family), and a non-declarator `=` (an assignment target — the
+    /// target's own face owns the context) answer `None`.
+    fn inference_group_literal_ctx(&self, open_idx: usize) -> Option<(Option<Ty>, String)> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let toks = self.tokens.as_slice();
+        // `var|final name =` directly before the literal.
+        if matches!(
+            open_idx
+                .checked_sub(2)
+                .and_then(|i| toks.get(i))
+                .map(|t| t.kind),
+            Some(TK::Identifier)
+        ) && matches!(
+            open_idx
+                .checked_sub(3)
+                .and_then(|i| toks.get(i))
+                .map(|t| t.kind),
+            Some(TK::Keyword(Kw::Var | Kw::Final))
+        ) {
+            return Some((None, "_".to_string()));
+        }
+        // A later declarator: scan left over the previous declarator's
+        // initializer (interior groups ride at depth) to the `=` that
+        // opens it, its name, and the head beyond.
+        let mut idx = open_idx.checked_sub(2)?;
+        let mut depth = 0i32;
+        while idx > 0 {
+            idx -= 1;
+            match toks[idx].kind {
+                TK::CloseParen | TK::CloseSquare | TK::CloseCurly => depth += 1,
+                TK::OpenParen | TK::OpenSquare | TK::OpenCurly => depth -= 1,
+                TK::Eq if depth == 0 => {
+                    if !matches!(
+                        idx.checked_sub(1).and_then(|i| toks.get(i)).map(|t| t.kind),
+                        Some(TK::Identifier)
+                    ) {
+                        return None;
+                    }
+                    match idx.checked_sub(2).and_then(|i| toks.get(i)).map(|t| t.kind) {
+                        Some(TK::Keyword(Kw::Var | Kw::Final)) => {
+                            return Some((None, "_".to_string()));
+                        }
+                        // An intermediate declarator keeps the run going;
+                        // a written type's end token (an annotated sibling
+                        // annotates the whole group) ends it.
+                        Some(TK::Comma) => {}
+                        _ => return None,
+                    }
+                }
+                // A statement boundary ends the declarator run — an
+                // assignment or a shape this walk does not own.
+                TK::Semicolon | TK::OpenCurly | TK::CloseCurly if depth == 0 => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// The declaration-initializer context for a shorthand directly under
@@ -2756,11 +3027,17 @@ impl<'a> Engine<'a> {
     /// the heads are equal or one names a declared supertype of the other
     /// (the LUB is then that supertype); every other pair stays untyped.
     fn stage_if_null_result(&mut self, mark: usize, op_range: SourceRange) {
-        if mark == 0 || self.rows.len() != mark + 1 {
+        // `mark` is the row count at the `??` group's open: the left
+        // operand's rows occupy `..mark` (its result is the last row below
+        // `mark`), the right operand's rows are `mark..` and its result is
+        // the last row on the stack — a compound right side (`x ?? f(y)`,
+        // `x ?? a.b`, `x ?? -1`) leaves more than one, the two-row shape
+        // only the parenthesized minimal pair.
+        if mark == 0 || self.rows.len() <= mark {
             return;
         }
         let lhs = &self.rows[mark - 1];
-        let rhs = &self.rows[mark];
+        let rhs = self.rows.last().expect("rows.len() > mark");
         if lhs.range.end() > op_range.offset || rhs.range.offset < op_range.end() {
             return;
         }
@@ -3038,23 +3315,62 @@ impl<'a> Engine<'a> {
                 // whose keyword starts after the declaration is a later
                 // sibling switch at the same depth, never the tag's own.
                 let switches = &self.switch.switches;
-                return self.locals[lo..hi]
-                    .iter()
-                    .rposition(|d| {
-                        d.name == name
-                            && !d.retired
-                            && match d.group {
-                                Some(g) if g >= PATTERN_ARM_SCOPE_BASE => {
-                                    let slot = (u32::MAX - g) as usize;
-                                    switches.len() >= slot
-                                        && switches.get(slot - 1).is_some_and(|ctx| {
-                                            ctx.switch_kw.offset < d.range.offset
-                                        })
-                                }
-                                _ => true,
+                let visible = |d: &LocalDecl| {
+                    d.name == name
+                        && !d.retired
+                        && match d.group {
+                            Some(g) if g >= PATTERN_ARM_SCOPE_BASE => {
+                                let slot = (u32::MAX - g) as usize;
+                                switches.len() >= slot
+                                    && switches
+                                        .get(slot - 1)
+                                        .is_some_and(|ctx| ctx.switch_kw.offset < d.range.offset)
                             }
-                    })
-                    .map(|p| (lo + p) as u32);
+                            _ => true,
+                        }
+                };
+                // Upstream's `LocalScope` binds a redeclared name to the
+                // FIRST declaration the scope saw (`LocalScope.add`'s
+                // `??=` — the same first-wins posture
+                // [`Engine::dup_scope_add`] records). The flat `locals`
+                // window can hold the redeclaring sibling beside it
+                // (`var i; var i;` sit in one frame), so the innermost
+                // open statement-list scope's stored range names the
+                // bound row; a name no open scope holds (a shadowing
+                // declaration the frame walk already narrowed to, or the
+                // for-head's own `dup_for_parts` map) keeps the window's
+                // last entry — the historical last-wins read. A visible
+                // case binder (an if-case or switch-case head's pattern
+                // variable: no group, an odd logical-or site group, or the
+                // arm-scope sentinel band — a pattern-declaration
+                // statement's binders carry an even group and join the
+                // statement-list scope) never registers in a duplicate
+                // scope: it lives in the case's own nested scope, retires
+                // when that scope closes, and is newer than every
+                // statement-list binding it could meet, so it shadows them
+                // (`var e = switch (r) { Box(:var e) => e, … }` and
+                // `if (parent case PA parent) { parent… }` read the binder).
+                let newest = self.locals[lo..hi].iter().rposition(|d| visible(d));
+                if let Some(p) = newest
+                    && matches!(self.locals[lo + p].kind, LocalKind::PatternVariable)
+                    && self.locals[lo + p]
+                        .group
+                        .is_none_or(|g| g % 2 == 1 || g >= PATTERN_ARM_SCOPE_BASE)
+                {
+                    return Some((lo + p) as u32);
+                }
+                if let Some(bound) = self
+                    .dup_scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(&name))
+                    && let Some(p) = self.locals[lo..hi]
+                        .iter()
+                        .position(|d| d.range == *bound && visible(d))
+                {
+                    return Some((lo + p) as u32);
+                }
+                return newest.map(|p| (lo + p) as u32);
             }
         }
         None
@@ -4783,10 +5099,22 @@ impl<'a> Engine<'a> {
             }
             return;
         }
-        let first = self
-            .dup_scopes
-            .last_mut()
-            .and_then(|scope| scope.insert(name, range));
+        // The statement-list scope binds FIRST-wins — upstream
+        // `LocalScope.add` inserts through `_addGetter`'s
+        // `_getters[element.name()] ??= element` (upstream Dart SDK
+        // source, pkg/analyzer/lib/src/dart/element/scope.dart's
+        // `EnclosedScope`), so a same-scope redeclaration leaves the
+        // original name bound and the later read lands on the FIRST
+        // declaration. [`Engine::resolve_local`] consults this stored
+        // range to bind the same row; the context row the verifier
+        // attaches ("The first definition of this name.") keys on the
+        // same first declaration.
+        let first = self.dup_scopes.last_mut().and_then(|scope| {
+            scope
+                .get(&name)
+                .copied()
+                .or_else(|| scope.insert(name, range))
+        });
         if let Some(first) = first {
             self.stage_local_duplicate(name, range, first);
         }
@@ -5009,18 +5337,58 @@ impl<'a> Engine<'a> {
         }
         // The literal's argument slot in the open invocation: completed
         // positional arguments before it, or the pending named label.
-        let level = self.arg_levels.last()?;
-        let slot = match level.pending_name {
-            Some(label) => SchemaSlot::Named(label),
-            None => SchemaSlot::Positional(
-                level
-                    .args
-                    .iter()
-                    .filter(|(label, ..)| label.is_none())
-                    .count(),
-            ),
+        let (slot, callee_row, unnamed_head, named_head) = {
+            let level = self.arg_levels.last()?;
+            (
+                match level.pending_name {
+                    Some(label) => SchemaSlot::Named(label),
+                    None => SchemaSlot::Positional(
+                        level
+                            .args
+                            .iter()
+                            .filter(|(label, ..)| label.is_none())
+                            .count(),
+                    ),
+                },
+                level.callee_row,
+                level.unnamed_head,
+                level.named_head,
+            )
         };
-        let callee_row = level.callee_row?;
+        // The creation-head lane mirrors [`Self::arg_slot_ty_ctx`]'s: the
+        // callee transport drops the row for a keyword creation
+        // (`new F0((a) { … })`) and a written-group head, but the level's
+        // own latches still spell it — `unnamed_head` is the class whose
+        // constructor table supplies the literal's formal, `named_head`
+        // is the `.named` selector whose class segment sits before the
+        // dot (`new F0.n((x) { … })` keys `n` against `F0`'s named table)
+        // — both already carrying the written-group/to-bounds
+        // substitution, so `F3<int>((x) { … })` binds `x := int` where the
+        // callee-formals lane would leave `T` raw. A prefix-qualified
+        // `const p.C(` resolves through the prefix's table the same
+        // helper consults. A named-selector creation head resolves here
+        // even when the callee transport kept a row: `new C<int>.n(`
+        // latches BOTH `callee_row` (the dropped fold's stale index — its
+        // row is an empty-named placeholder, not the `.n` selector) and
+        // `named_head` (the authoritative `n` head whose class segment
+        // `slot_creation_class` byte-walks), so the named head lane must
+        // win over the callee-row path that would read the wrong row.
+        if callee_row.is_none() || named_head.is_some() {
+            let (head, range, named) = match (unnamed_head, named_head) {
+                (Some((head, range)), _) => (head, range, false),
+                (None, Some((selector, range))) => (selector, range, true),
+                (None, None) => return None,
+            };
+            let formals = self.slot_creation_formals(head, range, named);
+            return formals
+                .and_then(|formals| match slot {
+                    SchemaSlot::Positional(index) => formals.positional.get(index).map(|f| f.ty),
+                    SchemaSlot::Named(label) => formals.named_formal(label).map(|f| f.ty),
+                })
+                .and_then(|ty| self.closure_schema_sig(ty))
+                .and_then(|sig| Self::schema_entry(&sig, formal));
+        }
+        let callee_row = callee_row?;
         let callee = self.rows.get(callee_row)?;
         // An unmerged member placeholder (`xs.map(…)`) classifies its
         // receiver from the row directly below it — the same below-row read
@@ -5188,6 +5556,31 @@ impl<'a> Engine<'a> {
         };
         let instantiated = self.closure_schema_instantiate(schema, &recv, callee_name, callee_row);
         let schema = instantiated.unwrap_or(schema);
+        // The pass-2 re-bind abstention: the upward face does not re-run
+        // when the argument list is gone (`callee_row=None` — the deferred
+        // re-derive), so a schema entry still spelling an unsolved
+        // inference parameter is the horizontal-inference placeholder,
+        // never a decision — the frozen pass-1 bind (a solved face like
+        // the disagreeing-siblings `Object` LUB, or an honest Unknown)
+        // must not be overwritten by it. `b.reduce(C(), D(), (a) { … })`
+        // solved `a := Object` at bind time; the pass-2 re-derive, blind
+        // to the already-typed arguments, answered the raw `S` and the
+        // narrowing gate let the placeholder replace the decided face —
+        // the member-miss then read the parameter's bound arm
+        // (`'<unknown>'`) where the oracle's solved face reports
+        // `'Object'`. The `dynamic` under-report for a param face whose
+        // pass-1 bind stayed `Unknown` is preserved downstream: this
+        // abstention only fires when a callee window declares the name.
+        if callee_row.is_none()
+            && self
+                .closure_callee_params(&recv, callee_name)
+                .is_some_and(|(params, ..)| {
+                    let names: Vec<StringId> = params.iter().map(|(name, _)| *name).collect();
+                    !names.is_empty() && self.ty_names_any(schema, &names)
+                })
+        {
+            return None;
+        }
         // `greatestClosure`'s nullable face: `T <: Null` binds `Object?`;
         // an invalid type argument (`List<Und>`'s `E`) collapses to the
         // same; a genuinely nullable schema type binds itself; `dynamic`
@@ -5218,10 +5611,37 @@ impl<'a> Engine<'a> {
                 // often carry (manifest_item.dart's `items.write`
                 // family), so the undefined-member rows against an
                 // inference-bound receiver stay silent (the under-report
-                // posture — the oracle resolves them).
+                // posture — the oracle resolves them). A class the local
+                // walk CAN see — the diagnosing file's own declaration, or
+                // a sibling graph unit's indexed members — answers real
+                // `undefined_*` rows the oracle reports (`b.reduce(Ann(),
+                // (a) => a.noSuchEver())` reports `undefined_method 'A'`
+                // upstream), so only a container whose member table is out
+                // of the walk's reach joins the suppression.
                 if callee_own_head && let Some(solved) = instantiated {
                     if let Ty::Named { name, .. } = solved {
-                        self.inferred_formal_containers.insert(name);
+                        // `Object` is the one unindexed head whose member
+                        // universe is frozen-complete (`members.object_members`
+                        // enumerates it): a solved-`Object` formal's miss
+                        // (`a.noSuchEver()` under `LUB(C, D)`) is a KNOWN
+                        // `undefined_method 'Object'` row, never the
+                        // under-resolved face the suppression exists for —
+                        // the walk's silence on a table-complete head is
+                        // evidence, not posture.
+                        let object = name == self.intern("Object");
+                        let walkable = object
+                            || resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                name,
+                            )
+                            .is_some();
+                        if !walkable {
+                            self.inferred_formal_containers.insert(name);
+                        }
                     }
                     return Some(solved);
                 }
@@ -5554,9 +5974,20 @@ impl<'a> Engine<'a> {
             match solutions[index] {
                 None => solutions[index] = Some(ty),
                 Some(kept) if kept == ty => {}
-                Some(_) => {
-                    poisoned.insert(index);
-                    solutions[index] = None;
+                // Conflicting lower constraints merge to their LUB, the
+                // same `MergedTypeConstraint`/`chooseTypes` rule the
+                // send-close solver applies below — `C <: S` + `D <: S`
+                // binds `S := LUB(C, D)` (the oracle's `Object` for
+                // disagreeing sibling arguments). An undecidable join
+                // still poisons.
+                Some(kept) => {
+                    let joined = self.closure_lub(kept, ty);
+                    if self.schema_type_is_decidable(joined) {
+                        solutions[index] = Some(joined);
+                    } else {
+                        poisoned.insert(index);
+                        solutions[index] = None;
+                    }
                 }
             }
         }
@@ -5807,6 +6238,20 @@ impl<'a> Engine<'a> {
             match solutions[index] {
                 None if self.schema_type_is_decidable(ty) => solutions[index] = Some(ty),
                 Some(kept) if kept == ty => {}
+                // Conflicting lower constraints merge to their LUB
+                // (upstream `MergedTypeConstraint`/`chooseTypes`:
+                // `C <: S` + `D <: S` binds `S := LUB(C, D)` — the oracle's
+                // `Object` for disagreeing sibling arguments). An
+                // undecidable join still poisons.
+                Some(kept) => {
+                    let joined = self.closure_lub(kept, ty);
+                    if self.schema_type_is_decidable(joined) {
+                        solutions[index] = Some(joined);
+                    } else {
+                        poisoned.insert(index);
+                        solutions[index] = None;
+                    }
+                }
                 _ => {
                     poisoned.insert(index);
                     solutions[index] = None;
@@ -6027,6 +6472,18 @@ impl<'a> Engine<'a> {
         // container's own parameters join only for the receiver's own
         // member, seeded by the receiver's written instantiation.
         if !matches!(recv, Receiver::Unknown | Receiver::Prefix { .. }) {
+            // A named-constructor selector (`new C<T>.n((x) { … })`,
+            // `p.C<T>.n(`, `C<T>.n(`) is no member — the member walk never
+            // reaches `ctor_formals`, so when the callee name IS a
+            // registered constructor the container's own parameters pair
+            // against the call's written group: `C<int>.n((x) { … })`
+            // binds `x := int` through the constructor's `C<T>`
+            // environment. A static member on the same receiver answers
+            // through the member arm below instead — `C.m(` keeps its
+            // method parameters.
+            if let Some(params) = self.ctor_selector_params(*recv, callee_name) {
+                return Some(params);
+            }
             let (container, recv_ty) = match *recv {
                 Receiver::Typed { type_name, ty } => (type_name, Some(ty)),
                 Receiver::This { container, .. } => (container, None),
@@ -6116,11 +6573,11 @@ impl<'a> Engine<'a> {
             return self.foreign_decl_params(&self.boundary.top(file, callee_name, decl));
         }
         // A same-file executable's captured bounds.
-        if let Some(params) = self.exec_bounds.get(&callee_name)
-            && !params.is_empty()
+        if let Some(window) = self.own_exec_window(callee_name, false)
+            && !window.params.is_empty()
         {
-            let own = params.len();
-            return Some((params.to_vec(), Vec::new(), Some(own)));
+            let own = window.params.len();
+            return Some((window.params.to_vec(), Vec::new(), Some(own)));
         }
         // A function-typed variable callee's written signature.
         if let Some(sig) = self.fn_var_sigs.get(&callee_name)
@@ -6132,6 +6589,114 @@ impl<'a> Engine<'a> {
         // A foreign top-level function's recovered spellings.
         self.top_level_decl(callee_name)
             .and_then(|decl| self.foreign_decl_params(&decl))
+    }
+
+    /// The named-constructor selector's inference environment
+    /// ([`Self::closure_callee_params`]'s creation arm): `callee_name` is
+    /// a registered constructor of the receiver's container — `C<T>.n(`,
+    /// `new C<T>.n(`, `p.C<T>.n(` — and the container's own parameters
+    /// pair against the call's written type arguments exactly like an own
+    /// member's would, the receiver's written instantiation seeding them.
+    /// `None` when the callee is no constructor (a static member takes
+    /// the member arm) or the container declares no parameters.
+    fn ctor_selector_params(
+        &self,
+        recv: Receiver,
+        callee_name: StringId,
+    ) -> Option<(
+        Vec<(StringId, Option<Ty>)>,
+        Vec<(StringId, Ty)>,
+        Option<usize>,
+    )> {
+        let (class, recv_ty) = match recv {
+            Receiver::Container { name, .. } => (name, None),
+            Receiver::Created { name, ty, .. } => (name, Some(ty)),
+            Receiver::PrefixedContainer { name, .. } => (name, None),
+            _ => (StringId::NONE, None),
+        };
+        let (container, _owner) = if let Receiver::PrefixedContainer { prefix, name, .. } = recv {
+            prefixed_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                prefix,
+                name,
+            )?
+        } else if class != StringId::NONE {
+            resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                class,
+            )?
+        } else {
+            return None;
+        };
+        // The selector must name a declared constructor — a static member
+        // answers through the member arm below, never here. The membership
+        // face is `constructors` (the same declared-selector table the
+        // tear-off face reads); `ctor_formals` keys on the unnamed face's
+        // class spelling and is a formals table, not a membership test.
+        if !container.constructors.contains(&callee_name) {
+            return None;
+        }
+        // The container's own parameters pair positionally against the
+        // receiver's written instantiation — `bounds.container_params`
+        // carries the same-file declared names (the member arm's source of
+        // truth); a prefix-resolved container answers through its own
+        // `type_param_names`/`type_param_bounds` tables (the bounds index
+        // keys on the diagnosing file's containers only). The bound trees
+        // translate through `tree_ty` so the `T extends num` spellings keep
+        // their bounds in the schema.
+        let params = self.bounds.container_params(class).or_else(|| {
+            (!container.type_param_names.is_empty()).then(|| {
+                container
+                    .type_param_names
+                    .iter()
+                    .map(|name| (*name, None, false))
+                    .collect()
+            })
+        })?;
+        if params.is_empty() {
+            return None;
+        }
+        let params: Vec<(StringId, Option<Ty>)> = params
+            .iter()
+            .map(|(name, bound, _)| (*name, bound.as_ref().map(|tree| self.tree_ty(tree))))
+            .collect();
+        // The seed source splits on the receiver face: a folded `Created`
+        // receiver's `ty` already carries the solved `C<int>` arguments; a
+        // `Container`/`PrefixedContainer` receiver spells them on the class
+        // segment before the selector (`C<int>.n(`, `p.C<int>.n(`), which
+        // `slot_creation_class`+`slot_head_group_args` recover from the
+        // callee row's byte range — the same read the head lane's
+        // `slot_creation_formals` runs. The callee row is the innermost
+        // open send's `.n` row — the most recent qualified row spelling
+        // `callee_name` still on the stack while its arguments bind.
+        let mut seeds: Vec<(StringId, Ty)> = Vec::new();
+        let written_args: Option<Vec<Ty>> = if let Some(Some(Ty::Named { args, .. })) = recv_ty
+            && args != ArgListId::EMPTY
+        {
+            Some(self.boundary.pool().get(args).to_vec())
+        } else {
+            self.rows
+                .iter()
+                .rev()
+                .find(|row| row.name == callee_name && row.qualified)
+                .and_then(|row| self.slot_creation_class(row.range))
+                .and_then(|(seg, seg_offset)| self.slot_head_group_args(seg, seg_offset))
+        };
+        if let Some(arg_list) = written_args
+            && arg_list.len() == params.len()
+        {
+            for ((param, _), ty) in params.iter().zip(arg_list.iter()) {
+                seeds.push((*param, *ty));
+            }
+        }
+        Some((params, seeds, None))
     }
 
     /// A foreign generic top-level function's inference-parameter
@@ -6440,6 +7005,242 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The send-close upward solve's merge for two conflicting lower
+    /// constraints on the same inference parameter — upstream
+    /// `MergedTypeConstraint`/`chooseTypes`: `C <: S` + `D <: S` binds
+    /// `S := LUB(C, D)` (the oracle's `Object` for disagreeing sibling
+    /// arguments, its `num` for an `int`/`double` pair). The candidates
+    /// this merge sees are always VALUE types (`closure_unify_upward`
+    /// pushes an argument's static type, never a schema parameter), so a
+    /// bare-headed or argument-carrying `Named` pair decides through the
+    /// supertype lattice; a `Null`/`Never`/top leg and every
+    /// non-`Named` shape keep the name-level under-report (the merge's
+    /// `schema_type_is_decidable` gate still poisons the slot).
+    fn closure_lub(&self, left: Ty, right: Ty) -> Ty {
+        if left == right {
+            return left;
+        }
+        // TOP absorbs; BOTTOM yields — the same lattice edges the
+        // composite join runs (least_upper_bound.dart:405-451).
+        if matches!(left, Ty::Dynamic | Ty::Void) {
+            return left;
+        }
+        if matches!(right, Ty::Dynamic | Ty::Void) {
+            return right;
+        }
+        if left == Ty::Never {
+            return right;
+        }
+        if right == Ty::Never {
+            return left;
+        }
+        // `UP(Null, T)` is `T?`; `Null` against `Null` already matched.
+        if left == Ty::Null {
+            return Self::nullable_form(right);
+        }
+        if right == Ty::Null {
+            return Self::nullable_form(left);
+        }
+        // The nullability merge: `UP(T1?, T2) = UP(T1, T2)?`.
+        if Self::closure_lub_nullable_leg(left) || Self::closure_lub_nullable_leg(right) {
+            return Self::nullable_form(
+                self.closure_lub(Self::non_null_form(left), Self::non_null_form(right)),
+            );
+        }
+        let (
+            Ty::Named {
+                name: l, args: la, ..
+            },
+            Ty::Named {
+                name: r, args: ra, ..
+            },
+        ) = (left, right)
+        else {
+            // A non-`Named` leg (a function/record/invalid face) has no
+            // name-level common supertype — the under-report posture.
+            return Ty::Unknown;
+        };
+        let world = self.name_world();
+        if l == r {
+            // Same head over covariant arguments: the pairwise LUB
+            // (`Iterable<int>`/`Iterable<double>` → `Iterable<num>`); a
+            // bare or arity-mismatched pair keeps the shared head.
+            let (left_args, right_args) = {
+                let pool = self.boundary.pool();
+                (pool.get(la).to_vec(), pool.get(ra).to_vec())
+            };
+            if la != ra && left_args.len() == right_args.len() && !left_args.is_empty() {
+                let joined: Vec<Ty> = left_args
+                    .iter()
+                    .zip(right_args.iter())
+                    .map(|(&a, &b)| self.closure_lub(a, b))
+                    .collect();
+                if joined.iter().all(|ty| *ty != Ty::Unknown) {
+                    return self.boundary.args.borrow_mut().named(l, false, &joined);
+                }
+            }
+            return Ty::Named {
+                name: l,
+                nullable: false,
+                args: if la == ra { la } else { ra },
+            };
+        }
+        // A subtype pair answers the supertype directly.
+        if world.named_sub(l, r) && (la == ArgListId::EMPTY || la == ra) {
+            return Ty::Named {
+                name: r,
+                nullable: false,
+                args: ra,
+            };
+        }
+        if world.named_sub(r, l) && (ra == ArgListId::EMPTY || ra == la) {
+            return Ty::Named {
+                name: l,
+                nullable: false,
+                args: la,
+            };
+        }
+        // Distinct heads: the least common supertype over the named
+        // lattice — the same candidate set and domination walk the
+        // composite join's common-supertype arm runs. Bare operands walk
+        // name-level (`int`/`double` answers `num`, unrelated classes
+        // `Object`). An arg-carrying pair needs the shared head certified
+        // under ONE instantiation on both sides — the official interface
+        // LUB's supertype-set intersection (`_computeLeastUpperBound`,
+        // least_upper_bound.dart:162-177): `List<int>`/`Set<int>` both view
+        // `Iterable<E>` with `E := int`, so `Iterable<int>` stands; views
+        // that differ (`C<int>`/`D<String>` over a shared `I`) are not in
+        // the intersection and the `Object` terminal keeps the oracle's
+        // answer. Without the strict snapshot the certification is
+        // unavailable and the `Object` under-report stands.
+        let mut heads: Vec<StringId> = vec![l, r, self.intern("Object")];
+        for name in [
+            "num",
+            "Comparable",
+            "Iterable",
+            "List",
+            "Set",
+            "Map",
+            "String",
+            "Pattern",
+            "bool",
+            "Enum",
+            "Function",
+            "Future",
+            "Record",
+        ] {
+            heads.push(self.intern(name));
+        }
+        if let Some(elements) = self.index.get(self.file) {
+            for (name, decl) in elements.declarations() {
+                if matches!(
+                    decl.kind,
+                    MicroKind::Class | MicroKind::Mixin | MicroKind::Enum | MicroKind::Extension
+                ) {
+                    heads.push(name);
+                }
+            }
+        }
+        heads.sort_unstable();
+        heads.dedup();
+        if la != ArgListId::EMPTY || ra != ArgListId::EMPTY {
+            let Some(ops) = self.ops else {
+                return Ty::named(self.intern("Object"));
+            };
+            let mut level: Vec<Ty> = Vec::new();
+            for head in heads {
+                let (Some(left_env), Some(right_env)) = (
+                    ops.instance_env(left, head, &self.boundary.args),
+                    ops.instance_env(right, head, &self.boundary.args),
+                ) else {
+                    continue;
+                };
+                if left_env != right_env {
+                    continue;
+                }
+                let args: Vec<Ty> = left_env.into_iter().map(|(_, ty)| ty).collect();
+                level.push(self.boundary.args.borrow_mut().named(head, false, &args));
+            }
+            if level.is_empty() {
+                return Ty::named(self.intern("Object"));
+            }
+            // The same domination descent the bare walk runs, the
+            // comparability ask at type level (`List<int>` dominates its
+            // `Iterable<int>` view even where the name lattice has no
+            // builtin edge): a candidate nothing strictly subtypes is the
+            // join when unique; a tied top level drops wholesale and the
+            // descent continues among what it dominated.
+            loop {
+                let dominated: Vec<usize> = (0..level.len())
+                    .filter(|&i| {
+                        (0..level.len()).any(|j| {
+                            j != i
+                                && self.slot_subtype(level[j], level[i]) == Some(true)
+                                && self.slot_subtype(level[i], level[j]) != Some(true)
+                        })
+                    })
+                    .collect();
+                let top: Vec<Ty> = level
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !dominated.contains(i))
+                    .map(|(_, &ty)| ty)
+                    .collect();
+                if top.len() == 1 {
+                    return top[0];
+                }
+                if top.len() == level.len() {
+                    return Ty::named(self.intern("Object"));
+                }
+                level = top;
+            }
+        }
+        let mut level: Vec<StringId> = heads
+            .into_iter()
+            .filter(|&head| head != l && head != r)
+            .filter(|&head| world.named_sub(l, head) && world.named_sub(r, head))
+            .collect();
+        if level.is_empty() {
+            return Ty::named(self.intern("Object"));
+        }
+        loop {
+            let dominated: Vec<usize> = (0..level.len())
+                .filter(|&i| {
+                    (0..level.len()).any(|j| {
+                        j != i
+                            && world.named_sub(level[j], level[i])
+                            && !world.named_sub(level[i], level[j])
+                    })
+                })
+                .collect();
+            let top: Vec<StringId> = level
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !dominated.contains(i))
+                .map(|(_, &head)| head)
+                .collect();
+            if top.len() == 1 {
+                return Ty::named(top[0]);
+            }
+            if top.len() == level.len() {
+                return Ty::named(self.intern("Object"));
+            }
+            level = top;
+        }
+    }
+
+    /// [`Self::closure_lub`]'s nullability-merge leg predicate (named apart
+    /// from the composite join's own — a `Named`/`Function`/`Record` leg
+    /// carrying the trailing `?` rewrites through `non_null_form`).
+    fn closure_lub_nullable_leg(ty: Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Named { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+                | Ty::Record { nullable: true, .. }
+        )
+    }
+
     /// The schema function's parameter entry under `slot` — the type the
     /// oracle's `greatestClosure` consumes for one closure formal.
     fn schema_entry(sig: &FnVarSig, slot: SchemaSlot) -> Option<Ty> {
@@ -6527,9 +7328,46 @@ impl<'a> Engine<'a> {
             // oracle's downward inference from the assignment context
             // (`SplayTreeMap((a, b) => …)`'s `K`/`V`), a face the
             // name-level walk cannot see — the formal keeps `dynamic`.
-            Receiver::Unknown | Receiver::Prefix { .. } => self
+            // The bare-creation callee (`F0([...])`) reaches here too:
+            // its class declaration answers no `formals`, so the
+            // unnamed-constructor table (keyed on the class's own name)
+            // supplies the slot — `F0(List<int> a)` types the literal's
+            // context `List<int>` exactly like the keyword spelling.
+            Receiver::Unknown => self
                 .top_level_decl(name)
-                .and_then(|d| d.formals.as_deref().cloned()),
+                .and_then(|d| d.formals.as_deref().cloned())
+                .or_else(|| self.ctor_schema_formals(name, name))
+                .or_else(|| self.factory_ctor_formals(name, name)),
+            // A prefixed callee resolves through the prefix's import table,
+            // never this unit's unprefixed constructor tables — a local
+            // class `C` must not supply `p.C(`'s formals. The prefix
+            // segment rides the receiver's `name`; the callee row spells
+            // the class/selector behind it, so `p.C(` reads `C`'s unnamed
+            // constructor table from the prefix-resolved container
+            // (`p.f(...)`'s function-declaration arm keeps its own lane —
+            // the element model answers the prefixed function's formals
+            // the same walk serves).
+            Receiver::Prefix { name: prefix } => self
+                .top_level_decl(name)
+                .and_then(|d| d.formals.as_deref().cloned())
+                .or_else(|| {
+                    let (container, owner) = prefixed_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        *prefix,
+                        name,
+                    )?;
+                    let mut formals = (**container
+                        .ctor_formals
+                        .get(&name)
+                        .or_else(|| container.factory_formals.get(&name))?)
+                    .clone();
+                    self.project_formals(owner, &mut formals);
+                    self.patch_field_formals(name, &mut formals);
+                    Some(formals)
+                }),
             // A constructor invocation (`Eb._(cb: (n) => …)`, the below
             // row a bare class name): constructors are not
             // [`MemberEntry`] rows, so the member walk never reaches
@@ -6537,7 +7375,8 @@ impl<'a> Engine<'a> {
             Receiver::Container { name: class, .. } => self
                 .member_formals_full(recv, name)
                 .map(|f| f.into_owned())
-                .or_else(|| self.ctor_schema_formals(*class, name)),
+                .or_else(|| self.ctor_schema_formals(*class, name))
+                .or_else(|| self.factory_ctor_formals(*class, name)),
             _ => self
                 .member_formals_full(recv, name)
                 .map(|f| f.into_owned())
@@ -6682,6 +7521,262 @@ impl<'a> Engine<'a> {
         Some(formals)
     }
 
+    /// The argument-slot context's creation-head formal table: the callee
+    /// transport drops the row for a keyword creation (`new F0([...])`) and
+    /// a written-group head (`F0<int>(`, `C<int>.named(`), so
+    /// [`Self::arg_slot_ty_ctx`] re-derives the resolved container and the
+    /// selected constructor from the level's own head latches — the same
+    /// source-spelled walk `invocation.rs`'s `creation_class_before` runs
+    /// for the fold, kept local because the byte walk answers the pair
+    /// (class segment AND optional prefix) the formals need.
+    ///
+    /// `named` selects the table key: the unnamed face keys on the class's
+    /// own name (`F0(` → `ctor_formals[F0]`), the named face on the
+    /// written selector (`F0.n(` → `ctor_formals[n]`). A written
+    /// `<...>` group on the class segment instantiates the container's
+    /// own parameters into the formals (`F0<int>([...])` reads
+    /// `List<int>`, never `List<T>`); the to-bounds face of a raw head
+    /// stays with the caller's unsolved-parameter gate (the literal
+    /// element check adjudicates the raw `List<T>` no worse than the
+    /// bind-time schema did).
+    fn slot_creation_formals(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        named: bool,
+    ) -> Option<Formals> {
+        // `name`/`range` spell the head the latch carries — the class for
+        // an unnamed head, the `.named` selector for a named one. The
+        // class segment sits before it, over one `.` and a balanced
+        // `<...>` group when written; for the unnamed face it IS `name`.
+        let (class, selector, class_offset) = if named {
+            let (class, class_offset) = self.slot_creation_class(range)?;
+            (class, name, class_offset)
+        } else {
+            (name, name, range.offset)
+        };
+        // A `p.` before the class segment resolves through the prefix's
+        // import table, never this unit's own scope.
+        let (container, owner) = match self.slot_head_prefix(class_offset) {
+            Some(prefix) => prefixed_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                prefix,
+                class,
+            )?,
+            None => resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                class,
+            )?,
+        };
+        let mut formals = (**container
+            .ctor_formals
+            .get(&selector)
+            .or_else(|| container.factory_formals.get(&selector))?)
+        .clone();
+        self.project_formals(owner, &mut formals);
+        self.patch_field_formals(class, &mut formals);
+        // The class segment's own written group (`F0<int>`) instantiates
+        // the container's parameters into every formal — the send's
+        // solved `List<int>` face. A raw head instantiates to the
+        // declared bounds (`instantiateToBounds`: `F3<dynamic>` — an
+        // unbounded parameter's `dynamic` accepts every literal element
+        // the way the oracle's inferred instantiation does); an arity
+        // mismatch leaves the formals unsubstituted (the wrong-arity
+        // verdict is another layer's).
+        let args = self.slot_head_group_args(class, class_offset);
+        let keys: FxHashMap<StringId, Ty> = match args {
+            Some(args) if args.len() == container.type_param_names.len() => container
+                .type_param_names
+                .iter()
+                .copied()
+                .zip(args.iter().copied())
+                .collect(),
+            _ => container
+                .type_param_names
+                .iter()
+                .copied()
+                .zip(container.type_param_bounds.iter().copied())
+                .map(|(param, bound)| {
+                    let bound = self.boundary.ty(owner, bound);
+                    (
+                        param,
+                        if bound == Ty::UNKNOWN {
+                            Ty::Dynamic
+                        } else {
+                            bound
+                        },
+                    )
+                })
+                .collect(),
+        };
+        if !keys.is_empty() {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .map(|f| &mut f.ty)
+                .chain(formals.named.iter_mut().map(|f| &mut f.ty))
+            {
+                *formal = self.substitute_ty(*formal, &keys);
+            }
+        }
+        Some(formals)
+    }
+
+    /// The class segment a named-selector creation head spells
+    /// (`C.named(`, `C<int>.named(`): the identifier before the selector's
+    /// `.`, across a balanced `<...>` type-argument group when one sits
+    /// between — the same ASCII byte walk `invocation.rs`'s
+    /// `creation_class_before` runs for the fold. Returns the interned
+    /// class name and the segment's UTF-16 start offset.
+    fn slot_creation_class(&self, selector: SourceRange) -> Option<(StringId, u32)> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(selector.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'.' {
+            return None;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor > 0 && bytes[cursor - 1] == b'>' {
+            let mut depth = 0usize;
+            while cursor > 0 {
+                let byte = bytes[cursor - 1];
+                cursor -= 1;
+                if byte == b'>' {
+                    depth += 1;
+                } else if byte == b'<' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if cursor == 0 {
+                return None;
+            }
+            while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                cursor -= 1;
+            }
+        }
+        let end = cursor;
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric()
+                || bytes[cursor - 1] == b'_'
+                || bytes[cursor - 1] == b'$')
+        {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        Some((
+            self.intern(&self.source[cursor..end]),
+            self.utf16_of(cursor),
+        ))
+    }
+
+    /// The import prefix a class segment's head is qualified by
+    /// (`p.C(`/`p.C.n(` → `p`): the identifier before the segment's `.`,
+    /// ASCII-walked like [`Self::slot_creation_class`]. `None` for a bare
+    /// head — the `.` the walk finds could also be `..`/`?.`, neither of
+    /// which prefixes a type, so the left-guard rejects those spellings.
+    fn slot_head_prefix(&self, offset: u32) -> Option<StringId> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor < 2 || bytes[cursor - 1] != b'.' {
+            return None;
+        }
+        // A cascade (`..`) or null-aware (`?.`) dot is no prefix edge.
+        if bytes[cursor - 2] == b'.' || bytes[cursor - 2] == b'?' {
+            return None;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let end = cursor;
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric()
+                || bytes[cursor - 1] == b'_'
+                || bytes[cursor - 1] == b'$')
+        {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        Some(self.intern(&self.source[cursor..end]))
+    }
+
+    /// The written `<...>` group after a class segment's head
+    /// (`F0<int>(` → `[int]`): the group's balanced bytes sit between the
+    /// head's end and the next non-trivia byte — `.`/`(` either way the
+    /// caller's latch already proved. `None` when no group was written or
+    /// the type-argument parse cannot spell it (an unregistered head, a
+    /// function-typed argument — the under-report posture).
+    fn slot_head_group_args(&self, head: StringId, offset: u32) -> Option<Vec<Ty>> {
+        // `call_type_args`/`completed_group` carry the headed group's
+        // parsed arguments keyed at the segment's own offset — the same
+        // read `receiver_group_args` runs for a tear-off operand; only
+        // the byte-walk below covers a group neither latch saw.
+        if let Some((_, entry)) = self.call_type_args.iter().find(|(at, _)| *at == offset) {
+            return Some(entry.tys.to_vec());
+        }
+        if let Some((_, group_offset, args)) = &self.completed_group
+            && *group_offset == offset
+        {
+            return Some(args.clone());
+        }
+        let bytes = self.source.as_bytes();
+        let head_len = self.strings.resolve(head).encode_utf16().count() as u32;
+        let mut cursor = self.byte_of(offset + head_len);
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'<' {
+            return None;
+        }
+        let mut depth = 0usize;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if depth != 0 || cursor >= bytes.len() {
+            return None;
+        }
+        let left = Token {
+            id: 0,
+            range: SourceRange {
+                offset: self.utf16_of(cursor + 1),
+                length: 1,
+            },
+        };
+        self.literal_group_args(left)
+    }
+
     /// Publishes one resolved constructor-use edge (#2931): a `member_refs`
     /// row the annotation verifier's `member: Some` arm drains — its
     /// `ctor_annotations` fallback answers the deprecated-constructor face
@@ -6809,68 +7904,34 @@ impl<'a> Engine<'a> {
     /// begin-time latch is its stale face).
     pub(crate) fn closure_context_ty(&mut self, literal_offset: u32) -> (Option<Ty>, bool) {
         let mark = self.rows.len();
-        // (i) The declaration initializer: the literal opened exactly at
-        // the initializer's mark (a deeper literal inside it opened after
-        // a callee's row and misses). `Function2<int, String>` folds to
-        // `String Function(int)` — the alias the raw `pending_decl_ty`
-        // misses.
-        if self.init_mark == Some(mark)
-            && let Some(ty) = self.pending_decl_ty
-        {
-            let folded = self.fold_alias_ty(ty);
-            if let Some(ctx) = self.function_ty_of(folded) {
-                return (Some(ctx), false);
-            }
-            // The old-style typedef's element-model face: `typedef T
-            // Function2<S, T>(S x)` spells its `Ty::Function` RHS through
-            // `decl.var_ty`, with the written arguments pairing through
-            // the shape's own `type_params_named` — `instantiate_alias`'s
-            // `type_param_names` gate misses this spelling entirely.
-            if let Ty::Named { name, args, .. } = folded
-                && args != ArgListId::EMPTY
-                && let Some(ctx) = self.closure_typedef_function_ty(name, args)
-            {
-                return (Some(ctx), false);
-            }
-        }
-        // (ii) The assignment right-hand side: the token directly before
-        // the literal is `=`/`??=` and the closest non-value row before it
-        // is the write target. `x = (e) => 3` over a `Function2` field
-        // reads the folded target face; a literal deeper in the RHS (a
-        // send's argument, a `??` operand) sits behind a `(`/`?`/`,`
-        // token and never matches.
-        if let Some(ctx) = self.assignment_ctx_at(literal_offset) {
-            return (Some(ctx), false);
-        }
-        // (iii) The argument slot: the literal opened exactly where the
-        // pending argument's rows begin — `arg_open` holds between
-        // `open_argument` and the flush, `mark` is the row count the
-        // argument's own rows start at. The slot's declared formal folds
-        // to the schema function; the call's inference parameters already
-        // substituted ride the instantiated answer.
-        if let Some(ctx) = self.argument_ctx_at(mark) {
-            return (Some(ctx), true);
-        }
-        // (iv) The enclosing executable's return position: the literal
-        // opened exactly where the in-flight `return` began and the
-        // enclosing declared return is function-shaped — `return (x) => …`
-        // inside `Function2<int, String> f() { … }`. The mark holds for
-        // arrow AND block bodies (the body's own returns re-arm
-        // `return_mark` inside the literal, where the capture already
-        // latched the context — the false direction the old mark-equality
-        // read could not separate). The `=>`-body arm (`body_mark` latches
-        // where the body's expression begins) is the same position spelled
-        // without `return`: `f() => (x) => …` — gated on the enclosing
-        // body's brace being absent, so a block body's first-statement
-        // literal (`f() { (x) => …; }`) never takes the channel.
+        // (iv) The enclosing executable's return position runs first: a
+        // literal nested in an outer literal's `=>` body opens at the SAME
+        // row mark as the initializer that owns the outer literal (the
+        // outer's deferred rows never advanced the count), so the
+        // declaration channel below would steal it and re-bind the
+        // declaration face — `F<int> g = () => (x) => …` would hand the
+        // inner literal `F<int>`'s whole instantiated signature instead of
+        // the outer context's return. Position beats provenance upstream
+        // (`inferLocalFunction` reads the literal's AST position, never
+        // the enclosing declaration's): whenever a return or arrow-body
+        // mark matches, the enclosing executable is the literal's real
+        // host.
+        // The mark holds for arrow AND block bodies (the body's own
+        // returns re-arm `return_mark` inside the literal, where the
+        // capture already latched the context — the false direction the
+        // old mark-equality read could not separate). The `=>`-body arm
+        // (`body_mark` latches where the body's expression begins) is the
+        // same position spelled without `return`: `f() => (x) => …` —
+        // gated on an enclosing frame's brace being absent (any executable
+        // — declared OR a literal — the literal's own frame is skipped:
+        // its `=>` body never opens a brace but its context is what this
+        // call is still deciding), so a block body's first-statement
+        // literal (`f() { (x) => …; }`, `() { (x) => …; }`) never takes
+        // the channel.
         let at_return = self.return_mark == Some(mark);
         let at_arrow_body = self.body_mark == Some(mark)
-            && self.frames.iter().rev().any(|f| match &f.kind {
-                FrameKind::Executable {
-                    ret: Some(_),
-                    body_brace,
-                    ..
-                } => body_brace.is_none(),
+            && self.frames.iter().rev().skip(1).any(|f| match &f.kind {
+                FrameKind::Executable { body_brace, .. } => body_brace.is_none(),
                 _ => false,
             });
         if at_return || at_arrow_body {
@@ -6904,6 +7965,100 @@ impl<'a> Engine<'a> {
                     _ => {}
                 }
             }
+        }
+        // (i) The declaration initializer: the literal opened exactly at
+        // the initializer's mark (a deeper literal inside it opened after
+        // a callee's row and misses). `Function2<int, String>` folds to
+        // `String Function(int)` — the alias the raw `pending_decl_ty`
+        // misses.
+        if self.init_mark == Some(mark)
+            && let Some(ty) = self.pending_decl_ty
+        {
+            // A bare generic alias head (`Foo f = <T>(T x) {}` over
+            // `typedef Foo<S> = S Function<T>(T x)`): the fold below hands
+            // the literal the raw right-hand side, the alias's own
+            // parameters riding unsubstituted (`S Function(T)` — the face
+            // every downstream diagnostic then displays). The oracle opens
+            // the literal under the instantiate-to-bounds instantiation
+            // (`Foo<dynamic>` = `dynamic Function<T>(T)`,
+            // `instantiateToBounds`, type_system.dart:719-731), so the
+            // typedef face answers it whole first. A `?`-spelled use keeps
+            // the same instantiation — the declared nullability joins onto
+            // the substituted signature (`Foo?` reads `(dynamic
+            // Function<T>(T))?`) exactly like the unchanged fold's own
+            // `nullable |=` joins the unfolded right-hand side. A head the
+            // face cannot instantiate (a non-alias, a poisoned capture)
+            // falls through to that fold.
+            if let Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } = ty
+                && let Some(ctx) = self.closure_typedef_function_ty(name, ArgListId::EMPTY)
+            {
+                let ctx = if nullable {
+                    match ctx {
+                        Ty::Function { shape, .. } => Ty::Function {
+                            shape,
+                            nullable: true,
+                        },
+                        other => other,
+                    }
+                } else {
+                    ctx
+                };
+                return (Some(ctx), false);
+            }
+            let folded = self.fold_alias_ty(ty);
+            if let Some(ctx) = self.function_ty_of(folded) {
+                return (Some(ctx), false);
+            }
+            // The old-style typedef's element-model face: `typedef T
+            // Function2<S, T>(S x)` spells its `Ty::Function` RHS through
+            // `decl.var_ty`, with the written arguments pairing through
+            // the shape's own `type_params_named` — `instantiate_alias`'s
+            // `type_param_names` gate misses this spelling entirely. The
+            // use-site `?` joins the substituted signature the same way
+            // the bare-use arm above carries it.
+            if let Ty::Named {
+                name,
+                nullable,
+                args,
+            } = folded
+                && args != ArgListId::EMPTY
+                && let Some(ctx) = self.closure_typedef_function_ty(name, args)
+            {
+                let ctx = if nullable {
+                    match ctx {
+                        Ty::Function { shape, .. } => Ty::Function {
+                            shape,
+                            nullable: true,
+                        },
+                        other => other,
+                    }
+                } else {
+                    ctx
+                };
+                return (Some(ctx), false);
+            }
+        }
+        // (ii) The assignment right-hand side: the token directly before
+        // the literal is `=`/`??=` and the closest non-value row before it
+        // is the write target. `x = (e) => 3` over a `Function2` field
+        // reads the folded target face; a literal deeper in the RHS (a
+        // send's argument, a `??` operand) sits behind a `(`/`?`/`,`
+        // token and never matches.
+        if let Some(ctx) = self.assignment_ctx_at(literal_offset) {
+            return (Some(ctx), false);
+        }
+        // (iii) The argument slot: the literal opened exactly where the
+        // pending argument's rows begin — `arg_open` holds between
+        // `open_argument` and the flush, `mark` is the row count the
+        // argument's own rows start at. The slot's declared formal folds
+        // to the schema function; the call's inference parameters already
+        // substituted ride the instantiated answer.
+        if let Some(ctx) = self.argument_ctx_at(mark) {
+            return (Some(ctx), true);
         }
         (None, false)
     }
@@ -6967,45 +8122,83 @@ impl<'a> Engine<'a> {
     /// answers no formal for the slot — including the unsolved-parameter
     /// gate (a bare `T` is no context).
     pub(crate) fn arg_slot_ty_ctx(&mut self) -> Option<Ty> {
-        let level = self.arg_levels.last()?;
-        let slot = match level.pending_name {
-            Some(label) => SchemaSlot::Named(label),
-            None => SchemaSlot::Positional(
-                level
-                    .args
-                    .iter()
-                    .filter(|(label, ..)| label.is_none())
-                    .count(),
-            ),
+        let (slot, callee_row, enum_const, unnamed_head, named_head) = {
+            let level = self.arg_levels.last()?;
+            (
+                match level.pending_name {
+                    Some(label) => SchemaSlot::Named(label),
+                    None => SchemaSlot::Positional(
+                        level
+                            .args
+                            .iter()
+                            .filter(|(label, ..)| label.is_none())
+                            .count(),
+                    ),
+                },
+                level.callee_row,
+                level.enum_const,
+                level.unnamed_head,
+                level.named_head,
+            )
         };
-        let callee_row = level.callee_row?;
-        let callee = self.rows.get(callee_row)?.clone();
-        let recv = if callee.qualified {
-            callee_row
-                .checked_sub(1)
-                .and_then(|below| self.rows.get(below))
-                .map_or(Receiver::Unknown, |below| {
-                    let recv = self.argument_receiver(below);
-                    if matches!(recv, Receiver::Unknown) {
-                        self.chain_link_receiver(below)
-                    } else {
-                        recv
-                    }
-                })
-        } else {
-            Receiver::Unknown
+        // The creation-head lane: the callee transport drops the row for
+        // a keyword creation (`new F0([...])`) and a written-group head
+        // (`F0<int>(`, `F0<int>.named(`), but the level's own latches
+        // still spell it — `unnamed_head` is the class name whose
+        // constructor table keys on itself, `named_head` is the `.named`
+        // selector whose class segment sits before the dot.
+        let (recv, callee_name, callee_row, head_formals) = match callee_row {
+            Some(callee_row) => {
+                let callee = self.rows.get(callee_row)?.clone();
+                let recv = if callee.qualified {
+                    callee_row
+                        .checked_sub(1)
+                        .and_then(|below| self.rows.get(below))
+                        .map_or(Receiver::Unknown, |below| {
+                            let recv = self.argument_receiver(below);
+                            if matches!(recv, Receiver::Unknown) {
+                                self.chain_link_receiver(below)
+                            } else {
+                                recv
+                            }
+                        })
+                } else {
+                    Receiver::Unknown
+                };
+                (recv, callee.name, Some(callee_row), None)
+            }
+            None if enum_const => return None,
+            None => match (unnamed_head, named_head) {
+                (Some((head, range)), _) => (
+                    Receiver::Unknown,
+                    head,
+                    None,
+                    self.slot_creation_formals(head, range, false),
+                ),
+                (None, Some((selector, range))) => (
+                    Receiver::Unknown,
+                    selector,
+                    None,
+                    self.slot_creation_formals(selector, range, true),
+                ),
+                (None, None) => return None,
+            },
         };
-        let callee_name = callee.name;
         // The slot's own declared type — the schema function the literal
         // matches. The element formals answer first; a function-typed
         // variable callee's captured signature closes (the same two
-        // lanes [`Self::closure_context_schema`] opens).
+        // lanes [`Self::closure_context_schema`] opens). A creation head
+        // reads the selected constructor's table (`new F0([...])` types
+        // the literal's context from `F0(List<int> a)`); the written
+        // group's type arguments instantiate the class's own parameters
+        // there (`F0<int>([...])` reads `List<int>`, never `List<T>`).
+        let slot_formals = head_formals.or_else(|| self.callee_formals(&recv, callee_name));
         let slot_ty = match slot {
-            SchemaSlot::Positional(index) => self
-                .callee_formals(&recv, callee_name)
+            SchemaSlot::Positional(index) => slot_formals
+                .as_ref()
                 .and_then(|f| f.positional.get(index).map(|f| f.ty)),
-            SchemaSlot::Named(label) => self
-                .callee_formals(&recv, callee_name)
+            SchemaSlot::Named(label) => slot_formals
+                .as_ref()
                 .and_then(|f| f.named_formal(label).map(|f| f.ty)),
         }
         .or_else(|| {
@@ -7038,7 +8231,7 @@ impl<'a> Engine<'a> {
         // `T Function(T)` latch would adjudicate the body's returns
         // against a bare callee parameter (the oracle's context is the
         // solved signature; an unsolved `T` is no context at all).
-        let inst = self.closure_schema_instantiate(slot_ty, &recv, callee_name, Some(callee_row));
+        let inst = self.closure_schema_instantiate(slot_ty, &recv, callee_name, callee_row);
         match inst {
             Some(ty) => Some(ty),
             None => {
@@ -7160,16 +8353,21 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The instantiated function type an old-style (function) typedef's
-    /// use spells — `Function2<int, String>` for `typedef T Function2<S,
-    /// T>(S x)` — the channel-(i) fallback when [`Self::fold_alias_ty`]
-    /// yields no `Ty::Function`. The element model is the only whole
-    /// record the old spelling arms: the collector synthesizes the RHS
-    /// `Ty::Function` into `decl.var_ty` (its `type_params_named` pairs
-    /// the written arguments positionally), while `decl.type_param_names`
-    /// stays empty (the count-only payload `instantiate_alias` refuses —
-    /// resolution.rs:234). `None` for a non-alias head, a non-function
-    /// `var_ty`, or an arity mismatch.
+    /// The instantiated function type a typedef's use spells as a closure
+    /// context — `Function2<int, String>` for the old-style
+    /// `typedef T Function2<S, T>(S x)` written with arguments, and
+    /// `dynamic Function<T>(T)` for the modern `typedef Foo<S> = S
+    /// Function<T>(T x)` used bare — the channel-(i) faces
+    /// [`Self::fold_alias_ty`] answers raw. The written face pairs the
+    /// arguments against the shape's own `type_params_named` (the element
+    /// model's only whole record for the old spelling: the collector
+    /// synthesizes the RHS `Ty::Function` into `decl.var_ty`, while
+    /// `decl.type_param_names` stays empty — the count-only payload
+    /// `instantiate_alias` refuses). The bare face substitutes the ALIAS's
+    /// parameters (`decl.type_param_names`) to their instantiate-to-bounds
+    /// defaults and keeps the right-hand side's own `<T>` group.
+    /// `None` for a non-alias head, a non-function `var_ty`, a poisoned
+    /// bounds capture, or a partially written argument list.
     fn closure_typedef_function_ty(&self, name: StringId, args: ArgListId) -> Option<Ty> {
         let (owner, decl) = match lookup_scoped(
             self.graph,
@@ -7208,14 +8406,56 @@ impl<'a> Engine<'a> {
             return Some(Ty::Function { shape, nullable });
         }
         let written: Vec<Ty> = self.boundary.pool().get(args).to_vec();
-        if written.len() != type_params_named.len() {
+        // A written MODERN-alias use (`Foo<int>` over `typedef Foo<S> = S
+        // Function<T>(T x)`): the arguments instantiate the ALIAS's
+        // parameters — the declaration's own spellings — so `S := int`
+        // substitutes into the right-hand shape while the function's own
+        // `<T>` group survives verbatim (`Foo<int>` = `int Function<T>(T)`
+        // — the element-model type the oracle hands `inferLocalFunction`).
+        // Zipping the group's parameters instead would bind `T := int`,
+        // drop the group, and leave `S` raw (the pre-fix `'S'` row). The
+        // old-style spelling (`typedef List<X> Function(int) F<X>()`)
+        // records no `type_param_names` — its alias parameters ARE the
+        // right-hand side's `type_params_named` group, so the written
+        // list pairs against the group directly and consumes it.
+        //
+        // A bare generic use (`Foo f`): the oracle resolves the raw head to
+        // the instantiate-to-bounds instantiation (`Foo<dynamic>` —
+        // `instantiateToBounds`, type_system.dart:719-731), so each alias
+        // parameter takes its bound default under the same preserved
+        // group. A poisoned capture (the snapshot answers `None`) and a
+        // partially written list (the wrong-arity face another layer
+        // reports) keep the bail's silence.
+        let (map, own_group) = if !written.is_empty() {
+            if !decl.type_param_names.is_empty() && written.len() == decl.type_param_names.len() {
+                let map: FxHashMap<StringId, Ty> =
+                    decl.type_param_names.iter().copied().zip(written).collect();
+                (map, Some(type_params_named))
+            } else if decl.type_param_names.is_empty() && written.len() == type_params_named.len() {
+                let map: FxHashMap<StringId, Ty> = type_params_named
+                    .iter()
+                    .map(|(param, _)| *param)
+                    .zip(written)
+                    .collect();
+                (map, None)
+            } else {
+                return None;
+            }
+        } else if written.is_empty() {
+            let defaults = self.bounds.itb_default_args(self.strings, name)?;
+            let spellings = &decl.type_param_names;
+            if defaults.len() != spellings.len() {
+                return None;
+            }
+            let map: FxHashMap<StringId, Ty> = spellings
+                .iter()
+                .copied()
+                .zip(defaults.iter().map(|tree| self.tree_ty(tree)))
+                .collect();
+            (map, Some(type_params_named))
+        } else {
             return None;
-        }
-        let map: FxHashMap<StringId, Ty> = type_params_named
-            .iter()
-            .map(|(param, _)| *param)
-            .zip(written)
-            .collect();
+        };
         let ret = self.closure_subst_param_ty(return_ty, &map);
         let positional: Vec<Ty> = positional
             .iter()
@@ -7225,15 +8465,19 @@ impl<'a> Engine<'a> {
             .iter()
             .map(|(n, ty)| (*n, self.closure_subst_param_ty(*ty, &map)))
             .collect();
-        // The substituted shape is a concrete signature — the typedef's
-        // own parameter group is consumed by the instantiation, so the
-        // answer carries no `type_params` of its own.
-        Some(
-            self.boundary
-                .args
-                .borrow_mut()
-                .function(0, ret, &positional, &named, nullable),
-        )
+        // The written path's zip consumed the group — the answer is a
+        // concrete signature with no `type_params` of its own. The bare
+        // path substituted the ALIAS's parameters instead, so the
+        // right-hand side's own `<T>` group survives verbatim
+        // (`Foo<dynamic>` = `dynamic Function<T>(T)` — the element-model
+        // type the oracle hands `inferLocalFunction`).
+        let mut substituted = self.boundary.args.borrow_mut();
+        let ty = match own_group {
+            Some(group) => substituted.function_generic(&group, ret, &positional, &named, nullable),
+            None => substituted.function(0, ret, &positional, &named, nullable),
+        };
+        drop(substituted);
+        Some(ty)
     }
 
     /// The use-site substitution of one typedef's parameter spellings:
@@ -7304,6 +8548,29 @@ impl<'a> Engine<'a> {
                         shape.named.to_vec(),
                     )
                 };
+                // The signature's own binder shadows the use-site map
+                // (`typedef Foo<T> = T Function<T>(T)` — every `T` leaf
+                // inside the right-hand signature is bound by the `<T>`
+                // group, never by the alias's own `T`, so `Foo<int>` reads
+                // `T Function<T>(T)` verbatim — the oracle's
+                // `element.dart` `instantiate` substitutes only the free
+                // spellings). A count-only group names nothing: opaque —
+                // the under-report direction, matching `ty_fold`'s walk. A
+                // bound subtree (`<T extends List<T>>`) sits inside the
+                // same scope — its `T` leaves are the binder's, so the
+                // shadowed map covers the bounds too.
+                let shadowed: Vec<StringId> = names.iter().map(|(n, _)| *n).collect();
+                if type_params > 0 && shadowed.is_empty() {
+                    return ty;
+                }
+                let inner = if shadowed.is_empty() {
+                    None
+                } else {
+                    let mut inner = map.clone();
+                    inner.retain(|name, _| !shadowed.contains(name));
+                    Some(inner)
+                };
+                let map = inner.as_ref().unwrap_or(map);
                 let positional: Vec<Ty> = positional
                     .iter()
                     .map(|ty| self.closure_subst_param_ty(*ty, map))
@@ -7370,19 +8637,34 @@ impl<'a> Engine<'a> {
                 .map(|(name, f)| (*name, self.tree_ty(f)))
                 .collect();
             // The signature's own group interns beside the shape (#2878),
-            // the same column the diagnose-side fn capture carries.
+            // the same column the diagnose-side fn capture carries. A
+            // count-only capture (a projection that kept the arity but not
+            // the spellings) still interns the arity — the render drops
+            // only the unspellable group, never the quantifier itself.
             let type_params: Vec<(StringId, Option<Ty>)> = fn_tree
                 .type_params_named
                 .iter()
                 .map(|(name, bound)| (*name, bound.as_ref().map(|b| self.tree_ty(b))))
                 .collect();
-            return self.boundary.args.borrow_mut().function_generic(
-                &type_params,
-                ret,
-                &positional,
-                &named,
-                tree.nullable,
-            );
+            return if type_params.is_empty() && fn_tree.type_params > 0 {
+                self.boundary.args.borrow_mut().function_required(
+                    fn_tree.type_params,
+                    fn_tree.required_positional,
+                    ret,
+                    &positional,
+                    &named,
+                    tree.nullable,
+                )
+            } else {
+                self.boundary.args.borrow_mut().function_generic_required(
+                    &type_params,
+                    fn_tree.required_positional,
+                    ret,
+                    &positional,
+                    &named,
+                    tree.nullable,
+                )
+            };
         }
         match self.strings.resolve(tree.head) {
             "dynamic" => return Ty::Dynamic,

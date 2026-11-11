@@ -391,7 +391,10 @@ class Reference {
 
 List<Reference> byIndex() => [];
 
-int f(int index) {
+// The `int?` return keeps the dead `?.` the only row under test — an `int`
+// return would add an incidental `return_of_invalid_type` (`reference?.id`
+// is `int?`) that the oracle also emits but this pin does not target.
+int? f(int index) {
   var reference = byIndex()[index];
   return reference?.id;
 }

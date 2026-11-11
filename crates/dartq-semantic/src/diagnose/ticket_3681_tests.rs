@@ -11,7 +11,7 @@
 //! Oracle provenance: `dart analyze` 3.13.1 — every pin below is silent
 //! on the oracle.
 
-use super::test_rig::{assert_silent, report_ops};
+use super::test_rig::{RigImport, assert_silent, report_ops, report_ops_imports};
 
 /// The co19 `StaticType`/`Exactly<T>` extension the census cases use.
 const EXPECT_HELPER: &str = "typedef Exactly<T> = T Function(T);\n\
@@ -123,5 +123,55 @@ fn if_null_assignment_double_int_types_num() {
          \x20 (d ??= 1).expectStaticType<Exactly<num>>();\n\
          }}\n"
     ));
+    assert_silent(&report);
+}
+
+// —— the return-context arm ————————————————————————————————————
+
+/// A conditional in direct return position under an `async` `Future<T>`
+/// declared return reaches the context arm's `FutureOr<T>` widening:
+/// `future_value_type` unwraps `T` by READING the pool, and the widening
+/// re-interns `FutureOr<T>` by WRITING the same pool. The unwrap used to
+/// sit inside the re-intern's argument list — a method receiver is
+/// evaluated before its arguments, so the unwrap's shared `pool()` read
+/// hit the live `RefMut` and panicked ("RefCell already mutably
+/// borrowed") on the listener-driven walk
+/// (`end_conditional_expression` → `fold_conditional` →
+/// `return_expression_context`). The unwrap now completes before the
+/// borrow; the fold's answer is unchanged (the plain LUB `int` already
+/// fits `FutureOr<int>`, so the node keeps `int`). Oracle: silent.
+#[test]
+fn conditional_return_async_future_context_no_pool_reentry() {
+    let report = report_ops(
+        "Future<int> f(bool c) async {\n\
+         \x20 return c ? 1 : 2;\n\
+         }\n",
+    );
+    assert_silent(&report);
+}
+
+// —— the mixin-constraint projection arm ————————————————————————————
+
+/// A mixin application's `on`-constraint check projects the constraint
+/// face through `Boundary::ty` (`verify_enum_member_set` →
+/// `verify_mixin_application` → `instantiated_constraint`), and a FOREIGN
+/// named face with written arguments re-interns its projected list into
+/// the diagnosing pool (`types.rs` projecting tail). The face used to be
+/// projected with the pool's shared `Ref` still live in this frame — the
+/// re-intern's `borrow_mut` then panicked ("RefCell already borrowed") on
+/// the whole-unit listener walk. The projection now completes before the
+/// borrow, the caller-holding hoist; the verdict is unchanged (the
+/// constraint `A<B>` is satisfied by the superclass `A<B>`, so the
+/// application stays silent). Oracle: silent.
+#[test]
+fn mixin_constraint_projection_no_pool_reentry() {
+    let report = report_ops_imports(
+        "class C extends A<B> with M {}\n",
+        &[RigImport {
+            uri: "package:t/m.dart",
+            prefix: None,
+            source: "class A<T> {}\nclass B {}\nmixin M on A<B> {}\n",
+        }],
+    );
     assert_silent(&report);
 }

@@ -554,9 +554,14 @@ fn build_fragments(
                             // token, and the oracle's pipeline folds those
                             // two reports into one row — only a
                             // back-to-back identical repeat is absorbed.
+                            // The merged cross-unit claims are always
+                            // members, never formal parameters, so the pair
+                            // code (`duplicate_field_formal_parameter`)
+                            // never applies here.
                             let row = DuplicateDecl {
                                 name: *name,
                                 range: entry.name_range,
+                                field_formal: false,
                             };
                             if unit_dups.last() != Some(&row) {
                                 unit_dups.push(row);

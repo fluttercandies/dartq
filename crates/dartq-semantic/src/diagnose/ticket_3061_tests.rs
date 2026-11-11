@@ -53,10 +53,16 @@ fn await_operand_argument_row_flattens() {
            f(await c.m());\n\
          }\n",
     );
-    assert_eq!(
-        codes(&folded),
-        Vec::<&str>::new(),
-        "`f(await c.m())` asks the flattened `int` — silent"
+    // The argument row is silent (the flattened `int` assigns), but the
+    // fixture's own `class C { Future<int> m(); }` declares a bodyless
+    // member in a CONCRETE class — the `concrete_class_with_abstract_member`
+    // row the #3934 class arm emits (oracle on the same input:
+    // `'m' must have a method body because 'C' isn't abstract.`). Assert on
+    // the argument face rather than on an empty report.
+    assert!(
+        !codes(&folded).contains(&"argument_type_not_assignable"),
+        "`f(await c.m())` asks the flattened `int` — no argument row: {:?}",
+        codes(&folded)
     );
 }
 
@@ -73,10 +79,19 @@ fn unawaited_future_argument_reports() {
            f(c.m());\n\
          }\n",
     );
+    // The argument row plus the fixture's own bodyless-member row (the
+    // #3934 class arm; oracle on the same input reports both).
+    let got = codes(&folded);
+    assert!(
+        got.contains(&"argument_type_not_assignable"),
+        "`f(c.m())` offers `Future<int>` against `int`: {got:?}"
+    );
     assert_eq!(
-        codes(&folded),
-        vec!["argument_type_not_assignable"],
-        "`f(c.m())` offers `Future<int>` against `int`"
+        got.iter()
+            .filter(|c| **c != "concrete_class_with_abstract_member")
+            .count(),
+        1,
+        "exactly one non-fixture row: {got:?}"
     );
 }
 

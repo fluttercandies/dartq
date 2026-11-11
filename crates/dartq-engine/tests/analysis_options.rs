@@ -927,8 +927,8 @@ fn included_file_local_problems_wrap_to_the_includer() {
     let issue = &near.issues[0];
     assert_eq!(issue.code.name, "included_file_warning");
     // The inner invalid-section row anchors at the value node in far.yaml —
-    // the oracle probe (dart analyze over `linter: 42`) reports (8..9), the
-    // section-value span convention pinned 2026-10-29.
+    // the oracle probe (dart analyze over `linter: 42`) reports (8..9),
+    // the section-value span convention pinned 2026-10-29.
     let far = dir.path("far.yaml").display().to_string();
     assert_eq!(
         issue.message,

@@ -1769,7 +1769,7 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 fn memory_answer(drain: &Drain<'_>) -> Value {
     let status = drain.engine.memory_status();
     let warm = drain.engine.warm_stats();
-    json!({
+    let mut answer = json!({
         "v": dartq_commands::SCHEMA_VERSION,
         "rss": status.rss_bytes,
         "limit_mib": status.limit_mib,
@@ -1777,7 +1777,22 @@ fn memory_answer(drain: &Drain<'_>) -> Value {
         "tier": status.degraded_tier,
         "warm_done": warm.completed,
         "warm_skipped": warm.skipped,
-    })
+    });
+    // The resident-state decomposition probe: with
+    // `DARTQ_RSS_DECOMPOSITION` set (the cold analyze face's env), the
+    // answer carries the same `dartq-rss`-family rows the cold face prints
+    // — the dep index, interning tables, store, index, and residency
+    // families of the loaded view, exact over owned columns at capacity.
+    if std::env::var_os("DARTQ_RSS_DECOMPOSITION").is_some() {
+        let rows: Vec<Value> = drain
+            .engine
+            .memory_report_full()
+            .into_iter()
+            .map(|(family, bytes, kind)| json!({"family": family, "bytes": bytes, "kind": kind}))
+            .collect();
+        answer["decomposition"] = Value::Array(rows);
+    }
+    answer
 }
 
 // ---------------------------------------------------------------------------

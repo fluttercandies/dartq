@@ -153,9 +153,12 @@ fn self_referential_bare_head_poisons_to_dynamic() {
     assert_eq!(rendered_defaults(&bounds, &strings, a), ["dynamic"]);
 }
 
-/// `class A<X extends G<Y>, Y extends num>` — the acyclic dependent
-/// completes with the peer's substituted default, so the alias keeps its
-/// written argument under the grounding: `G<num>` beside `num`.
+/// `class A<X extends G<Y>, Y extends num>` over `typedef G<X> = X
+/// Function()` — the acyclic dependent completes with the peer's
+/// substituted default, and `G`'s `X` sits in the covariant return, so the
+/// alias keeps its written argument under the grounding: `G<num>` beside
+/// `num` (probed: `dart analyze` 3.13.7 types a raw `A` as `A<G<num>,
+/// num>`). The contravariant twin below is the shape that grounds `Never`.
 #[test]
 fn argument_bearing_alias_bound_substitutes_the_peer_default() {
     let strings = StringTable::new();
@@ -177,6 +180,46 @@ fn argument_bearing_alias_bound_substitutes_the_peer_default() {
     bounds.note_container(Some(a), 25, 55, false, false);
 
     assert_eq!(rendered_defaults(&bounds, &strings, a), ["G<num>", "num"]);
+}
+
+/// The contravariant twin: `typedef G<X> = void Function(X);` stores `X`
+/// contravariant (it occurs only in a formal), so the grounding sweep's
+/// lower map lands `Never` for the same `class A<X extends G<Y>, Y extends
+/// num>` — `G<Never>` beside `num` (probed: `dart analyze` 3.13.7 types a
+/// raw `A` as `A<G<Never>, num>`).
+#[test]
+fn contravariant_alias_bound_grounds_the_peer_to_never() {
+    let strings = StringTable::new();
+    let g = strings.intern("G");
+    let a = strings.intern("A");
+    let x = strings.intern("X");
+    let y = strings.intern("Y");
+    let num = strings.intern("num");
+    let void_id = strings.intern("void");
+    let mut bounds = Bounds::new();
+    bounds.begin_alias(g);
+    bounds.begin_type_variables();
+    bounds.end_type_variable(x, false);
+    bounds.end_type_variables();
+    bounds.alias_formal_boundary();
+    bounds.alias_leaf(void_id, false, range(15, 4));
+    bounds.alias_formals_region_open();
+    bounds.alias_leaf(x, false, range(29, 1));
+    bounds.alias_formal_end(x, 29, true);
+    bounds.alias_formals_closed();
+    bounds.alias_rhs_question(false);
+    bounds.end_alias();
+    bounds.begin_type_variables();
+    bounds.leaf(num, false, range(60, 3));
+    bounds.end_type_variable(y, true);
+    bounds.begin_group(Some((g, range(42, 1))), false);
+    bounds.leaf(y, false, range(44, 1));
+    bounds.end_group(range(45, 1));
+    bounds.end_type_variable(x, true);
+    bounds.end_type_variables();
+    bounds.note_container(Some(a), 35, 65, false, false);
+
+    assert_eq!(rendered_defaults(&bounds, &strings, a), ["G<Never>", "num"]);
 }
 
 /// `class A<X extends List<G>>` — an alias leaf nested inside an

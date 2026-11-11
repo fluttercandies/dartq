@@ -597,6 +597,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// The recovery-only front of `computeType` (type_info.dart:165-215):
     /// built-ins, `.`-prefixed orphans, and `var<...>` shapes.
     fn compute_type_recovery(&mut self, required: bool, in_declaration: bool) -> TypeInfo {
+        // Recovery: a `.`-prefixed type whose prefix is missing
+        // (`computeType`'s recovery front for a non-type-reference head,
+        // type_info.dart:193-202). The arm sits OUTSIDE the built-in probe —
+        // any junk head reaches it in a required position — so a type
+        // argument like `<.[]` keeps a `.`-prefixed member (the
+        // `prefixedTypeReference` ensure reports `expected_type_name` at the
+        // `.`) instead of degrading to type-argument junk.
+        if required && self.peek_kind() == TokenKind::Period {
+            let type_param = self.compute_type_param_or_arg_at(0, in_declaration);
+            let mut complex = self.complex_from_here(type_param);
+            complex.compute_prefixed_type(self, required);
+            complex.recovered = true;
+            return TypeInfo::Complex(complex);
+        }
         let TokenKind::Keyword(kw) = self.peek_kind() else {
             return TypeInfo::NoType;
         };
@@ -639,14 +653,6 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             return TypeInfo::NoType;
         }
         if required {
-            if self.peek_kind() == TokenKind::Period {
-                // Prefixed type missing its prefix.
-                let type_param = self.compute_type_param_or_arg_at(1, in_declaration);
-                let mut complex = self.complex_from_here(type_param);
-                complex.compute_prefixed_type(self, required);
-                complex.recovered = true;
-                return TypeInfo::Complex(complex);
-            }
             if kw == Keyword::Var
                 && matches!(
                     self.cursor.look_kind(1),

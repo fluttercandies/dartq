@@ -909,7 +909,7 @@ fn dead_prefix_annotation_group_counts_against_nothing() {
     let report = report(source);
     let spans = rows(&report);
     let theirs = source.find("theirs").unwrap() as u32;
-    assert_eq!(spans, vec![("undefined_identifier", theirs)], "{spans:?}");
+    assert_eq!(spans, vec![("undefined_class", theirs)], "{spans:?}");
 }
 
 // —— #2351: the Map ctor-arity family (creation selector faces) ——————————

@@ -179,7 +179,7 @@ fn generic_function_type_argument_reports_the_arity_mismatch() {
 /// `test_notRegularBounded_notSuperBounded_parameter_invariant`, whose bare
 /// `foo(G g)` over `typedef G<X extends A<X>> = void Function<Y extends X>()`
 /// reports upstream).
-#[ignore = "alias heads answer no instantiate-to-bounds form: Bounds::bounds_instantiation has no decl_params entry for an alias element (bounds.rs)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn bare_alias_head_reports() {
     let hits = bounds_rows(&report_ops(

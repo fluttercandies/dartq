@@ -1,5 +1,10 @@
-//! Snapshot entries: keys and the checksummed, tables-stamped JSON payload
-//! frame.
+//! Snapshot entries: keys and the checksummed, tables-stamped binary
+//! payload frame. The payload codec is `bincode-next`'s serde bridge
+//! (#4207, positional): payload shapes carry every field on the wire (no
+//! `skip_serializing_if` — a positional decoder would misalign), and the
+//! generation header's `format_version` gates codec eras (a change of
+//! codec bumps [`crate::SNAPSHOT_FORMAT_VERSION`], so an old generation
+//! is a whole-generation miss before any entry decodes).
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -33,7 +38,7 @@ impl EntryKey {
     }
 }
 
-/// One stored entry. On disk: the blake3-128 hex checksum of the JSON
+/// One stored entry. On disk: the blake3-128 hex checksum of the payload
 /// bytes, a space, the blake3-128 hex stamp of the generation's
 /// remap-slices serialization, a newline, then those bytes — so truncation
 /// and corruption are both caught by the checksum, and an entry is only
@@ -48,12 +53,14 @@ pub struct Entry<T> {
 }
 
 /// Frames an entry for writing. Infallible except for payload
-/// serialization.
+/// serialization. The payload is positional binary (#4207): payload
+/// shapes carry every field explicitly, and the frame's checksum covers
+/// exactly the bytes a decode reads.
 pub(super) fn encode<T: Serialize>(
     entry: &Entry<T>,
     tables_stamp: [u8; 16],
-) -> Result<Vec<u8>, serde_json::Error> {
-    let payload = serde_json::to_vec(entry)?;
+) -> Result<Vec<u8>, bincode_next::error::EncodeError> {
+    let payload = bincode_next::serde::encode_to_vec(entry, bincode_next::config::standard())?;
     let mut framed = Vec::with_capacity(66 + payload.len());
     framed.extend_from_slice(hex::encode(blake3_128(&payload)).as_bytes());
     framed.push(b' ');
@@ -63,7 +70,7 @@ pub(super) fn encode<T: Serialize>(
     Ok(framed)
 }
 
-/// Decodes a framed entry; `None` on any framing, checksum, or JSON
+/// Decodes a framed entry; `None` on any framing, checksum, or payload
 /// failure (the accelerator invariant: corruption is a miss). The embedded
 /// tables stamp returns with the entry — the store compares it against the
 /// generation's current remap-slices stamp and treats a mismatch as
@@ -80,9 +87,9 @@ pub(super) fn decode<T: DeserializeOwned>(framed: &[u8]) -> Option<(Entry<T>, [u
     if blake3_128(payload) != checksum {
         return None;
     }
-    serde_json::from_slice(payload)
+    bincode_next::serde::decode_from_slice(payload, bincode_next::config::standard())
         .ok()
-        .map(|entry| (entry, stamp))
+        .map(|(entry, _)| (entry, stamp))
 }
 
 #[cfg(test)]

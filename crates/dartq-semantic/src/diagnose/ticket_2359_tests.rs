@@ -192,18 +192,22 @@ fn contravariant_signature_test_stays_informatively_silent() {
 }
 
 /// The signature region control: a direct function-typed RETURN
-/// annotation keeps its shapeless degradation (the assignability
-/// context face's pinned under-report) — the body gate must not leak
-/// into the return position, where the frame is open but the body brace
-/// is unlatched.
+/// annotation checks like the alias spelling — the written
+/// `Str Function()` shape is the closure's context, so the `DB()` body
+/// reports (oracle probe 3.13.7: `RETURN_OF_INVALID_TYPE_FROM_CLOSURE`
+/// "The returned type 'DB' isn't returnable from a 'Str' function, as
+/// required by the closure's context."). The body gate itself must not
+/// leak into the return position, where the frame is open but the body
+/// brace is unlatched — the row here is the context's own verdict, not
+/// a leaked body gate.
 #[test]
-fn return_position_annotation_keeps_shapeless_degradation() {
+fn return_position_annotation_checks_the_written_shape() {
     let report = unit_report(
         "class DB {}\nclass Str {}\n\
          Str Function() h() {\n  return () => DB();\n}\n",
     );
     assert!(
-        !has(&report, "return_of_invalid_type_from_closure"),
+        has(&report, "return_of_invalid_type_from_closure"),
         "{:?}",
         code_names(&report)
     );

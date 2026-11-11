@@ -765,7 +765,23 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // Type (required in function types, optional otherwise); the formal
         // flavor lets `TYPE <reserved word>` read as type + keyword name
         // (official acceptKeywordForSimpleType, parser_impl.dart:2158).
-        let type_info = self.compute_type_formal(in_function_type);
+        let mut type_info = self.compute_type_formal(in_function_type);
+        // Official `parseFormalParameter` malformed-type-reference recovery
+        // (parser_impl.dart:2142-2149): a `noType` probe whose follower is a
+        // period — or an identifier directly followed by one — is re-computed
+        // in the required position, which admits the `id.` prefixed shape and
+        // moves the failure onto the missing name after the period. `void
+        // f(io., a)` therefore reports `expected_type_name` (the prefixed
+        // continuation context's recovery template) + `missing_identifier` at
+        // the `,`, and `void f(io.x)` parses `io.x` as the type with the
+        // parameter name missing.
+        if matches!(type_info, TypeInfo::NoType)
+            && (self.peek_kind() == TokenKind::Period
+                || (is_identifier(self.peek_kind())
+                    && self.cursor.look_kind(1) == TokenKind::Period))
+        {
+            type_info = self.compute_type(true, false);
+        }
 
         // Official :2160 — the type region is consumed before the
         // this/super walk. `looksLikeName` accepts `this`/`super` in the
@@ -903,6 +919,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // _head`), exactly as the pre-typed walk did.
         let mut before_inline_function_type: Option<TokenSpan> = None;
         let mut inline_name: Option<TokenSpan> = None;
+        // The UNNAMED `<...>(...)` formal (`Function(<S>())`, `f(<T>())`):
+        // an inline function type with type parameters and a parameter list
+        // but neither a return type nor a name. Upstream detects it in the
+        // same probe as the name-led shape (parser_impl.dart:2214-2239) and
+        // the name slot later anchors on the token BEFORE the type, whose
+        // follower is the `<` (:2335-2352).
+        let mut unnamed_type_param_name: Option<TokenSpan> = None;
         // The token opening the parameter's own suffix (`<`/`(`) — upstream's
         // `invalid_inline_function_type` anchor is `beforeInlineFunctionType
         // .next!` (parser_impl.dart:2326), the suffix opener, not the name.
@@ -1017,6 +1040,37 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     }) {
                         phantom_name = Some(at);
                     }
+                }
+            }
+            if !tentative_name && self.peek_kind() == TokenKind::Lt {
+                // Official parser_impl.dart:2214-2239: the group is computed
+                // at the token BEFORE the `<`; a closer followed by `(` makes
+                // the whole shape the parameter's type (an inline function
+                // type with type parameters and no return type), and the
+                // parse steps to the parameter list's own `)`. The modifier
+                // report is the same pair the name-led arm produces
+                // (:2219-2234).
+                let opener = self.peek_span(); // `<`
+                let group = self.compute_type_param_or_arg_on_lt(false);
+                if !matches!(group, TypeParamOrArg::None)
+                    && self.type_arg_follower(&group, self.cursor.real_pos())
+                        == TokenKind::OpenParen
+                {
+                    if let Some(t) = var_final_or_const {
+                        if member_kind != MemberKind::PrimaryConstructor {
+                            self.report(msg::function_typed_parameter_var(), t);
+                        } else if !self.features.primary_constructors_enabled {
+                            self.report(msg::experiment_not_enabled("primary-constructors"), t);
+                        }
+                    }
+                    // `beforeInlineFunctionType = token` — here the token is
+                    // the `<` itself, so `beforeInlineFunctionType.next!` (the
+                    // `invalid_inline_function_type` anchor, :2326) is also
+                    // the `<`.
+                    before_inline_function_type = Some(opener);
+                    inline_anchor = Some(opener);
+                    type_param = group;
+                    unnamed_type_param_name = Some(opener);
                 }
             }
             // The unified parse below re-walks from the type start (official
@@ -1195,8 +1249,42 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.listener.handle_identifier(n, name_context);
             }
             n
+        } else if let Some(at) = unnamed_type_param_name {
+            // The unnamed `<...>(...)` formal's name slot. Official
+            // parser_impl.dart:2335-2352: the noType re-walk leaves `token`
+            // at `beforeType` — the token BEFORE the inline function type —
+            // so `ensureIdentifier(token, formalParameterDeclaration)`
+            // anchors on it and its FOLLOWER is the `<`; the context
+            // template's consume-in-doubt branch reports `missing_identifier`
+            // on that follower and splices the synthetic AFTER it
+            // (`insertSyntheticIdentifier`, zero-width at `<`.next). The
+            // parse then resumes at the inline function type's end
+            // (`token = endInlineFunctionType`, :2350-2352) — which is
+            // exactly where the re-walk above already left the cursor, so no
+            // stream surgery is needed here.
+            self.report(msg::missing_identifier(), at);
+            let span = TokenSpan::new(
+                at.id,
+                SourceRange {
+                    offset: at.range.offset + at.range.length,
+                    length: 0,
+                },
+            );
+            self.listener.handle_identifier(span, name_context);
+            span
         } else if !(before_inline_function_type.is_some()
             || name_context != IdentifierContext::FormalParameterDeclaration
+            // Official :2341-2349: the nameless face is a FUNCTION-TYPE
+            // formals privilege only (`inFunctionType && !isNamedParameter
+            // && !next.isKeywordOrIdentifier && beforeInlineFunctionType ==
+            // null`); every other formal always runs `ensureIdentifier`, so
+            // a type carrying no name slot reports `missing_identifier` at
+            // its follower (`void f(io., a)` anchors on the `,`). Catch
+            // formals keep the nameless face: the catch clause runs its own
+            // `(e, st)` shape walk before this parameter walk, so a junk
+            // trace slot must not mint a second name (oracle
+            // `catch (x, {st})` carries `catch_syntax` only).
+            || (!in_function_type && member_kind != MemberKind::Catch)
             || matches!(type_info, TypeInfo::NoType)
             || is_identifier(self.peek_kind())
             || matches!(

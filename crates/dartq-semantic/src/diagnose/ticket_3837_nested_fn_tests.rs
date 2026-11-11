@@ -33,9 +33,7 @@
 //! Both directions are pinned: the unprovable pairs stay silent, and every
 //! pair the oracle does fix at a constant keeps reporting.
 
-use super::test_rig::{
-    CORE_PRELUDE, RigImport, assert_silent, code_names, report_ops, report_ops_imports, rows,
-};
+use super::test_rig::{assert_silent, code_names, report_ops, report_ops_core_prefixed, rows};
 
 /// The declarations every nested fixture shares: the corpus's own shape —
 /// the alias parameter sits inside the INNER function's return type
@@ -50,27 +48,14 @@ class U0<T> {
   List<T> Function(int, [core.List<core.int> x]) m15() => throw 0;
 "#;
 
-/// [`NESTED_PROLOGUE`] with the two spellings of one library mounted: the
-/// bare one binds the fixture's `List`/`int`, the `core.`-prefixed one
-/// mirrors the corpus's `import 'dart:core' as core` — the alias RHS's
+/// [`NESTED_PROLOGUE`] under the corpus's own header: `dart:core` imported
+/// bare and as `core`, one library behind both spellings — the alias RHS's
 /// leaf arrives qualified while the declaration's return arrives bare, the
 /// split that strands the armed-head fold.
 fn nested_report(body: &str) -> super::FileReport {
-    report_ops_imports(
-        &format!("{NESTED_PROLOGUE}{body}\n}}\n"),
-        &[
-            RigImport {
-                uri: "package:t/core.dart",
-                prefix: None,
-                source: CORE_PRELUDE,
-            },
-            RigImport {
-                uri: "package:t/core.dart",
-                prefix: Some("core"),
-                source: "",
-            },
-        ],
-    )
+    report_ops_core_prefixed(&format!(
+        "import 'dart:core';\nimport 'dart:core' as core;\n{NESTED_PROLOGUE}{body}\n}}\n"
+    ))
 }
 
 /// The three unprovable pairs: a differing nested argument (`List<int>` vs

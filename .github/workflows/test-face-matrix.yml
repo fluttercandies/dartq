@@ -127,7 +127,7 @@ jobs:
             echo "::error::cargo config strip left matches behind (layout drift?)"
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - name: Install the matrix Dart SDK
         uses: dart-lang/setup-dart@v1
@@ -168,7 +168,7 @@ jobs:
             echo "::error::cargo config strip left matches behind (layout drift?)"
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - name: Install the matrix Flutter SDK
         uses: subosito/flutter-action@v2

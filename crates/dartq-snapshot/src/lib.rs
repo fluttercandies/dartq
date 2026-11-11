@@ -102,11 +102,14 @@
 //!
 //! # Format
 //!
-//! JSON — final form, with [`SNAPSHOT_FORMAT_VERSION`] in the header
-//! should a future container (e.g. bincode) ever replace it. The engine's
-//! semantic version is *supplied by the caller*: this crate deliberately has
-//! no dependency on `dartq-engine`, so the wiring layer passes the current
-//! `EngineSemanticVersion` when it builds the header and entry keys.
+//! Header, manifest, and remap tables are JSON; entry payloads are
+//! positional binary (`bincode-next`'s serde bridge) since v6 (#4207),
+//! with [`SNAPSHOT_FORMAT_VERSION`] in the header gating codec eras — a
+//! generation written under another codec misses at the header, never
+//! mid-entry. The engine's semantic version is *supplied by the caller*:
+//! this crate deliberately has no dependency on `dartq-engine`, so the
+//! wiring layer passes the current `EngineSemanticVersion` when it builds
+//! the header and entry keys.
 
 mod entry;
 mod header;

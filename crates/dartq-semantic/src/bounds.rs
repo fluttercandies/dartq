@@ -81,8 +81,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use dartq_types::{
     Boundedness, CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy,
     TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedType,
-    Variance, instantiate_type_formals_to_bounds, is_well_bounded, regular_bounded_issues,
-    replace_top_bottom_with_facts, variance_in_type_with,
+    Variance, instantiate_type_formals_to_bounds, instantiate_type_formals_to_bounds_fixpoint,
+    is_well_bounded, regular_bounded_issues, replace_top_bottom_with_facts, variance_in_type_with,
 };
 
 // The written-type capture is shared with the collector's pool feeding
@@ -171,6 +171,13 @@ struct ContainerCapture {
     /// the poisoned bit — bounded by an unmodelable shape, which
     /// suppresses the container's checks).
     bounds: Vec<(Option<TypeTree>, bool)>,
+    /// The declaration's name-token offset, set when the header's
+    /// type-variable window lands. The name-only bound lookup orders its
+    /// candidates by it — the one ordering such a lookup may read (#4216:
+    /// a hash-order scan flips verdicts between runs because parallel
+    /// interning moves the `StringId` values and with them the map's
+    /// iteration order).
+    at: u32,
     /// Captured supertype trees (extends/with/implements).
     supers: Vec<TypeTree>,
     /// Every clause tree the header wrote, `on` clauses included — the
@@ -871,10 +878,8 @@ enum ScopeKind<'w> {
     Window(&'w FxHashMap<StringId, Option<TypeTree>>),
 }
 
-/// One raw-constructor inference failure (the [`Bounds::
-/// check_creation_inference`] answer, #2831 P1): the failing parameter
-/// with the message pieces of its two rows — the `could_not_infer` detail
-/// and the creation-site `type_argument_not_matching_bounds` twin.
+/// One raw-constructor inference failure (#2831 P1): the failing
+/// parameter with the message pieces of its `could_not_infer` detail.
 pub(crate) struct CreationInferenceRow {
     /// The parameter's own name.
     pub(crate) parameter: String,
@@ -882,21 +887,30 @@ pub(crate) struct CreationInferenceRow {
     pub(crate) seed: String,
     /// The declared bound as written (the parameter's own spellings).
     pub(crate) raw_bound: String,
-    /// The bound substituted with every seed.
-    pub(crate) bound: String,
-    /// The bound substituted with every seed, with the parameters the
-    /// inference left `unknown` rendered `_` — the spelling the
-    /// `could_not_infer` detail carries (`producing 'A<_, …>'`). The twin
-    /// keeps `bound`'s fully substituted display (the oracle spells the
-    /// same slot `dynamic` or its seed there — the two faces differ only
-    /// in this one rendering).
-    #[allow(
-        dead_code,
-        reason = "the `could_not_infer` detail builder still reads `bound`; \
-                  switching it to this field is the remaining half of the \
-                  `_`-for-unknown display"
-    )]
+    /// The bound substituted with the SOLVED parameters' seeds only, the
+    /// parameters the inference left `unknown` rendered `_` — the
+    /// `producing 'A<_, …>'` spelling of `_formatConstraints`.
     pub(crate) infer_bound: String,
+}
+
+/// One creation-site `type_argument_not_matching_bounds` twin: the
+/// verifier's regular-bounded check over the creation's implicit type
+/// arguments (`type_arguments_verifier.dart:342-385`).
+pub(crate) struct CreationTwinRow {
+    /// The non-conforming implicit argument.
+    pub(crate) argument: String,
+    /// The checked declaration's parameter name.
+    pub(crate) parameter: String,
+    /// The parameter's bound substituted with every implicit argument.
+    pub(crate) bound: String,
+}
+
+/// The [`Bounds::check_creation_inference`] answer: the `could_not_infer`
+/// rows and, when any reported, the creation's bound twins.
+#[derive(Default)]
+pub(crate) struct CreationInference {
+    pub(crate) rows: Vec<CreationInferenceRow>,
+    pub(crate) twins: Vec<CreationTwinRow>,
 }
 
 /// `greatestClosure` (type_system.dart:592-620 over least_greatest_
@@ -1055,6 +1069,17 @@ pub(crate) struct Bounds<'a> {
     /// :627-636, so every group of a level closes before the level
     /// seals).
     fn_sig_marks: Vec<usize>,
+    /// Use-site captures whose upstream AST parent is a `ConstructorName`
+    /// (an instance creation, a constructor reference/tear-off, a factory
+    /// redirect target, an annotation creation): `_shouldAllowSuperBoundedTypes`
+    /// denies the super pass on that parent before its extension-type leg
+    /// (upstream Dart SDK source, pkg/analyzer/lib/src/error/
+    /// type_arguments_verifier.dart:699-708). The capture site reads the
+    /// parent shape off the source and notes the posture keyed by the
+    /// site's own offset — the `PendingBoundedCheck::Site` capture cannot
+    /// carry it — and [`Self::check_site`] consumes the entry by the same
+    /// offset.
+    site_super_denies: FxHashSet<u32>,
     /// The lazy `dartq_types` snapshot (interior-mutable so the
     /// `&self` compare faces — #2838's raw-type arm — can build it
     /// mid-parse; the rebuild-aware count keeps a later teardown build
@@ -1149,6 +1174,17 @@ impl<'a> Bounds<'a> {
             self.index.param_windows.push(window);
             return;
         }
+        // A use-site window's own signature group closed while a function
+        // level was open in the site sink (`C<void Function<T extends
+        // int>()>? x;`): the variables ride the same side channel the
+        // bound window uses above — the diagnose-side sinks receive no
+        // per-variable name events, so `end_function`'s site stitch reads
+        // them back by the level's mark. The declaration faces keep their
+        // own paths (the alias RHS carries its variables itself, the
+        // header latch feeds `pending`).
+        if !window.is_empty() && !self.fn_sig_marks.is_empty() {
+            self.sig_windows.push(window.clone());
+        }
         self.alias_type_variables(&window);
         if !window.is_empty() {
             self.index.param_windows.push(window.clone());
@@ -1198,6 +1234,7 @@ impl<'a> Bounds<'a> {
             .or_insert_with(|| ContainerCapture {
                 params: Vec::new(),
                 bounds: Vec::new(),
+                at: 0,
                 supers: Vec::new(),
                 bound_sites: Vec::new(),
                 on_sites: Vec::new(),
@@ -1209,6 +1246,12 @@ impl<'a> Bounds<'a> {
         // same-named duplicate's second header never re-registers).
         capture.params = window.iter().map(|(n, _, _)| *n).collect();
         capture.bounds = window.iter().map(|(_, b, p)| (b.clone(), *p)).collect();
+        // The declaring name's token offset — the ordered key the
+        // name-only bound lookups narrow by (#4216). Only a header with a
+        // type-variable window reaches this path, and only such a header
+        // records parameters, so every param-bearing capture carries a
+        // real offset.
+        capture.at = name_offset;
     }
 
     /// The container's header window opened (its supertype clauses are
@@ -1224,6 +1267,7 @@ impl<'a> Bounds<'a> {
             .or_insert_with(|| ContainerCapture {
                 params: Vec::new(),
                 bounds: Vec::new(),
+                at: 0,
                 supers: Vec::new(),
                 bound_sites: Vec::new(),
                 on_sites: Vec::new(),
@@ -1359,12 +1403,19 @@ impl<'a> Bounds<'a> {
         self.rep_mark = None;
     }
 
-    /// A simple type completed inside an open capture window.
+    /// A simple type completed inside an open capture window. An open
+    /// type-variables window wins over the header capture: every type
+    /// parsed between `begin_type_variables` and `end_type_variables` is a
+    /// bound of that window's variables — including a signature's own
+    /// group inside a header clause (`class C extends G<void Function<U
+    /// extends int>()>` fires its bound re-parse while the header sink is
+    /// open), where the header-first order fed the bound into the clause
+    /// tree and starved the window.
     pub(crate) fn leaf(&mut self, head: StringId, nullable: bool, range: SourceRange) {
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.leaf(head, nullable, range);
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.leaf(head, nullable, range);
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.leaf(head, nullable, range);
         } else if self.alias.is_none()
             && let Some(site) = self.site.as_mut()
         {
@@ -1379,10 +1430,13 @@ impl<'a> Bounds<'a> {
     /// `alias_*` arms and its own finalize face — a site capture here
     /// would double-check every written argument.
     pub(crate) fn begin_group(&mut self, head: Option<(StringId, SourceRange)>, in_site: bool) {
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.begin_group(head);
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        // Window first (see [`Self::leaf`]): a group inside an open
+        // type-variables window is the bound's own arguments
+        // (`U extends G<int>`), never a clause shape.
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.begin_group(head);
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.begin_group(head);
         } else if self.alias.is_none() {
             if let Some(site) = self.site.as_mut() {
                 site.begin_group(head);
@@ -1397,12 +1451,12 @@ impl<'a> Bounds<'a> {
     /// The group closed; `Some` back means the site capture closed with
     /// it (its outermost group) and its single root is the site tree.
     pub(crate) fn end_group(&mut self, end: SourceRange) -> Option<Vec<TypeTree>> {
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.end_group(end);
-            return None;
-        }
         if let Some(sink) = self.bound_sink.as_mut() {
             sink.end_group(end);
+            return None;
+        }
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.end_group(end);
             return None;
         }
         let site = self.site.as_mut()?;
@@ -1429,10 +1483,10 @@ impl<'a> Bounds<'a> {
         // stitches (or, where the sealed node is unreachable, drops)
         // exactly that slice.
         self.fn_sig_marks.push(self.sig_windows.len());
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.begin_function();
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.begin_function();
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.begin_function();
         } else if let Some(alias) = self.alias.as_mut()
             && matches!(alias.region, Some(AliasRegion::Formals { .. }))
         {
@@ -1457,18 +1511,16 @@ impl<'a> Bounds<'a> {
     /// static, and the parser pairs the two events).
     pub(crate) fn end_function(&mut self, nullable: bool, end: SourceRange) {
         let mark = self.fn_sig_marks.pop().unwrap_or(0);
-        // The stitch's only live path is the bound window's own sink
-        // (`T extends void Function<U extends B>()`): signature groups
-        // record only while a declaration's `<...>` window is open, and
-        // no other sink is open then. Every other arm just drops the
-        // slice — a header clause's GFT argument (`class C extends G<void
-        // Function<U>>()`) folds its sealed node into the clause group's
-        // private level, and the alias RHS carries its signature
+        // The stitch reads the group's variables out of `sig_windows` (the
+        // diagnose-side sinks receive no per-variable name events) and
+        // writes them onto the sealed node, wherever it folded: the bound
+        // window's own sink (`T extends void Function<U extends B>()`), a
+        // header clause's GFT argument (`class C extends G<void Function<U
+        // extends int>()>` — the sealed node rides the clause group's
+        // argument list), or the use-site capture (`C<void Function<T
+        // extends int>()>? x`). The alias RHS carries its signature
         // variables itself (`alias_type_variables` → `rhs_vars`).
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.end_function(nullable, end);
-            self.sig_windows.truncate(mark);
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.end_function(nullable, end);
             if sink.stack.is_empty() {
                 let windows = self.sig_windows.split_off(mark);
@@ -1481,6 +1533,18 @@ impl<'a> Bounds<'a> {
                 // same posture the unpatched capture had).
                 self.sig_windows.truncate(mark);
             }
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.end_function(nullable, end);
+            // The same stitch the bound and site sinks take, through the
+            // header sink's newest node (the clause group's last argument
+            // — a supertype's GFT argument seals into the still-open
+            // group level, never `done`). Without it the quantifier
+            // vanishes from the clause tree: the check's argument face,
+            // the message texts, and the bound-annotation walk all read
+            // `void Function()` for the written `void Function<U extends
+            // int>()`.
+            let windows = self.sig_windows.split_off(mark);
+            stitch_signature_variables(header.sink.last_completed_node(), &windows);
         } else if let Some(alias) = self.alias.as_mut()
             && alias.sink_fn_levels > 0
         {
@@ -1491,7 +1555,17 @@ impl<'a> Bounds<'a> {
             && self.alias.is_none()
         {
             site.end_function(nullable, end);
-            self.sig_windows.truncate(mark);
+            // The group's variables recorded above the mark stitch onto
+            // the sealed node — the same stitch the bound window's sink
+            // takes, through the sink's newest node (a root when the
+            // function is the whole window, the enclosing group's last
+            // argument otherwise). Without it the quantifier vanishes
+            // from every later face: the check's binder relation, the
+            // inverted display, and the message texts all read `void
+            // Function()` for the written `void Function<T extends
+            // int>()`.
+            let windows = self.sig_windows.split_off(mark);
+            stitch_signature_variables(site.last_completed_node(), &windows);
         } else {
             self.sig_windows.truncate(mark);
         }
@@ -1501,10 +1575,10 @@ impl<'a> Bounds<'a> {
     /// before it is the written return type. A no-op unless the open
     /// window's top level is a function level (the sink guards itself).
     pub(crate) fn function_formals_begin(&mut self) {
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.function_formals_begin();
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_formals_begin();
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_formals_begin();
         } else if let Some(alias) = self.alias.as_mut()
             && alias.sink_fn_levels > 0
         {
@@ -1522,10 +1596,10 @@ impl<'a> Bounds<'a> {
     /// Function(int)` and `int Function([int])` are distinct types). A
     /// no-op unless the open window's top level is a function level.
     pub(crate) fn function_optional_group(&mut self, opener: &str) {
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.function_optional_group(opener);
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_optional_group(opener);
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_optional_group(opener);
         } else if let Some(alias) = self.alias.as_mut()
             && alias.sink_fn_levels > 0
         {
@@ -1540,10 +1614,10 @@ impl<'a> Bounds<'a> {
     /// One function-level formal closed: its name pairs with the type
     /// node that just landed (the sink guards itself).
     pub(crate) fn function_formal_end(&mut self, named: bool, name: Option<StringId>) {
-        if let Some((_, header)) = self.header.as_mut() {
-            header.sink.function_formal_end(named, name);
-        } else if let Some(sink) = self.bound_sink.as_mut() {
+        if let Some(sink) = self.bound_sink.as_mut() {
             sink.function_formal_end(named, name);
+        } else if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_formal_end(named, name);
         } else if let Some(alias) = self.alias.as_mut()
             && alias.sink_fn_levels > 0
         {
@@ -1952,19 +2026,32 @@ impl<'a> Bounds<'a> {
         in_scope_params: &[StringId],
         site: SourceRange,
     ) -> Vec<BoundedIssue> {
-        // The annotation-site posture: the super-bounded pass is forbidden
-        // only at extension-type elements (`_shouldAllowSuperBoundedTypes`,
-        // :750-752). An alias head keeps the pass — the alias identity is
-        // not in the deny list, and the contexts that deny it (the
-        // declaration/clause parents) call [`Self::check_clause_sites`] or
+        // The annotation-site posture (`_shouldAllowSuperBoundedTypes`,
+        // type_arguments_verifier.dart:699-715): the super pass is denied
+        // first by the parent shape — the `ConstructorName` parents this
+        // lane's capture noted ([`Self::note_super_deny_site`]; the
+        // declaration/clause contexts call [`Self::check_clause_sites`] or
         // [`Self::check_bound_annotation_sites`] with the pass denied
-        // explicitly.
-        let allow_super = self
-            .index
-            .containers
-            .get(&head)
-            .is_none_or(|capture| !capture.is_extension_type);
+        // explicitly) — then by the extension-type element leg. An alias
+        // head keeps the pass: the alias identity is not in the deny list.
+        let allow_super = !self.site_super_denies.remove(&site.offset)
+            && self
+                .index
+                .containers
+                .get(&head)
+                .is_none_or(|capture| !capture.is_extension_type);
         self.check_site_inner(strings, head, args, in_scope_params, allow_super, site)
+    }
+
+    /// The capture site's parent-kind posture: the written type-argument
+    /// group is a `ConstructorName`'s child — its closer is followed by a
+    /// `(` (an instance creation, an annotation creation, an enum
+    /// constant's constructor) or a selector `.` (a constructor
+    /// reference/tear-off, a factory redirect target) — where the
+    /// super-bounded pass is denied, so a regular violation reports
+    /// without the inverted recovery. Consumed by [`Self::check_site`].
+    pub(crate) fn note_super_deny_site(&mut self, site_offset: u32) {
+        self.site_super_denies.insert(site_offset);
     }
 
     /// The clause-site face: every written supertype/constraint annotation
@@ -2327,6 +2414,494 @@ impl<'a> Bounds<'a> {
         };
         state.alias(&self.index, name);
         state.has_self
+    }
+
+    /// The `not_instantiated_bound` declaration face: every written
+    /// type-parameter bound is walked for a bare head naming an in-file
+    /// type-parameterized declaration that is *not simply bounded* —
+    /// the upstream `_UninstantiatedBoundChecker`'s bare-head arm
+    /// (upstream Dart SDK source, pkg/analyzer/lib/src/generated/
+    /// error_verifier.dart:8521-8541), fired per type parameter by
+    /// `visitTypeParameter`'s `node.bound?.accept(...)` (:2159). A head
+    /// written with type arguments is instantiated — only its argument
+    /// positions recurse (`visitNamedType`, :8526-8532) — and a head
+    /// shadowed by an in-scope type parameter resolves to that parameter,
+    /// never a declaration. An unresolvable head answers `true` upstream
+    /// (simply_bounded.dart:304) and suppresses here (the in-file map is
+    /// the only resolution face, the under-report direction).
+    ///
+    /// Simple-boundedness is the dependency-graph verdict of
+    /// `computeSimplyBounded` (simply_bounded.dart:31-105): a container
+    /// is simply bounded unless one of its parameter bounds mentions a
+    /// type parameter (each bound's own declaration scope), or a bare
+    /// head it depends on is not simply bounded, or it sits on a
+    /// reference cycle (`_markCircular`, :282-286 — self-loops included).
+    /// A typedef reads its parameter bounds the same way plus its
+    /// right-hand-side types, where type parameters are *allowed*
+    /// (`_collectTypedefRhsTypes` walked with `allowTypeParameters=true`,
+    /// :236-286). Supertype clauses never enter the verdict (classes
+    /// contribute bounds only, :239-252). A poisoned tree cannot decide —
+    /// its subtree suppresses and its node stays simply bounded (only a
+    /// *proven* not-simply-bounded head reports, the capture-wide
+    /// under-report posture).
+    ///
+    /// The rows anchor at each bare head's own token (the upstream
+    /// `.at(node)` span) in source order: the verifier visits type
+    /// parameters in declaration order and each bound's offending heads
+    /// in written order, so the sites' own offsets decide.
+    pub(crate) fn check_uninstantiated_bound_sites(&self) -> Vec<SourceRange> {
+        // The in-file declaration graph: containers first, then aliases
+        // (keep-first per capture map; a cross-map name collision leaves
+        // the alias node unreachable — its reports suppress, the
+        // duplicate-definition face's business).
+        let mut node_idx: FxHashMap<StringId, usize> = FxHashMap::default();
+        let mut deps: Vec<Vec<usize>> = Vec::new();
+        let mut killed: Vec<bool> = Vec::new();
+        for (name, capture) in &self.index.containers {
+            node_idx.insert(*name, deps.len());
+            deps.push(Vec::new());
+            killed.push(false);
+        }
+        let alias_base = deps.len();
+        for (name, capture) in &self.index.aliases {
+            let slot = deps.len();
+            deps.push(Vec::new());
+            killed.push(false);
+            node_idx.entry(*name).or_insert(slot);
+        }
+        // The dependency edges and type-parameter kills: each node's own
+        // bounds (declarations scope) and, aliases only, the RHS types
+        // (type parameters allowed there).
+        for (i, capture) in self.index.containers.values().enumerate() {
+            let mut scope: Vec<StringId> = capture.params.clone();
+            for (bound, poisoned) in &capture.bounds {
+                if *poisoned {
+                    continue;
+                }
+                let Some(tree) = bound else {
+                    continue;
+                };
+                Self::collect_uninstantiated_deps(
+                    tree,
+                    &mut scope,
+                    false,
+                    &node_idx,
+                    &mut deps[i],
+                    &mut killed[i],
+                );
+            }
+        }
+        for (j, capture) in self.index.aliases.values().enumerate() {
+            let i = alias_base + j;
+            let mut scope: Vec<StringId> =
+                capture.params.iter().map(|(name, _, _)| *name).collect();
+            for (_, bound, poisoned) in &capture.params {
+                if *poisoned {
+                    continue;
+                }
+                let Some(tree) = bound else {
+                    continue;
+                };
+                Self::collect_uninstantiated_deps(
+                    tree,
+                    &mut scope,
+                    false,
+                    &node_idx,
+                    &mut deps[i],
+                    &mut killed[i],
+                );
+            }
+            match &*capture.rhs {
+                AliasRhs::Fn {
+                    ret,
+                    positional,
+                    named,
+                    type_params,
+                    ..
+                } => {
+                    // The RHS signature's own variables scope over the
+                    // whole RHS walk, beside the alias's parameters.
+                    let entry = scope.len();
+                    scope.extend(type_params.iter().map(|(name, _, _)| *name));
+                    if let Some(ret) = ret {
+                        Self::collect_uninstantiated_deps(
+                            ret,
+                            &mut scope,
+                            true,
+                            &node_idx,
+                            &mut deps[i],
+                            &mut killed[i],
+                        );
+                    }
+                    for (_, bound, poisoned) in type_params {
+                        if *poisoned {
+                            continue;
+                        }
+                        if let Some(bound) = bound {
+                            Self::collect_uninstantiated_deps(
+                                bound,
+                                &mut scope,
+                                true,
+                                &node_idx,
+                                &mut deps[i],
+                                &mut killed[i],
+                            );
+                        }
+                    }
+                    for formal in positional {
+                        Self::collect_uninstantiated_deps(
+                            formal,
+                            &mut scope,
+                            true,
+                            &node_idx,
+                            &mut deps[i],
+                            &mut killed[i],
+                        );
+                    }
+                    for (_, formal, _) in named {
+                        Self::collect_uninstantiated_deps(
+                            formal,
+                            &mut scope,
+                            true,
+                            &node_idx,
+                            &mut deps[i],
+                            &mut killed[i],
+                        );
+                    }
+                    scope.truncate(entry);
+                }
+                AliasRhs::Named(tree) => {
+                    Self::collect_uninstantiated_deps(
+                        tree,
+                        &mut scope,
+                        true,
+                        &node_idx,
+                        &mut deps[i],
+                        &mut killed[i],
+                    );
+                }
+            }
+        }
+        // The verdict: dependencies close before their dependents (the
+        // SCC order), so each component evaluates against settled
+        // answers; a multi-member component or a self-loop is a cycle,
+        // every member not simply bounded.
+        let mut simply_bounded = vec![true; deps.len()];
+        for component in &strong_components(&deps) {
+            if component.len() > 1 || deps[component[0]].contains(&component[0]) {
+                for &node in component {
+                    simply_bounded[node] = false;
+                }
+                continue;
+            }
+            let node = component[0];
+            if killed[node] || deps[node].iter().any(|&dep| !simply_bounded[dep]) {
+                simply_bounded[node] = false;
+            }
+        }
+        // The report sites: every written type-parameter bound — the
+        // declaring parameters of each container and alias, a function-
+        // shaped alias RHS signature's own variables, and every captured
+        // `<...>` window no declaration adopted (executable type
+        // parameters). Adopted windows match back out by fingerprint,
+        // the bound-annotation face's exact ledger.
+        fn fingerprint(window: &[(StringId, Option<TypeTree>, bool)]) -> Vec<(StringId, u32)> {
+            window
+                .iter()
+                .map(|(name, bound, _)| {
+                    (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                })
+                .collect()
+        }
+        let adopted: Vec<Vec<(StringId, u32)>> = self
+            .index
+            .containers
+            .values()
+            .map(|capture| {
+                capture
+                    .params
+                    .iter()
+                    .zip(&capture.bounds)
+                    .map(|(name, (bound, _))| {
+                        (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                    })
+                    .collect()
+            })
+            .chain(self.index.aliases.values().map(|capture| {
+                capture
+                    .params
+                    .iter()
+                    .map(|(name, bound, _)| {
+                        (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                    })
+                    .collect()
+            }))
+            .chain(self.index.aliases.values().filter_map(|capture| {
+                match &*capture.rhs {
+                    AliasRhs::Fn { type_params, .. } => Some(
+                        type_params
+                            .iter()
+                            .map(|(name, bound, _)| {
+                                (*name, bound.as_ref().map_or(u32::MAX, |b| b.range.offset))
+                            })
+                            .collect(),
+                    ),
+                    AliasRhs::Named(_) => None,
+                }
+            }))
+            .collect();
+        let mut sites: Vec<(u32, TypeTree, Vec<StringId>)> = Vec::new();
+        for capture in self.index.containers.values() {
+            for (bound, poisoned) in &capture.bounds {
+                let Some(tree) = bound else {
+                    continue;
+                };
+                if *poisoned || tree.poisoned {
+                    continue;
+                }
+                sites.push((tree.range.offset, tree.clone(), capture.params.clone()));
+            }
+        }
+        for capture in self.index.aliases.values() {
+            let names: Vec<StringId> = capture.params.iter().map(|(name, _, _)| *name).collect();
+            for (_, bound, poisoned) in &capture.params {
+                let Some(tree) = bound else {
+                    continue;
+                };
+                if *poisoned || tree.poisoned {
+                    continue;
+                }
+                sites.push((tree.range.offset, tree.clone(), names.clone()));
+            }
+            if let AliasRhs::Fn { type_params, .. } = &*capture.rhs {
+                // Every signature variable's bound walks with the alias's
+                // parameters and the whole variable list in scope — the
+                // element model scopes them over the entire signature.
+                let mut seed = names.clone();
+                seed.extend(type_params.iter().map(|(seen, _, _)| *seen));
+                for (_, bound, poisoned) in type_params {
+                    let Some(tree) = bound else {
+                        continue;
+                    };
+                    if *poisoned || tree.poisoned {
+                        continue;
+                    }
+                    sites.push((tree.range.offset, tree.clone(), seed.clone()));
+                }
+            }
+        }
+        for window in &self.index.param_windows {
+            if adopted.iter().any(|print| *print == fingerprint(window)) {
+                continue;
+            }
+            let seed: Vec<StringId> = window.iter().map(|(name, _, _)| *name).collect();
+            for (_, bound, _) in window {
+                let Some(tree) = bound else {
+                    continue;
+                };
+                if tree.poisoned {
+                    continue;
+                }
+                sites.push((tree.range.offset, tree.clone(), seed.clone()));
+            }
+        }
+        sites.sort_by_key(|(offset, _, _)| *offset);
+        let mut rows: Vec<SourceRange> = Vec::new();
+        let mut scope: Vec<StringId> = Vec::new();
+        for (_, tree, seed) in sites {
+            scope.clear();
+            scope.extend(seed);
+            Self::report_uninstantiated_leaves(
+                &tree,
+                &mut scope,
+                &node_idx,
+                &simply_bounded,
+                &mut rows,
+            );
+        }
+        rows
+    }
+
+    /// The dependency walk of one written tree: bare heads that name an
+    /// in-scope type parameter kill the owner's simple-boundedness unless
+    /// the position allows type parameters (a typedef's right-hand side);
+    /// bare in-file heads record dependency edges; everything else
+    /// descends. A poisoned subtree decides nothing.
+    fn collect_uninstantiated_deps(
+        tree: &TypeTree,
+        scope: &mut Vec<StringId>,
+        allow_type_params: bool,
+        node_idx: &FxHashMap<StringId, usize>,
+        deps: &mut Vec<usize>,
+        killed: &mut bool,
+    ) {
+        if tree.poisoned {
+            return;
+        }
+        if let Some((positional, named)) = &tree.record {
+            for field in positional {
+                Self::collect_uninstantiated_deps(
+                    field,
+                    scope,
+                    allow_type_params,
+                    node_idx,
+                    deps,
+                    killed,
+                );
+            }
+            for (_, field) in named {
+                Self::collect_uninstantiated_deps(
+                    field,
+                    scope,
+                    allow_type_params,
+                    node_idx,
+                    deps,
+                    killed,
+                );
+            }
+            return;
+        }
+        if let Some(function) = &tree.function {
+            // The signature's own variables scope over the whole
+            // signature — return type, every variable's bound, every
+            // formal — and shadow any same-named outer parameter.
+            let entry = scope.len();
+            scope.extend(function.type_params_named.iter().map(|(name, _)| *name));
+            if let Some(ret) = &function.ret {
+                Self::collect_uninstantiated_deps(
+                    ret,
+                    scope,
+                    allow_type_params,
+                    node_idx,
+                    deps,
+                    killed,
+                );
+            }
+            for (_, bound) in &function.type_params_named {
+                if let Some(bound) = bound {
+                    Self::collect_uninstantiated_deps(
+                        bound,
+                        scope,
+                        allow_type_params,
+                        node_idx,
+                        deps,
+                        killed,
+                    );
+                }
+            }
+            for formal in &function.positional {
+                Self::collect_uninstantiated_deps(
+                    formal,
+                    scope,
+                    allow_type_params,
+                    node_idx,
+                    deps,
+                    killed,
+                );
+            }
+            for (_, formal) in &function.named {
+                Self::collect_uninstantiated_deps(
+                    formal,
+                    scope,
+                    allow_type_params,
+                    node_idx,
+                    deps,
+                    killed,
+                );
+            }
+            scope.truncate(entry);
+            return;
+        }
+        if !tree.args.is_empty() {
+            for arg in &tree.args {
+                Self::collect_uninstantiated_deps(
+                    arg,
+                    scope,
+                    allow_type_params,
+                    node_idx,
+                    deps,
+                    killed,
+                );
+            }
+            return;
+        }
+        if scope.contains(&tree.head) {
+            if !allow_type_params {
+                *killed = true;
+            }
+            return;
+        }
+        if let Some(&node) = node_idx.get(&tree.head) {
+            deps.push(node);
+        }
+    }
+
+    /// The report walk of one written bound: every bare leaf whose head
+    /// escapes the scope and names an in-file type-parameterized
+    /// declaration that is not simply bounded anchors a row. A head with
+    /// written arguments recurses into the arguments instead; a function
+    /// type's own variables shadow (each bound sees the variables before
+    /// it and itself); a poisoned subtree suppresses its whole descent.
+    fn report_uninstantiated_leaves(
+        tree: &TypeTree,
+        scope: &mut Vec<StringId>,
+        node_idx: &FxHashMap<StringId, usize>,
+        simply_bounded: &[bool],
+        rows: &mut Vec<SourceRange>,
+    ) {
+        if tree.poisoned {
+            return;
+        }
+        if let Some((positional, named)) = &tree.record {
+            for field in positional {
+                Self::report_uninstantiated_leaves(field, scope, node_idx, simply_bounded, rows);
+            }
+            for (_, field) in named {
+                Self::report_uninstantiated_leaves(field, scope, node_idx, simply_bounded, rows);
+            }
+            return;
+        }
+        if let Some(function) = &tree.function {
+            // The signature's own variables shadow any same-named outer
+            // parameter for the rest of the descent. Their BOUNDS are not
+            // walked here: every nested `<...>` group the parser completed
+            // parks its own window in the capture (`end_type_variables`
+            // records each one), which the unclaimed-window sites below
+            // walk exactly once — a descent here would double-emit (the
+            // oracle's census answers one row per signature-variable
+            // bound).
+            let entry = scope.len();
+            scope.extend(function.type_params_named.iter().map(|(name, _)| *name));
+            if let Some(ret) = &function.ret {
+                Self::report_uninstantiated_leaves(ret, scope, node_idx, simply_bounded, rows);
+            }
+            for formal in &function.positional {
+                Self::report_uninstantiated_leaves(formal, scope, node_idx, simply_bounded, rows);
+            }
+            for (_, formal) in &function.named {
+                Self::report_uninstantiated_leaves(formal, scope, node_idx, simply_bounded, rows);
+            }
+            scope.truncate(entry);
+            return;
+        }
+        if !tree.args.is_empty() {
+            for arg in &tree.args {
+                Self::report_uninstantiated_leaves(arg, scope, node_idx, simply_bounded, rows);
+            }
+            return;
+        }
+        if scope.contains(&tree.head) {
+            return;
+        }
+        // Every in-file node is an upstream TypeParameterizedElement —
+        // the class/mixin/enum/extension-type/alias kinds alike, a
+        // zero-parameter alias included (its right-hand side still joins
+        // reference cycles).
+        if let Some(&node) = node_idx.get(&tree.head) {
+            if !simply_bounded[node] {
+                rows.push(tree.range);
+            }
+        }
     }
 
     /// The nested-`NamedType` walk: upstream's verifier visits every
@@ -2701,7 +3276,43 @@ impl<'a> Bounds<'a> {
                     None => replace_top_bottom_with_facts(&system, &merged_facts, instantiation),
                 }
             };
-            let inverted_issues = regular_bounded_issues(&system, &merged_facts, inverted);
+            // The written-level inversion allocates the inverted type's own
+            // signature binders (`Self::invert_function`'s fresh ids) after
+            // `merged_facts` was materialized, so the re-check re-merges the
+            // overlay before it runs — on the stale merge the correlation's
+            // bounds leg reads the new binders unbounded and answers
+            // vacuously, dropping the row the oracle reports (`C<void
+            // Function<T extends int>()>` over `X extends void
+            // Function<T>()`: the inverted type is also not
+            // regular-bounded). The fallback inversion arm reuses table
+            // types whose binders predate the merge, so re-merging is a
+            // no-op there.
+            // The written-level inversion allocates the inverted type's own
+            // signature binders (`Self::invert_function`'s fresh ids) after
+            // `merged_facts` was materialized, so the re-check re-merges the
+            // overlay before it runs — on the stale merge the correlation's
+            // bounds leg reads the new binders unbounded and answers
+            // vacuously, dropping the row the oracle reports (`C<void
+            // Function<T extends int>()>` over `X extends void
+            // Function<T>()`: the inverted type is also not
+            // regular-bounded). The fallback inversion arm reuses table
+            // types whose binders predate the merge, so re-merging is a
+            // no-op there.
+            // The written-level inversion allocates the inverted type's own
+            // signature binders (`Self::invert_function`'s fresh ids) after
+            // `merged_facts` was materialized, so the re-check re-merges the
+            // overlay before it runs — on the stale merge the correlation's
+            // bounds leg reads the new binders unbounded and answers
+            // vacuously, dropping the row the oracle reports (`C<void
+            // Function<T extends int>()>` over `X extends void
+            // Function<T>()`: the inverted type is also not
+            // regular-bounded). The fallback inversion arm reuses table
+            // types whose binders predate the merge, so re-merging is a
+            // no-op there.
+            let inverted_facts = snapshot.merged_facts(facts);
+            let inverted_system = snapshot.system_with(&inverted_facts);
+            let inverted_issues =
+                regular_bounded_issues(&inverted_system, &inverted_facts, inverted);
             if inverted_issues.is_empty() {
                 issues = Vec::new();
             } else {
@@ -3581,24 +4192,49 @@ impl<'a> Bounds<'a> {
         )
     }
 
-    /// The captured bound of the type parameter `param` wherever a
-    /// container header declares it — `class C<T extends num?>` registers
-    /// `T → num?` under `C`. This-file containers only, matching
-    /// [`Self::container_params`]'s scope: a spelling two declarations
-    /// share answers the first captured bound (the name-level scope the
-    /// post-walk caller no longer holds narrows no further — the
-    /// under-report direction). `None` when no own container declares
-    /// `param` (a concrete head, or a parameter whose bound the executable
-    /// windows alone carry).
-    pub(crate) fn container_param_bound(&self, param: StringId) -> Option<Option<TypeTree>> {
-        self.index.containers.values().find_map(|capture| {
-            capture
+    /// The captured bound of the type parameter `param` declared by the
+    /// nearest own container header at or before the reference offset `at`
+    /// — the first declaration when the caller holds no offset or the
+    /// reference precedes every declaration. This-file containers only,
+    /// matching [`Self::container_params`]'s scope: a spelling two
+    /// declarations share answers the header that actually encloses the
+    /// reference, never the hash-order-first one (#4216 — `FxHashMap`
+    /// iteration follows the `StringId` values, which move between runs
+    /// because parallel interning is scheduler-ordered, so the same
+    /// reference flipped verdicts across runs). `None` when no own
+    /// container declares `param` (a concrete head, or a parameter whose
+    /// bound the executable windows alone carry).
+    pub(crate) fn container_param_bound(
+        &self,
+        param: StringId,
+        at: Option<u32>,
+    ) -> Option<Option<TypeTree>> {
+        let mut nearest: Option<(u32, &Option<TypeTree>)> = None;
+        let mut first: Option<(u32, &Option<TypeTree>)> = None;
+        for capture in self.index.containers.values() {
+            let Some((_, (bound, _))) = capture
                 .params
                 .iter()
                 .zip(&capture.bounds)
                 .find(|(name, _)| **name == param)
-                .map(|(_, (bound, _))| bound.clone())
-        })
+            else {
+                continue;
+            };
+            if first
+                .as_ref()
+                .is_none_or(|(earliest, _)| capture.at < *earliest)
+            {
+                first = Some((capture.at, bound));
+            }
+            if at.is_some_and(|reference| capture.at < reference)
+                && nearest
+                    .as_ref()
+                    .is_none_or(|(closest, _)| capture.at > *closest)
+            {
+                nearest = Some((capture.at, bound));
+            }
+        }
+        nearest.or(first).map(|(_, bound)| bound.clone())
     }
 
     /// A captured type alias's own parameters (name, written bound, poison
@@ -3739,7 +4375,7 @@ impl<'a> Bounds<'a> {
         &mut self,
         strings: &'a StringTable,
         head: StringId,
-    ) -> Vec<CreationInferenceRow> {
+    ) -> CreationInference {
         // The capture gate is shape-agnostic (container header or alias
         // declaration): both captures carry the same non-empty unpoisoned
         // parameter contract, and the snapshot's registry/facts below
@@ -3755,17 +4391,17 @@ impl<'a> Bounds<'a> {
             (None, Some(capture)) => {
                 capture.params.is_empty() || capture.params.iter().any(|(_, _, p)| *p)
             }
-            (None, None) => return Vec::new(),
+            (None, None) => return CreationInference::default(),
         };
         if unmodelable {
-            return Vec::new();
+            return CreationInference::default();
         }
         let snapshot = self.snapshot(strings);
         let Some(&decl) = snapshot.registry.get(&head) else {
-            return Vec::new();
+            return CreationInference::default();
         };
         let Some(params) = snapshot.decl_params.get(&decl) else {
-            return Vec::new();
+            return CreationInference::default();
         };
         let dynamic = snapshot.table.intern(UninternedType::Dynamic, false);
         let bounds: Vec<TypeId> = params
@@ -3810,11 +4446,24 @@ impl<'a> Bounds<'a> {
         // parameter of this inference. A solved parameter's seed joins
         // the map the later bounds substitute — `inferTypeParameterFromAll`
         // reads `inferredTypes` for exactly those.
+        //
+        // The declared-bound test reads the capture, not the facts face:
+        // the snapshot records an unbounded parameter's implicit `dynamic`
+        // as a bound, which would mark it solved (seed `dynamic`) and spell
+        // it `dynamic` where the detail prints `_`.
+        let declared: Vec<bool> = match (
+            self.index.containers.get(&head),
+            self.index.aliases.get(&head),
+        ) {
+            (Some(capture), _) => capture.bounds.iter().map(|(b, _)| b.is_some()).collect(),
+            (None, Some(capture)) => capture.params.iter().map(|(_, b, _)| b.is_some()).collect(),
+            (None, None) => Vec::new(),
+        };
         let mut solved = Vec::with_capacity(params.len());
         let mut prior: Vec<(TypeParamId, TypeId)> = Vec::new();
         for (index, (&param, &bound)) in params.iter().zip(&bounds).enumerate() {
             let partial = snapshot.table.substitute(bound, &prior);
-            let inferred = snapshot.facts.get(param).bound.is_some()
+            let inferred = declared.get(index).copied().unwrap_or(false)
                 && !matches!(
                     snapshot.table.get(partial).kind(),
                     TypeKind::TypeParameter { parameter } if targets.contains(&parameter)
@@ -3832,26 +4481,100 @@ impl<'a> Bounds<'a> {
             .zip(&solved)
             .filter_map(|(param, &s)| (!s).then_some(param))
             .collect();
+        let all_seeds: Vec<(TypeParamId, TypeId)> =
+            params.iter().copied().zip(seeds.iter().copied()).collect();
         let mut rows = Vec::new();
         for (index, (&param, &bound)) in params.iter().zip(&bounds).enumerate() {
             if !solved[index] || !snapshot.type_is_safe(bound) {
                 continue;
             }
-            let map: Vec<(TypeParamId, TypeId)> =
-                params.iter().copied().zip(seeds.iter().copied()).collect();
-            let substituted = snapshot.table.substitute(bound, &map);
+            let substituted = snapshot.table.substitute(bound, &all_seeds);
             if system.is_subtype(seeds[index], substituted) {
                 continue;
             }
+            // The detail's `producing` text is the bound under
+            // `inferredTypes` — the solved seeds alone, every unsolved
+            // slot left `unknown` and printed `_`.
+            let produced = snapshot.table.substitute(bound, &prior);
             rows.push(CreationInferenceRow {
                 parameter: snapshot.param_text(param),
                 seed: snapshot.display(seeds[index]),
                 raw_bound: snapshot.display(bound),
-                bound: snapshot.display(substituted),
-                infer_bound: snapshot.display_with(substituted, &unsolved),
+                infer_bound: snapshot.display_with(produced, &unsolved),
             });
         }
-        rows
+        if rows.is_empty() {
+            return CreationInference::default();
+        }
+        // The kept types finish through `instantiateTypeFormalsToBounds`
+        // with the solved seeds as `knownTypes` (generic_inferrer.dart
+        // :420-430): a seed is ground, so a known parameter completes as
+        // itself and an unsolved one completes from its bound under them.
+        let known: FxHashMap<TypeParamId, TypeId> = prior.iter().copied().collect();
+        let implicit = instantiate_type_formals_to_bounds_fixpoint(&snapshot.table, params, |p| {
+            known
+                .get(&p)
+                .copied()
+                .or(Some(bounds[params.iter().position(|&q| q == p)?]))
+        })
+        .defaults;
+        // The creation-site twin is the verifier's regular-bounded check of
+        // the constructed type (`_checkForTypeArgumentNotMatchingBounds`;
+        // a `ConstructorName` parent denies the super-bounded pass). An
+        // alias callee constructs its EXPANDED class type, so the check
+        // reads the class's own parameters over the expansion's arguments.
+        let checked = if snapshot.alias_decls.contains(&decl) {
+            snapshot.alias_expansions.get(&decl).and_then(|&expansion| {
+                let ty = snapshot.table.substitute(
+                    expansion,
+                    &params
+                        .iter()
+                        .copied()
+                        .zip(implicit.iter().copied())
+                        .collect::<Vec<_>>(),
+                );
+                match snapshot.table.get(ty).kind() {
+                    TypeKind::Interface { decl, args } => Some((
+                        decl,
+                        (0..args.len())
+                            .map(|i| snapshot.table.arg(args.offset() + i))
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => None,
+                }
+            })
+        } else {
+            Some((decl, implicit))
+        };
+        let mut twins = Vec::new();
+        if let Some((class, args)) = checked
+            && let Some(class_params) = snapshot.decl_params.get(&class)
+            && class_params.len() == args.len()
+        {
+            let map: Vec<(TypeParamId, TypeId)> = class_params
+                .iter()
+                .copied()
+                .zip(args.iter().copied())
+                .collect();
+            for (&param, &argument) in class_params.iter().zip(&args) {
+                let Some(bound) = snapshot.facts.get(param).bound else {
+                    continue;
+                };
+                if !snapshot.type_is_safe(bound) {
+                    continue;
+                }
+                let substituted = snapshot.table.substitute(bound, &map);
+                if system.is_subtype(argument, substituted) {
+                    continue;
+                }
+                twins.push(CreationTwinRow {
+                    argument: snapshot.display(argument),
+                    parameter: snapshot.param_text(param),
+                    bound: snapshot.display(substituted),
+                });
+            }
+        }
+        CreationInference { rows, twins }
     }
 
     /// Whether `name` is one of this file's captured declarations (a
@@ -4121,7 +4844,7 @@ impl<'a> Bounds<'a> {
     /// declarations captured so far — an incomplete world answers through
     /// registry misses and the arity gate, the under-report direction —
     /// and the count check rebuilds for every later consumer.
-    fn snapshot<'s>(&'s self, strings: &'a StringTable) -> Ref<'s, Snapshot<'a>> {
+    pub(crate) fn snapshot<'s>(&'s self, strings: &'a StringTable) -> Ref<'s, Snapshot<'a>> {
         let decl_count = self.index.containers.len() + self.index.aliases.len();
         {
             let mut slot = self.snapshot.borrow_mut();
@@ -4173,7 +4896,7 @@ const BUILTINS: &[(&str, &[&str], &[&str])] = &[
 /// The lazy `dartq_types` snapshot: the table/hierarchy pair, the name
 /// registry, the parameter facts, and the safety closure. Single-threaded
 /// like [`TypeTable`] (its interior `RefCell`).
-struct Snapshot<'a> {
+pub(crate) struct Snapshot<'a> {
     strings: &'a StringTable,
     table: TypeTable,
     hierarchy: TypeHierarchy,
@@ -4814,10 +5537,22 @@ impl<'a> Snapshot<'a> {
         // expanded) the class-side default stands — the under-report
         // direction, since a covariant seed can only leave a rewrite at
         // `dynamic`, never fabricate a `Never`.
+        //
+        // The provisional hierarchy stands whenever ANY alias declares
+        // parameters — `VarianceBuilder` computes an alias parameter's
+        // variance from the aliased body whether or not that parameter
+        // carries an `extends` bound (variance_builder.dart:153-225;
+        // the element's stored `variable.variance` exists unconditionally).
+        // Gating on a written bound skips the computation for exactly the
+        // files whose aliases are unbounded: `typedef G<X> = Function(X)`
+        // stores `X` contravariant upstream, and a co-declaration's bound
+        // `X extends G<A<X>>` then grounds the `A<X>` leaf under `G` to
+        // `Never` — a covariant fallback would hold it `dynamic` (the
+        // `G<A<dynamic>>` the oracle's `G<A<Never>>` display contradicts).
         let provisional = index
             .aliases
             .values()
-            .any(|capture| capture.params.iter().any(|(_, bound, _)| bound.is_some()))
+            .any(|capture| !capture.params.is_empty())
             .then(|| {
                 let mut builder = TypeHierarchy::builder(CoreDecls {
                     object,
@@ -5327,12 +6062,83 @@ impl<'a> Snapshot<'a> {
         tree: &TypeTree,
         subst: &FxHashMap<StringId, String>,
     ) -> Option<String> {
-        if tree.poisoned || tree.record.is_some() || tree.function.is_some() {
+        if tree.poisoned || tree.record.is_some() {
             return None;
+        }
+        self.display_written_bound_in(tree, subst, &FxHashSet::default())
+    }
+
+    /// The substitution-aware recursive body, threaded with the
+    /// function-type binders currently in scope: a leaf naming one
+    /// renders by its own name (the binder shadows any same-named outer
+    /// parameter), everything else substitutes through `subst` first.
+    fn display_written_bound_in(
+        &self,
+        tree: &TypeTree,
+        subst: &FxHashMap<StringId, String>,
+        binders: &FxHashSet<StringId>,
+    ) -> Option<String> {
+        if let Some(function) = &tree.function {
+            let mut inner = binders.clone();
+            inner.extend(function.type_params_named.iter().map(|(name, _)| *name));
+            let ret = match &function.ret {
+                Some(ret) => self.display_written_bound_in(ret, subst, &inner)?,
+                // An unwritten return reads `dynamic`, the same
+                // resolution `map_function` interns.
+                None => "dynamic".to_string(),
+            };
+            let mut text = format!("{ret} Function");
+            if !function.type_params_named.is_empty() {
+                // Each binder renders `name` or `name extends <bound>` —
+                // the official `_writeTypeParameters` face. A bound tree
+                // that cannot render leaves the bare name.
+                let names: Vec<String> = function
+                    .type_params_named
+                    .iter()
+                    .map(|(name, bound)| {
+                        let rendered = bound
+                            .as_ref()
+                            .and_then(|bound| self.display_written_bound_in(bound, subst, &inner));
+                        match rendered {
+                            Some(text) => {
+                                format!("{} extends {}", self.strings.resolve(*name), text)
+                            }
+                            None => self.strings.resolve(*name).to_string(),
+                        }
+                    })
+                    .collect();
+                text.push_str(&format!("<{}>", names.join(", ")));
+            }
+            let mut formals: Vec<String> = function
+                .positional
+                .iter()
+                .map(|tree| self.display_written_bound_in(tree, subst, &inner))
+                .collect::<Option<Vec<_>>>()?;
+            if !function.named.is_empty() {
+                let named: Vec<String> = function
+                    .named
+                    .iter()
+                    .map(|(name, tree)| {
+                        Some(format!(
+                            "required {} {}",
+                            self.display_written_bound_in(tree, subst, &inner)?,
+                            self.strings.resolve(*name)
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                formals.push(format!("{{{}}}", named.join(", ")));
+            }
+            let suffix = if tree.nullable { "?" } else { "" };
+            return Some(format!("{text}({}){suffix}", formals.join(", ")));
         }
         let text = self.strings.resolve(tree.head);
         let suffix = if tree.nullable { "?" } else { "" };
         if tree.args.is_empty() {
+            // A function-type binder shadows any outer parameter of the
+            // same name: the leaf renders by its own name, unsubstituted.
+            if binders.contains(&tree.head) {
+                return Some(format!("{text}{suffix}"));
+            }
             if let Some(text) = subst.get(&tree.head) {
                 // The substituted leaf renders the substituted argument's
                 // text; a nullable leaf takes that text's nullable form —
@@ -5407,12 +6213,26 @@ impl<'a> Snapshot<'a> {
     /// one). `None` where the written shape cannot render (a poisoned or
     /// record node, an unregistered head, an arity mismatch): the caller
     /// keeps the expanded display.
-    fn display_written_argument(
+    pub(crate) fn display_written_argument(
         &self,
         tree: &TypeTree,
         variance: Variance,
         flip: bool,
         scope: &FxHashMap<StringId, TypeParamId>,
+    ) -> Option<String> {
+        self.display_written_argument_in(tree, variance, flip, scope, &FxHashSet::default())
+    }
+
+    /// The recursive body, threaded with the function-type binders
+    /// currently in scope (a binder shadows any same-named outer
+    /// parameter or in-scope name while its function descends).
+    fn display_written_argument_in(
+        &self,
+        tree: &TypeTree,
+        variance: Variance,
+        flip: bool,
+        scope: &FxHashMap<StringId, TypeParamId>,
+        binders: &FxHashSet<StringId>,
     ) -> Option<String> {
         if tree.poisoned || tree.record.is_some() {
             return None;
@@ -5432,8 +6252,12 @@ impl<'a> Snapshot<'a> {
             }
         };
         if let Some(function) = &tree.function {
+            let mut inner = binders.clone();
+            inner.extend(function.type_params_named.iter().map(|(name, _)| *name));
             let ret = match &function.ret {
-                Some(ret) => self.display_written_argument(ret, variance, flip, scope)?,
+                Some(ret) => {
+                    self.display_written_argument_in(ret, variance, flip, scope, &inner)?
+                }
                 // An unwritten return reads `dynamic` (the same resolution
                 // `map_function` interns).
                 None => render_leaf("dynamic", false),
@@ -5452,8 +6276,13 @@ impl<'a> Snapshot<'a> {
                 .iter()
                 .map(|(name, bound)| match bound {
                     Some(bound) => {
-                        let rendered =
-                            self.display_written_argument(bound, Variance::Covariant, false, scope);
+                        let rendered = self.display_written_argument_in(
+                            bound,
+                            Variance::Covariant,
+                            false,
+                            scope,
+                            &inner,
+                        );
                         match rendered {
                             Some(bound_text) => {
                                 format!("{} extends {}", self.strings.resolve(*name), bound_text)
@@ -5468,11 +6297,12 @@ impl<'a> Snapshot<'a> {
                 text.push_str(&format!("<{}>", type_parameters.join(", ")));
             }
             let formal = |tree: &TypeTree| {
-                self.display_written_argument(
+                self.display_written_argument_in(
                     tree,
                     variance.combine(Variance::Contravariant),
                     flip,
                     scope,
+                    &inner,
                 )
             };
             let mut formals: Vec<String> = function
@@ -5510,7 +6340,8 @@ impl<'a> Snapshot<'a> {
             if tree.args.len() != 1 {
                 return None;
             }
-            let base = self.display_written_argument(&tree.args[0], variance, flip, scope)?;
+            let base =
+                self.display_written_argument_in(&tree.args[0], variance, flip, scope, binders)?;
             let suffix = if tree.nullable { "?" } else { "" };
             return Some(format!("FutureOr<{base}>{suffix}"));
         }
@@ -5540,16 +6371,25 @@ impl<'a> Snapshot<'a> {
                 .zip(params.iter())
                 .map(|(arg, &param)| {
                     let declared = self.facts.get(param).variance;
-                    self.display_written_argument(arg, declared.combine(variance), flip, scope)
+                    self.display_written_argument_in(
+                        arg,
+                        declared.combine(variance),
+                        flip,
+                        scope,
+                        binders,
+                    )
                 })
                 .collect::<Option<Vec<_>>>()?;
             return Some(format!("{text}<{}>{suffix}", rendered.join(", ")));
         }
-        // An in-scope type parameter renders by name; anything else is not
-        // a shape the written face can vouch for.
-        scope
-            .contains_key(&tree.head)
-            .then(|| render_leaf(text, tree.nullable))
+        // An in-scope type parameter — or a function-type binder — renders
+        // by name. Anything else failed resolution: the oracle's element is
+        // the InvalidType sentinel and its `getDisplayString` spells it
+        // verbatim (`'InvalidType Function(InvalidType)'`).
+        if binders.contains(&tree.head) || scope.contains_key(&tree.head) {
+            return Some(render_leaf(text, tree.nullable));
+        }
+        Some(format!("InvalidType{suffix}"))
     }
 
     /// The written instantiate-to-bounds argument trees of a bare head
@@ -6728,3 +7568,11 @@ mod ticket_3154_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3850_tests.rs"]
 mod ticket_3850_tests;
+
+// The #4216 pins (the container type-parameter bound lookup's declaration
+// order): a name-only lookup must never read the capture map's hash order
+// — parallel interning moves the `StringId` values, and with them the
+// iteration order, between runs.
+#[cfg(test)]
+#[path = "diagnose/ticket_4216_tests.rs"]
+mod ticket_4216_tests;

@@ -21,26 +21,35 @@
 use std::path::Path;
 
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet};
+use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_scanner::{ScanConfig, scan};
 use dartq_source::{FileTable, StringTable};
 
 use crate::l1::extract_directives;
 use crate::state::DirectiveKind;
 
-/// The `(kind, name)` of every directive fact the diet walk yields for
-/// `text`, in source order.
-fn facts(text: &str) -> Vec<(DirectiveKind, Option<String>)> {
+/// Scans `text` once so both the directive-diet harness and the
+/// recovery-diagnostics harness share the same token stream.
+fn scan_text(text: &str) -> dartq_scanner::ScanResult {
     let mut files = FileTable::new();
     let file = files.intern(Path::new("/lib1.dart"));
     let features = FeatureSet::for_language_version(DEFAULT_LANGUAGE_VERSION);
-    let scanned = scan(
+    scan(
         text,
         ScanConfig {
             enable_triple_shift: features.is_enabled(Feature::TripleShift),
             enable_augmentations: features.is_enabled(Feature::Augmentations),
         },
         file,
-    );
+    )
+}
+
+/// The `(kind, name)` of every directive fact the diet walk yields for
+/// `text`, in source order.
+fn facts(text: &str) -> Vec<(DirectiveKind, Option<String>)> {
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("/lib1.dart"));
+    let scanned = scan_text(text);
     let strings = StringTable::new();
     let mut diagnostics = Vec::new();
     let (directives, _, _) =
@@ -49,6 +58,43 @@ fn facts(text: &str) -> Vec<(DirectiveKind, Option<String>)> {
         .into_iter()
         .map(|directive| (directive.kind, directive.name.as_deref().map(str::to_owned)))
         .collect()
+}
+
+/// The `(code, offset)` of every `missing_identifier` /
+/// `multiple_library_directives` recovery row the real parser reports
+/// for `text`, sorted for a stable comparison — the subset of the
+/// oracle's `--format=machine` rows this pin asserts (offsets are
+/// UTF-16, byte-identical for this ASCII fixture). `expected_token`
+/// rows are deliberately excluded: they are semicolon-recovery noise
+/// whose anchor convention is implementation detail, not the
+/// synthetic-name semantics this pin guards.
+fn recovery_diagnostics(text: &str) -> Vec<(&'static str, u32)> {
+    const KEEP: [&str; 2] = ["missing_identifier", "multiple_library_directives"];
+    struct Collector(Vec<(&'static str, u32)>);
+    impl ParserListener for Collector {
+        fn handle_recoverable_error(
+            &mut self,
+            message: Message,
+            start: TokenSpan,
+            _end: TokenSpan,
+        ) {
+            if KEEP.contains(&message.code.name) {
+                self.0.push((message.code.name, start.range.offset));
+            }
+        }
+    }
+    let scanned = scan_text(text);
+    let features = FeatureSet::for_language_version(DEFAULT_LANGUAGE_VERSION);
+    let mut collector = Collector(Vec::new());
+    Parser::new(
+        text,
+        &scanned.tokens,
+        ParserFeatures::from_feature_set(features),
+        &mut collector,
+    )
+    .parse_unit();
+    collector.0.sort_unstable();
+    collector.0
 }
 
 fn library(name: &str) -> (DirectiveKind, Option<String>) {
@@ -82,13 +128,38 @@ fn a_qualified_name_joins_across_its_periods() {
     assert_eq!(facts("library a.b.c;"), vec![library("a.b.c")]);
 }
 
-/// Name position takes a built-in identifier: `library` names the library,
-/// and the next `library` head still starts its own directive.
+/// A built-in identifier that reaches name position only to be followed by
+/// another declaration head is NOT a name: `LibraryIdentifierContext.
+/// ensureIdentifier` (upstream `identifier_context_impl.dart`:947-1000)
+/// splices a synthetic name in front of it and hands it back to the
+/// top-level loop, so the name slot stays empty and the head starts its own
+/// `library` directive. The oracle agrees — `dart analyze --format=machine`
+/// on this fixture yields three `library` directives (the two synthetic
+/// empty names plus `fetch`) and reports `MISSING_IDENTIFIER` on each
+/// would-be name `library` (cols 9 and 17 → offsets 8 and 16) plus
+/// `MULTIPLE_LIBRARY_DIRECTIVES` on each repeat.
 #[test]
-fn a_built_in_identifier_in_name_position_is_a_name() {
+fn a_builtin_identifier_before_a_directive_head_is_a_synthetic_name() {
     assert_eq!(
         facts("library library library fetch;"),
-        vec![library("library"), library("fetch")]
+        vec![
+            (DirectiveKind::Library, Some(String::new())),
+            (DirectiveKind::Library, Some(String::new())),
+            library("fetch"),
+        ]
+    );
+    // The synthetic names surface as `missing_identifier` on each would-be
+    // name `library` (offsets 8 and 16 = oracle cols 9 and 17) and the
+    // three-directive file as `multiple_library_directives` on each repeat
+    // `library` keyword (same two offsets).
+    assert_eq!(
+        recovery_diagnostics("library library library fetch;"),
+        vec![
+            ("missing_identifier", 8),
+            ("missing_identifier", 16),
+            ("multiple_library_directives", 8),
+            ("multiple_library_directives", 16),
+        ]
     );
 }
 

@@ -100,14 +100,19 @@ fn ticket_2935_non_bool_condition_type_literal_operand() {
 
 /// A `super` expression's static type is the superclass — untyped at
 /// the row layer (`this_type` resolves the keyword), still known
-/// non-`bool` for the verdict.
+/// non-`bool` for the verdict. The bare keyword is also a selector miss
+/// (probe 3.13.7 over the same source: `NON_BOOL_CONDITION` first, then
+/// `MISSING_ASSIGNABLE_SELECTOR` — both at the `super` span, "Missing
+/// selector such as '.identifier' or '[0]'."); the raw fold report
+/// lists the selector row first (the engine's canonical output sort
+/// normalizes to the oracle's order).
 #[test]
 fn ticket_2935_non_bool_condition_super_operand() {
     let report =
         report_ops("class B {}\nclass A extends B {\n  void m() {\n    if (super) {}\n  }\n}");
     assert_eq!(
         code_names(&report),
-        ["non_bool_condition"],
+        ["missing_assignable_selector", "non_bool_condition"],
         "{:?}",
         rows(&report)
     );
@@ -247,7 +252,7 @@ fn ticket_2935_condition_dynamic_respects_strict_casts() {
 /// skipped (layer: dartq-flow), no in-scope fix. `#[ignore]`d because
 /// it encodes oracle output dartq does not yet produce.
 #[test]
-#[ignore = "probe result: divergence is dartq-flow promotion, not engine_core"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn ticket_2935_boolean_conditional_a02_t02_pin() {
     let report = report_ops(
         "void foo() {}\nvoid main() {\n  bool x = false;\n  x = foo();\n  Object? o = true;\n  x = o;\n}",

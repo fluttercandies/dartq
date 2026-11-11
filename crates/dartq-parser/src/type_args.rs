@@ -614,6 +614,27 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         Some(self.offset_of(end) - lt_offset + 1)
     }
 
+    /// [`Self::group_skip_len`] with the group's own `recovered` flag — the
+    /// official `TypeParamOrArgInfo.recovered` that a containing type folds
+    /// into its own (`recovered = recovered | typeInfo.recovered`,
+    /// type_info_impl.dart:1357).
+    fn group_skip_len_full(
+        &self,
+        lt_offset: usize,
+        in_declaration: bool,
+        depth: u32,
+    ) -> Option<(usize, bool)> {
+        if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
+            return None;
+        }
+        if simple1_closer(self, lt_offset).is_some() {
+            return Some((3, false));
+        }
+        let (end, recovered, ..) =
+            self.scan_type_group(self.real_id(lt_offset), in_declaration, depth)?;
+        Some((self.offset_of(end) - lt_offset + 1, recovered))
+    }
+
     /// Scans a `<...>` group without consuming (official
     /// `ComplexTypeParamOrArgInfo.compute`). Returns
     /// `(closer id, recovered, closer is a raw compound, closer is a shared
@@ -636,7 +657,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 scan += metadata_len;
             }
-            let mut len = self.skip_type_len_in(scan, in_declaration, depth + 1);
+            let (mut len, mut member_recovered) =
+                self.skip_type_len_in_full(scan, in_declaration, depth + 1);
             if len == 0 {
                 // Official `computeType(required: true)` at the member slot
                 // admits a built-in keyword via `computeBuiltinOrVarAsType`
@@ -645,7 +667,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // whole group. The upstream shape is `..recovered = true`
                 // (:178/:190), so the group is flagged recovered too.
                 len = self.builtin_recovered_type_len(scan, in_declaration, depth + 1);
-                recovered |= len > 0;
+                member_recovered = len > 0;
+                recovered |= member_recovered;
             }
             if len == 0 {
                 let here = self.kind_at(scan);
@@ -675,6 +698,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     )
                 {
                     recovered = true;
+                    member_recovered = true;
                     scan += 1;
                     continue;
                 }
@@ -687,8 +711,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // so the closer probes start one token later — `< extends
                 // int>` ends on the real `>` instead of degenerating to
                 // `<` alone (which resurfaces as a missing-comma cascade).
-                return Some(self.recovered_group_end(scan, true));
+                return Some(self.recovered_group_end(scan));
             }
+            // Official `recovered = recovered | typeInfo.recovered`
+            // (`type_info_impl.dart:1357`): a member type's own recovery
+            // flags the whole group. `a(b < c, d < e, 1 >> (2))` stays
+            // relational only through this fold — the nested `<e, 1>` group
+            // recovers, and `parseSend` takes type arguments only from an
+            // unrecovered group (`computeMethodTypeArguments`,
+            // `type_info.dart:486-494`). The flag rides the same single scan
+            // (`skip_type_len_in_full`), never a second one: a re-probe here
+            // would double the work per nesting level.
+            recovered |= member_recovered;
             let (end, mut backed_up) = self.step_over_type(scan, len);
             scan = end;
             if self.kind_at(scan) == TokenKind::Keyword(Keyword::Extends) {
@@ -766,7 +800,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // `int m0`), not consumed junk — the official break
                     // leaves `next` on it, so the `(`-step and closer probes
                     // start right there.
-                    return Some(self.recovered_group_end(scan, false));
+                    return Some(self.recovered_group_end(scan));
                 }
             }
         }
@@ -780,20 +814,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// before the follower being the group's last token, so the type ends
     /// there and the follower (a declaration's name) stays out of the type.
     ///
-    /// `junk_is_member` selects between the two official break shapes:
-    /// non-type junk inside the group (`< extends int>`, the :1395-1397
-    /// break) is consumed as the member itself, so probing starts one
-    /// token later; a failed member test (the `(` after `int m0`, the
-    /// :1404 `looksLikeTypeParamOrArg` break) leaves `next` ON the failed
-    /// token, so probing starts at `next` unchanged.
-    fn recovered_group_end(
-        &self,
-        mut next: usize,
-        junk_is_member: bool,
-    ) -> (TokenId, bool, bool, bool) {
-        if junk_is_member {
-            next += 1;
-        }
+    /// `next` is the official `next` of both break shapes verbatim: the
+    /// no-type member break (`< = ...>`, `< extends int>`) lands ON the
+    /// failed member's first token (:1370-1374), and the failed member test
+    /// (the `(` after `int m0`, :1404) lands on that token too — the
+    /// official probes are `splitCloser(next)` / `splitCloser(next.next)`
+    /// and the synthetic sits in front of `next`, so probing never skips
+    /// ahead. A skipped probe here put the group's end past the junk
+    /// (`< = ...` ending on `=` with `end.next` = `int` instead of on a
+    /// synthetic `>` whose follower IS `=`), which flipped
+    /// `computeSimpleWithTypeArguments`' optional-position veto and sent
+    /// `typedef F< = int Function(int);` down the old-style branch.
+    fn recovered_group_end(&self, mut next: usize) -> (TokenId, bool, bool, bool) {
         if self.kind_at(next) == TokenKind::OpenParen
             && let Some(end) = self.cursor.table_matching_end(self.real_id(next))
         {
@@ -1157,9 +1189,25 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         in_declaration: bool,
         depth: u32,
     ) -> usize {
+        self.skip_type_len_in_full(offset, in_declaration, depth).0
+    }
+
+    /// [`Self::skip_type_len_in`] plus the scanned type's own `recovered`
+    /// flag (official `TypeInfo.recovered`, folded by every containing group
+    /// scan — `recovered = recovered | typeInfo.recovered`,
+    /// type_info_impl.dart:1357). Returning it from the same walk keeps the
+    /// group scan single-pass: a second probe per nesting level would make
+    /// the scan quadratic in the type depth.
+    fn skip_type_len_in_full(
+        &self,
+        offset: usize,
+        in_declaration: bool,
+        depth: u32,
+    ) -> (usize, bool) {
         if depth >= crate::parser::TYPE_DEPTH_CRASH_GUARD {
-            return 0;
+            return (0, false);
         }
+        let mut recovered = false;
         match self.kind_at(offset) {
             TokenKind::Keyword(Keyword::Void) => {
                 let mut n = 1;
@@ -1183,7 +1231,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         n += fn_len;
                     }
                 }
-                n
+                (n, false)
             }
             TokenKind::OpenParen => {
                 // Record type `(...)` — only with a real (non-synthetic)
@@ -1202,14 +1250,27 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // junk) so only the non-declaration read validates contents.
                 match self.cursor.table_matching_end(self.real_id(offset)) {
                     Some(end) if !self.cursor.resolve(end).1 => {
-                        if !in_declaration
-                            && !self.record_type_fields_valid(
+                        // `_checkIfRecordTypeParenthesisAreRecovered`
+                        // (type_info_impl.dart:882-945) marks the record
+                        // recovered when its contents are not
+                        // `type (, type)*` / `{...}` named fields; the
+                        // non-declaration read then rejects the whole record
+                        // (the `!required` follower veto), while a
+                        // declaration keeps it and flags the group.
+                        if !in_declaration {
+                            if !self.record_type_fields_valid(
                                 offset,
                                 self.offset_of(end),
                                 depth + 1,
-                            )
-                        {
-                            return 0;
+                            ) {
+                                return (0, false);
+                            }
+                        } else {
+                            recovered = !self.record_type_fields_valid(
+                                offset,
+                                self.offset_of(end),
+                                depth + 1,
+                            );
                         }
                         let mut n = self.offset_of(end) - offset + 1;
                         if self.kind_at(offset + n) == TokenKind::Question {
@@ -1245,9 +1306,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                                 n += 1;
                             }
                         }
-                        n
+                        (n, recovered)
                     }
-                    _ => 0,
+                    _ => (0, false),
                 }
             }
             TokenKind::Keyword(Keyword::Function) => {
@@ -1261,7 +1322,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // `Function <...>? (...) ?` suffix series,
                 // type_info_impl.dart:1094-1133).
                 match self.gft_suffix_len(offset, depth) {
-                    Some(n) => n,
+                    Some(n) => (n, false),
                     // Bare `Function` head — not a GFT intro: the official
                     // computeType(required) reads it as `simpleType` /
                     // `simpleNullableType` (type_info.dart:305-330), so the
@@ -1272,9 +1333,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // a conditional (the expected-token ':' cascade).
                     None => {
                         if self.kind_at(offset + 1) == TokenKind::Question {
-                            2
+                            (2, false)
                         } else {
-                            1
+                            (1, false)
                         }
                     }
                 }
@@ -1298,8 +1359,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // neither `,` nor a closer, so the compute returns
                     // noTypeParamOrArg) leaves the type as the bare identifier
                     // and the `<...>` outside it.
-                    match self.group_skip_len(offset + n, in_declaration, depth + 1) {
-                        Some(len) => {
+                    match self.group_skip_len_full(offset + n, in_declaration, depth + 1) {
+                        Some((len, group_recovered)) => {
+                            recovered |= group_recovered;
                             // The group length covers only the `<...>` tail;
                             // the identifier (or `id.id`) prefix stays.
                             n += len;
@@ -1325,7 +1387,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                                 closer_units(tail) > opens.saturating_sub(closed)
                             };
                             if shared {
-                                return n;
+                                return (n, recovered);
                             }
                             if self.kind_at(offset + n) == TokenKind::Question {
                                 n += 1;
@@ -1370,9 +1432,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         n += 1;
                     }
                 }
-                n
+                (n, recovered)
             }
-            _ => 0,
+            _ => (0, false),
         }
     }
 

@@ -6415,13 +6415,30 @@ fn non_promoted_property_read_reports_the_swept_evidence() {
     );
 }
 
-/// The increment face of the write anchor: `x++` demotes the promoted
-/// type the written `num` no longer satisfies and the row anchors at the
-/// whole postfix expression (the official `postIncDec` node,
-/// increment_or_decrement_resolver.dart:344-349).
+/// The increment face does NOT demote: `x++` writes the operator's result
+/// type (the official `postIncDec` hands flow
+/// `SharedTypeView(operatorReturnType)`, postfix_expression_resolver.dart
+/// :174-186, and `_write` demotes against that type — a result still under
+/// the standing promotion keeps it, flow_analysis.dart:6319/:7881-7905).
+/// On a promoted `int` the `int`-returning `+` keeps the promotion, so the
+/// read after `x++` carries no demotion row. Oracle-verified silent.
 #[test]
-fn why_not_promoted_anchors_the_increment_expression() {
+fn why_not_promoted_increment_keeps_the_promotion() {
     let source = "void f() { num x = 1; if (x is int) { x++; x; } }";
+    let (flow, facts, rows) = why_rows(source);
+    assert!(
+        rows.is_empty(),
+        "an int-returning increment keeps the promoted int face: {facts:?}"
+    );
+    let _ = &flow;
+}
+
+/// The plain-assignment twin of the anchor face: `x = 1.5` writes a `num`
+/// the promoted `int` no longer satisfies, so the demotion row anchors at
+/// the whole assignment expression (the official `_write` node).
+#[test]
+fn why_not_promoted_anchors_the_assignment_expression() {
+    let source = "void f() { num x = 1; if (x is int) { x = 1.5; x; } }";
     let (flow, facts, rows) = why_rows(source);
     assert_eq!(rows.len(), 1, "{facts:?}");
     let flow = flow.borrow();
@@ -6430,7 +6447,7 @@ fn why_not_promoted_anchors_the_increment_expression() {
     let crate::facts::NonPromotionCause::ExplicitWrite { span: write } = context[0].cause else {
         panic!("{:?}", context[0].cause)
     };
-    assert_eq!(span_text(source, write), "x++");
+    assert_eq!(span_text(source, write), "x = 1.5");
 }
 
 /// Bounded growth: repeated reads of one demoted state share one arena

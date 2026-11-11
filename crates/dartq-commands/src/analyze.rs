@@ -58,16 +58,8 @@ pub(crate) fn prelude(engine: &mut Engine) -> Result<(), AnalyzeError> {
 fn analyze_pass(
     engine: &mut Engine,
 ) -> Result<(Vec<Diagnostic>, Duration, usize, usize, Vec<String>), AnalyzeError> {
-    let mut analyzed = (0_usize, 0_usize);
     let mut notices: Vec<String> = Vec::new();
     let mut on_event = |event: EngineEvent| match event {
-        EngineEvent::LibraryAnalyzed { from_cache, .. } => {
-            if from_cache {
-                analyzed.1 += 1;
-            } else {
-                analyzed.0 += 1;
-            }
-        }
         EngineEvent::ExperimentDegrade {
             sdk_version,
             unknown,
@@ -82,11 +74,18 @@ fn analyze_pass(
     let diagnostics = engine
         .analyze(&[], &mut on_event, &CancellationToken::default())
         .map_err(|_: Cancelled| AnalyzeError::Cancelled)?;
+    // The honest per-turn library counts (#4205): the event stream's
+    // `LibraryAnalyzed` cache hits fire for asked-for targets only, so a
+    // pure-replay turn — every library served, none recomputed — reported
+    // zeros there. The engine's turn stats count every live run holder
+    // that was not recomputed as served (a reuse-gate keep, a replayed
+    // persisted run, or a clean target).
+    let (libraries_analyzed, libraries_from_cache) = engine.last_analyze_stats();
     Ok((
         diagnostics,
         analyze_at.elapsed(),
-        analyzed.0,
-        analyzed.1,
+        libraries_analyzed,
+        libraries_from_cache,
         notices,
     ))
 }
@@ -225,7 +224,9 @@ pub fn run_overlaid<'a>(
         // The lint rows ride the same severity face as the engine rows
         // (`analyzer.errors` re-levels and filters them identically — the
         // engine pass already applied it to its own output). A one-shot
-        // run shares nothing across processes: a throwaway memo.
+        // run's memo is throwaway, but the rows themselves persist into
+        // and replay from the engine's L3 store (#4205): the next process
+        // over the same workspace serves them with zero re-execution.
         let lint_rows =
             crate::lints::analyze_lints(engine, roots, &mut crate::lints::LintMemo::default());
         diagnostics.extend(engine.apply_severity_options(lint_rows));
@@ -396,12 +397,13 @@ pub fn run_targets<'a>(
     notices.append(&mut event_notices);
     // The loaded options set lives past the roots block: the plugin weave's
     // per-directory gate consumes the same governing directories.
-    let loaded = loaded_options(engine, roots);
     let lints_at = std::time::Instant::now();
+    let mut loaded = Vec::new();
     if !roots.is_empty() {
         let lint_rows =
             crate::lints::analyze_lints(engine, roots, &mut crate::lints::LintMemo::default());
         diagnostics.extend(engine.apply_severity_options(lint_rows));
+        loaded = loaded_options(engine, roots);
         let registry_rows = options_registry_rows(engine, &loaded);
         if !registry_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(registry_rows));

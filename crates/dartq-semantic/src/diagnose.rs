@@ -1073,6 +1073,13 @@ pub struct UnitFold {
 /// model keeps no declaration spans, so each face resolves from its own
 /// capture grade; an unresolved anchor degrades to the plain row, never a
 /// dropped diagnostic.
+///
+/// The formal-parameter scope splits the row in two codes: two colliding
+/// `this.x` formals report `duplicate_field_formal_parameter` (same span,
+/// same context row, the pair text — duplicate_definition_verifier.dart:
+/// 433-442), everything else `duplicate_definition`. The capture decides
+/// the split (`DuplicateDecl::field_formal`), so the bake and the fold
+/// render the same code from the same log.
 pub fn duplicate_definition_diagnostics(
     file: FileId,
     elements: &FileElements,
@@ -1084,10 +1091,15 @@ pub fn duplicate_definition_diagnostics(
         .iter()
         .map(|dup| {
             let display = strings.resolve(dup.name);
+            let code = if dup.field_formal {
+                SemanticCode::DuplicateFieldFormalParameter
+            } else {
+                SemanticCode::DuplicateDefinition
+            };
             Diagnostic::new(
                 Severity::Error,
-                SemanticCode::DuplicateDefinition.code_info(),
-                SemanticCode::DuplicateDefinition.message(display, ""),
+                code.code_info(),
+                code.message(display, ""),
                 file,
                 dup.range,
                 None,
@@ -2133,6 +2145,23 @@ pub fn fold_unit_with_ops<'t>(
     // The promoted-receiver re-decision (#1465) reads the joined read
     // types throughout pass 2; the rows re-home into the fold product
     // below (the sort here makes the join's offset walk exact).
+    //
+    // PHASE INVARIANT (#3910): this is the latch's ONLY writer, and it
+    // runs AFTER `parser.parse_unit` — every listener fold that runs
+    // during the parse (the binary and conditional fold callbacks in
+    // `diagnose/listener.rs` and anything else answering `read_type_at`)
+    // therefore observes an EMPTY latch and falls back to
+    // the declared face. Only pass-2 consumers (assignment right-hand
+    // sides, the member/argument re-decisions) see the fill. Upstream
+    // keeps the promotion state live while typing — a promoted read's
+    // static type is answered by the local-variable type provider during
+    // resolution (upstream Dart SDK source,
+    // `pkg/analyzer/lib/src/dart/resolver/flow_analysis_visitor.dart`
+    // :1394-1417, `flow.promotedType`), which is why
+    // `visitBinaryExpression` types its operands on the promoted face. A
+    // promotion-aware in-fold consult needs the flow's read rows published
+    // BEFORE the fold (a read sink on the flow recorder), not a second
+    // latch fill here.
     engine.read_types = std::mem::take(&mut read_type_rows);
     // The semantic-side query rows (#1869-2) join the flow rows before the
     // sort: the flow layer types neither the `this` keyword nor an
@@ -2233,9 +2262,14 @@ pub fn fold_unit_with_ops<'t>(
     // see every in-file container — folding the deferred sites, the enum
     // values-field checks, and the `strict_raw_type` displays.
     engine.finalize_bounds();
+    // The #3891 `not_instantiated_bound` declaration face: the same
+    // settled capture's simply-boundedness verdict against every written
+    // type-parameter bound.
+    engine.finalize_not_instantiated_bounds();
     engine.finalize_ext_faces();
     engine.finalize_pattern_getters();
     engine.finalize_mixin_uses();
+    engine.finalize_mixin_class_declarations();
     // The #2972 non-subtypable supertype faces: after the mixin-use
     // teardown so both walk the settled whole-unit container set.
     engine.finalize_disallowed_subtypes();
@@ -3020,6 +3054,20 @@ pub fn fold_unit_with_ops<'t>(
 /// idempotent-terminal shape): structural termination, never a loop, and an
 /// under-cap file pays one comparison.
 pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 10_000;
+
+impl Engine<'_> {
+    /// The `not_instantiated_bound` emit (#3891): the bounds capture's
+    /// declaration-face rows — every written type-parameter bound's bare
+    /// head naming an in-file generic declaration that is not simply
+    /// bounded — anchor at each head token with the row's verbatim
+    /// template and correction.
+    fn finalize_not_instantiated_bounds(&mut self) {
+        let code = SemanticCode::NotInstantiatedBound;
+        for range in self.bounds.check_uninstantiated_bound_sites() {
+            self.emit_message_with_correction(code, range, code.message("", ""));
+        }
+    }
+}
 
 /// The `// ignore:` / `// ignore_for_file:` suppression face over the
 /// assembled semantic run (`ignore_info.dart`'s line attribution, mirrored
@@ -7822,3 +7870,13 @@ mod ticket_3785_tests;
 #[cfg(test)]
 #[path = "diagnose/ticket_3848_tests.rs"]
 mod ticket_3848_tests;
+
+/// The #4202 pins: the executable type-parameter windows scan in
+/// DECLARATION order, so twin generics sharing a parameter name (one
+/// bounded, one unbounded) resolve their own bound — the post-walk
+/// lookups used to scan two `FxHashMap`s whose iteration order moves with
+/// the run's interning order, flipping the receiver-nullability verdict
+/// between byte-identical runs.
+#[cfg(test)]
+#[path = "diagnose/ticket_4202_tests.rs"]
+mod ticket_4202_tests;

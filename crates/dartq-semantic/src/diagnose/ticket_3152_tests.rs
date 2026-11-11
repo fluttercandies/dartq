@@ -42,8 +42,10 @@ fn destructure_decl_no_self_duplicate() {
                   }\n";
     assert_eq!(duplicate_rows(source), Vec::<(u32, u32)>::new());
     // Both binders are unused (unusedLocalVariable on a and b).
-    //   offsets: `a` @17, `b` @19.
-    assert_eq!(unused_local_rows(source), vec![(17, 1), (19, 1)]);
+    //   oracle 3.13.7: `a` at (2,8) -> offset 18, `b` at (2,11) -> 21
+    //   (0-based UTF-16 offset = line start + col - 1; ASCII so UTF-16 ==
+    //   byte).
+    assert_eq!(unused_local_rows(source), vec![(18, 1), (21, 1)]);
 }
 
 /// A single-element record pattern destructures and reads the binder —
@@ -60,9 +62,11 @@ fn destructure_single_used_no_duplicate() {
 }
 
 /// A nested destructuring registers every leaf once — `var (a, [b, c])`
-/// reads `c`, so `a` and `b` report unused, and NO binder reports a
-/// duplicate.
-/// Oracle: `a` @21 +1, `b` @26 +1 unused; `c` @29 read — no row.
+/// reads `c`, and NO binder reports a duplicate. The oracle reports NO
+/// unused row at all here: `visitPatternVariableDeclaration`
+/// (unused_local_elements_verifier.dart :688-715) skips the whole
+/// declaration once ANY of its binders is read.
+/// Oracle 3.13.7: zero `unused_local_variable` rows.
 #[test]
 fn destructure_nested_no_duplicate() {
     let source = "void f() {\n\
@@ -70,8 +74,9 @@ fn destructure_nested_no_duplicate() {
                   \x20 c;\n\
                   }\n";
     assert_eq!(duplicate_rows(source), Vec::<(u32, u32)>::new());
-    // `a` @17, `b` @21 unused; `c` @24 read.
-    assert_eq!(unused_local_rows(source), vec![(17, 1), (21, 1)]);
+    // `c` read spares the whole pattern declaration — silence, not two
+    // rows on `a`/`b`.
+    assert_eq!(unused_local_rows(source), Vec::<(u32, u32)>::new());
 }
 
 /// A destructuring inside a nested function-literal body registers its own
@@ -88,34 +93,39 @@ fn destructure_nested_closure_scope_no_duplicate() {
                   \x20 }();\n\
                   }\n";
     assert_eq!(duplicate_rows(source), Vec::<(u32, u32)>::new());
-    // `a` @21, `b` @24 unused; `c`/`d` returned — used.
-    assert_eq!(unused_local_rows(source), vec![(17, 1), (19, 1)]);
+    // `a` and `b` unused (the closure body's `c`/`d` belong to the inner
+    //   pattern — reads there do not spare the outer declaration).
+    //   oracle 3.13.7: `a` at (2,8) -> 18, `b` at (2,11) -> 21.
+    assert_eq!(unused_local_rows(source), vec![(18, 1), (21, 1)]);
 }
 
 /// The all-underscores binder in a destructuring is not a wildcard (the
 /// wildcard gate is exact `_` only, unused_local_elements_verifier.dart
 /// :985-994) — `var (__) = (1);` reports `unused_local_variable` AND, with
 /// the double-add retracted, no `duplicate_definition`.
-/// Oracle: `__` @21 +2 unused.
+/// Oracle 3.13.7: `__` at (2,8) -> offset 13, length 2.
 #[test]
 fn destructure_dunder_binder_unused_no_duplicate() {
     let source = "f() {\n\
                   \x20 var (__) = (1);\n\
                   }\n";
     assert_eq!(duplicate_rows(source), Vec::<(u32, u32)>::new());
-    assert_eq!(unused_local_rows(source), vec![(12, 2)]);
+    // `__` at (2,8): line 2 starts at 6, col 8 - 1 = 7 -> 13.
+    assert_eq!(unused_local_rows(source), vec![(13, 2)]);
 }
 
 /// A list-pattern destructuring with an all-underscores binder: the name
 /// still reports `unused_local_variable` (not a wildcard) and no
-/// `duplicate_definition`. Oracle: `var [__] = [1];` → `__` @20 +2.
+/// `duplicate_definition`. Oracle 3.13.7: `var [__] = [1];` reports `__`
+/// at (2,8) -> offset 13, length 2.
 #[test]
 fn list_pattern_dunder_unused_no_duplicate() {
     let source = "f() {\n\
                   \x20 var [__] = [1];\n\
                   }\n";
     assert_eq!(duplicate_rows(source), Vec::<(u32, u32)>::new());
-    assert_eq!(unused_local_rows(source), vec![(12, 2)]);
+    // `__` at (2,8): line 2 starts at 6, col 8 - 1 = 7 -> 13.
+    assert_eq!(unused_local_rows(source), vec![(13, 2)]);
 }
 
 /// A genuine same-scope redeclaration still reports `duplicate_definition`
@@ -130,10 +140,12 @@ fn genuine_redeclaration_still_reports() {
                   \x20 var i = 0;\n\
                   \x20 var i = 0;\n\
                   }\n";
-    // Second `i` @27 is the duplicate_definition anchor.
-    assert_eq!(duplicate_rows(source), vec![(27, 1)]);
-    // Both `i` decls report unused (neither is read).
-    assert_eq!(unused_local_rows(source), vec![(15, 1), (27, 1)]);
+    // Second `i` is the duplicate_definition anchor — oracle 3.13.7
+    //   reports it at (3,7): line 3 starts at 24, col 7 - 1 = 6 -> 30.
+    assert_eq!(duplicate_rows(source), vec![(30, 1)]);
+    // Both `i` decls report unused (neither is read) — oracle (2,7) ->
+    //   17 and (3,7) -> 30.
+    assert_eq!(unused_local_rows(source), vec![(17, 1), (30, 1)]);
 }
 
 /// The first-declaration binding (upstream `LocalScope.add`'s `??=`): a
@@ -149,8 +161,9 @@ fn duplicate_read_binds_first_declaration() {
                   \x20 print(i);\n\
                   }\n\
                   void print(Object? o) {}\n";
-    // The first `i` (@15) is read; only the duplicate (@27) is unused.
-    assert_eq!(unused_local_rows(source), vec![(27, 1)]);
+    // The first `i` (@17) is read; only the duplicate is unused —
+    //   oracle 3.13.7 (3,7) -> 30.
+    assert_eq!(unused_local_rows(source), vec![(30, 1)]);
 }
 
 /// An annotation mention credits a local read — the oracle's
@@ -165,7 +178,9 @@ fn annotation_head_credits_local_read() {
                   \x20 var b = 0;\n\
                   }\n";
     // `a` is read by the `@a` annotation — only `b` reports.
-    assert_eq!(unused_local_rows(source), vec![(31, 1)]);
+    //   oracle 3.13.7: `b` at (4,7) -> line 4 starts at 29, col 7 - 1 = 6
+    //   -> 35.
+    assert_eq!(unused_local_rows(source), vec![(35, 1)]);
 }
 
 /// A same-line `// ignore: unused_field` must NOT suppress an
@@ -179,7 +194,9 @@ fn wrong_code_same_line_ignore_does_not_suppress() {
     let source = "void f() {\n\
                   \x20 var x = 0; // ignore: unused_field\n\
                   }\n";
-    assert_eq!(unused_local_rows(source), vec![(15, 1)]);
+    // oracle 3.13.7: `x` at (2,7) -> line 2 starts at 11, col 7 - 1 = 6
+    //   -> 17.
+    assert_eq!(unused_local_rows(source), vec![(17, 1)]);
 }
 
 /// The matching `// ignore: unused_local_variable` DOES suppress.
@@ -205,10 +222,11 @@ fn switch_expression_or_binders_each_report() {
                   \x20 print(z);\n\
                   }\n\
                   void print(Object? o) {}\n";
-    // Three `var a` binders at offsets 40, 49, 58 — all
-    // unused, none spared (each is its own element).
+    // Three `var a` binders — oracle 3.13.7 (3,9), (3,18), (3,27) ->
+    //   line 3 starts at 34, so offsets 42, 51, 60 (all unused, none
+    //   spared: each spelling is its own element).
     let rows = unused_local_rows(source);
-    assert_eq!(rows, vec![(40, 1), (49, 1), (58, 1)]);
+    assert_eq!(rows, vec![(42, 1), (51, 1), (60, 1)]);
 }
 
 /// A single switch-expression arm binder that is read by its arm body
@@ -239,8 +257,10 @@ fn pattern_assignment_var_binder_reports_unused() {
                   \x20 var a = 0;\n\
                   \x20 [a, var d] = y;\n\
                   }\n";
-    // `a` decl @26 unused; `d` binder @42 unused (its own element).
+    // `a` decl unused — oracle 3.13.7 (2,7) -> line 2 starts at 22,
+    //   col 7 - 1 = 6 -> 28. `d` binder unused (its own element) —
+    //   oracle (3,11) -> line 3 starts at 35, col 11 - 1 = 10 -> 45.
     let rows = unused_local_rows(source);
-    assert!(rows.contains(&(26, 1)), "a decl unused: {rows:?}");
-    assert!(rows.contains(&(42, 1)), "var d binder unused: {rows:?}");
+    assert!(rows.contains(&(28, 1)), "a decl unused: {rows:?}");
+    assert!(rows.contains(&(45, 1)), "var d binder unused: {rows:?}");
 }

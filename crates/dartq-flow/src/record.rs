@@ -397,6 +397,14 @@ pub struct Flow<'t> {
     /// local (upstream `ConstructorFieldInitializer` writes `this.f`).
     init_starts: Vec<usize>,
     facts: Vec<FlowFact>,
+    /// How many of [`Flow::facts`] a consumer has already consumed through
+    /// the live publication cursor ([`Flow::published_facts`] /
+    /// [`Flow::mark_facts_published`]). Rows append one executable's replay
+    /// at a time (see [`Flow::exec_end`]), so this cursor is the read-latch
+    /// bridge: the rows of every executable that has finished replaying are
+    /// visible to a consumer polling from any later parser callback, while
+    /// [`Flow::take_facts`] stays the whole-unit view.
+    facts_published: usize,
     /// The write-target reads' flow types, keyed on the read token's
     /// offset (see [`Interp::write_target_read_tys`]): a plain
     /// assignment's retraction removes its target read's fact rows, so
@@ -494,6 +502,7 @@ impl<'t> Flow<'t> {
             wildcard_inits: Vec::new(),
             init_starts: Vec::new(),
             facts: Vec::new(),
+            facts_published: 0,
             write_target_read_tys: FxHashMap::default(),
             bail_count: 0,
             max_step_permille: 0,
@@ -990,6 +999,7 @@ impl<'t> Flow<'t> {
     /// Every fact of the unit, ordered by source offset.
     pub fn take_facts(&mut self) -> Vec<FlowFact> {
         let mut facts = std::mem::take(&mut self.facts);
+        self.facts_published = 0;
         facts.sort_by_key(|fact| match fact {
             FlowFact::DeadCode { span }
             | FlowFact::UnassignedRead { span, .. }
@@ -1006,6 +1016,40 @@ impl<'t> Flow<'t> {
             FlowFact::WriteSite { decl_name_span, .. } => decl_name_span.offset,
         });
         facts
+    }
+
+    /// The facts published since the previous [`Flow::mark_facts_published`],
+    /// in publication order: one finished executable's rows at a time (the
+    /// replay of an executable runs inside the parse, at
+    /// [`Flow::exec_end`]), source order within that executable.
+    ///
+    /// # The live read-latch bridge (#3914)
+    ///
+    /// [`Flow::take_facts`] is the whole-unit view the semantic layer takes
+    /// after `parse_unit`, so an in-parse consumer sees nothing from it.
+    /// This cursor is the incremental face: a consumer that polls it from
+    /// any parser callback which runs after an executable's replay sees
+    /// that executable's [`FlowFact::ReadType`] / [`FlowFact::PromotedRead`]
+    /// rows without waiting for the unit to finish. The rows are `Copy`;
+    /// copy out the ones you need, `mark_facts_published`, and only then
+    /// resolve them against [`Flow::type_args_at`] / [`Flow::name_lexeme`]
+    /// (both re-borrow the recorder).
+    ///
+    /// What this cursor cannot do: a read inside the executable that is
+    /// still parsing. Its rows do not exist until that executable's replay,
+    /// which is the earliest point the flow walk can answer them (the walk
+    /// is a whole-executable replay over the recorded event stream).
+    #[must_use]
+    pub fn published_facts(&self) -> &[FlowFact] {
+        let from = self.facts_published.min(self.facts.len());
+        &self.facts[from..]
+    }
+
+    /// Marks every fact returned by [`Flow::published_facts`] as consumed.
+    /// Idempotent: a second call is a no-op, and [`Flow::take_facts`] still
+    /// returns the whole unit (the cursor never removes rows).
+    pub fn mark_facts_published(&mut self) {
+        self.facts_published = self.facts.len();
     }
 
     /// The flow type the read at `offset` carried in its replay, for the
@@ -1639,7 +1683,7 @@ impl ParserListener for Flow<'_> {
         &mut self,
         _augment: Option<Token>,
         _extension_keyword: Token,
-        _name: Option<Token>,
+        name: Option<Token>,
     ) {
         // The header's type annotations now arriving race for the on-type
         // latch (see [`Flow::extension_on_head`]): the primary
@@ -1647,6 +1691,17 @@ impl ParserListener for Flow<'_> {
         // is the last depth-0 head before the body opens.
         self.in_extension_header = true;
         self.extension_on_head = None;
+        // The override face (see [`crate::ty::ClosedNames::extension_names`]):
+        // a NAMED extension's head spelling is what `E(n)` writes, so the
+        // send fold must not read it as an implicit creation. Captured at
+        // the declaration's own begin — an extension declared after the
+        // executable that overrides it under-reports there (the unknown
+        // head keeps the name-level class face, the under-report
+        // direction).
+        if let Some(name) = name {
+            let id = self.name(name);
+            self.closed.extension_names.insert(id);
+        }
         self.container_depth += 1;
     }
 
@@ -3164,6 +3219,7 @@ impl ParserListener for Flow<'_> {
     fn handle_unary_prefix_expression(&mut self, operator: Token) {
         self.record(Ev::UnaryPrefix {
             is_not: self.kind(operator) == Some(dartq_scanner::TokenKind::Bang),
+            span: operator,
         });
     }
 

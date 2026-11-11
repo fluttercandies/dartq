@@ -232,6 +232,114 @@ pub(crate) const CORE_MEMBER_RETURNS: &[(&str, &str, CoreRet)] = &[
     ("Map", "toString", CoreRet::Fixed("String")),
 ];
 
+/// One formal of a core-constructor tear-off's signature, as the
+/// [`CORE_CTOR_FORMALS`] table spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum CoreCtorArg {
+    /// A fixed non-generic head (`int`, `bool`).
+    Fixed(&'static str),
+    /// The container's Nth type parameter (`E` of `List.filled`'s `fill`;
+    /// `K`/`V` are 0/1 of `Map`).
+    Param(u8),
+    /// A generic head with FIXED argument spellings — a raw head spells
+    /// `dynamic` per slot (`Iterable elements` reads `Iterable<dynamic>`,
+    /// `Map other` reads `Map<dynamic, dynamic>`), a pinned one its
+    /// literals (`Iterable<Object?>`).
+    FixedGeneric(&'static str, &'static [&'static str]),
+    /// A generic head whose arguments ARE the container's first `count`
+    /// type parameters (`Iterable<E>` of `List.of`, `Map<K, V>` of
+    /// `Map.of`).
+    Params(&'static str, u8),
+}
+
+/// The core containers' constructor signatures the tear-off face answers
+/// — the dart:core factories whose formals the constructor-reference
+/// static type carries (`ConstructorElement.type`), spelled as a data
+/// table off the reference SDK declarations (`sdk/lib/core/list.dart`
+/// :151/:165/:194/:210/:248, `sdk/lib/core/map.dart`:64/:76,
+/// `sdk/lib/core/set.dart`:82/:97). Every row is
+/// `(container, selector, positional, named)`; the tear-off's return is
+/// the container head instantiated with the receiver's own arguments
+/// (`List<int>.filled` reads `List<int> Function(int, int, {bool
+/// growable})`). Constructors whose formals spell a function type
+/// (`List.generate`'s `E generator(int index)`) stay out — an entry is a
+/// claim, not a guess.
+pub(crate) const CORE_CTOR_FORMALS: &[(&str, &str, &[CoreCtorArg], &[(&str, CoreCtorArg)])] = &[
+    // list.dart:151 — `factory List.filled(int length, E fill,
+    // {bool growable = false})`.
+    (
+        "List",
+        "filled",
+        &[CoreCtorArg::Fixed("int"), CoreCtorArg::Param(0)],
+        &[("growable", CoreCtorArg::Fixed("bool"))],
+    ),
+    // list.dart:165 — `factory List.empty({bool growable = false})`.
+    (
+        "List",
+        "empty",
+        &[],
+        &[("growable", CoreCtorArg::Fixed("bool"))],
+    ),
+    // list.dart:210 — `factory List.of(Iterable<E> elements,
+    // {bool growable = true})`.
+    (
+        "List",
+        "of",
+        &[CoreCtorArg::Params("Iterable", 1)],
+        &[("growable", CoreCtorArg::Fixed("bool"))],
+    ),
+    // list.dart:194 — `factory List.from(Iterable<Object?> elements,
+    // {bool growable = true})`.
+    (
+        "List",
+        "from",
+        &[CoreCtorArg::FixedGeneric("Iterable", &["Object?"])],
+        &[("growable", CoreCtorArg::Fixed("bool"))],
+    ),
+    // list.dart:248 — `factory List.unmodifiable(Iterable elements)`.
+    (
+        "List",
+        "unmodifiable",
+        &[CoreCtorArg::FixedGeneric("Iterable", &["dynamic"])],
+        &[],
+    ),
+    // map.dart:64 — `factory Map.from(Map other)` (raw `Map` reads
+    // `Map<dynamic, dynamic>`).
+    (
+        "Map",
+        "from",
+        &[CoreCtorArg::FixedGeneric("Map", &["dynamic", "dynamic"])],
+        &[],
+    ),
+    // map.dart:76 — `factory Map.of(Map<K, V> other)`.
+    ("Map", "of", &[CoreCtorArg::Params("Map", 2)], &[]),
+    // set.dart:82 — `factory Set.from(Iterable elements)`.
+    (
+        "Set",
+        "from",
+        &[CoreCtorArg::FixedGeneric("Iterable", &["dynamic"])],
+        &[],
+    ),
+    // set.dart:97 — `factory Set.of(Iterable<E> elements)`.
+    ("Set", "of", &[CoreCtorArg::Params("Iterable", 1)], &[]),
+];
+
+/// The [`CORE_CTOR_FORMALS`] lookup — `(positional, named)` of the
+/// container's constructor selector, `None` when the pair is outside the
+/// table (the under-report direction the tear-off face keeps).
+pub(crate) fn core_ctor_formals(
+    head: &str,
+    selector: &str,
+) -> Option<(
+    &'static [CoreCtorArg],
+    &'static [(&'static str, CoreCtorArg)],
+)> {
+    CORE_CTOR_FORMALS
+        .iter()
+        .find(|(h, s, _, _)| *h == head && *s == selector)
+        .map(|(_, _, positional, named)| (*positional, *named))
+}
+
 /// The [`CORE_MEMBER_RETURNS`] lookup — a linear scan over the small
 /// table on the send-return miss path (a resolved member never consults
 /// it).

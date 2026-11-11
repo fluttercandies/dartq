@@ -1658,9 +1658,45 @@ impl NameTy {
             // this level (the under-report direction — never a false
             // constant verdict).
             Ty::Function { shape, nullable } => {
-                NameTy::Unknown((2 << 41) | (u64::from(shape.raw()) << 1) | u64::from(nullable))
+                NameTy::Unknown(Self::function_sentinel(shape, nullable))
             }
         }
+    }
+
+    /// The [`NameTy::Unknown`] key a `Ty::Function` maps to: the `(2 << 41)`
+    /// tag lifts the slot above the fresh-[`NameWorld::unknown`] counter's
+    /// range and separates the two shape-id pools, the shape's raw id keys
+    /// equal spellings self-equal, and the nullability bit rides along
+    /// (the `F`-vs-`F?` pair stays unprovable at name level — the
+    /// under-report direction, never a false verdict). The sentinel
+    /// shape is what `canBeSubtypeOf`'s function arms
+    /// (type_system.dart:161-171) and `isPotentiallyNullable`'s
+    /// non-nullable-function arm read back out.
+    fn function_sentinel(shape: crate::model::FnShapeId, nullable: bool) -> u64 {
+        (2 << 41) | (u64::from(shape.raw()) << 1) | u64::from(nullable)
+    }
+
+    /// The `(shape, nullable)` a [`NameTy::Unknown`] encodes when it
+    /// carries a function type (the [`Self::function_sentinel`] tag);
+    /// `None` for every other unknown — a minted counter slot, a
+    /// relational-pattern unknown, never a function. The shape id
+    /// itself rides unused: the function arms ask only the head face
+    /// (`isDartCoreFunction`/`isDartCoreObject`), never the signature.
+    fn function_face(ty: &NameTy) -> Option<(u32, bool)> {
+        let NameTy::Unknown(key) = ty else {
+            return None;
+        };
+        if (*key >> 41) != 2 {
+            return None;
+        }
+        Some((((*key >> 1) & 0xFFFF_FFFF) as u32, key & 1 == 1))
+    }
+
+    /// Whether the [`NameTy::Unknown`] carries a function type (any
+    /// nullability face) — the `canBeSubtypeOf` FunctionType-left arm's
+    /// trigger (type_system.dart:161-165).
+    fn is_function_face(ty: &NameTy) -> bool {
+        Self::function_face(ty).is_some()
     }
 }
 
@@ -2358,6 +2394,68 @@ impl<'a> NameWorld<'a> {
             return self.can_be_subtype_of_within(left, &base, budget - 1)
                 || self.future_half_can_be(left, &base, false, budget - 1);
         }
+        // The FunctionType/InterfaceType arms (type_system.dart:161-171,
+        // before either head comparison): a function type only ever
+        // inhabits `Function`/`Object`; nothing outside those two heads
+        // accepts one. The sentinel is opaque to `head_name`, so the
+        // arms must run before it.
+        let left_function = NameTy::function_face(left).is_some();
+        let right_function = NameTy::function_face(right).is_some();
+        let right_interface = matches!(right, NameTy::Named(..) | NameTy::NamedArgs(..));
+        let left_interface = matches!(left, NameTy::Named(..) | NameTy::NamedArgs(..));
+        if left_function && right_interface {
+            let Some(right_name) = self.head_name(right) else {
+                return true;
+            };
+            return right_name == self.function_head()
+                || right_name == self.object_id
+                || (!self.is_known_head(right_name));
+        }
+        if left_interface && right_function {
+            let Some(left_name) = self.head_name(left) else {
+                return true;
+            };
+            return left_name == self.function_head()
+                || left_name == self.object_id
+                || (!self.is_known_head(left_name));
+        }
+        // The RecordType arms (type_system.dart:269-320): a record is
+        // disjoint from every function type, accepts only the `Object`/
+        // `Record` heads at an interface face, and two records compare
+        // shape — positional arity, named-name set, every field pairwise
+        // `canBeSubtypeOf`. `head_name` is likewise opaque to records.
+        let left_record = matches!(left, NameTy::Record { .. });
+        let right_record = matches!(right, NameTy::Record { .. });
+        if left_record && right_function {
+            return false;
+        }
+        if left_record && right_interface {
+            let Some(right_name) = self.head_name(right) else {
+                return true;
+            };
+            // `Record`'s declared edges are `Object` and `Record` alone
+            // (record.dart:82's `abstract final class Record`) — the
+            // spelling asks the interned name, never a declared edge walk
+            // (dart:core's own `Record` declares no container the unit
+            // indexes).
+            return right_name == self.object_id
+                || self.strings.resolve(right_name) == "Record"
+                || (!self.is_known_head(right_name));
+        }
+        if right_record && left_function {
+            return false;
+        }
+        if right_record && left_interface {
+            let Some(left_name) = self.head_name(left) else {
+                return true;
+            };
+            return left_name == self.object_id
+                || self.strings.resolve(left_name) == "Record"
+                || (!self.is_known_head(left_name));
+        }
+        if left_record && right_record {
+            return self.record_pair_can_be(left, right, budget - 1);
+        }
         let (Some(left_name), Some(right_name)) = (self.head_name(left), self.head_name(right))
         else {
             // `Never` (already a subtype of everything), top, and unknown
@@ -2807,8 +2905,14 @@ impl<'a> NameWorld<'a> {
 
     /// `isPotentiallyNullable` (`type_system.dart:1260`): everything except
     /// the non-nullable shapes. The cast-pattern close reads it for the
-    /// `null` half of `createCastSpace` (shared.dart:731-735).
+    /// `null` half of `createCastSpace` (shared.dart:731-735). A function
+    /// sentinel decodes its own `?` bit — the non-nullable `F` face is the
+    /// official's non-nullable FunctionType (`type_system.dart:1260`'s
+    /// `isDartCoreNull`-less FunctionType arm), disjoint from `Null`.
     pub(crate) fn is_potentially_nullable(ty: &NameTy) -> bool {
+        if let Some((_, nullable)) = NameTy::function_face(ty) {
+            return nullable;
+        }
         !matches!(
             ty,
             NameTy::Named(_, false)
@@ -2863,7 +2967,11 @@ impl<'a> NameWorld<'a> {
     /// and `Null` constants reach the relation (the official's gate);
     /// named/`Null` values decide through the declared subtype relation
     /// (the greatest closure is the identity without type parameters);
-    /// every other shape answers `true` (the official's type-parameter
+    /// a `Null` constant against a function/record face asks whether the
+    /// value is nullable (constant_verifier.dart:570-580 — `Null` is the
+    /// only constant the FunctionType/RecordType arm admits), every
+    /// non-`Null` constant against either is provably never equal; the
+    /// remaining shapes answer `true` (the official's type-parameter
     /// and non-interface fallbacks).
     pub(crate) fn can_be_equal(&self, constant: &NameTy, value: &NameTy) -> bool {
         let constant = &self.extension_erasure(constant);
@@ -2877,6 +2985,12 @@ impl<'a> NameWorld<'a> {
         match value {
             NameTy::Named(..) | NameTy::NamedArgs(..) | NameTy::Null => {
                 self.is_subtype_of(constant, value)
+            }
+            NameTy::Record { .. } => {
+                matches!(constant, NameTy::Null) && Self::is_potentially_nullable(value)
+            }
+            _ if NameTy::is_function_face(value) => {
+                matches!(constant, NameTy::Null) && Self::is_potentially_nullable(value)
             }
             _ => true,
         }
@@ -2987,6 +3101,14 @@ impl<'a> NameWorld<'a> {
         self.strings.intern("List")
     }
 
+    /// The interned `Function` spelling — dart:core's `abstract final
+    /// class Function` (function.dart:105), the head a FunctionType's
+    /// only non-`Object` interface face (`canBeSubtypeOf`'s
+    /// `right.isDartCoreFunction`, type_system.dart:163-171).
+    fn function_head(&self) -> StringId {
+        self.strings.intern("Function")
+    }
+
     /// `List<elem>` as the world sees it: `NamedArgs` inside a fold
     /// window (the pool carries the single-argument list), the bare head
     /// otherwise — the same under-report collapse `NamedArgs` itself
@@ -3056,6 +3178,66 @@ impl<'a> NameWorld<'a> {
             )
             .all(|(a, b)| {
                 self.is_subtype_of(&NameTy::from_semantic(*a), &NameTy::from_semantic(*b))
+            })
+    }
+
+    /// The record-pair `canBeSubtypeOf` arm (type_system.dart:287-320):
+    /// equal positional arity, equal named-name set, every field pairwise
+    /// `canBeSubtypeOf` — the overlap question (`isSubtypeOf` below asks
+    /// the subtype question; the pair walks the same shape clauses but
+    /// every field's verdict is the mutual-exclusion one). A nullability
+    /// mismatch still carries the pair: `R` and `R?` share `null` — or
+    /// the un-null non-null half — already settled by the nullable
+    /// pre-flight above, so here the bare shapes compare. Outside a fold
+    /// window the pair is undecidable (the conservative `true`).
+    fn record_pair_can_be(&self, left: &NameTy, right: &NameTy, budget: u8) -> bool {
+        let (
+            NameTy::Record {
+                shape: left_shape, ..
+            },
+            NameTy::Record {
+                shape: right_shape, ..
+            },
+        ) = (left, right)
+        else {
+            return true;
+        };
+        if left_shape == right_shape {
+            return true;
+        }
+        let Some(engine) = fold_engine() else {
+            return true;
+        };
+        let pool = engine.boundary.pool();
+        let (left, right) = (
+            pool.record_shape(*left_shape),
+            pool.record_shape(*right_shape),
+        );
+        if left.positional.len() != right.positional.len()
+            || left.named.len() != right.named.len()
+            || !left
+                .named
+                .iter()
+                .zip(right.named.iter())
+                .all(|((a, _), (b, _))| a == b)
+        {
+            return false;
+        }
+        left.positional
+            .iter()
+            .zip(right.positional.iter())
+            .chain(
+                left.named
+                    .iter()
+                    .zip(right.named.iter())
+                    .map(|((_, a), (_, b))| (a, b)),
+            )
+            .all(|(a, b)| {
+                self.can_be_subtype_of_within(
+                    &NameTy::from_semantic(*a),
+                    &NameTy::from_semantic(*b),
+                    budget,
+                )
             })
     }
 
@@ -3648,22 +3830,40 @@ impl<'a> NameWorld<'a> {
     /// Whether the world decides `name`'s sealedness and subclass set:
     /// the name resolves to a container (this unit's, or one the library
     /// graph reaches — [`Self::locate`]), it is a core sealed type
-    /// (`bool`), or it is dart:core's `Enum` root — no unit ever declares
-    /// that container, yet its exhaustiveness face is fully decided here
-    /// (not sealed, no coverable subtypes — [`Self::name_subtypes`]), so
-    /// the covering verdict over it is the world's answer, not a blind
-    /// spot. A `FutureOr` spelling resolves to dart:async's union — not a
-    /// container — yet the world still decides its sealedness and subtype
-    /// set (`T | Future<T>`), so a `FutureOr<int>` switch expression's
+    /// (`bool`), or it is dart:core's `Enum`/`Object` root — no unit ever
+    /// declares those containers, yet their exhaustiveness faces are fully
+    /// decided here (`Enum` is not sealed and has no coverable subtypes —
+    /// [`Self::name_subtypes`]; `Object` is not sealed either and its
+    /// nullable split `[Object, Null]` is spelled by name alone —
+    /// [`Self::subtypes`]'s `Named(_, true)` arm), so the covering verdict
+    /// over them is the world's answer, not a blind spot. A `FutureOr`
+    /// spelling resolves to dart:async's union — not a container — yet the
+    /// world still decides its sealedness and subtype set
+    /// (`T | Future<T>`), so a `FutureOr<int>` switch expression's
     /// covering verdict is no blind spot either. An unresolvable name is
     /// opaque — its sealed classes and enum constants are invisible, so a
     /// non-exhaustive verdict over it may be false and the expression-face
     /// covering emit suppresses.
+    ///
+    /// The other names-only core stub heads decide identically — an
+    /// opaque leaf plus the `Head()` witness is the whole covering
+    /// question (oracle 3.13.7 evidence, all five emit the
+    /// `non_exhaustive_switch_expression` gap over `Head?`):
+    /// `Function`/`Record` (`abstract final`, zero declared subtypes —
+    /// function.dart:105, record.dart:82), `Type`/`Future`
+    /// (`abstract interface`, open but every subtype inhabits the
+    /// same `[Head, Null]` split — type.dart:21, future.dart:229), and
+    /// `Symbol` (`abstract class`, same shape — symbol.dart:8).
     pub(crate) fn name_resolvable(&self, name: StringId) -> bool {
         name == self.enum_id
+            || name == self.object_id
             || self.container(name).is_some()
             || self.is_sealed_name(name)
             || self.is_future_or_name(name)
+            || matches!(
+                self.strings.resolve(name),
+                "Function" | "Record" | "Type" | "Symbol" | "Future"
+            )
     }
 
     /// The constant's declared instantiation as a [`NameTy`]

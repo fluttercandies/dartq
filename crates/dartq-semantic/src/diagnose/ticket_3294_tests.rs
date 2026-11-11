@@ -228,7 +228,7 @@ fn in_bounds_arguments_stay_silent() {
 /// `typedef G<X extends A<X>> = void Function<Y extends X>();` reports at
 /// the head (co19 `typedef_l2_*`, `TypeArgumentNotMatchingBoundsTest`'s
 /// `test_notRegularBounded_notSuperBounded_parameter_invariant`).
-#[ignore = "bare-head annotation sites have no `end_group`, so no PendingBoundedCheck::Site is queued (diagnose/invocation.rs)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn bare_head_annotation_reports() {
     let hits = bounds_rows(&report_ops(
@@ -248,7 +248,7 @@ fn bare_head_annotation_reports() {
 /// Ignored until `crates/dartq-types` decides generic-function conformance;
 /// upstream `CB<int Function(int)>` over `CB<T extends F>`,
 /// `typedef F = T Function<T>(T)`, reports.
-#[ignore = "generic-function-type conformance is undecided in crates/dartq-types, so the verdict suppresses (bounds.rs check_named)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn generic_function_type_argument_reports() {
     let hits = bounds_rows(&report_ops(
@@ -266,7 +266,7 @@ fn generic_function_type_argument_reports() {
 ///
 /// Ignored for the same reason; upstream `test_extensionType_superBounded`
 /// reports `'A<dynamic>' doesn't conform to the bound 'A<A<dynamic>>'`.
-#[ignore = "bare-head annotation sites have no `end_group`, so no PendingBoundedCheck::Site is queued (diagnose/invocation.rs)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn bare_head_extension_type_reports() {
     let hits = bounds_rows(&report_ops(

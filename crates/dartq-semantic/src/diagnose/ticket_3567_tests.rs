@@ -461,7 +461,7 @@ fn untyped_mixed_positional_tearoff_fires() {
 /// shape with its optional split (the required count must survive the
 /// canonical re-intern); the operand side is already honest.
 #[test]
-#[ignore = "pre-existing: old-style typedef targets lose their optional split on the pooled-shape path"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn untyped_required_against_optional_stays_silent() {
     let report = prefix_report(concat!(
         "typedef fy([y,]);\n",

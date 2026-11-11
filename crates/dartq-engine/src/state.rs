@@ -9,9 +9,10 @@ use std::collections::VecDeque;
 use std::hash::Hash;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use dartq_diagnostics::Diagnostic;
+use dartq_diagnostics::{CodeRegistry, Diagnostic};
 use dartq_index::{FileCapture, LibraryIndex, Postings, distinct_decl_names};
 use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_package::PackageTable as IdentityTable;
@@ -207,6 +208,43 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// populated-elements probe now carries a head range, so the next
 /// encoding edit in that subtree moves bytes again. The fold moves on
 /// the shape lane, so `SIGNATURE_VERSION` stays 13.
+/// v25: two container column waves landed together and this is their
+/// joint record (the v15/v20 retroactive posture — both entered the tree
+/// without their bump, and the engine fixture literal that would have
+/// carried them was uncompilable, so the structural guard saw zero bytes
+/// move). First, the #3847 declared-face wave: containers carry the
+/// named-mixin-application bit (`is_mixin_application`) and the written
+/// type arguments of every supertype clause face
+/// (`with_clause_args` / `implements_clause_args` / `on_clause_args`,
+/// parallel to their name columns, and `superclass_args` for the
+/// `extends` head). The restore pads short columns with
+/// `ArgListId::EMPTY`, so a pre-column payload decodes argument-less —
+/// the exact face the substitution sites read, which is why the wave
+/// changed capture output. Second, the #3903 wave: containers carry each
+/// type parameter's written variance modifier
+/// (`type_param_variances`, parallel to the spellings; the restore pads
+/// a short column with the legacy code). A v24 payload decodes
+/// mixin-application-false, clause-argument-less, and
+/// variance-less, so a warm start would serve faces the current capture
+/// resolves differently; the bump forks such snapshots and forces
+/// re-capture. The same train raised `dartq_semantic::SIGNATURE_VERSION`
+/// 13 → 14 (the clause arguments hash into the element face) and then
+/// 14 → 15 (the variances hash too), so the folded
+/// `FACTS_SEMANTIC_VERSION` moves on both lanes. The populated-elements
+/// probe carries the container row these columns ride, so the next
+/// layout edit there moves pinned bytes again.
+/// v26 (#4207): the persisted payload codec moved from JSON to positional
+/// binary (`bincode-next`'s serde bridge) for both the snapshot facts
+/// entries and the L3 run records. The payload shapes lost their
+/// `skip_serializing_if` attributes in the same change — a positional
+/// decoder would misalign on an omitted field — so every optional column
+/// (`PersistedConfiguration::interpolated`,
+/// `PersistedDiagnostic::context`, `PersistedRefRow::target_container`/
+/// `qualifier`) now always rides the wire (one tag byte for the `None`/
+/// `false` faces). The JSON shape pin below re-pinned to the always-write
+/// encoding; the snapshot container bumped its own
+/// `SNAPSHOT_FORMAT_VERSION` 5 → 6 in the same train, so a JSON-era
+/// generation misses at the header vault before any entry decodes.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -225,7 +263,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 24;
+const FACTS_SHAPE_VERSION: u32 = 26;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with
@@ -256,14 +294,27 @@ const _: () = assert!(dartq_semantic::SIGNATURE_VERSION <= u16::MAX as u32);
 /// law): insertion beyond the cap evicts oldest-first.
 const FACTS_CACHE_CAP: usize = 1024;
 
-/// Scanned-face-cache capacity in entries, same discipline as
-/// [`FACTS_CACHE_CAP`] (the scan face is the token table the semdiag fold
-/// and the index captures consume — the engine perf charter: one keystroke
-/// on a part-heavy library must not re-scan every member). Token tables
-/// cost a small multiple of the source bytes, so the cap — not residency —
-/// bounds the footprint; workspaces above the cap fall back to per-consumer
-/// scans for the coldest entries.
+/// Scanned-face-cache capacity in entries, the cache's secondary bound
+/// (same oldest-first discipline as [`FACTS_CACHE_CAP`]; the scan face is
+/// the token table the semdiag fold and the index captures consume — the
+/// engine perf charter: one keystroke on a part-heavy library must not
+/// re-scan every member). The entry cap keeps a corpus of tiny files from
+/// amassing map/queue overhead; the primary bound is the byte budget
+/// below.
 const SCANNED_CACHE_CAP: usize = 1024;
+
+/// Scanned-face-cache **byte** budget — the primary bound (#4217). Token
+/// tables cost a small multiple of the source bytes (~24 B/token here),
+/// so an entry cap sized for a ~1k-file workspace pinned ~32 MB of token
+/// tables on the 1,332-file cockpit shape: 1,024 tables the next analyze
+/// re-reads anyway while the other ~300 files re-scan on every turn. The
+/// budget decouples the cache's footprint from the workspace's file count;
+/// 16 MiB halves that measured working set, and the miss path is a cheap
+/// pure re-scan on the caller's own thread (the analyze fan-out already
+/// parallelizes it), so the trade is a bounded fraction of a scan pass per
+/// analyze against a hard memory ceiling. A face larger than the whole
+/// budget is never cached: it would evict everything and then itself.
+pub(crate) const SCANNED_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Raw-site-cache capacity in files, same oldest-first discipline as
 /// [`FACTS_CACHE_CAP`] (`#1859`): a capture's raw reference sites are a
@@ -538,10 +589,88 @@ pub struct ScannedFace {
     pub version: LanguageVersion,
 }
 
+impl ScannedFace {
+    /// The face's owned heap bytes: the token table's rows plus its
+    /// begin/end pairing column (`u32` per token), and the face shell.
+    /// The same per-token accounting [`EngineState::memory_report`]
+    /// reports; the scanned cache's byte budget ([`SCANNED_CACHE_BYTES`])
+    /// is kept off this number.
+    #[must_use]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.tokens.len() * (std::mem::size_of::<dartq_scanner::Token>() + 4)
+    }
+}
+
 /// One library surface's reference rows regrouped by use file: per file,
 /// the row indices into [`LibraryIndex::refs`], offset-ascending — the
 /// position face's per-file probe domain.
 pub(crate) type UseView = Box<[(FileId, Box<[u32]>)]>;
+
+/// The on-demand file mint for a replay pass (#4208): interns every path
+/// a run payload names, returning the payload-spelling → id map the
+/// materialize fan-out resolves through. A persisted run's `files` domain
+/// is the producing engine's: the library's members plus every
+/// declaration TARGET its references resolved to — SDK library files
+/// (`dart:core`, `dart:io`, …), pub-cache dependency internals, and the
+/// synthetic SDK unit spellings — none of which a warm turn has
+/// necessarily interned when the replay runs. The graph and SDK-unit
+/// builds intern them on a recompute path, and a pure-replay turn defers
+/// those builds entirely (pipeline.rs's graph gate); requiring
+/// pre-membership in the file table would therefore reject most of a real
+/// workspace's runs and collapse the replay.
+///
+/// Minting here cannot change a byte of output, by construction: every
+/// payload path rides a key whose fold (build, semantic version, grants,
+/// package graph, cycle fingerprint, member content) proves the producing
+/// engine analyzed identical inputs, so the path is one this workspace's
+/// analysis genuinely names; interning is path-keyed and idempotent (the
+/// [`FileTable`] contract), so a path minted now and the same path
+/// interned later by discovery or the graph build share the one id; and
+/// ids are process-local handles that never key output-visible ordering
+/// (#3974/#3987 — machine output renders paths through the table,
+/// canonical sorts compare path bytes), so the *time* of a mint is
+/// unobservable. The batch shape keeps the pass syscall-bounded: one
+/// `realpath` per distinct parent directory ([`dartq_source::normalize_paths`]),
+/// then a hash-only `intern_normalized` per distinct spelling.
+pub(crate) fn mint_run_paths<'a>(
+    files: &mut dartq_source::FileTable,
+    paths: impl Iterator<Item = &'a Path>,
+) -> rustc_hash::FxHashMap<PathBuf, FileId> {
+    let mut seen: rustc_hash::FxHashSet<&Path> = rustc_hash::FxHashSet::default();
+    let mut spellings: Vec<&Path> = Vec::new();
+    for path in paths {
+        if seen.insert(path) {
+            spellings.push(path);
+        }
+    }
+    let normalized = dartq_source::normalize_paths(&spellings);
+    let mut minted: rustc_hash::FxHashMap<PathBuf, FileId> = rustc_hash::FxHashMap::default();
+    for (spelling, normalized) in spellings.iter().zip(normalized) {
+        let id = files.intern_normalized(spelling, normalized);
+        minted.insert((*spelling).to_path_buf(), id);
+    }
+    minted
+}
+
+/// The library's member paths in [`LibraryInfo::content`] order (defining
+/// file first, parts in part-directive order) — the path identity the
+/// library-run key folds (see [`persist::library_run_key`]). Both the
+/// write side (`persist_library_runs`) and the read side
+/// (`replay_library_runs`) derive through here, so the two can never drift
+/// (a drift is a silent cache miss, never a wrong hit — but a permanent
+/// one).
+pub(crate) fn library_member_paths<'a>(
+    info: &'a LibraryInfo,
+    files: &'a dartq_source::FileTable,
+) -> Vec<&'a Path> {
+    let mut paths = Vec::with_capacity(1 + info.parts.len());
+    paths.push(files.path(info.defining).expect("live member interned"));
+    for &part in &info.parts {
+        paths.push(files.path(part).expect("live member interned"));
+    }
+    paths
+}
 
 /// Builds `surface`'s [`UseView`]: a pure function of the surface's rows,
 /// so the analyze fan-out derives it in the job that built the surface and
@@ -751,6 +880,58 @@ struct SkewLog {
 }
 
 impl FeatureGrants {
+    /// The configuration fingerprint of the grant tables (#4199):
+    /// blake3-128 narrowed to u64 over the faces a semantic run's output
+    /// depends on that no signature fold carries — the CLI and per-directory
+    /// options experiment flags, the SDK library layout, and the SDK
+    /// version whose whitelist adjudicates experiment names. Sorted keys
+    /// and length-prefixed fields make the digest a pure function of the
+    /// configuration (equal grants digest equally across processes); the
+    /// memo and skew log are derived state and never hash. Spellings fold
+    /// through the `Debug` form — stable within a build, and the run key
+    /// already pins the build.
+    pub(crate) fn fingerprint(&self) -> u64 {
+        let mut bytes = Vec::new();
+        let mut field = |bytes: &mut Vec<u8>, value: &[u8]| {
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value);
+        };
+        field(&mut bytes, self.sdk_lib_root.as_os_str().as_encoded_bytes());
+        let mut library_dirs: Vec<(&Path, &str)> = self
+            .sdk_library_dirs
+            .iter()
+            .map(|(path, name)| (&**path, &**name))
+            .collect();
+        library_dirs.sort_unstable();
+        for (path, name) in library_dirs {
+            field(&mut bytes, path.as_os_str().as_encoded_bytes());
+            field(&mut bytes, name.as_bytes());
+        }
+        let mut options: Vec<(&Path, Option<&[dartq_language::Feature]>)> = self
+            .options_experiments
+            .iter()
+            .map(|(path, flags)| (&**path, flags.as_deref()))
+            .collect();
+        options.sort_unstable();
+        for (path, flags) in options {
+            field(&mut bytes, path.as_os_str().as_encoded_bytes());
+            // `None` (the directory governs but enables nothing, shielding
+            // its subtree from the CLI base) and `Some([])` resolve
+            // identically today — fold the distinction anyway so a future
+            // semantic split cannot alias old keys.
+            field(&mut bytes, &[u8::from(flags.is_some())]);
+            for flag in flags.unwrap_or_default() {
+                field(&mut bytes, format!("{flag:?}").as_bytes());
+            }
+        }
+        for flag in self.cli_experiments.iter() {
+            field(&mut bytes, format!("{flag:?}").as_bytes());
+        }
+        field(&mut bytes, self.sdk_version.as_bytes());
+        let digest = blake3::hash(&bytes);
+        u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
+    }
+
     /// Derives the grant faces from the loaded SDK snapshot, the target
     /// segment, the package table, and the resolved options table. Only
     /// owners that can actually win a file's attribution are scanned: the
@@ -1655,6 +1836,14 @@ pub(crate) struct EngineState {
     pub part_of_sources: TargetRows<FileId>,
     /// Per-library result cache.
     pub results: FxHashMap<LibraryId, LibraryResult>,
+    /// The L3 run-cache keys this process already wrote (#4199): the
+    /// content-store id bytes of each library's persisted run under its
+    /// current fingerprint, so the post-analyze sweep re-encodes only runs
+    /// whose face moved (and pays nothing for runs a replay adopted — the
+    /// replay seeds the memo with the keys it served). Entries for retired
+    /// libraries prune lazily at the sweep head. Never a correctness face:
+    /// a memo hit skips an idempotent re-write, a memo miss pays one.
+    pub run_writes: FxHashMap<LibraryId, [u8; 16]>,
     /// Change generation per library: bumped each time a fresh run is stored
     /// (the recompute loop in `pipeline::analyze`). The merged-output cache's
     /// key half (`Self::merged`). Monotone per id and never swept — the arena
@@ -1778,9 +1967,19 @@ pub(crate) struct EngineState {
     /// facts cache: the token table + settled feature set the semdiag fold
     /// and the index captures parse through. Filled at the apply recompute
     /// (the one place a scan runs) and drained consumers fall back to a
-    /// local scan on a miss. Bounded, `SCANNED_CACHE_CAP`.
+    /// local scan on a miss. Bounded, `SCANNED_CACHE_CAP` entries and
+    /// [`SCANNED_CACHE_BYTES`] bytes.
     scanned: FxHashMap<FactsKey, Arc<ScannedFace>>,
     scanned_order: VecDeque<FactsKey>,
+    /// The live entries' summed [`ScannedFace::heap_bytes`] — the byte
+    /// budget's ledger, maintained at every insert and eviction.
+    scanned_bytes: usize,
+    /// Scanned-cache probe tallies (the #4217 hit-rate evidence the
+    /// memory decomposition reports as count rows): one relaxed increment
+    /// per [`Self::cached_scanned`] call. Raised from `&self` consumers
+    /// that run in the analyze fan-out, hence atomics over plain counters.
+    scanned_hits: AtomicU64,
+    scanned_misses: AtomicU64,
     /// The maintained symbol-index inputs (the Engine owns dirty
     /// scheduling, the index never invalidates itself):
     /// one capture per resident file (declaration surface + raw sites —
@@ -1864,6 +2063,10 @@ pub(crate) struct EngineState {
     /// [`crate::Engine::open_content_store`]; every apply batch persists
     /// its changed contents and flushes (pipeline's `flush_l3`).
     pub(crate) l3: Option<crate::store::ContentStore>,
+    /// The last completed analyze turn's (recomputed, served-from-standing)
+    /// library counts — the honest per-turn pair
+    /// [`crate::Engine::last_analyze_stats`] reports (#4205).
+    pub(crate) turn_stats: (usize, usize),
     /// The `Tier::Background` warm lane's plan ([`crate::warm::WarmPlan`]):
     /// armed at each analyze settle, stepped in bounded chunks by the
     /// caller's background-tier drain. `armed=false` (the default) is the
@@ -1968,6 +2171,7 @@ impl EngineState {
             import_sources: TargetRows::default(),
             part_of_sources: TargetRows::default(),
             results: FxHashMap::default(),
+            run_writes: FxHashMap::default(),
             library_generations: FxHashMap::default(),
             merged: None,
             invalidated: Vec::new(),
@@ -1989,6 +2193,9 @@ impl EngineState {
             facts_order: VecDeque::new(),
             scanned: FxHashMap::default(),
             scanned_order: VecDeque::new(),
+            scanned_bytes: 0,
+            scanned_hits: AtomicU64::new(0),
+            scanned_misses: AtomicU64::new(0),
             captures: Vec::new(),
             sites_cached: FxHashSet::default(),
             sites_order: VecDeque::new(),
@@ -2003,6 +2210,7 @@ impl EngineState {
             budget: None,
             trace: None,
             l3: None,
+            turn_stats: (0, 0),
             warm: crate::warm::WarmPlan::default(),
         })
     }
@@ -2022,12 +2230,278 @@ impl EngineState {
     /// feature-set merge consults, in one disjoint-field borrow. Every
     /// per-file lane builds this once per item.
     pub(crate) fn grants(&self) -> crate::l1::Grants<'_> {
+        self.grants_over(&self.files)
+    }
+
+    /// [`Self::grants`] with the file table the grant derivation resolves
+    /// ids through — the dep closure's parallel probe passes its
+    /// thread-local [`FileTable`]: the id there is local, but the path it
+    /// maps to is the real one, which is exactly what the owner
+    /// attribution (SDK-library reverse map, package lookup, options
+    /// entries) reads.
+    pub(crate) fn grants_over<'a>(&'a self, files: &'a FileTable) -> crate::l1::Grants<'a> {
         crate::l1::Grants {
             tables: &self.feature_grants,
             experiments: &self.sdk.platform_metadata,
             packages: &self.packages,
-            files: &self.files,
+            files,
         }
+    }
+
+    /// Cross-session run replay (#4199): the pre-analyze half of the L3
+    /// run cache. On the cross-session warm shape — a snapshot staged by
+    /// [`crate::Engine::ingest_facts_snapshot`] and not yet claimed — this
+    /// runs the apply the analyze head would run anyway (forwarding the
+    /// caller's events so the stream is byte-identical to the plain cold
+    /// path), rebuilds the condensation over the claimed faces, and adopts
+    /// every invalidated library whose stored run key matches its current
+    /// cycle fingerprint into `results`, installing the run's persisted
+    /// reference surface (`LibraryIndex`) and its derived use view through
+    /// [`Self::set_surface`], with the reference postings flushed once after
+    /// the loop — the exact install the recompute store loop performs
+    /// (pipeline.rs), so a pure-replay turn's query faces
+    /// (`query_symbols`, `resolve_at`, `override_family`, callers,
+    /// reachability's row read) answer what the recompute they skipped
+    /// would have produced. The analyze phase's own reuse gate then finds
+    /// the adopted records standing and skips their recompute — the
+    /// in-process gate's exact equality, fed from disk.
+    ///
+    /// Every other shape returns before any work: an engine without
+    /// staged facts cannot have stored runs under this build (the key
+    /// folds the build), and an engine whose staging was already consumed
+    /// has its runs in `results` or freshly invalidated by the ordinary
+    /// incremental path. Adoption is all-or-nothing per library — a
+    /// payload that fails its embedded fingerprint check or decodes badly
+    /// is a miss for that library, and the plain recompute serves it. A
+    /// payload's file paths are minted on demand ([`mint_run_paths`]), so
+    /// a declaration target the warm turn has not discovered is no miss.
+    pub(crate) fn replay_library_runs(
+        &mut self,
+        on_event: &mut dyn FnMut(crate::event::EngineEvent),
+    ) {
+        if self.warm_start.is_empty() {
+            return;
+        }
+        let applied = crate::l1::apply(self, on_event);
+        if applied.changed.is_empty() && applied.removed.is_empty() {
+            return;
+        }
+        // The L3 write batch the analyze head would flush for this apply —
+        // a replayed turn must leave the store exactly as the plain path.
+        crate::pipeline::flush_l3(self, &applied.changed);
+        let salvage = std::mem::take(&mut self.condensation);
+        let built = crate::cycle::Condensation::build(Some(&salvage), &self.libraries, |file| {
+            self.residency[&file].api_signature
+        });
+        drop(salvage);
+        self.condensation = built;
+        let build = persist::analyzer_build();
+        let grants = self.feature_grants.fingerprint();
+        let packages = persist::package_graph_fingerprint(&self.packages);
+        let codes = CodeRegistry::builtin();
+        // The destructured fields serve the read-only fan-out only: the
+        // adoption loop below writes `results`/`run_writes`/
+        // `library_generations` and installs surfaces through
+        // `set_surface` — `&mut self` calls cannot share a loop with
+        // outstanding field borrows, so those three stay on `self.`
+        // qualified access (each statement-level borrow ends inside its
+        // own statement).
+        let EngineState {
+            invalidated,
+            condensation,
+            libraries,
+            l3,
+            files,
+            strings,
+            ..
+        } = self;
+        let Some(store) = l3.as_ref() else {
+            return;
+        };
+        // Phase 1 — the lookup fan-out: one content-store read + decode per
+        // library, independent — the same parallel shape as the recompute
+        // fan-out it replaces (49k libraries decode in ~1/8th the serial
+        // wall on the corpus; the read is page-cache-hot by the second
+        // run). The payload's file paths are carried through undecoded
+        // ids-wise: the mint below owns the file domain, in order.
+        use rayon::prelude::*;
+        type Decoded = (
+            LibraryId,
+            [u8; 16],
+            dartq_semantic::ApiSignature,
+            persist::PersistedLibraryRun,
+        );
+        let decoded: Vec<Decoded> = invalidated
+            .par_iter()
+            .filter_map(|&library| {
+                let fingerprint = condensation.fingerprint_of(library)?;
+                let info = libraries.info(library)?;
+                let key = persist::library_run_key(
+                    build,
+                    FACTS_SEMANTIC_VERSION,
+                    grants,
+                    packages,
+                    &fingerprint,
+                    &info.content,
+                    &library_member_paths(info, files),
+                );
+                let payload = store
+                    .read(&key)
+                    .ok()
+                    .and_then(|bytes| persist::decode_run(&bytes))?;
+                Some((library, *key.as_bytes(), fingerprint, payload))
+            })
+            .collect();
+
+        // Phase 2 — the on-demand mint (#4208): intern every payload path
+        // through the shared file table. A run's `files` domain is not the
+        // discovered workspace: it also names every declaration TARGET the
+        // library's references resolve to — SDK library files (`dart:core`
+        // and friends), pub-cache dependency internals, the synthetic SDK
+        // unit spellings — and those files are interned by the graph /
+        // SDK-unit build, which a pure-replay turn deliberately never runs
+        // (pipeline.rs's graph gate defers it while nothing is dirty).
+        // Requiring pre-membership here would miss 90% of libraries on a
+        // real Flutter workspace (cockpit: 1197/1318 on the first measured
+        // warm turn) and collapse the replay. See [`mint_run_paths`] for
+        // why minting cannot move a byte of output.
+        let minted = mint_run_paths(
+            files,
+            decoded
+                .iter()
+                .flat_map(|(_, _, _, payload)| payload.files.iter().map(PathBuf::as_path)),
+        );
+
+        // Phase 3 — the materialize fan-out: diagnostics rows, surface
+        // rows, and the restored `LibraryIndex` per adopted library. The
+        // name texts re-intern through the shared `StringTable` (interior
+        // mutability, the table the whole analyze fan-out already interns
+        // through), and `LibraryIndex::assemble` re-derives the index's
+        // CSR columns from the restored rows inside the worker, so the
+        // serial loop below only installs finished indexes. The minted map
+        // is read-only here — every payload path is present by
+        // construction, so the closure never mints under contention.
+        let adopted: Vec<(LibraryId, [u8; 16], LibraryResult, LibraryIndex)> = decoded
+            .into_par_iter()
+            .filter_map(|(library, key, fingerprint, payload)| {
+                let (run, surface) =
+                    payload.materialize(&fingerprint, &codes, strings, &mut |path| {
+                        minted.get(path).copied()
+                    })?;
+                Some((library, key, run, surface))
+            })
+            .collect();
+        // The reference listings of every adopted surface land in one
+        // batch after the loop — the same deferral the recompute store
+        // loop runs through `set_surface` (nothing reads the reference
+        // postings between the stores; the batch keeps a shared name's
+        // library list sorted-insertion linear instead of per-pair).
+        let mut listings: Vec<(StringId, LibraryId)> = Vec::new();
+        for (library, key, run, surface) in adopted {
+            self.run_writes.insert(library, key);
+            self.results.insert(library, run);
+            // The merged-output cache's contributor invariant (pipeline.rs
+            // `merge_contributors`): every stored result carries a
+            // generation. An adopted run never recomputed in this process,
+            // so its generation is the library's standing one (the initial
+            // entry a fresh library would carry); the next recompute bumps.
+            self.library_generations.entry(library).or_insert(0);
+            // The query faces' install point (pipeline.rs's own
+            // `set_surface` call, mirrored): the persisted surface's use
+            // view is a pure function of its rows, derived here rather
+            // than carried in the payload — derived columns never ride
+            // the wire. `listings` collects the surface's reference
+            // postings for the batch below.
+            let view = use_view_of(&surface);
+            self.set_surface(library, surface, view, &mut listings);
+        }
+        self.list_references(&mut listings);
+    }
+
+    /// The post-analyze half of the L3 run cache (#4199): writes every
+    /// live run whose recorded fingerprint still matches its current cycle
+    /// face (a mid-invalidation record is skipped — never persisted under
+    /// a face it was not computed under), one content-store entry per
+    /// library under [`persist::library_run_key`]. The `run_writes` memo
+    /// keeps the sweep O(changed) across interactive turns: a run whose
+    /// key the process already wrote (or adopted from the store) encodes
+    /// nothing. A disarmed store is a no-op — the cache is an accelerator.
+    pub(crate) fn persist_library_runs(&mut self) {
+        self.run_writes
+            .retain(|library, _| self.results.contains_key(library));
+        if self.results.is_empty() {
+            return;
+        }
+        let build = persist::analyzer_build();
+        let grants = self.feature_grants.fingerprint();
+        let packages = persist::package_graph_fingerprint(&self.packages);
+        let EngineState {
+            results,
+            run_writes,
+            condensation,
+            libraries,
+            library_surfaces,
+            l3,
+            files,
+            strings,
+            ..
+        } = self;
+        let Some(store) = l3.as_mut() else {
+            return;
+        };
+        let mut batch: Vec<(dartq_source::ContentId, Vec<u8>)> = Vec::new();
+        for (&library, result) in results.iter() {
+            let Some(fingerprint) = condensation.fingerprint_of(library) else {
+                continue;
+            };
+            if fingerprint != result.cycle_fingerprint {
+                continue;
+            }
+            let Some(info) = libraries.info(library) else {
+                continue;
+            };
+            let key = persist::library_run_key(
+                build,
+                FACTS_SEMANTIC_VERSION,
+                grants,
+                packages,
+                &fingerprint,
+                &info.content,
+                &library_member_paths(info, files),
+            );
+            if run_writes.get(&library) == Some(key.as_bytes()) {
+                continue;
+            }
+            // The surface rides the same payload: a stored run replays its
+            // query faces whole, and a result whose surface cannot encode
+            // (or is absent — the run predates its surface's install
+            // point, an engine bug) never reaches the store, the
+            // faithful-or-nothing posture applied to the whole record.
+            let Some(surface) = library_surfaces
+                .get(library.index() as usize)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let Some(payload) = persist::PersistedLibraryRun::of(result, surface, files, strings)
+            else {
+                continue;
+            };
+            let Some(bytes) = persist::encode_run(&payload) else {
+                continue;
+            };
+            run_writes.insert(library, *key.as_bytes());
+            batch.push((key, bytes));
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let slices: Vec<(dartq_source::ContentId, &[u8])> = batch
+            .iter()
+            .map(|(id, bytes)| (*id, bytes.as_slice()))
+            .collect();
+        store.put_known_batch(&slices);
+        store.flush();
     }
 
     /// Fact-cache lookup.
@@ -2082,9 +2556,16 @@ impl EngineState {
         }
     }
 
-    /// Scanned-face lookup.
+    /// Scanned-face lookup. Tallying rides the probe: a hit is one the
+    /// caller serves without a re-scan, a miss one it re-derives locally.
     pub(crate) fn cached_scanned(&self, key: FactsKey) -> Option<Arc<ScannedFace>> {
-        self.scanned.get(&key).cloned()
+        let hit = self.scanned.get(&key).cloned();
+        if hit.is_some() {
+            self.scanned_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.scanned_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
     }
 
     /// Test seam: drops every cached scanned face — the post-shed miss
@@ -2095,6 +2576,7 @@ impl EngineState {
     pub(crate) fn shed_scanned_for_test(&mut self) {
         self.scanned.clear();
         self.scanned_order.clear();
+        self.scanned_bytes = 0;
     }
 
     /// The persisted scan face of a resident file, addressed under the exact
@@ -2112,22 +2594,48 @@ impl EngineState {
         self.cached_scanned(key)
     }
 
-    /// Scanned-face insert with the facts cache's oldest-first cap
-    /// eviction. No GC tally: a scanned face holds interned ids and token
-    /// tables, never a store `ContentId`, so its eviction cannot orphan
-    /// content.
+    /// Test seam: the scanned cache's occupancy — `(entries, live heap
+    /// bytes)` — the byte budget's ledger and the eviction pin read.
+    #[cfg(test)]
+    pub(crate) fn scanned_occupancy_for_test(&self) -> (usize, usize) {
+        (self.scanned.len(), self.scanned_bytes)
+    }
+
+    /// Scanned-face insert under the dual bound — the entry cap
+    /// ([`SCANNED_CACHE_CAP`]) and the byte budget
+    /// ([`SCANNED_CACHE_BYTES`]) — oldest-first eviction. No GC tally: a
+    /// scanned face holds interned ids and token tables, never a store
+    /// `ContentId`, so its eviction cannot orphan content.
+    ///
+    /// A face larger than the whole budget is not cached at all: admitting
+    /// it would evict every entry and then itself on the next insert, so
+    /// the miss path's local re-derivation is the better bound. A key
+    /// already present re-inserts in place (same content and feature set
+    /// under the same [`FactsKey`] imply the same token table): the
+    /// ledger and feed position stand.
     pub(crate) fn cache_scanned(&mut self, key: FactsKey, face: ScannedFace) {
-        if self.scanned.len() >= SCANNED_CACHE_CAP && !self.scanned.contains_key(&key) {
-            while self.scanned.len() >= SCANNED_CACHE_CAP {
-                let Some(oldest) = self.scanned_order.pop_front() else {
-                    break;
-                };
-                self.scanned.remove(&oldest);
+        let bytes = face.heap_bytes();
+        if bytes > SCANNED_CACHE_BYTES {
+            return;
+        }
+        if self.scanned.contains_key(&key) {
+            self.scanned.insert(key, Arc::new(face));
+            return;
+        }
+        while !self.scanned.is_empty()
+            && (self.scanned.len() >= SCANNED_CACHE_CAP
+                || self.scanned_bytes + bytes > SCANNED_CACHE_BYTES)
+        {
+            let Some(oldest) = self.scanned_order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.scanned.remove(&oldest) {
+                self.scanned_bytes -= old.heap_bytes();
             }
         }
-        if self.scanned.insert(key, Arc::new(face)).is_none() {
-            self.scanned_order.push_back(key);
-        }
+        self.scanned_bytes += bytes;
+        self.scanned.insert(key, Arc::new(face));
+        self.scanned_order.push_back(key);
     }
 
     /// The maintained capture of `file`, `None` before its first analyze
@@ -2419,11 +2927,7 @@ impl EngineState {
                 merged.contributors.capacity() * size_of::<(LibraryId, u32)>(),
             )
         });
-        let scanned = self
-            .scanned
-            .values()
-            .map(|face| face.tokens.len() * (size_of::<dartq_scanner::Token>() + 4))
-            .sum::<usize>();
+        let scanned = self.scanned_bytes;
         let scanned_slots =
             self.scanned.capacity() * (size_of::<(FactsKey, Arc<ScannedFace>)>() + 1);
         let element_models = self
@@ -2483,6 +2987,16 @@ impl EngineState {
             ),
             ("scanned_cache_tokens", as_u64(scanned), "exact"),
             ("scanned_map_slots", as_u64(scanned_slots), "exact"),
+            (
+                "scanned_cache_hits",
+                self.scanned_hits.load(Ordering::Relaxed),
+                "count",
+            ),
+            (
+                "scanned_cache_misses",
+                self.scanned_misses.load(Ordering::Relaxed),
+                "count",
+            ),
             ("facts_cache_facts", as_u64(cached_facts), "est"),
             ("facts_cache_map_slots", as_u64(facts_cache_slots), "exact"),
             ("warm_start_payloads", as_u64(warm_start), "est"),
@@ -2731,18 +3245,19 @@ impl EngineState {
     /// path's body and the budget ladder's tier-3 shed): every store entry
     /// neither residency nor the facts cache references goes. See
     /// [`Self::collect_garbage`] for the liveness rule's authority note.
+    ///
+    /// The dependency tier holds no store content (#4217): a dep unit
+    /// keeps its derived interface faces and reads source bytes back from
+    /// disk on the rare query-face demand, so nothing under `deps` is
+    /// live here.
     fn sweep_store(&mut self) {
         self.gc_debt = 0;
         let mut live: FxHashSet<ContentId> = FxHashSet::with_capacity_and_hasher(
-            self.residency.len() + self.facts_cache.len() + self.deps.units.len(),
+            self.residency.len() + self.facts_cache.len(),
             FxBuildHasher,
         );
         live.extend(self.residency.values().map(|facts| facts.content));
         live.extend(self.facts_cache.keys().map(|key| key.content));
-        // The dependency-interface units' sources stay live too: a swept dep
-        // content would break the clause-tree capture's store read (the
-        // under-report direction, but an avoidable one).
-        live.extend(self.deps.units.values().map(|unit| unit.facts.content()));
         self.store
             .collect_garbage(&|id: ContentId| live.contains(&id));
     }
@@ -2768,6 +3283,7 @@ impl EngineState {
             crate::budget::Tier::SemanticSlices => {
                 self.scanned.clear();
                 self.scanned_order.clear();
+                self.scanned_bytes = 0;
             }
             crate::budget::Tier::AstCold => {
                 self.warm_start.clear();
@@ -2822,6 +3338,53 @@ impl EngineState {
 mod tests {
     use super::*;
     use dartq_source::content_hash;
+
+    /// The replay mint (#4208): payload paths absent from the warm file
+    /// table are interned on demand, a pre-existing path keeps its id
+    /// (idempotent, not a re-allocation), spellings that alias one file
+    /// share the one id, duplicate spellings mint once, and — the load
+    /// bearing half — a path minted here answers the same id to every
+    /// later `intern`, so a recompute after a replay sees one file, one
+    /// id. This is the regression pin for the 1197/1318 cockpit warm-turn
+    /// misses: the pre-fix closure resolved through `try_file_id` only,
+    /// and every SDK declaration target the table had not interned
+    /// rejected its whole run.
+    #[test]
+    fn replay_mint_interns_absent_paths_and_keeps_id_identity() {
+        let mut files = FileTable::new();
+        let existing = files.intern(Path::new("/w/lib/main.dart"));
+        let alias = Path::new("/w/lib/../lib/main.dart");
+        let sdk = Path::new("/no-such-sdk/lib/core/bool.dart");
+        let dup = Path::new("/no-such-sdk/lib/core/panic.dart");
+        let spellings = [Path::new("/w/lib/main.dart"), sdk, dup, alias, sdk];
+        let minted = mint_run_paths(&mut files, spellings.into_iter());
+
+        assert_eq!(
+            minted[Path::new("/w/lib/main.dart")],
+            existing,
+            "a pre-existing path keeps its id — the mint never re-allocates"
+        );
+        let sdk_id = minted[sdk];
+        assert_eq!(
+            files.try_file_id(sdk),
+            Some(sdk_id),
+            "the minted path is the table's own entry"
+        );
+        assert_eq!(
+            files.intern(sdk),
+            sdk_id,
+            "a later intern answers the same id — one path, one id"
+        );
+        assert_eq!(
+            minted[alias], existing,
+            "an alias spelling normalizes onto the same file, one id"
+        );
+        assert_eq!(
+            minted.len(),
+            4,
+            "one map entry per distinct spelling; the repeated sdk spelling is one"
+        );
+    }
 
     /// The live-path ceiling's degrade row (#1887): one row naming the
     /// ceiling, anchored at the caller's id, and the (file, face) dedup

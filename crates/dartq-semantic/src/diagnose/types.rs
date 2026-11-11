@@ -1747,10 +1747,16 @@ pub(crate) struct IndexArgFace {
 
 /// One annotation in flight: the written name plus, when captured, the
 /// `UseResult.unless` `parameterDefined` face (the official gate's value
-/// face and the written expression's span).
+/// face and the written expression's span). `node` is the whole
+/// Annotation node's span (`@` through the argument list's close),
+/// latched at the metadata end — the upstream verdict anchor every
+/// consumed entry reports on.
 pub(crate) struct PendingAnnotation {
     pub(crate) name: StringId,
     pub(crate) unless: Option<(UnlessArg, SourceRange)>,
+    /// The whole Annotation node span; `None` until `end_metadata`
+    /// latches it (the name event pushes the entry first).
+    pub(crate) node: Option<SourceRange>,
 }
 
 /// One primary-constructor formal that declares a field: the name token's
@@ -1968,6 +1974,15 @@ pub(crate) enum DeclKind {
     Constructor { container: StringId },
 }
 
+/// One const generative constructor of a container: the oracle's
+/// `errorRange` (the const-constructor rows' span) and the head token the
+/// initializer-list scan starts from.
+#[derive(Clone, Copy)]
+pub(crate) struct ConstCtorSite {
+    pub(crate) range: SourceRange,
+    pub(crate) head: SourceRange,
+}
+
 /// The `_checkForWrongVariancePosition` member-face node spans of one
 /// declaration (`error_verifier.dart:7565-7658`): the model keeps no
 /// per-node spans, so the member walk anchors at the member name —
@@ -2073,6 +2088,28 @@ pub(crate) enum VarInferSlot {
     TopLevel,
     /// A field of `container`: [`Engine::field_inferred_tys`].
     Field(StringId),
+}
+
+/// One captured executable type-parameter window (`void f<T extends
+/// num>(T t)`), in declaration order inside [`Engine::exec_windows`].
+///
+/// The declaration offset is the window's ordering key: a post-walk
+/// name-only lookup picks the nearest declaration at or before the
+/// reference, deterministically. Hash order must never decide — parallel
+/// scanning interns names in a scheduler-dependent order, so a
+/// `FxHashMap<StringId, _>` scan is a per-run nondeterminism source
+/// (#4202).
+pub(crate) struct ExecWindow {
+    /// The declaring name (`f`).
+    pub(crate) owner: StringId,
+    /// The declaring name token's offset.
+    pub(crate) at: u32,
+    /// The declaring header is a method (the former `method_exec_bounds`
+    /// side: the callee-side substitution faces must not see method
+    /// entries race their own parameter sources).
+    pub(crate) is_method: bool,
+    /// The window's `(param, written bound)` pairs in declaration order.
+    pub(crate) params: Box<[(StringId, Option<Ty>)]>,
 }
 
 /// The engine: one parse, then the resolution pass.
@@ -2715,22 +2752,21 @@ pub(crate) struct Engine<'a> {
     /// merges into; the augment fragment owns no initializer obligation).
     pub(crate) group_augment: bool,
     /// #1314 FAM10: the diagnosing file's own executables' type parameters
-    /// with their written bounds, keyed by declaring name (`void f<T
-    /// extends num>(T t)` → `[(T, num)]`). The argument-check
-    /// substitution reads it for same-file generic callees.
-    pub(crate) exec_bounds: FxHashMap<StringId, Box<[(StringId, Option<Ty>)]>>,
-    /// The enclosing-method shape of the same capture (`void m<T extends
-    /// C?>(T t)` → `[(T, C?)]`, keyed by declaring name): the
-    /// nullability/never-match gates read the enclosing executable's own
-    /// parameter bounds through it. Held apart from [`Engine::exec_bounds`]
-    /// so the callee-side substitution faces — whose member-send
-    /// inference sources its own parameters from the member walk — never
-    /// see a method entry race them.
-    pub(crate) method_exec_bounds: FxHashMap<StringId, Box<[(StringId, Option<Ty>)]>>,
+    /// with their written bounds (`void f<T extends num>(T t)` →
+    /// `[(T, num)]`), in DECLARATION order. The argument-check
+    /// substitution reads them for same-file generic callees; the post-walk
+    /// name-only scans (`exec_param_bound` / `param_bound_of`) read them
+    /// too, and that order is load-bearing: a `FxHashMap` keyed by
+    /// `StringId` iterates in hash order, which moves run to run because
+    /// parallel scanning interns names in a scheduler-dependent order —
+    /// a first-match scan over it flips diagnostics between byte-identical
+    /// inputs (#4202). One ordered list is the single ordering source;
+    /// exact-owner lookups scan it from the back (keep-last, matching the
+    /// former map inserts).
+    pub(crate) exec_windows: Vec<ExecWindow>,
     /// Whether the latched [`Engine::pending_exec_name`] header is a
-    /// method (`MethodDeclaration` — routed to
-    /// [`Engine::method_exec_bounds`]) or a top-level function (routed to
-    /// [`Engine::exec_bounds`]).
+    /// method (`MethodDeclaration` — the window's `is_method` bit) or a
+    /// top-level function.
     pub(crate) pending_exec_is_method: bool,
     /// The written signatures of function-typed variables (top-level
     /// variables and fields annotated `T Function<T>(T)`), keyed by
@@ -5841,6 +5877,14 @@ impl<'a> Engine<'a> {
     /// this predicate's consumers rather than routing `Null` receivers
     /// into the unchecked code.
     pub(crate) fn potentially_nullable(&self, ty: Ty) -> bool {
+        self.potentially_nullable_at(ty, None)
+    }
+
+    /// [`Self::potentially_nullable`] with the reference's own offset
+    /// where the caller knows it (a post-walk row always does): the
+    /// parameter-bound lookup then reads the nearest declaring window at
+    /// or before the reference instead of the first declaration.
+    pub(crate) fn potentially_nullable_at(&self, ty: Ty, at: Option<u32>) -> bool {
         match ty {
             Ty::Named { nullable: true, .. }
             | Ty::Function { nullable: true, .. }
@@ -5849,7 +5893,7 @@ impl<'a> Engine<'a> {
                 name,
                 nullable: false,
                 ..
-            } => self.param_bound_potentially_nullable(name),
+            } => self.param_bound_potentially_nullable_at(name, at),
             _ => false,
         }
     }
@@ -5868,8 +5912,8 @@ impl<'a> Engine<'a> {
     /// solver's leaked-parameter discipline), and this layer cannot tell
     /// a leaked schema spelling from a user-annotated one (the
     /// under-report direction, the class-generic census rows).
-    fn param_bound_potentially_nullable(&self, name: StringId) -> bool {
-        let mut next = self.exec_param_bound(name);
+    fn param_bound_potentially_nullable_at(&self, name: StringId, at: Option<u32>) -> bool {
+        let mut next = self.exec_param_bound(name, at);
         for _ in 0..4 {
             let Some(ty) = next else { return false };
             match ty {
@@ -5884,7 +5928,7 @@ impl<'a> Engine<'a> {
                     if self.future_or_potentially_nullable(ty) {
                         return true;
                     }
-                    next = self.exec_param_bound(param);
+                    next = self.exec_param_bound(param, at);
                 }
                 _ => return false,
             }
@@ -5909,29 +5953,41 @@ impl<'a> Engine<'a> {
     /// spell `T` without a written `T` annotation — that face binds
     /// `dynamic`, never `Named { T }`, so the window answer stays honest
     /// wherever this predicate actually asks it.
-    fn exec_param_bound(&self, name: StringId) -> Option<Ty> {
+    /// Iteration order is [`Engine::exec_windows`]' declaration order —
+    /// the single ordering a name-only lookup may read (#4202: a
+    /// `FxHashMap` scan flips verdicts between runs because parallel
+    /// interning moves `StringId` values, and with them hash order); `at`
+    /// (the reference offset) picks the nearest declaring window at or
+    /// before the reference, the first declaration otherwise.
+    fn exec_param_bound(&self, name: StringId, at: Option<u32>) -> Option<Ty> {
         let implicit_object = || Ty::Named {
             name: self.intern("Object"),
             nullable: true,
             args: ArgListId::EMPTY,
         };
         let mut container_owned = None;
-        for (owner, window) in self
-            .exec_bounds
-            .iter()
-            .chain(self.method_exec_bounds.iter())
-        {
-            if let Some((_, bound)) = window.iter().find(|(param, _)| *param == name) {
-                if self
-                    .index
-                    .get(self.file)
-                    .is_some_and(|elements| elements.container(*owner).is_some())
-                {
-                    container_owned.get_or_insert_with(|| bound.unwrap_or_else(implicit_object));
-                    continue;
-                }
-                return Some(bound.unwrap_or_else(implicit_object));
+        let mut first_exec = None;
+        let mut nearest_exec = None;
+        for window in &self.exec_windows {
+            let Some((_, bound)) = window.params.iter().find(|(param, _)| *param == name) else {
+                continue;
+            };
+            let bound = bound.unwrap_or_else(implicit_object);
+            if self
+                .index
+                .get(self.file)
+                .is_some_and(|elements| elements.container(window.owner).is_some())
+            {
+                container_owned.get_or_insert(bound);
+                continue;
             }
+            first_exec.get_or_insert(bound);
+            if at.is_some_and(|at| window.at < at) {
+                nearest_exec = Some(bound);
+            }
+        }
+        if let Some(bound) = nearest_exec.or(first_exec) {
+            return Some(bound);
         }
         // A container's own type-parameter spelling (`class C<T extends
         // num?>` member face — `t.isFinite` over `T t`): its bound lives in
@@ -5943,7 +5999,7 @@ impl<'a> Engine<'a> {
         // spelling no own container declares still falls to
         // `container_owned` (the under-report direction).
         if container_owned.is_none()
-            && let Some(bound) = self.bounds.container_param_bound(name)
+            && let Some(bound) = self.bounds.container_param_bound(name, at)
         {
             return Some(bound.map_or_else(implicit_object, |tree| self.tree_ty(&tree)));
         }
@@ -6396,23 +6452,22 @@ impl<'a> Engine<'a> {
         Some(enum_target)
     }
 
-    /// The `const_constructor_with_non_final_field` declaration face
-    /// (`_checkForConstConstructorWithNonFinalField`,
-    /// error_verifier.dart:4098-4112, reached from the
-    /// `ConstructorDeclaration` / `PrimaryConstructorDeclaration` visitors
-    /// at :697-712 / :1766-1790): a const GENERATIVE constructor of a class
-    /// reports when the class carries a non-final instance field — its own,
-    /// its superclass chain's, or its mixins' (`hasNonFinalField`,
-    /// summary2/link.dart:295-322) — anchored on the constructor's
-    /// `errorRange`: a secondary head's type name through its selector, a
-    /// primary head's `const` keyword through the constructor name.
+    /// The declarative const-constructor faces of the container that just
+    /// closed — `_checkForConstConstructorWithNonFinalField`
+    /// (error_verifier.dart:4132-4160, reached from the two constructor
+    /// visitors) and the enum `with`-clause face below, which shares this
+    /// call site because `flush_init_instance_fields` (type_capture.rs) is
+    /// the one declaration-close hook every container kind reaches.
     ///
-    /// The two upstream siblings that pre-empt this row keep it silent:
-    /// `const_constructor_with_mixin_with_field[s]` (a class mixin adding an
-    /// instance field) and `const_constructor_with_non_const_super` (the
-    /// invoked super constructor is not const). Neither sibling is
-    /// implemented here, so this face carries their gates itself — without
-    /// them the oracle's sibling row would surface as an extra row of ours.
+    /// The `const_constructor_with_mixin_with_field[s]` sibling reports from
+    /// the whole-unit mixin-application post-pass instead
+    /// (`enum_verifier.rs`'s `verify_const_constructor_mixin_fields`) —
+    /// upstream decides it first and then stops, so THIS pass stands its own
+    /// row down whenever the mixin list is non-empty (the pre-emption,
+    /// mirrored rather than re-decided). The anchor of both is the
+    /// constructor's `errorRange`: a secondary head's type name through its
+    /// selector, a primary head's `const` keyword through the constructor
+    /// name.
     pub(crate) fn flush_const_ctor_non_final_face(&mut self, container: StringId) {
         let Some(decl) = self
             .index
@@ -6421,37 +6476,59 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        // `enclosingElement is! ClassElement` exempts enums, mixins, and
-        // extension types (:4105-4108).
-        if decl.kind != ContainerKind::Class {
-            return;
+        // The enum `with`-clause face is not constructor-driven: it reports
+        // per mixin entry, once per declaration close, and it needs the
+        // clause spans this pass still holds (the teardown consumes them).
+        if decl.kind == ContainerKind::Enum {
+            self.flush_enum_mixin_instance_variable(container, decl);
         }
-        if !self.face_has_non_final_field(self.file, self.lib, container, &mut FxHashSet::default())
-            || self.class_mixin_adds_instance_field(decl, container)
+        // `enclosingElement is! ClassElement` exempts enums, mixins, and
+        // extension types (:4105-4108), and `hasNonFinalField` gates the rest.
+        if decl.kind != ContainerKind::Class
+            || !self.face_has_non_final_field(
+                self.file,
+                self.lib,
+                container,
+                &mut FxHashSet::default(),
+            )
         {
             return;
         }
-        // The const GENERATIVE constructor sites of this class: a factory is
-        // not generative (upstream `isGenerative` false), an augment
-        // declaration carries no row of its own, and every site without a
-        // latched head anchor (nameless recovery) stays out.
-        let sites: Vec<(usize, SourceRange)> = self
-            .decl_sites
-            .iter()
-            .enumerate()
-            .filter(|(_, site)| {
-                !site.is_factory
-                    && !site.is_augment
-                    && matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
-            })
-            .filter_map(|(index, _)| {
-                let head = *self.ctor_head_anchors.get(&index)?;
-                Some((index, head))
-            })
-            .collect();
-        for (index, head) in sites {
-            let primary = matches!(self.lexeme_at(head.offset), Some("(" | "."));
-            let range = if primary {
+        if self.mixin_declares_instance_field(decl, container) {
+            return;
+        }
+        for site in self.const_ctor_sites(container) {
+            if self.ctor_has_non_const_super(decl, site.head) {
+                continue;
+            }
+            self.emit(
+                SemanticCode::ConstConstructorWithNonFinalField,
+                site.range,
+                "",
+                "",
+            );
+        }
+    }
+
+    /// One const generative constructor's anchors: the oracle's `errorRange`
+    /// (the row's span) and the head token (the initializer-list scan's
+    /// start).
+    fn const_ctor_sites(&self, container: StringId) -> Vec<ConstCtorSite> {
+        let mut sites: Vec<ConstCtorSite> = Vec::new();
+        for (index, site) in self.decl_sites.iter().enumerate() {
+            // A factory is not generative (upstream `isGenerative` false), an
+            // augment declaration carries no row of its own, and every site
+            // without a latched head anchor (nameless recovery) stays out.
+            if site.is_factory
+                || site.is_augment
+                || !matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
+            {
+                continue;
+            }
+            let Some(head) = self.ctor_head_anchors.get(&index).copied() else {
+                continue;
+            };
+            let range = if matches!(self.lexeme_at(head.offset), Some("(" | ".")) {
                 // A primary constructor's const bit lives on the class
                 // header, not the constructor (the site opens before the
                 // keyword is visited): the written `const` decides.
@@ -6463,15 +6540,15 @@ impl<'a> Engine<'a> {
                 }
                 range
             } else {
-                if !self.decl_sites[index].const_ctor {
+                if !site.const_ctor {
                     continue;
                 }
-                if self.decl_sites[index].range.offset > head.offset {
+                if site.range.offset > head.offset {
                     // A named secondary: the type name through the selector
                     // (the site range was rewritten to the selector token).
                     SourceRange {
                         offset: head.offset,
-                        length: self.decl_sites[index].range.end() - head.offset,
+                        length: site.range.end() - head.offset,
                     }
                 } else {
                     // An unnamed secondary (`C(...)`, `new(...)`): the head
@@ -6479,16 +6556,129 @@ impl<'a> Engine<'a> {
                     head
                 }
             };
-            if self.ctor_has_non_const_super(decl, head) {
-                continue;
-            }
-            self.emit(
-                SemanticCode::ConstConstructorWithNonFinalField,
-                range,
-                "",
-                "",
-            );
+            sites.push(ConstCtorSite { range, head });
         }
+        sites
+    }
+
+    /// Stages one `const_constructor_with_mixin_with_field[s]` row at
+    /// `range` into the usage tail (the post-pass rows merge source-ordered
+    /// with the parse-time ones). The singular and plural phrasings share one
+    /// diagnostic code (upstream `diag.constConstructorWithMixinWithField`
+    /// and `constConstructorWithMixinWithFields` both carry the `name`
+    /// `const_constructor_with_mixin_with_field`,
+    /// diagnostic.g.dart:2620-2653), so only the singular text comes from the
+    /// table and the plural one is composed here; the attached correction
+    /// stays the table's singular text until the table grows the plural row.
+    /// Whether one of the container's `with`-clause faces declares an
+    /// instance field — the `const_constructor_with_mixin_with_field[s]`
+    /// pre-emption of this file's non-final-field face
+    /// (`_checkForConstConstructorWithNonConstSuper`'s mixin loop,
+    /// error_verifier.dart:4053-4085; the row itself is staged by the
+    /// whole-unit post-pass, `enum_verifier.rs`'s
+    /// `verify_const_constructor_mixin_fields`).
+    ///
+    /// The set is each written mixin's DECLARED fields
+    /// (`enclosingClass.mixins[*].element.fields`): a field counts unless it
+    /// is static or the abstract+final pair (an abstract final field is a
+    /// getter alone), while an `external` field counts — this loop carries no
+    /// `isExternal` test. Inheritance never joins here: a field the mixin
+    /// merely inherits belongs to `hasNonFinalField`, whose row the oracle
+    /// reports for such a class instead of this one.
+    fn mixin_declares_instance_field(&self, decl: &Container, container: StringId) -> bool {
+        if decl.with_clause.is_empty() {
+            return false;
+        }
+        let scope_lib = self
+            .owner_library_of(self.file, container)
+            .unwrap_or(self.lib);
+        decl.with_clause.iter().any(|&mixin| {
+            self.resolve_clause_face(container, self.file, scope_lib, mixin)
+                .is_some_and(|(face, _)| {
+                    face.members.iter().any(|(_, entry)| {
+                        entry.kind == MemberKind::Field
+                            && !entry.is_static
+                            && !(entry.is_abstract && entry.is_final)
+                    })
+                })
+        })
+    }
+
+    /// The `enum_mixin_with_instance_variable` face: an enum's `with`-clause
+    /// entry whose mixin declares an instance variable
+    /// (`inheritance_override.dart:869-893` `_checkMixinOfEnum`, reached from
+    /// `_checkDirectSuperTypes`' with-clause loop at :684-695). The row
+    /// anchors at the written `NamedType` node.
+    fn flush_enum_mixin_instance_variable(&mut self, container: StringId, decl: &Container) {
+        if decl.with_clause.is_empty() {
+            return;
+        }
+        let Some(name_range) = self.container_name_range(container) else {
+            return;
+        };
+        let Some(spans) = self.with_clause_entry_spans(decl, name_range) else {
+            return;
+        };
+        let scope_lib = self
+            .owner_library_of(self.file, container)
+            .unwrap_or(self.lib);
+        // The rows are collected before any emission: the span slice borrows
+        // the engine immutably.
+        let rows: Vec<SourceRange> = decl
+            .with_clause
+            .iter()
+            .zip(spans)
+            .filter_map(|(&mixin, &span)| {
+                let (face, _) = self.resolve_clause_face(container, self.file, scope_lib, mixin)?;
+                // `interfaceElement is EnumElement || ExtensionTypeElement`
+                // stands the check down (:873-876).
+                if matches!(
+                    face.kind,
+                    ContainerKind::Enum | ContainerKind::ExtensionType
+                ) {
+                    return None;
+                }
+                face.members
+                    .iter()
+                    .any(|(_, entry)| {
+                        entry.kind == MemberKind::Field
+                            && !entry.is_static
+                            && !entry.is_abstract
+                            && !entry.is_external
+                    })
+                    .then_some(span)
+            })
+            .collect();
+        for span in rows {
+            self.emit(SemanticCode::EnumMixinWithInstanceVariable, span, "", "");
+        }
+    }
+
+    /// The written `with`-clause entry spans of the declaration that just
+    /// closed: the tail `drain_with_clause_spans` moved into
+    /// [`Engine::pending_mixin_uses`] at the clause's end, in application
+    /// order. Each span is the oracle's whole-`NamedType` extent — the head
+    /// name through the type-argument group's closer or a trailing `?`.
+    ///
+    /// A recovery shape (fewer completions than the element's claimed
+    /// entries) would leave an earlier declaration's spans in the tail, so
+    /// every entry must sit past this declaration's own name; a mismatch
+    /// answers `None` and the caller under-reports rather than anchoring a
+    /// row at a foreign offset.
+    fn with_clause_entry_spans(
+        &self,
+        decl: &Container,
+        name_range: SourceRange,
+    ) -> Option<&[SourceRange]> {
+        let start = self
+            .pending_mixin_uses
+            .len()
+            .checked_sub(decl.with_clause.len())?;
+        let spans = &self.pending_mixin_uses[start..];
+        spans
+            .iter()
+            .all(|span| span.offset > name_range.offset)
+            .then_some(spans)
     }
 
     /// Whether the class `container` (or any superclass/mixin it climbs
@@ -6526,57 +6716,6 @@ impl<'a> Engine<'a> {
             .with_clause
             .iter()
             .any(|mixin| self.face_has_non_final_field(owner, scope_lib, *mixin, seen))
-    }
-
-    /// Whether one of the class's mixins adds an instance field — the
-    /// `const_constructor_with_mixin_with_field[s]` trigger
-    /// (`_checkForConstConstructorWithNonConstSuper`'s mixin loop,
-    /// error_verifier.dart:4053-4098): a non-static field that is not an
-    /// accessor, the abstract+final pair excepted (an abstract final field
-    /// is a getter alone).
-    fn class_mixin_adds_instance_field(&self, decl: &Container, container: StringId) -> bool {
-        if decl.with_clause.is_empty() {
-            return false;
-        }
-        let lib = owner_library(self.graph, self.lib, self.file, container).unwrap_or(self.lib);
-        let mut seen = FxHashSet::default();
-        decl.with_clause
-            .iter()
-            .any(|mixin| self.face_has_mixin_field(self.file, lib, *mixin, &mut seen))
-    }
-
-    /// The mixin-field walk for [`Self::class_mixin_adds_instance_field`],
-    /// climbing the resolved face's superclass/mixin edges (a mixin
-    /// application in the `with` list resolves to its class face).
-    fn face_has_mixin_field(
-        &self,
-        file: FileId,
-        lib: LibraryId,
-        name: StringId,
-        seen: &mut FxHashSet<(FileId, StringId)>,
-    ) -> bool {
-        let Some((decl, owner)) =
-            resolve_container(self.graph, self.namespaces, self.index, lib, file, name)
-        else {
-            return false;
-        };
-        if !seen.insert((owner, name)) {
-            return false;
-        }
-        if decl.members.values().any(|entry| {
-            !entry.is_static
-                && matches!(entry.kind, crate::model::MemberKind::Field)
-                && !(entry.is_abstract && entry.is_final)
-        }) {
-            return true;
-        }
-        let scope_lib = owner_library(self.graph, self.lib, owner, name).unwrap_or(lib);
-        decl.superclass
-            .is_some_and(|superclass| self.face_has_mixin_field(owner, scope_lib, superclass, seen))
-            || decl
-                .with_clause
-                .iter()
-                .any(|mixin| self.face_has_mixin_field(owner, scope_lib, *mixin, seen))
     }
 
     /// Whether the constructor whose head anchor is `head` invokes a
@@ -6668,6 +6807,16 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// The declaring name token's span of `container` — the anchor the
+    /// container-level faces compose their `errorRange`s from.
+    fn container_name_range(&self, container: StringId) -> Option<SourceRange> {
+        self.decl_sites
+            .iter()
+            .rev()
+            .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
+            .map(|site| site.range)
+    }
+
     /// A primary constructor's `errorRange` (`PrimaryConstructorDeclaration`
     /// overrides it): `beginToken` — the `const` keyword when written, else
     /// the class name — through the constructor name. The `const` keyword
@@ -6678,12 +6827,7 @@ impl<'a> Engine<'a> {
         container: StringId,
         head: SourceRange,
     ) -> Option<SourceRange> {
-        let name = self
-            .decl_sites
-            .iter()
-            .rev()
-            .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
-            .map(|site| site.range)?;
+        let name = self.container_name_range(container)?;
         let start = self
             .token_before(name.offset)
             .filter(|previous| self.lexeme_at(previous.offset) == Some("const"))

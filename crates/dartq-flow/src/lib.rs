@@ -327,3 +327,21 @@ mod void_region_tests;
 #[cfg(test)]
 #[path = "ticket_3853_pins.rs"]
 mod ticket_3853_pins;
+
+#[cfg(test)]
+mod ticket_3902_tests;
+
+#[cfg(test)]
+mod ticket_3915_tests;
+
+#[cfg(test)]
+mod ticket_3923_tests;
+
+#[cfg(test)]
+mod ticket_3936_tests;
+
+#[cfg(test)]
+mod ticket_3950_tests;
+
+#[cfg(test)]
+mod ticket_3955_tests;

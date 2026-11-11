@@ -36,7 +36,7 @@ F<X> toF<X>(X x) => <Y extends X>() {};
 /// `A<num>?`), and neither is a subtype of the other in both directions —
 /// reports `invalid_assignment` on the assigned expression.
 #[test]
-#[ignore = "reverted: the var-inferred send fallback fabricated 1,067 invalid_assignment rows without recovering any missing one (census 20261102-092322)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn bounds_differ_nested_nullability_reports() {
     let report = report_ops_with(
         r#"import 'package:x/lang_feature_check.dart';

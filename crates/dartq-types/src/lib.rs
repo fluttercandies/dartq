@@ -147,3 +147,5 @@ pub use variance::{
 
 #[cfg(test)]
 mod ticket_3468_tests;
+#[cfg(test)]
+mod ticket_3892_tests;

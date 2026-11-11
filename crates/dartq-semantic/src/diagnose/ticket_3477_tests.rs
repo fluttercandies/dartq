@@ -28,6 +28,17 @@
 //! hasCall_extensionMethod#0`, and the
 //! `if_null_assignment_implicit_extension_*` family).
 //!
+//! The extension-body sweep adds the shapes no row record carries at all:
+//! a bare implicit-`this` `??=`/compound write inside the face's own body
+//! (the write half produces no read-position ref) and a `this(...)`
+//! invocation (`RefTarget::This` rides no application arm) — both credit
+//! the enclosing face directly. The literal arm also skips a null
+//! assertion between the literal and its application (`42!(2)`).
+//! Routed out: the `on void` / `on Record` supertype admissions — the
+//! resolve side rejects the read itself (`undefined_getter`), so the
+//! finalize arm never sees the row; the owning layer is
+//! `extension_application`'s admission.
+//!
 //! Registered here via `#[path]`; the module stays inside the `diagnose`
 //! subtree so `crate::diagnose::test_rig` resolves.
 
@@ -170,6 +181,91 @@ extension on String {
 }
 void f() {
   '' .pIntQuestion ??= 1;
+}
+";
+    assert_silent(fixture);
+}
+
+// —— the extension-body sweep (implicit-`this` writes and invocations) ———
+
+/// The `if_null_assignment_implicit_extension_implicit_this_property_test`
+/// discriminator: `p ??= v` on a BARE name inside the face's own body —
+/// the write half produces no read-position record, so the sweep credits
+/// the accessor pair from the token stream. Every accessor pair of the
+/// census fixture's face stays used.
+#[test]
+fn implicit_this_if_null_write_credits_getter_and_setter() {
+    let fixture = "\
+class A {}
+class B1<T> implements A {}
+class B2<T> implements A {}
+class C1<T> implements B1<T>, B2<T> {}
+extension on String {
+  double? get pDoubleQuestion => null;
+  set pDoubleQuestion(Object? value) {}
+  int? get pIntQuestion => null;
+  set pIntQuestion(Object? value) {}
+  String get pString => '';
+  set pString(Object? value) {}
+  String? get pStringQuestion => null;
+  set pStringQuestion(String? value) {}
+  test() {
+    pString ??= contextType('');
+    pStringQuestion ??= contextType('');
+    var d = 2.0;
+    context<Object>((pIntQuestion ??= d));
+    context<Object>((pDoubleQuestion ??= d));
+  }
+}
+Object? contextType(Object? x) => x;
+void context<T>(Object? x) {}
+void main() {
+  ''.test();
+}
+";
+    assert_silent(fixture);
+}
+
+/// `Extension-methods/call_member_t10`: `this(42)` inside the face's own
+/// body is the implicit-`call` invocation on a value of the `on` type —
+/// the face's `call` stays used.
+#[test]
+fn this_invocation_credits_call() {
+    let fixture = "\
+class C {}
+extension on C {
+  test() {
+    Expect.equals('Lily was here: 42', this(42));
+  }
+  String call(int v) => 'Lily was here: $v';
+}
+class Expect {
+  static void equals(expected, actual) {}
+}
+void main() {
+  C c = new C();
+  c.test();
+}
+";
+    assert_silent(fixture);
+}
+
+/// `nnbd/null_check_operator_A05_t02`: a null assertion between the
+/// literal and its application (`42!(2)`, `42![24]`, `42![24] = 24`) —
+/// `e!` keeps the literal's own head, so `call`, `[]`, and `[]=` all
+/// stay used.
+#[test]
+fn null_asserted_literal_application_credits_call_and_index() {
+    let fixture = "\
+extension on int {
+  String call(int i) => 'Lily was here $i times';
+  Object? operator [](int index) => index;
+  void operator []=(int index, int val) {}
+}
+void main() {
+  42!(2);
+  42![24];
+  42![24] = 24;
 }
 ";
     assert_silent(fixture);

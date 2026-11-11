@@ -7,16 +7,16 @@
 //! `catchClauses.last`).
 //!
 //! The clause fact is built in `finish_catch_clause`
-//! (`diagnose/scopes_bodies.rs`): a record-typed (or paren-headed,
-//! recovered) `on` head joins the try's clause list with `on_type: None`
-//! even though the head's field types fire their own `TypeReference`
-//! events, and a clause whose body block never materialized ends at its
-//! head's recovery boundary. The two faces pinned here are the ones the
-//! corpus exercises — `on (int, int)` (`on_clauses_A01_t02`),
-//! `on (int i, {String? n})` (`on_clauses_A02_t01`), and the bare
-//! `on (42, …)` recovery (`parser-fe/record/on`) — plus the plain
-//! `catch (e)` control and the `on Object?` face (a nullable Object is
-//! NOT `isDartCoreObject`, so it takes the subtype arm instead).
+//! (`diagnose/scopes_bodies.rs`): a record-typed `on` head is a
+//! `RecordType` upstream — the subtype arm, which a following non-record
+//! clause never satisfies (silent) — while the paren-headed recovery with
+//! no type joins the try's clause list with `on_type: None`, and a clause
+//! whose body block never materialized ends at its head's recovery
+//! boundary. The faces pinned here are the ones the corpus exercises —
+//! `on (int, int)` (`on_clauses_A01_t02`), `on (int i, {String? n})`
+//! (`on_clauses_A02_t01`), and the bare `on (42, …)` recovery
+//! (`parser-fe/record/on`) — plus the plain `catch (e)` control and the
+//! `on Object?` face.
 
 use crate::diagnose::test_rig::{CORE_PRELUDE, code_names, report_ops};
 
@@ -31,33 +31,31 @@ fn rows_of(source: &str) -> Vec<(&'static str, usize)> {
         .collect()
 }
 
-/// A valid record-type head is the catch-all face: the following `on int`
-/// clause is dead, anchored at its own `on` (not at the record head).
+/// A valid record-type head is NOT the catch-all face: upstream's
+/// `exceptionType` is the `RecordType` itself (never null, never
+/// `isDartCoreObject`), so the following `on int` takes the subtype arm —
+/// `int` is no subtype of `(int, String)` — and the oracle (3.13.7) is
+/// silent.
 #[test]
 fn ticket_3179_record_head_makes_the_tail_dead() {
     let fixture = "void f() {\n  try {\n  } on (int, String) {\n  } on int {\n  }\n}";
     assert_eq!(
         rows_of(fixture),
-        vec![(
-            "dead_code_catch_following_catch",
-            fixture.find("on int").unwrap()
-        )],
+        Vec::<(&str, usize)>::new(),
         "{:#?}",
         rows_of(fixture)
     );
 }
 
-/// The named-record recovery the co19 cases probe (`on (int i, {String? n})`)
-/// is the same catch-all face.
+/// The named-record head (`on (int i, {String? n})`, the co19 shape) is
+/// the same subtype arm: `String` is no subtype of the record, so the
+/// oracle (3.13.7) is silent.
 #[test]
 fn ticket_3179_named_record_head_makes_the_tail_dead() {
     let fixture = "void f() {\n  try {\n  } on (int i, {String? n}) {\n  } on String {\n  }\n}";
     assert_eq!(
         rows_of(fixture),
-        vec![(
-            "dead_code_catch_following_catch",
-            fixture.find("on String").unwrap()
-        )],
+        Vec::<(&str, usize)>::new(),
         "{:#?}",
         rows_of(fixture)
     );
@@ -95,27 +93,38 @@ fn ticket_3179_plain_catch_is_catch_all() {
     );
 }
 
-/// `on Object?` is NOT the catch-all face (`isDartCoreObject` needs the none
-/// nullability suffix): the tail reports the subtype arm instead, anchored at
-/// the dead clause, with `int <: Object?` as the right-top rule.
+/// `on Object?` reads as the catch-all family for the dead-code face
+/// AND fires its own nullable-head row: probe 3.13.7 over the same
+/// fixture reports `NULLABLE_TYPE_IN_CATCH_CLAUSE` at the `Object?`
+/// head ("A potentially nullable type can't be used in an 'on' clause
+/// because it isn't valid to throw a nullable expression.") then
+/// `DEAD_CODE_CATCH_FOLLOWING_CATCH` at the tail ("Dead code: Catch
+/// clauses after a 'catch (e)' or an 'on Object catch (e)' are never
+/// reached." — the nullable-Object head joins the catch-all family).
 #[test]
-fn ticket_3179_nullable_object_head_takes_the_subtype_arm() {
+fn ticket_3179_nullable_object_head_takes_the_catch_all_arm() {
     let fixture = "void f() {\n  try {\n  } on Object? {\n  } on int {\n  }\n}";
     let rows = rows_of(fixture);
     assert_eq!(
         rows,
-        vec![(
-            "dead_code_on_catch_subtype",
-            fixture.find("on int").unwrap()
-        )],
+        vec![
+            (
+                "nullable_type_in_catch_clause",
+                fixture.find("Object?").unwrap()
+            ),
+            (
+                "dead_code_catch_following_catch",
+                fixture.find("on int").unwrap()
+            ),
+        ],
         "{:#?}",
         rows
     );
     let report = report_ops(fixture);
     assert!(
-        code_names(&report)
-            .iter()
-            .all(|code| *code == "dead_code_on_catch_subtype"),
+        code_names(&report).iter().all(|code| {
+            *code == "nullable_type_in_catch_clause" || *code == "dead_code_catch_following_catch"
+        }),
         "{:#?}",
         rows
     );

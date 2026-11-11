@@ -178,9 +178,14 @@ pub(crate) mod msg {
         Message::new(EXPECTED_TOKEN, format!("Expected to find '{expected}'."))
     }
 
-    /// `invalidVoid` (analyzer code `expected_type_name`, per pseudoSharedCode).
+    /// `invalidVoid` (`VoidType.ensureTypeNotVoid`,
+    /// `type_info_impl.dart:427-432`). The fasta message text is "Type
+    /// 'void' can't be used here." but its `pseudoSharedCode` is
+    /// `expectedTypeName`, so the analyzer converter re-renders it as the
+    /// registry diagnostic (`error_converter.dart:96-99`) — only
+    /// `Expected a type name.` is observable.
     pub(crate) fn invalid_void() -> Message {
-        Message::new(EXPECTED_TYPE_NAME, "Type 'void' can't be used here.")
+        Message::new(EXPECTED_TYPE_NAME, "Expected a type name.")
     }
 
     /// `expectedType` (`NoType.ensureTypeNotVoid`, analyzer code

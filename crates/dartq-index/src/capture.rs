@@ -236,22 +236,43 @@ pub struct SuperEdge {
 
 /// The unlinked declaration surface of one file, built by [`capture`].
 ///
-/// Rows are sorted by `(name, offset)`; equal-name runs (duplicate
-/// declarations are #120's `duplicate_definition` business, not a modeling
-/// event) are contiguous for binary-search probes.
+/// Rows are sorted by `(name bytes, offset)` — the canonical,
+/// interning-order-independent order every byte-exact consumer (the export
+/// stream) emits; interned ids follow the run's file-processing order, not
+/// the bytes, so they must not key any output-visible ordering (#3974).
+/// Equal-name runs (duplicate declarations are #120's
+/// `duplicate_definition` business, not a modeling event) stay contiguous
+/// and offset-ascending; [`Self::by_name`] probes them through
+/// [`Self::runs`], the id-ordered directory, not the row order.
 #[derive(Clone, Debug, Default)]
 pub struct FileIndex {
     decls: Vec<DeclRow>,
     supers: Vec<SuperEdge>,
+    /// The equal-name run directory: each distinct declaration name with
+    /// its run's start row, ascending by `StringId` — the probe face
+    /// [`Self::by_name`] binary-searches. Kept in interned-id order (not
+    /// the stored byte-canonical row order) because a probe arrives as a
+    /// `StringId` and ids order independently of their spellings' bytes.
+    runs: Vec<(StringId, u32)>,
 }
 
 impl FileIndex {
-    /// The equal-name run of `name`, if the file declares it.
+    /// The equal-name run of `name`, if the file declares it: a binary
+    /// search over [`Self::runs`] (the id-ordered directory) lands the
+    /// run's start, and the run's extent comes off the rows themselves —
+    /// equal ids are contiguous in the byte-canonical order (equal
+    /// bytes), so an id-equality probe closes the slice, offset-ascending
+    /// as always.
     #[must_use]
     pub fn by_name(&self, name: StringId) -> Option<&[DeclRow]> {
-        let start = self.decls.partition_point(|row| row.name < name);
+        let slot = self.runs.partition_point(|&(run, _)| run < name);
+        let &(run, start) = self.runs.get(slot)?;
+        if run != name {
+            return None;
+        }
+        let start = start as usize;
         let end = self.decls[start..].partition_point(|row| row.name == name) + start;
-        (start < end).then(|| &self.decls[start..end])
+        Some(&self.decls[start..end])
     }
 
     /// Whether the file declares `name` (any kind, private included).
@@ -283,7 +304,8 @@ impl FileIndex {
         &self.decls[index as usize]
     }
 
-    /// Every declaration row, ascending by `(name, offset)`.
+    /// Every declaration row, ascending by `(name bytes, offset)` — the
+    /// canonical order byte-exact consumers emit.
     #[must_use]
     pub fn decls(&self) -> &[DeclRow] {
         &self.decls
@@ -432,12 +454,14 @@ pub struct FileCapture {
     /// The raw reference sites. Crate-internal with [`RawSites`] (the
     /// only consumer is [`crate::LibraryBuilder`]).
     pub(crate) sites: RawSites,
-    /// Whether the sites were shed after the capture was built (`#1859`
-    /// LRU discipline): the engine's site cache capped out and replaced
-    /// this capture with its [`FileCapture::without_sites`] twin. A fresh
-    /// capture is never shed; the declaration surface is unaffected, and
-    /// the sites re-derive purely from (content, feature set) on the next
-    /// library build.
+    /// Whether the site columns are unmounted: the engine's site cache
+    /// capped out and replaced this capture with its
+    /// [`FileCapture::without_sites`] twin (`#1859` LRU discipline), or the
+    /// capture ran in the declaration-only mode
+    /// ([`Capturer::declarations_only`]) and never collected sites. The
+    /// declaration surface is unaffected either way, and a site consumer
+    /// re-derives the pure face from (content, feature set) on its next
+    /// build.
     shed: bool,
 }
 
@@ -453,8 +477,9 @@ impl FileCapture {
         self.sites.capacity()
     }
 
-    /// Whether the raw sites are mounted. False only for the shed twin
-    /// ([`FileCapture::without_sites`]) — a file with genuinely zero sites
+    /// Whether the raw sites are mounted. False for the shed twin
+    /// ([`FileCapture::without_sites`]) and for a declaration-only capture
+    /// ([`Capturer::declarations_only`]) — a file with genuinely zero sites
     /// still reports true, so the engine's rebuild face can tell "nothing
     /// to fold" from "shed, re-derive".
     #[must_use]
@@ -463,16 +488,18 @@ impl FileCapture {
     }
 
     /// The capture's owned heap bytes at reserved capacity: the
-    /// declaration rows, the supertype edges, and the five site columns
-    /// (`u32` name + kind byte + family byte + `u32` offset + `u32` length
-    /// per site). Exact over the columns this type owns; the allocator's
-    /// per-block rounding is not counted. The engine's memory
-    /// decomposition reads it.
+    /// declaration rows, the supertype edges, the equal-name run directory
+    /// (one `StringId`-plus-start pair per distinct name — `by_name`'s
+    /// probe face), and the five site columns (`u32` name + kind byte +
+    /// family byte + `u32` offset + `u32` length per site). Exact over the
+    /// columns this type owns; the allocator's per-block rounding is not
+    /// counted. The engine's memory decomposition reads it.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
         self.index.decls.capacity() * size_of::<DeclRow>()
             + self.index.supers.capacity() * size_of::<SuperEdge>()
+            + self.index.runs.capacity() * size_of::<(StringId, u32)>()
             + self.sites.capacity() * (size_of::<StringId>() + 2 + 2 * size_of::<u32>())
     }
 
@@ -491,6 +518,19 @@ impl FileCapture {
             index: self.index.clone(),
             sites: RawSites::empty(),
             shed: true,
+        }
+    }
+
+    /// The declaration-surface form of `self`, consuming the capture: an
+    /// already site-less capture (a declaration-only build, or a shed
+    /// twin) passes through untouched, so the free-standing dependency
+    /// tier pays no index clone.
+    #[must_use]
+    pub fn into_declaration_surface(self) -> FileCapture {
+        if self.shed {
+            self
+        } else {
+            self.without_sites()
         }
     }
 }
@@ -533,6 +573,11 @@ struct Builder<'src, 'tab> {
     /// and the unended group's rows honestly `UNKNOWN`.
     field_group: Option<usize>,
     sites: RawSites,
+    /// Whether reference sites are collected at all: cleared for the
+    /// declaration-only mode ([`Capturer::declarations_only`]), where the
+    /// listener still walks every event for declarations, supertype edges,
+    /// and positional columns but never allocates or pushes site rows.
+    sites_enabled: bool,
     /// The token the bare-send marker last armed for (`handle_no_arguments`
     /// under dartq's emission, `handle_send_without_arguments` under the
     /// official one). A send is the bare identifier shape only when it ends
@@ -579,6 +624,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         source: &'src str,
         tokens: &'tab TokenTable,
         strings: &'src StringTable,
+        sites_enabled: bool,
     ) -> Self {
         Self {
             source,
@@ -595,7 +641,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_top: None,
             pending_typedef: None,
             field_group: None,
-            sites: RawSites::with_capacity(tokens.len()),
+            sites: if sites_enabled {
+                RawSites::with_capacity(tokens.len())
+            } else {
+                RawSites::empty()
+            },
+            sites_enabled,
             no_args_at: None,
             type_arg_depth: 0,
             access_chain_end: 0,
@@ -848,8 +899,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
     }
 
-    /// Appends a raw reference site (synthetic tokens contribute nothing).
+    /// Appends a raw reference site (synthetic tokens contribute nothing;
+    /// the declaration-only mode collects no sites at all).
     fn site(&mut self, token: Token, family: Family, kind: RefKind) {
+        if !self.sites_enabled {
+            return;
+        }
         let Some(name) = self.name_of(token) else {
             return;
         };
@@ -863,6 +918,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// Upgrades the site at `token`'s offset to [`RefKind::Invoked`] (the
     /// send and constructor-reference events carry the target's span).
     fn mark_invoked(&mut self, token: Token) {
+        if !self.sites_enabled {
+            return;
+        }
         if let Ok(i) = self.sites.offsets.binary_search(&token.range.offset) {
             self.sites.kinds[i] = RefKind::Invoked as u8;
         }
@@ -874,17 +932,22 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         while !self.containers.is_empty() {
             self.close_container();
         }
-        // Sort rows by (name, offset) and remap the container anchors and
-        // superclass edges through the permutation. The anchors remap in
-        // place first (they are values, not positions), then the rows
-        // permute in place — the build's only table-sized extra allocation
-        // is the index vector driving the permutation.
+        // Sort rows by (name bytes, offset) and remap the container anchors
+        // and superclass edges through the permutation. The name key is the
+        // spelling's bytes, not the interned id: ids follow the run's
+        // file-processing order (the engine discovers files in parallel),
+        // so an id-keyed row order flips run to run and leaks into every
+        // byte-exact consumer (#3974). The key is total — one name token
+        // per offset. The anchors remap in place first (they are values,
+        // not positions), then the rows permute in place — the build's only
+        // table-sized extra allocation is the index vector driving the
+        // permutation.
         let mut order: Vec<u32> = (0..crate::narrow(self.decls.len())).collect();
-        order.sort_by_key(|&i| {
-            (
-                self.decls[i as usize].name,
-                self.decls[i as usize].range.offset,
-            )
+        order.sort_by(|&a, &b| {
+            let left = &self.decls[a as usize];
+            let right = &self.decls[b as usize];
+            (self.strings.resolve(left.name), left.range.offset)
+                .cmp(&(self.strings.resolve(right.name), right.range.offset))
         });
         let mut remap = vec![DeclRow::NONE; self.decls.len()];
         for (new, &old) in order.iter().enumerate() {
@@ -913,19 +976,37 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 remap.swap(i, j);
             }
         }
+        // The equal-name run directory: one entry per distinct name, off
+        // the contiguous runs of the sorted rows, then reordered to
+        // interned-id ascent — the probe face `by_name` binary-searches.
+        // The directory decouples the probe order (ids, what a lookup
+        // arrives as) from the row order (bytes, what the export emits).
+        let mut runs: Vec<(StringId, u32)> = Vec::new();
+        let mut prev: Option<StringId> = None;
+        for (i, row) in self.decls.iter().enumerate() {
+            if prev != Some(row.name) {
+                runs.push((row.name, crate::narrow(i)));
+                prev = Some(row.name);
+            }
+        }
+        runs.sort_unstable_by_key(|&(name, _)| name);
+        runs.shrink_to_fit();
         // Freeze: the site columns move into the long-lived capture, so the
         // token-count reservation `RawSites::with_capacity` opened with must
         // be shed here — sites run well under tokens, and holding the slack
         // would keep ~2/3 of the reserved site bytes resident per file.
-        self.sites.shrink_to_fit();
+        if self.sites_enabled {
+            self.sites.shrink_to_fit();
+        }
         FileCapture {
             file: self.file,
             index: FileIndex {
                 decls: self.decls,
                 supers,
+                runs,
             },
             sites: self.sites,
-            shed: false,
+            shed: !self.sites_enabled,
         }
     }
 }
@@ -948,7 +1029,30 @@ impl<'src, 'tab> Capturer<'src, 'tab> {
         strings: &'src StringTable,
     ) -> Self {
         Self {
-            builder: Rc::new(RefCell::new(Builder::new(file, source, tokens, strings))),
+            builder: Rc::new(RefCell::new(Builder::new(
+                file, source, tokens, strings, true,
+            ))),
+        }
+    }
+
+    /// The declaration-only capturer: the same declaration surface,
+    /// supertype edges, and positional columns as [`Capturer::new`], with
+    /// the raw reference-site columns never allocated and never filled.
+    /// The engine's dependency tier reads only the declaration surface
+    /// (`query symbol`/`rename` joins), so the site half — a token-count
+    /// reservation plus one row per identifier use, the bulk of a fresh
+    /// capture — is pure waste there: the finished capture reports
+    /// [`FileCapture::sites_present`] false, exactly like a shed twin.
+    pub fn declarations_only(
+        file: FileId,
+        source: &'src str,
+        tokens: &'tab TokenTable,
+        strings: &'src StringTable,
+    ) -> Self {
+        Self {
+            builder: Rc::new(RefCell::new(Builder::new(
+                file, source, tokens, strings, false,
+            ))),
         }
     }
 
@@ -2329,6 +2433,7 @@ mod tests {
             source,
             &result.tokens,
             &strings,
+            true,
         )));
         let mut capturer = Capturer {
             builder: Rc::clone(&builder),
@@ -2361,5 +2466,53 @@ mod tests {
         let captured = build_recovered("class B { void m() {}", &strings);
         assert!(captured.index.by_name(id(&strings, "B")).is_some());
         assert!(captured.index.by_name(id(&strings, "m")).is_some());
+    }
+
+    /// The declaration-only mode (the dependency tier's capture): the
+    /// declaration surface, supertype edges, and positional columns are
+    /// byte-identical to the site-bearing capture, while the site columns
+    /// are never mounted — no reservation, no rows, `sites_present`
+    /// false. Consumers reading the declaration surface cannot tell the
+    /// two apart, which is exactly the contract the dep tier relies on.
+    #[test]
+    fn declarations_only_matches_the_full_capture_and_mounts_no_sites() {
+        let source = "class A extends B<int> with M { int f = g(); void m() { h(); } }\n\
+                      class B<T> {}\n\
+                      mixin M {}\n\
+                      int g() => 0;\n\
+                      void h() {}\n\
+                      int top = q;\n";
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("decl_only.dart"));
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(result.diagnostics.is_empty());
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let strings = StringTable::new();
+        let full = capture(file, source, &result.tokens, features, &strings);
+        let mut capturer = Capturer::declarations_only(file, source, &result.tokens, &strings);
+        Parser::new(source, &result.tokens, features, &mut capturer).parse_unit();
+        let decl_only = capturer.finish();
+        assert!(full.sites_present());
+        assert!(!decl_only.sites_present());
+        assert_eq!(decl_only.sites_capacity(), 0, "no site reservation");
+        assert_eq!(full.index.decls(), decl_only.index.decls());
+        assert_eq!(full.index.supers(), decl_only.index.supers());
+        assert!(
+            decl_only
+                .index
+                .by_name(id(&strings, "A"))
+                .is_some_and(|rows| rows[0].body_open != DeclRow::UNKNOWN
+                    && rows[0].decl_end != DeclRow::UNKNOWN),
+            "the positional columns still stamp"
+        );
     }
 }

@@ -384,11 +384,39 @@ impl Interp<'_> {
                     {
                         return;
                     }
+                    // The failure join runs FIRST, on the live pre-test
+                    // state (official `promoteForPattern`'s `ifFalse`,
+                    // flow_analysis.dart:6420-6430): the else arm keeps the
+                    // unpromoted scrutinee. Killing the matched arm before
+                    // this join would hand the chain a dead state and fold
+                    // the else dead with the body — the shape of the two
+                    // reverted attempts.
                     let cur = self.current.clone();
                     self.note_may_fail(&cur);
                     let joined = self.join(Some(chain), Some(cur));
                     if let Some(pattern) = self.pattern.as_mut() {
                         pattern.unmatched = joined;
+                    }
+                    // The shape families' `cannotMatch` verdict, committed
+                    // AFTER the join so it lands on the MATCHED arm alone.
+                    // Each of `analyzeListPattern`/`analyzeMapPattern`/
+                    // `analyzeRecordPattern` hands `promoteForPattern` a
+                    // NON-NULLABLE required type — `List<…>`/`Map<…>`/the
+                    // record type (upstream Dart SDK source,
+                    // pkg/_fe_analyzer_shared/lib/src/type_inference/
+                    // type_analyzer.dart:1003, :1119, :1264) — so under
+                    // sound flow a null-or-equivalent matched value can never
+                    // match one and the body is unreachable
+                    // (`if (null case [...])`). Relational patterns compare
+                    // their operand instead (`case == null` matches), so
+                    // they keep both arms.
+                    if self.pattern_depth == 1
+                        && self.sound_flow
+                        && !matches!(shape, PatternShape::Relational)
+                        && let Some((ty, _)) = self.matched_value_ty()
+                        && self.classify(ty) == Classification::NullOrEquivalent
+                    {
+                        self.unreachable_cur();
                     }
                 }
             }
@@ -625,6 +653,22 @@ impl Interp<'_> {
                         let (matched_arm, unmatched_arm) =
                             self.branch_type_test(var, declared, declared_args, candidate);
                         self.current = matched_arm;
+                        // The cannot-match kill on the REFERENCE scrutinee
+                        // (official `promoteForPattern`'s `classifyType`
+                        // legs, upstream Dart SDK source,
+                        // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+                        // flow_analysis.dart:6361-6388): a null-or-equivalent
+                        // matched value can never match a non-nullable
+                        // required type (and the mirror pair) under sound
+                        // flow, so the matched arm is unreachable —
+                        // `Null n; if (n case int i)` rows its body dead.
+                        // The failure join below still runs on the
+                        // pre-verdict state (upstream keeps it beside
+                        // `_current.setUnreachable()`, never behind it), so
+                        // the else arm stays live.
+                        if self.sound_flow && self.disjoint_by_nullability(matched_ty, declared) {
+                            self.unreachable_cur();
+                        }
                         if !self.covers_matched(matched_ty, matched_args, declared, declared_args) {
                             self.join_unmatched(unmatched_arm);
                         } else if self.ops.is_invalid_typed(
@@ -642,6 +686,22 @@ impl Interp<'_> {
                     } else {
                         self.non_var_invalid_scrutinee_covers(declared, declared_args);
                     }
+                } else if !self.collecting() && self.pattern_depth == 1 && written {
+                    // A WRITTEN annotation this lattice cannot spell — a
+                    // record type (`case final () b`, `final (int, String) b`)
+                    // arrives as the opaque `Unknown` face (the recorder's
+                    // `end_record_type` row), so `declared != Ty::UNKNOWN`
+                    // above does not fire and the clause would keep its
+                    // cannot-fail posture. The required type is a real,
+                    // refutable one upstream (`promoteForPattern` over the
+                    // record type: a `String` value never matches `()`), so
+                    // the clause MUST stand its kill down — the matched arm
+                    // keeps the unpromoted face (this lattice spells no
+                    // record) and the failure arm joins the chain, the
+                    // undecided may-fail posture every unanswerable face
+                    // shares. Without it every later member of the switch
+                    // reads dead (census `issue_51230`, 24 extra rows).
+                    self.stand_down_may_fail();
                 } else if !self.collecting()
                     && !staged
                     && self.pattern_depth > 1
@@ -672,7 +732,7 @@ impl Interp<'_> {
                 // collect pre-pass (the rollback does not cover `pattern`).
                 let declared = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
                 let declared_args = std::mem::take(&mut self.pending_ty_args);
-                self.pending_ty_written = false;
+                let written = std::mem::take(&mut self.pending_ty_written);
                 // An untyped `_` at depth 1 leaves the case's unmatched
                 // chain to the semantic layer's chain-start emission — the
                 // flow kill here would duplicate those rows through the
@@ -692,6 +752,22 @@ impl Interp<'_> {
                         let (matched_arm, unmatched_arm) =
                             self.branch_type_test(var, declared, declared_args, candidate);
                         self.current = matched_arm;
+                        // The cannot-match kill on the REFERENCE scrutinee
+                        // (official `promoteForPattern`'s `classifyType`
+                        // legs, upstream Dart SDK source,
+                        // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+                        // flow_analysis.dart:6361-6388): a null-or-equivalent
+                        // matched value can never match a non-nullable
+                        // required type (and the mirror pair) under sound
+                        // flow, so the matched arm is unreachable —
+                        // `Null n; if (n case int i)` rows its body dead.
+                        // The failure join below still runs on the
+                        // pre-verdict state (upstream keeps it beside
+                        // `_current.setUnreachable()`, never behind it), so
+                        // the else arm stays live.
+                        if self.sound_flow && self.disjoint_by_nullability(matched_ty, declared) {
+                            self.unreachable_cur();
+                        }
                         if !self.covers_matched(matched_ty, matched_args, declared, declared_args) {
                             self.join_unmatched(unmatched_arm);
                         } else if self.ops.is_invalid_typed(
@@ -709,6 +785,13 @@ impl Interp<'_> {
                     } else {
                         self.non_var_invalid_scrutinee_covers(declared, declared_args);
                     }
+                } else if !self.collecting() && self.pattern_depth == 1 && written {
+                    // The typed-wildcard twin of the unspellable written
+                    // annotation above (`case final () _`): a record type
+                    // reaches this lattice as the opaque `Unknown` face, so
+                    // the clause still carries a refutable test and must
+                    // stand its cannot-fail kill down.
+                    self.stand_down_may_fail();
                 }
             }
             Ev::GuardBegin => {

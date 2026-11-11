@@ -317,7 +317,10 @@ fn named_record_pattern_missing_one_reports() {
 /// behind it stays live (non-exhaustive is impossible: `int?` splits to
 /// `int` + `Null`). The oracle's `unreachable_switch_case` lands on a
 /// SECOND `Null _` / `null` row — before the fix the leaf collapsed to
-/// `NamedContext` and the row landed on `int _` instead.
+/// `NamedContext` and the row landed on `int _` instead. The oracle
+/// (3.13.7) also reports the unreachable case's `break;` as `dead_code`
+/// and, the matched type being `int` after `case null`, the `Null`
+/// pattern as `pattern_never_matches_value_type`.
 #[test]
 fn null_wildcard_covers_null_space_over_nullable() {
     let report = report_ops(
@@ -329,25 +332,34 @@ fn null_wildcard_covers_null_space_over_nullable() {
          \x20 }\n\
          }\n",
     );
-    let names = super::test_rig::code_names(&report);
-    assert_eq!(
-        names,
-        vec!["unreachable_switch_case"],
-        "the duplicate null-space case must be the unreachable one: {:#?}",
-        rows(&report)
-    );
     // The unreachable row anchors on the `Null _` case — the second
     // null-space case — not the `int _` behind it (the pre-fix bug
     // placed it there).
     let fixture = "void f(int? o) {\n switch (o) {\n   case null: break;\n   case Null _: break;\n   case int _: break;\n }\n}\n";
     let analyzed = format!("{}{}", super::test_rig::CORE_PRELUDE, fixture);
-    let offset = report.diagnostics[0].range.offset as usize;
+    let offset = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "unreachable_switch_case")
+        .map(|d| d.range.offset as usize)
+        .unwrap_or_else(|| panic!("no unreachable_switch_case row: {:#?}", rows(&report)));
     let null_case = analyzed.find("case Null").unwrap();
     let int_case = analyzed.find("case int").unwrap();
     assert!(
         (null_case..int_case).contains(&offset),
         "unreachable_switch_case must anchor inside the `Null _` case span \
          [case Null @{null_case}, case int @{int_case}), got @{offset}: {:#?}",
+        rows(&report)
+    );
+    let names = super::test_rig::code_names(&report);
+    assert_eq!(
+        names,
+        vec![
+            "unreachable_switch_case",
+            "pattern_never_matches_value_type",
+            "dead_code"
+        ],
+        "the oracle's three rows over the duplicate null-space case: {:#?}",
         rows(&report)
     );
 }

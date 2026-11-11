@@ -1611,8 +1611,10 @@ mod tests {
     /// type question reads it): `IntAlias` (of `int`) answers `int`, a
     /// `dynamic` formal answers `dynamic`, an alias chain folds to its
     /// terminal named type with the use-site `?` joined, and a
-    /// parameterized alias use keeps its written spelling (its
-    /// substitution face is not modeled).
+    /// parameterized alias use reads its instantiated aliased type
+    /// (`L<int>` over `typedef L<T> = List<T>` answers `List<int>` — the
+    /// #2410 use-site substitution, `fold_parameterized_alias`), never the
+    /// written alias head.
     #[test]
     fn type_of_folds_a_typed_formal_alias_in_conditional_position() {
         let source = "typedef IntAlias = int;\nvoid f(IntAlias x) {\n  if (x is int) {}\n}\n";
@@ -1649,15 +1651,24 @@ mod tests {
         let generic_source = "typedef L<T> = List<T>;\nvoid k(L<int> x) {\n  if (x is int) {}\n}\n";
         let generic = analyze(generic_source, None);
         match generic.type_of(token_of(generic_source, "x is int")) {
-            Some(Ty::Named { name, .. }) => {
+            Some(Ty::Named {
+                name,
+                nullable,
+                args,
+            }) => {
                 assert_eq!(
                     name,
-                    analysis_strings(&generic).intern("L"),
-                    "a parameterized alias use keeps its written head (its \
-                     substitution face is not modeled)"
+                    analysis_strings(&generic).intern("List"),
+                    "a parameterized alias use reads its aliased head"
+                );
+                assert!(!nullable, "the written use carries no `?`");
+                assert_ne!(
+                    args,
+                    ArgListId::EMPTY,
+                    "the substituted argument list rides the aliased head"
                 );
             }
-            other => panic!("the written spelling answers, got {other:?}"),
+            other => panic!("the instantiated aliased type answers, got {other:?}"),
         }
     }
 

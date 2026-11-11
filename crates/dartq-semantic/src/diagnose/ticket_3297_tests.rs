@@ -120,7 +120,7 @@ fn if_case_binder_resolves_in_the_then_branch() {
 /// ... and falls through in the `else` branch (`scope_A06_t01`): the case
 /// scope closed, so the read is undefined.
 #[test]
-#[ignore = "case-scope exit: resolve_bare ignores LocalDecl::retired (module docs, residual 1)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn if_case_binder_is_out_of_scope_in_the_else_branch() {
     let report =
         report_ops("void test() {\n  if (42 case var v) {\n    v;\n  } else {\n    v;\n  }\n}\n");
@@ -129,7 +129,7 @@ fn if_case_binder_is_out_of_scope_in_the_else_branch() {
 
 /// ... and after the statement (`scope_A04_t01` test3's second read).
 #[test]
-#[ignore = "case-scope exit: resolve_bare ignores LocalDecl::retired (module docs, residual 1)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn if_case_binder_is_out_of_scope_after_the_statement() {
     let report = report_ops("void test() {\n  if (42 case var v) {\n    v;\n  }\n  v;\n}\n");
     assert_identifier_rows(&report, &["Undefined name 'v'."]);
@@ -148,7 +148,7 @@ fn switch_case_binder_resolves_in_its_own_arm() {
 /// `case 0` / `default` reads): each guarded pattern introduces its own
 /// case scope.
 #[test]
-#[ignore = "case-scope exit: resolve_bare ignores LocalDecl::retired (module docs, residual 1)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn switch_case_binder_is_out_of_scope_in_a_later_arm() {
     let report = report_ops(
         "void test() {\n  switch (42) {\n    case var v:\n      v;\n      break;\n    default:\n      v;\n  }\n}\n",

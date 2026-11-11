@@ -78,45 +78,49 @@ fn assert_absent(report: &FileReport, code: &str) {
 }
 
 // `NativeCallable.listener(f)` with no type argument: `Function` display,
-// anchored at the constructor name (oracle 5:4+23).
+// anchored at the constructor name. oracle 3.13.7 (5,3)+23 — the fixture
+// drops the `import` line but keeps its newline, so case line 5 is
+// fixture line index 3 (`at`'s `index + 2 == case_line`), and col 3 is
+// the `N` of `NativeCallable` (UTF-16 offset = line start + col - 1).
 #[test]
 fn listener_must_have_type_args() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  NativeCallable.listener(f);\n}\n";
     assert_row(
         &report(f),
         "must_be_a_native_function_type",
-        at(f, 5, 4),
+        at(f, 5, 3),
         23,
     );
 }
 
 // A non-`Function` type argument fails the native-signature gate at the
-// constructor name (oracle 5:4+43).
+// constructor name — oracle 3.13.7 (5,3)+43 (col 3 = `N` of
+// `NativeCallable`; UTF-16 offset = line start + col - 1).
 #[test]
 fn listener_must_be_a_native_function_type() {
     let f = "\nvoid f(int i) => i * 2;\nvoid g() {\n  NativeCallable<void Function(int)>.listener(f);\n}\n";
     assert_row(
         &report(f),
         "must_be_a_native_function_type",
-        at(f, 5, 4),
+        at(f, 5, 3),
         43,
     );
 }
 
 // The Dart callback must be `dartToNative`-compatible; a mismatch reports
-// at the callback `f` (oracle 5:51+1).
+// at the callback `f` — oracle 3.13.7 (5,50)+1.
 #[test]
 fn listener_must_be_a_subtype() {
     let f = "\nvoid f(int i) => i * 2;\nvoid g() {\n  NativeCallable<Void Function(Double)>.listener(f);\n}\n";
-    assert_row(&report(f), "must_be_a_subtype", at(f, 5, 51), 1);
+    assert_row(&report(f), "must_be_a_subtype", at(f, 5, 50), 1);
 }
 
-// A non-`Void` native return reports `mustReturnVoid` at the callback
-// (oracle 5:51+1).
+// A non-`Void` native return reports `mustReturnVoid` at the callback —
+// oracle 3.13.7 (5,50)+1.
 #[test]
 fn listener_must_return_void() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  NativeCallable<Int32 Function(Int32)>.listener(f);\n}\n";
-    assert_row(&report(f), "must_return_void", at(f, 5, 51), 1);
+    assert_row(&report(f), "must_return_void", at(f, 5, 50), 1);
 }
 
 // A valid listener reports nothing.
@@ -130,57 +134,57 @@ fn listener_ok() {
 }
 
 // `isolateLocal` with no type argument: `Function` display at the
-// constructor name (oracle 5:4+27).
+// constructor name — oracle 3.13.7 (5,3)+27.
 #[test]
 fn isolate_local_must_have_type_args() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  NativeCallable.isolateLocal(f, exceptionalReturn: 4);\n}\n";
     assert_row(
         &report(f),
         "must_be_a_native_function_type",
-        at(f, 5, 4),
+        at(f, 5, 3),
         27,
     );
 }
 
 // A non-`Void`/`Handle`/`Pointer`/compound return with no exception value
-// reports `missingExceptionValue` over the whole creation (oracle
-// 5:4+53).
+// reports `missingExceptionValue` over the whole creation — oracle
+// 3.13.7 (5,3)+53.
 #[test]
 fn isolate_local_missing_exception_value() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  NativeCallable<Int32 Function(Int32)>.isolateLocal(f);\n}\n";
-    assert_row(&report(f), "missing_exception_value", at(f, 5, 4), 53);
+    assert_row(&report(f), "missing_exception_value", at(f, 5, 3), 53);
 }
 
 // A `Void`-returning signature cannot take an exception value: the second
-// argument reports `invalidExceptionValue` (oracle 5:57+20).
+// argument reports `invalidExceptionValue` — oracle 3.13.7 (5,56)+20.
 #[test]
 fn isolate_local_invalid_exception_value() {
     let f = "\nvoid f(int i) => i * 2;\nvoid g() {\n  NativeCallable<Void Function(Int32)>.isolateLocal(f, exceptionalReturn: 4);\n}\n";
-    assert_row(&report(f), "invalid_exception_value", at(f, 5, 57), 20);
+    assert_row(&report(f), "invalid_exception_value", at(f, 5, 56), 20);
 }
 
 // A non-const exception value reports `argumentMustBeAConstant` at the
-// value (oracle 6:77+1).
+// value — oracle 3.13.7 (6,76)+1.
 #[test]
 fn isolate_local_argument_must_be_a_constant() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  int e = 123;\n  NativeCallable<Int32 Function(Int32)>.isolateLocal(f, exceptionalReturn: e);\n}\n";
-    assert_row(&report(f), "argument_must_be_a_constant", at(f, 6, 77), 1);
+    assert_row(&report(f), "argument_must_be_a_constant", at(f, 6, 76), 1);
 }
 
 // A `dartToNative`-incompatible exception value reports `mustBeASubtype`
-// at the value (oracle 5:77+3).
+// at the value — oracle 3.13.7 (5,76)+3.
 #[test]
 fn isolate_local_exception_must_be_a_subtype() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  NativeCallable<Int32 Function(Int32)>.isolateLocal(f, exceptionalReturn: '?');\n}\n";
-    assert_row(&report(f), "must_be_a_subtype", at(f, 5, 77), 3);
+    assert_row(&report(f), "must_be_a_subtype", at(f, 5, 76), 3);
 }
 
 // A `dartToNative`-incompatible callback reports `mustBeASubtype` at the
-// callback (oracle 5:56+1).
+// callback — oracle 3.13.7 (5,55)+1.
 #[test]
 fn isolate_local_must_be_a_subtype() {
     let f = "\nint f(int i) => i * 2;\nvoid g() {\n  NativeCallable<Int32 Function(Double)>.isolateLocal(f, exceptionalReturn: 4);\n}\n";
-    assert_row(&report(f), "must_be_a_subtype", at(f, 5, 56), 1);
+    assert_row(&report(f), "must_be_a_subtype", at(f, 5, 55), 1);
 }
 
 // A valid isolateLocal reports nothing.

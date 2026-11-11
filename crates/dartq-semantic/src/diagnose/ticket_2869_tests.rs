@@ -154,9 +154,11 @@ main() {
     assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
 }
 
-/// The `dynamic` argument pin: `dynamic` is the top type
-/// (`isSubtypeOf(dynamic, bound)` holds for every bound), so no bound
-/// ever rejects it.
+/// The `dynamic` argument pin: the written `dynamic` IS bound-checked —
+/// the strict subtype ask `dynamic <: num` is false, so the bound
+/// rejects it (probe 3.13.7: `TYPE_ARGUMENT_NOT_MATCHING_BOUNDS` "'dynamic'
+/// doesn't conform to the bound 'num' of the type parameter 'T'." at the
+/// written `dynamic` argument's own span).
 #[test]
 fn dynamic_argument_satisfies_any_bound() {
     let source = r#"
@@ -166,7 +168,15 @@ main() {
 }
 "#;
     let report = report_ops(source);
-    assert!(bounds_rows(&report).is_empty(), "{:?}", report.diagnostics);
+    let rows = bounds_rows(&report);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0]
+            .2
+            .contains("'dynamic' doesn't conform to the bound 'num' of the type parameter 'T'"),
+        "{rows:?}"
+    );
+    assert_eq!(rows[0].1, 7, "{rows:?}");
 }
 
 /// The satisfying generic-function-type argument

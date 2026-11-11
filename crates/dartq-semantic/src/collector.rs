@@ -91,6 +91,7 @@ use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
 use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{StringId, StringTable};
+use dartq_types::Variance;
 use rustc_hash::FxHashMap;
 
 use dartq_source::SourceRange;
@@ -101,6 +102,14 @@ use dartq_source::SourceRange;
 const OPERATORS_WITH_ONE_PARAMETER: [&str; 16] = [
     "<", ">", "<=", ">=", "==", "+", "/", "~/", "*", "%", "|", "^", "&", "<<", ">>", ">>>",
 ];
+
+/// The open prefixed-annotation latch depth bound
+/// (`Builder::pending_qualified`): a prefix whose completion never fires
+/// (a recovery shape) leaves its entry behind until an enclosing head's
+/// completion truncates past it; past this depth the oldest entry drops,
+/// so the stack never grows without bound. Real annotations nest a
+/// handful of prefixed heads at most.
+const MAX_OPEN_QUALIFIED: usize = 32;
 
 /// One member-claim bit of a container's duplicate scope: the oracle's
 /// `_checkDuplicateIdentifier` keys every member by its BARE lexeme
@@ -164,6 +173,10 @@ struct OpenContainer {
     is_final: bool,
     is_interface: bool,
     is_mixin_class: bool,
+    /// The named mixin application form (`class X = S with M` or
+    /// `mixin class X = S with M`) — the `= ` alias form, not a body
+    /// declaration. [`Container::is_mixin_application`] carries it.
+    is_mixin_application: bool,
     /// The member name set so far (sorted-insert; sealed into the
     /// finished [`Container::members`] at the close).
     members: NameMapBuilder<MemberEntry>,
@@ -184,6 +197,12 @@ struct OpenContainer {
     /// The header's type-variable bounds, parallel to `type_param_names`
     /// (`Dynamic` for an absent bound).
     type_param_bounds: Vec<Ty>,
+    /// The header's written variance modifiers, parallel to
+    /// `type_param_names` (`None` = no modifier — the legacy default): the
+    /// class / enum / mixin header window is the only one the parser opens
+    /// with `allowsVariance: true`, so every other kind opens with an empty
+    /// column.
+    type_param_variances: Vec<Option<Variance>>,
     /// The `sealed` modifier was present on the class header.
     sealed: bool,
     /// The header's clause type names, per clause family and in written
@@ -191,6 +210,19 @@ struct OpenContainer {
     with_clause: Vec<StringId>,
     implements_clause: Vec<StringId>,
     on_clause: Vec<StringId>,
+    /// The clause faces' written type arguments, parallel to the name
+    /// columns above (`with M<V>` keeps the interned `[V]` list; an
+    /// argument-less or dropped face carries `ArgListId::EMPTY`). Sealed
+    /// with the names at the close; the augment fold merges them with the
+    /// same keep-first rule the names get.
+    with_clause_args: Vec<ArgListId>,
+    implements_clause_args: Vec<ArgListId>,
+    on_clause_args: Vec<ArgListId>,
+    /// The superclass head's written type arguments (`extends S<int>` / a
+    /// named mixin application's head type); `ArgListId::EMPTY` when the
+    /// head wrote none. The augment fold fills it only when it fills the
+    /// superclass edge itself.
+    superclass_args: ArgListId,
     /// Unattributed header-window names (extends overflow, recovery
     /// residue); never a super-face.
     header_residue: Vec<StringId>,
@@ -329,7 +361,7 @@ struct PendingAnonMethod {
 /// clause-boundary events (`handle_class_with_clause` /
 /// `handle_enum_with_clause` / `handle_mixin_on` / `handle_implements`)
 /// decide it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HeaderClause {
     With,
     Implements,
@@ -466,13 +498,14 @@ struct PendingAug {
     ctor_completion: bool,
 }
 
-/// An enclosing type-variable group's four pending buffers, parked while a
+/// An enclosing type-variable group's five pending buffers, parked while a
 /// nested `<>` inside one of its bounds parses its own quantifier (#3748).
 struct TypeVarFrame {
     group: Vec<StringId>,
     bounds: Vec<Ty>,
     ranges: Vec<SourceRange>,
     bound_ranges: Vec<Option<SourceRange>>,
+    variances: Vec<Option<Variance>>,
 }
 
 /// The capture state shared between the listener and [`collect`].
@@ -587,6 +620,16 @@ struct Builder<'src, 'tab> {
     /// ...) split it into the event-attributed clause names and
     /// [`Builder::header_residue`].
     header_interfaces: Vec<(StringId, u32)>,
+    /// The header window's completed type trees, buffered at
+    /// [`DeclarationCollector::handle_type`] beside
+    /// [`Builder::header_interfaces`] (one tree per buffered name — the
+    /// same annotation). The clause commits and the superclass commit pair
+    /// each claimed name to the tree whose span covers the name's offset
+    /// and intern its written arguments into the container's parallel
+    /// clause-args columns; a tree no commit claims (recovery residue,
+    /// head overflow) drops with its name — the columns keep
+    /// [`ArgListId::EMPTY`] for it, never wrong arguments.
+    header_trees: Vec<TypeTree>,
     /// Header-window type names no clause event claimed: the `extends`
     /// overflow the oracle throws away (`ast_builder.dart:3972-3982`) and
     /// recovery residue. Committed to the open container's
@@ -719,11 +762,14 @@ struct Builder<'src, 'tab> {
     /// `_FormalParameterDuplicateIdentifierScope` per list, shared across
     /// the positional and named sections (upstream
     /// `duplicate_definition_verifier.dart` `checkParameters`). Each entry
-    /// is `(name, wildcard-shaped)`: a wildcard-shaped `_` never reports
-    /// under the wildcard-variables feature but does without it, so the
-    /// capture parks that row in the wildcard log instead of the hard
-    /// duplicate log (`record_wildcard_duplicate`).
-    formal_scope: Vec<(StringId, bool)>,
+    /// is `(name, wildcard-shaped, field-formal)`: a wildcard-shaped `_`
+    /// never reports under the wildcard-variables feature but does without
+    /// it, so the capture parks that row in the wildcard log instead of the
+    /// hard duplicate log (`record_wildcard_duplicate`), and the
+    /// field-formal bit (`this.x`) decides the pair row's code — the scope
+    /// keeps the FIRST claim, so a later collision reads its bit off that
+    /// entry rather than off the immediate predecessor.
+    formal_scope: Vec<(StringId, bool, bool)>,
     /// The current type-parameter list's nesting depth (the executable's
     /// own list is depth 1).
     type_group_depth: u32,
@@ -743,11 +789,18 @@ struct Builder<'src, 'tab> {
     /// `type_var_group` mutation mirrors here, and a group without a bound
     /// leaves its slot at `Dynamic`.
     type_var_bounds: Vec<Ty>,
+    /// The group's written variance modifiers, parallel to
+    /// [`Builder::type_var_group`] (`None` = no modifier written, the
+    /// legacy covariance default). Every `type_var_group` mutation mirrors
+    /// here; the variable's modifier token lands at its `end_type_variable`,
+    /// a modifier-less parameter keeps the `None` placeholder its
+    /// `begin_type_variable` slot was pushed with.
+    type_var_variances: Vec<Option<Variance>>,
     /// The outer `<>` groups' pending state, saved when a nested group
     /// opens inside a bound (`class C<X extends T Function<T extends
     /// num>(T)>` — the inner `<>` clobbers the outer buffers without it,
     /// #3748). Pushed at `begin_type_variables` (depth > 1), popped at
-    /// `end_type_variables` back into the four per-group buffers it took.
+    /// `end_type_variables` back into the five per-group buffers it took.
     type_var_saved: Vec<TypeVarFrame>,
     /// Count of the open depth-1 type-parameter list.
     type_param_count: u16,
@@ -763,7 +816,7 @@ struct Builder<'src, 'tab> {
     /// (`parser_impl.dart` `parseClassExtendsSeenExtendsClause`), so the
     /// name can only be captured while the header is open.
     header_super_open: bool,
-    super_candidate: Option<StringId>,
+    super_candidate: Option<(StringId, u32)>,
     /// Set once the pending executable's header is past its type-parameter
     /// position (formals began, or none exist); body declarations must not
     /// touch the header's counts.
@@ -781,6 +834,15 @@ struct Builder<'src, 'tab> {
     /// The record level's node count at the open field entry — the hole
     /// latch [`TreeSink::record_entry_end`] checks against.
     record_entry_mark: usize,
+    /// The open record-type annotation's nesting depth
+    /// (`begin_record_type` raises, `end_record_type` lowers). Identifiers
+    /// inside are record field types, never header clause faces — a
+    /// record-typed `on (int i, String s)` is a parser recovery upstream
+    /// (`expected_named_type`), and the element's constraint list drops the
+    /// whole head (`_toInterfaceTypeList`'s `whereType<InterfaceType>`,
+    /// upstream Dart SDK source, types_builder.dart:47-53), so the field
+    /// names must not reach the clause buffer.
+    record_type_depth: u32,
     /// The type head awaiting its argument group (`List` of `List<int>`),
     /// armed at the `TypeReference` identifier and consumed at
     /// `begin_type_arguments` or the head's own completion.
@@ -794,16 +856,34 @@ struct Builder<'src, 'tab> {
     /// `AnalyzerEnumOperations.getEnumElementType`), the fact the
     /// generic-enum exhaustiveness split filters on.
     enum_const_ref: bool,
-    /// The prefixed annotation head awaiting its completing `handle_type`
-    /// (`ast` and `AstNode` of `ast.AstNode?`): the prefix latches at the
-    /// `PrefixedTypeReference` identifier, the continuation fills in at
-    /// `TypeReferenceContinuation`. The completion carries the prefix
-    /// token as its head — [`Builder::join_qualified`] rewrites the armed
-    /// spelling to the dot-joined qualified name, the intern table's
+    /// The open prefixed annotation heads awaiting their completing
+    /// `handle_type` (`ast` and `AstNode` of `ast.AstNode?`), innermost
+    /// last: each prefix latches at its `PrefixedTypeReference` identifier
+    /// (id + name + token range), the continuation fills the innermost
+    /// entry at `TypeReferenceContinuation`. The completion carries the
+    /// prefix token as its head — [`Builder::join_qualified`] rewrites the
+    /// armed spelling to the dot-joined qualified name, the intern table's
     /// one-head form (`note_annotation_segment`'s idiom; upstream resolves
     /// `prefix.Name` through the import namespace as one node — upstream
-    /// Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart).
-    pending_qualified: Option<(TokenId, StringId, StringId, Option<SourceRange>)>,
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart). The prefix
+    /// range also arms the argument-group head (`p.M<int>` —
+    /// `begin_type_arguments` reads [`Builder::pending_type_head`] before
+    /// the group opens).
+    ///
+    /// A stack, not a slot: a prefixed type argument (`core.int` inside
+    /// `core.List<core.int>`) latches and completes INSIDE the outer head's
+    /// group, before the outer completion fires — a single slot let the
+    /// inner prefix overwrite the outer entry, the outer completion fell
+    /// back to the bare prefix spelling, and its sealed group node stood
+    /// beside a stray `core` leaf (a dropped two-root tree, or a poisoned
+    /// function level). Bounded by [`MAX_OPEN_QUALIFIED`].
+    pending_qualified: Vec<(
+        TokenId,
+        StringId,
+        StringId,
+        Option<SourceRange>,
+        SourceRange,
+    )>,
     /// The latched declared type of the open field group.
     field_group_ty: Option<Ty>,
     /// The metadata star of the declaration that opens next, in written
@@ -890,6 +970,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             type_group_close: None,
             in_class_header: false,
             header_interfaces: Vec::new(),
+            header_trees: Vec::new(),
             header_residue: Vec::new(),
             header_capture_open: false,
             extension_on_type: None,
@@ -926,6 +1007,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             type_arg_depth: 0,
             type_var_group: Vec::new(),
             type_var_bounds: Vec::new(),
+            type_var_variances: Vec::new(),
             type_var_saved: Vec::new(),
             type_param_count: 0,
             header_type_params: 0,
@@ -936,9 +1018,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             armed_tree: None,
             capture: None,
             record_entry_mark: 0,
+            record_type_depth: 0,
             pending_type_head: None,
             enum_const_ref: false,
-            pending_qualified: None,
+            pending_qualified: Vec::new(),
             field_group_ty: None,
             field_group_ty_range: None,
             pending_annotations: Vec::new(),
@@ -1001,7 +1084,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// check twice per variable; the emitted set carries one row), so
     /// only a back-to-back identical (name, range) repeat is absorbed —
     /// every other repeat is a real second row.
-    fn record_duplicate(&mut self, name: StringId, range: SourceRange) {
+    fn record_duplicate(&mut self, name: StringId, range: SourceRange, field_formal: bool) {
         if self
             .duplicates
             .last()
@@ -1009,18 +1092,26 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         {
             return;
         }
-        self.duplicates.push(DuplicateDecl { name, range });
+        self.duplicates.push(DuplicateDecl {
+            name,
+            range,
+            field_formal,
+        });
     }
 
     /// Records a duplicate whose name is the wildcard `_` (upstream
     /// `isWildcardVariable`, duplicate_definition_verifier.dart:350-360 —
     /// the variable declares nothing under the feature). The row parks in
     /// the wildcard log; the diagnose pass emits it only when the feature
-    /// is off for the unit's language version.
+    /// is off for the unit's language version. A wildcard-shaped formal is
+    /// never a `this.x` formal (upstream `isWildcard`'s
+    /// `FieldFormalParameterElement` exit), so the row is always a plain
+    /// `duplicate_definition`.
     fn record_wildcard_duplicate(&mut self, range: SourceRange) {
         self.wildcard_dups.push(DuplicateDecl {
             name: self.strings.intern("_"),
             range,
+            field_formal: false,
         });
     }
 
@@ -1075,7 +1166,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 scope.insert(bare, DUP_PAIR);
             }
             _ => {
-                self.record_duplicate(bare, range);
+                self.record_duplicate(bare, range, false);
             }
         }
     }
@@ -1085,9 +1176,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// [`Self::numeric_initializer_ty`] — whitespace-skipping read from the
     /// name's byte end, `=` (not `==`, which a field group never writes in
     /// the declarator slot) means initialized, `,`/`;`/end means none.
-    /// `name_end` is the name token's UTF-16 span end converted to a byte
-    /// offset by the caller (the group's `is_ascii` fast path covers the
-    /// common case).
+    /// `name_end` is the name token's byte end from the token table
+    /// ([`Self::byte_end_of`]).
     fn has_initializer(&self, name_end: u32) -> bool {
         let bytes = self.source.as_bytes();
         let mut i = name_end as usize;
@@ -1149,7 +1239,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 // the getter/formals bit are the whole probe.
                 let sitting_kind = existing.kind;
                 let sitting_getter = existing.formals.is_none();
-                self.record_duplicate(name, range);
+                self.record_duplicate(name, range, false);
                 // The slot answers the oracle's `LibraryDeclarations`
                 // ownership, not first-in-file: the scope adds whole kind
                 // lists in a fixed order and `_getters[id] ??=` keeps the
@@ -1219,7 +1309,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
         match self.top_setters.entry(spelling) {
             Entry::Occupied(_) => {
-                self.record_duplicate(spelling, range);
+                self.record_duplicate(spelling, range, false);
             }
             Entry::Vacant(slot) => {
                 slot.insert(());
@@ -1235,6 +1325,19 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .map(|t| self.strings.intern(&self.source[t.byte_range()]))
     }
 
+    /// The token's lexeme end as a byte offset — the anchor the byte
+    /// scanners below (`numeric_initializer_ty` and kin) index
+    /// `source.as_bytes()` from. The token table carries every handle's
+    /// byte projection (scanned and parser-inserted alike), so this is
+    /// O(1) on any source; converting the event's UTF-16 range instead
+    /// walks the unit head on every call (O(file) per field name —
+    /// quadratic over a large generated file).
+    fn byte_end_of(&self, token: Token) -> u32 {
+        self.tokens
+            .get(token.id as usize)
+            .map_or(token.range.end(), |scanned| scanned.byte_range().end as u32)
+    }
+
     /// The token's own span (the parser's UTF-16 projection of the token —
     /// recovery synthetics carry the parser's chosen fallback span).
     fn span_of(&self, token: Token) -> SourceRange {
@@ -1245,6 +1348,22 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// (the parser's own synthetic boundary spans).
     fn kind_of(&self, token: Token) -> Option<TokenKind> {
         self.tokens.get(token.id as usize).map(|t| t.kind)
+    }
+
+    /// The variance reading of the parser's modifier token: the keyword a
+    /// class/enum/mixin type-parameter declaration wrote before the name
+    /// (`in`/`out`/`inout`), or `None` (the legacy covariance default) when
+    /// it wrote none. A token outside the table cannot reach here — the
+    /// parser only records a scanned keyword in this slot — so an absent or
+    /// unresolvable token lands on the default, the direction that never
+    /// invents a rejection.
+    fn variance_of(&self, token: Option<Token>) -> Option<Variance> {
+        match token.and_then(|token| self.kind_of(token)) {
+            Some(TokenKind::Keyword(Keyword::In)) => Some(Variance::Contravariant),
+            Some(TokenKind::Keyword(Keyword::Inout)) => Some(Variance::Invariant),
+            Some(TokenKind::Keyword(Keyword::Out)) => Some(Variance::Covariant),
+            _ => None,
+        }
     }
 
     /// Whether the span names an identifier-shaped slot — an identifier or a
@@ -1291,18 +1410,22 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// continuation (recovery fired no honest name) keeps the prefix-only
     /// spelling, the under-report direction. A non-matching completion (a
     /// type argument's head completing inside the qualified type's own
-    /// `<...>`) leaves the latch for the outer head.
+    /// `<...>`) leaves every latch for its own head. A matching completion
+    /// closes its entry together with any entry above it — an inner prefix
+    /// whose completion never fired (a recovery shape) cannot outlive the
+    /// head that encloses it.
     /// Returns the joined qualified spelling plus the continuation token's
     /// range — the prefix head's `handle_type` extends the armed range to
     /// the continuation's end so a `p.T` anchor spans the whole written
     /// `TypeAnnotation`, matching the oracle's node extent.
     fn join_qualified(&mut self, name: Token) -> Option<(StringId, Option<SourceRange>)> {
-        let (prefix_id, prefix, cont, cont_range) = self.pending_qualified?;
-        if prefix_id != name.id {
-            return None;
-        }
-        self.pending_qualified = None;
-        (cont != StringId::NONE).then(|| {
+        let at = self
+            .pending_qualified
+            .iter()
+            .rposition(|&(prefix_id, ..)| prefix_id == name.id)?;
+        let (_, prefix, cont, cont_range, _) = self.pending_qualified[at];
+        self.pending_qualified.truncate(at);
+        (prefix != StringId::NONE && cont != StringId::NONE).then(|| {
             let joined = format!(
                 "{}.{}",
                 self.strings.resolve(prefix),
@@ -1536,9 +1659,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// between `= <` and the literal's opening brace/bracket, two
     /// arguments making a map and one a set (`{`) or list (`[`); anything
     /// else — `void`/`dynamic` spellings, function-typed arguments —
-    /// keeps the unknown face, the under-report direction.
+    /// keeps the unknown face, the under-report direction. The literal
+    /// must also end the declarator ([`Self::literal_ends_declarator`]):
+    /// a selector or operator continuation (`<int>[1].first`,
+    /// `<int>[1] as Object`) types a different expression, so the face
+    /// stays unknown and the diagnosing pass's read-side initializer
+    /// consult answers what it can spell.
     fn typed_literal_initializer_ty(&mut self, name_end: u32) -> Option<Ty> {
-        let bytes = self.source.as_bytes().to_vec();
+        let bytes = self.source.as_bytes();
         let mut i = name_end as usize;
         Self::skip_literal_ws(&bytes, &mut i);
         if bytes.get(i) != Some(&b'=') {
@@ -1564,6 +1692,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             (b'[', 1) => "List",
             _ => return None,
         };
+        if !Self::literal_ends_declarator(&bytes, i) {
+            return None;
+        }
         let args: Vec<Ty> = spellings
             .into_iter()
             .map(|spelling| self.literal_spelling_ty(spelling))
@@ -1677,6 +1808,56 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     fn skip_literal_ws(bytes: &[u8], i: &mut usize) {
         while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
             *i += 1;
+        }
+    }
+
+    /// Whether the collection literal whose opening bracket sits at
+    /// `open` ends its declarator: after the bracket-balanced close (the
+    /// same string-skipping posture [`Self::creation_initializer_ty`]
+    /// runs over its argument group) the next code is `;`, `,`, or the
+    /// cascade `..` — whose static type is its target's, the literal's
+    /// own. A selector or operator continuation (`.first`, `as`, `+`)
+    /// types a different expression and answers `false`, the gate
+    /// [`Self::typed_literal_initializer_ty`] reads. An unbalanced group
+    /// (a parse error upstream) answers `false` too, the under-report
+    /// direction.
+    fn literal_ends_declarator(bytes: &[u8], open: usize) -> bool {
+        let mut depth = 0usize;
+        let mut close = None;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth = match depth.checked_sub(1) {
+                        Some(depth) => depth,
+                        None => return false,
+                    };
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(close) = close else {
+            return false;
+        };
+        i = close + 1;
+        Self::skip_literal_ws(bytes, &mut i);
+        match bytes.get(i) {
+            Some(b';' | b',') => true,
+            Some(b'.') => bytes.get(i + 1) == Some(&b'.'),
+            _ => false,
         }
     }
 
@@ -2074,6 +2255,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 | ContainerKind::ExtensionType
         );
         self.header_interfaces.clear();
+        self.header_trees.clear();
         self.header_residue.clear();
         // The extension on-type latch and the extension-type rep-formal
         // capture open with the container and close at the body events.
@@ -2110,6 +2292,16 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         } else {
             Vec::new()
         };
+        // The variance modifiers ride the same window and the same take
+        // gate: only class/enum/mixin headers accept them (the parser's
+        // `allowsVariance` face), and a parameterless header must not
+        // inherit a previous declaration's still-buffered modifiers — the
+        // same hazard the names' gate closes.
+        let type_param_variances = if header_type_params > 0 {
+            std::mem::take(&mut self.type_var_variances)
+        } else {
+            Vec::new()
+        };
         // The member-claim scope: an `augment` declaration joins its
         // element's introduction (upstream keys the context on the merged
         // element's first fragment), every other declaration opens a fresh
@@ -2142,15 +2334,21 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             is_final: false,
             is_interface: false,
             is_mixin_class: false,
+            is_mixin_application: false,
             members: NameMapBuilder::default(),
             scope,
             type_params: header_type_params,
             type_param_names,
             type_param_bounds,
+            type_param_variances,
             sealed: false,
             with_clause: Vec::new(),
             implements_clause: Vec::new(),
             on_clause: Vec::new(),
+            with_clause_args: Vec::new(),
+            implements_clause_args: Vec::new(),
+            on_clause_args: Vec::new(),
+            superclass_args: ArgListId::EMPTY,
             header_residue: Vec::new(),
             primary_formals: Vec::new(),
             enum_constants: Vec::new(),
@@ -2180,6 +2378,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.in_class_header = false;
         self.header_capture_open = false;
         self.header_interfaces.clear();
+        self.header_trees.clear();
         self.declaring_augment = false;
         // A trailing star (recovery residue after the last member) binds to
         // nothing once the body closed — drop it before it could leak into
@@ -2239,6 +2438,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         let members = open.members;
         let type_param_names = std::mem::take(&mut open.type_param_names).into_boxed_slice();
         let type_param_bounds = std::mem::take(&mut open.type_param_bounds).into_boxed_slice();
+        // Sealed with the other two columns. The extension faces take their
+        // own copies of the names/bounds above; no extension declaration
+        // accepts a variance modifier (the parser's `allowsVariance` face),
+        // so the modifier column stays the container row's own fact.
+        let type_param_variances =
+            std::mem::take(&mut open.type_param_variances).into_boxed_slice();
         if open.kind == ContainerKind::Extension && open.name.is_none() {
             // An unnamed extension has no container entry: its application
             // face owns the members outright. An on-type that never produced
@@ -2297,6 +2502,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 is_final: open.is_final,
                 is_interface: open.is_interface,
                 is_mixin_class: open.is_mixin_class,
+                is_mixin_application: open.is_mixin_application,
                 superclass: open.superclass,
                 // The claiming fragment's own `extends` fact — the merged
                 // edge above takes a same-unit augment's clause on the fold,
@@ -2307,6 +2513,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 type_params: open.type_params,
                 type_param_names,
                 type_param_bounds,
+                type_param_variances,
                 sealed: open.sealed,
                 // The clause columns seal at exact length here — the
                 // push-grown staging Vecs shed their growth slack by
@@ -2314,6 +2521,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 with_clause: open.with_clause.into_boxed_slice(),
                 implements_clause: open.implements_clause.into_boxed_slice(),
                 on_clause: open.on_clause.into_boxed_slice(),
+                with_clause_args: open.with_clause_args.into_boxed_slice(),
+                implements_clause_args: open.implements_clause_args.into_boxed_slice(),
+                on_clause_args: open.on_clause_args.into_boxed_slice(),
+                superclass_args: open.superclass_args,
                 header_residue: open.header_residue.into_boxed_slice(),
                 primary_formals: open.primary_formals.into_boxed_slice(),
                 enum_constants: open.enum_constants.into_boxed_slice(),
@@ -2479,11 +2690,37 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // `extends` is one edge: the introduction's superclass stands, a
         // fragment's fills the gap. `with`/`implements`/`on` are lists the
         // fragment adds to (`augment class C with M {}` makes `C().m()`
-        // resolve).
-        sitting.superclass = sitting.superclass.or(fragment.superclass);
-        sitting.with_clause = union(&sitting.with_clause, &fragment.with_clause);
-        sitting.implements_clause = union(&sitting.implements_clause, &fragment.implements_clause);
-        sitting.on_clause = union(&sitting.on_clause, &fragment.on_clause);
+        // resolve). The written-args columns merge under the same rules —
+        // an edge the fragment fills carries the fragment's head arguments,
+        // and a clause face's first mention keeps its args.
+        if sitting.superclass.is_none() {
+            sitting.superclass = fragment.superclass;
+            sitting.superclass_args = fragment.superclass_args;
+        }
+        let (names, args) = union_args(
+            &sitting.with_clause,
+            &sitting.with_clause_args,
+            &fragment.with_clause,
+            &fragment.with_clause_args,
+        );
+        sitting.with_clause = names;
+        sitting.with_clause_args = args;
+        let (names, args) = union_args(
+            &sitting.implements_clause,
+            &sitting.implements_clause_args,
+            &fragment.implements_clause,
+            &fragment.implements_clause_args,
+        );
+        sitting.implements_clause = names;
+        sitting.implements_clause_args = args;
+        let (names, args) = union_args(
+            &sitting.on_clause,
+            &sitting.on_clause_args,
+            &fragment.on_clause,
+            &fragment.on_clause_args,
+        );
+        sitting.on_clause = names;
+        sitting.on_clause_args = args;
         // The implicit default's gate is the ELEMENT's declaration count, so
         // the fragment's declarations join the element's before the flag is
         // re-derived (`class C {} augment class C {C.named();}` has no
@@ -2528,6 +2765,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// then that form's interface edges under-report, never false-positive).
     fn end_header_window(&mut self) {
         self.in_class_header = false;
+        self.header_trees.clear();
         let buffered = std::mem::take(&mut self.header_interfaces);
         let residue = &mut self.header_residue;
         if let Some(open) = self.containers.last_mut() {
@@ -2560,7 +2798,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// Splits the buffered window at a clause boundary: the claimed names go
     /// to the open container's `which` clause list, the unclaimed ones to
-    /// its residue.
+    /// its residue. Each claimed name pairs with the buffered tree whose
+    /// span covers its head identifier — the tree's written type arguments
+    /// intern into the clause's parallel args column (one entry per name,
+    /// `ArgListId::EMPTY` for an argument-less face or a dropped capture);
+    /// unpaired trees drop with their residue names, the same
+    /// unattributed-window posture the names keep.
     fn commit_header_clause(&mut self, which: HeaderClause, claim: ClauseClaim) {
         let buffered = std::mem::take(&mut self.header_interfaces);
         let (claimed, residue) = match claim {
@@ -2573,18 +2816,107 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 (buffered[at..].to_vec(), buffered[..at].to_vec())
             }
         };
+        let mut trees = std::mem::take(&mut self.header_trees);
+        let mut args: Vec<ArgListId> = Vec::with_capacity(claimed.len());
+        for &(_, offset) in &claimed {
+            // A face's annotation spans its head identifier (a qualified
+            // `p.M<V>` anchors at the prefix token and still covers the
+            // continuation), so containment pairs name and tree exactly;
+            // each tree is claimed once.
+            let tree = trees
+                .iter()
+                .position(|tree| tree.range.offset <= offset && offset < tree.range.end())
+                .map(|at| trees.remove(at));
+            args.push(tree.map_or(ArgListId::EMPTY, |tree| self.clause_tree_args(tree)));
+        }
+        self.header_trees = trees;
+        // The `on` arm's element-side filter must run before the container
+        // borrow below (upstream's `_toInterfaceTypeList` arm — see
+        // [`Self::on_entry_is_interface`]).
+        let on_keeps: Option<Vec<bool>> = (which == HeaderClause::On).then(|| {
+            claimed
+                .iter()
+                .map(|&(name, _)| self.on_entry_is_interface(name))
+                .collect()
+        });
         if let Some(open) = self.containers.last_mut() {
             match which {
-                HeaderClause::With => open.with_clause.extend(claimed.into_iter().map(|(n, _)| n)),
+                HeaderClause::With => {
+                    open.with_clause.extend(claimed.iter().map(|&(n, _)| n));
+                    open.with_clause_args.extend(args);
+                }
                 HeaderClause::Implements => {
                     open.implements_clause
-                        .extend(claimed.into_iter().map(|(n, _)| n));
+                        .extend(claimed.iter().map(|&(n, _)| n));
+                    open.implements_clause_args.extend(args);
                 }
-                HeaderClause::On => open.on_clause.extend(claimed.into_iter().map(|(n, _)| n)),
+                HeaderClause::On => {
+                    // Upstream's element-side filter
+                    // (`_toInterfaceTypeList`, upstream Dart SDK source,
+                    // types_builder.dart:47-53): an `on` head whose resolved
+                    // type is not an `InterfaceType` never enters
+                    // `superclassConstraints`. The name-level arm here chases
+                    // the unit's own typedef decls — a terminal
+                    // `Ty::Named` is a container (kept), every other
+                    // terminal shape (a record expansion like
+                    // `typedef Rec = (int i, String s)`, a function type)
+                    // drops with its args. An unproven name keeps its slot:
+                    // a cross-unit alias the unit table cannot see is the
+                    // consumer's verdict, never a capture-time guess.
+                    let keeps = on_keeps.unwrap_or_default();
+                    for (((name, _), arg), keep) in claimed.iter().zip(args.iter()).zip(keeps) {
+                        if keep {
+                            open.on_clause.push(*name);
+                            open.on_clause_args.push(*arg);
+                        }
+                    }
+                }
             }
             open.header_residue
                 .extend(residue.into_iter().map(|(n, _)| n));
         }
+    }
+
+    /// Whether an `on`-clause head can name an interface type at the
+    /// element's grade (`_toInterfaceTypeList`'s `whereType<InterfaceType>`
+    /// arm): chases the unit's own typedef decls through their right-hand
+    /// `var_ty` — a `Ty::Named` terminal is a container name (kept); every
+    /// other terminal (`Record`, `Function`, `Void`, …) is a non-interface
+    /// type upstream drops from `superclassConstraints`. Anything unproven
+    /// — a plain declaration, an alias whose right-hand side never
+    /// captured, a name the unit table cannot see — keeps its slot (the
+    /// under-drop direction: the consumer's own resolution verdict decides
+    /// it, never a wrong drop at capture).
+    fn on_entry_is_interface(&self, name: StringId) -> bool {
+        let mut head = name;
+        for _ in 0..8 {
+            let Some(decl) = self.decls.get(&head) else {
+                return true;
+            };
+            if decl.kind != MicroKind::TypeAlias {
+                return true;
+            }
+            match decl.var_ty {
+                Ty::Named { name: next, .. } => head = next,
+                // An uncaptured right-hand side proves nothing — the
+                // alias's terminal could still be a container the unit
+                // table never saw.
+                Ty::Unknown => return true,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The written type arguments of one clause-face tree, interned: a
+    /// poisoned or argument-less face stays [`ArgListId::EMPTY`] (the
+    /// under-report direction — never wrong arguments).
+    fn clause_tree_args(&mut self, tree: TypeTree) -> ArgListId {
+        if tree.poisoned || tree.args.is_empty() {
+            return ArgListId::EMPTY;
+        }
+        let args: Vec<Ty> = tree.args.into_iter().map(|arg| self.arg_ty(arg)).collect();
+        self.type_args.intern(&args)
     }
 
     /// Buffers one header clause type name with its source offset
@@ -2651,10 +2983,20 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             }
             return;
         }
+        // Record-field positions (`on (int i, String s)`): the names inside
+        // a record-type annotation are field types, never clause faces —
+        // the upstream recovery reports `expected_named_type` and the
+        // element's clause list keeps no head at all
+        // (`_toInterfaceTypeList`, types_builder.dart:47-53). The
+        // extension arm already returned above, so only the class-family
+        // buffer and the superclass latch gate here.
+        if self.record_type_depth > 0 {
+            return;
+        }
         match context {
             IdentifierContext::TypeReference | IdentifierContext::TypeReferenceContinuation => {
                 if self.header_super_open && self.super_candidate.is_none() {
-                    self.super_candidate = name;
+                    self.super_candidate = name.map(|name| (name, offset));
                 } else if self.in_class_header {
                     self.buffer_header_interface(name, offset);
                 }
@@ -2664,14 +3006,31 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// Commits the buffered header type reference as the superclass edge
-    /// (the `extends` clause or the named mixin application's head type).
+    /// (the `extends` clause or the named mixin application's head type),
+    /// with the head's written type arguments (`extends S<int>` keeps
+    /// `[int]`): the latched name pairs with the buffered tree whose span
+    /// covers its identifier, the same containment rule the clause commits
+    /// pair with.
     fn commit_super_candidate(&mut self) {
         let candidate = self.super_candidate.take();
         self.header_super_open = false;
+        let Some((name, offset)) = candidate else {
+            return;
+        };
+        let args = self
+            .header_trees
+            .iter()
+            .position(|tree| tree.range.offset <= offset && offset < tree.range.end())
+            .map(|at| {
+                let tree = self.header_trees.remove(at);
+                self.clause_tree_args(tree)
+            })
+            .unwrap_or(ArgListId::EMPTY);
         if let Some(open) = self.containers.last_mut()
             && open.superclass.is_none()
         {
-            open.superclass = candidate;
+            open.superclass = Some(name);
+            open.superclass_args = args;
         }
     }
 
@@ -2846,6 +3205,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 pending.type_params = count;
                 pending.type_param_names = std::mem::take(&mut self.type_var_group);
                 pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
+                // A member's own header cannot carry a variance modifier
+                // (the parser's `allowsVariance` face is off for executable
+                // headers), so the modifier buffer is drained with its
+                // siblings and its content is the legacy default.
+                self.type_var_variances.clear();
             }
         } else if let Some(pending) = &mut self.pending_top {
             // The same name-first rule (#2878): a generic top-level
@@ -2867,6 +3231,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 // for every use of the parameter (`T extends St` never
                 // closes a switch, #3336).
                 pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
+                // Same as the member face: an executable header carries no
+                // variance modifier, so the buffer drains as all-legacy.
+                self.type_var_variances.clear();
             }
         } else if let Some(pending) = &mut self.pending_typedef {
             // The declaring group closes before the right-hand side parses
@@ -2955,6 +3322,30 @@ fn union(base: &[StringId], add: &[StringId]) -> Box<[StringId]> {
         }
     }
     names.into_boxed_slice()
+}
+
+/// [`union`] with the clause's parallel written-args column: a name
+/// already present keeps the earlier row — the keep-first rule the names
+/// get (an augment re-mentioning the introduction's clause face adds no
+/// new instantiation fact); a fragment's new name joins with its own
+/// arguments. A short args column (a pre-#3847 restored payload) reads as
+/// `EMPTY` at its missing entries — the additive-default posture.
+fn union_args(
+    base: &[StringId],
+    base_args: &[ArgListId],
+    add: &[StringId],
+    add_args: &[ArgListId],
+) -> (Box<[StringId]>, Box<[ArgListId]>) {
+    let mut names: Vec<StringId> = base.to_vec();
+    let mut args: Vec<ArgListId> = base_args.to_vec();
+    args.resize(names.len(), ArgListId::EMPTY);
+    for (at, name) in add.iter().enumerate() {
+        if !names.contains(name) {
+            names.push(*name);
+            args.push(add_args.get(at).copied().unwrap_or(ArgListId::EMPTY));
+        }
+    }
+    (names.into_boxed_slice(), args.into_boxed_slice())
 }
 
 /// Seals a nested owner-keyed builder (`name → name → value`) into the
@@ -3155,7 +3546,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         interface_kw: Option<Token>,
         final_kw: Option<Token>,
         augment_kw: Option<Token>,
-        _mixin_kw: Option<Token>,
+        mixin_kw: Option<Token>,
         name: Token,
     ) {
         let builder = &mut self.builder;
@@ -3170,6 +3561,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             open.is_interface = interface_kw.is_some();
             open.is_final = final_kw.is_some();
             open.sealed = sealed_kw.is_some();
+            // `mixin class X = Y with Z` keeps the mixin-class bit — the
+            // header's `mixin` keyword distinguishes the alias form from a
+            // plain `class X = Y with Z`.
+            open.is_mixin_class = mixin_kw.is_some();
+            // The `= ` form itself marks the container a mixin application
+            // — the upstream element's `isMixinApplication` flag.
+            open.is_mixin_application = true;
         });
         // A named mixin application is never a valid augmentation target:
         // every `augment` of the name reports
@@ -3740,6 +4138,25 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             self.builder.extension_on_type_nullable = question.is_some();
         }
+        // The header window's clause-face capture (#3847): one completed
+        // tree per buffered clause name (the same annotation — the name
+        // buffered at its identifier, the tree completing here). The gates
+        // mirror `note_header_reference`: argument positions
+        // (`type_arg_depth`) are parts of the enclosing annotation, an
+        // extension-type's representation formal parses inside the primary
+        // `()` (`formal_depth`), and a default-value window never carries a
+        // clause face. The extends head buffers here too (its window is
+        // `in_class_header` for the class family) and the super commit
+        // claims it by the same span containment.
+        if self.builder.in_class_header
+            && self.builder.type_arg_depth == 0
+            && self.builder.formal_depth == 0
+            && self.builder.formal_default_depth == 0
+            && self.builder.record_type_depth == 0
+            && let Some(tree) = self.builder.armed_tree.clone()
+        {
+            self.builder.header_trees.push(tree);
+        }
     }
     fn handle_no_type(&mut self, _last_consumed: Token) {
         let builder = &mut self.builder;
@@ -3893,6 +4310,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_record_type(&mut self, _left_paren: Token) {
         let builder = &mut self.builder;
+        builder.record_type_depth += 1;
         // The record-type capture: the field list opens its own level
         // (lazily — a bare `(int, int) x;` fires no argument-group event,
         // so the sink starts here), and the completed node feeds the
@@ -3920,6 +4338,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             offset: left_paren.range.offset,
             length: end.end() - left_paren.range.offset,
         };
+        builder.record_type_depth = builder.record_type_depth.saturating_sub(1);
         if let Some(site) = builder.capture.as_mut() {
             site.end_record(question.is_some(), range);
         }
@@ -3989,28 +4408,64 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 if context == IdentifierContext::TypeReference {
                     builder.pending_type_head = name_with_range;
                 }
-                // The qualified head's continuation fills the open latch
-                // (`ast` latched at `PrefixedTypeReference`, `AstNode`
+                // The qualified head's continuation fills the innermost open
+                // latch (`ast` latched at `PrefixedTypeReference`, `AstNode`
                 // joins it here); a synthetic continuation carries no
-                // honest name and leaves the slot empty.
+                // honest name and leaves the entry empty.
                 if context == IdentifierContext::TypeReferenceContinuation
-                    && let Some(entry) = &mut builder.pending_qualified
+                    && let Some(entry) = builder.pending_qualified.last_mut()
                     && entry.2 == StringId::NONE
                     && let Some((name, range)) = name_with_range
                 {
                     entry.2 = name;
                     entry.3 = Some(range);
+                    // The qualified head's own argument group opens on the
+                    // next token (`p.M<int>`): `begin_type_arguments` reads
+                    // `pending_type_head`, which the bare `TypeReference`
+                    // arm above never latched for a prefixed head — the
+                    // prefix token fired `PrefixedTypeReference` instead.
+                    // Arm the joined spelling anchored at the prefix token
+                    // so the group seals a `p.M` node the completing
+                    // `handle_type` re-fire merges onto (`site.leaf` pairs
+                    // head name + range offset — both must match the
+                    // qualified completion's). A synthetic prefix spells no
+                    // head to arm.
+                    let (prefix, prefix_range) = (entry.1, entry.4);
+                    if prefix != StringId::NONE {
+                        let joined = format!(
+                            "{}.{}",
+                            builder.strings.resolve(prefix),
+                            builder.strings.resolve(name)
+                        );
+                        let head = builder.strings.intern(&joined);
+                        builder.pending_type_head = Some((
+                            head,
+                            SourceRange {
+                                offset: prefix_range.offset,
+                                length: range.end() - prefix_range.offset,
+                            },
+                        ));
+                    }
                 }
                 builder.note_header_reference(context, name, offset);
             }
             IdentifierContext::PrefixedTypeReference => {
                 // The prefix token of a `p.T` annotation: the same token
                 // completes the type at `handle_type`, where
-                // `join_qualified` matches it by id — a fresh reference
-                // overwrites any stale latch, a synthetic prefix (no
-                // honest name) clears it.
-                builder.pending_qualified =
-                    name_with_range.map(|(name, _)| (token.id, name, StringId::NONE, None));
+                // `join_qualified` matches it by id. A fresh reference
+                // pushes its own entry — an enclosing head's entry (the
+                // outer `core.List` while its `<core.int>` argument parses)
+                // stays latched for that head's completion. A synthetic
+                // prefix (no honest name) still owns an entry, so its
+                // continuation never fills an enclosing head's; the entry
+                // spells nothing (`StringId::NONE` prefix).
+                if builder.pending_qualified.len() == MAX_OPEN_QUALIFIED {
+                    builder.pending_qualified.remove(0);
+                }
+                let (prefix, range) = name_with_range.unwrap_or((StringId::NONE, token.range));
+                builder
+                    .pending_qualified
+                    .push((token.id, prefix, StringId::NONE, None, range));
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 // The return type parsed between the begin event and the
@@ -4096,15 +4551,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         && (context == IdentifierContext::TopLevelVariableDeclaration
                             || builder.field_static.unwrap_or(false))
                         && let Some(inferred) = {
-                            // The byte scanners read source bytes; the name
-                            // span is UTF-16 (a non-ASCII character earlier
-                            // in the unit shifts the two apart).
-                            let name_end = if builder.source.is_ascii() {
-                                range.end()
-                            } else {
-                                dartq_source::utf16_offset_to_byte(builder.source, range.end())
-                                    as u32
-                            };
+                            // The byte scanners read source bytes, so they
+                            // anchor at the name's byte end (the token
+                            // table's own projection — a non-ASCII character
+                            // earlier in the unit shifts it off the UTF-16
+                            // span).
+                            let name_end = builder.byte_end_of(token);
                             builder
                                 .numeric_initializer_ty(name_end)
                                 .or_else(|| builder.typed_literal_initializer_ty(name_end))
@@ -4119,23 +4571,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     let is_final = builder.field_final;
                     let field_covariant = builder.field_covariant;
                     let field_late = builder.field_late;
-                    let name_end = if builder.source.is_ascii() {
-                        range.end()
-                    } else {
-                        dartq_source::utf16_offset_to_byte(builder.source, range.end()) as u32
-                    };
+                    let name_end = builder.byte_end_of(token);
                     // The `late final` initializer face (`definesSetter`
                     // reads it): computed before the container borrow
                     // below, which `open` holds across the member insert.
                     let has_init = builder.has_initializer(name_end);
                     if context == IdentifierContext::TopLevelVariableDeclaration {
                         if builder.top_const_group {
-                            let name_end = if builder.source.is_ascii() {
-                                range.end()
-                            } else {
-                                dartq_source::utf16_offset_to_byte(builder.source, range.end())
-                                    as u32
-                            };
                             if let Some(face) = builder.const_creation_face(name_end) {
                                 builder.const_creations.insert(name, face);
                             }
@@ -4447,6 +4889,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 bounds: std::mem::take(&mut builder.type_var_bounds),
                 ranges: std::mem::take(&mut builder.type_var_ranges),
                 bound_ranges: std::mem::take(&mut builder.type_var_bound_ranges),
+                variances: std::mem::take(&mut builder.type_var_variances),
             });
         } else {
             builder.type_param_count = 0;
@@ -4454,6 +4897,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.type_var_bounds.clear();
             builder.type_var_ranges.clear();
             builder.type_var_bound_ranges.clear();
+            builder.type_var_variances.clear();
         }
         builder.type_group_close = None;
         if let Some(site) = builder.capture.as_mut() {
@@ -4476,7 +4920,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 if builder.strings.resolve(name) == "_" {
                     builder.record_wildcard_duplicate(range);
                 } else {
-                    builder.record_duplicate(name, range);
+                    builder.record_duplicate(name, range, false);
                 }
             } else {
                 builder.type_var_group.push(name);
@@ -4485,6 +4929,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 builder.type_var_bounds.push(Ty::Dynamic);
                 builder.type_var_ranges.push(range);
                 builder.type_var_bound_ranges.push(None);
+                // The modifier latches at the same event; until then the
+                // slot carries the modifier-less (legacy covariant) reading.
+                builder.type_var_variances.push(None);
             }
             builder
                 .decls
@@ -4506,7 +4953,28 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         variance: Option<Token>,
     ) {
         let builder = &mut self.builder;
-        let _ = (index, variance);
+        let _ = index;
+        // The variance modifier (`in`/`out`/`inout`) is the variable's own
+        // fact — a modifier-less parameter keeps the legacy reading its
+        // `begin_type_variable` slot was pushed with, and a variable with
+        // no bound still carries its modifier (upstream `endTypeVariable`
+        // writes `varianceKeyword` beside `bound` unconditionally). The
+        // parser keeps the FIRST modifier's span of a repeated run
+        // (`multiple_variance_modifiers` recovers the rest), so one write
+        // per variable covers the written modifier.
+        let variance = builder.variance_of(variance);
+        // The group's slot for this variable — the same name-keyed row the
+        // bound write below lands on, so a duplicated spelling's row keeps
+        // its modifier paired with the bound it wrote.
+        let slot = match builder.capture_name(token) {
+            Some((name, _)) => builder.type_var_group.iter().rposition(|&n| n == name),
+            None => None,
+        };
+        if let Some(at) = slot
+            && at < builder.type_var_variances.len()
+        {
+            builder.type_var_variances[at] = variance;
+        }
         // A bound re-parses immediately before this event (the group
         // completes in reverse declaration order, each bound rewinding to
         // its own `extends` — `type_args.rs`'s completion loop), so with a
@@ -4520,10 +4988,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if extends_or_super.is_none() {
             return;
         }
-        let Some((name, _)) = builder.capture_name(token) else {
-            return;
-        };
-        let Some(at) = builder.type_var_group.iter().rposition(|&n| n == name) else {
+        let Some(at) = slot else {
             return;
         };
         if at < builder.type_var_bounds.len() {
@@ -4563,6 +5028,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             pending.type_param_names = std::mem::take(&mut builder.type_var_group);
             pending.type_param_bounds = std::mem::take(&mut builder.type_var_bounds);
+            // An alias group never carries a variance modifier (the parser
+            // passes `allowsVariance: false` for type aliases), so the
+            // buffer drains as all-legacy with its siblings.
+            builder.type_var_variances.clear();
         }
         if let Some(site) = builder.capture.as_mut() {
             site.type_variables_end();
@@ -4579,6 +5048,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.type_var_bounds = frame.bounds;
             builder.type_var_ranges = frame.ranges;
             builder.type_var_bound_ranges = frame.bound_ranges;
+            builder.type_var_variances = frame.variances;
         }
     }
 
@@ -6160,6 +6630,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn begin_optional_formal_parameters(&mut self, token: Token) {
         let builder = &mut self.builder;
+        // A `[`/`{` group inside a captured function type's own formal
+        // list latches the required/optional boundary on the sink level
+        // (the sink guards to `[`; a named group leaves every positional
+        // required) — the same relay `crate::bounds`'s sinks run at
+        // `alias_optional_group`.
+        let opener_range = builder
+            .tokens
+            .get(token.id as usize)
+            .map(|t| t.byte_range());
+        if let Some(site) = builder.capture.as_mut()
+            && site.top_is_function()
+            && let Some(range) = opener_range
+        {
+            site.function_optional_group(&builder.source[range]);
+        }
         // The augment capture's group delimiter (`[` or `{`): the count
         // rows anchor there before falling back to a parameter or the `)`
         // (the oracle's `formalParameterList.leftDelimiter`).
@@ -6602,19 +7087,32 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             // readings report it); a wildcard-only prior collides only
             // while the feature is off, so its row parks in the wildcard
             // log (dropped on a feature-enabled unit).
+            //
+            // The row's code reads the FIRST same-name hard claim, not the
+            // immediate predecessor: the oracle's scope keeps the first
+            // node out of a colliding run (`_DuplicateIdentifierScope.add`
+            // only inserts into an empty slot), so three `this.x` formals
+            // pair the second and the third with the first.
             let prior_hard = builder
                 .formal_scope
                 .iter()
-                .any(|&(prior, wildcard)| prior == name && !wildcard);
-            let prior_any = builder.formal_scope.iter().any(|&(prior, _)| prior == name);
+                .find(|&&(prior, wildcard, _)| prior == name && !wildcard);
+            let prior_any = builder
+                .formal_scope
+                .iter()
+                .any(|&(prior, _, _)| prior == name);
+            let field_formal = this_keyword.is_some();
             if prior_any {
-                if wildcard_shaped || !prior_hard {
+                if wildcard_shaped || prior_hard.is_none() {
                     builder.record_wildcard_duplicate(range);
                 } else {
-                    builder.record_duplicate(name, range);
+                    let prior_field_formal = prior_hard.is_some_and(|&(_, _, ff)| ff);
+                    builder.record_duplicate(name, range, prior_field_formal && field_formal);
                 }
             }
-            builder.formal_scope.push((name, wildcard_shaped));
+            builder
+                .formal_scope
+                .push((name, wildcard_shaped, field_formal));
         }
         // The formal's own star — drained from the latch `begin_formal_
         // parameter` armed — joins the side-map under the resolved owner
@@ -6755,6 +7253,23 @@ mod tests {
 
     fn id(strings: &StringTable, name: &str) -> StringId {
         strings.intern(name)
+    }
+
+    /// The initializer-inference scanners anchor at the name token's byte
+    /// end ([`Builder::byte_end_of`]); a non-ASCII unit shifts that off
+    /// the UTF-16 span (the astral emoji is 4 bytes but 2 UTF-16 units),
+    /// and the inference must still read the initializer past it.
+    #[test]
+    fn initializer_inference_anchors_on_byte_offsets_in_non_ascii_units() {
+        let strings = StringTable::new();
+        let elements = build(
+            "const emoji = '\u{1F600}';\nconst kDefaultBufferSize = 1024 * 1024;",
+            &strings,
+        );
+        let decl = elements
+            .decl(id(&strings, "kDefaultBufferSize"))
+            .expect("decl captured");
+        assert_eq!(decl.var_ty, Ty::named(id(&strings, "int")));
     }
 
     /// Declaration capture across the full top-level surface.

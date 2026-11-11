@@ -82,7 +82,7 @@ fn promoted_local_member_read_stays_silent() {
 /// seam (`check_extension_member_type_arg_bounds`, invocation.rs), which
 /// a sibling lane owns — pinned `#[ignore]` as the documented residual.
 #[test]
-#[ignore = "missing-side residual: pass-1 never emitted; the emit seam lives in invocation.rs"]
+#[ignore = "missing-side residual: pass-1 never emitted; the emit seam lives in invocation.rs; engine emits 0 rows (expected 1 type_argument_not_matching_bounds on the promoted `Exactly<num>` actual against bound `Exactly<int>`)"]
 fn promoted_local_wrong_expectation_reports() {
     let report = report_ops(&format!(
         "{EXPECT_HELPER}void f(num n) {{\n\

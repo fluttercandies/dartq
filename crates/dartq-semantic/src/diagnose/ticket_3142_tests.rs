@@ -39,9 +39,13 @@
 //!   families decide on the real arity now.
 //!
 //! Oracle rows captured 2026-10-31 against `dart analyze --format
-//! machine` 3.13.7.
+//! machine` 3.13.7. The `core.`-spelled fixtures run under
+//! `report_ops_core_prefixed` — the corpus's `import 'dart:core' as core`
+//! wiring, where `core.List` and `List` name one declaration (the plain
+//! rig never binds the prefix the fixture writes, and its prelude lands
+//! ahead of the import directive).
 
-use super::test_rig::report_ops;
+use super::test_rig::{report_ops, report_ops_core_prefixed};
 use super::*;
 
 fn utc_rows(report: &FileReport) -> Vec<&Diagnostic> {
@@ -64,7 +68,7 @@ fn all_codes(report: &FileReport) -> Vec<&'static str> {
 /// heads and the always-true verdict stayed silent (oracle-verified row).
 #[test]
 fn core_spelled_alias_rhs_reports_true() {
-    let report = report_ops(
+    let report = report_ops_core_prefixed(
         "import 'dart:core' as core;\n\
          typedef F2<T> = core.List<core.int> Function(int, [List<T> x]);\n\
          core.List<core.int> f2(int x0, [List<int> x = const []]) => throw 'u';\n\
@@ -80,7 +84,7 @@ fn core_spelled_alias_rhs_reports_true() {
 /// element under both spellings (oracle-verified TRUE).
 #[test]
 fn plain_target_against_core_operand_reports_true() {
-    let report = report_ops(
+    let report = report_ops_core_prefixed(
         "import 'dart:core' as core;\n\
          core.List<core.int> f2(int x0, [List<int> x = const []]) => throw 'u';\n\
          void g() { f2 is List<int> Function(int, [List<int> x]); }",
@@ -94,7 +98,7 @@ fn plain_target_against_core_operand_reports_true() {
 /// TRUE; the #3129 baseline).
 #[test]
 fn core_target_against_core_operand_reports_true() {
-    let report = report_ops(
+    let report = report_ops_core_prefixed(
         "import 'dart:core' as core;\n\
          core.List<core.int> f2(int x0, [List<int> x = const []]) => throw 'u';\n\
          void g() { f2 is core.List<core.int> Function(int, [List<int> x]); }",
@@ -137,7 +141,7 @@ fn generic_method_written_signature_reports_true() {
 /// (oracle-verified TRUE; the enclosing-container bare read).
 #[test]
 fn fn_returning_generic_method_alias_reports_true() {
-    let report = report_ops(
+    let report = report_ops_core_prefixed(
         "import 'dart:core' as core;\n\
          typedef F5<T> = int Function([Function x]) Function<B extends core.int>();\n\
          class U<T> { int Function([Function x]) m5<B extends core.int>() => throw 'u'; }\n\
@@ -152,7 +156,7 @@ fn fn_returning_generic_method_alias_reports_true() {
 /// TRUE).
 #[test]
 fn fn_returning_generic_method_written_sig_reports_true() {
-    let report = report_ops(
+    let report = report_ops_core_prefixed(
         "import 'dart:core' as core;\n\
          class U<T> { int Function([Function x]) m5<B extends core.int>() => throw 'u'; }\n\
          void g(U<int> u) { u.m5 is int Function([Function x]) Function<B extends core.int>(); }",
@@ -199,7 +203,7 @@ fn raw_generic_alias_target_reports_true() {
 /// (oracle-verified TRUE).
 #[test]
 fn optional_formal_alias_reports_true() {
-    let report = report_ops(
+    let report = report_ops_core_prefixed(
         "import 'dart:core' as core;\n\
          typedef F5<T> = int Function([Function x]) Function<B extends core.int>();\n\
          int Function([Function x]) f5<B extends core.int>() => throw 'u';\n\

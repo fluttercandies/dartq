@@ -54,7 +54,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use common::Fixture;
+use common::{Fixture, GREETER_0, MAIN_0};
 use dartq_diagnostics::{AnalysisOutput, Diagnostic, FileLayoutProvider, write_machine};
 use dartq_engine::{AffectedReport, CancellationToken, Engine, LibraryId, PersistedFacts};
 use dartq_snapshot::{SnapshotConfig, SnapshotStore};
@@ -523,5 +523,100 @@ fn warm_start_is_not_an_observable_state_seam() {
     assert_eq!(
         previous_b, full,
         "A1 the warm arm matches the cold recompute"
+    );
+}
+
+/// The pure-replay surface gate: a warm arm whose every library is adopted
+/// from the L3 run cache must answer the query faces exactly as a
+/// recompute does — `library_surfaces` populated, `query_symbols`
+/// serving the resolved references, `use_view`/`ref_postings` installed.
+/// The persisted run carries the library's `LibraryIndex` rows; replay
+/// installs them through `set_surface` verbatim, so the index the
+/// recompute would have built stands again without one.
+#[test]
+fn pure_replay_reinstalls_the_query_surfaces() {
+    // A two-library workspace with a real cross-library reference:
+    // `greet` is declared in greeter.dart and invoked in main.dart, so
+    // the surface carries both a declaration target and a resolved use.
+    let initial = [("lib/main.dart", MAIN_0), ("lib/greeter.dart", GREETER_0)];
+    let fixture = Fixture::new(&initial);
+    let state: BTreeMap<String, String> = initial
+        .iter()
+        .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
+        .collect();
+    // Both arms share the one L3 content store — arm A writes the run
+    // records, arm B adopts them back.
+    let store_root = fixture.root.join("l3-store");
+    let store_config = || dartq_engine::store::StoreConfig {
+        root: store_root.clone(),
+        size_limit: 64 * 1024 * 1024,
+    };
+
+    // Arm A: analyze with the store armed — `persist_library_runs`
+    // writes every library's run (diagnostics + surface) behind the
+    // pass.
+    let mut arm_a = fixture.engine();
+    arm_a
+        .open_content_store(&store_config())
+        .expect("store opens");
+    feed(&fixture, &mut arm_a, &state);
+    let outcome_a = settle(&fixture, &mut arm_a, &state);
+    assert!(
+        arm_a.library_surfaces().next().is_some(),
+        "arm A's analyze installed surfaces"
+    );
+    let snapshot_store = SnapshotStore::open(SnapshotConfig {
+        root: Some(fixture.root.join("snapshot-store")),
+        capacity_bytes: 64 * 1024 * 1024,
+    })
+    .expect("store opens");
+    let saved = arm_a.save_facts_snapshot(&snapshot_store).expect("flush");
+    assert_eq!(saved, state.len(), "one facts entry per resident file");
+    drop(arm_a);
+
+    // Arm B: the daemon's warm-start shape — load the generation, ingest
+    // before the first apply, feed the live set, apply, analyze. Every
+    // library's stored run key matches its fresh cycle fingerprint, so
+    // the adoption loop serves them all without a recompute.
+    let mut arm_b = fixture.engine();
+    arm_b
+        .open_content_store(&store_config())
+        .expect("store opens");
+    let snapshot = snapshot_store
+        .load::<PersistedFacts>(&arm_b.snapshot_header())
+        .expect("arm A's generation loads under arm B's own header");
+    arm_b.ingest_facts_snapshot(snapshot);
+    feed(&fixture, &mut arm_b, &state);
+    let outcome_b = settle(&fixture, &mut arm_b, &state);
+
+    // The replay's diagnostic face is the recompute's, byte-identical —
+    // the adoption's own contract (the in-process gate's exact equality,
+    // fed from disk).
+    assert_eq!(
+        outcome_b.bytes, outcome_a.bytes,
+        "the adopted runs answer the same diagnostics"
+    );
+
+    // The regression: `library_surfaces` must be populated — the adopted
+    // runs installed their persisted indexes through `set_surface`.
+    let surfaces: Vec<_> = arm_b.library_surfaces().collect();
+    assert_eq!(
+        surfaces.len(),
+        2,
+        "both adopted libraries installed their reference surfaces"
+    );
+
+    // The surface actually answers: `greet` resolves to its greeter.dart
+    // declaration plus the main.dart invocation row — the query face the
+    // empty-surface bug returned nothing for.
+    let answer = arm_b.query_symbols("greet");
+    assert_eq!(
+        answer.decls.len(),
+        1,
+        "the declaration survives the round trip"
+    );
+    assert!(
+        !answer.refs.is_empty(),
+        "the resolved use row stands on the replayed surface"
     );
 }

@@ -1,6 +1,35 @@
 use super::*;
 use crate::const_eval::CreatedState;
 
+/// The leading-dot shorthand callee's face, decided against the context
+/// type's own member set (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/dart/resolver/method_invocation_resolver.dart`
+/// `_resolveReceiverTypeLiteralForDotShorthand`: the member lookup first,
+/// the constructor rewrite only on a miss).
+enum ShorthandCallee {
+    /// A static METHOD of the context type — the shorthand is a
+    /// `DotShorthandInvocation`, so a call through it is the oracle's
+    /// `const_eval_method_invocation` fault.
+    StaticMethod,
+    /// A static field/getter/setter of the context type. Upstream
+    /// rewrites the call to a `FunctionExpressionInvocation`
+    /// (`method_invocation_resolver.dart` :1287-1296), which
+    /// `ConstantVisitor` has no arm for — the enclosing site's default
+    /// row fires instead, never the method fault.
+    PropertyAccessor,
+    /// A constructor of the context type (the unnamed face included) —
+    /// the shorthand is a `DotShorthandConstructorInvocation`, a valid
+    /// constant creation whose initializer walk still runs. Carries the
+    /// context container the walk keys on.
+    Ctor(StringId),
+    /// The context type is undecidable here (no written annotation, an
+    /// unresolved head, a broken member climb) or answers neither arm —
+    /// the under-report posture: the caller keeps the creation face, and
+    /// the shorthand's own `dot_shorthand_undefined_member` row owns the
+    /// miss.
+    Defer,
+}
+
 /// One const-variable reference's instance key (the equality face of a
 /// const set/map element spelled `name` / `p.name` whose instance value
 /// this unit cannot fold): the declaring file, the creation's container,
@@ -208,6 +237,16 @@ impl ConstLookup for CtorScope<'_, '_> {
     fn shorthand_context(&self, span: SourceRange) -> bool {
         self.engine.shorthand_context(span)
     }
+
+    /// `isSubtypeOf(runtimeType(value), ty)` under the creation's
+    /// argument values; the constructor's type parameters were already
+    /// substituted into the captured `Expr` trees at
+    /// [`Self::check_ctor_initializers`] (`subst_init_tys`), so a
+    /// parameter-spelled target arriving here is genuinely unbound and
+    /// defers like the engine face.
+    fn value_subtype(&self, value: &ConstantValue, ty: &Ty) -> Option<bool> {
+        self.engine.value_subtype(value, ty)
+    }
 }
 
 impl ConstLookup for Engine<'_> {
@@ -377,6 +416,76 @@ impl ConstLookup for Engine<'_> {
 
     fn shorthand_context(&self, span: SourceRange) -> bool {
         self.dot_shorthand_context(span.offset)
+    }
+
+    /// `isSubtypeOf(runtimeType(value), ty)` — the `castToType`/`hasType`
+    /// compare (value.dart:378 / :617): the value's own runtime-type face
+    /// against the WRITTEN target as the resolved `Ty` spells it.
+    ///
+    /// `Some` decides, `None` defers to the valid-but-unknown face:
+    /// - `Ty::Unknown` (the recovered `InvalidType` splice — upstream's
+    ///   `isInvalid || castType.isInvalid → return this`, value.dart:368);
+    /// - an in-scope type PARAMETER still spelled `T` (upstream's
+    ///   `hasTypeParameterReference → return this`, value.dart:373 —
+    ///   `castToType` only; `hasType` decides it, but the subtype verdict
+    ///   over an unbound parameter head is meaningless at this face, so
+    ///   both folds read the same deferral);
+    /// - a `Record`/`Function` shaped target the name-level lattice does
+    ///   not reach (the sealed shapes carry no interface head).
+    ///
+    /// The value→type map follows the oracle's `DartObjectImpl.type`:
+    /// literals to their primitive heads, `Enum`/`Created`/`Type`/`Symbol`
+    /// to their container/interface faces, collections to the raw generic
+    /// head (the element type does not ride the subset's value) — the
+    /// `List<dynamic>` approximation faults only where the oracle's own
+    /// `List<int>` runtime type would already differ.
+    fn value_subtype(&self, value: &ConstantValue, ty: &Ty) -> Option<bool> {
+        let ids = &self.members.primitive_ids;
+        let value_ty = match value {
+            ConstantValue::Null => Ty::Null,
+            ConstantValue::Bool(_) => Ty::named(ids[3]),
+            ConstantValue::Int(_) => Ty::named(ids[0]),
+            ConstantValue::Double(_) => Ty::named(ids[1]),
+            ConstantValue::Str(_) => Ty::named(ids[4]),
+            ConstantValue::Enum { container, .. } | ConstantValue::Created(container) => {
+                Ty::named(*container)
+            }
+            ConstantValue::Type(_) => Ty::named(self.intern("Type")),
+            ConstantValue::Symbol(_) => Ty::named(self.intern("Symbol")),
+            ConstantValue::List(_) | ConstantValue::Instance(InstanceKind::List) => {
+                Ty::named(self.intern("List"))
+            }
+            ConstantValue::Set(_) | ConstantValue::Instance(InstanceKind::Set) => {
+                Ty::named(self.intern("Set"))
+            }
+            ConstantValue::Map(_) | ConstantValue::Instance(InstanceKind::Map) => {
+                Ty::named(self.intern("Map"))
+            }
+            ConstantValue::Record { .. } | ConstantValue::Instance(InstanceKind::Record) => {
+                Ty::named(self.intern("Record"))
+            }
+            // The `Object`/`Function` instance placeholders carry no
+            // container name — the runtime type face is unreadable here.
+            ConstantValue::Instance(InstanceKind::Function | InstanceKind::Object) => {
+                return None;
+            }
+        };
+        match ty {
+            // `isInvalid || castType.isInvalid → return this` — the
+            // recovered splices and the unresolved-type face both pass.
+            Ty::Unknown | Ty::Dynamic | Ty::Void => Some(true),
+            // `hasTypeParameterReference → return this`: a parameter
+            // head in scope defers (the creation's substitution runs in
+            // `subst_init_tys`; a surviving spelling is unbound).
+            Ty::Named { name, .. } if self.is_scope_param(*name) => None,
+            Ty::Named { .. } => Some(self.name_subtype(value_ty, *ty)),
+            // `Null` as a target answers on the value's own nullability
+            // face; `Never` rejects every value but `Never`'s.
+            Ty::Null | Ty::Never => Some(self.name_subtype(value_ty, *ty)),
+            // Record/function-shaped targets and any other spelling the
+            // name level cannot prove stay deferred (the under-report).
+            Ty::Record { .. } | Ty::Function { .. } => None,
+        }
     }
 }
 
@@ -747,7 +856,22 @@ impl<'a> Engine<'a> {
         if let Verdict::Value(value) = &verdict {
             let folded = self.folded_ty(value);
             if local {
-                self.bind_var_type(name, folded);
+                // A WRITTEN annotation keeps the declared slot it already
+                // owns: `bind_declared_type` bound it at the name event,
+                // and the oracle re-types a local from its initializer only
+                // for an UNANNOTATED declarator — `variable_declaration_
+                // resolver.dart:84`'s `parent.type == null && element is
+                // LocalVariableElementImpl` gate. Overwriting the slot with
+                // the constant's VALUE type made every later read of a
+                // `const Object o = 'a'` / `const dynamic d = 3` see
+                // `String`/`int` instead of the declared face (the census's
+                // `const dynamic i1 = 3; i1 | 2.2` family: the operator's
+                // argument check then read an `int` receiver and reported
+                // `argument_type_not_assignable`, where the oracle reads
+                // `dynamic` and stays silent).
+                if self.pending_decl_ty.is_none() {
+                    self.bind_var_type(name, folded);
+                }
             } else if let Some((container, _)) = self.container_context() {
                 self.const_field_values
                     .insert((container, name), value.clone());
@@ -898,29 +1022,105 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Widens an operator fault's anchor left to the prefix operator that
+    /// Narrows an operator fault's anchor to the prefix application that
     /// produced it.
     ///
-    /// The capture folds a prefix operator onto its operand without
-    /// widening the node span (`ConstCapture::apply_unaries_at` copies the
-    /// operand's span), while upstream anchors every constant fault at the
-    /// *operator node*: `ConstantVisitor.visitUnaryExpression` hands the
-    /// whole `PrefixExpression` to `DartObjectComputer`, whose
-    /// `_reportError` reports that node's offset and length (upstream Dart
-    /// SDK source, pkg/analyzer/lib/src/dart/constant/evaluation.dart,
-    /// `visitUnaryExpression`; `value.dart`'s `negated`/`bitNot`/`logicalNot`
-    /// throw with the same entity). The oracle rows pin the node extent:
-    /// `!D` over a null-valued const reports at `!D`, `!!D` at the innermost
-    /// `!D`, `- - D` at `- D`, and the operand-type faults of `!1`, `~'a'`
-    /// and `-'a'` cover their operator as well.
+    /// Upstream anchors every constant fault at the *operator node*:
+    /// `ConstantVisitor.visitPrefixExpression` evaluates the operand and
+    /// returns a non-`DartObjectImpl` verdict verbatim, so the reported
+    /// entity is the innermost `PrefixExpression` that threw (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/constant/
+    /// evaluation.dart, `visitPrefixExpression`; `value.dart`'s
+    /// `negated`/`bitNot`/`logicalNot` throw with that node).
     ///
-    /// A candidate operator the *binary* grammar produced keeps the span
-    /// untouched: `1 - x` and `a ~ b` put a value-ending byte left of the
-    /// operator, which a prefix operator never has (it follows an opener,
-    /// another operator, or nothing).
+    /// The capture latches every prefix token of a run innermost-first
+    /// (`unary_prefix` fires when each operand completes) and applies
+    /// them outermost-first, so a nested run like `!!D` or `- - D`
+    /// arrives here with the OUTER application's extent while the fault
+    /// it carries was thrown by the INNER one. When the span's first
+    /// byte is itself an operator, the correct anchor is the LAST
+    /// operator of a HOMOGENEOUS run (`!!`, `- -`, `~ ~`) — a run of one
+    /// repeated op can only fault in its innermost application (the
+    /// inner fold answers a Bool/Int/Double the same op accepts), so the
+    /// throwing `PrefixExpression` always starts at the operand-adjacent
+    /// token; `!!D` narrows to the oracle's `(35,2)`, `- - D` to
+    /// `(51,3)`. A mixed run (`!-x`) faults at the OUTER op instead,
+    /// and a composite that merely begins with an operator (`- -x / 0`)
+    /// anchors at its own first byte — both keep the incoming span. A
+    /// single-operator run narrows onto its own byte, so `!D`, `-'a'`
+    /// and the type-fault pins are untouched.
+    ///
+    /// A span that still anchors at the operand walks back to its own
+    /// prefix instead: a candidate operator the *binary* grammar
+    /// produced keeps the span untouched (`1 - x` and `a ~ b` put a
+    /// value-ending byte left of the operator, which a prefix operator
+    /// never has — it follows an opener, another operator, or nothing).
     fn unary_fault_extent(&self, span: SourceRange) -> SourceRange {
         let bytes = self.source.as_bytes();
-        let mut i = self.byte_of(span.offset).min(bytes.len());
+        let start_byte = self.byte_of(span.offset).min(bytes.len());
+        if matches!(bytes.get(start_byte), Some(b'!' | b'-' | b'~')) {
+            // The operator run is `op (ws|op)*`. A HOMOGENEOUS run
+            // (`!!`, `- -`, `~ ~`) can only fault in its innermost
+            // application — the inner fold answers a Bool/Int/Double the
+            // same operator accepts — so the run's LAST operator token
+            // is the throwing `PrefixExpression`'s start. A mixed run
+            // (`!-x`) faults at the outer operator, and a composite that
+            // merely STARTS with an operator (`- -x / 0`, `-x ? y : z`)
+            // anchors at its own first byte, so the narrow requires the
+            // whole run to spell one operator and the operand region to
+            // carry no top-level infix byte.
+            let end_byte = self.byte_of(span.end()).min(bytes.len());
+            let op_byte = bytes[start_byte];
+            let mut last_op = start_byte;
+            let mut p = start_byte + 1;
+            while p < end_byte {
+                let b = bytes[p];
+                if b == op_byte {
+                    last_op = p;
+                    p += 1;
+                } else if b.is_ascii_whitespace() {
+                    p += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut depth = 0u32;
+            let mut composite = last_op == start_byte;
+            let mut q = p;
+            while q < end_byte && !composite {
+                match bytes[q] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                    b'\'' | b'"' => {
+                        // Skip a quoted run (raw prefixes never reach here —
+                        // the `r` rides inside the operand's ident head);
+                        // escapes are consumed so `\'` does not close early.
+                        let quote = bytes[q];
+                        q += 1;
+                        while q < end_byte && bytes[q] != quote {
+                            q += if bytes[q] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    b'+' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' | b'=' | b'?'
+                    | b':' | b'-' | b'~' | b'!'
+                        if depth == 0 =>
+                    {
+                        composite = true
+                    }
+                    _ => {}
+                }
+                q += 1;
+            }
+            if !composite {
+                let start = self.utf16_of(last_op);
+                return SourceRange {
+                    offset: start,
+                    length: span.end().saturating_sub(start),
+                };
+            }
+            return span;
+        }
+        let mut i = start_byte;
         while i > 0 && bytes[i - 1].is_ascii_whitespace() {
             i -= 1;
         }
@@ -1177,6 +1377,47 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn const_ctor_target(&self, container: StringId) -> bool {
         self.const_ctor_decl(container).is_some()
+    }
+
+    /// The `(container, constructor-site)` key [`Self::check_ctor_initializers`]
+    /// looks the initializer stash up under.
+    ///
+    /// The stash registers each const constructor under its own DECLARATION
+    /// spelling: the unnamed face under the class name, a named one under
+    /// its selector. A creation reaches the walk with whatever spelling the
+    /// capture folded — `C(...)` with the class, `C.named(...)` with the
+    /// selector, and a leading-dot shorthand (`.new(...)` / `.named(...)`)
+    /// with the selector ALONE, its head only recoverable from the
+    /// declaration's context type (exactly the container the oracle
+    /// resolves the shorthand against, `method_invocation_resolver.dart`
+    /// `_resolveReceiverTypeLiteralForDotShorthand`). [`Self::ctor_decl_site`]
+    /// is the normalizer on the other side: it already answers `new` and
+    /// the class name as the unnamed face's spellings, so its site name is
+    /// the stash key. A head this pass cannot name leaves the key as given,
+    /// which simply misses the stash — the under-report direction.
+    fn ctor_init_key(&self, callee: StringId, span: SourceRange) -> (StringId, StringId) {
+        let container = if self.dot_shorthand_context(span.offset) {
+            match self.shorthand_ctx_ty() {
+                Some(Ty::Named { name: context, .. }) => context,
+                _ => callee,
+            }
+        } else {
+            // `C.named(` — the written head precedes the selector; a bare
+            // `C(` already arrives as the container itself.
+            let text = self
+                .source
+                .get(self.byte_of(span.offset)..self.byte_of(span.end()))
+                .unwrap_or("");
+            let head = text.split('(').next().unwrap_or("");
+            match head.split_once('.') {
+                Some((head_text, _)) => self.intern(head_text),
+                None => callee,
+            }
+        };
+        let site = self
+            .ctor_decl_site(container, callee)
+            .map_or(callee, |site| site.name);
+        (container, site)
     }
 
     /// Whether a const-declaration initializer's creation is a valid
@@ -1456,33 +1697,105 @@ impl<'a> Engine<'a> {
         self.emit_const_type_param_args(head_name, self.byte_of(head_end));
     }
 
+    /// The qualified implicit-creation face of
+    /// [`Self::emit_const_type_param_args`]: `const x = C<T>.named(...)`
+    /// parses as the parser's implicit creation (`parseImplicitCreation
+    /// Expression` — `id ('.' id)? typeArguments '.' id '('`), whose
+    /// selector rides a constructor-reference event, so the capture never
+    /// closes a bare `Ident` callee and [`Self::classify_call`] never sees
+    /// the reference. The creation's own argument list opening (this
+    /// creation is the innermost one and no list opened since it began) is
+    /// the hook; the head is the `type_uses` entry the written `<...>`
+    /// group follows, with `.selector(` after the group.
+    ///
+    /// The const context mirrors the capture's own: an open window that is
+    /// neither a non-const candidate (literal-ctor, map-pattern key,
+    /// constant pattern) nor a non-const dup literal — a dup window opens
+    /// only outside every const window, so a const initializer, a `const`
+    /// creation, or an enum element must own the position. Explicit
+    /// `const C<T>.named()` never reaches here (`implicit_creation_depth`
+    /// stays 0 on that path; [`Self::arm_const_ctor_gate`] owns it), and
+    /// the unqualified `C<T>(` parses as an invocation instead.
+    fn emit_const_type_param_implicit_named(&mut self) {
+        if self.implicit_creation_depth == 0
+            || !self.at_creation_level()
+            || !self.const_capture.open()
+            || self.const_capture.top_is_literal_ctor()
+            || self.const_capture.top_is_map_pattern_key()
+            || self.const_capture.top_is_constant_pattern()
+            || (self.pending_init_names.is_empty()
+                && self.const_kw_spans.is_empty()
+                && !self.enum_element_open)
+        {
+            return;
+        }
+        let bytes = self.source.as_bytes();
+        let head = self.type_uses.iter().rev().find_map(|&(range, name)| {
+            let head_end = self.byte_of(range.end());
+            let open = ws_skip(bytes, head_end);
+            let group_end = skip_balanced(bytes, open, b'<');
+            if group_end == open {
+                return None;
+            }
+            let dot = ws_skip(bytes, group_end);
+            if bytes.get(dot) != Some(&b'.') {
+                return None;
+            }
+            let selector = ws_skip(bytes, dot + 1);
+            let selector_end = ident_end(bytes, selector);
+            (selector_end > selector && bytes.get(ws_skip(bytes, selector_end)) == Some(&b'('))
+                .then_some((name, head_end))
+        });
+        if let Some((name, head_end)) = head {
+            self.emit_const_type_param_args(name, head_end);
+        }
+    }
+
     /// The callee classification a closed bare-identifier call resolves
     /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`). The
     /// `&mut` receiver stages the `C.named(` implicit-const creation the
     /// qualified-selector split detects — the tail pass needs the
     /// whole-file const-ctor set before it can verdict.
     pub(crate) fn classify_call(&mut self, name: StringId) -> CallClass {
-        // The dot-shorthand constructor invocation (`.new(...)` /
-        // `.named(...)`): a bare selector callee reaches here only through
-        // the shorthand's `_tryRewriteNewToIdentifier` identifier event —
-        // `C.new(...)` parses the constructor-reference path and
-        // `x.new(...)` folds its member before the group opens. The oracle
-        // resolves the shorthand against the context type
-        // (`visitDotShorthandConstructorInvocation2`, evaluation.dart
-        // :880-916) — a resolution this pass cannot perform — so the
-        // under-report verdict is the valid-creation face: its arguments
-        // still answer the const-argument check, and a static-method
-        // shorthand (`.create()` — the oracle's `constEvalMethodInvocation`
-        // when it reaches a call) stays silent beside it.
-        if let Some(offset) = self
+        // The leading-dot shorthand call (`.new(...)` / `.named(...)` /
+        // `.method()`): a bare selector callee reaches here only through
+        // the shorthand's selector event — `C.new(...)` parses the
+        // constructor-reference path and `x.new(...)` folds its member
+        // before the group opens. The oracle resolves the callee against
+        // the CONTEXT type (`method_invocation_resolver.dart`
+        // `_resolveReceiverTypeLiteralForDotShorthand`: `_resolveElement`'s
+        // getter/method lookup first, a static executable taking the
+        // method-invocation face, `getNamedConstructor` after it rewriting
+        // the node to a `DotShorthandConstructorInvocation`), so the two
+        // kinds split on the context type's own member set — see
+        // [`Self::shorthand_callee`]. A context this pass cannot resolve
+        // (an unindexed SDK head, an unwritten annotation) keeps the
+        // valid-creation defer, the under-report direction.
+        if self
             .invokes
             .last()
             .and_then(|slot| *slot)
             .and_then(|index| self.rows.get(index))
-            .map(|row| row.range.offset)
-            && self.dot_shorthand_context(offset)
+            .is_some_and(|row| self.dot_shorthand_context(row.range.offset))
         {
-            return CallClass::ConstCtor;
+            return match self.shorthand_callee(name) {
+                // A STATIC METHOD of the context type: the oracle's
+                // `visitDotShorthandInvocation` →
+                // `_invalidConstantForMethodInvocation`
+                // (evaluation.dart:930-932).
+                ShorthandCallee::StaticMethod => CallClass::Invocable,
+                // A static field/getter: the oracle's
+                // `FunctionExpressionInvocation` rewrite, which no
+                // `ConstantVisitor` arm answers — the site default.
+                ShorthandCallee::PropertyAccessor => CallClass::ValueCall,
+                // A constructor of the context type — and every context
+                // the model cannot decide. Both keep the creation face;
+                // the constructor's initializer walk runs at
+                // [`Self::check_ctor_initializers`], which re-reads the
+                // same discriminator with the closed argument list in
+                // hand.
+                ShorthandCallee::Ctor(_) | ShorthandCallee::Defer => CallClass::ConstCtor,
+            };
         }
         // A pattern's constant-expression context is NOT a const context: a
         // bare `C(...)` there is an ordinary (non-const) creation, not the
@@ -1670,6 +1983,100 @@ impl<'a> Engine<'a> {
             offset: dot.utf16_offset,
             length: span.end() - dot.utf16_offset,
         }
+    }
+
+    /// The leading-dot shorthand's callee face: the context type's member
+    /// set decides whether the selector names a constructor (the oracle's
+    /// `DotShorthandConstructorInvocation`) or a static method (the
+    /// `DotShorthandInvocation` method face).
+    ///
+    /// Upstream's order is member-first: `method_invocation_resolver.dart`
+    /// `_resolveReceiverTypeLiteralForDotShorthand` runs `_resolveElement`
+    /// (setter, then getter, then method, :484-500) and takes the
+    /// method-invocation face for a static `InternalExecutableElement`
+    /// (:1287-1304); only a miss falls through to
+    /// `receiver.getNamedConstructor(name)`'s rewrite to a
+    /// `DotShorthandConstructorInvocation` (:1310-1330). The constructor
+    /// probe is therefore only reached when the member walk found nothing.
+    ///
+    /// The context type is the declaration group's written annotation
+    /// ([`Self::shorthand_ctx_ty`] — alias-folded, `FutureOr`-unwrapped
+    /// like the oracle's `futureOrBase`). [`ShorthandCallee::Defer`] covers
+    /// every context this pass cannot decide — no annotation, an
+    /// unresolved or non-interface head, a member walk that broke on a
+    /// foreign supertype — and the caller keeps the creation face there
+    /// (the under-report direction: a method shorthand in such a context
+    /// stays silent, exactly the pre-#3956 posture).
+    fn shorthand_callee(&self, name: StringId) -> ShorthandCallee {
+        let Some(Ty::Named { name: context, .. }) = self.shorthand_ctx_ty() else {
+            return ShorthandCallee::Defer;
+        };
+        // The member face first: a STATIC member of the context type
+        // answers the shorthand. Upstream splits it by element kind —
+        // `_resolveElement`'s getter/method lookup answers a
+        // `InternalExecutableElement`, and
+        // `_resolveReceiverTypeLiteralForDotShorthand` sends a
+        // `InternalPropertyAccessorElement` (a field or getter) through
+        // `_rewriteAsFunctionExpressionInvocation` while a method takes
+        // the invocation face (:1287-1304). The rewrite has no
+        // `ConstantVisitor` arm, so the call is the site default
+        // ([`CallClass::ValueCall`]), never the method fault. A
+        // non-static member never answers the shorthand (there is no
+        // receiver) — it falls through to the constructor probe, its own
+        // `dot_shorthand_undefined_member` row already reported.
+        match self.walk_members(context, name) {
+            Walk::Found(entry) if entry.is_static => {
+                return match entry.kind {
+                    MemberKind::Method => ShorthandCallee::StaticMethod,
+                    MemberKind::Field | MemberKind::Getter | MemberKind::Setter => {
+                        ShorthandCallee::PropertyAccessor
+                    }
+                };
+            }
+            // A broken climb leaves the inherited half of the member set
+            // unknown — neither arm can claim the selector.
+            Walk::ChainBroken => return ShorthandCallee::Defer,
+            Walk::Found(_) | Walk::Missing => {}
+        }
+        // The constructor face: the same decl-site/model union
+        // [`Self::shorthand_member_ty`] uses, so a context head declared
+        // in a sibling unit resolves through the model.
+        let ctor_hit = self.ctor_decl_site(context, name).is_some()
+            || resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                context,
+            )
+            .is_some_and(|(decl, _)| self.ctor_face_exists(decl, context, name));
+        if ctor_hit {
+            return ShorthandCallee::Ctor(context);
+        }
+        // Neither arm answers: the shorthand's own
+        // `dot_shorthand_undefined_member` face reported it, and the
+        // initializer's `const_initialized_with_non_constant_value` twin
+        // rides the failed-verdict path — never the creation face, which
+        // would walk a nonexistent constructor's initializers.
+        ShorthandCallee::Defer
+    }
+
+    /// The shorthand resolution's context type — the declaration group's
+    /// armed annotation folded through the alias chain and the
+    /// `FutureOr<S>` base (upstream `_resolveDotShorthand` unwraps both:
+    /// `typedef E2 = E; E2 e = .a` resolves `.a` against `E`, and the
+    /// static namespace `S` denotes is the one `FutureOr<S>` denotes).
+    /// `None` when the group carries no decidable context: unwritten
+    /// (`var x = .a`), unresolvable (`pending_decl_ty_unresolved` — the
+    /// oracle's `InvalidType`, which swallows the member verdict), or a
+    /// non-interface shape the shorthand's lookup never climbs.
+    fn shorthand_ctx_ty(&self) -> Option<Ty> {
+        if self.pending_decl_ty_unresolved {
+            return None;
+        }
+        let ty = self.future_or_base(self.fold_alias_ty(self.pending_decl_ty?));
+        (ty != Ty::UNKNOWN).then_some(ty)
     }
 
     /// Whether the name expression at `offset` is a leading-dot shorthand
@@ -2200,12 +2607,62 @@ impl<'a> Engine<'a> {
         args: &[crate::const_eval::Node],
         span: SourceRange,
     ) {
-        let Some(inits) = self.ctor_inits.get(&(container, container)) else {
+        // The `(container, constructor-site)` key the stash registers under:
+        // a plain `C(...)` arrives with the class itself as the callee, a
+        // `C.named(...)` and a leading-dot shorthand (`.new(...)` /
+        // `.named(...)`) arrive with the SELECTOR alone — the head is
+        // re-read from the written creation (see
+        // [`Self::ctor_init_key`]).
+        let (container, site) = self.ctor_init_key(container, span);
+        let Some(inits) = self.ctor_inits.get(&(container, site)) else {
             return;
         };
         if inits.is_empty() {
             return;
         }
+        // The container's type parameters substitute with the creation's
+        // written type arguments (upstream evaluates the initializers
+        // under `definingType`'s instantiated element —
+        // `SubstitutedConstructorElementImpl.from2`, evaluation.dart
+        // :3228 — so `x as T` inside `C<int>`'s init sees `int`). The
+        // `call_type_args` entry keys on the callee head offset, which
+        // sits inside the creation span (the head is the first
+        // identifier past the `const` keyword); only an exact offset
+        // match binds — a nested expression's group never substitutes.
+        let type_env: Option<FxHashMap<StringId, Ty>> = (|| {
+            let decl = self.index.get(self.file)?.container(container)?;
+            if decl.type_param_names.is_empty() {
+                return None;
+            }
+            let bytes = self.source.as_bytes();
+            let mut p = self.byte_of(span.offset);
+            while matches!(bytes.get(p), Some(b) if b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+            {
+                p += 1;
+            }
+            while matches!(bytes.get(p), Some(b) if b.is_ascii_whitespace()) {
+                p += 1;
+            }
+            let head = self.utf16_of(p);
+            let entry = self.call_type_args.iter().find(|(at, _)| *at == head)?;
+            let env: FxHashMap<StringId, Ty> = decl
+                .type_param_names
+                .iter()
+                .copied()
+                .zip(entry.1.tys.iter().copied())
+                .collect();
+            (!env.is_empty()).then_some(env)
+        })();
+        let owned;
+        let inits = if let Some(env) = &type_env {
+            owned = inits
+                .iter()
+                .map(|node| self.subst_init_tys(node, env))
+                .collect::<Vec<_>>();
+            &owned
+        } else {
+            inits
+        };
         // Positional formals bind the arguments in order (the capture
         // drops named-argument labels — a named-only call binds its
         // values positionally, which only ever moves the walk toward
@@ -2215,7 +2672,7 @@ impl<'a> Engine<'a> {
             .index
             .get(self.file)
             .and_then(|f| f.container(container))
-            .and_then(|c| c.ctor_formals.get(&container));
+            .and_then(|c| c.ctor_formals.get(&site));
         if let Some(formals) = formals {
             for (formal, arg) in formals.positional.iter().zip(args) {
                 let binding = match eval(arg, self) {
@@ -2257,7 +2714,173 @@ impl<'a> Engine<'a> {
         }
     }
 
-    // —— #749: non_const_call_to_literal_constructor ————————————————————
+    /// Substitutes the constructor's type parameters inside a captured
+    /// initializer tree's `as`/`is` target types with the creation's
+    /// written type arguments (the `T` of `x as T` under `const C<int>(x)`
+    /// — upstream instantiates the constructor under the invocation's
+    /// `typeArguments` before evaluating its initializers). Only `Named`
+    /// heads bound in `env` rewrite — a target spelling a real container
+    /// or an unbound parameter stays as written (`castToType` defers on
+    /// it anyway). Argument lists substitute elementwise (`x as List<T>`
+    /// under `C<int>` sees `List<int>`), interning through the shared
+    /// pool; `Record`/`Function` shapes carry no substitutable face this
+    /// deep into the parse-time `Ty`.
+    fn subst_init_tys(
+        &self,
+        node: &crate::const_eval::Node,
+        env: &FxHashMap<StringId, Ty>,
+    ) -> crate::const_eval::Node {
+        let expr = match &node.expr {
+            Expr::Unary { op, operand } => Expr::Unary {
+                op: match op {
+                    // Only the type-carrying operators substitute — the
+                    // creation's env answers a `T`/`List<T>` target with
+                    // the written arguments (`x as T` under `C<int>` sees
+                    // `int`, evaluation.dart's `definingType`
+                    // instantiation). `Assert`/the prefix kinds carry no
+                    // `Ty`.
+                    UnOp::As(ty) => UnOp::As(self.subst_init_ty(*ty, env)),
+                    UnOp::Is(ty) => UnOp::Is(self.subst_init_ty(*ty, env)),
+                    UnOp::IsNot(ty) => UnOp::IsNot(self.subst_init_ty(*ty, env)),
+                    _ => *op,
+                },
+                operand: Box::new(self.subst_init_tys(operand, env)),
+            },
+            Expr::Member { recv, name } => Expr::Member {
+                recv: Box::new(self.subst_init_tys(recv, env)),
+                name: *name,
+            },
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op: *op,
+                left: Box::new(self.subst_init_tys(left, env)),
+                right: Box::new(self.subst_init_tys(right, env)),
+            },
+            Expr::Cond { cond, then, els } => Expr::Cond {
+                cond: Box::new(self.subst_init_tys(cond, env)),
+                then: Box::new(self.subst_init_tys(then, env)),
+                els: Box::new(self.subst_init_tys(els, env)),
+            },
+            Expr::Interp { parts } => Expr::Interp {
+                parts: parts.iter().map(|p| self.subst_init_tys(p, env)).collect(),
+            },
+            Expr::Adjacent(parts) | Expr::List(parts) | Expr::Set(parts) | Expr::Record(parts) => {
+                let parts = parts.iter().map(|p| self.subst_init_tys(p, env)).collect();
+                match &node.expr {
+                    Expr::Adjacent(_) => Expr::Adjacent(parts),
+                    Expr::List(_) => Expr::List(parts),
+                    Expr::Set(_) => Expr::Set(parts),
+                    _ => Expr::Record(parts),
+                }
+            }
+            Expr::Map(parts) => {
+                Expr::Map(parts.iter().map(|p| self.subst_init_tys(p, env)).collect())
+            }
+            Expr::Entry(key, value) => Expr::Entry(
+                Box::new(self.subst_init_tys(key, env)),
+                Box::new(self.subst_init_tys(value, env)),
+            ),
+            Expr::IfElement { cond, then, els } => Expr::IfElement {
+                cond: Box::new(self.subst_init_tys(cond, env)),
+                then: Box::new(self.subst_init_tys(then, env)),
+                els: els.as_ref().map(|e| Box::new(self.subst_init_tys(e, env))),
+            },
+            Expr::Spread {
+                operand,
+                null_aware,
+            } => Expr::Spread {
+                operand: Box::new(self.subst_init_tys(operand, env)),
+                null_aware: *null_aware,
+            },
+            Expr::Call { name, args } => Expr::Call {
+                name: *name,
+                args: args.iter().map(|a| self.subst_init_tys(a, env)).collect(),
+            },
+            // Value/Ident/Faulted/Opaque/Other carry no `Ty` face.
+            _ => node.expr.clone(),
+        };
+        crate::const_eval::Node {
+            expr,
+            span: node.span,
+        }
+    }
+
+    /// The `Ty` half of [`Self::subst_init_tys`]: a `Named` head bound in
+    /// the creation's env resolves to its written argument; an unbound
+    /// head keeps its spelling with its own argument list substituted
+    /// elementwise (`List<T>` under `C<int>` → `List<int>`). Other shapes
+    /// return verbatim — the `Ty` lattice carries no param face inside
+    /// `Record`/`Function` slots this face needs. Named `subst_init_ty`
+    /// against the alias-instantiation `subst_ty` (`assignability.rs`)
+    /// — the two `impl Engine` faces share the type's method namespace.
+    fn subst_init_ty(&self, ty: Ty, env: &FxHashMap<StringId, Ty>) -> Ty {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        if let Some(bound) = env.get(&name) {
+            // The written `?` joins the bound argument's nullability
+            // (`x as T?` under `C<int>` stays `int?`).
+            return if nullable {
+                match *bound {
+                    Ty::Named { name, args, .. } => Ty::Named {
+                        name,
+                        nullable: true,
+                        args,
+                    },
+                    Ty::Record { shape, .. } => Ty::Record {
+                        shape,
+                        nullable: true,
+                    },
+                    Ty::Function { shape, .. } => Ty::Function {
+                        shape,
+                        nullable: true,
+                    },
+                    other => other,
+                }
+            } else {
+                *bound
+            };
+        }
+        if args == ArgListId::EMPTY {
+            return ty;
+        }
+        let list = self.boundary.args.borrow().get(args).to_vec();
+        if !list.iter().any(|arg| self.ty_mentions_init_env(arg, env)) {
+            return ty;
+        }
+        let joined: Vec<Ty> = list
+            .iter()
+            .map(|arg| self.subst_init_ty(*arg, env))
+            .collect();
+        self.boundary
+            .args
+            .borrow_mut()
+            .named(name, nullable, &joined)
+    }
+
+    /// Whether `ty` mentions an env-bound name (its own head or inside
+    /// its argument list) — the early-exit half of [`Self::subst_init_ty`].
+    fn ty_mentions_init_env(&self, ty: &Ty, env: &FxHashMap<StringId, Ty>) -> bool {
+        let Ty::Named { name, args, .. } = ty else {
+            return false;
+        };
+        if env.contains_key(name) {
+            return true;
+        }
+        if *args == ArgListId::EMPTY {
+            return false;
+        }
+        self.boundary
+            .args
+            .borrow()
+            .get(*args)
+            .iter()
+            .any(|arg| self.ty_mentions_init_env(arg, env))
+    }
     //
     // `_checkForLiteralConstructorUse` (best_practices_verifier.dart
     // :1276-1290) hooks every constructor invocation; the decision order is
@@ -2278,6 +2901,9 @@ impl<'a> Engine<'a> {
     /// non-const window. Returns the arm for the list's per-list slot —
     /// `None` leaves the slot empty.
     pub(crate) fn arm_literal_ctor_args(&mut self) -> Option<LiteralCtorArm> {
+        // The list-open hook every argument list passes through, ahead of
+        // the engine's own level push (the creation-level read needs it).
+        self.emit_const_type_param_implicit_named();
         if self.ctor_pos != 0
             || self.annotation_at.is_some()
             || self.default_value_depth != 0
@@ -3041,8 +3667,21 @@ impl<'a> Engine<'a> {
                             )
                         })
                 });
+                // Every bare name inside the initializer list carries the
+                // `init_rows` stamp — `f(` callees included — so the arm
+                // reads as "any bare call in an initializer folds
+                // non-constant", which is the oracle's
+                // `_reportNotPotentiallyConstants` verdict for a runtime
+                // call (`x = f(y)` reports `invalid_constant` at the whole
+                // call). The ONE admitted shape is the two-argument
+                // `identical(a, b)` — the potentially-constant grammar's
+                // only invocation — which must reach the generic close's
+                // `Expr::Call` fold instead (#3992: `assert(identical(
+                // o1, o2))` in `Utils/expect_common.dart` folded to
+                // `Expr::Other` here and false-fired `invalid_constant`).
+                let identical_call = head.name == self.identical_id && level.args.len() == 2;
                 on_keyword_receiver
-                    || self.init_rows.contains_key(&head.range.offset)
+                    || (self.init_rows.contains_key(&head.range.offset) && !identical_call)
                     || self
                         .pending_init_super
                         .iter()
@@ -3510,7 +4149,7 @@ impl<'a> Engine<'a> {
         // left belongs to this window even when the alignment check below
         // bails.
         let leaves = self.const_capture.take_annotation_leaves(0, close.end());
-        let Some((head_range, head_name, selector)) = self.annotation_head_before(close) else {
+        let Some((_head_range, head_name, selector)) = self.annotation_head_before(close) else {
             return;
         };
         if labels.len() != args.len() {
@@ -3522,9 +4161,13 @@ impl<'a> Engine<'a> {
         let Some(formals) = decl.ctor_formals.get(&selector.unwrap_or(head_name)) else {
             return;
         };
-        // The argument-count faces: a deficit anchors at the annotation
-        // head, a surplus at the first extra positional argument (the
-        // probed `@P()` / `@P(1, 2, 3)` pairings).
+        // The argument-count faces: upstream `resolveArgumentsToParameters`
+        // (type_analyzer.dart) anchors a deficit at
+        // `lastPositionalArgument?.endToken.next ?? leftParenthesis.next ??
+        // rightParenthesis` — the argument list's close `)` for every
+        // positional-arg shape this face sees — and a surplus at the first
+        // unresolved (extra) positional argument's expression (the probed
+        // `@P()` / `@P(1, 2, 3)` pairings: `)` and `3`).
         let given = named.iter().filter(|flag| !**flag).count();
         // Required-ness is the parser's classification (the formal's own
         // group: `[...]` is optional whether or not a default is written —
@@ -3549,7 +4192,7 @@ impl<'a> Engine<'a> {
                 let message = code.message3(&required.to_string(), &given.to_string(), &display);
                 (code, message)
             };
-            self.emit_message_with_correction(code, head_range, message);
+            self.emit_message_with_correction(code, close, message);
         } else if given > formals.positional.len() {
             let capacity = formals.positional.len();
             if let Some((arg, _)) = args
@@ -4096,6 +4739,11 @@ mod face_tests {
         // A created bool of unknown value: `!`, `&&`, `||`, `?:`, and the
         // interpolation gate all admit `BoolState`. A created int answers
         // `-`/`~`; a created non-state container still faults its gate.
+        // The file-local `class int` shadows the dart:core `int` spelling,
+        // so `i`'s static type is that declaration — which declares no
+        // `unary-`/`~` — and the operator face reports both applications
+        // (oracle-adjudicated: `dart analyze` on this fixture emits
+        // `undefined_operator` at `-i` and `~i`).
         let rep = unit_report(
             "class V { const V(); }\n\
              class bool { final V? v; const bool.fromEnvironment(this.v); }\n\
@@ -4115,12 +4763,20 @@ mod face_tests {
         );
         assert_eq!(
             code_names(&rep),
-            ["const_eval_type_bool"],
+            [
+                "const_eval_type_bool",
+                "undefined_operator",
+                "undefined_operator",
+            ],
             "{:?}",
             code_names(&rep)
         );
         // Negative controls: the operand-type gates still fault non-state
-        // operands; `&&`'s non-bool right faults at the right operand.
+        // operands; `&&`'s non-bool right faults at the right operand. The
+        // `-'a'`/`~'a'` applications additionally report `undefined_operator`
+        // — `String` declares no `unary-`/`~` member (oracle probe 3.13.7 on
+        // this exact shape: `CONST_EVAL_TYPE_NUM` + `UNDEFINED_OPERATOR` at
+        // `-'a'`, `CONST_EVAL_TYPE_INT` + `UNDEFINED_OPERATOR` at `~'a'`).
         let rep = unit_report(
             "class V { const V(); }\n\
              class bool { final V? v; const bool.fromEnvironment(this.v); }\n\
@@ -4135,7 +4791,9 @@ mod face_tests {
             [
                 "const_eval_type_bool",
                 "const_eval_type_num",
+                "undefined_operator",
                 "const_eval_type_int",
+                "undefined_operator",
                 "const_eval_type_bool",
             ],
             "{:?}",

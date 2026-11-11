@@ -452,7 +452,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     // `type_info` is consumed by some recovery paths only; the signature
     // mirrors the official `parseTopLevelMethod`.
     #[allow(clippy::needless_pass_by_value)]
-    fn parse_top_level_method(
+    pub(crate) fn parse_top_level_method(
         &mut self,
         before_start: crate::cursor::CursorMark,
         augment: Option<TokenSpan>,
@@ -2761,11 +2761,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // parked at the real follower — anchors on the first real
             // follower token (manual face factory_with_initializers/1: the
             // oracle's `missing_method_parameters` spans the `{`, 3:23|1).
+            // The cursor's peek IS `name.next` after `ensureIdentifier`
+            // drained the synthetic, so the walk starts at `look_span_at(0)`
+            // — `class C { @a( int get a => 0; }` reparses `=>` as the
+            // member head, splices the synthetic name in front of it, and
+            // this row anchors on the `=>` (24,26), not on `0` (27,28).
             let mut anchor = name;
             let mut n = 0usize;
             while anchor.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
-                n += 1;
                 anchor = self.look_span_at(n);
+                n += 1;
             }
             self.report(msg::missing_parameters(kind), anchor);
             self.last_parameter_count = 0;

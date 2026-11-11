@@ -134,7 +134,7 @@ fn non_nullable_receiver_keeps_the_argument_row() {
 ///   The refinement must be skipped whenever the signature came from an
 ///   extension (the ordering arm reads it from
 ///   `Engine::nullable_extension_operator_sig`).
-#[ignore = "row_resolution.rs compound nullable gate + assignability.rs compound refinement; see #3423 report"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn compound_nullable_extension_operator_is_silent() {
     let report = report_ops(

@@ -32,8 +32,12 @@
 //!
 //! Declaration maps are hash maps, so every name set is rendered sorted by
 //! **resolved name text** (interning order differs between the incremental
-//! and full arms — sorting by [`StringId`] would fork the hash). Ordered
-//! faces keep their semantic order: positional formals and named formals
+//! and full arms — sorting by [`StringId`] would fork the hash). That law
+//! covers the interned record-shape and function-shape named sets too: the
+//! pools sort their named pairs by intern-arrival [`StringId`] (pool-local
+//! canonical only), so the face re-sorts them by text exactly like the
+//! display does ([`crate::model`]'s `display_named`). Ordered faces keep
+//! their semantic order: positional formals and positional record fields
 //! keep declaration order (positional order is the call-site contract), and
 //! enum constants keep declaration order. The rendering writes into one
 //! scratch buffer and hashes once — no intermediate strings, no String-keyed
@@ -49,9 +53,10 @@ use blake3::Hasher;
 use dartq_source::{StringId, StringTable};
 
 use crate::model::{
-    Annotation, ArgPool, Container, ContainerKind, FileElements, Formal, Formals, MemberEntry,
-    MemberKind, MicroKind, TopDecl, Ty,
+    Annotation, ArgListId, ArgPool, Container, ContainerKind, FileElements, Formal, Formals,
+    MemberEntry, MemberKind, MicroKind, TopDecl, Ty, display_named,
 };
+use dartq_types::Variance;
 
 /// The signature-composition version: bumped with any change to
 /// what [`FileElements::api_signature`] hashes. v1: the initial composition-F
@@ -97,8 +102,20 @@ use crate::model::{
 /// const-creation faces — an initializer-only edit of a `const` variable
 /// (same name, same declared type) moves the cross-library const-instance
 /// equality of every dependent's const-set faces, so it must flip the L2
-/// gate.
-pub const SIGNATURE_VERSION: u32 = 13;
+/// gate. v14: the supertype clauses' written type arguments, parallel to
+/// the clause name lists, and the superclass head's (#3847) — an
+/// argument-only edit of a clause face (`with M<int>` → `with M<String>`)
+/// re-instantiates every dependent's inherited member faces, so it must
+/// flip the L2 gate. v15: the container's type-parameter variance
+/// modifiers, parallel to the names (#3903) — a modifier-only edit
+/// (`class C<T>` → `class C<inout T>`) changes the interface-argument
+/// relation every dependent's subtype face answers
+/// (`_interfaceArguments`), so it must flip the L2 gate. v16: the interned
+/// record-shape field set and function-shape named-formal set render in
+/// resolved-text order (#4214) — the pools sort by intern-arrival
+/// `StringId`, which moves with the parallel fan-out's interning order, so
+/// the previous byte order forked the digest between runs.
+pub const SIGNATURE_VERSION: u32 = 16;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -283,6 +300,15 @@ impl<'a> Face<'a> {
         scratch.sort_unstable_by(|a, b| strings.resolve(*a).cmp(strings.resolve(*b)));
     }
 
+    /// One written-argument list of a clause face: the count then each
+    /// argument's own face (#3847).
+    fn arg_list(&mut self, list: ArgListId) {
+        self.usize(self.args.get(list).len());
+        for arg in self.args.get(list) {
+            self.ty(*arg);
+        }
+    }
+
     fn ty(&mut self, ty: Ty) {
         match ty {
             Ty::Unknown => self.field("?"),
@@ -304,15 +330,18 @@ impl<'a> Face<'a> {
                 }
             }
             Ty::Record { shape, nullable } => {
-                // The interned shape is canonical (named fields sorted at
-                // intern), so the field walk itself is the identity — no
-                // re-sort, no slot numbers.
+                // The named set renders in resolved-text order: the pool's
+                // stored order is intern-arrival `StringId` order — canonical
+                // within one pool, not across runs (the string table is
+                // shared across the parallel fan-out, so ids follow scheduler
+                // order). Positional fields keep source order: that order is
+                // type identity (`(int, String)` != `(String, int)`).
                 self.field("record");
                 let shape = self.args.record_shape(shape);
                 for ty in shape.positional.iter() {
                     self.ty(*ty);
                 }
-                for (name, ty) in shape.named.iter() {
+                for (name, ty) in display_named(&shape.named, self.strings).iter() {
                     self.name(*name);
                     self.ty(*ty);
                 }
@@ -321,11 +350,10 @@ impl<'a> Face<'a> {
                 }
             }
             Ty::Function { shape, nullable } => {
-                // The interned shape is canonical (named formals sorted at
-                // intern), so the field walk itself is the identity — no
-                // re-sort, no slot numbers. The type-parameter count rides
-                // (a generic function type is a distinct shape even where
-                // its columns coincide).
+                // The named formals render in resolved-text order (the pool's
+                // stored order is pool-local, see the record arm). The
+                // type-parameter count rides (a generic function type is a
+                // distinct shape even where its columns coincide).
                 self.field("function");
                 let shape = self.args.function_shape(shape);
                 self.usize(shape.type_params as usize);
@@ -338,7 +366,7 @@ impl<'a> Face<'a> {
                 for ty in shape.positional.iter() {
                     self.ty(*ty);
                 }
-                for (name, ty) in shape.named.iter() {
+                for (name, ty) in display_named(&shape.named, self.strings).iter() {
                     self.name(*name);
                     self.ty(*ty);
                 }
@@ -546,16 +574,22 @@ impl<'a> Face<'a> {
             is_final,
             is_interface,
             is_mixin_class,
+            is_mixin_application,
             superclass,
             intro_superclass,
             members,
             type_params,
             type_param_names,
             type_param_bounds,
+            type_param_variances,
             sealed,
             with_clause,
             implements_clause,
             on_clause,
+            with_clause_args,
+            implements_clause_args,
+            on_clause_args,
+            superclass_args,
             header_residue,
             primary_formals,
             enum_constants,
@@ -591,6 +625,18 @@ impl<'a> Face<'a> {
         for bound in type_param_bounds {
             self.ty(*bound);
         }
+        // The written variance modifiers, parallel to the names: a
+        // modifier-only edit (`class C<T>` → `class C<inout T>`) changes the
+        // interface-argument relation every dependent's subtype face answers
+        // (`_interfaceArguments`), so it must flip the L2 gate (v15).
+        self.usize(type_param_variances.len());
+        for variance in type_param_variances {
+            self.field(match variance {
+                // No keyword written: the legacy covariance default.
+                None => "legacy-covariant",
+                Some(variance) => variance.keyword().unwrap_or("unrelated"),
+            });
+        }
         self.field(if *is_abstract { "abstract" } else { "concrete" });
         self.field(if *sealed { "sealed" } else { "unsealed" });
         // The declared class-modifier facts: a modifier-only edit moves
@@ -608,10 +654,19 @@ impl<'a> Face<'a> {
         } else {
             "nominal-class"
         });
+        self.field(if *is_mixin_application {
+            "mixin-application"
+        } else {
+            "nominal"
+        });
         match superclass {
             Some(superclass) => self.name(*superclass),
             None => self.field("no-superclass"),
         }
+        // The superclass head's written type arguments (#3847): an
+        // `extends`-argument-only edit re-instantiates every inherited
+        // member face, so it must flip the L2 gate (v14).
+        self.arg_list(*superclass_args);
         // The claiming fragment's own `extends` fact: a same-unit augment
         // can fill the merged edge above without writing the clause on the
         // introduction, and the fold moves diagnostics (the
@@ -622,18 +677,30 @@ impl<'a> Face<'a> {
             "no-intro-extends"
         });
         // Clause lists in fixed order (with, on, implements), each in
-        // written declaration order.
+        // written declaration order, and each face's written type arguments
+        // parallel to it (#3847): an argument-only clause edit
+        // re-instantiates every dependent's inherited member faces, so it
+        // must flip the L2 gate (v14).
         self.usize(with_clause.len());
         for supertype in with_clause {
             self.name(*supertype);
+        }
+        for list in with_clause_args {
+            self.arg_list(*list);
         }
         self.usize(on_clause.len());
         for supertype in on_clause {
             self.name(*supertype);
         }
+        for list in on_clause_args {
+            self.arg_list(*list);
+        }
         self.usize(implements_clause.len());
         for supertype in implements_clause {
             self.name(*supertype);
+        }
+        for list in implements_clause_args {
+            self.arg_list(*list);
         }
         // The unclaimed header names hash too (L2 honesty: an edit that
         // only moves a name between a clause and the residue must flip
@@ -1052,6 +1119,59 @@ mod tests {
             with_int,
             with_args(),
             "same content, separate pools: equal face"
+        );
+    }
+
+    /// The stored named-pair order of a typedef's record or function type —
+    /// the pool's intern-arrival `StringId` order, before any render re-sort.
+    fn stored_named(elements: &FileElements, strings: &StringTable, name: &str) -> Vec<String> {
+        let named: Box<[(StringId, Ty)]> = match elements.decls[&strings.intern(name)].var_ty {
+            Ty::Record { shape, .. } => elements.type_args().record_shape(shape).named.clone(),
+            Ty::Function { shape, .. } => elements.type_args().function_shape(shape).named.clone(),
+            other => panic!("typedef {name} captures {other:?}, not a named shape"),
+        };
+        named
+            .iter()
+            .map(|(field, _)| strings.resolve(*field).to_owned())
+            .collect()
+    }
+
+    /// #4214: the element face is byte-stable across interning histories.
+    /// The record/function shape pools sort their named sets by
+    /// intern-arrival `StringId` — canonical within one pool, not across
+    /// runs (the string table is shared across the parallel fan-out, so ids
+    /// follow scheduler order). The face renders the pairs in resolved-text
+    /// order, so two independent collections of one source answer identical
+    /// bytes even when the stored orders invert.
+    #[test]
+    fn named_shape_faces_are_stable_across_interning_histories() {
+        // `zeta` before `alpha` in source order: a fresh table interns them
+        // zeta-first, while a table that pre-interned `alpha` stores the
+        // pair the other way round.
+        let source = "typedef R = ({int zeta, int alpha});\n\
+                      typedef F = int Function({int zeta, int alpha});\n";
+        let fresh = StringTable::new();
+        let a = elements_of(source, &fresh);
+        let shifted = StringTable::new();
+        let _ = shifted.intern("alpha");
+        let _ = shifted.intern("zeta");
+        let b = elements_of(source, &shifted);
+        // The setup is not vacuous: the two pools really do store the named
+        // pairs in opposite orders.
+        assert_ne!(
+            stored_named(&a, &fresh, "R"),
+            stored_named(&b, &shifted, "R"),
+            "the two pools must store the record fields in opposite orders"
+        );
+        assert_ne!(
+            stored_named(&a, &fresh, "F"),
+            stored_named(&b, &shifted, "F"),
+            "the two pools must store the function formals in opposite orders"
+        );
+        assert_eq!(
+            a.api_signature(&fresh),
+            b.api_signature(&shifted),
+            "the named-set order must not ride the interning history"
         );
     }
 

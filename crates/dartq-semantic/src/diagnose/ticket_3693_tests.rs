@@ -112,7 +112,7 @@ fn non_function_argument_still_rejects() {
 /// `check_call_type_arg_bounds` as a function type — `Snapshot::tree_of`'s
 /// Function arm (bounds.rs) drops the signature's own binder row, so the
 /// bound collapses before `assignable` can reject the argument.
-#[ignore = "inline bound collapses at Snapshot::tree_of (bounds.rs) — outside this lane's scope"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn inline_generic_bound_rejects_mismatched_alias() {
     let report = report_ops(

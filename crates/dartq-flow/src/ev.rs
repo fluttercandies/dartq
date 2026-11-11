@@ -407,8 +407,13 @@ pub enum Ev {
     This {
         span: TokenSpan,
     },
+    /// A unary-prefix operator (`-x`, `!x`, `~x`). The operator's span is
+    /// the operand expression's begin token: an anchored dead interval
+    /// runs from the uncovered expression's FIRST token, so `x ??= -42`
+    /// reports `-42;`, never the numeric literal alone.
     UnaryPrefix {
         is_not: bool,
+        span: TokenSpan,
     },
     NonNullAssert,
     /// Prefix `++`/`--` (`handleUnaryPrefixAssignmentExpression`): the
@@ -924,6 +929,7 @@ impl Ev {
             | Ev::Bool { span, .. }
             | Ev::PatternBegin { span, .. }
             | Ev::This { span }
+            | Ev::UnaryPrefix { span, .. }
             | Ev::ParenBegin { span } => Some(*span),
             Ev::AnonMethodBegin { punct, .. } => Some(*punct),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),

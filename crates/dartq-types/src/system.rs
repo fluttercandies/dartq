@@ -1014,11 +1014,20 @@ impl<'a> TypeSystem<'a> {
         // Rule 4 Right Object (subtype.dart:304-346). `b` is non-`?` here:
         // `Object?` was consumed by rule 1.
         if self.is_object_declaration(b) {
-            if let TypeKind::TypeParameter { .. } = a.kind() {
-                // Bound-based (subtype.dart:309-318); M1 has no bounds, and
-                // the official unbound default `Object?` is not a subtype of
-                // `Object`, so `false` either way.
-                return false;
+            if let TypeKind::TypeParameter { parameter } = a.kind() {
+                // An UNPROMOTED type variable `X` is a subtype of `Object`
+                // iff its bound `B` is; the official unbound default is
+                // `Object?`, which is not a subtype of `Object`
+                // (subtype.dart:309-318). A nullable `X?` never reaches the
+                // bound read — the official arm requires the no-suffix
+                // projection — and answers false like every other `S?`.
+                if a.is_nullable() {
+                    return false;
+                }
+                return self
+                    .param_facts
+                    .and_then(|facts| facts.get(parameter).bound)
+                    .is_some_and(|bound| self.is_subtype(bound, t1));
             }
             if let Some(base) = Self::non_null_future_or_base(a) {
                 // `FutureOr<S> <: Object` iff `S <: Object` (subtype.dart:321-325);

@@ -72,6 +72,11 @@ mod library;
 mod postings;
 mod test_graph;
 
+#[cfg(test)]
+mod ticket_3974_tests;
+#[cfg(test)]
+mod ticket_3987_tests;
+
 pub use capture::{
     Capturer, DeclKind, DeclRow, FileCapture, FileIndex, SuperClause, SuperEdge, capture,
 };

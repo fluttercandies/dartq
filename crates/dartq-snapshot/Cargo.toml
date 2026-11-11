@@ -11,9 +11,11 @@ keywords = ["dart", "snapshot", "persistence", "cold-start"]
 categories = ["development-tools"]
 
 [dependencies]
+bincode-next = { workspace = true }
 blake3 = { workspace = true }
 filetime = { workspace = true }
 hex = { workspace = true }
+rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

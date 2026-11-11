@@ -1892,7 +1892,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 && level == ASSIGNMENT_PRECEDENCE
             {
                 let assignment = self.peek_span();
+                let is_if_null = self.peek_kind() == TokenKind::QuestionQuestionEq;
                 self.cursor.advance();
+                // The `??=` RHS split's begin face (official
+                // `ifNullExpression_rightBegin`), the section twin of the
+                // general assignment arm's call: the section's RHS runs on
+                // the null path alone, so the flow snapshots the live skip
+                // path before the RHS's events run. Without it the
+                // assignment event finds an empty snapshot stack and the
+                // RHS's post-state escapes the operator's join.
+                if is_if_null {
+                    self.listener.begin_if_null_assignment_rhs(assignment);
+                }
                 let rhs = self.parse_expression_without_cascade();
                 self.listener.handle_assignment_expression(assignment, rhs);
                 end = rhs;

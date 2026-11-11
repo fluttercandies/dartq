@@ -268,7 +268,6 @@ fn for_in_element_spans_the_head_through_the_body() {
 /// `const_initialized_with_non_constant_value`. dartq adds the site
 /// default at the literal (14:14 len 31).
 #[test]
-#[ignore = "const_eval_faces.rs finish_const_initializer: a local const's for-element failed literal must not reach the site default"]
 fn local_const_for_element_has_no_site_default() {
     let fixture = "void f() {\n  const l = [for (var i = 0; i < 3; i++) i];\n}\n";
     let (rows, source) = family_of(fixture);
@@ -291,7 +290,7 @@ fn local_const_for_element_has_no_site_default() {
 /// `const_initialized_with_non_constant_value` 5:12 len 36. dartq anchors
 /// the site default at `[` (5:17 len 31).
 #[test]
-#[ignore = "listener.rs handle_literal_list: the for-element branch's literal_span must start at the type arguments"]
+#[ignore = "listener.rs handle_literal_list: the for-element branch's literal_span must start at the type arguments; oracle-verified (a.dart t5, file docs): expected span at `<` (offset 607 in fixture), engine emits at `[` (offset 612)"]
 fn typed_top_level_literal_site_default_spans_the_type_arguments() {
     let fixture = "const t = <int>[for (var i = 0; i < 3; i++) i];\n";
     let (rows, source) = family_of(fixture);
@@ -323,7 +322,6 @@ fn typed_top_level_literal_site_default_spans_the_type_arguments() {
 /// `const <String, int>{'a', 'b': 2, 'c'}`: 12:23 and 12:36, len 3 each.
 /// dartq reports nothing.
 #[test]
-#[ignore = "listener.rs set-or-map close + assignability.rs literal-element faces: the map-entry shape check (literal_element_verifier.dart :100/:135) is unwired"]
 fn stray_expression_in_a_typed_map_reports_expression_in_map() {
     let m1 = "var m1 = <String, int>{'a', 'b': 2};\n";
     let m2 = "const m2 = <String, int>{'a', 'b': 2};\n";
@@ -376,7 +374,7 @@ fn stray_expression_in_a_typed_map_reports_expression_in_map() {
 /// `dart:core`'s own `==`; the rig's prelude `double` declares none, so
 /// they are not pinned here.)
 #[test]
-#[ignore = "const_eval_faces.rs check_const_elements: the primitive-equality key/element verdict (constant_verifier.dart _validateMapLiteralEntry :1502 / _validateSetExpression :1158) is unwired"]
+#[ignore = "const_eval_faces.rs check_const_elements: the primitive-equality key/element verdict (constant_verifier.dart _validateMapLiteralEntry :1502 / _validateSetExpression :1158) is unwired; oracle-verified (d.dart/e.dart, file docs): expected 11 rows (10 map-key + 1 set-element), engine emits 0"]
 fn const_map_key_without_primitive_equality_reports_at_the_key() {
     let z = "const z = {A(): 0};\n";
     let k1 = "  const {const A(): 0};\n";
@@ -442,7 +440,7 @@ fn const_map_key_without_primitive_equality_reports_at_the_key() {
 /// "Constant list literals can't use a type parameter in a type argument,
 /// such as 'E'." (set / map spellings for `{}`). dartq reports nothing.
 #[test]
-#[ignore = "assignability.rs typed-literal face: the const typed literal's type-argument walk (error_verifier.dart) is unwired"]
+#[ignore = "assignability.rs typed-literal face: the const typed literal's type-argument walk (error_verifier.dart) is unwired; oracle-verified (c.dart, file docs): expected 8 rows, engine emits 0"]
 fn const_typed_literal_type_parameter_argument_reports_at_the_parameter() {
     let d = "  const A([this.x = const <String, List<E Function()>>{}]);\n";
     let l1 = "    <E>[];\n";

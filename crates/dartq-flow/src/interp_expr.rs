@@ -238,6 +238,11 @@ impl Interp<'_> {
                                 // (`if (v)` over a `Never` parameter rows
                                 // nothing). [`Interp::cond_split`] reads it.
                                 self.cond_exempt = Some((token.range.end(), self.current.clone()));
+                                self.compound_lvalue_saves.push((
+                                    token.range.end(),
+                                    self.current.clone(),
+                                    self.exit_at,
+                                ));
                                 self.unreachable_cur();
                                 if !self.collecting() {
                                     self.exit_at = Some(token.range.end());
@@ -276,6 +281,11 @@ impl Interp<'_> {
                             // `Resolved::Local` arm's face applied to the
                             // unit's own top-level `Never` declaration.
                             if self.ops.is_bottom(top.ty) {
+                                self.compound_lvalue_saves.push((
+                                    token.range.end(),
+                                    self.current.clone(),
+                                    self.exit_at,
+                                ));
                                 self.unreachable_cur();
                                 if !self.collecting() {
                                     self.exit_at = Some(token.range.end());
@@ -605,7 +615,7 @@ impl Interp<'_> {
                 expr.non_null_literal = true;
                 self.exprs.push(expr);
             }
-            Ev::UnaryPrefix { is_not } => {
+            Ev::UnaryPrefix { is_not, .. } => {
                 // The operand ends: rejoin the null-shorting its own `?`
                 // opened (`!x?.y`).
                 self.flush_null_shorts_above(self.consumer_base(1));
@@ -730,14 +740,32 @@ impl Interp<'_> {
                         // official's unreasoned-write shape).
                         _ => None,
                     };
-                    self.write_var(
-                        var,
-                        self.ops.promote_to_non_null(declared),
-                        declared_args,
-                        false,
-                        write_span,
-                        false,
-                    );
+                    // The written type is the OPERATOR's result type, never a
+                    // blanket non-null declared face (official `postIncDec`:
+                    // the resolver hands flow `SharedTypeView(
+                    // operatorReturnType)` — upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/dart/resolver/
+                    // postfix_expression_resolver.dart:174-186 — and
+                    // `_write` demotes against that type, so a write whose
+                    // result still sits under the standing promotion keeps
+                    // it: flow_analysis.dart:6319, :7881-7905). Writing the
+                    // declared face instead demotes the local on every
+                    // `i++` (`covers(Object, int)` is false), and every
+                    // later read loses the promotion — the `undefined_operator`
+                    // family this arm owns.
+                    //
+                    // This lattice carries no operator table, so the operand's
+                    // own flow face is the answer: `int`/`double` receivers
+                    // return themselves (the official's `isDartCoreInt` arm
+                    // spells exactly that), and a user-defined `operator +`
+                    // returning its own type is the ordinary shape. An
+                    // unspellable face keeps the pre-existing non-null
+                    // declared fallback.
+                    let (written, written_args) = match target.ty.base {
+                        Base::Name(_) | Base::Function => (target.ty.non_null(), target.args),
+                        _ => (self.ops.promote_to_non_null(declared), declared_args),
+                    };
+                    self.write_var(var, written, written_args, false, write_span, false);
                 }
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                 // The whole read-modify-write is one expression — an open
@@ -1754,10 +1782,23 @@ impl Interp<'_> {
                     && self.dead.is_none()
                     && self.arm_dead_depth == 0
                     && !self.stmt_began_dead
-                    && self.exprs.last().is_some_and(|left| {
-                        self.classify(left.ty) == Classification::NonNullable
-                            || left.non_null_literal
-                    });
+                    // A cascade SECTION's write target is a member/index of
+                    // the target, and its face is NOT the stack top — the
+                    // top is still the cascade target itself (the section
+                    // chains on it). Classifying the target's face here
+                    // would kill the null path on a LHS the official reads
+                    // as the member's own type (`c..x ??= i!` over
+                    // `int? x` runs the RHS live); the member face being
+                    // unmaterialized at this point, the PotentiallyNullable
+                    // classify is the under-report direction.
+                    && !self.receiver_is_cascade_target()
+                    && self
+                        .exprs
+                        .last()
+                        .is_some_and(|left| {
+                            self.classify(left.ty) == Classification::NonNullable
+                                || left.non_null_literal
+                        });
                 // The `??=` skip-path snapshot (official
                 // `ifNullExpression_rightBegin`'s split, flattened): the
                 // RHS runs inline below, so the live pre-RHS state is
@@ -1782,74 +1823,128 @@ impl Interp<'_> {
                 let rhs = self.pop_value();
                 let rhs_literal = rhs.literal;
                 let mut target = self.pop_value();
-                // The `??=` RHS runs on the null path alone (official
-                // `ifNullExpression_rightBegin`'s split); the flattened
-                // replay runs it inline, so an RHS that EXITS (`x ??=
-                // throw e`) must not leak its unreachability — the
-                // post-state is the skip path (live; the write's own
-                // non-null LUB promotion carries the null-aware face). A
-                // dead window the exit's polls opened inside the RHS drops
-                // with the restore: the skip path was never dead.
-                // The `??=` RHS runs on the null path alone (official
-                // `ifNullExpression_rightBegin`'s split); the flattened
-                // replay runs it inline, so an RHS that EXITS (`x ??=
-                // throw e`) must not leak its unreachability — the
-                // post-state is the skip path (live; the write's own
-                // non-null LUB promotion carries the null-aware face).
-                // Restoring unconditionally-under-unreachable is sound:
-                // a skip path that was already dead restores dead, and
-                // a dead window the exit's polls opened inside the RHS
-                // drops with a live restore — that path was never dead.
-                if *if_null
-                    && let Some((_, skip, rhs_dead_entry, operand_start)) = self.if_null_skips.pop()
-                    && !self.reachable()
+                // The compound lvalue's never-read face (#3997): upstream
+                // resolves a `x op= e` target through `resolveForWrite`,
+                // whose `setReadElement` never calls `recordStaticType` —
+                // the read's `Never` face feeds only `parent.readType`, so
+                // no `handleExit` runs and the RHS stays live (probed
+                // 3.13.7: `x += 3` over `Never x` rows nothing). The read
+                // arm exited per its ordinary bottom face and parked the
+                // pre-exit state on [`Interp::compound_lvalue_saves`];
+                // restore it only when this write's own target is the
+                // parked read AND no later exit superseded it — a nested
+                // exiting callee (`x += nf()`) sets `exit_at` to its own
+                // end and keeps the kill (the official exits at the call).
+                // A dead `pre` restores the exit that made it dead
+                // (`x += (x += 1)` revives the inner read into the outer's
+                // dead state, then the outer restores live). `??=` skips:
+                // `ifNullExpression`'s `getType` genuinely reads the LHS
+                // and exits. `++`/`--` never reach here — they exit at the
+                // postfix node upstream and stay dead.
+                if !*plain
+                    && !*if_null
+                    && let Some(span) = target.read_span
+                    && self
+                        .compound_lvalue_saves
+                        .last()
+                        .is_some_and(|(at, _, _)| *at == span.range.end())
                 {
-                    if rhs_dead_entry {
-                        // The entry-dead `??=` RHS is the official's first
-                        // dead node itself — anchor the interval at the
-                        // operand's begin token (`AssignmentExpression`
-                        // carries no operator re-anchor in
-                        // dead_code_verifier). An inner poll's window folds
-                        // into the operand anchor (the interval's owner is
-                        // always the topmost dead node); no window means a
-                        // bare literal operand polled nothing — the poll
-                        // here opens it while the state is still the dead
-                        // null path (the restore below is live). A bare
-                        // `null` operand leaves the step-level latch empty
-                        // (`Ev::Null` carries no span): the literal ends
-                        // exactly at the assignment end, so its begin is
-                        // `end - 4` — `l ??= null` rows `null;`, never
-                        // the `1:1` whole-file fallback.
-                        let operand_begin = operand_start.unwrap_or_else(|| {
-                            if matches!(events.get(i.wrapping_sub(1)), Some(Ev::Null)) {
-                                end.saturating_sub(4)
-                            } else {
-                                0
-                            }
-                        });
-                        let anchor = TokenSpan {
-                            id: 0,
-                            range: dartq_source::SourceRange {
-                                offset: operand_begin,
-                                length: 0,
-                            },
-                        };
-                        match &mut self.dead {
-                            Some(window) if window.anchor_from(anchor.range.offset) => {
-                                window.reanchor_to(anchor);
-                            }
-                            Some(_) => {}
-                            None => self.dead_code(anchor),
+                    let (_, pre, pre_exit_at) = self.compound_lvalue_saves.pop().unwrap();
+                    if self.exit_at.is_none() || self.exit_at == Some(span.range.end()) {
+                        self.current = pre;
+                        self.exit_at = pre_exit_at;
+                        // The RHS's own dead poll anchored inside the write's
+                        // extent — drop it (nothing ever died). A window
+                        // anchored before the lvalue's read belongs to an
+                        // earlier kill and stays.
+                        if self
+                            .dead
+                            .as_ref()
+                            .is_some_and(|w| w.anchor_span().range.offset > span.range.end())
+                        {
+                            self.dead = None;
                         }
                     }
-                    self.current = skip;
+                }
+                // The `??=` RHS runs on the null path alone (official
+                // `ifNullExpression_rightBegin`'s split); the flattened
+                // replay runs it inline, so the write's close must rejoin
+                // that path (official `ifNullExpression_end`,
+                // flow_analysis.dart:5835-5840:
+                // `_join(_current, context._shortcutState).unsplit()`).
+                // A REACHABLE RHS joins its post-state with the parked
+                // skip state — the join drops every fact the two paths do
+                // not share, so a promotion the RHS made (`y ??= i!`)
+                // cannot escape the operator into the following
+                // statements. A condition-valued RHS first rejoins its
+                // own arms (the value face the plain arm recombines
+                // below) — upstream's `_current` after a value-context
+                // RHS carries the recombined state, not the narrowed arm.
+                // An RHS that EXITS (`x ??= throw e`) has no post-state
+                // to join: the post-state IS the skip path (live; the
+                // write's own non-null LUB promotion carries the
+                // null-aware face), and a dead window the exit's polls
+                // opened inside the RHS drops with that restore — the
+                // skip path was never dead.
+                if *if_null
+                    && let Some((_, skip, rhs_dead_entry, operand_start)) = self.if_null_skips.pop()
+                {
                     if self.reachable() {
-                        self.exit_at = None;
-                        if !rhs_dead_entry {
-                            // An exit-dead `??=` RHS's window drops with
-                            // the live restore — the skip path was never
-                            // dead (`x ??= throw e`).
-                            self.dead = None;
+                        self.rejoin_value_split(&rhs);
+                        self.current = self.join(Some(self.current.clone()), Some(skip));
+                    } else {
+                        // The exit path: an unreachable RHS leaves no
+                        // post-state to join — the parked skip path IS
+                        // the post-state. Restoring dead is equally
+                        // sound: a skip path that was already dead
+                        // restores dead.
+                        if rhs_dead_entry {
+                            // The entry-dead `??=` RHS is the official's first
+                            // dead node itself — anchor the interval at the
+                            // operand's begin token (`AssignmentExpression`
+                            // carries no operator re-anchor in
+                            // dead_code_verifier). An inner poll's window folds
+                            // into the operand anchor (the interval's owner is
+                            // always the topmost dead node); no window means a
+                            // bare literal operand polled nothing — the poll
+                            // here opens it while the state is still the dead
+                            // null path (the restore below is live). A bare
+                            // `null` operand leaves the step-level latch empty
+                            // (`Ev::Null` carries no span): the literal ends
+                            // exactly at the assignment end, so its begin is
+                            // `end - 4` — `l ??= null` rows `null;`, never
+                            // the `1:1` whole-file fallback.
+                            let operand_begin = operand_start.unwrap_or_else(|| {
+                                if matches!(events.get(i.wrapping_sub(1)), Some(Ev::Null)) {
+                                    end.saturating_sub(4)
+                                } else {
+                                    0
+                                }
+                            });
+                            let anchor = TokenSpan {
+                                id: 0,
+                                range: dartq_source::SourceRange {
+                                    offset: operand_begin,
+                                    length: 0,
+                                },
+                            };
+                            match &mut self.dead {
+                                Some(window) if window.anchor_from(anchor.range.offset) => {
+                                    window.reanchor_to(anchor);
+                                }
+                                Some(_) => {}
+                                None => self.dead_code(anchor),
+                            }
+                        }
+                        self.current = skip;
+                        if self.reachable() {
+                            self.exit_at = None;
+                            if !rhs_dead_entry {
+                                // An exit-dead `??=` RHS's window drops with
+                                // the live restore — the skip path was never
+                                // dead (`x ??= throw e`).
+                                self.dead = None;
+                            }
                         }
                     }
                 }
@@ -1866,6 +1961,30 @@ impl Interp<'_> {
                 // resolver.dart:1195-1200): `n?.p = i` reports `p = i`,
                 // never `p = i;` and never the bare member.
                 self.close_dead_null_write(*end);
+                // The RHS that ran dead inside a LIVE null-shorted chain
+                // (`c1n?[nv] = x` — the operand's own `Never` read killed
+                // the walk, so the RHS is the official's first dead node):
+                // no event of a bare identifier polls on its own, and the
+                // statement's `;` would grow the row. `close_dead_null_write`
+                // above already trimmed the window to the assignment's end;
+                // this only opens it when nothing did. Gated on the chain's
+                // own short still being open (the write's `?` context) so
+                // an ordinary dead RHS keeps its statement-level row.
+                if self.dead.is_none()
+                    && !self.reachable()
+                    && !self.stmt_began_dead
+                    && self.arm_dead_depth == 0
+                    && let Some(rhs_span) = rhs.read_span.or(rhs.callee_span)
+                    && self.null_shorts.last().is_some_and(|short| {
+                        // A chain that died AT ITS OPEN already owns its row
+                        // (the operand poll's `i] = j`); only an
+                        // interior-death chain leaves the RHS to this poll.
+                        !short.dead_at_open && short.recv_offset < rhs_span.range.offset
+                    })
+                {
+                    self.dead_code(rhs_span);
+                    self.close_dead_null_write(*end);
+                }
                 // A constructor field initializer's write targets `this.f`
                 // (upstream `ConstructorFieldInitializer`): the LHS name is
                 // a field name, so a like-named local must take no write —
@@ -2957,6 +3076,7 @@ impl Interp<'_> {
                         && callee.reference.is_none()
                         && callee.prop.is_some()
                         && let Some(name) = callee.name
+                        && !self.is_extension_override_head(name)
                     {
                         let Ev::Send { args, .. } = ev else {
                             unreachable!("gated on Ev::Send above")
@@ -3025,6 +3145,9 @@ impl Interp<'_> {
                     // unknown under-reports exactly as before.
                     let callee_key = callee.callee_span.or(callee.read_span);
                     if callee.chain_base.is_none()
+                        && !callee
+                            .name
+                            .is_some_and(|name| self.is_extension_override_head(name))
                         && matches!(
                             callee.ty,
                             Ty::UNKNOWN
@@ -3089,9 +3212,19 @@ impl Interp<'_> {
                     if matches!(ev, Ev::Send { .. })
                         && matches!(events.get(i.wrapping_sub(1)), Some(Ev::ArgumentsEnd { .. }))
                     {
+                        // An extension override's value IS the argument, so
+                        // the argument's by-construction non-null face must
+                        // survive (`E(1)?.m` kills its skip path like `1?.m`
+                        // does). Every other argumented send drops it: the
+                        // call evaluates to whatever the return declares.
+                        let override_value = callee
+                            .name
+                            .is_some_and(|name| self.is_extension_override_head(name));
                         callee.reference = None;
                         callee.prop = None;
-                        callee.non_null_literal = false;
+                        if !override_value {
+                            callee.non_null_literal = false;
+                        }
                         // The chain flag dies with the slots (#3452): the
                         // member callee arrived carrying the
                         // reference-rooted `ref_chain` its own DotAccess set
@@ -3114,10 +3247,26 @@ impl Interp<'_> {
                     // `Ev::Exit` for the resolved sends it tracks; this
                     // face covers the ones only the flow layer re-typed
                     // (a staged `Never` return adopted above).
-                    if self
-                        .ops
-                        .is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
+                    if self.ops.is_bottom(self.exprs.last().map(|e| e.ty).unwrap_or(Ty::UNKNOWN))
                         && let Ev::Send { end, .. } | Ev::SendNoArgs { end } = ev
+                        // The compound write's own operator send (#3997):
+                        // upstream's `_resolveOperator` early-returns
+                        // `InvalidType` on a `Never` LHS (assignment_
+                        // expression_resolver.dart), so `recordStaticType`
+                        // never exits here — `x += 3` over `Never x` stays
+                        // live. The lvalue's read parked its pre-exit on
+                        // `compound_lvalue_saves` and its span survives on
+                        // the send's result: matching it skips this exit so
+                        // `Ev::Assign`'s revive finds `exit_at` still at the
+                        // lvalue. A REAL callee inside the RHS (`x += nf()`)
+                        // exits at its own end later and keeps the kill.
+                        && !self.exprs.last().is_some_and(|e| {
+                            e.read_span.is_some_and(|s| {
+                                self.compound_lvalue_saves
+                                    .last()
+                                    .is_some_and(|(at, _, _)| *at == s.range.end())
+                            })
+                        })
                     {
                         // The identifier-rooted member read's pre-exit
                         // capture (`x.f`/`this.f`/the implicit `this` face):
@@ -3300,6 +3449,37 @@ impl Interp<'_> {
                 // The list closes: its base leaves the per-argument flush
                 // stack (before the `identical` fast path's early return).
                 self.args_bases.pop();
+                // The extension override's value face (`E(n)`): the
+                // expression evaluates to its ARGUMENT, never the head's
+                // class spelling. Upstream wraps the argument and the
+                // null-shorting start reads that argument's own
+                // `staticType` (pkg/analyzer/lib/src/generated/
+                // resolver.dart:4814-4840 — the `ExtensionOverride` arm of
+                // `_startNullAwareAccess` hands the `argumentExpression` to
+                // `startNullShorting`), so `E(null)?.m()` opens the short
+                // over `Null` and rows its member dead, while `E(x)?.m()`
+                // over a live receiver stays live. Adopted HERE because the
+                // argument is still on the stack: the `Send` fold below
+                // runs after this event's pops. The single-argument shape
+                // is the override's only form (upstream reports
+                // `invalidExtensionArgumentCount` otherwise and types the
+                // override `dynamic` — the unknown face this layer keeps).
+                if *count == 1
+                    && matches!(events.get(i.wrapping_add(1)), Some(Ev::Send { .. }))
+                    && let Some(callee_index) = self.exprs.len().checked_sub(2)
+                    && let Some(callee) = self.exprs.get(callee_index)
+                    && callee.reference.is_none()
+                    && callee.prop.is_some()
+                    && callee
+                        .name
+                        .is_some_and(|name| self.is_extension_override_head(name))
+                    && let Some(arg) = self.exprs.last().cloned()
+                {
+                    let callee = &mut self.exprs[callee_index];
+                    callee.ty = arg.ty;
+                    callee.args = arg.args;
+                    callee.non_null_literal = arg.non_null_literal;
+                }
                 // The arguments are complete expressions: rejoin the
                 // null-shorting they opened — but not a caller-side `?`
                 // context (`f()?.m(g()?.n)`'s outer short opened before
@@ -4201,11 +4381,19 @@ impl Interp<'_> {
         ) {
             return None;
         }
-        // The intersection's nullability (`type_system.dart:2100-2120`):
-        // nullable only when both the variable and the tested type are —
-        // a non-nullable variable's `is int?` still narrows to the
-        // non-null face.
-        Some(if from.nullable && tested.nullable {
+        // The intersection's nullability (`type_system.dart:2104-2121`,
+        // `_promotedTypeParameterTypeNullability`): nullable only when
+        // both the reference and the tested type are — and a `?`-less
+        // reference to a parameter whose bound admits null is itself
+        // nullable, so `T` over an implicit `Object?` bound tested with
+        // `is C?` promotes to `T & C?` with the nullable leg KEPT
+        // (a member access on the promoted read stays potentially null:
+        // the null-aware tear-off refusal and `unchecked_use_of_nullable_
+        // value` both ride it). The written flag alone answers
+        // non-nullable there; the boundary-aware [`Interp::classify`] is
+        // the effective nullability the official reads off that suffix.
+        let from_nullable = self.classify(from) != Classification::NonNullable;
+        Some(if from_nullable && tested.nullable {
             tested
         } else {
             tested.non_null()

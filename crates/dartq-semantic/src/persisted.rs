@@ -14,10 +14,36 @@ use serde::{Deserialize, Serialize};
 use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::{
-    Annotation, ArgPool, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
-    ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, NameMap,
-    RepFormal, TopDecl, Ty,
+    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, Container, ContainerKind,
+    DuplicateDecl, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind,
+    MicroKind, NameMap, RepFormal, TopDecl, Ty,
 };
+use dartq_types::Variance;
+
+/// The persisted wire code of one type parameter's written variance
+/// modifier: `0` = no modifier written (the legacy covariance default), the
+/// rest the shared lattice's discriminant (`dartq_types::Variance`:
+/// covariant `1`, contravariant `2`, invariant `3`). `Variance::Unrelated`
+/// is a computation result, never a declared variance, and folds onto the
+/// same `0`. Stable wire values — never renumber.
+const fn variance_code(variance: Option<Variance>) -> u8 {
+    match variance {
+        None | Some(Variance::Unrelated) => 0,
+        Some(variance) => variance as u8,
+    }
+}
+
+/// Decodes a persisted variance wire code. An unknown value (a payload this
+/// build does not write) reads as the no-modifier default — the additive
+/// direction, never an invented rejection.
+const fn variance_from_code(code: u8) -> Option<Variance> {
+    match code {
+        1 => Some(Variance::Covariant),
+        2 => Some(Variance::Contravariant),
+        3 => Some(Variance::Invariant),
+        _ => None,
+    }
+}
 
 /// A span projection: `SourceRange`'s two public columns (`SourceRange`
 /// itself carries no serde impl and is foreign to every writer of this
@@ -331,6 +357,12 @@ pub struct PersistedContainer {
     pub is_interface: bool,
     #[serde(default)]
     pub is_mixin_class: bool,
+    /// The named mixin application form (`class X = S with M` or
+    /// `mixin class X = S with M`). Additive after the format shipped:
+    /// `default` so payloads persisted before the field existed decode
+    /// as body declarations (the #539 additive-field discipline).
+    #[serde(default)]
+    pub is_mixin_application: bool,
     pub superclass: Option<u32>,
     /// Additive after the format shipped: `default` so payloads persisted
     /// before the field existed decode with no claiming-fragment `extends`
@@ -351,10 +383,37 @@ pub struct PersistedContainer {
     /// reads as unbounded — the same answer the pre-field engine gave.
     #[serde(default)]
     pub type_param_bounds: Vec<PersistedTy>,
+    /// Each type parameter's written variance modifier, parallel to
+    /// `type_param_names` ([`variance_code`] wire values; `0` = no modifier
+    /// written). Additive after the format shipped: a pre-field payload
+    /// decodes empty, and the restore pads it back to the names' length with
+    /// the legacy code — the additive-default posture (#3903).
+    #[serde(default)]
+    pub type_param_variances: Vec<u8>,
     pub sealed: bool,
     pub with_clause: Vec<u32>,
     pub implements_clause: Vec<u32>,
     pub on_clause: Vec<u32>,
+    /// The written type arguments of each `with`-clause face, parallel to
+    /// `with_clause` (each entry the face's argument list in written
+    /// order). Additive after the format shipped: `default` so payloads
+    /// persisted before the columns existed decode argument-less — the
+    /// restore pads them back to the name columns' length with
+    /// `ArgListId::EMPTY` (the #539 additive-field discipline; #3847).
+    #[serde(default)]
+    pub with_clause_args: Vec<Vec<PersistedTy>>,
+    /// Each `implements`-clause face's written type arguments, parallel to
+    /// `implements_clause`; additive-default like `with_clause_args`.
+    #[serde(default)]
+    pub implements_clause_args: Vec<Vec<PersistedTy>>,
+    /// Each `on`-clause face's written type arguments, parallel to
+    /// `on_clause`; additive-default like `with_clause_args`.
+    #[serde(default)]
+    pub on_clause_args: Vec<Vec<PersistedTy>>,
+    /// The superclass head's written type arguments (`extends S<int>`);
+    /// additive-default decodes older payloads with no arguments.
+    #[serde(default)]
+    pub superclass_args: Vec<PersistedTy>,
     pub header_residue: Vec<u32>,
     pub primary_formals: Vec<PersistedRepFormal>,
     pub enum_constants: Vec<u32>,
@@ -504,6 +563,14 @@ pub struct PersistedArity {
 pub struct PersistedDuplicate {
     pub name: u32,
     pub range: PersistedRange,
+    /// Both colliding claims were `this.x` formals, so the row renders
+    /// `duplicate_field_formal_parameter`. Additive after the format
+    /// shipped: `default` so payloads persisted before the column existed
+    /// decode as the plain `duplicate_definition` row (the #539 additive-
+    /// field discipline; without it a warm-start replay would re-emit the
+    /// old code while a cold fold emits the new one).
+    #[serde(default)]
+    pub field_formal: bool,
 }
 
 /// The `augment` declaration family's mirrors (the #2784 augmentation
@@ -725,6 +792,19 @@ impl<'a> Slice<'a> {
         ids.iter().map(|&id| self.id(id)).collect()
     }
 
+    /// One interned argument list as a payload row (each argument through
+    /// [`Slice::ty`]).
+    fn args(&mut self, list: ArgListId) -> Vec<PersistedTy> {
+        let args = self.type_args.get(list).to_vec();
+        args.iter().map(|ty| self.ty(ty)).collect()
+    }
+
+    /// A clause's parallel written-args column (each face's list through
+    /// [`Slice::args`], parallel to the name column beside it).
+    fn args_column(&mut self, column: &[ArgListId]) -> Vec<Vec<PersistedTy>> {
+        column.iter().map(|&list| self.args(list)).collect()
+    }
+
     fn ty(&mut self, ty: &Ty) -> PersistedTy {
         match *ty {
             Ty::Unknown => PersistedTy::Unknown,
@@ -931,6 +1011,7 @@ impl PersistedElements {
             .map(|duplicate| PersistedDuplicate {
                 name: s.id(duplicate.name),
                 range: PersistedRange::of(duplicate.range),
+                field_formal: duplicate.field_formal,
             })
             .collect();
         let arity_violations = elements
@@ -1070,6 +1151,7 @@ impl PersistedElements {
             .map(|duplicate| PersistedDuplicate {
                 name: s.id(duplicate.name),
                 range: PersistedRange::of(duplicate.range),
+                field_formal: duplicate.field_formal,
             })
             .collect();
         let formal_annotations = elements
@@ -1195,6 +1277,7 @@ impl PersistedElements {
                 .map(|duplicate| DuplicateDecl {
                     name: at_name(duplicate.name),
                     range: duplicate.range.source_range(),
+                    field_formal: duplicate.field_formal,
                 })
                 .collect(),
             arity_violations: self
@@ -1326,6 +1409,7 @@ impl PersistedElements {
                 .map(|duplicate| DuplicateDecl {
                     name: at_name(duplicate.name),
                     range: duplicate.range.source_range(),
+                    field_formal: duplicate.field_formal,
                 })
                 .collect(),
             formal_annotations: self
@@ -1464,6 +1548,7 @@ impl PersistedContainer {
             is_final: container.is_final,
             is_interface: container.is_interface,
             is_mixin_class: container.is_mixin_class,
+            is_mixin_application: container.is_mixin_application,
             superclass: container.superclass.map(|name| s.id(name)),
             intro_superclass: container.intro_superclass,
             members: container
@@ -1478,10 +1563,19 @@ impl PersistedContainer {
                 .iter()
                 .map(|bound| s.ty(bound))
                 .collect(),
+            type_param_variances: container
+                .type_param_variances
+                .iter()
+                .map(|variance| variance_code(*variance))
+                .collect(),
             sealed: container.sealed,
             with_clause: s.ids(&container.with_clause),
             implements_clause: s.ids(&container.implements_clause),
             on_clause: s.ids(&container.on_clause),
+            with_clause_args: s.args_column(&container.with_clause_args),
+            implements_clause_args: s.args_column(&container.implements_clause_args),
+            on_clause_args: s.args_column(&container.on_clause_args),
+            superclass_args: s.args(container.superclass_args),
             header_residue: s.ids(&container.header_residue),
             primary_formals: container
                 .primary_formals
@@ -1528,6 +1622,7 @@ impl PersistedContainer {
             is_final: self.is_final,
             is_interface: self.is_interface,
             is_mixin_class: self.is_mixin_class,
+            is_mixin_application: self.is_mixin_application,
             superclass: self.superclass.map(|at| ids[at as usize]),
             intro_superclass: self.intro_superclass,
             members: self
@@ -1546,6 +1641,19 @@ impl PersistedContainer {
                 .into_iter()
                 .map(|bound| into_ty(bound, ids, pool))
                 .collect(),
+            // The modifier column pads to its name column's length: a
+            // pre-#3903 payload decodes with names but no modifiers, and
+            // every in-memory consumer reads a well-formed parallel row
+            // (the legacy code = no modifier written), never a short one.
+            type_param_variances: {
+                let mut variances: Vec<Option<Variance>> = self
+                    .type_param_variances
+                    .into_iter()
+                    .map(variance_from_code)
+                    .collect();
+                variances.resize(self.type_param_names.len(), None);
+                variances.into()
+            },
             sealed: self.sealed,
             with_clause: self
                 .with_clause
@@ -1558,6 +1666,38 @@ impl PersistedContainer {
                 .map(|&at| ids[at as usize])
                 .collect(),
             on_clause: self.on_clause.iter().map(|&at| ids[at as usize]).collect(),
+            // The parallel columns pad to their name columns' length: a
+            // pre-#3847 payload decodes with names but no arguments, and
+            // every in-memory consumer reads a well-formed parallel row
+            // (`EMPTY` = argument-less), never a short one.
+            with_clause_args: {
+                let mut args: Vec<ArgListId> = self
+                    .with_clause_args
+                    .into_iter()
+                    .map(|list| into_args(list, ids, pool))
+                    .collect();
+                args.resize(self.with_clause.len(), ArgListId::EMPTY);
+                args.into()
+            },
+            implements_clause_args: {
+                let mut args: Vec<ArgListId> = self
+                    .implements_clause_args
+                    .into_iter()
+                    .map(|list| into_args(list, ids, pool))
+                    .collect();
+                args.resize(self.implements_clause.len(), ArgListId::EMPTY);
+                args.into()
+            },
+            on_clause_args: {
+                let mut args: Vec<ArgListId> = self
+                    .on_clause_args
+                    .into_iter()
+                    .map(|list| into_args(list, ids, pool))
+                    .collect();
+                args.resize(self.on_clause.len(), ArgListId::EMPTY);
+                args.into()
+            },
+            superclass_args: into_args(self.superclass_args, ids, pool),
             header_residue: self
                 .header_residue
                 .iter()
@@ -1679,6 +1819,13 @@ impl PersistedMemberEntry {
                 }),
         }
     }
+}
+
+/// One written-args payload row back to its interned slot (each argument
+/// through [`into_ty`]; the empty list restores to `ArgListId::EMPTY`).
+fn into_args(list: Vec<PersistedTy>, ids: &[StringId], pool: &mut ArgPool) -> ArgListId {
+    let args: Vec<Ty> = list.into_iter().map(|ty| into_ty(ty, ids, pool)).collect();
+    pool.intern(&args)
 }
 
 fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
@@ -1868,6 +2015,7 @@ mod tests {
                 is_final: false,
                 is_interface: false,
                 is_mixin_class: false,
+                is_mixin_application: false,
                 superclass: Some(name("Object")),
                 intro_superclass: true,
                 members: [name("m"), name("m=")]
@@ -1877,10 +2025,17 @@ mod tests {
                 type_params: 2,
                 type_param_names: Box::new([name("K"), name("V")]),
                 type_param_bounds: Box::new([Ty::Dynamic, Ty::named(name("Object"))]),
+                // One written modifier and one modifier-less parameter:
+                // both wire codes ride the round trip.
+                type_param_variances: Box::new([Some(Variance::Invariant), None]),
                 sealed: true,
                 with_clause: Box::new([]),
                 implements_clause: Box::new([name("I")]),
                 on_clause: Box::new([]),
+                with_clause_args: Box::new([]),
+                implements_clause_args: Box::new([ArgListId::EMPTY]),
+                on_clause_args: Box::new([]),
+                superclass_args: ArgListId::EMPTY,
                 header_residue: Box::new([name("R")]),
                 primary_formals: Box::new([RepFormal {
                     formal: Formal {
@@ -1932,6 +2087,7 @@ mod tests {
         elements.duplicates = Box::new([DuplicateDecl {
             name: name("d"),
             range,
+            field_formal: true,
         }]);
         elements.arity_violations = Box::new([ArityDecl {
             violation: ArityViolation::Operator {
@@ -2076,6 +2232,7 @@ mod tests {
                 is_final: false,
                 is_interface: false,
                 is_mixin_class: false,
+                is_mixin_application: false,
                 superclass: None,
                 intro_superclass: false,
                 members: [(name("b"), member()), (name("a"), member())]
@@ -2084,10 +2241,15 @@ mod tests {
                 type_params: 0,
                 type_param_names: Box::new([]),
                 type_param_bounds: Box::new([]),
+                type_param_variances: Box::new([]),
                 sealed: false,
                 with_clause: Box::new([]),
                 implements_clause: Box::new([]),
                 on_clause: Box::new([]),
+                with_clause_args: Box::new([]),
+                implements_clause_args: Box::new([]),
+                on_clause_args: Box::new([]),
+                superclass_args: ArgListId::EMPTY,
                 header_residue: Box::new([]),
                 primary_formals: Box::new([]),
                 enum_constants: Box::new([]),

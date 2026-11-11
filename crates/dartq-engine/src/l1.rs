@@ -956,6 +956,111 @@ pub(crate) fn compute_unit(
     (facts, capture, scanned_face)
 }
 
+/// The interface-only per-file pipeline for dependency units (the
+/// `deps.rs` closure): same scan, same single multiplexed parse, same
+/// element model, same declaration capture, same directive extraction as
+/// [`compute_unit`] — but none of the faces a dependency file can never
+/// produce. A dep file is never an engine library: it yields no diagnostic
+/// rows (the parse-recovery collector, the duplicate bake, and the scanner
+/// rows all feed a dead `diagnostics` column), its `api_signature` gates
+/// nothing (the L2 gate reads resident facts only), and its `doc_imports`
+/// exist only to feed URI diagnostics the file never reports. The element
+/// model, the directives, the declaration surface, and the line index are
+/// byte-identical to the full pipeline's output — those are the faces the
+/// workspace's resolution joins against.
+///
+/// The capture runs in the declaration-only mode
+/// ([`dartq_index::Capturer::declarations_only`]): the dependency tier
+/// reads only the declaration surface, so the raw-site columns — the bulk
+/// of a fresh capture — are never allocated, let alone built and shed.
+///
+/// Returns the facts (with the dead columns empty), the capture, and the
+/// settled language version. Neither the scan face nor the source bytes
+/// are retained: the clause-tree capture runs once at load through
+/// [`capture_dep_clauses`], and the unit keeps only the small derived
+/// product.
+pub(crate) fn compute_dep_unit(
+    file: FileId,
+    content: ContentId,
+    text: &str,
+    version: LanguageVersion,
+    strings: &StringTable,
+    grants: &Grants<'_>,
+) -> (UnitFacts, dartq_index::FileCapture, LanguageVersion) {
+    let (feature_set, settled_version, scanned, _lexical_rows) =
+        scan_unit(text, version, file, grants);
+    // The parse-once fan-out, minus the diagnostics consumer: the element
+    // model and the index capture observe the same event stream they do in
+    // `compute_unit`, so both faces come out byte-identical.
+    let mut decl = dartq_semantic::DeclarationCollector::new(text, &scanned.tokens, strings);
+    let mut capture =
+        dartq_index::Capturer::declarations_only(file, text, &scanned.tokens, strings);
+    Parser::new(
+        text,
+        &scanned.tokens,
+        ParserFeatures::from_feature_set(feature_set),
+        &mut MultiplexListener::new(&mut decl, &mut capture),
+    )
+    .parse_unit();
+    let elements = Arc::new(decl.finish());
+    let capture = capture.finish();
+    // Directive extraction's diagnostic rows are dead for a dep file; they
+    // sink into a scratch vec that is never read. The directives themselves
+    // (kinds, URIs, prefixes, combinators, configurations — the graph-edge
+    // and file-role faces) are the live product.
+    let mut dead = Vec::new();
+    let (directives, _region_end, _doc_imports) =
+        extract_directives(text, &scanned.tokens, strings, file, &mut dead);
+    let facts = UnitFacts {
+        content,
+        // Never read for a dep unit: the L2 gate consults resident facts
+        // only, and the dependency index keeps no signature consumers.
+        api_signature: dartq_semantic::ApiSignature::from_bytes([0; 16]),
+        directives,
+        doc_imports: Vec::new(),
+        elements,
+        diagnostics: Vec::new(),
+        line_index: scanned.line_index,
+    };
+    (facts, capture, settled_version)
+}
+
+/// The clause-tree capture of one dependency unit, run once at load and
+/// retained beside the unit's facts. This is the dependency tier's
+/// replacement for keeping the source text alive: the analyze-time clause
+/// capture used to re-read the retained bytes out of the content store,
+/// re-scan them, and re-parse them on every analyze — the retained text
+/// existed for that one consumer (≈52 MB at cockpit's closure scale). The
+/// derived product is the written supertype/parameter-bound trees alone
+/// (`ClauseTrees`), orders of magnitude smaller than the bytes it
+/// replaces, and the analyze path becomes a merge instead of a re-scan.
+///
+/// The scan inputs match the retired analyze-time re-scan exactly: the
+/// settled language version is the base (the apply path's re-scan keyed
+/// the same way), the grants resolve through the caller's file table, and
+/// the feature set / parser configuration come out of the shared
+/// [`scan_unit`] — so the trees are byte-identical to the ones the
+/// analyze-time capture produced.
+pub(crate) fn capture_dep_clauses(
+    file: FileId,
+    text: &str,
+    version: LanguageVersion,
+    strings: &StringTable,
+    grants: &Grants<'_>,
+) -> dartq_semantic::ClauseTrees {
+    let (feature_set, _settled, scanned, _warnings) = scan_unit(text, version, file, grants);
+    let mut trees = dartq_semantic::ClauseTrees::empty();
+    dartq_semantic::capture_clause_trees(
+        file,
+        text,
+        &scanned.tokens,
+        ParserFeatures::from_feature_set(feature_set),
+        strings,
+        &mut trees,
+    );
+    trees
+}
+
 /// The file's API signature: the canonical element-face
 /// hash folded with the directive-region lexemes, one blake3 pass over both
 /// faces. Computed once per changed file inside the parallel recompute and
@@ -6575,6 +6680,68 @@ pub(crate) mod tests {
         assert_eq!(
             import_spelled, "Target of URI doesn't exist: 'nope.dart'.",
             "import keeps the written literal"
+        );
+    }
+
+    /// The scanned cache's **byte** budget (#4217): the entry cap alone
+    /// pinned ~32 MB of token tables on the 1,332-file cockpit shape, so
+    /// the cache is bounded by bytes first. The pin stages two faces that
+    /// each fit but cannot coexist (the second evicts the first), an
+    /// oversized face the budget refuses outright (admitting it would
+    /// evict every entry and then itself on the next insert), and a
+    /// same-key re-insert that keeps the ledger and the feed position.
+    #[test]
+    fn scanned_cache_honors_the_byte_budget() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = state.files.intern(Path::new("/t/budget.dart"));
+        let budget = crate::state::SCANNED_CACHE_BYTES;
+        let make = |state: &EngineState, source: &str| {
+            let (features, settled, scanned, _) =
+                scan_unit(source, DEFAULT_LANGUAGE_VERSION, file, &state.grants());
+            ScannedFace {
+                tokens: scanned.tokens,
+                features,
+                version: settled,
+            }
+        };
+        // A face a hair over half the budget (2 tokens per `a;` pair at
+        // the cache's own per-token accounting): two never coexist.
+        let per_token = std::mem::size_of::<dartq_scanner::Token>() + 4;
+        let pairs = budget / 4 / per_token + 2;
+        let source = "a;".repeat(pairs);
+        let key = |content: &[u8]| FactsKey {
+            content: dartq_source::content_hash(content),
+            feature_fingerprint: 0,
+            semantic_version: FACTS_SEMANTIC_VERSION,
+        };
+        let first = make(&state, &source);
+        let bytes = first.heap_bytes();
+        assert!(bytes < budget, "one face fits: {bytes} < {budget}");
+        assert!(bytes * 2 > budget, "two do not: {bytes} × 2 > {budget}");
+        let (k1, k2) = (key(b"budget-1"), key(b"budget-2"));
+        state.cache_scanned(k1, first.clone());
+        assert_eq!(state.scanned_occupancy_for_test(), (1, bytes));
+        state.cache_scanned(k2, make(&state, &source));
+        assert_eq!(
+            state.scanned_occupancy_for_test(),
+            (1, bytes),
+            "the second face evicted the first and the ledger followed"
+        );
+        assert!(state.cached_scanned(k1).is_none());
+        assert!(state.cached_scanned(k2).is_some());
+        // Same-key re-insert replaces in place: one entry, same ledger.
+        state.cache_scanned(k2, make(&state, &source));
+        assert_eq!(state.scanned_occupancy_for_test(), (1, bytes));
+        // A face over the whole budget is never admitted.
+        let oversized = "a;".repeat(pairs * 2 + 8);
+        let enforced = make(&state, &oversized);
+        assert!(enforced.heap_bytes() > budget);
+        state.cache_scanned(key(b"budget-3"), enforced);
+        assert_eq!(
+            state.scanned_occupancy_for_test(),
+            (1, bytes),
+            "an oversized face leaves the cache untouched"
         );
     }
 }

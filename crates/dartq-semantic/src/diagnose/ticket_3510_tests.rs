@@ -152,16 +152,33 @@ fn contravariant_alias_parameter_decorates_with_never() {
     );
     assert_eq!(
         code_names(&report),
-        ["type_argument_not_matching_bounds"],
+        [
+            "type_argument_not_matching_bounds",
+            "not_instantiated_bound",
+        ],
         "{:#?}",
         rows(&report)
     );
+    // The bound face's grounding: `A`'s stored contravariant seed
+    // grounds the self-referential `Wrap<X>` to `Wrap<Never>`.
     assert!(
         report.diagnostics[0].message.contains(
             "'int' doesn't conform to the bound 'A<Wrap<Never>>' of the type parameter 'T'"
         ),
         "{:#?}",
         rows(&report)
+    );
+    // The declaration face: the raw alias head in `T extends A` names a
+    // not-simply-bounded declaration (probe 3.13.7:
+    // `NOT_INSTANTIATED_BOUND` "Type parameter bound types must be
+    // instantiated." at the `A` head). The raw fold report lists it
+    // after the use-site row because the declaration face finalizes
+    // after the body walk — an order the engine's canonical output sort
+    // normalizes (the oracle's machine line lists the offset-earlier
+    // declaration row first).
+    assert_eq!(
+        report.diagnostics[1].message,
+        "Type parameter bound types must be instantiated."
     );
 }
 
@@ -182,7 +199,10 @@ fn invariant_alias_parameter_decorates_with_dynamic() {
     );
     assert_eq!(
         code_names(&report),
-        ["type_argument_not_matching_bounds"],
+        [
+            "type_argument_not_matching_bounds",
+            "not_instantiated_bound",
+        ],
         "{:#?}",
         rows(&report)
     );
@@ -192,6 +212,10 @@ fn invariant_alias_parameter_decorates_with_dynamic() {
         ),
         "{:#?}",
         rows(&report)
+    );
+    assert_eq!(
+        report.diagnostics[1].message,
+        "Type parameter bound types must be instantiated."
     );
 }
 

@@ -137,6 +137,8 @@ testme(G source) {
 
 /// `G? source` binds `G<A<dynamic>>?`: the use-site `?` rides the
 /// instantiation (the fold carries it through, the fill preserves it).
+/// The row anchors at the READ `source` (the initializer), never the
+/// declaration (oracle 3.13.7: line 6, column 25).
 #[test]
 fn nullable_bare_alias_binds_the_nullable_i2b_face() {
     let source = r#"
@@ -151,7 +153,7 @@ main() {
     assert_eq!(
         rows_named(&report, "invalid_assignment"),
         [(
-            at(source, "source;"),
+            at(source, "source;\n}"),
             6,
             "A value of type 'G<A<dynamic>>?' can't be assigned to a variable of type 'G<A<Never>>?'."
                 .to_string()

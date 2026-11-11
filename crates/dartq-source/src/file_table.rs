@@ -167,6 +167,53 @@ impl FileTable {
         self.paths[id.index() as usize] = None;
         Some(id)
     }
+
+    /// The table's resident bytes, split by family — the RSS-
+    /// decomposition's view into the path universe. Rows: the dense
+    /// `FileId → Option<Arc<Path>>` slot arena at capacity, the
+    /// `path → FileId` map's slot arena plus the canonical paths' own
+    /// `Arc<Path>` heap bytes, and the [`PathMemo`] spelling→canonical
+    /// cache — its slot arena plus only those `Arc<Path>` keys that carry
+    /// their own allocation (a canonical-keyed entry shares the value's
+    /// lease, counted once in the `paths` family).
+    ///
+    /// O(paths + memo entries). The `PathMemo` itself is `pub(crate)`, so
+    /// this method is the only public byte-accounting face over it; the
+    /// engine's decomposition calls it under the probe env only.
+    #[must_use]
+    pub fn heap_bytes(&self) -> Vec<(&'static str, u64)> {
+        let path_slots = self.paths.capacity() * std::mem::size_of::<Option<Arc<Path>>>();
+        let path_bytes: usize = self
+            .paths
+            .iter()
+            .flatten()
+            .map(|p| p.as_os_str().len() + std::mem::size_of::<Arc<Path>>())
+            .sum();
+        let ids_slots =
+            self.ids_by_path.capacity() * (std::mem::size_of::<(Arc<Path>, FileId)>() + 1);
+        // The memo's keys are `Arc<Path>`: a canonical spelling's key is the
+        // canonical lease itself (zero extra bytes), a dirty spelling's is
+        // one owned allocation. Count only the distinct-key allocations —
+        // pointer-sharing against the values keeps the walk exact.
+        let memo_entries = self.memo.canonical.len();
+        let memo_slots =
+            self.memo.canonical.capacity() * (std::mem::size_of::<(Arc<Path>, Arc<Path>)>() + 1);
+        let memo_bytes: usize = self
+            .memo
+            .canonical
+            .iter()
+            .filter(|(key, value)| !Arc::ptr_eq(key, value))
+            .map(|(key, _)| key.as_os_str().len() + std::mem::size_of::<Arc<Path>>())
+            .sum();
+        vec![
+            ("file_table_path_slots", path_slots as u64),
+            ("file_table_path_bytes", path_bytes as u64),
+            ("file_table_ids_slots", ids_slots as u64),
+            ("file_table_memo_entries", memo_entries as u64),
+            ("file_table_memo_slots", memo_slots as u64),
+            ("file_table_memo_bytes", memo_bytes as u64),
+        ]
+    }
 }
 
 /// The single normalization rule for path keys, shared by [`FileTable`] and
@@ -351,7 +398,13 @@ fn lexical_key(path: &Path) -> Cow<'_, Path> {
 /// job (Locator mtime/content records), not path-spelling resolution.
 #[derive(Debug, Default)]
 pub(crate) struct PathMemo {
-    canonical: FxHashMap<PathBuf, Arc<Path>>,
+    /// spelling → canonical, both as `Arc<Path>`: a spelling already in
+    /// canonical form (the workspace walk's dominant case) inserts the
+    /// canonical lease itself as the key, so the entry costs one allocation
+    /// instead of a duplicated `PathBuf`. A dirty spelling (symlink target,
+    /// dot segments, relative form) allocates its own key Arc — the same
+    /// bytes a `PathBuf` key would own.
+    canonical: FxHashMap<Arc<Path>, Arc<Path>>,
 }
 
 impl PathMemo {
@@ -381,7 +434,23 @@ impl PathMemo {
             return Arc::clone(cached);
         }
         let shared: Arc<Path> = Arc::from(normalize_keyed(key.as_ref()));
-        self.canonical.insert(key.into_owned(), Arc::clone(&shared));
+        self.insert(key.as_ref(), shared)
+    }
+
+    /// Inserts `spelling` → `shared` and returns the canonical lease.
+    ///
+    /// A spelling already in canonical form (the workspace walk's dominant
+    /// case) is keyed by the canonical allocation itself, so one `Arc`
+    /// serves both the key and the value; a dirty spelling allocates its
+    /// own key. In both shapes lookups stay by `&Path` (`Arc<Path>` borrows
+    /// as `Path`), so the dedup is invisible to every caller.
+    fn insert(&mut self, spelling: &Path, shared: Arc<Path>) -> Arc<Path> {
+        let key = if spelling == shared.as_ref() {
+            Arc::clone(&shared)
+        } else {
+            Arc::from(spelling)
+        };
+        self.canonical.insert(key, Arc::clone(&shared));
         shared
     }
 
@@ -408,9 +477,7 @@ impl PathMemo {
         if let Some(cached) = self.canonical.get(key.as_ref()) {
             return Arc::clone(cached);
         }
-        let shared: Arc<Path> = Arc::from(normalized);
-        self.canonical.insert(key.into_owned(), Arc::clone(&shared));
-        shared
+        self.insert(key.as_ref(), Arc::from(normalized))
     }
 }
 

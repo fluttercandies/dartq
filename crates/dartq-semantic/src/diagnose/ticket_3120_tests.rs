@@ -531,16 +531,18 @@ fn enum_on_missing_reports_nothing_beyond_parser() {
 /// `enum E with Und` — the enum's `with` clause feeds `_resolveType` the
 /// same as a class's (`scope_context.dart:144-167`'s
 /// `node.withClause?.accept`); `Und` reports `mixin_of_non_class`.
+///
+/// Oracle 3.13.7 emits ONLY the clause verdict here — a malformed enum
+/// (its own clause unresolved) does not reach the enum-constant
+/// static×instance collision face, so no `conflicting_static_and_instance`
+/// row rides along (unlike the well-formed `enum E { v }` pins above).
 #[test]
 fn enum_with_missing_reports_mixin_of_non_class() {
     let fixture = "enum E with Und { v }\n";
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![
-            ("mixin_of_non_class", at(fixture, "Und"), 3),
-            ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-        ],
+        vec![("mixin_of_non_class", at(fixture, "Und"), 3)],
         "rows: {:?}",
         rows(&report)
     );
@@ -548,16 +550,15 @@ fn enum_with_missing_reports_mixin_of_non_class() {
 
 /// `enum E implements Und` reports `implements_non_class` — the enum's
 /// `implements` clause feeds `_resolveType` (`scope_context.dart:156`).
+/// Same malformed-enum suppression as the `with` arm: oracle emits only the
+/// clause verdict, no enum-constant collision row.
 #[test]
 fn enum_implements_missing_reports_implements_non_class() {
     let fixture = "enum E implements Und { v }\n";
     let report = report_ops(fixture);
     assert_eq!(
         code_spans(&report),
-        vec![
-            ("implements_non_class", at(fixture, "Und"), 3),
-            ("conflicting_static_and_instance", at(fixture, "v }"), 1),
-        ],
+        vec![("implements_non_class", at(fixture, "Und"), 3)],
         "rows: {:?}",
         rows(&report)
     );

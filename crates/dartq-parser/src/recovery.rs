@@ -888,7 +888,23 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // `missing_identifier` at the `5`); every other context keeps the
         // leave posture so the caller's cascade stands (oracle
         // `class C { new = 42; }`: two rows at the `42`).
-        self.report(msg::missing_identifier(), peek.span);
+        //
+        // The template is the CONTEXT's (`recoveryTemplate`,
+        // identifier_context.dart:294-305): the whole type-reference family
+        // (`typeReference` / `prefixedTypeReference` /
+        // `typeReferenceContinuation`, identifier_context_impl.dart:1486-1508)
+        // carries `diag.expectedType`, so a junk follower reports
+        // `expected_type_name` (`y.<z>` / `<.` type-argument faces), never the
+        // generic `missing_identifier`.
+        let missing_message = match context {
+            crate::listener::IdentifierContext::TypeReference
+            | crate::listener::IdentifierContext::PrefixedTypeReference
+            | crate::listener::IdentifierContext::TypeReferenceContinuation => {
+                msg::expected_type_name()
+            }
+            _ => msg::missing_identifier(),
+        };
+        self.report(missing_message, peek.span);
         // The combinator keep-set is the context's own
         // `_isOneOfFollowingValues` (`;` `,` `if` `as` `show` `hide` EOF,
         // identifier_context_impl.dart:123-131) — the generic
@@ -896,7 +912,37 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // consume-in-doubt else-branch, so `import 'a' show @` absorbs the
         // `@` and the directive tail's `expected_token ';'` anchors on it
         // instead of reparsing the `@` as metadata.
-        let leave_for_grammar = if context == crate::listener::IdentifierContext::Combinator {
+        // `TypeReferenceIdentifierContext.ensureIdentifier`'s keep set
+        // (identifier_context_impl.dart:1533-1552, shared by the plain /
+        // continuation / prefixed flavors): the type-argument group
+        // delimiters, the record/argument groupers, and the statement
+        // boundaries stay current so the group's unexpected-end recovery
+        // reads them (`<.[]` keeps its `[]` for the list-literal suffix);
+        // every other junk consumes in doubt (:1547-1550).
+        let type_reference_keep = matches!(
+            context,
+            crate::listener::IdentifierContext::TypeReference
+                | crate::listener::IdentifierContext::PrefixedTypeReference
+                | crate::listener::IdentifierContext::TypeReferenceContinuation
+        );
+        let leave_for_grammar = if type_reference_keep {
+            matches!(
+                peek.kind,
+                TokenKind::Lt
+                    | TokenKind::Gt
+                    | TokenKind::GtGt
+                    | TokenKind::GtGtGt
+                    | TokenKind::CloseParen
+                    | TokenKind::OpenSquare
+                    | TokenKind::CloseSquare
+                    | TokenKind::Index
+                    | TokenKind::OpenCurly
+                    | TokenKind::CloseCurly
+                    | TokenKind::Comma
+                    | TokenKind::Semicolon
+                    | TokenKind::Eof
+            )
+        } else if context == crate::listener::IdentifierContext::Combinator {
             matches!(
                 peek.kind,
                 TokenKind::Semicolon
@@ -1119,7 +1165,16 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // what the downstream capture reads (dartq-semantic's
         // declaration-name arms), and the order matches upstream — the
         // recovery report lands BEFORE the event, in every posture here
-        // (report at the template entry, event after the postures).
+        // (report at the template entry, event after the postures). The
+        // metadata contexts join for the same unconditional contract: a
+        // junk follower of `@` (a second `@`, a literal) falls into the
+        // consume-in-doubt tail and the returned synthetic still fires —
+        // upstream's `MetadataReferenceIdentifierContext.ensureIdentifier`
+        // (identifier_context_impl.dart:1085-1093) inserts the synthetic
+        // and `parseMetadata`'s wrapper reports it whatever came back,
+        // so `@ @x`'s first `@` contributes its own `MetadataReference`
+        // (the `''` annotation the oracle's `undefined_annotation` rows
+        // name).
         if matches!(
             context,
             crate::listener::IdentifierContext::ConstructorReferenceContinuation
@@ -1132,6 +1187,9 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
                 | crate::listener::IdentifierContext::LocalVariableDeclaration
                 | crate::listener::IdentifierContext::LocalFunctionDeclaration
                 | crate::listener::IdentifierContext::RecordFieldDeclaration
+                | crate::listener::IdentifierContext::MetadataReference
+                | crate::listener::IdentifierContext::MetadataContinuation
+                | crate::listener::IdentifierContext::MetadataContinuationAfterTypeArguments
         ) {
             self.listener.handle_identifier(span, context);
         }

@@ -37,6 +37,7 @@ use crate::cancel::{CancellationToken, Cancelled, Checkpoint};
 use crate::cycle::Condensation;
 use crate::event::{EngineEvent, duration_us};
 use crate::l1;
+
 use crate::sdk_faces_gen::SDK_LIBRARY_FACES;
 use crate::state::{
     DirectiveFacts, DirectiveKind, EngineState, LibraryId, LibraryInfo, LibraryResult,
@@ -146,37 +147,26 @@ pub(crate) fn analyze(
     structure_removed.extend(applied.removed.iter().copied());
     let structure_moved = refresh_structure_digests(state, &structure_changed, &structure_removed);
 
-    if state.structure_dirty || graph.is_none() {
-        // The condensation rides the same gate: any
-        // structure move re-derives it — the partition wholesale, the
-        // fingerprints salvaged (#1387). A cycle whose member signatures and
-        // dependency digests are byte-equal to the standing ones reuses the
-        // previous digest with no hash, so a structure keystroke re-folds
-        // only its dirty front and probes the standing front; the values are
-        // identical to a wholesale rebuild either way. The re-derivation is
-        // unconditional under the flag — even when the structure digest
-        // below stands — because the cycle fingerprints fold the members'
-        // api signatures and the post-closure reuse gate (g485 W2) compares
-        // them against the recorded runs: skipping it would serve
-        // fingerprints recorded under the pre-edit faces and could hold a
-        // result a dependency's member-shape move invalidated.
-        if state.structure_dirty {
-            let prev = std::mem::take(&mut state.condensation);
-            state.condensation = Condensation::build(Some(&prev), &state.libraries, |file| {
-                state.residency[&file].api_signature
-            });
-            if let Some(sink) = state.trace.as_mut() {
-                sink.cycle_rebuilt(state.condensation.cycle_count());
-            }
-        }
-        // The structure-fingerprint gate (#1040): the O(workspace) graph +
-        // namespace rebuild runs only when a tracked file's structural face
-        // moved against the standing graph (a flipped digest, a newly
-        // resident file, or a removal). A signature edit that adds no
-        // declaration and touches no directive recomputes the dirty
-        // libraries against the standing graph and namespaces instead.
-        if structure_moved || graph.is_none() {
-            *graph = (!state.residency.is_empty()).then(|| build_library_graph(state));
+    // The condensation rides the structure gate: any structure move
+    // re-derives it — the partition wholesale, the fingerprints salvaged
+    // (#1387). A cycle whose member signatures and dependency digests are
+    // byte-equal to the standing ones reuses the previous digest with no
+    // hash, so a structure keystroke re-folds only its dirty front and
+    // probes the standing front; the values are identical to a wholesale
+    // rebuild either way. The re-derivation is unconditional under the
+    // flag — even when the structure digest below stands — because the
+    // cycle fingerprints fold the members' api signatures and the
+    // post-closure reuse gate (g485 W2) compares them against the recorded
+    // runs: skipping it would serve fingerprints recorded under the
+    // pre-edit faces and could hold a result a dependency's member-shape
+    // move invalidated.
+    if state.structure_dirty {
+        let prev = std::mem::take(&mut state.condensation);
+        state.condensation = Condensation::build(Some(&prev), &state.libraries, |file| {
+            state.residency[&file].api_signature
+        });
+        if let Some(sink) = state.trace.as_mut() {
+            sink.cycle_rebuilt(state.condensation.cycle_count());
         }
         state.structure_dirty = false;
     }
@@ -195,7 +185,8 @@ pub(crate) fn analyze(
     // cancelled-leftover carry-forward (#428): an invalidated library whose
     // cycle face returned (an undo) keeps its recorded run.
     let candidates = std::mem::take(&mut state.invalidated);
-    let mut dirty = Vec::with_capacity(candidates.len());
+    let candidates_len = candidates.len();
+    let mut dirty = Vec::with_capacity(candidates_len);
     let mut reused = 0usize;
     for library in candidates {
         let stands = state.results.get(&library).is_some_and(|recorded| {
@@ -213,6 +204,22 @@ pub(crate) fn analyze(
         sink.cycle_reused(reused);
     }
     let order = state.condensation.topo_order(&dirty);
+
+    // The structure-fingerprint gate (#1040): the O(workspace) graph +
+    // namespace rebuild runs only when a tracked file's structural face
+    // moved against the standing graph (a flipped digest, a newly resident
+    // file, or a removal) — or when a turn that needs the graph has none
+    // standing. A signature edit that adds no declaration and touches no
+    // directive recomputes the dirty libraries against the standing graph
+    // and namespaces instead. A turn with no dirty libraries never reads
+    // the graph (the fold seam, the surface rebuilds, and the diagnose
+    // fan-out are the only consumers, all dirty-driven), so a fresh
+    // process whose first turn is a pure replay — every run adopted from
+    // the store, nothing recomputed — defers the build to the first turn
+    // that does: a turn that changes nothing recomputes nothing (#4205).
+    if structure_moved || (graph.is_none() && !order.is_empty()) {
+        *graph = (!state.residency.is_empty()).then(|| build_library_graph(state));
+    }
 
     // Phase-boundary budget poll: the ladder's first chance to
     // descend after the apply/capture phase. Armed engines pay one `Option`
@@ -409,31 +416,20 @@ pub(crate) fn analyze(
         for unit_trees in &captured {
             dartq_semantic::extend_clause_trees(&mut trees, unit_trees);
         }
-        for (&file, unit) in &state.deps.units {
-            if !captures_a_header(&unit.facts, generic) {
-                continue;
-            }
-            let Some(bytes) = state.store.get(unit.facts.content()) else {
-                continue;
-            };
-            let Ok(text) = std::str::from_utf8(bytes) else {
-                continue;
-            };
-            // Dep units retain no token table (the interface face only);
-            // the capture re-scans the retained bytes — a pure function of
-            // (text, settled version), and the scanner is the fastest pass
-            // in the pipeline. The scan's own diagnostics are dropped: a
-            // dependency file never reports rows.
-            let (features, _settled, scanned, _) =
-                l1::scan_unit(text, unit.version, file, &state.grants());
-            dartq_semantic::capture_clause_trees(
-                file,
-                text,
-                &scanned.tokens,
-                ParserFeatures::from_feature_set(features),
-                &state.strings,
-                &mut trees,
-            );
+        // Dep units retain no source: they carry the written clause trees
+        // their load captured once ([`l1::capture_dep_clauses`]), so the
+        // analyze-time half is a merge — the retained bytes and the
+        // per-analyze re-scan+parse they fed are both gone (#4217). The
+        // gate is unchanged: only units whose headers can carry anything
+        // the capture sharpens contribute, exactly the set the retired
+        // re-scan walk collected, so the merged trees are byte-identical.
+        for unit in state
+            .deps
+            .units
+            .values()
+            .filter(|unit| captures_a_header(&unit.facts, generic))
+        {
+            dartq_semantic::extend_clause_trees(&mut trees, &unit.clauses);
         }
         trees
     });
@@ -652,6 +648,13 @@ pub(crate) fn analyze(
     // cycle copies the standing rows and joins them after, exactly the
     // options-row shape of the pre-cache code.
     let contributors = merge_contributors(state);
+    // The turn's honest counts (#4205): recomputed = this turn's completed
+    // recompute; served-from-standing = every other live run holder (a
+    // reuse-gate keep, a replayed PersistedLibraryRun, or a clean target)
+    // — the pair the event stream cannot report (its cache hits fire for
+    // asked-for targets only, so a pure-replay turn shows zeros there).
+    let recomputed = completed.len();
+    state.turn_stats = (recomputed, contributors.len().saturating_sub(recomputed));
     if state
         .merged
         .as_ref()

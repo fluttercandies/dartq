@@ -31,10 +31,11 @@
 //! # What defers (under-report, never a false positive)
 //!
 //! * Values this subset cannot produce: symbols, const-class instances,
-//!   foreign (cross-file) constants, `as` results, index expressions,
-//!   string interpolation text — these evaluate to [`Verdict::Constant`]
-//!   ("a valid constant of unknown value") and no diagnostic can arise
-//!   from them.
+//!   foreign (cross-file) constants, undecidable `as`/`is` targets (a
+//!   type parameter without a substitution, a record/function-shaped
+//!   target), index expressions, string interpolation text — these
+//!   evaluate to [`Verdict::Constant`] ("a valid constant of unknown
+//!   value") and no diagnostic can arise from them.
 //! * Identifiers the pass cannot prove constant *or* non-constant (a
 //!   not-yet-seen or imported name): they evaluate to
 //!   [`Verdict::Constant`]; only an in-scope local/formal proves
@@ -62,6 +63,8 @@
 use std::rc::Rc;
 
 use dartq_source::{SourceRange, StringId};
+
+use crate::model::Ty;
 
 /// A compile-time constant value (the Rust-native stand-in for the
 /// oracle's `DartObjectImpl` states — no class mirroring).
@@ -314,11 +317,12 @@ pub enum Expr {
     /// code there rather than `const_initialized_with_non_constant_value`.
     Faulted(ConstFault),
     /// A valid constant of unknown value — constructs the subset defers
-    /// on (`e as T`, index expressions, unresolvable call shapes): the
-    /// fold carries no verdict through them, so no diagnostic can arise.
+    /// on (`e as T` results, index expressions, unresolvable call
+    /// shapes): the fold carries no verdict through them, so no
+    /// diagnostic can arise.
     Opaque,
     /// Provably not a constant expression (assignment, `await`, `throw`,
-    /// `new`, function literal, `++`/`--`, cascade, `x!`, `is`).
+    /// `new`, function literal, `++`/`--`, cascade, `x!`).
     Other,
 }
 
@@ -354,6 +358,31 @@ pub enum UnOp {
     BitNot,
     /// `++`/`--` — captures as [`Expr::Other`] at eval.
     Inc,
+    /// `operand as ty` (upstream `visitAsExpression`, evaluation.dart:661):
+    /// the operand's verdict propagates; a known value whose type is
+    /// provably NOT a subtype of the target faults
+    /// `constEvalThrowsException` at the whole `AsExpression`
+    /// (`castToType`, value.dart:356-381 — a type-parameter target
+    /// defers, an unresolved/unknown target passes). Built only by
+    /// [`ConstCapture::as_operator`] — never a `pending_unary` member.
+    As(Ty),
+    /// `operand is ty` / `operand is! ty` (`visitIsExpression`,
+    /// evaluation.dart:1106 → `typeTest` :2749): the operand's verdict
+    /// propagates; a known value folds to the decided `Bool` —
+    /// `isSubtypeOf` never throws on a mismatch, but `assert(x is T)`
+    /// still needs the decided false to fault. [`Self::IsNot`] is the
+    /// `!` twin through `logicalNot` (:2753). An undecidable pair defers
+    /// to [`Verdict::Constant`].
+    Is(Ty),
+    IsNot(Ty),
+    /// A const constructor's `assert(cond[, message])` initializer
+    /// (`evaluation.dart:3241-3300`). The unary operand carries the
+    /// operands: the condition alone, or an [`Expr::Entry`] staging
+    /// `cond` × `message` — a `false`/non-bool condition is the
+    /// creation's `constEvalThrowsException` (the `isRuntimeException`
+    /// arm re-anchors at the invocation node); a passing condition
+    /// contributes no value.
+    Assert,
 }
 
 /// The bare-name resolution face the evaluator needs; implemented by the
@@ -392,6 +421,16 @@ pub trait ConstLookup {
     /// the default (the lookup has no source access).
     fn shorthand_context(&self, _span: SourceRange) -> bool {
         false
+    }
+    /// The `isSubtypeOf(runtimeType(value), ty)` verdict the `as`/`is`
+    /// folds need (upstream `TypeSystem.isSubtypeOf` over the object's
+    /// own type and the written target, value.dart:378 /
+    /// evaluation.dart:3811). `Some` decides; `None` defers — a target the
+    /// lookup cannot prove (a type parameter without a substitution, a
+    /// record/function shape, an unknown head) keeps the
+    /// valid-but-unknown face instead of inventing a throw.
+    fn value_subtype(&self, _value: &ConstantValue, _ty: &Ty) -> Option<bool> {
+        None
     }
 }
 
@@ -537,7 +576,19 @@ fn collect_npc(node: &Node, lookup: &dyn ConstLookup, out: &mut Vec<SourceRange>
             // collects (the oracle's `_Collector` adds the operator
             // application, not the operand).
             UnOp::Inc => out.push(node.span),
-            UnOp::Neg | UnOp::Not | UnOp::BitNot => collect_npc(operand, lookup, out, depth),
+            // `as`/`is`/`assert` operands collect like any subexpression —
+            // the potentially-constant gate's `AsExpression`/
+            // `IsExpression`/`AssertInitializer` arms visit the operand
+            // (the type side carries no expression; the assert's `Entry`
+            // staging recurses into condition AND message, matching the
+            // oracle's `cannotCompute` row at `'${throw ''}'`).
+            UnOp::Neg
+            | UnOp::Not
+            | UnOp::BitNot
+            | UnOp::As(_)
+            | UnOp::Is(_)
+            | UnOp::IsNot(_)
+            | UnOp::Assert => collect_npc(operand, lookup, out, depth),
         },
         Expr::Cond { cond, then, els } => {
             collect_npc(cond, lookup, out, depth);
@@ -596,13 +647,29 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
     match &node.expr {
         Expr::Value(v) => Verdict::Value(v.clone()),
         Expr::Other => Verdict::NotConstant(node.span),
-        Expr::Ident(name) => match lookup.ident(*name) {
-            IdentVerdict::Value(v) => Verdict::Value(v),
-            IdentVerdict::Constant => Verdict::Constant,
-            IdentVerdict::InProgress => Verdict::Fault(ConstFault::Recursive, node.span),
-            IdentVerdict::NotConstant => Verdict::NotConstant(node.span),
-            IdentVerdict::Unresolved => Verdict::Unresolved(node.span),
-        },
+        Expr::Ident(name) => {
+            // A leading-dot shorthand (`.name`) never names a bare variable:
+            // it resolves against the CONTEXT TYPE upstream
+            // (`visitDotShorthandPropertyAccess`, evaluation.dart:935-944 —
+            // `node.propertyName.element`), so the const-scope/frame lookup
+            // below answers for an unrelated same-spelled binding. The
+            // capture folds the shorthand's selector to a bare name (the dot
+            // is dropped), so this probe is the only face that tells the two
+            // apart: `const A a = .new(.a)` read the argument `.a` as the
+            // in-progress `a` and reported a false
+            // `recursive_compile_time_constant`. The context type's value is
+            // not modelled here, so the shorthand defers.
+            if lookup.shorthand_context(node.span) {
+                return Verdict::Constant;
+            }
+            match lookup.ident(*name) {
+                IdentVerdict::Value(v) => Verdict::Value(v),
+                IdentVerdict::Constant => Verdict::Constant,
+                IdentVerdict::InProgress => Verdict::Fault(ConstFault::Recursive, node.span),
+                IdentVerdict::NotConstant => Verdict::NotConstant(node.span),
+                IdentVerdict::Unresolved => Verdict::Unresolved(node.span),
+            }
+        }
         Expr::Member { recv, name } => {
             if let Expr::Ident(prefix) = recv.expr
                 && let Some(verdict) = lookup.prefixed(prefix, *name)
@@ -679,6 +746,64 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeInt, node.span),
                 other => other,
             },
+            // `visitAsExpression` (evaluation.dart:661): the operand's own
+            // verdict propagates verbatim — a non-`DartObjectImpl` result
+            // returns before the cast runs. A known value casts through
+            // `castToType` (value.dart:356-381): `isInvalid`/unknown-target
+            // defers, a type-parameter target returns the object
+            // unchanged, `!isSubtypeOf` throws `constEvalThrowsException`
+            // at the whole `AsExpression` node.
+            UnOp::As(ty) => match fold(operand, lookup, depth) {
+                Verdict::Value(v) => match lookup.value_subtype(&v, ty) {
+                    Some(false) => Verdict::Fault(ConstFault::ThrowsException, node.span),
+                    _ => Verdict::Constant,
+                },
+                other => other,
+            },
+            // `visitIsExpression` (evaluation.dart:1106): the operand's
+            // verdict propagates the same way; a known value answers
+            // `BoolState.from(isSubtypeOf)` — the type test itself never
+            // throws on a mismatch (`hasType`, value.dart:610-622). `is!`
+            // runs the same test through `logicalNot` (:2753). An
+            // undecidable target defers — the oracle decides against the
+            // resolved type, which the parse-time face does not always
+            // carry.
+            UnOp::Is(ty) | UnOp::IsNot(ty) => match fold(operand, lookup, depth) {
+                Verdict::Value(v) => match lookup.value_subtype(&v, ty) {
+                    Some(b) => {
+                        Verdict::Value(ConstantValue::Bool(b ^ matches!(op, UnOp::IsNot(_))))
+                    }
+                    None => Verdict::Constant,
+                },
+                other => other,
+            },
+            // The const-constructor `assert` initializer
+            // (evaluation.dart:3241-3300): the operand stages the
+            // condition (bare, or `Expr::Entry{cond, message}` when a
+            // message was written — only the condition decides the
+            // verdict; the message's own leaves report through the
+            // not-potentially-constant scan). `!isBool ||
+            // toBoolValue() == false` (a created-bool of unknown value
+            // passes: `isBool` admits it and `null` is not `false`)
+            // yields the creation's `constEvalThrowsException`. A
+            // passing condition folds to `Constant` — the initializer
+            // contributes no value, only its fault.
+            UnOp::Assert => {
+                let cond = match &operand.expr {
+                    Expr::Entry(cond, _) => cond,
+                    _ => operand,
+                };
+                match fold(cond, lookup, depth) {
+                    Verdict::Value(ConstantValue::Bool(true)) => Verdict::Constant,
+                    Verdict::Value(ConstantValue::Created(c))
+                        if lookup.created_state(c) == CreatedState::Bool =>
+                    {
+                        Verdict::Constant
+                    }
+                    Verdict::Value(_) => Verdict::Fault(ConstFault::ThrowsException, node.span),
+                    other => other,
+                }
+            }
         },
         Expr::Cond { cond, then, els } => match fold(cond, lookup, depth) {
             // A known condition skips one branch, but upstream checks the
@@ -1201,7 +1326,7 @@ fn eval_binary(
             let l = fold(left, lookup, depth);
             let r = fold(right, lookup, depth);
             match (l, r) {
-                (Verdict::Value(a), Verdict::Value(b)) => binary_values(op, span, &a, &b),
+                (Verdict::Value(a), Verdict::Value(b)) => binary_values(op, span, &a, &b, lookup),
                 (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
                 // A failed operand propagates with its own grade, left
                 // first (the oracle evaluates operands in order): a
@@ -1221,6 +1346,13 @@ fn eval_binary(
 /// The eager operator matrix, mirroring `DartObjectImpl`'s per-state
 /// methods (`value.dart`): the operand-type asserts decide which
 /// `constEval*` fault fires, in the oracle's assert order (left first).
+///
+/// A created primitive instance (`bool.fromEnvironment(...)`) answers its
+/// container's `InstanceState` class with an UNKNOWN payload — the same
+/// class its unary arms already fold through [`CreatedState`] — so every
+/// eager gate reads the CLASS and an admitted operand pair answers an
+/// unknown result ([`Verdict::Constant`], `value.dart`
+/// `InstanceState`+`IntState.add`'s `value == null` arms).
 #[expect(
     clippy::too_many_lines,
     clippy::many_single_char_names,
@@ -1229,7 +1361,27 @@ fn eval_binary(
     clippy::cast_precision_loss,
     clippy::float_cmp
 )] // operator table mirrors value.dart's listing; VM casts, exact equality
-fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantValue) -> Verdict {
+fn binary_values(
+    op: BinOp,
+    span: SourceRange,
+    a: &ConstantValue,
+    b: &ConstantValue,
+    lookup: &dyn ConstLookup,
+) -> Verdict {
+    // Only a CREATED PRIMITIVE takes the state-class path: its container's
+    // `InstanceState` family (Bool/Int/Num/String) is what the gates read.
+    // A generic created instance (a user const constructor) keeps the
+    // `Created` arms below — its operator faces come from the user's own
+    // overrides, which the name level cannot survey.
+    let created_primitive = |v: &ConstantValue| match v {
+        ConstantValue::Created(container) => {
+            lookup.created_state(*container) != CreatedState::Generic
+        }
+        _ => false,
+    };
+    if created_primitive(a) || created_primitive(b) {
+        return created_operand_values(op, span, a, b, lookup);
+    }
     // Every operator variant appears in the matrix below; the explicit
     // list keeps the `enum_glob_use` gate honest.
     use BinOp::{
@@ -1274,8 +1426,9 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                 _ => Verdict::Fault(ConstFault::TypeNumString, span),
             },
             // A created container's `InstanceState` family is the lookup's
-            // answer, so its operand face keeps the num gate the subset
-            // already reported for it.
+            // answer; `created_operand_values` owns that pair (the entry
+            // above routes every created operand pair there), so the arm is
+            // the num face the concrete states would answer.
             ConstantValue::Created(_) => Verdict::Fault(ConstFault::TypeNum, span),
             // Every concrete remaining state (`BoolState`, the collection
             // states, `TypeState`, `SymbolState`) inherits the base
@@ -1443,6 +1596,161 @@ fn is_num(v: &ConstantValue) -> bool {
 
 fn is_num_or_null(v: &ConstantValue) -> bool {
     is_num(v) || *v == ConstantValue::Null
+}
+
+/// The eager operator matrix over a pair with at least one CREATED
+/// primitive instance (`bool.fromEnvironment(...)` and friends): the
+/// operand's state class is the lookup's [`CreatedState`] answer, so the
+/// gates below read the class and an admitted pair answers an unknown
+/// result ([`Verdict::Constant`]) — every upstream state method whose
+/// `value == null` (an unknown-payload instance) returns `*State.
+/// UNKNOWN_VALUE` instead of computing (`value.dart` `IntState.add`
+/// :2053-2075, `BoolState.logicalAnd` :1902-1920, `StringState.
+/// concatenate` :3093-3105).
+///
+/// A created state that fails a gate answers exactly what the same
+/// CONCRETE state would (`IntState & true` → `constEvalTypeBoolInt`,
+/// `IntState + true` → `constEvalTypeNum`), so the arms mirror
+/// [`binary_values`]'s with the value payload removed.
+fn created_operand_values(
+    op: BinOp,
+    span: SourceRange,
+    a: &ConstantValue,
+    b: &ConstantValue,
+    lookup: &dyn ConstLookup,
+) -> Verdict {
+    use BinOp::{
+        Add, BitAnd, BitOr, BitXor, Div, Eq, Ge, Gt, IntDiv, Le, Lt, Mod, Mul, Ne, Shl, Shr, Sub,
+        Ushr,
+    };
+    // The operator-gate state of one operand: `InstanceState` classes plus
+    // the `NullState`/`GenericState` arms the `*OrNull` gates distinguish.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum St {
+        Bool,
+        Int,
+        Num,
+        Str,
+        Null,
+        Other,
+    }
+    // A created instance reads its container's family; a concrete value
+    // reads its own variant.
+    let state = |v: &ConstantValue| match v {
+        ConstantValue::Created(container) => match lookup.created_state(*container) {
+            CreatedState::Bool => St::Bool,
+            CreatedState::Int => St::Int,
+            CreatedState::Num => St::Num,
+            CreatedState::String => St::Str,
+            CreatedState::Generic => St::Other,
+        },
+        ConstantValue::Null => St::Null,
+        ConstantValue::Bool(_) => St::Bool,
+        ConstantValue::Int(_) => St::Int,
+        ConstantValue::Double(_) => St::Num,
+        ConstantValue::Str(_) => St::Str,
+        _ => St::Other,
+    };
+    let (sa, sb) = (state(a), state(b));
+    // `isNum` is the int/double family; null passes every `*OrNull` gate.
+    let num_or_null = |s: St| matches!(s, St::Int | St::Num | St::Null);
+    let int_or_null = |s: St| matches!(s, St::Int | St::Null);
+    match op {
+        // `InstanceState.add` (value.dart:1636-1647) and its
+        // `IntState`/`DoubleState` override (:2053-2075):
+        // - a String/String pair concatenates;
+        // - a num receiver asserts `assertNumOrNull(right)` first, so a
+        //   non-num right answers the NUM face; a num/null right then runs
+        //   the state's `add`, whose unknown payload returns UNKNOWN_VALUE
+        //   (num right) or falls through to the throw (null right);
+        // - every other receiver runs the base `add`, whose two
+        //   `assertNumStringOrNull` gates admit num/String/null and then
+        //   throw.
+        Add => {
+            if sa == St::Str && sb == St::Str {
+                return Verdict::Constant;
+            }
+            if matches!(sa, St::Int | St::Num) {
+                return match sb {
+                    St::Int | St::Num => Verdict::Constant,
+                    St::Null => Verdict::Fault(ConstFault::ThrowsException, span),
+                    _ => Verdict::Fault(ConstFault::TypeNum, span),
+                };
+            }
+            let num_string_or_null = |s: St| matches!(s, St::Int | St::Num | St::Str | St::Null);
+            if num_string_or_null(sa) && num_string_or_null(sb) {
+                return Verdict::Fault(ConstFault::ThrowsException, span);
+            }
+            Verdict::Fault(ConstFault::TypeNumString, span)
+        }
+        // `assertNumOrNull` on both, then the state's own method runs
+        // (`NumState.minus`/`times`/… :1956-2030). A num/num pair computes
+        // — the payload is the created instance's own value, which this
+        // subset does not carry, so the result is a valid constant of
+        // unknown value. A null side passes the assert and the base method
+        // then throws.
+        Sub | Mul | Div | IntDiv | Mod | Lt | Gt | Le | Ge => {
+            if matches!(sa, St::Int | St::Num) && matches!(sb, St::Int | St::Num) {
+                // `~/` by a known zero divisor is the idbze arm
+                // (`IntState.integerDivide` :2212-2216).
+                if op == IntDiv && matches!(b, ConstantValue::Int(0)) {
+                    return Verdict::Fault(ConstFault::ThrowsIdbze, span);
+                }
+                return Verdict::Constant;
+            }
+            if num_or_null(sa) && num_or_null(sb) {
+                return Verdict::Fault(ConstFault::ThrowsException, span);
+            }
+            Verdict::Fault(ConstFault::TypeNum, span)
+        }
+        // `eagerAnd`/`eagerOr`/`eagerXor` (value.dart:446-514): a
+        // bool/bool or int/int pair computes, everything else answers the
+        // bool-or-int face (a null operand is neither `isBool` nor `isInt`).
+        BitAnd | BitOr | BitXor => {
+            if (sa == St::Bool && sb == St::Bool) || (sa == St::Int && sb == St::Int) {
+                return Verdict::Constant;
+            }
+            Verdict::Fault(ConstFault::TypeBoolInt, span)
+        }
+        // `shiftLeft`/`shiftRight`/`logicalShiftRight` run
+        // `assertIntOrNull` on both (value.dart:1987-2003): an int/int pair
+        // computes, a null side passes the assert and the base method then
+        // throws.
+        Shl | Shr | Ushr => {
+            if sa == St::Int && sb == St::Int {
+                return Verdict::Constant;
+            }
+            if int_or_null(sa) && int_or_null(sb) {
+                return Verdict::Fault(ConstFault::ThrowsException, span);
+            }
+            Verdict::Fault(ConstFault::TypeInt, span)
+        }
+        // `equalEqual` (value.dart:524-566): a null side decides false (or
+        // true for null/null) BEFORE the primitive-equality gate; otherwise
+        // the state's own `equalEqual` answers an unknown bool for an
+        // unknown payload.
+        Eq | Ne => {
+            if sa == St::Null || sb == St::Null {
+                let both_null = sa == St::Null && sb == St::Null;
+                return Verdict::Value(ConstantValue::Bool(if op == Eq {
+                    both_null
+                } else {
+                    !both_null
+                }));
+            }
+            // A created primitive carries `hasPrimitiveEquality` and answers
+            // an unknown bool; a GENERIC created instance (a user const
+            // constructor) compares through a `==` override the name level
+            // cannot survey, so it keeps the deferring posture.
+            if matches!(sa, St::Bool | St::Int | St::Num | St::Str)
+                || matches!(sb, St::Bool | St::Int | St::Num | St::Str)
+            {
+                return Verdict::Constant;
+            }
+            Verdict::Constant
+        }
+        _ => Verdict::NotConstant(span),
+    }
 }
 
 /// The numeric kernel: int/int stays int (except `/`, always double),
@@ -3206,32 +3514,43 @@ impl ConstCapture {
     /// Wraps the top operand with every prefix operator whose operand
     /// just completed (latched at the current depth).
     fn apply_unaries_at(&mut self, depth: u32) {
+        let mut run = Vec::new();
         while self
             .pending_unary
             .last()
             .is_some_and(|&(_, d, _)| d == depth)
         {
-            let Some(mut node) = self.pop_clamped(self.base()) else {
-                self.pending_unary.pop();
-                continue;
-            };
             let (op, _, op_span) = self.pending_unary.pop().expect("checked above");
-            let span = unary_span(op_span, node.span);
-            node = Node {
-                expr: Expr::Unary {
-                    op,
-                    operand: Box::new(node),
-                },
-                span,
-            };
-            self.stack.push(node);
+            run.push((op, op_span));
         }
+        self.wrap_unary_run(run);
     }
 
     /// Window teardown: applies every surviving prefix (recovery debris
     /// has no completing event).
     fn apply_unaries(&mut self) {
+        let mut run = Vec::new();
         while let Some((op, _, op_span)) = self.pending_unary.pop() {
+            run.push((op, op_span));
+        }
+        self.wrap_unary_run(run);
+    }
+
+    /// Applies one drained run of prefix windows to the stack's top
+    /// operand in the syntactic wrap order — innermost operator first.
+    ///
+    /// The listener latches a run's windows as each operand completes, so
+    /// a nested run like `!-~x` arrives innermost-first; a plain LIFO
+    /// drain would apply the OUTERMOST operator to the bare operand,
+    /// evaluating `!-~x` as `~(-(!x))` — a different expression, wrong
+    /// constant value — and parking each level's extent on the wrong
+    /// node (`!!D`'s inner node carrying the outer extent). Prefix
+    /// operators stack leftward, so pairing every window to its own
+    /// operator token — descending token offset — rebuilds the nesting
+    /// whatever order the pushes arrived in.
+    fn wrap_unary_run(&mut self, mut run: Vec<(UnOp, SourceRange)>) {
+        run.sort_by_key(|&(_, span)| std::cmp::Reverse(span.offset));
+        for (op, op_span) in run {
             if let Some(mut node) = self.pop_clamped(self.base()) {
                 let span = unary_span(op_span, node.span);
                 node = Node {
@@ -4015,13 +4334,10 @@ impl ConstCapture {
         }
     }
 
-    /// `is` — a valid constant of unknown value: the oracle evaluates the
-    /// type test like any other constant operation and reports only what
-    /// the operands report (upstream Dart SDK source,
-    /// pkg/analyzer/lib/src/dart/constant/evaluation.dart:1106,
-    /// `visitIsExpression` — no invalid arm of its own; the corpus has
-    /// zero oracle rows anchored at the operator). The fold defers
-    /// through it, so the operand below becomes inert debris.
+    /// Pushes an opaque leaf anchored at `span` — a valid constant of
+    /// unknown value whose own shape carries no fault. (The `is`/`as`
+    /// operators capture as [`UnOp::Is`]/[`UnOp::As`] wrappers since
+    /// #3870 — this leaf is for the remaining defer-only constructs.)
     pub fn not_constant(&mut self, span: SourceRange) {
         if self.open() {
             self.push(
@@ -4034,8 +4350,9 @@ impl ConstCapture {
         }
     }
 
-    /// `as` — a valid constant of unknown value (`(1 as int) + 1` stays
-    /// clean in the oracle): the fold defers through it.
+    /// An undecidable-but-valid construct (`(1 as T) + 1` for an unknown
+    /// `T`, a nested literal in a non-const duplicate window): the fold
+    /// defers through it.
     pub fn opaque_leaf(&mut self, span: SourceRange) {
         if self.open() {
             self.push(
@@ -4064,6 +4381,102 @@ impl ConstCapture {
             },
             true,
         );
+    }
+
+    /// `operand as ty` — wraps the top operand into
+    /// `Expr::Unary { op: UnOp::As(ty) }` so the fold can decide the
+    /// `castToType` throw (`visitAsExpression`, evaluation.dart:661). The
+    /// operand completes before the `as` token, so pending prefix
+    /// operators at this depth apply to it (a `-x as T` reads `(-x) as T`
+    /// upstream, never `-(x as T)`). `span` is the whole `AsExpression` —
+    /// the operand's start through the written type's end, the oracle's
+    /// `.at(node)` anchor.
+    pub fn as_operator(&mut self, ty: Ty, span: SourceRange) {
+        if !self.open() {
+            return;
+        }
+        self.apply_unaries_at(self.depth);
+        let base = self.base();
+        let Some(operand) = self.pop_clamped(base) else {
+            return;
+        };
+        self.push(
+            Node {
+                expr: Expr::Unary {
+                    op: UnOp::As(ty),
+                    operand: Box::new(operand),
+                },
+                span,
+            },
+            true,
+        );
+    }
+
+    /// `operand is ty` / `operand is! ty` — wraps the top operand into
+    /// `Expr::Unary { op: UnOp::Is/IsNot(ty) }` (`visitIsExpression`,
+    /// evaluation.dart:1106). Same operand-complete ordering as
+    /// [`Self::as_operator`]; `span` is the whole `IsExpression`.
+    pub fn is_operator(&mut self, ty: Ty, negated: bool, span: SourceRange) {
+        if !self.open() {
+            return;
+        }
+        self.apply_unaries_at(self.depth);
+        let base = self.base();
+        let Some(operand) = self.pop_clamped(base) else {
+            return;
+        };
+        let op = if negated {
+            UnOp::IsNot(ty)
+        } else {
+            UnOp::Is(ty)
+        };
+        self.push(
+            Node {
+                expr: Expr::Unary {
+                    op,
+                    operand: Box::new(operand),
+                },
+                span,
+            },
+            true,
+        );
+    }
+
+    /// The const-constructor `assert(cond[, message])` initializer's
+    /// operands: the condition (and message, when written) sit on the
+    /// operand stack — `parse_assert` opens no argument-list level — and
+    /// the assert itself is not an expression value, so the node moves
+    /// OUT of the stack for the caller to stash (the initializer window's
+    /// `ctor_inits` feed). The captured node is `Expr::Unary { op:
+    /// UnOp::Assert }` over the condition, or over `Expr::Entry{cond,
+    /// message}` when the message was written. `span` is the whole
+    /// `assert(...)` extent — `begin` through the closing `)`. `None`
+    /// when the recovery left no condition operand.
+    pub fn take_assert_init(&mut self, has_message: bool, span: SourceRange) -> Option<Node> {
+        if !self.open() {
+            return None;
+        }
+        self.apply_unaries_at(self.depth);
+        let base = self.base();
+        let operand = if has_message {
+            let (Some(message), Some(cond)) = (self.pop_clamped(base), self.pop_clamped(base))
+            else {
+                return None;
+            };
+            Node {
+                expr: Expr::Entry(Box::new(cond), Box::new(message)),
+                span,
+            }
+        } else {
+            self.pop_clamped(base)?
+        };
+        Some(Node {
+            expr: Expr::Unary {
+                op: UnOp::Assert,
+                operand: Box::new(operand),
+            },
+            span,
+        })
     }
 
     /// Pushes a provably non-constant leaf anchored at `span` (a const
@@ -5052,6 +5465,7 @@ mod tests {
                 span,
                 &ConstantValue::Bool(true),
                 &ConstantValue::Bool(false),
+                &w(),
             ),
             Verdict::NotConstant(span)
         );

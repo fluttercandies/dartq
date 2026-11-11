@@ -66,16 +66,27 @@ fn switch_expression_arm_binder_reports_individually() {
     assert_eq!(uv_rows(&report), [uv("v2", v2)], "{:?}", uv_rows(&report));
 }
 
-/// Same-name arm binders of one switch stay one exemption unit — the
-/// official join (a use of any spelling marks every transitive variable,
-/// `UsedLocalElements.addElement`), so the guard's use of the later `b`
-/// spares the earlier unread `b` while the differently-named unused `s`
-/// still reports.
+/// Same-name arm binders of one shared case body join through a BODY use
+/// only — the official join marks every transitive variable of the
+/// body's joined `b` (`UsedLocalElements.addElement`). A guard reads its
+/// own case's binder, so with no body use the earlier unread `b` still
+/// reports (oracle 3.13.7: line 3, column 14), and a body read spares
+/// both spellings; the differently-named unused `s` reports either way.
 #[test]
 fn same_name_arm_binders_stay_joined() {
     let fixture = "void f(Object o) {\n  switch (o) {\n    case int b:\n    case int b when b > 0:\n      break;\n    case String s:\n      break;\n  }\n}\n";
     let report = report_ops(fixture);
+    let b = at(fixture, "case int b:") + "case int ".len();
     let s = at(fixture, "case String s") + "case String ".len();
+    assert_eq!(
+        uv_rows(&report),
+        [uv("b", b), uv("s", s)],
+        "{:?}",
+        uv_rows(&report)
+    );
+    let joined = "void f(Object o) {\n  switch (o) {\n    case int b:\n    case int b when b > 0:\n      if (b > 1) {}\n      break;\n    case String s:\n      break;\n  }\n}\n";
+    let report = report_ops(joined);
+    let s = at(joined, "case String s") + "case String ".len();
     assert_eq!(uv_rows(&report), [uv("s", s)], "{:?}", uv_rows(&report));
 }
 

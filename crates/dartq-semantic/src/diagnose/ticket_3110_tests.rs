@@ -187,7 +187,7 @@ void main() {
 /// formal instead — the captured shape drops it and the arity compare
 /// sees a phantom extra required positional.
 #[test]
-#[ignore = "root is fn_capture_formal's poison arm in type_capture.rs — in-flight #3099"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn at1_untyped_required_formal_stays_silent() {
     let fixture = "\
 void topx(x,) {}
@@ -209,7 +209,7 @@ void main() { argfx(topx); }
 /// The optional-positional twin: `void f([y,])` resolves
 /// `void Function([dynamic])`.
 #[test]
-#[ignore = "same fn_capture_formal root"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn at1_untyped_optional_formal_stays_silent() {
     let fixture = "\
 void topy([y,]) {}
@@ -261,7 +261,7 @@ void main() { argfn(topy); }
 /// pair verdict lives in assignability.rs's typedef-pair arm — a lane
 /// this ticket does not own.
 #[test]
-#[ignore = "pair verdict is assignability.rs's typedef-pair arm — in-flight lane; the invocation.rs clobber half is pinned in ticket_3122_tests::ia1_solved_send_return_feeds_the_callable_face"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn ia1_mutual_bound_typedef_reports_both_assignments() {
     let fixture = "\
 typedef F<X> = void Function<Y extends X>();

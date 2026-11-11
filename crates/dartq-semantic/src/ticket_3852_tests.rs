@@ -249,9 +249,13 @@ fn ticket_3852_null_shift_throws_at_the_binary() {
     );
 }
 
-/// The deliberate deviation the subset keeps: a `Created` container's
-/// per-instance state is the lookup's answer, so `+` against one keeps the
-/// num face instead of guessing the String face.
+/// A created BOOL container's `+` against an int: the base
+/// `InstanceState.add` gate is `assertNumStringOrNull` on BOTH operands
+/// (`value.dart:1636-1647`), so the num-or-String face reports — not the
+/// num face. The oracle confirms on
+/// `const b = bool.fromEnvironment('b'); const x = b + 1;` →
+/// `const_eval_type_num_string`. (#3913 corrected this expectation; the
+/// previous num-face pin recorded a deviation the oracle contradicts.)
 #[test]
 fn ticket_3852_created_container_plus_keeps_the_num_face() {
     let world = w();
@@ -261,7 +265,7 @@ fn ticket_3852_created_container_plus_keeps_the_num_face() {
             ConstantValue::Created(world.id("bool")),
             ConstantValue::Int(1)
         ),
-        Verdict::Fault(ConstFault::TypeNum, BINARY)
+        Verdict::Fault(ConstFault::TypeNumString, BINARY)
     );
 }
 

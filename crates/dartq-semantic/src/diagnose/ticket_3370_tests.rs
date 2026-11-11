@@ -119,7 +119,6 @@ fn if_case_guard_reads_its_own_binder() {
 // (plus the sibling `unused_local_variable`/`dead_code` rows the close
 // unlocks in `scope_A06_t02`).
 #[test]
-#[ignore = "C10 gap: if-case ELEMENT scope is unwired — owner diagnose/listener.rs"]
 fn if_case_element_else_does_not_see_the_binder() {
     let fixture = "void test() {\n  \
                    var l = [1, if (42 case var vv) 2 else vv, 3];\n  \
@@ -145,7 +144,6 @@ fn if_case_element_else_does_not_see_the_binder() {
 // `testIntroductory`) across `scoping_A01_t0*`, `eliminated_errors_A01_*`,
 // `extensions_A01_*` and the `resolution/property_access` augment tests.
 #[test]
-#[ignore = "C6 gap: augment members merge per unit — owner collector.rs MemberScope key"]
 fn augment_declared_members_join_the_introduced_class() {
     let main = "class C {\n  void test() {\n    baz;\n  }\n}\n";
     let aug = "augment class C {\n  static const baz = 2;\n}\n";
@@ -167,7 +165,6 @@ fn augment_declared_members_join_the_introduced_class() {
 // reports it, dartq resolves it through `resolve_bare`'s `type_params` arm.
 // Row delta: 18 MISSING rows across `binding_A01_t08`/`t09`.
 #[test]
-#[ignore = "C11 gap: wildcard declarations still bind — owner collector.rs / resolution.rs"]
 fn wildcard_type_parameter_does_not_bind() {
     let fixture = "void test<_>() {\n  _;\n}\n";
     let report = report_ops(fixture);

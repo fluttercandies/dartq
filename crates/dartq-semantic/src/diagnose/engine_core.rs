@@ -82,6 +82,59 @@ impl CondFace {
     }
 }
 
+// The pending composite-fold records (#3980): a binary or conditional
+// fold whose operand/arm `read_type_at` consult starved because the
+// flow's read-type table only fills after `parse_unit` returns. The fold
+// records the operand rows and fold-time types it needs; `filter_staged`
+// drains the table once `read_types` is populated and recomputes the
+// promoted result, feeding the staged-check `from` ladder the corrected
+// composite type. Thread-local rather than an engine field so the fold
+// state stays untouched — a sequential fold drains it before the next
+// unit parses (the `DEFERRED_DEFAULTS` precedent).
+thread_local! {
+    static PENDING_COMPOSITE_FOLDS: std::cell::RefCell<Vec<PendingCompositeFold>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One recorded composite fold awaiting its promoted-type recompute.
+/// `file` tags the record so a stale row from a previous unit on the same
+/// rayon thread never answers a consult for a different file.
+enum PendingCompositeFold {
+    /// `fold_binary`'s record: the operator, the operand rows it cloned,
+    /// and the fold-time result type (the `UNKNOWN`/`bool`/declared face
+    /// the starvation produced). `node_range` is the folded `Value` row's
+    /// span — the join key the staged-check `from` ladder consults.
+    Binary {
+        file: FileId,
+        node_range: SourceRange,
+        op: StringId,
+        left: Row,
+        right: Row,
+        left_ty: Ty,
+        right_ty: Ty,
+        result: Ty,
+    },
+    /// `fold_conditional`'s record: the arm rows and the fold-time result
+    /// type. `context` captures the `return_expression_context` answer the
+    /// fold computed (the frame-dependent face is dead at teardown).
+    Conditional {
+        file: FileId,
+        node_range: SourceRange,
+        then_row: Row,
+        else_row: Row,
+        then_ty: Ty,
+        else_ty: Ty,
+        context: Option<Ty>,
+        result: Ty,
+    },
+}
+
+/// The cap on pending records per unit: a pathological file with thousands
+/// of composite folds must not grow the thread-local unboundedly. At the
+/// cap the record silently drops — the pre-fix starvation posture stands
+/// (the under-report direction, never a panic).
+const PENDING_COMPOSITE_FOLD_CAP: usize = 512;
+
 impl<'a> Engine<'a> {
     // —— plumbing ————————————————————————————————————————————————————
 
@@ -248,8 +301,7 @@ impl<'a> Engine<'a> {
             group_final: false,
             group_const: false,
             group_augment: false,
-            exec_bounds: FxHashMap::default(),
-            method_exec_bounds: FxHashMap::default(),
+            exec_windows: Vec::new(),
             pending_exec_is_method: false,
             fn_var_sigs: FxHashMap::default(),
             fn_param_sigs: FxHashMap::default(),
@@ -1082,6 +1134,232 @@ impl<'a> Engine<'a> {
         });
     }
 
+    /// Drains [`PENDING_COMPOSITE_FOLDS`] and recomputes each recorded
+    /// composite fold's result type against the now-populated
+    /// `read_types` table (#3980). Returns the `(node_range → ty)` rewrite
+    /// entries whose recomputed type differs from the fold-time answer,
+    /// offset-sorted for the staged-check `from` ladder's binary search.
+    /// Records tagged for a different file drop silently — the thread-local
+    /// is per-rayon-thread and a unit that errored before `filter_staged`
+    /// could leave stragglers the next unit must not answer for.
+    fn drain_pending_composite_folds(&mut self) -> Vec<(SourceRange, Ty)> {
+        let records =
+            PENDING_COMPOSITE_FOLDS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+        // The rewrite map builds in fold order: an outer composite's
+        // operand is the inner composite's `Value` row, pushed AFTER the
+        // inner's own record, so the inner's recompute already sits in
+        // `rewrites` when the outer consults it — the order-independent
+        // forward pass the records' fold-order guarantees.
+        let mut rewrites: Vec<(SourceRange, Ty)> = Vec::new();
+        for record in records {
+            let (node_range, new_ty, old_ty) = match record {
+                PendingCompositeFold::Binary {
+                    file,
+                    node_range,
+                    op,
+                    left,
+                    right,
+                    left_ty,
+                    right_ty,
+                    result,
+                } => {
+                    if file != self.file {
+                        continue;
+                    }
+                    let new_ty = self
+                        .recompute_binary_result(op, &left, &right, left_ty, right_ty, &rewrites);
+                    (node_range, new_ty, result)
+                }
+                PendingCompositeFold::Conditional {
+                    file,
+                    node_range,
+                    then_row,
+                    else_row,
+                    then_ty,
+                    else_ty,
+                    context,
+                    result,
+                } => {
+                    if file != self.file {
+                        continue;
+                    }
+                    let new_ty = self.recompute_conditional_result(
+                        &then_row, &else_row, then_ty, else_ty, context, &rewrites,
+                    );
+                    (node_range, new_ty, result)
+                }
+            };
+            if new_ty != old_ty {
+                rewrites.push((node_range, new_ty));
+            }
+        }
+        rewrites.sort_by_key(|(range, _)| range.offset);
+        rewrites
+    }
+
+    /// One composite operand/arm's teardown type: the inner composite's
+    /// recomputed face when the operand IS a recorded node (its `Value`
+    /// row's range is the inner `node_range`, paren-transparent), else the
+    /// flow read-type fact at the operand's own span, else the fold-time
+    /// fallback. `rewrites` holds only the records already recomputed in
+    /// this forward pass — an operand nested deeper than the current record
+    /// is by construction earlier in fold order and already present.
+    fn composite_operand_ty(&self, row: &Row, fallback: Ty, rewrites: &[(SourceRange, Ty)]) -> Ty {
+        let key = self.strip_outer_parens(row.range);
+        rewrites
+            .iter()
+            .find(|(range, _)| *range == key)
+            .map(|(_, ty)| *ty)
+            .or_else(|| {
+                self.read_type_at(row.range)
+                    .filter(|promoted| *promoted != Ty::Unknown)
+            })
+            .unwrap_or(fallback)
+    }
+
+    /// [`PendingCompositeFold::Binary`]'s teardown recompute: re-asks the
+    /// operand type consults now that `read_types` is populated and the
+    /// inner composites' rewrites stand, then re-runs the pure result-ty
+    /// derivation — the operator signature resolution and the numeric
+    /// refinement — skipping the side-effecting `check_binary_argument`
+    /// (its staged `Argument` row already exists from the fold and the
+    /// `from` ladder cleans it independently). The fold-time
+    /// `left_ty`/`right_ty` are the post-`bound_face` fallbacks: a
+    /// standing promotion substitutes the concrete promoted face (never a
+    /// scope parameter, so no bound re-application is owed); no promotion
+    /// keeps the fold-time answer byte-identical.
+    fn recompute_binary_result(
+        &mut self,
+        op: StringId,
+        left: &Row,
+        right: &Row,
+        left_ty_fallback: Ty,
+        right_ty_fallback: Ty,
+        rewrites: &[(SourceRange, Ty)],
+    ) -> Ty {
+        let left_ty = self.composite_operand_ty(left, left_ty_fallback, rewrites);
+        let right_ty = self.composite_operand_ty(right, right_ty_fallback, rewrites);
+        let op_text = self.strings.resolve(op).to_string();
+        // Mirror `fold_binary`'s result arms minus the
+        // `check_binary_argument` side effect — the nullable-extension
+        // face first, then the resolved signature + numeric refinement.
+        if let Some((_formal, declared)) = self.nullable_extension_operator_sig(left_ty, op) {
+            declared
+        } else {
+            match self.binary_operator_sig_typed(&op_text, left_ty) {
+                Some((_formal, declared)) => {
+                    if left_ty == Ty::Dynamic {
+                        Ty::Dynamic
+                    } else {
+                        let face = self.operand_face(right, right_ty);
+                        self.refine_numeric_binary(&op_text, left_ty, face, declared)
+                    }
+                }
+                None => Ty::UNKNOWN,
+            }
+        }
+    }
+
+    /// [`PendingCompositeFold::Conditional`]'s teardown recompute: re-asks
+    /// the arm type consults, re-joins through `composite_lub`, then
+    /// re-applies the captured return-context face —
+    /// `return_expression_context` reads `self.frames` (dead at teardown),
+    /// so the fold stored its `Option<Ty>` answer and the `assignable`
+    /// ladder below mirrors `conditional_return_context_ty`'s
+    /// gate-for-gate.
+    fn recompute_conditional_result(
+        &mut self,
+        then_row: &Row,
+        else_row: &Row,
+        then_ty_fallback: Ty,
+        else_ty_fallback: Ty,
+        context: Option<Ty>,
+        rewrites: &[(SourceRange, Ty)],
+    ) -> Ty {
+        let then_ty = self.composite_operand_ty(then_row, then_ty_fallback, rewrites);
+        let else_ty = self.composite_operand_ty(else_row, else_ty_fallback, rewrites);
+        let mut ty = if then_ty == Ty::UNKNOWN || else_ty == Ty::UNKNOWN {
+            Ty::UNKNOWN
+        } else {
+            self.composite_lub(then_ty, else_ty, false)
+        };
+        if ty != Ty::UNKNOWN
+            && let Some(context) = context
+            && self.assignable(ty, context, false) != Some(true)
+            && self.assignable(then_ty, context, false) == Some(true)
+            && self.assignable(else_ty, context, false) == Some(true)
+        {
+            ty = context;
+        }
+        ty
+    }
+
+    /// Strips balanced outer paren pairs from `range` — `(n + 1)` unwraps
+    /// to `n + 1`, `((n + 1))` to `n + 1` — so a parenthesized composite's
+    /// `Value` row keys the same `node_range` the fold recorded. Whitespace
+    /// just inside each paren pair trims with it. The walk stops at the
+    /// first byte that is not a wrapping paren; a `(` whose match closes
+    /// before the range's end does not wrap the whole span and ends the
+    /// strip. Byte access rides [`Self::byte_at`] (UTF-16 → byte), and the
+    /// paren bytes never occur inside a multi-byte UTF-8 sequence, so the
+    /// scan is exact on any source.
+    fn strip_outer_parens(&self, mut range: SourceRange) -> SourceRange {
+        loop {
+            let start = range.offset;
+            let end = range.end();
+            if end <= start.saturating_add(1)
+                || self.byte_at(start) != Some(b'(')
+                || self.byte_at(end.saturating_sub(1)) != Some(b')')
+            {
+                return range;
+            }
+            // The `(` at `start` must match the `)` at `end - 1`: depth
+            // returns to zero only at the final byte.
+            let mut depth = 0u32;
+            let mut pos = start;
+            let mut wraps = false;
+            while pos < end {
+                match self.byte_at(pos) {
+                    Some(b'(') => depth += 1,
+                    Some(b')') => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            wraps = pos == end.saturating_sub(1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+            if !wraps {
+                return range;
+            }
+            range = SourceRange {
+                offset: start.saturating_add(1),
+                length: end.saturating_sub(start.saturating_add(2)),
+            };
+            while range.length > 0
+                && self
+                    .byte_at(range.offset)
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                range.offset = range.offset.saturating_add(1);
+                range.length = range.length.saturating_sub(1);
+            }
+            while range.length > 0
+                && self
+                    .byte_at(range.end().saturating_sub(1))
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                range.length = range.length.saturating_sub(1);
+            }
+            if range.length == 0 {
+                return range;
+            }
+        }
+    }
+
     /// Re-decides the staged verdicts against the promotion staging and
     /// emits the survivors (#477 S1). A promoted-read fact on the staged
     /// expression's exact span substitutes its type — the official read's
@@ -1100,6 +1378,14 @@ impl<'a> Engine<'a> {
         props: &PropPromotionStaging,
     ) -> Vec<Diagnostic> {
         let mut survivors: Vec<Diagnostic> = Vec::new();
+        // The composite-fold recompute (#3980): `read_types` filled after
+        // `parse_unit`, so the in-fold `read_type_at` consults starved.
+        // Drain the pending records now — the promoted operand/arm faces
+        // answer — and build the `(node_range → recomputed ty)` rewrite
+        // map the staged-check `from` ladder consults below. The drain
+        // `take()`s the thread-local on every path, so a stale record can
+        // never leak into the next unit on this rayon thread.
+        let composite_rewrites = self.drain_pending_composite_folds();
         // The statement-form operand faces (#2814) join the same
         // offset-sorted survivor tail — promotion-aware: an opaque
         // nullability-only promotion on the operand read silences the
@@ -1314,6 +1600,26 @@ impl<'a> Engine<'a> {
                     span.offset <= check.range.offset && check.range.end() <= span.end()
                 })
                 .map(|(_, ty)| *ty);
+            // The composite-fold rewrite (#3980): a staged check anchored
+            // on a binary/conditional node's span reads the recomputed
+            // promoted result — the fold-time `read_type_at` consult
+            // starved, so `check.from` carries the unpromoted face. The key
+            // strips outer parens first: a parenthesized `(n + 1)` stages
+            // wider than the `n + 1` node range but is the same value, while
+            // a call wrapper `foo(n + 1)` strips nothing and correctly
+            // misses (its type is the call's, never the argument's).
+            // `composite_rewrites` is offset-sorted; the file tag was
+            // applied at drain time. Skipped entirely when the unit recorded
+            // no rewrites — the common case pays one emptiness check.
+            let composite_ty = if composite_rewrites.is_empty() {
+                None
+            } else {
+                let key = self.strip_outer_parens(check.range);
+                composite_rewrites
+                    .iter()
+                    .find(|(range, _)| *range == key)
+                    .map(|(_, ty)| *ty)
+            };
             let mut from = if let Some(ty) = cast_ty {
                 ty
             } else {
@@ -1326,6 +1632,7 @@ impl<'a> Engine<'a> {
                     // type that decision produces.
                     Some(Ty::Unknown) => Self::non_null_form(check.from),
                     staged => staged
+                        .or_else(|| composite_ty)
                         .or_else(|| {
                             self.promotable_field_substitution(props, check.range, check.from)
                         })
@@ -1560,6 +1867,16 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
+            // The composite-fold rewrite (#3980) also owns the literal flag:
+            // a staged check anchored on a recorded binary/conditional node
+            // is that composite expression, never a primitive literal — yet
+            // `check.literal` was captured from the fold row's `num`/`int`
+            // face (`primitive_literal` keys on the row's declared type, not
+            // the node kind), so a promoted `int` result would wrongly take
+            // the int→double literal conversion and silence a real
+            // `invalid_assignment`. `composite_ty.is_some()` is exactly "the
+            // staged expression is a fold node", so it clears the flag.
+            let literal = check.literal && composite_ty.is_none();
             let verdict = match check.kind {
                 StagedKind::Return { ctor, is_async, .. } => {
                     // The expression body's `void` exemption (upstream Dart
@@ -1592,12 +1909,8 @@ impl<'a> Engine<'a> {
                     // `return null` is legal because the alias spells a
                     // nullable function type); the diagnostic's display
                     // still writes the spelled name (`check.to`).
-                    let verdict = self.return_verdict(
-                        from,
-                        self.fold_alias_ty(check.to),
-                        check.literal,
-                        is_async,
-                    );
+                    let verdict =
+                        self.return_verdict(from, self.fold_alias_ty(check.to), literal, is_async);
                     if verdict.is_none() && ctor {
                         self.declared_subtype_negative(&from, &check.to)
                     } else {
@@ -1622,8 +1935,8 @@ impl<'a> Engine<'a> {
                 // The assignment face closes the nominal blind spot (the
                 // declared-subtype negative); the yield face keeps the
                 // matrix posture.
-                StagedKind::Assignment => self.assignment_verdict(from, check.to, check.literal),
-                _ => self.assignable(from, check.to, check.literal),
+                StagedKind::Assignment => self.assignment_verdict(from, check.to, literal),
+                _ => self.assignable(from, check.to, literal),
             };
             if verdict != Some(false) {
                 // Cleaned by the promotion, or the promoted type left the
@@ -4462,9 +4775,21 @@ impl<'a> Engine<'a> {
         );
         let dynamic = Ty::Dynamic;
         let (head, args) = match kind {
-            // The empty `{}` literal's default (`literal_return_ty`'s
-            // map arm).
-            UntypedLiteral::EmptyBraces => (map, self.boundary.intern_list(&[dynamic, dynamic])),
+            // The empty `{}` literal's map default (`literal_return_ty`'s
+            // map arm) — and the spread-only map-decided literal
+            // (`{...m}`, the same marker): its spreads donate `Map<K, V>`
+            // arguments to the per-slot folds, `dynamic` where none is
+            // spellable. The same conventions the initializer face's
+            // `collection_init_ty` runs for the slot.
+            UntypedLiteral::EmptyBraces => {
+                let blank = trim_value_ws(bytes, open + 1, close) >= close;
+                if blank {
+                    (map, self.boundary.intern_list(&[dynamic, dynamic]))
+                } else {
+                    let (key, value) = self.entry_leaf_tys(bytes, open + 1, close);
+                    (map, self.boundary.intern_list(&[key, value]))
+                }
+            }
             UntypedLiteral::List => (
                 list,
                 self.boundary
@@ -4643,9 +4968,10 @@ impl<'a> Engine<'a> {
     /// keeps itself, an `Object` form absorbs every other, `int` /
     /// `double` / `num` mixes join at `num`, and distinct `dart:core`
     /// finals (`int`, `double`, `num`, `bool`, `String`, `Type`) share no
-    /// superinterface below `Object`. Every other mix — user classes whose
-    /// shared supertype needs the depth-ranked walk, distinct generic
-    /// instantiations, function and record shapes — and a `void`,
+    /// superinterface below `Object`. Every other mix takes the shared
+    /// superinterface walk [`Self::composite_lub`] runs (a user class pair
+    /// joins at `Pattern`, distinct generic instantiations join pairwise);
+    /// a function/record shape the walk cannot spell and a `void`,
     /// `Never`, or unknown leaf answer `None`.
     fn exact_leaf_lub(&self, leaves: &[Ty]) -> Option<Ty> {
         if leaves.is_empty() || leaves.contains(&Ty::Dynamic) {
@@ -4704,7 +5030,23 @@ impl<'a> Engine<'a> {
                 {
                     object
                 } else {
-                    return None;
+                    // Unrelated heads join at their nearest shared
+                    // superinterface — upstream `TypeSystem.leastUpperBound`'s
+                    // depth-ranked walk (`String`/`RegExp` → `Pattern`,
+                    // `least_upper_bound.dart`), which
+                    // [`Self::composite_lub`] already implements for the
+                    // composite folds. A pair whose only common supertype
+                    // is `Object` joins there, exactly as the oracle's UP
+                    // answers. A shape the walk cannot spell answers
+                    // `UNKNOWN`, and the leaf face keeps its under-report.
+                    let mut acc = forms[0];
+                    for &next in &forms[1..] {
+                        acc = self.composite_lub(acc, next, false);
+                        if acc == Ty::UNKNOWN {
+                            return None;
+                        }
+                    }
+                    acc
                 }
             }
         };
@@ -4718,9 +5060,13 @@ impl<'a> Engine<'a> {
     /// The element leaves' least row type: each top-level comma
     /// segment's own row (the push-ordered row the leaf completed with —
     /// a primitive literal's declared primitive, a bare local's declared
-    /// type, a typed nested literal's face), folded to the least type
-    /// the name-level lattice can stand ([`Self::least_leaf_ty_from`]).
-    /// A segment without an exact leaf row forces `dynamic`.
+    /// type, a typed nested literal's face), folded through the exact
+    /// join ([`Self::exact_leaf_lub`]) — the same lattice the upward
+    /// inference runs, so the direct operand answers the `Object` /
+    /// `num` / nullable joins the oracle infers instead of a name-level
+    /// under-report. A segment without an exact leaf row forces
+    /// `dynamic`; a join the lattice cannot spell answers `dynamic` too
+    /// (the is-face under-report direction).
     fn least_leaf_ty(&self, bytes: &[u8], start: usize, end: usize) -> Ty {
         let leaves: Vec<Option<Ty>> = value_comma_segments(bytes, start, end)
             .into_iter()
@@ -4729,12 +5075,17 @@ impl<'a> Engine<'a> {
         if leaves.iter().any(|leaf| leaf.is_none()) {
             return Ty::Dynamic;
         }
-        self.least_leaf_ty_from(leaves.into_iter().flatten().collect())
+        self.exact_leaf_lub(&leaves.into_iter().flatten().collect::<Vec<_>>())
+            .unwrap_or(Ty::Dynamic)
     }
 
     /// The map entry leaves' key/value least types: each segment's
-    /// top-level colon splits the sides, a colonless leaf (a spread, a
-    /// control-flow element) keeps both sides `dynamic`.
+    /// top-level colon splits the sides, a colonless map spread donates
+    /// its `Map<K, V>` arguments to the per-slot folds
+    /// ([`Self::spread_map_entry_tys`]), and any other colonless leaf
+    /// (a control-flow element, a non-map spread) keeps both sides
+    /// `dynamic`. The fold rides [`Self::exact_leaf_lub`], `dynamic`
+    /// where a slot lost every leaf or the join is unspellable.
     fn entry_leaf_tys(&self, bytes: &[u8], start: usize, end: usize) -> (Ty, Ty) {
         let mut keys = Vec::new();
         let mut values = Vec::new();
@@ -4745,8 +5096,22 @@ impl<'a> Engine<'a> {
                     values.push(self.leaf_row_ty(bytes, colon + 1, e));
                 }
                 None => {
-                    keys.push(None);
-                    values.push(None);
+                    let s = trim_value_ws(bytes, s, e);
+                    if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"...")) {
+                        match self.spread_map_entry_tys(bytes, s, e) {
+                            Some((k, v)) => {
+                                keys.push(Some(k));
+                                values.push(Some(v));
+                            }
+                            None => {
+                                keys.push(None);
+                                values.push(None);
+                            }
+                        }
+                    } else {
+                        keys.push(None);
+                        values.push(None);
+                    }
                 }
             }
         }
@@ -4754,24 +5119,93 @@ impl<'a> Engine<'a> {
             if tys.iter().any(|ty| ty.is_none()) {
                 return Ty::Dynamic;
             }
-            self.least_leaf_ty_from(tys.into_iter().flatten().collect())
+            self.exact_leaf_lub(&tys.into_iter().flatten().collect::<Vec<_>>())
+                .unwrap_or(Ty::Dynamic)
         };
         (fold(keys), fold(values))
     }
 
+    /// The map spread's per-slot donation (`{...m}` inside a map-decided
+    /// literal — `_computeElementType`'s map arm): the operand's
+    /// `Map<K, V>` arguments are the key/value leaves it contributes,
+    /// an operand whose head is an in-scope type parameter reads the
+    /// parameter's declared bound first ([`Self::bound_face`] —
+    /// `T extends Map<num, String>` donating `(num, String)`), and every
+    /// other operand shape answers `None` (the map default's `dynamic`
+    /// slot, never a guessed element). `start` is the trimmed segment
+    /// start, `...`/`...?` prefix included.
+    fn spread_map_entry_tys(&self, bytes: &[u8], start: usize, end: usize) -> Option<(Ty, Ty)> {
+        let skip = 3 + usize::from(bytes.get(start + 3) == Some(&b'?'));
+        let operand_start = trim_value_ws(bytes, start + skip, end);
+        let ty = self.bound_face(self.leaf_row_ty(bytes, operand_start, end)?);
+        let Ty::Named { name, args, .. } = ty else {
+            return None;
+        };
+        if name != self.collection_heads[2] {
+            return None;
+        }
+        let pool = self.boundary.pool();
+        let slots = pool.get(args);
+        let key = slots.first().copied().filter(|ty| *ty != Ty::UNKNOWN)?;
+        let value = slots.get(1).copied().filter(|ty| *ty != Ty::UNKNOWN)?;
+        Some((key, value))
+    }
+
     /// The leaf's own row type: the push-ordered row the segment
-    /// completed with, its push-time type only (a [`Ty::Unknown`] row —
-    /// a send, an untyped read — is no exact face and answers `None`).
-    /// Type-use rows are annotation positions, never leaves. The
+    /// completed with (a [`Ty::Unknown`] or `dynamic` answer — an
+    /// untyped read, an unresolvable send — is no exact face and answers
+    /// `None`). Type-use rows are annotation positions, never leaves. The
     /// listener's `leaf_completion_row` scan at name level. A segment
     /// no row covers answers its own literal spelling
     /// ([`Self::literal_leaf_ty`]) — the primitive literals push no
     /// row.
+    ///
+    /// A control-flow `if` element joins its BRANCH leaves before any
+    /// row scan (`typed_literal_resolver.dart` `_computeElementType`'s
+    /// IfElementImpl arm — `leastUpperBound(thenType, elseType)`, a
+    /// missing `else` keeping the then leaf): the keyword's word
+    /// boundary and the parenthesized condition detect the element, the
+    /// first top-level depth-aware `else` splits it, and each branch
+    /// walks this same read (a nested `if` joins its own, a nested
+    /// spread contributes its element). The branches join through
+    /// [`Self::exact_leaf_lub`] — the same lattice the element fold
+    /// runs — and a branch without an exact leaf answers no exact face
+    /// (the oracle's join reads `dynamic` there).
     fn leaf_row_ty(&self, bytes: &[u8], start: usize, end: usize) -> Option<Ty> {
         let start = trim_value_ws(bytes, start, end.min(bytes.len()));
         let end = end.min(bytes.len());
         if start >= end {
             return None;
+        }
+        // `if` is a reserved word: the prefix is the element, never an
+        // identifier's head, and the parenthesized condition follows.
+        let after_if = trim_value_ws(bytes, start + 2, end);
+        if bytes[start..end].starts_with(b"if")
+            && !bytes.get(start + 2).is_some_and(|b| ident_byte(*b))
+            && bytes.get(after_if) == Some(&b'(')
+            && let Some(close) = matching_bracket_fwd(bytes, after_if)
+        {
+            let then_start = trim_value_ws(bytes, close + 1, end);
+            return match value_top_level_else(bytes, close + 1, end) {
+                Some(else_at) => {
+                    let else_start = trim_value_ws(bytes, else_at + 4, end);
+                    match (
+                        self.leaf_row_ty(bytes, then_start, else_at),
+                        self.leaf_row_ty(bytes, else_start, end),
+                    ) {
+                        (Some(then_ty), Some(else_ty)) => Some(
+                            self.exact_leaf_lub(&[then_ty, else_ty])
+                                .unwrap_or(Ty::Dynamic),
+                        ),
+                        // A branch without an exact leaf (a `dynamic` read)
+                        // answers no exact face — the oracle's join reads
+                        // `dynamic` there, the same face a `None` leaf
+                        // forces through the literal fold.
+                        _ => None,
+                    }
+                }
+                None => self.leaf_row_ty(bytes, then_start, end),
+            };
         }
         let (s16, e16) = (self.utf16_of(start), self.utf16_of(end));
         // A leaf's own row may live on either stack: the enclosing list
@@ -4808,7 +5242,13 @@ impl<'a> Engine<'a> {
             // `dynamic` upstream — `_computeElementType`'s else arm).
             return self.spread_element_ty(row);
         }
-        let ty = row.ty;
+        // The leaf's face reads through the row's re-derived static type
+        // ([`Self::operand_static_ty`] — a creation leaf's `Unknown` push
+        // answers its created type, `new RegExp('.')` is `RegExp`, and a
+        // send answers the callee's declared return). An `Unknown` or
+        // `dynamic` answer stays no exact face (the under-report
+        // direction) and falls to the literal spelling.
+        let ty = self.operand_static_ty(row);
         (ty != Ty::UNKNOWN && ty != Ty::Dynamic)
             .then_some(ty)
             .or_else(|| self.literal_leaf_ty(bytes, start, end))
@@ -4924,58 +5364,6 @@ impl<'a> Engine<'a> {
             prev = c;
         }
         Some(Ty::named(if is_double { ids[1] } else { ids[0] }))
-    }
-
-    /// The collected leaf types' least face: one exact type keeps
-    /// itself, `int` mixed with `double` lifts to `num`, unrelated
-    /// non-nullable interface faces lift to bare `Object` (the official
-    /// LUB of the oracle's list inference — every target the lifted list
-    /// folds, this folds), everything else — a nullable leaf (whose lift
-    /// rides the nullability union this face does not recompute),
-    /// `Null` leaves, function/record faces — keeps `dynamic` (the
-    /// under-report).
-    fn least_leaf_ty_from(&self, tys: Vec<Ty>) -> Ty {
-        let int = Ty::named(self.members.primitive_ids[0]);
-        let double = Ty::named(self.members.primitive_ids[1]);
-        let mut first: Option<Ty> = None;
-        let mut diverse = false;
-        let mut other_face = false;
-        for ty in tys.iter().copied() {
-            if ty == Ty::Dynamic {
-                return Ty::Dynamic;
-            }
-            if ty != int && ty != double {
-                other_face = true;
-            }
-            match first {
-                None => first = Some(ty),
-                Some(prev) if prev != ty => diverse = true,
-                Some(_) => {}
-            }
-        }
-        // The unrelated-face lift: bare `Object` folds exactly where the
-        // oracle's inferred `List<Object>` folds (every non-nullable
-        // interface face subtypes `Object`, so the argument legs agree in
-        // both directions); a leaf outside that shape answers no
-        // recomputable LUB here.
-        let object_lift = tys.iter().all(|ty| {
-            matches!(
-                ty,
-                Ty::Named {
-                    nullable: false,
-                    ..
-                }
-            )
-        });
-        match first {
-            None => Ty::Dynamic,
-            Some(ty) if !diverse => ty,
-            // The int/double pair is the one diverse fold the lattice
-            // names exactly (`num`).
-            Some(_) if !other_face => Ty::named(self.members.primitive_ids[2]),
-            Some(_) if object_lift => Ty::named(self.intern("Object")),
-            Some(_) => Ty::Dynamic,
-        }
     }
 
     /// The closure literal's function type at an `is` operand
@@ -5224,15 +5612,15 @@ impl<'a> Engine<'a> {
                 .top_level_decl(operand.name)
                 .map(|decl| {
                     let bounds = self
-                        .exec_bounds
-                        .get(&operand.name)
-                        .or_else(|| self.method_exec_bounds.get(&operand.name));
+                        .own_exec_window(operand.name, false)
+                        .or_else(|| self.own_exec_window(operand.name, true));
                     decl.type_param_names
                         .iter()
                         .copied()
                         .map(|name| {
                             let bound = bounds.and_then(|window| {
                                 window
+                                    .params
                                     .iter()
                                     .find(|(param, _)| *param == name)
                                     .map(|(_, bound)| *bound)
@@ -5475,6 +5863,16 @@ impl<'a> Engine<'a> {
             // stays out (the raw face keeps the nullability the null-aware
             // junctions need; the documented generic under-report).
             Receiver::Created { name, .. } => (*name, false),
+            // A member read spelled through the container NAME (`A.sm`) —
+            // the static-member face: the read's static type is the
+            // member's own value face (`Identifier.staticType` over a
+            // static method is its tear-off signature — `A.foo!` reports
+            // `unnecessary_non_null_assertion` over `void Function()`,
+            // UnnecessaryNonNullAssertionTest.test_nonNull_method). The
+            // constructor selectors (`C.new`) answered earlier through
+            // [`Self::ctor_tear_off_ty`]; the raw face stands (a bare
+            // container name carries no written instantiation).
+            Receiver::Container { name, .. } => (*name, false),
             _ => return None,
         };
         let found = if super_walk {
@@ -5485,6 +5883,13 @@ impl<'a> Engine<'a> {
         let Walk::Found(entry) = found else {
             return None;
         };
+        // The container-name arm is the STATIC face: an instance member
+        // reached through `A.m` is the invalid-access shape whose typing
+        // the error's own lane owns — only a static member's value face
+        // answers here.
+        if matches!(recv, Receiver::Container { .. }) && !entry.is_static {
+            return None;
+        }
         // A generic member keeps its own `<T>` group on the signature face
         // (`member_entry_tear_off_ty` carries it as `type_params_named`);
         // the receiver instantiation's `subst_params` re-interns a
@@ -5647,27 +6052,46 @@ impl<'a> Engine<'a> {
         };
         let (resolved, class) = match *recv {
             Receiver::Container { name, .. } => (
-                resolve_container(
+                match resolve_container(
                     self.graph,
                     self.namespaces,
                     self.index,
                     self.lib,
                     self.file,
                     name,
-                )?,
+                ) {
+                    Some(hit) => hit,
+                    // An unindexed SDK container (`List.filled`'s receiver)
+                    // or an ungrounded alias head: the core-constructor
+                    // table owns that face.
+                    None => return self.core_ctor_face(row),
+                },
                 name,
             ),
             Receiver::PrefixedContainer { prefix, name, .. } => (
-                prefixed_container(
+                match prefixed_container(
                     self.graph,
                     self.namespaces,
                     self.index,
                     self.lib,
                     prefix,
                     name,
-                )?,
+                ) {
+                    Some(hit) => hit,
+                    None => return self.core_ctor_face(row),
+                },
                 name,
             ),
+            // The grounding postures an unindexed receiver head leaves:
+            // the listener grounds an alias whose right-hand head resolves
+            // to no indexed container (`typedef IntList = List<int>`'s
+            // receiver) to `Typed` carrying the right-hand type as
+            // written (a generic alias keeps its unsubstituted `T`), and
+            // a bare SDK head with a written group (`List<int>.filled`)
+            // stays `Unknown` — no container ever arms for either, so
+            // the source bytes' spelling (the fold's own start) are the
+            // only face left: the core-constructor table's.
+            Receiver::Typed { .. } | Receiver::Unknown => return self.core_ctor_face(row),
             _ => return None,
         };
         let (container, owner) = resolved;
@@ -5807,6 +6231,350 @@ impl<'a> Engine<'a> {
         Some(ty)
     }
 
+    /// The receiver head's written spelling at a constructor tear-off
+    /// operand, with its written type-argument group when one closed on
+    /// the head (`IntList` / `MyList` / `List` before the `.`). The
+    /// merged row anchors the selector, so the head sits before the `.`:
+    /// the walk recovers the SPELLING (the alias the source wrote — the
+    /// row's own receiver may be a `Typed` grounding or `Unknown`, and a
+    /// grounded expansion head drops its right-hand-side arguments)
+    /// beside the group's arguments — a `call_type_args` entry or the
+    /// #610 `completed_group` latch keyed at the head's offset first,
+    /// the written bytes between the balanced brackets otherwise
+    /// ([`Self::written_group_tys`] — an expression head's group keys
+    /// neither latch, the #2917 hole). [`Self::receiver_group_args`]
+    /// delegates here for the group answer alone.
+    fn receiver_head_face(&self, row: &Row) -> Option<(StringId, Option<Vec<Ty>>)> {
+        let is_ident = |b: u8| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+        let mut p = self.byte_of(row.range.offset);
+        let bytes = self.source.as_bytes();
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p == 0 || bytes[p - 1] != b'.' {
+            return None;
+        }
+        p -= 1;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p == 0 {
+            return None;
+        }
+        if bytes[p - 1] != b'>' {
+            // The bare head: an identifier run ends at `p`.
+            let mut ident = p;
+            while ident > 0 && is_ident(bytes[ident - 1]) {
+                ident -= 1;
+            }
+            if ident == p {
+                return None;
+            }
+            let spelling = std::str::from_utf8(&bytes[ident..p]).ok()?;
+            return Some((self.intern(spelling), None));
+        }
+        // `Head<...>` ends in `>`: walk back to the matching `<`, then to
+        // the head ident's start — the group latches' key.
+        let mut depth = 0usize;
+        let mut scan = p - 1;
+        let head_open = loop {
+            if scan == 0 {
+                return None;
+            }
+            scan -= 1;
+            match bytes[scan] {
+                b'>' => depth += 1,
+                b'<' => {
+                    if depth == 0 {
+                        break scan;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        };
+        let mut ident = head_open;
+        while ident > 0 && is_ident(bytes[ident - 1]) {
+            ident -= 1;
+        }
+        if ident == head_open {
+            return None;
+        }
+        let head_offset = self.utf16_of(ident);
+        let spelling = std::str::from_utf8(&bytes[ident..head_open]).ok()?;
+        let head = self.intern(spelling);
+        let group = if let Some((_, entry)) = self
+            .call_type_args
+            .iter()
+            .find(|(offset, _)| *offset == head_offset)
+        {
+            Some(entry.tys.to_vec())
+        } else if let Some((_, group_offset, args)) = &self.completed_group
+            && *group_offset == head_offset
+        {
+            Some(args.clone())
+        } else {
+            // Neither latch holds an expression head's group (the #2917
+            // hole: `call_type_args` keys only headless groups,
+            // `completed_group` only declaration heads) — but the group
+            // is written in the bytes the walk already bounds.
+            self.written_group_tys(head_open, p - 1)
+        };
+        Some((head, group))
+    }
+
+    /// The written type-argument spellings between a balanced `<` (at
+    /// `open`) and its `>` (at `close`): simple named forms alone — an
+    /// identifier head, an optional nested group, an optional trailing
+    /// `?` (`int`, `String?`, `List<int>`, `dynamic`). Anything else
+    /// (function syntax, `void`, a dotted prefix, `dynamic?`) keeps the
+    /// under-report: the family's groups are plain instantiations, and
+    /// an out-of-claim spelling is the honest decline.
+    fn written_group_tys(&self, open: usize, close: usize) -> Option<Vec<Ty>> {
+        let is_ident = |b: u8| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+        let bytes = self.source.as_bytes();
+        let mut cursor = open + 1;
+        let mut args = Vec::new();
+        loop {
+            while cursor < close && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let start = cursor;
+            while cursor < close && is_ident(bytes[cursor]) {
+                cursor += 1;
+            }
+            if cursor == start {
+                return None;
+            }
+            let head = std::str::from_utf8(&bytes[start..cursor]).ok()?;
+            let mut nested: Vec<Ty> = Vec::new();
+            if cursor < close && bytes[cursor] == b'<' {
+                let mut depth = 0usize;
+                let mut scan = cursor;
+                while scan < close {
+                    match bytes[scan] {
+                        b'<' => depth += 1,
+                        b'>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    scan += 1;
+                }
+                if scan >= close {
+                    return None;
+                }
+                nested = self.written_group_tys(cursor, scan)?;
+                cursor = scan + 1;
+            }
+            let nullable = cursor < close && bytes[cursor] == b'?';
+            if nullable {
+                cursor += 1;
+            }
+            if head == "dynamic" {
+                if !nested.is_empty() || nullable {
+                    return None;
+                }
+                args.push(Ty::Dynamic);
+            } else {
+                let arg_list = self.boundary.args.borrow_mut().intern(&nested);
+                args.push(Ty::Named {
+                    name: self.intern(head),
+                    nullable,
+                    args: arg_list,
+                });
+            }
+            while cursor < close && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor == close {
+                return Some(args);
+            }
+            if bytes[cursor] != b',' {
+                return None;
+            }
+            cursor += 1;
+        }
+    }
+
+    /// The core-constructor tear-off face — the SDK containers' factory
+    /// selectors ([`crate::member_face::CORE_CTOR_FORMALS`], the
+    /// reference SDK's own signature table) whose element index cannot
+    /// answer: the SDK units are unindexed, so `resolve_container`
+    /// chain-breaks at the receiver and the declared-constructor table
+    /// never arms — every `List.filled` tear-off through a typedef
+    /// (`typedef IntList = List<int>`'s `IntList.filled`, the
+    /// co19 `tearing_off_from_typedef` family) stayed the under-report
+    /// `None` before this face.
+    ///
+    /// The receiver's head comes from the source bytes
+    /// ([`Self::receiver_head_face`]) — the row's receiver name may be a
+    /// grounded alias head whose right-hand-side arguments the grounding
+    /// dropped, and those arguments instantiate the tear-off
+    /// (`IntList`'s `List<int>` reads `E` as `int`):
+    ///
+    /// * a written `<...>` group instantiates directly
+    ///   (`List<int>.filled`) or substitutes a GENERIC alias's own
+    ///   parameters (`typedef MyList<T> = List<T>` written
+    ///   `MyList<int>.filled` — the right-hand `T` reads the written
+    ///   `int`);
+    /// * a bare NON-generic alias reads its right-hand side's arguments
+    ///   (`IntList.filled` — `[int]`); a spelled group on a non-generic
+    ///   alias is the wrong-type-argument-count face's own report, so
+    ///   the fold declines it;
+    /// * a bare SDK head with no alias (`List.filled`) is the generic
+    ///   tear-off form — outside this face's claim, the under-report.
+    ///
+    /// A foreign alias (declared in another library) and a chain past
+    /// the loop bound keep the same under-report. The tear-off's return
+    /// is the container head instantiated with the receiver's arguments
+    /// — the same face [`Self::ctor_selector_ty`] builds for an indexed
+    /// container.
+    fn core_ctor_face(&self, row: &Row) -> Option<Ty> {
+        use crate::member_face::{CoreCtorArg, core_ctor_formals};
+        let (mut head, written) = self.receiver_head_face(row)?;
+        let mut elem: Option<Vec<Ty>> = written.clone();
+        for _ in 0..4 {
+            if let Some((positional, named)) =
+                core_ctor_formals(self.strings.resolve(head), self.strings.resolve(row.name))
+            {
+                let elem = elem?;
+                let ret_args = self.boundary.args.borrow_mut().intern(&elem);
+                let return_ty = Ty::Named {
+                    name: head,
+                    nullable: false,
+                    args: ret_args,
+                };
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|arg| self.core_ctor_arg_ty(arg, &elem))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, arg)| (self.intern(name), self.core_ctor_arg_ty(arg, &elem)))
+                    .collect();
+                // Every table row's positionals are required — no
+                // optional-positional factory formals in the covered set.
+                let required = positional.len() as u16;
+                let ty = self.boundary.args.borrow_mut().function_required(
+                    0,
+                    required,
+                    return_ty,
+                    &positional,
+                    &named,
+                    false,
+                );
+                return Some(ty);
+            }
+            // The alias fold: this hop's head names a type alias whose
+            // named right-hand side re-heads the walk (chained aliases
+            // fold up to the bound).
+            let decl = self.top_level_decl(head)?;
+            if decl.kind != MicroKind::TypeAlias || decl.var_ty == Ty::UNKNOWN {
+                return None;
+            }
+            let Ty::Named {
+                name: next,
+                nullable: false,
+                args,
+            } = decl.var_ty
+            else {
+                return None;
+            };
+            if decl.type_params == 0 {
+                // A spelled group on a non-generic alias is the count
+                // face's report, never an instantiation.
+                if written.is_some() {
+                    return None;
+                }
+                elem = Some({
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                });
+            } else {
+                // The alias's own parameters substitute by the written
+                // group before the right-hand arguments read.
+                let written = elem.as_ref()?;
+                let subst: FxHashMap<StringId, Ty> = decl
+                    .type_param_names
+                    .iter()
+                    .zip(written.iter().copied())
+                    .map(|(name, ty)| (*name, ty))
+                    .collect();
+                let rhs = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                };
+                elem = Some(
+                    rhs.into_iter()
+                        .map(|ty| self.subst_named_leaves(ty, &subst))
+                        .collect(),
+                );
+            }
+            head = next;
+        }
+        None
+    }
+
+    /// One [`crate::member_face::CoreCtorArg`] resolved against the
+    /// receiver's element arguments.
+    fn core_ctor_arg_ty(&self, arg: &crate::member_face::CoreCtorArg, elem: &[Ty]) -> Ty {
+        use crate::member_face::CoreCtorArg;
+        match arg {
+            CoreCtorArg::Fixed(spelling) => self.core_spelling_ty(spelling),
+            CoreCtorArg::Param(index) => elem
+                .get(usize::from(*index))
+                .copied()
+                .unwrap_or(Ty::Dynamic),
+            CoreCtorArg::FixedGeneric(head, spellings) => {
+                let args: Vec<Ty> = spellings
+                    .iter()
+                    .map(|spelling| self.core_spelling_ty(spelling))
+                    .collect();
+                let args = self.boundary.args.borrow_mut().intern(&args);
+                Ty::Named {
+                    name: self.intern(head),
+                    nullable: false,
+                    args,
+                }
+            }
+            CoreCtorArg::Params(head, count) => {
+                let args: Vec<Ty> = (0..*count)
+                    .map(|index| elem.get(usize::from(index)).copied().unwrap_or(Ty::Dynamic))
+                    .collect();
+                let args = self.boundary.args.borrow_mut().intern(&args);
+                Ty::Named {
+                    name: self.intern(head),
+                    nullable: false,
+                    args,
+                }
+            }
+        }
+    }
+
+    /// One fixed spelling of a core-constructor formal: `dynamic`, or a
+    /// named head with an optional `?` nullability suffix (`Object?`).
+    fn core_spelling_ty(&self, spelling: &str) -> Ty {
+        if spelling == "dynamic" {
+            return Ty::Dynamic;
+        }
+        if let Some(head) = spelling.strip_suffix('?') {
+            return Ty::Named {
+                name: self.intern(head),
+                nullable: true,
+                args: ArgListId::EMPTY,
+            };
+        }
+        Ty::Named {
+            name: self.intern(spelling),
+            nullable: false,
+            args: ArgListId::EMPTY,
+        }
+    }
+
     /// The named-leaf substitution over a captured type: a bare `Named`
     /// head the map holds reads its entry; an argument list re-interns
     /// bottom-up; a function shape re-interns its parts with its own
@@ -5914,7 +6682,6 @@ impl<'a> Engine<'a> {
         if let Some((_, type_params, ret, positional, named, required_positional)) =
             self.bounds.alias_fn_shape(name)
         {
-            let required = required_positional;
             let ret = ret.map_or(Ty::Dynamic, |tree| self.tree_ty(tree));
             let positional: Vec<Ty> = positional.iter().map(|tree| self.tree_ty(tree)).collect();
             let named: Vec<(StringId, Ty)> = named
@@ -5925,25 +6692,35 @@ impl<'a> Engine<'a> {
                 .iter()
                 .map(|(name, bound, _)| (*name, bound.as_ref().map(|b| self.tree_ty(b))))
                 .collect();
-            let ty = self.boundary.args.borrow_mut().function_generic(
+            // The capture's honest required-positional count rides the
+            // shape itself: `typedef TOpt = void Function([int])` spells
+            // an optional positional formal, and a split-blind intern
+            // would merge that face with the all-required
+            // `Function(int)` id — `fn_face_sig`'s fallback then reads
+            // `positional.len()` off the merged shape and the arity gate
+            // (`_isFunctionSubtypeOf`'s required rule,
+            // subtype.dart:363-369) answers the wrong side, proving
+            // `req is TOpt` constant-true where the oracle stays silent.
+            // The count also lands in `fn_shape_required` keyed by the
+            // honest id: a `canonical_dotted_ty` leaf rewrite that
+            // re-interns the face copies it across onto the new shape.
+            // A capture without the count (a persisted pre-split
+            // payload) keeps the all-required reading.
+            let required = required_positional
+                .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+                .unwrap_or_else(|| u16::try_from(positional.len()).unwrap_or(u16::MAX));
+            let ty = self.boundary.args.borrow_mut().function_generic_required(
                 &type_params,
+                required,
                 ret,
                 &positional,
                 &named,
                 nullable,
             );
-            // The capture's honest required-positional count rides the
-            // shape: `typedef int f<T>([int? a])` spells all-optional
-            // formals, which the pooled `Function(...)` id merges with the
-            // all-required `Function(int?, ...)`. Without this record the
-            // arity gate reads `required = positional.len` and answers the
-            // wrong side of `_isFunctionSubtypeOf`'s rule.
-            if let (Some(required), Ty::Function { shape, .. }) = (required, ty)
+            if let Ty::Function { shape, .. } = ty
                 && shape != crate::model::FnShapeId::EMPTY
             {
-                self.fn_shape_required
-                    .entry(shape)
-                    .or_insert(u16::try_from(required).unwrap_or(u16::MAX));
+                self.fn_shape_required.entry(shape).or_insert(required);
             }
             return Some(ty);
         }
@@ -5993,23 +6770,16 @@ impl<'a> Engine<'a> {
     /// Rebuilds a non-generic `Ty::Function`'s [`FnVarSig`] with the honest
     /// required-positional count the written signature carried — the
     /// `fn_shape_required` side table the listener seals at each
-    /// `end_function_type`. The canonical `FnShapeId` merges required and
-    /// optional positionals (`Function(int)` and `Function([int])` are one
-    /// id), so the arity gate [`Self::fn_sig_subtype`] runs upstream
-    /// (`_isFunctionSubtypeOf`'s `required` rule, subtype.dart:107-113)
-    /// cannot read the split off the pool. A shape with no recorded
-    /// spelling — a declaration signature or an alias RHS folded through
-    /// the pool — keeps the all-required face the count-only rebuild
-    /// [`crate::diagnose::types`] `canonical_dotted_ty` plus the
-    /// required-count propagation the re-intern loses: the rewrite builds
-    /// a new `FnShapeId` when a `core.`/`p.` leaf changed, and that id
-    /// answers `positional.len()` (the all-required face) in
-    /// [`Self::fn_face_sig`] — a `core.List<int> Function(int, [int])`
-    /// face would read required 2 where the written signature said 1. The
-    /// written count is a positional-LAYOUT fact the leaf rewrite
-    /// preserves, so it copies across onto the new shape — the
-    /// `last_fn_seal` pair first (the written site's own answer), then the
-    /// map's record for the old id.
+    /// `end_function_type`. The required/optional split is part of the
+    /// shape identity ([`FnShape::required_positional`]), but a face
+    /// re-interned by the count-blind leaf-rewrite path lands on the
+    /// all-required id — [`Self::fn_face_sig`]'s fallback then reads that
+    /// shape's `required_positional`, which answers `positional.len()` —
+    /// a `core.List<int> Function(int, [int])` face would read required 2
+    /// where the written signature said 1. The written count is a
+    /// positional-LAYOUT fact the leaf rewrite preserves, so it copies
+    /// across onto the new shape — the `last_fn_seal` pair first (the
+    /// written site's own answer), then the map's record for the old id.
     fn canonical_function_ty(&mut self, ty: Ty) -> Ty {
         let before = match ty {
             Ty::Function { shape, .. } if shape != crate::model::FnShapeId::EMPTY => Some(shape),
@@ -6366,6 +7136,81 @@ impl<'a> Engine<'a> {
             && shape.positional.is_empty()
             && shape.named.is_empty()
             && shape.return_ty == Ty::Unknown
+    }
+
+    /// The bare alias fold's split repair: [`Self::fold_alias_ty`] answers
+    /// a function-RHS alias with the RHS shape interned at capture, whose
+    /// producer is split-blind — `typedef TOpt = void Function([int])`
+    /// interns as the all-required `void Function(int)` id and shares it
+    /// with every all-required spelling, so `req is TOpt` proves
+    /// constant-true by pooled reflexivity where the oracle stays silent
+    /// (`_isFunctionSubtypeOf`'s required rule, subtype.dart:363-369).
+    /// The capture's honest required-positional count re-interns the face
+    /// onto its own id (the #3511 identity contract: the two spellings are
+    /// distinct types); a capture without the count, a non-alias target,
+    /// or an already-honest face keeps the fold as written.
+    fn repair_alias_fold_split(&mut self, armed: Ty, folded: Ty) -> Ty {
+        let Ty::Named {
+            name,
+            args: ArgListId::EMPTY,
+            ..
+        } = armed
+        else {
+            return folded;
+        };
+        let Ty::Function { shape, nullable } = folded else {
+            return folded;
+        };
+        if shape == crate::model::FnShapeId::EMPTY {
+            return folded;
+        }
+        let Some((.., required_positional)) = self.bounds.alias_fn_shape(name) else {
+            return folded;
+        };
+        let Some(required) = required_positional.and_then(|n| u16::try_from(n).ok()) else {
+            return folded;
+        };
+        let (type_params_named, type_params, return_ty, positional, named, split_blind) = {
+            let pool = self.boundary.pool();
+            let s = pool.function_shape(shape);
+            (
+                s.type_params_named.to_vec(),
+                s.type_params,
+                s.return_ty,
+                s.positional.to_vec(),
+                s.named.to_vec(),
+                s.required_positional != required,
+            )
+        };
+        if !split_blind {
+            return folded;
+        }
+        // A count-only shape keeps anonymous entries — the same rebuild
+        // `fn_face_sig` answers for unwritten parameter spellings.
+        let params: Vec<(StringId, Option<Ty>)> = if type_params_named.is_empty() {
+            (0..usize::from(type_params))
+                .map(|_| (StringId::NONE, None))
+                .collect()
+        } else {
+            type_params_named
+        };
+        let repaired = self.boundary.args.borrow_mut().function_generic_required(
+            &params,
+            required,
+            return_ty,
+            &positional,
+            &named,
+            nullable,
+        );
+        if let Ty::Function { shape: honest, .. } = repaired
+            && honest != crate::model::FnShapeId::EMPTY
+        {
+            // The count rides the map for the leaf-rewrite copies
+            // (`canonical_function_ty` re-interns the face and reads it
+            // back here).
+            self.fn_shape_required.entry(honest).or_insert(required);
+        }
+        repaired
     }
 
     fn sentinel_walk(&self, ty: Ty, unknown_return_counts: bool) -> bool {
@@ -7345,10 +8190,13 @@ impl<'a> Engine<'a> {
         Some(params.iter().map(|(name, _)| *name).zip(list).collect())
     }
 
-    /// already produced. `None` for a non-function or nullable face.
-    /// `required` overrides the map answer for a caller that knows the
-    /// face's own written site (`check_type_check`'s `last_fn_seal` match)
-    /// — the per-site count the shared `FnShapeId` cannot carry.
+    /// The pooled shape's face as an [`FnVarSig`]: the required-positional
+    /// count reads, in order, the caller's `required` override (the face's
+    /// own written site — `check_type_check`'s `last_fn_seal` match), the
+    /// `fn_shape_required` map (a spelling a count-blind re-intern lost),
+    /// and finally the shape's own `required_positional` field (the honest
+    /// written count for the split-aware producers, the all-required
+    /// reading for the rest). `None` for a non-function or nullable face.
     fn fn_face_sig(&self, ty: Ty, required: Option<u16>) -> Option<Box<FnVarSig>> {
         let Ty::Function {
             shape,
@@ -7692,87 +8540,12 @@ impl<'a> Engine<'a> {
     }
 
     /// The receiver head's written type-argument list at a constructor
-    /// tear-off operand (`C<int>` of `C<int>.constr`): the merged row
-    /// anchors the member token, so the receiver's head byte sits
-    /// before the `.` — walk the bytes back over the selector and the
-    /// balanced `<...>` group, then read the `call_type_args` entry
-    /// keyed at the head's offset. `None` when no group was written
-    /// (the bare `C` face, whose all-dynamic raw face a `C<int>`
-    /// checked spelling cannot spell).
+    /// tear-off operand (`C<int>` of `C<int>.constr`): the shared head
+    /// walk ([`Self::receiver_head_face`]) with its group answer alone.
+    /// `None` when no group was written (the bare `C` face, whose
+    /// all-dynamic raw face a `C<int>` checked spelling cannot spell).
     fn receiver_group_args(&self, row: &Row) -> Option<Vec<Ty>> {
-        // The selector's token start minus one: the `.` sits there
-        // (possibly through whitespace). The head's last byte is the
-        // `>` of the closed group for `C<int>` — or the head ident's
-        // end for the bare `C` face.
-        let mut p = self.byte_of(row.range.offset);
-        let bytes = self.source.as_bytes();
-        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
-            p -= 1;
-        }
-        if p == 0 || bytes[p - 1] != b'.' {
-            return None;
-        }
-        p -= 1;
-        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
-            p -= 1;
-        }
-        if p == 0 {
-            return None;
-        }
-        // `C<int>` ends in `>`: walk back to its matching `<`, then to
-        // the head ident's start — the `call_type_args` key.
-        if bytes[p - 1] != b'>' {
-            return None;
-        }
-        let mut depth = 0usize;
-        let mut scan = p - 1;
-        let head_open = loop {
-            if scan == 0 {
-                return None;
-            }
-            scan -= 1;
-            match bytes[scan] {
-                b'>' => depth += 1,
-                b'<' => {
-                    if depth == 0 {
-                        break scan;
-                    }
-                    depth -= 1;
-                }
-                _ => {}
-            }
-        };
-        let mut ident = head_open;
-        while ident > 0
-            && matches!(bytes[ident - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
-        {
-            ident -= 1;
-        }
-        if ident == head_open {
-            return None;
-        }
-        let head_offset = self.utf16_of(ident);
-        if let Some((_, entry)) = self
-            .call_type_args
-            .iter()
-            .find(|(offset, _)| *offset == head_offset)
-        {
-            return Some(entry.tys.to_vec());
-        }
-        // A type-head group (`C<int>.new`) never keys the call-args table:
-        // the group closes with a TYPE head (end_type_arguments' head arm
-        // skips `call_args_end`), so its written arguments ride the #610
-        // completed-group latch until a declaration consumes it — and a
-        // constructor-reference selector is an expression head, no
-        // declaration ever fires. The latch keys at the same head offset
-        // the byte walk recovered; an unrelated later head replaces it
-        // (the latch's own reset rule), so a stale entry cannot answer.
-        if let Some((_, group_offset, args)) = &self.completed_group
-            && *group_offset == head_offset
-        {
-            return Some(args.clone());
-        }
-        None
+        self.receiver_head_face(row).and_then(|(_, group)| group)
     }
 
     /// A function-typed operand/checked spelling rebuilt with the
@@ -8072,7 +8845,7 @@ impl<'a> Engine<'a> {
         // [`Self::parameterized_alias_fn_ty`] can re-read the alias's own
         // RHS and land the instantiated signature, so the stub hands over.
         let mut checked = {
-            let folded = self.fold_alias_ty(armed);
+            let folded = self.repair_alias_fold_split(armed, self.fold_alias_ty(armed));
             match folded {
                 Ty::Function { shape, .. } if self.is_armed_head_stub(shape) => {
                     self.parameterized_alias_fn_ty(armed).unwrap_or(folded)
@@ -8441,9 +9214,14 @@ impl<'a> Engine<'a> {
         // #2813) reads the same official leaves as the checked side. The
         // `Never` unit fold canonicalizes the written-leaf captures
         // (#2842 — `typedef Fun(Never a, Never b)`'s synthesized formals)
-        // before any structural leg asks.
-        let operand_ty =
-            self.normalized_never(self.official_fn_face(self.fold_alias_ty(operand_ty)));
+        // before any structural leg asks. The bare alias fold repairs its
+        // split-blind capture intern the same way the target side does:
+        // an operand declared `TOpt opt` carries the alias's honest
+        // required-positional count onto its own shape id.
+        let operand_ty = {
+            let folded = self.repair_alias_fold_split(operand_ty, self.fold_alias_ty(operand_ty));
+            self.normalized_never(self.official_fn_face(folded))
+        };
         // The function-RHS typedef arm above fires on the operand face too:
         // `Alias f; f is F` reads `f`'s declared `Alias` head, whose
         // captured `Ty::Function` the verdict's function rule answers.
@@ -8784,6 +9562,22 @@ impl<'a> Engine<'a> {
             }
             return self.untyped_operand_ty(row);
         }
+        // A `this`/`super` keyword invoke is the implicit-`call` dispatch
+        // on the enclosing instance (`this(42)` over `class C { String
+        // call(int) ... }`): the invoked expression is the keyword whose
+        // face is the container's `thisType`, and the send's static type
+        // is its `call` member's declared return — the same rewrite every
+        // callable receiver runs. No `call` member keeps the under-report
+        // (the arm only ever answers a resolved member).
+        if let RowShape::Receiver(
+            Receiver::This { container, kind } | Receiver::Super { container, kind },
+        ) = &row.shape
+        {
+            let this_ty = self.this_static_ty(*container, *kind);
+            if let Some((_, call_ret, _)) = self.implicit_call_face(this_ty) {
+                return call_ret;
+            }
+        }
         // A send on a formal whose written annotation is a function type
         // (`bool Function(E) test`) reads its signature's return — the
         // row's `ty` is the formal's own declared type (or a fragment of
@@ -8876,7 +9670,14 @@ impl<'a> Engine<'a> {
             // names a result keeps that result: `Function top()` reads
             // `Function`, never the interface's `dynamic` dispatch face —
             // the callee spelling (`Function f` invoked `f()`, whose
-            // declaration names no return) keeps the dispatch below.
+            // declaration names no return) is the dispatch:
+            // `InvocationInferrer.computeInvokeReturnType`'s else arm
+            // (invocation_inferrer.dart:727-733) types every invoke whose
+            // callee face is not a function signature `dynamic`, so a
+            // `Function`-typed local/param's send is `dynamic` — strictly
+            // non-nullable's question never fires on it (`f2(42)!` stays
+            // silent, co19 `null_check_operator_A02_t01`'s rows) and the
+            // result assigns everywhere the oracle's `dynamic` does.
             if !row.qualified
                 && let Ty::Named { name, .. } = row.ty
                 && self.strings.resolve(name) == "Function"
@@ -8885,6 +9686,7 @@ impl<'a> Engine<'a> {
                 if declared != Ty::UNKNOWN {
                     return declared;
                 }
+                return Ty::Dynamic;
             }
             // A function-typed callee (or the bare `Function` interface)
             // answers the send face ([`Self::invoked_callee_result`]).
@@ -9070,17 +9872,25 @@ impl<'a> Engine<'a> {
         (self.declared_type_params_of_container(name) == Some(0)).then_some(entry.return_ty)
     }
 
-    /// `TypeSystem::flatten` at name level — see [`flatten_ty`] for the
-    /// head/nullability arms. This method adds the type-parameter arm the
-    /// name-level helper cannot reach (type_system.dart:437-454): an
-    /// in-scope parameter `X` flattens through its captured bound — `X
-    /// extends Future<A>` awaits to `A`, `X extends FutureOr<A>` to `A`,
-    /// `X extends A` stays `X`, a chained parameter (`X extends Y`,
-    /// `Y extends Future<A>`) recurses through `Y`. The bound itself is
-    /// fed back through this method so a `Future<A>?` bound awaits to
-    /// `A?` and a bare `Future` bound awaits to `dynamic`. Unbounded or
-    /// non-Future bounds leave the parameter spelled as written
-    /// (identity), mirroring the oracle's `otherwise flatten(X)` return.
+    /// `TypeSystem::flatten` — see [`flatten_ty`] for the head/nullability
+    /// arms. This method adds the two arms the name-level helper cannot
+    /// reach:
+    ///
+    /// * the type-parameter arm (upstream Dart SDK source,
+    ///   `pkg/analyzer/lib/src/dart/element/type_system.dart`:423-435): an
+    ///   in-scope parameter `X` flattens through its captured bound — `X
+    ///   extends Future<A>` awaits to `A`, `X extends FutureOr<A>` to `A`,
+    ///   `X extends A` stays `X`, a chained parameter (`X extends Y`,
+    ///   `Y extends Future<A>`) recurses through `Y`. The bound itself is
+    ///   fed back through this method so a `Future<A>?` bound awaits to
+    ///   `A?` and a bare `Future` bound awaits to `dynamic`. Unbounded or
+    ///   non-Future bounds leave the parameter spelled as written
+    ///   (identity), mirroring the oracle's `otherwise flatten(X)` return.
+    /// * the derived-future arm — upstream's `futureType(T)` walks
+    ///   `T.asInstanceOf(futureElement)` (:464-478), so a user class,
+    ///   mixin, enum, or extension type that `implements Future<E>` awaits
+    ///   to `E` ([`Self::future_supertype_arg`]).
+    ///
     /// The walk is bounded by the parameter chain: a bound that names
     /// the parameter itself (`X extends X` — rejected upstream) or loops
     /// back would re-enter; the `depth` guard caps the recursion at the
@@ -9164,7 +9974,54 @@ impl<'a> Engine<'a> {
                 return ty;
             }
         }
-        flatten_ty(self.strings, &self.boundary.pool(), ty)
+        let flat = flatten_ty(self.strings, &self.boundary.pool(), ty);
+        if flat != ty {
+            return flat;
+        }
+        // The derived-future arm (`TypeSystem.futureType`'s
+        // `T.asInstanceOf(futureElement)` walk, type_system.dart:464-478):
+        // a written head that is neither `Future` nor `FutureOr` — the
+        // name-level helper already answered both — but maps into
+        // `Future<E>` through its superinterface chain awaits to `E`.
+        // `flatten(SubFuture)` is `int`, never `flatten(int)` again: the
+        // official flatten takes the future type's argument verbatim
+        // (`flatten(Future<Future<int>>)` is `Future<int>`, :443-455), so
+        // the argument is NOT fed back through this method.
+        if depth > 0
+            && let Some(arg) = self.future_supertype_arg(name, list)
+        {
+            return arg;
+        }
+        ty
+    }
+
+    /// `T`'s `Future<E>` argument through the superinterface chain —
+    /// `TypeSystem.futureType`'s first arm (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/type_system.dart`:464-472:
+    /// "T implements S, and there is a U such that S is Future<U>"), read
+    /// off the strict snapshot's instantiated supertype view
+    /// (`ResolvedTypeOps::instance_env`). Only a class, mixin, enum, or
+    /// extension type `implements Future<E>` head answers — a type
+    /// parameter's bound walk is [`Engine::flatten_param`]'s own arm, and
+    /// the `Future`/`FutureOr` heads were already peeled by
+    /// [`flatten_ty`]. `None` when the snapshot cannot answer (an
+    /// unregistered head, an unspellable argument shape): the keep
+    /// direction.
+    fn future_supertype_arg(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        if name == self.intern("Future") || name == self.intern("FutureOr") {
+            return None;
+        }
+        let ops = self.ops?;
+        let env = ops.instance_env(
+            Ty::Named {
+                name,
+                nullable: false,
+                args,
+            },
+            self.intern("Future"),
+            &self.boundary.args,
+        )?;
+        env.first().map(|(_, ty)| *ty)
     }
 
     /// `this`'s static type (the nullability checks and inferred-local
@@ -9771,19 +10628,19 @@ impl<'a> Engine<'a> {
 
     /// The captured bound of the in-scope parameter `name` (`None` = no
     /// bound — the implicit `Object?`): the declaring executable's window
-    /// first (`void f<T extends num>(T t)`, the [`Engine::exec_bounds`]
+    /// first (`void f<T extends num>(T t)`, the [`Engine::exec_windows`]
     /// capture), then the enclosing container's capture (`class C<T
     /// extends num>`, the `container_params` face). Both record `(param,
     /// bound)` per owner in declaration order; the innermost owner wins.
     pub(crate) fn param_bound(&self, name: StringId) -> Option<Ty> {
         if let Some(exec) = self.exec_self_name() {
-            if let Some(window) = self.exec_bounds.get(&exec)
-                && let Some((_, bound)) = window.iter().find(|(param, _)| *param == name)
+            if let Some(window) = self.own_exec_window(exec, false)
+                && let Some((_, bound)) = window.params.iter().find(|(param, _)| *param == name)
             {
                 return *bound;
             }
-            if let Some(window) = self.method_exec_bounds.get(&exec)
-                && let Some((_, bound)) = window.iter().find(|(param, _)| *param == name)
+            if let Some(window) = self.own_exec_window(exec, true)
+                && let Some((_, bound)) = window.params.iter().find(|(param, _)| *param == name)
             {
                 return *bound;
             }
@@ -9795,6 +10652,16 @@ impl<'a> Engine<'a> {
         let params = self.bounds.container_params(container)?;
         let tree = params.into_iter().find(|(param, _, _)| *param == name)?.1?;
         Some(self.tree_ty(&tree))
+    }
+
+    /// The LAST captured window declaring `owner` on the requested side —
+    /// the exact-owner lookup (`keep-last`, matching the former map
+    /// inserts), a deterministic scan over declaration order.
+    pub(crate) fn own_exec_window(&self, owner: StringId, is_method: bool) -> Option<&ExecWindow> {
+        self.exec_windows
+            .iter()
+            .rev()
+            .find(|window| window.owner == owner && window.is_method == is_method)
     }
 
     /// A type-parameter head replaced by its captured bound (#2349): the
@@ -9832,31 +10699,48 @@ impl<'a> Engine<'a> {
     /// (the extension-applicability row resolves a receiver argument
     /// spelled `T` long after `type_params`/`frames` emptied). The bound
     /// survives only in the per-executable captures — a top-level/generic
-    /// function's `exec_bounds` window or a method's `method_exec_bounds`
-    /// window — so the lookup scans every captured window for one that
-    /// declares `name`. Returns `Some(bound)` when a capture declares
-    /// `name` (the implicit `Object?` when its slot is empty), `None`
-    /// when no window does — i.e. `name` is a concrete head (`String`,
-    /// `Color`), never a scope parameter. A class-generic `class C<T>`
-    /// receiver stays unmodeled (`container_params` needs the container
-    /// name the post-walk caller no longer holds — the under-report
-    /// direction).
+    /// function's window or a method's window — so the lookup scans every
+    /// captured window for one that declares `name`. Returns `Some(bound)`
+    /// when a capture declares `name` (the implicit `Object?` when its slot
+    /// is empty), `None` when no window does — i.e. `name` is a concrete
+    /// head (`String`, `Color`), never a scope parameter. A class-generic
+    /// `class C<T>` receiver stays unmodeled (`container_params` needs the
+    /// container name the post-walk caller no longer holds — the
+    /// under-report direction).
+    ///
+    /// The scan iterates [`Engine::exec_windows`] in DECLARATION order —
+    /// the one ordering a name-only lookup may read (#4202: hash order is
+    /// per-run unstable under parallel interning). `at` — the reference's
+    /// own offset where the caller knows it — narrows the pick to the
+    /// nearest declaration at or before the reference, so each reference
+    /// reads its own enclosing scope; without it the first declaration
+    /// wins.
     pub(crate) fn param_bound_of(&self, name: StringId) -> Option<Ty> {
+        self.param_bound_of_at(name, None)
+    }
+
+    /// [`Self::param_bound_of`] with the reference offset: the nearest
+    /// declaring window at or before `at` answers; the first declaration
+    /// otherwise.
+    pub(crate) fn param_bound_of_at(&self, name: StringId, at: Option<u32>) -> Option<Ty> {
         let implicit_object = || Ty::Named {
             name: self.intern("Object"),
             nullable: true,
             args: ArgListId::EMPTY,
         };
-        for window in self
-            .exec_bounds
-            .values()
-            .chain(self.method_exec_bounds.values())
-        {
-            if let Some((_, bound)) = window.iter().find(|(param, _)| *param == name) {
-                return Some(bound.unwrap_or_else(implicit_object));
+        let mut first = None;
+        let mut nearest = None;
+        for window in &self.exec_windows {
+            let Some((_, bound)) = window.params.iter().find(|(param, _)| *param == name) else {
+                continue;
+            };
+            let bound = bound.unwrap_or_else(implicit_object);
+            first.get_or_insert(bound);
+            if at.is_some_and(|at| window.at < at) {
+                nearest = Some(bound);
             }
         }
-        None
+        nearest.or(first)
     }
 
     /// Whether `ty` mentions an in-scope parameter anywhere in its shape
@@ -9945,7 +10829,7 @@ impl<'a> Engine<'a> {
     /// assertion's own static type (`promoteToNonNull`): the downstream
     /// member merges read the promoted receiver through it.
     pub(crate) fn check_null_assert(&mut self, at: SourceRange) {
-        let (ty, read_span, qualified) = match self.rows.last() {
+        let (ty, read_span, qualified, super_operand) = match self.rows.last() {
             Some(row) => {
                 // The implicit-this getter read's row type is the unknown
                 // face — `non_null_form(Unknown)` is a no-op and the
@@ -9965,6 +10849,15 @@ impl<'a> Engine<'a> {
                     },
                     row.range,
                     row.qualified,
+                    // A `super` operand never reports the null-check pair:
+                    // `_checkForUnnecessaryNullAware` returns before the
+                    // strictly-non-null question for a `SuperExpression`
+                    // target (error_verifier.dart:7299-7302), and
+                    // `nullCheckAlwaysFails` needs a `Null`-typed operand
+                    // `super` never carries — so `super!` and `super()!`
+                    // stage nothing (the oracle's silence on both shapes,
+                    // co19 `null_check_operator_A04_t01`'s rows).
+                    matches!(row.shape, RowShape::Receiver(Receiver::Super { .. })),
                 )
             }
             None => return,
@@ -9989,11 +10882,36 @@ impl<'a> Engine<'a> {
             };
             self.emit(SemanticCode::UseOfVoidResult, range, "", "");
         } else if ty == Ty::Null {
-            self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
-        } else if self.strictly_non_nullable(ty) {
+            // The whole postfix node anchors the always-fails row
+            // (`nullCheckAlwaysFails.at(node)` over the `e!` expression,
+            // best_practices_verifier.dart:752-754): the span opens at the
+            // operand EXPRESSION's head — a member operand's `x.m()!`
+            // spans from `x` — and closes at the `!`, exactly the extent
+            // the `use_of_void_result` arm above computes (`null!` is
+            // five columns, never the operator's one).
+            let head = self
+                .rows
+                .last()
+                .and_then(|row| self.property_access_span(row.range).map(|span| span.offset));
+            let offset = head.unwrap_or(read_span.offset);
+            let range = SourceRange {
+                offset,
+                length: at.end() - offset,
+            };
+            self.stage_usage(SemanticCode::NullCheckAlwaysFails, range, "");
+        } else if !super_operand && self.strictly_non_nullable(ty) {
             self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
-        } else if ty != Ty::Unknown && !qualified && self.local_hits.contains_key(&read_span.offset)
-        {
+        } else if !qualified && self.local_hits.contains_key(&read_span.offset) {
+            // A bare local read stages whatever its walk-time type — the
+            // unknown faces (an implicitly typed formal, an unannotated
+            // `var`) promote through `is` exactly like `dynamic` upstream
+            // (`_checkForUnnecessaryNullAware` asks only
+            // `isStrictlyNonNullable`, error_verifier.dart:7352), so the
+            // teardown re-decision, not the declared face, carries their
+            // verdict (#3954). A never-promoted read's staged entry simply
+            // answers `None` at the join — the suppression stays in the
+            // promotion table, never in this gate.
+            //
             // The staged re-decision reads the local promotion table at the
             // operand's own span, so it keys the operand's OWN local read —
             // a bare identifier. A receiver-chain row (`dep.dependencies!`)
@@ -10024,7 +10942,16 @@ impl<'a> Engine<'a> {
                 .push((read_span, at, nullable_params));
         }
         if let Some(row) = self.rows.last_mut() {
-            row.ty = Self::non_null_form(ty);
+            // `promoteToNonNull(Null)` is `Never` (the assertion's only
+            // success path throws): the postfix node's static type over a
+            // `Null` operand is bottom, so `f(null!)` offers `Never` —
+            // assignable everywhere — and the argument face stays silent
+            // exactly as the oracle's `null!` verdicts do.
+            row.ty = if ty == Ty::Null {
+                Ty::Never
+            } else {
+                Self::non_null_form(ty)
+            };
         }
     }
 
@@ -10369,6 +11296,28 @@ impl<'a> Engine<'a> {
         let left_ty @ Ty::Named { name, .. } = left_ty else {
             return;
         };
+        // A type-parameter receiver resolves `==` through its bound
+        // (upstream resolves the member on the receiver's `leftType`, and a
+        // `TypeParameterType`'s member interface IS its bound's —
+        // binary_expression_resolver.dart:147-151's `findMember` over the
+        // bound's interface, the same face `subclass_of` runs): `X extends
+        // Covar1`'s `x == e` asks `Covar1.==`'s `covariant Covar1` formal,
+        // `?`-promoted for the verdict exactly like every receiver face. No
+        // recoverable bound keeps the under-report (an unbounded parameter's
+        // effective bound is `Object?`, whose formal the `Object?` arm below
+        // silences anyway).
+        let (recv_name, recv_ty) = if self.declared_head_is_type_param(name) {
+            match self.param_bound(name) {
+                Some(
+                    bound @ Ty::Named {
+                        name: bound_name, ..
+                    },
+                ) => (bound_name, bound),
+                _ => return,
+            }
+        } else {
+            (name, left_ty)
+        };
         // The operand's INSTANTIATED type rides the receiver: `C<int>(1)`'s
         // `C<int>` binds the `T` the container's `==` formal spells, the same
         // substitution `member_recv_env` composes for every typed receiver
@@ -10379,8 +11328,8 @@ impl<'a> Engine<'a> {
         // declared table stands — the pre-#3719 face.
         let formals = self.member_formals_full(
             &Receiver::Typed {
-                type_name: name,
-                ty: left_ty,
+                type_name: recv_name,
+                ty: recv_ty,
             },
             self.intern("=="),
         );
@@ -10580,6 +11529,16 @@ impl<'a> Engine<'a> {
         // num` answers `num.+`); an unbound parameter keeps the written
         // head and falls to the `None` below.
         let left_ty = self.bound_face(self.equality_operand_ty(left));
+        self.binary_operator_sig_typed(op, left_ty)
+    }
+
+    /// [`Self::binary_operator_sig`]'s signature resolution over an
+    /// already-resolved receiver type — the teardown recompute (#3980)
+    /// hands the promoted operand face directly, skipping the
+    /// frame-dependent `bound_face`/`equality_operand_ty` derivation the
+    /// fold-time row consult runs (both read `self.frames`, dead after
+    /// pass 2).
+    fn binary_operator_sig_typed(&mut self, op: &str, left_ty: Ty) -> Option<(Ty, Ty)> {
         let Ty::Named { name, .. } = left_ty else {
             return None;
         };
@@ -10784,7 +11743,7 @@ impl<'a> Engine<'a> {
             "clamp" if positional.len() == 2 => {
                 let all = |tys: &[Ty], head| {
                     tys.iter()
-                        .all(|t| *t != Ty::Never && self.name_subtype(*t, named_q(head)))
+                        .all(|t| !self.is_never_ty(*t) && self.name_subtype(*t, named_q(head)))
                 };
                 let operands = [recv_ty, positional[0], positional[1]];
                 if all(&operands, int) {
@@ -10935,13 +11894,16 @@ impl<'a> Engine<'a> {
             Ty::Named { name, .. } => !self.name_world().is_known_head(name),
             _ => false,
         };
-        // `Never` stays excluded (the upstream `!s.isBottom` cut) and
-        // falls to `num`.
-        if right_ty != Ty::Never && (right_invalid || self.name_subtype(right_ty, named_q(double)))
+        // `Never` stays excluded (the upstream `!s.isBottom` cut,
+        // type_system.dart:2029/:2036 — the written `Never` spelling
+        // included, which the name lattice folds to the bottom atom and
+        // would grant against `double?`) and falls to `num`.
+        if !self.is_never_ty(right_ty)
+            && (right_invalid || self.name_subtype(right_ty, named_q(double)))
         {
             return Ty::named(double);
         }
-        if right_ty != Ty::Never
+        if !self.is_never_ty(right_ty)
             && self.name_subtype(left_ty, named_q(int))
             && self.name_subtype(right_ty, named_q(int))
         {
@@ -11014,8 +11976,19 @@ impl<'a> Engine<'a> {
         }
         let left = self.rows[left_index].clone();
         let right = self.rows[right_index].clone();
-        let left_ty = self.equality_operand_ty(&left);
-        let right_ty = self.equality_operand_ty(&right);
+        // The operands read their flow-PROMOTED static types (upstream
+        // types each operand through the branch's flow facts):
+        // `if (n is int) (n + i)` resolves on the promoted `int`, not the
+        // declared `num` — the promotion latch answers the read at the
+        // operand's own span; an operand without a fact keeps the
+        // declared face.
+        let promoted_operand_ty = |row: &Row, ty: Ty| -> Ty {
+            self.read_type_at(row.range)
+                .filter(|promoted| *promoted != Ty::Unknown)
+                .unwrap_or(ty)
+        };
+        let left_ty = promoted_operand_ty(&left, self.equality_operand_ty(&left));
+        let right_ty = promoted_operand_ty(&right, self.equality_operand_ty(&right));
         // The void-operand verdict runs first (upstream
         // `visitBinaryExpression`, error_verifier.dart:467-482 →
         // error_detection_helpers.dart:245-258): the LEFT operand is
@@ -11127,12 +12100,46 @@ impl<'a> Engine<'a> {
         for row in self.rows.drain(left_index..) {
             self.deferred_miss_rows.push(row);
         }
+        let node_range = SourceRange {
+            offset: expr_start,
+            length: right.range.end().saturating_sub(expr_start),
+        };
+        // Record the fold for the teardown recompute (#3980): the
+        // `read_type_at` consults above starved because `read_types` fills
+        // only after `parse_unit` returns. Skip only the promotion-invariant
+        // arms (`==`/`!=`/`&&`/`||`/`??` — their result is `bool`/`UNKNOWN`
+        // regardless of operand promotion). Every other operator records:
+        // an operand that is itself a composite node (a `Value` row, never
+        // a bare read) can still shift when the inner fold's recompute
+        // lands, so the operand-shape gate would drop the outer record the
+        // order-independent forward pass needs.
+        if !matches!(
+            op,
+            o if o == self.intern("==")
+                || o == self.intern("!=")
+                || o == self.intern("&&")
+                || o == self.intern("||")
+                || o == self.intern("??")
+        ) {
+            PENDING_COMPOSITE_FOLDS.with(|queue| {
+                let mut queue = queue.borrow_mut();
+                if queue.len() < PENDING_COMPOSITE_FOLD_CAP {
+                    queue.push(PendingCompositeFold::Binary {
+                        file: self.file,
+                        node_range,
+                        op,
+                        left: left.clone(),
+                        right: right.clone(),
+                        left_ty,
+                        right_ty,
+                        result,
+                    });
+                }
+            });
+        }
         self.rows.push(Row {
             name: self.intern(""),
-            range: SourceRange {
-                offset: expr_start,
-                length: right.range.end().saturating_sub(expr_start),
-            },
+            range: node_range,
             qualified: false,
             shape: RowShape::Value,
             intent: Intent::Read,
@@ -11170,9 +12177,19 @@ impl<'a> Engine<'a> {
         let Some((then_index, else_index)) = self.conditional_arms() else {
             return;
         };
-        let then_ty = self.operand_static_ty(&self.rows[then_index]);
-        let else_ty = self.operand_static_ty(&self.rows[else_index]);
-        let ty = if then_ty == Ty::UNKNOWN || else_ty == Ty::UNKNOWN {
+        // The arms read their flow-PROMOTED static types (upstream
+        // flow-analyzes each branch under the test's facts — `c == null ?
+        // 0 : c` promotes the else arm's `c` to its non-null form): the
+        // promotion latch answers the read at the arm's own span; an arm
+        // without a fact keeps the row's own face.
+        let arm_ty = |row: &Row| -> Ty {
+            self.read_type_at(row.range)
+                .filter(|promoted| *promoted != Ty::Unknown)
+                .unwrap_or_else(|| self.operand_static_ty(row))
+        };
+        let then_ty = arm_ty(&self.rows[then_index]);
+        let else_ty = arm_ty(&self.rows[else_index]);
+        let mut ty = if then_ty == Ty::UNKNOWN || else_ty == Ty::UNKNOWN {
             Ty::UNKNOWN
         } else {
             self.composite_lub(then_ty, else_ty, false)
@@ -11232,18 +12249,181 @@ impl<'a> Engine<'a> {
                     )
                 });
         let tail = if is_follower { arm_site_end } else { end.end() };
+        // The `inference_update_3` context arm (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/generated/static_type_analyzer.dart`:74-112):
+        // a conditional in direct return position is typed under the
+        // return expression's context — when the plain LUB falls outside
+        // it but BOTH arms fit, the context type itself is the node's
+        // static type (`x ? 42 : Future.value(42)` under an async
+        // `Future<int>` return types `FutureOr<int>`, never `Object`).
+        if ty != Ty::UNKNOWN {
+            ty = self.conditional_return_context_ty(ty, then_ty, else_ty, head, tail);
+        }
+        let node_range = SourceRange {
+            offset: head,
+            length: tail.saturating_sub(head),
+        };
+        // Record the fold for the teardown recompute (#3980): the arm
+        // `read_type_at` consults starved during pass 1. The context face
+        // (`return_expression_context`) reads `self.frames`, which is dead
+        // at teardown — capture its answer now. `conditional_return_context_ty`
+        // already ran `assignable` on the fold-time arms; the recompute
+        // re-asks it with the promoted arm types and the same context. Every
+        // conditional records: an arm that is itself a composite node can
+        // shift when the inner fold's recompute lands, so an arm-shape gate
+        // would drop the record the order-independent forward pass needs.
+        let context = if ty != Ty::UNKNOWN {
+            self.return_expression_context(head, tail)
+        } else {
+            None
+        };
+        PENDING_COMPOSITE_FOLDS.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            if queue.len() < PENDING_COMPOSITE_FOLD_CAP {
+                queue.push(PendingCompositeFold::Conditional {
+                    file: self.file,
+                    node_range,
+                    then_row: self.rows[then_index].clone(),
+                    else_row: self.rows[else_index].clone(),
+                    then_ty,
+                    else_ty,
+                    context,
+                    result: ty,
+                });
+            }
+        });
         self.rows.push(Row {
             name: self.intern(""),
-            range: SourceRange {
-                offset: head,
-                length: tail.saturating_sub(head),
-            },
+            range: node_range,
             qualified: false,
             shape: RowShape::Value,
             intent: Intent::Read,
             write_op: None,
             ty,
         });
+    }
+
+    /// [`Self::fold_conditional`]'s `inference_update_3` arm: upstream
+    /// `visitConditionalExpression` types the node `T = UP(T1, T2)` unless
+    /// a context `K` stands (`T <: S` keeps `T`; `T1 <: S` and `T2 <: S`
+    /// with `S` the greatest closure of `K` take `S`; anything else keeps
+    /// `T` — upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/generated/static_type_analyzer.dart`:94-112).
+    /// The greatest closure of a closed written schema is the schema
+    /// itself, so the arm reduces to the subtype questions below. Only a
+    /// DIRECT return expression carries a context here (`var y = cond`
+    /// binds the plain `T`, c6-shaped); an undecidable ask keeps `T` (the
+    /// under-report direction).
+    fn conditional_return_context_ty(
+        &self,
+        lub: Ty,
+        then_ty: Ty,
+        else_ty: Ty,
+        head: u32,
+        tail: u32,
+    ) -> Ty {
+        let Some(context) = self.return_expression_context(head, tail) else {
+            return lub;
+        };
+        if self.assignable(lub, context, false) == Some(true) {
+            return lub;
+        }
+        if self.assignable(then_ty, context, false) == Some(true)
+            && self.assignable(else_ty, context, false) == Some(true)
+        {
+            return context;
+        }
+        lub
+    }
+
+    /// The context type a return expression gives its expression: the
+    /// innermost executable frame's latched declared return, `Future<T>`
+    /// widened to `FutureOr<T>` under `async` (upstream's return-expression
+    /// context, `body_inference_context.dart` — `Future<int> f() async`
+    /// types `return e` under `FutureOr<int>`). `None` unless the
+    /// conditional spanning `head..tail` IS the whole returned expression:
+    /// the tokens before `head`, open parens skipped, spell `return` or
+    /// the `=>` arrow, and the matching close parens after `tail` end the
+    /// statement — `return (cond) + 1;` fails the forward leg and keeps
+    /// the plain LUB, exactly as the oracle's nested-context inference
+    /// does not reach the conditional through `+`'s own context.
+    fn return_expression_context(&self, head: u32, tail: u32) -> Option<Ty> {
+        let tokens = self.tokens.as_slice();
+        let mut open = tokens.partition_point(|t| t.utf16_offset < head);
+        let mut depth = 0usize;
+        while open > 0 && tokens[open - 1].kind == dartq_scanner::TokenKind::OpenParen {
+            open -= 1;
+            depth += 1;
+        }
+        // An `=>` arrow only counts for a frame that owns the return — a
+        // function literal's arrow body meets the innermost frame's
+        // unlatched (context-inferred) return below and answers `None`.
+        match tokens.get(open.checked_sub(1)?)?.kind {
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Return) => {}
+            dartq_scanner::TokenKind::Function => {}
+            _ => return None,
+        }
+        let mut close = tokens.partition_point(|t| t.utf16_offset < tail);
+        while depth > 0 {
+            // A non-paren token before the parens close: the conditional
+            // is a proper sub-expression (`+ 1`, an argument, an index)
+            // and owns no return context.
+            if tokens.get(close)?.kind != dartq_scanner::TokenKind::CloseParen {
+                return None;
+            }
+            depth -= 1;
+            close += 1;
+        }
+        if !matches!(
+            tokens.get(close)?.kind,
+            dartq_scanner::TokenKind::Semicolon | dartq_scanner::TokenKind::Comma
+        ) {
+            return None;
+        }
+        // The INNERMOST executable owns the return (the same frame
+        // `check_return` walks): a function literal's frame carries no
+        // latched declared return, and the conditional in its body owns
+        // that literal's context — never the enclosing method's declared
+        // face — so the walk stops there.
+        let frame = self
+            .frames
+            .iter()
+            .rev()
+            .find(|f| matches!(f.kind, FrameKind::Executable { .. }))?;
+        let FrameKind::Executable {
+            ret: Some(ret),
+            is_async,
+            ..
+        } = &frame.kind
+        else {
+            return None;
+        };
+        let (ret, is_async) = (ret.ty, *is_async);
+        // The async widening runs only over a genuine `Future`/`FutureOr`
+        // declared head (`futureValueType`'s own gate); every other
+        // declared shape keeps itself as the context — the oracle's
+        // non-future async returns ask their value face directly.
+        let future_head = matches!(
+            ret,
+            Ty::Named { name, .. }
+                if (name == self.intern("Future") || name == self.intern("FutureOr"))
+                    && self.named_type_is_type(name)
+        );
+        if !is_async || !future_head {
+            return Some(ret);
+        }
+        // The unwrap runs BEFORE the pool borrow: a method receiver is
+        // evaluated before its arguments, so `future_value_type` inside
+        // the re-intern's argument list read the pool (`pool()`'s shared
+        // borrow) against the live `RefMut` and panicked — the same
+        // discipline `tear_off_fn_ty` keeps.
+        let value = self.future_value_type(ret);
+        Some(
+            self.boundary
+                .args
+                .borrow_mut()
+                .named(self.intern("FutureOr"), false, &[value]),
+        )
     }
 
     /// The `??=` node's own static type, staged at
@@ -13467,8 +14647,10 @@ impl<'a> Engine<'a> {
 ///   non-Future operand is legal and yields the operand's type.
 ///
 /// The subtype-driven `asInstanceOf` face (a user class `implements
-/// Future<int>` awaiting to `int`) stays an under-report: the name level
-/// carries no instantiated supertype walk.
+/// Future<int>` awaiting to `int`) lives one level up: the name level
+/// carries no instantiated supertype walk, so [`Engine::flatten`] adds it
+/// beside the type-parameter arm. This helper answers only what a
+/// written head decides.
 pub(crate) fn flatten_ty(strings: &StringTable, args: &crate::model::ArgPool, ty: Ty) -> Ty {
     let Ty::Named {
         name,
@@ -13607,6 +14789,51 @@ fn value_comma_segments(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, u
     }
     segments.push((seg_start, end));
     segments
+}
+
+/// The first top-level `else` keyword in `[start, end)`: a depth walk
+/// over `()[]{}` with string contents skipped, word-bounded both sides —
+/// the if-element leaf's then/else split. A nested `if`'s own `else`
+/// (an inner control-flow element inside a branch) lives inside the
+/// branch's own brackets or belongs to the nearest if, so the FIRST
+/// top-level hit is the split the outer element owns.
+fn value_top_level_else(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let end = end.min(bytes.len());
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'e' if depth == 0
+                && bytes[i..].starts_with(b"else")
+                && (i == start || !ident_byte(bytes[i - 1]))
+                && bytes.get(i + 4).is_none_or(|b| !ident_byte(*b)) =>
+            {
+                return Some(i);
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// An identifier byte (Dart identifiers are `[a-zA-Z0-9_$]` — the
+/// official scanner spells them ASCII-only): the keyword scans' word
+/// boundary.
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 /// The first top-level `:` in `[start, end)`, string contents skipped —
@@ -13903,7 +15130,7 @@ impl<'a> Engine<'a> {
     /// spelling (the chased one for an alias); the REPORT's `{0}` stays the
     /// entry's written name (`Classes can't mixin 'T'.`, messages.yaml
     /// :17358).
-    fn disallowed_subtype_head(&self, entry: StringId) -> Option<StringId> {
+    pub(crate) fn disallowed_subtype_head(&self, entry: StringId) -> Option<StringId> {
         let mut head = entry;
         // An unresolved alias-shape entry keeps the written head; a resolved
         // one chases the aliased face. `resolve_container` runs on the

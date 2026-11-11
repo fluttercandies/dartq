@@ -9,6 +9,7 @@ use std::sync::{MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_atime, set_file_mtime};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,11 @@ pub enum SaveError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// An entry payload that cannot encode under the binary codec
+    /// (#4207): infallible for every shape this crate stores, carried so
+    /// a future non-encodable payload is a typed error, never a panic.
+    #[error(transparent)]
+    Encode(#[from] bincode_next::error::EncodeError),
 }
 
 /// One loaded generation: the matched header, the remap slices, and the
@@ -212,7 +218,10 @@ impl SnapshotStore {
     /// touches the generation's recency marker once, refreshing its access
     /// time for the LRU sweep.
     #[must_use]
-    pub fn load<T: DeserializeOwned>(&self, expected: &GenerationHeader) -> Option<Snapshot<T>> {
+    pub fn load<T: DeserializeOwned + Send>(
+        &self,
+        expected: &GenerationHeader,
+    ) -> Option<Snapshot<T>> {
         let generation = self.generation_dir(expected);
         let stored: GenerationHeader = parse(&fs::read(generation.join("header.json")).ok()?)?;
         if stored != *expected {
@@ -229,39 +238,68 @@ impl SnapshotStore {
 
         // The entries directory must exist (a generation is its entries,
         // even when the manifest is empty) and every decodable, stamped,
-        // honestly-keyed entry file must carry a claimed id.
+        // honestly-keyed entry file must carry a claimed id. The per-file
+        // read + checksum + decode fan out over rayon (#4204): each entry
+        // is independent, and a large generation is decode-bound, so the
+        // serial loop dominated the warm-start wall. The serial pass below
+        // keeps the manifest gate exact — every decoded entry is consumed
+        // in full (the #344 seam materializes each loaded entry), so eager
+        // decode stays. Output order is deterministic (sorted ids), never
+        // a function of rayon's scheduling.
+        enum Framed<T> {
+            /// Unreadable or undecodable: the whole generation demotes to
+            /// a miss, never a partial `Some`.
+            Damaged,
+            /// A foreign stamp or a relabeled key: *absent*, never fatal.
+            Absent,
+            Valid(Entry<T>),
+        }
+        let files: Vec<(PathBuf, [u8; 16])> = fs::read_dir(generation.join("entries"))
+            .ok()?
+            .flatten()
+            .filter_map(|file| {
+                let path = file.path();
+                entry_file_id(&path).map(|id| (path, id))
+            })
+            .collect();
+        let framed: Vec<Framed<T>> = files
+            .par_iter()
+            .map(|(path, id)| {
+                let Ok(bytes) = fs::read(path) else {
+                    return Framed::Damaged;
+                };
+                let Some((entry, stamp)) = entry::decode::<T>(&bytes) else {
+                    return Framed::Damaged;
+                };
+                // A foreign stamp is an entry from another save group
+                // (#338). A payload key disagreeing with the filename is a
+                // relabeled file, served under a key it does not hold.
+                // Both are *absent*, never fatal.
+                if stamp != tables_stamp || entry.key.id() != *id {
+                    return Framed::Absent;
+                }
+                Framed::Valid(entry)
+            })
+            .collect();
         let mut present: Vec<[u8; 16]> = Vec::with_capacity(claimed.len());
-        let mut entries = Vec::with_capacity(claimed.len());
-        for file in fs::read_dir(generation.join("entries")).ok()?.flatten() {
-            let Some(id) = entry_file_id(&file.path()) else {
-                continue;
-            };
-            let bytes = fs::read(file.path()).ok()?;
-            // #422 lazy-decode audit: every decoded entry here is consumed
-            // in full — the only callers are this crate's contract tests,
-            // and the planned #344 seam materializes each loaded entry
-            // (dartq-engine `state/persist.rs`) — so eager JSON decode
-            // stays; split into frame-verify + per-key payload parse only
-            // if a consumer that reads a subset of keys appears.
-            let (decoded, stamp) = entry::decode::<T>(&bytes)?;
-            // A foreign stamp is an entry from another save group (#338).
-            // A payload key disagreeing with the filename is a relabeled
-            // file, served under a key it does not hold. Both are *absent*,
-            // never fatal.
-            if stamp != tables_stamp {
-                continue;
+        let mut entries: Vec<Entry<T>> = Vec::with_capacity(claimed.len());
+        for ((_, id), framed) in files.iter().zip(framed) {
+            match framed {
+                Framed::Damaged => return None,
+                Framed::Absent => {}
+                Framed::Valid(entry) => {
+                    present.push(*id);
+                    entries.push(entry);
+                }
             }
-            if decoded.key.id() != id {
-                continue;
-            }
-            entries.push(decoded);
-            present.push(id);
         }
         present.sort_unstable();
         if present != claimed {
             return None;
         }
-        entries.sort_by_key(|entry| entry.key.id());
+        // Ids are unique per file and each accepted entry's key id equals
+        // its filename id (checked above), so the order is total.
+        entries.sort_unstable_by_key(|entry| entry.key.id());
         // A completed load is the strongest seeding the bookkeeping can
         // get (#1386): the manifest equality just proved every entry file
         // is on disk under this generation's stamp, so the next flush may

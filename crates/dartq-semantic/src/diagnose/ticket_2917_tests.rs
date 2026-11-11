@@ -215,7 +215,7 @@ fn generic_class_ctor_tearoff_is_constant_true() {
 /// therefore answers `None` and the bare generic form stands — no
 /// verdict. Un-ignores the moment the written group of an expression
 /// head reaches the table.
-#[ignore = "written type-args of an expression-head group never key call_type_args (invocation.rs/bounds.rs, #2908 domain)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn instantiated_receiver_tearoff_is_constant_true() {
     let report = report_ops(

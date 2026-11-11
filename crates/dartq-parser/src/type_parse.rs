@@ -110,17 +110,20 @@ impl TypeInfo {
     ) -> TokenSpan {
         match self {
             TypeInfo::Void => {
-                // Report and parse `void` as a type name
-                // (VoidType.ensureTypeNotVoid, type_info_impl.dart:431).
+                // Report, then parse `void` as a type name
+                // (VoidType.ensureTypeNotVoid, type_info_impl.dart:427-432):
+                // the official `simpleType.parseTypeNotVoid` consumes the
+                // `void` token itself — identifier+type events anchor ON
+                // `void`, never its follower (the follower is the clause's
+                // next token or the member name).
                 let void_tok = parser.peek_span();
                 parser.report(msg::invalid_void(), void_tok);
-                parser.cursor.advance();
-                let name = parser.peek_span();
                 parser
                     .listener
-                    .handle_identifier(name, IdentifierContext::TypeReference);
-                parser.listener.handle_type(name, None);
-                name
+                    .handle_identifier(void_tok, IdentifierContext::TypeReference);
+                parser.cursor.advance();
+                parser.listener.handle_type(void_tok, None);
+                void_tok
             }
             other => other.parse_type(parser),
         }

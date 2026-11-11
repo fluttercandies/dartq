@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use dartq_diagnostics::{
     CodeInfo, CodeRegistry, ContextMessage, Diagnostic, DiagnosticType, Severity,
 };
+use dartq_index::{LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
 use dartq_resolution::{
     CombinatorClause, Combinators, Configuration, ResolutionCode, ResolvedTarget,
@@ -45,7 +46,7 @@ use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
 use dartq_source::{ContentId, FileId, FileTable, LineIndex, SourceRange, StringId, StringTable};
 
-use crate::state::{DirectiveFacts, DirectiveKind, DocImportFacts, UnitFacts};
+use crate::state::{DirectiveFacts, DirectiveKind, DocImportFacts, LibraryResult, UnitFacts};
 
 /// blake3 truncated to 128 bits — the house digest width.
 fn blake3_128(bytes: &[u8]) -> [u8; 16] {
@@ -318,6 +319,567 @@ impl PersistedFacts {
     }
 }
 
+/// The persisted per-library semantic run (#4199): the cross-session half
+/// of the L3 reuse gate (`g485 W2`). The in-process gate compares the
+/// condensation fingerprint of a library's cycle against the fingerprint
+/// recorded in its [`LibraryResult`]; this payload carries that recorded
+/// pair — the diagnostic rows plus the fingerprint they were computed
+/// under — into the L3 content store, keyed by
+/// [`library_run_key`]. A fresh process rebuilds the condensation from
+/// replayed (or recomputed) facts, derives the same key for every
+/// invalidated library, and adopts the stored run when the embedded
+/// fingerprint equals the current one — the exact equality the
+/// in-process gate already trusts, extended across process death.
+///
+/// The rows mirror through [`PersistedDiagnostic`] (files as per-entry
+/// path slices, re-interned at adopt). A run whose rows cannot project
+/// faithfully (a `FileId` missing from the file table — an engine bug)
+/// is never persisted: a payload that would under-report on reload must
+/// not displace a full recompute.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedLibraryRun {
+    /// The cycle fingerprint the run was computed under — the self-check
+    /// a read performs before serving the payload (the store key folds
+    /// the same value, but the embedded copy verifies the bytes actually
+    /// landed under that key).
+    pub fingerprint: [u8; 16],
+    /// The run's rows in canonical order, as stored.
+    pub diagnostics: Vec<PersistedDiagnostic>,
+    /// The library's reference surface — the `LibraryIndex` projection the
+    /// query faces (`query_symbols`, `resolve_at`, `override_family`,
+    /// callers, supertypes) serve through `EngineState::surface`. The
+    /// replay path installs it verbatim through `set_surface`, so a
+    /// pure-replay turn answers exactly what the recompute it skipped
+    /// would have built; a run whose surface cannot encode is never
+    /// persisted (the faithful-or-nothing contract below), so a stored
+    /// payload always carries its surface.
+    pub surface: PersistedSurface,
+    /// The interned file paths every row reference indexes — diagnostics
+    /// and surface rows share the one table (`target_file` reaches past
+    /// the member set to dependency declarations, so the run's file
+    /// domain is the union either way).
+    pub files: Vec<PathBuf>,
+}
+
+impl PersistedLibraryRun {
+    /// Projects a resident run with its reference surface. `None` when
+    /// any row cannot encode — the faithful-or-nothing contract above
+    /// (under-reporting payloads never reach the store).
+    pub(crate) fn of(
+        result: &LibraryResult,
+        surface: &LibraryIndex,
+        files: &FileTable,
+        strings: &StringTable,
+    ) -> Option<Self> {
+        let mut sink = Files::new(files);
+        let diagnostics = result
+            .diagnostics
+            .iter()
+            .map(|row| PersistedDiagnostic::of(row, &mut sink))
+            .collect::<Option<Vec<_>>>()?;
+        let surface = PersistedSurface::of(surface, &mut sink, strings)?;
+        Some(Self {
+            fingerprint: *result.cycle_fingerprint.as_bytes(),
+            diagnostics,
+            surface,
+            files: sink.paths,
+        })
+    }
+
+    /// Restores the run for a library whose current cycle fingerprint is
+    /// `expected`: `None` when the payload does not verify (a fingerprint
+    /// mismatch, undecodable rows, or rows attributing to files the
+    /// caller's id face cannot resolve — a key-fold hit proves the member
+    /// faces identical, so the file domain is this workspace's own; the
+    /// replay caller therefore mints it on demand rather than requiring
+    /// pre-membership, see `replay_library_runs`: a run's file domain
+    /// reaches declaration TARGETS — SDK library files, dependency
+    /// internals — the warm turn has not discovered). `intern` answers
+    /// the loading process's id for a path. `codes` is the builtin
+    /// registry (built once per replay pass by the caller). `strings`
+    /// re-interns the surface's name texts through the loading engine's
+    /// shared table — interior mutability, safe under the replay
+    /// fan-out's parallelism.
+    ///
+    /// Returns the run and its reference surface as a pair — the replay
+    /// loop installs both from the one materialized file table so their
+    /// `FileId` domains agree by construction.
+    pub(crate) fn materialize(
+        self,
+        expected: &ApiSignature,
+        codes: &CodeRegistry,
+        strings: &StringTable,
+        intern: &mut dyn FnMut(&Path) -> Option<FileId>,
+    ) -> Option<(LibraryResult, LibraryIndex)> {
+        if self.fingerprint != *expected.as_bytes() {
+            return None;
+        }
+        let files: Vec<FileId> = self
+            .files
+            .iter()
+            .map(|path| intern(path))
+            .collect::<Option<Vec<_>>>()?;
+        let diagnostics = self
+            .diagnostics
+            .into_iter()
+            .filter_map(|row| row.restore(codes, &files))
+            .map(Arc::new)
+            .collect();
+        let surface = self.surface.restore(&files, strings)?;
+        Some((
+            LibraryResult {
+                diagnostics,
+                cycle_fingerprint: ApiSignature::from_bytes(self.fingerprint),
+            },
+            surface,
+        ))
+    }
+}
+
+/// The persisted per-library reference surface — the [`LibraryIndex`]
+/// mirror that makes a cross-session replay's query faces answer
+/// identically to the recompute it skipped. The index's derived columns
+/// (the CSR run tables `runs`/`name_runs`/`name_refs`, the id-ordered
+/// `super_runs` directory) are pure functions of the row tables, so the
+/// payload carries the rows only and [`LibraryIndex::assemble`]
+/// re-derives them at load — the same derivation [`LibraryBuilder::finish`]
+/// runs, keeping the two constructors column-identical by construction.
+///
+/// Interned ids are process-local by contract, exactly as in
+/// [`PersistedFacts`]: file references ride the run's shared `files`
+/// path table (a `u32` index per row), and every interned `StringId`
+/// text joins a per-payload `strings` slice once, referenced by `u32`
+/// index — the same intern-the-texts-not-the-ids discipline the facts
+/// mirror follows. `StringId::NONE` columns (a bare ref's qualifier, a
+/// library-face target's container) encode as `None`, one tag byte under
+/// the binary codec (#4207) — no field may be omitted on the wire: a
+/// positional codec would decode skipped fields against the wrong bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSurface {
+    /// Resolved reference rows, in the index's stored order.
+    pub refs: Vec<PersistedRefRow>,
+    /// Unresolved-name rows of the built table.
+    pub names: Vec<PersistedNameRow>,
+    /// Seam rows appended after the build (`record_unresolved`) —
+    /// empty in every surface the current engine produces, carried for
+    /// the seam's faithful round-trip.
+    pub overflow: Vec<PersistedNameRow>,
+    /// Resolved supertype edges, in the index's stored order.
+    pub supers: Vec<PersistedSubtypeEdge>,
+    /// The name texts every `*_name`/`container`/`qualifier` index
+    /// resolves through — first-use ordered, deduplicated.
+    pub strings: Vec<String>,
+}
+
+/// One resolved reference row in payload form — the mirror of
+/// [`RefRow`]: every `FileId`/`StringId` remapped to a `files`/`strings`
+/// index, the kind as a mirror enum, `None` when the id is
+/// `StringId::NONE`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRefRow {
+    /// Indexes the run's `files`.
+    pub file: u32,
+    /// Indexes the run's `files`.
+    pub target_file: u32,
+    /// Indexes [`PersistedSurface::strings`].
+    pub target_name: u32,
+    /// Indexes [`PersistedSurface::strings`]; `None` for
+    /// `StringId::NONE` (library-face targets).
+    pub target_container: Option<u32>,
+    pub kind: PersistedRefKind,
+    pub range: PersistedRange,
+    /// Indexes [`PersistedSurface::strings`]; `None` for
+    /// `StringId::NONE` (bare uses).
+    pub qualifier: Option<u32>,
+}
+
+/// One unresolved-name row in payload form — the mirror of
+/// [`NameRow`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedNameRow {
+    /// Indexes [`PersistedSurface::strings`].
+    pub name: u32,
+    pub kind: PersistedRefKind,
+    pub range: PersistedRange,
+    pub qualified: bool,
+}
+
+/// One resolved supertype edge in payload form — the mirror of
+/// [`SubtypeEdge`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSubtypeEdge {
+    /// Indexes the run's `files`.
+    pub file: u32,
+    /// Indexes [`PersistedSurface::strings`].
+    pub name: u32,
+    pub supertype: PersistedTargetRef,
+    pub clause: PersistedSuperClause,
+}
+
+/// The mirror of [`TargetRef`]: a workspace declaration as a
+/// `(file, name)` index pair, or the bare name when the supertype lies
+/// outside the analyzed set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedTargetRef {
+    /// A workspace declaration — indexes `(files, strings)`.
+    Decl { file: u32, name: u32 },
+    /// Outside the analyzed set — indexes `strings`.
+    Name(u32),
+}
+
+/// The mirror of [`RefKind`] — the exhaustive match forcing a
+/// persistence-format review on any variant addition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedRefKind {
+    Referenced,
+    Read,
+    Invoked,
+    Written,
+    ReadWritten,
+}
+
+/// The mirror of `dartq_index::SuperClause` — the same
+/// review-forcing exhaustive match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedSuperClause {
+    Extends,
+    With,
+    On,
+    Implements,
+}
+
+/// The per-payload intern table under construction: every name text gets
+/// one `strings` slot, first-use ordered. The run's `Files` sink covers
+/// the file half; this covers the string half — two remaps, one row
+/// domain each.
+struct Names<'a> {
+    table: &'a StringTable,
+    texts: Vec<String>,
+    at: rustc_hash::FxHashMap<StringId, u32>,
+}
+
+impl<'a> Names<'a> {
+    fn new(table: &'a StringTable) -> Self {
+        Self {
+            table,
+            texts: Vec::new(),
+            at: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// Resolves `id` to its text and interning it in the payload's own
+    /// table, deduplicated. `StringId::NONE` — the packed-row optional
+    /// column's sentinel — answers `None` instead of a slot (the
+    /// absent-key encoding).
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    fn id(&mut self, id: StringId) -> Option<u32> {
+        if id == StringId::NONE {
+            return None;
+        }
+        if let Some(&at) = self.at.get(&id) {
+            return Some(at);
+        }
+        self.texts.push(self.table.resolve(id).to_owned());
+        let at = self.texts.len() as u32 - 1;
+        self.at.insert(id, at);
+        Some(at)
+    }
+
+    /// The required-column twin of [`Self::id`] — a name a row cannot
+    /// drop. A `StringId::NONE` in a required slot degrades to `None`
+    /// like an untracked file id: under-report (the run never reaches
+    /// the store), never a crash on the accelerator path.
+    fn name(&mut self, id: StringId) -> Option<u32> {
+        self.id(id)
+    }
+}
+
+impl PersistedSurface {
+    /// Projects a resident surface onto the payload form — `files` is
+    /// the run's shared file sink (ref targets reach past the member
+    /// set), `strings` the engine's intern table the ids resolve
+    /// against. `None` when any referenced file cannot encode — the
+    /// same encode↔table pairing break as the diagnostics half
+    /// (an engine bug; under-report, never a crash).
+    fn of(surface: &LibraryIndex, files: &mut Files<'_>, strings: &StringTable) -> Option<Self> {
+        let mut names = Names::new(strings);
+        let refs = surface
+            .refs()
+            .iter()
+            .map(|row| {
+                Some(PersistedRefRow {
+                    file: files.id(row.file)?,
+                    target_file: files.id(row.target_file)?,
+                    target_name: names.name(row.target_name)?,
+                    target_container: names.id(row.target_container),
+                    kind: PersistedRefKind::of(row.kind),
+                    range: PersistedRange::of(row.range),
+                    qualifier: names.id(row.qualifier),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let unresolved = |rows: &[NameRow], names: &mut Names<'_>| {
+            rows.iter()
+                .map(|row| {
+                    Some(PersistedNameRow {
+                        name: names.name(row.name)?,
+                        kind: PersistedRefKind::of(row.kind),
+                        range: PersistedRange::of(row.range),
+                        qualified: row.qualified,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let overflow_rows = unresolved(surface.names_overflow_rows(), &mut names)?;
+        let name_rows = unresolved(surface.names(), &mut names)?;
+        let supers = surface
+            .supers()
+            .iter()
+            .map(|edge| {
+                Some(PersistedSubtypeEdge {
+                    file: files.id(edge.file)?,
+                    name: names.name(edge.name)?,
+                    supertype: match edge.supertype {
+                        TargetRef::Decl(file, name) => PersistedTargetRef::Decl {
+                            file: files.id(file)?,
+                            name: names.name(name)?,
+                        },
+                        TargetRef::Name(name) => PersistedTargetRef::Name(names.name(name)?),
+                    },
+                    clause: PersistedSuperClause::of(edge.clause),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            refs,
+            names: name_rows,
+            overflow: overflow_rows,
+            supers,
+            strings: names.texts,
+        })
+    }
+
+    /// Restores the surface: file indexes resolve against the run's
+    /// materialized file slice (an out-of-range index is a corrupt
+    /// payload — `None`, the same unattributable-row posture as the
+    /// diagnostics half), name texts re-intern through `strings`, and
+    /// [`LibraryIndex::assemble`] re-derives every derived column from
+    /// the restored rows.
+    fn restore(self, files: &[FileId], strings: &StringTable) -> Option<LibraryIndex> {
+        let name = |at: u32| -> Option<StringId> {
+            self.strings
+                .get(at as usize)
+                .map(|text| strings.intern(text))
+        };
+        let optional = |at: Option<u32>| -> Option<StringId> {
+            match at {
+                Some(at) => name(at),
+                None => Some(StringId::NONE),
+            }
+        };
+        let refs = self
+            .refs
+            .iter()
+            .map(|row| {
+                Some(RefRow {
+                    file: *files.get(row.file as usize)?,
+                    target_file: *files.get(row.target_file as usize)?,
+                    target_name: name(row.target_name)?,
+                    target_container: optional(row.target_container)?,
+                    kind: row.kind.resolve(),
+                    range: row.range.source_range(),
+                    qualifier: optional(row.qualifier)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let unresolved = |rows: &[PersistedNameRow]| {
+            rows.iter()
+                .map(|row| {
+                    Some(NameRow {
+                        name: name(row.name)?,
+                        kind: row.kind.resolve(),
+                        range: row.range.source_range(),
+                        qualified: row.qualified,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let overflow = unresolved(&self.overflow)?;
+        let names = unresolved(&self.names)?;
+        let supers = self
+            .supers
+            .iter()
+            .map(|edge| {
+                Some(SubtypeEdge {
+                    file: *files.get(edge.file as usize)?,
+                    name: name(edge.name)?,
+                    supertype: match edge.supertype {
+                        PersistedTargetRef::Decl {
+                            file: target_file,
+                            name: target_name,
+                        } => TargetRef::Decl(*files.get(target_file as usize)?, name(target_name)?),
+                        PersistedTargetRef::Name(target_name) => {
+                            TargetRef::Name(name(target_name)?)
+                        }
+                    },
+                    clause: edge.clause.resolve(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(LibraryIndex::assemble(refs, names, overflow, supers))
+    }
+}
+
+impl PersistedRefKind {
+    fn of(kind: RefKind) -> Self {
+        match kind {
+            RefKind::Referenced => Self::Referenced,
+            RefKind::Read => Self::Read,
+            RefKind::Invoked => Self::Invoked,
+            RefKind::Written => Self::Written,
+            RefKind::ReadWritten => Self::ReadWritten,
+        }
+    }
+
+    fn resolve(self) -> RefKind {
+        match self {
+            Self::Referenced => RefKind::Referenced,
+            Self::Read => RefKind::Read,
+            Self::Invoked => RefKind::Invoked,
+            Self::Written => RefKind::Written,
+            Self::ReadWritten => RefKind::ReadWritten,
+        }
+    }
+}
+
+impl PersistedSuperClause {
+    fn of(clause: dartq_index::SuperClause) -> Self {
+        match clause {
+            dartq_index::SuperClause::Extends => Self::Extends,
+            dartq_index::SuperClause::With => Self::With,
+            dartq_index::SuperClause::On => Self::On,
+            dartq_index::SuperClause::Implements => Self::Implements,
+        }
+    }
+
+    fn resolve(self) -> dartq_index::SuperClause {
+        match self {
+            Self::Extends => dartq_index::SuperClause::Extends,
+            Self::With => dartq_index::SuperClause::With,
+            Self::On => dartq_index::SuperClause::On,
+            Self::Implements => dartq_index::SuperClause::Implements,
+        }
+    }
+}
+
+/// Encodes a library run for the L3 store (#4207): positional binary via
+/// `bincode-next`'s serde bridge — roughly a third of the JSON it
+/// replaced on a reference-dense payload, and the codec the store's
+/// entries are uniform under. `None` when the payload cannot encode (an
+/// infallible shape today; the miss posture is the store's accelerator
+/// contract — a run that cannot persist simply recomputes next session).
+pub(crate) fn encode_run(payload: &PersistedLibraryRun) -> Option<Vec<u8>> {
+    bincode_next::serde::encode_to_vec(payload, bincode_next::config::standard()).ok()
+}
+
+/// Decodes a stored library run; `None` on any decode failure. An entry
+/// written under a previous codec (JSON-era frames are self-describing
+/// text, never valid bincode) lands here as a miss — the run recomputes
+/// and the sweep re-writes it under the current codec, so old entries
+/// drain by use, never by a migration pass.
+pub(crate) fn decode_run(bytes: &[u8]) -> Option<PersistedLibraryRun> {
+    bincode_next::serde::decode_from_slice(bytes, bincode_next::config::standard())
+        .ok()
+        .map(|(payload, _)| payload)
+}
+
+/// The content-store key of one library run (#4199): blake3-128 over the
+/// run's fork dimensions — the analyzer build ([`analyzer_build`], the
+/// #3113 posture), the engine's `FACTS_SEMANTIC_VERSION`, the grants
+/// configuration fingerprint, the package-graph fingerprint, the cycle
+/// fingerprint (itself the transitive fold of member and dependency
+/// faces, so equality of this field carries the whole dependency
+/// closure), the library's ordered member content identity
+/// ([`LibraryInfo::content`]), and the library's ordered member paths
+/// (defining file first, parts after — [`library_member_paths`]). The
+/// content column is load-bearing, not belt-and-braces: a member edit
+/// that moves no element face (a body edit, a parse error) leaves the
+/// cycle fingerprint byte-equal, and the in-process gate stays sound
+/// there only because apply drops a result on every content move — the
+/// cross-session key must reproduce that guard itself. The path column
+/// is the same discipline for identity, not content: a run's rows and
+/// surface anchor at the member paths verbatim (the payload carries
+/// paths, replay mints them back), and every other column is
+/// path-free — two byte-identical files at different paths (an
+/// overlay-introduced file carrying another member's exact bytes) fold
+/// equal everywhere else, so without this column one library's stored
+/// run would falsely serve the other's diagnostics under the wrong
+/// anchor (#4221). The lints twin folds the path for the same reason
+/// ([`lint_rows_key`]). The leading columns pin everything neither fold
+/// can see: a different binary, a semantic-shape bump, a
+/// feature/experiment configuration move, or a package-graph repoint
+/// each fork the key even when every signature stands — the
+/// context-salt discipline, applied per run. Two processes over the
+/// same workspace, SDK, options, and build derive identical keys for
+/// identical inputs.
+#[must_use]
+pub(crate) fn library_run_key(
+    build: [u8; 16],
+    semantic_version: u32,
+    grants: u64,
+    packages: [u8; 16],
+    fingerprint: &ApiSignature,
+    content: &[ContentId],
+    paths: &[&std::path::Path],
+) -> ContentId {
+    let mut bytes = Vec::with_capacity(58 + content.len() * 16);
+    field(&mut bytes, &build);
+    bytes.extend_from_slice(&semantic_version.to_le_bytes());
+    bytes.extend_from_slice(&grants.to_le_bytes());
+    field(&mut bytes, &packages);
+    field(&mut bytes, fingerprint.as_bytes());
+    bytes.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    for id in content {
+        bytes.extend_from_slice(id.as_bytes());
+    }
+    bytes.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for path in paths {
+        field(&mut bytes, path.as_os_str().as_encoded_bytes());
+    }
+    dartq_source::content_hash(&bytes)
+}
+
+/// The content-store key of one file's persisted lint rows (#4205): the
+/// lint stage's twin of [`library_run_key`] — the same context-salt
+/// discipline applied to the lint face. The fork dimensions the lints
+/// layer's own row fingerprint does not pin: the analyzer build (a
+/// different binary may lint differently — the #3113 posture), the grants
+/// configuration fingerprint, and the package-graph fingerprint. The
+/// lints layer's fingerprint (`fingerprint`, the memo key's fold) already
+/// carries everything a row reads: the file's content id (`content`), the
+/// settled features and language version, the enable set, the containing
+/// package's facts, the path, the cannot-ignore set, the semantic
+/// library-context generation, the breaking-version gate, and — where the
+/// cross-library rule runs — the reachability-inputs epoch. Two processes
+/// over the same workspace, SDK, options, and build derive identical keys
+/// for identical inputs.
+#[must_use]
+pub(crate) fn lint_rows_key(
+    build: [u8; 16],
+    grants: u64,
+    packages: [u8; 16],
+    content: ContentId,
+    fingerprint: u64,
+) -> ContentId {
+    let mut bytes = Vec::with_capacity(64);
+    field(&mut bytes, &build);
+    bytes.extend_from_slice(&grants.to_le_bytes());
+    field(&mut bytes, &packages);
+    bytes.extend_from_slice(content.as_bytes());
+    bytes.extend_from_slice(&fingerprint.to_le_bytes());
+    dartq_source::content_hash(&bytes)
+}
+
 /// One extracted `@docImport` in payload form — the mirror of
 /// [`DocImportFacts`]: the decoded URI (or `None` for interpolation), the
 /// raw literal's UTF-16 span, and the resolved diagnostic code.
@@ -370,11 +932,9 @@ pub struct PersistedConfiguration {
     /// `DirectiveUriWithoutString` face (`file_state.dart:118`): the clause
     /// still takes its selection slot, and selecting it reports
     /// `uri_with_interpolation` instead of resolving `uri` (a placeholder
-    /// empty string on the wire). `default` keeps pre-field payloads
-    /// loading; `skip_serializing_if` keeps the wire byte-stable for the
-    /// universal `false` case — only a real interpolated clause writes the
-    /// key at all.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// empty string on the wire). Always written on the wire: the binary
+    /// codec is positional, so no field may omit itself (#4207) — the
+    /// universal `false` costs its one tag byte.
     pub interpolated: bool,
     /// UTF-16 span of the clause's URI literal.
     pub uri_span: PersistedRange,
@@ -498,13 +1058,12 @@ pub struct PersistedDiagnostic {
     pub range: PersistedRange,
     pub correction: Option<String>,
     /// The `contextMessages` rows, each carrying its own file index. `None`
-    /// is the zero-cost no-context face — no key is written at all
-    /// (`skip_serializing_if`), so a payload without context stays exactly
-    /// its previous size; `Some` persists every element's message, file, and
-    /// UTF-16 span. A corrupt file index inside a context row drops just
-    /// that element on restore (under-report, never a crash) — the parent
-    /// diagnostic survives because its own `file` already resolved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// is the no-context face — one tag byte under the binary codec (no
+    /// field may omit itself on a positional wire, #4207); `Some` persists
+    /// every element's message, file, and UTF-16 span. A corrupt file index
+    /// inside a context row drops just that element on restore (under-report,
+    /// never a crash) — the parent diagnostic survives because its own
+    /// `file` already resolved.
     pub context: Option<Vec<PersistedContextMessage>>,
 }
 
@@ -905,8 +1464,9 @@ mod tests {
         r#""combinators":[{"hide":false,"names":["showOnly"],"name_spans":[{"offset":40,"#,
         r#""length":8}]},{"hide":true,"names":["hideMe"],"name_spans":[{"offset":53,"length":6}]}],"#,
         r#""name":"main","configurations":[{"dotted_name":"dart.library.io","value":null,"#,
-        r#""uri":"io.dart","uri_span":{"offset":20,"length":9}},{"dotted_name":"flutter.mode","#,
-        r#""value":"release","uri":"release.dart","uri_span":{"offset":36,"length":14}}]}],"#,
+        r#""uri":"io.dart","interpolated":false,"uri_span":{"offset":20,"length":9}},"#,
+        r#"{"dotted_name":"flutter.mode","value":"release","uri":"release.dart","#,
+        r#""interpolated":false,"uri_span":{"offset":36,"length":14}}]}],"#,
         r#""doc_imports":[{"uri":"package:b/b.dart","uri_span":{"offset":60,"length":17},"#,
         r#""code":"UriDoesNotExistInDocImport"},{"uri":null,"uri_span":{"offset":80,"length":9},"#,
         r#""code":"UriWithInterpolation"}],"#,
@@ -916,7 +1476,7 @@ mod tests {
         r#"{"severity":"Error","code_name":"uri_does_not_exist","code_machine":"URI_DOES_NOT_EXIST","#,
         r#""code_dtype":"CompileTimeError","code_published":false,"message":"Target of URI "#,
         r#"doesn't exist: 'package:a/a.dart'.","file":0,"range":{"offset":0,"length":18},"#,
-        r#""correction":null},{"severity":"Warning","code_name":"dead_code","#,
+        r#""correction":null,"context":null},{"severity":"Warning","code_name":"dead_code","#,
         r#""code_machine":"DEAD_CODE","code_dtype":"StaticWarning","code_published":true,"#,
         r#""message":"Dead code.","file":1,"range":{"offset":4,"length":9},"#,
         r#""correction":"Try removing the dead code.","context":[{"message":"'dead' "#,
@@ -1094,7 +1654,7 @@ mod tests {
     /// [`Self::populated_elements_shape_is_pinned`] fails — the same
     /// bump-the-version-and-re-pin contract as the main pin.
     const FACTS_SHAPE_ELEMENTS_JSON_PIN: &str = concat!(
-        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[],"required_positional":1}},"required":true,"covariant":false,"default_value":null}],"named":[]},"annotations":[]}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","is_augment":false,"is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"is_const":false,"covariant":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_augment":false,"is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"is_const":false,"covariant":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]],"annotations":[]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null,"default_separator":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false,"head_range":{"offset":58,"length":3},"name_range":null}],"anon_methods":[],"wildcard_duplicates":[],"formal_annotations":[],"ctor_annotations":[],"library_annotations":[]}"#,
+        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"type_params_named":[],"return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"named":[],"required_positional":1}},"required":true,"covariant":false,"default_value":null}],"named":[]},"annotations":[]}]],"containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"is_mixin_application":false,"superclass":null,"intro_superclass":false,"members":[[1,{"kind":"Method","is_augment":false,"is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"is_const":false,"covariant":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"type_param_names":[],"type_param_bounds":[],"type_param_variances":[],"sealed":false,"with_clause":[],"implements_clause":[],"on_clause":[],"with_clause_args":[],"implements_clause_args":[],"on_clause_args":[],"superclass_args":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"factory_formals":[],"annotations":[]}]],"container_order":[0],"extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"members":[[14,{"kind":"Getter","is_augment":false,"is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"is_const":false,"covariant":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"name_range":null}]],"annotations":[]}],"duplicates":[],"arity_violations":[],"const_creations":[],"augmentations":[{"kind":"Class","name":0,"display_name":0,"name_range":{"offset":10,"length":1},"augment_kw":{"offset":1,"length":7},"container":null,"is_static":false,"is_final":false,"modifiers":{"abstract_kw":null,"base_kw":{"offset":8,"length":4},"final_kw":null,"interface_kw":null,"sealed_kw":null,"mixin_kw":null},"extends_kw":{"offset":15,"length":7},"type_params":[{"name":13,"name_range":{"offset":40,"length":1},"bound":[{"Named":{"name":4,"nullable":false,"args":[]}},{"offset":49,"length":3}]}],"type_params_close":{"offset":52,"length":1},"return_ty":null,"return_ty_range":null,"formals":[{"name":7,"name_range":{"offset":70,"length":1},"full_range":{"offset":66,"length":5},"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"ty_range":{"offset":66,"length":3},"required_positional":true,"optional_positional":false,"named":false,"covariant_kw":null,"required_kw":null,"default_separator":null}],"parens":[{"offset":65,"length":1},{"offset":76,"length":1}],"group_open":null,"const_kw":null,"factory_kw":null,"is_complete":false}],"decl_kinds":[{"container":0,"name":0,"kind":"Constructor","is_final":false,"is_mixin_application":false,"is_const":true,"is_factory":false,"is_complete":false,"head_range":{"offset":58,"length":3},"name_range":null}],"anon_methods":[],"wildcard_duplicates":[],"formal_annotations":[],"ctor_annotations":[],"library_annotations":[]}"#,
     );
 
     /// The element rows the main probe rides past empty, modeled on the
@@ -1184,6 +1744,9 @@ mod tests {
                     is_final: false,
                     is_interface: false,
                     is_mixin_class: false,
+                    // A body class declaration, not a named mixin
+                    // application (`class X = S with M`).
+                    is_mixin_application: false,
                     intro_superclass: false,
                     superclass: None,
                     factory_formals: Vec::new(),
@@ -1239,10 +1802,20 @@ mod tests {
                     type_params: 0,
                     type_param_names: Vec::new(),
                     type_param_bounds: Vec::new(),
+                    // No type parameters, so no written variance modifiers
+                    // (#3903's column, parallel to the spellings).
+                    type_param_variances: Vec::new(),
                     sealed: false,
                     with_clause: Vec::new(),
                     implements_clause: Vec::new(),
                     on_clause: Vec::new(),
+                    // The #3847 clause-face argument columns, parallel to
+                    // the three name columns above (empty clauses ⇒ empty
+                    // argument lists) and to the `extends` head.
+                    with_clause_args: Vec::new(),
+                    implements_clause_args: Vec::new(),
+                    on_clause_args: Vec::new(),
+                    superclass_args: Vec::new(),
                     header_residue: Vec::new(),
                     primary_formals: Vec::new(),
                     enum_constants: Vec::new(),
@@ -1919,6 +2492,29 @@ mod tests {
         .expect("engine")
     }
 
+    /// The [`bare_engine`] assembly over one shared synthetic SDK root: the
+    /// #4199 run key folds the grants fingerprint, which folds the SDK lib
+    /// root (an SDK move is a legitimate miss), so a test asserting
+    /// cross-engine replay must build every engine over the same root.
+    fn bare_engine_over_sdk(root: &Path, sdk_root: &Path) -> Engine {
+        let pub_config = Arc::new(
+            PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#).expect("valid config"),
+        );
+        Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(sdk_root, None).expect("synthetic SDK loads"),
+            packages: PackageTable::basic(root, None).expect("table"),
+            pub_config,
+            config_dir: root.join(".dart_tool"),
+            context_roots: Vec::new(),
+            semdiag: None,
+            target: "vm".to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine")
+    }
+
     /// The #2274 cross-workspace collision pin: two pubspec-less
     /// workspaces with byte-identical files digest distinct headers (the
     /// context root rides the salt, so the generation directories fork),
@@ -2392,12 +2988,13 @@ mod tests {
 
     /// The `contextMessages` payload (#1821): message text, the referenced
     /// file's index into the facts' path table, and the UTF-16 span all
-    /// survive the round trip — `None` rows persist as no key at all
-    /// (`skip_serializing_if`), while `Some` rows ride their elements'
-    /// columns verbatim. A corrupt inner file index drops just that element
-    /// (under-report, never a crash) — the parent diagnostic survives.
+    /// survive the round trip — `None` rows ride an explicit `null` (the
+    /// positional codec writes every field, #4207), while `Some` rows ride
+    /// their elements' columns verbatim. A corrupt inner file index drops
+    /// just that element (under-report, never a crash) — the parent
+    /// diagnostic survives.
     #[test]
-    fn diagnostic_context_round_trips_and_omits_when_empty() {
+    fn diagnostic_context_round_trips_across_the_payload() {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let reported = files.intern(Path::new("/w/lib/main.dart"));
@@ -2453,12 +3050,12 @@ mod tests {
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let decoded: PersistedFacts = serde_json::from_slice(&bytes).expect("deserialize");
 
-        // The no-context row persists byte-identically to before the field
-        // existed — `skip_serializing_if` writes no key.
+        // The no-context row carries an explicit null — the positional
+        // codec never omits a field (#4207).
         let contextless_bytes = serde_json::to_string(&decoded.diagnostics[1]).expect("re-encode");
         assert!(
-            !contextless_bytes.contains("\"context\""),
-            "None writes no context key: {contextless_bytes}"
+            contextless_bytes.contains("\"context\":null"),
+            "None rides an explicit null: {contextless_bytes}"
         );
         let context_bytes =
             serde_json::to_string(&decoded.diagnostics[0]).expect("re-encode context row");
@@ -3238,5 +3835,409 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    /// The #4199 cross-session run replay, end to end: a producer engine's
+    /// completed run lands in the content store (the post-analyze sweep),
+    /// a fresh engine over the same workspace — same snapshot staging, so
+    /// the warm start claims the facts — adopts the stored run through the
+    /// pipeline's standing reuse gate (`from_cache: true` on the target
+    /// library) and returns the producer's exact rows, and a content edit
+    /// that moves the file's face reverts that library to a full recompute
+    /// (`from_cache: false`) — the legitimate-miss set, nothing broader.
+    #[test]
+    fn library_runs_replay_across_engine_instances_and_gate_on_face_moves() {
+        let root = bare_workspace("run-replay");
+        // One SDK root for every engine: the run key folds the grants
+        // fingerprint, which folds the SDK lib root — per-engine synthetic
+        // SDKs would fork the key and the test would pin a miss.
+        let sdk_root = std::env::temp_dir().join(format!(
+            "dartq-engine-run-replay-sdk-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&sdk_root);
+        std::fs::create_dir_all(sdk_root.join("lib/_internal")).expect("sdk dirs");
+        std::fs::write(sdk_root.join("version"), "3.13.1\n").expect("version");
+        std::fs::write(sdk_root.join("lib/libraries.json"), SDK_LIBRARIES).expect("libraries");
+        std::fs::write(
+            sdk_root.join("lib/_internal/allowed_experiments.json"),
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        )
+        .expect("experiments");
+        // A face-carrying fixture: the parse-error row rides the payload, so
+        // the replay assertion below proves rows survived, not just the key.
+        let source = "void main() { var x = ; }\n";
+        let main_path = root.join("lib/main.dart");
+        let snap_root = snapshot_cache_dir();
+        let store_root = snapshot_cache_dir();
+
+        let mut producer = bare_engine_over_sdk(&root, &sdk_root);
+        producer
+            .open_content_store(&crate::store::StoreConfig {
+                root: store_root.clone(),
+                size_limit: 16 << 20,
+            })
+            .expect("open store");
+        let main_cold = producer.set_content(&main_path, source.as_bytes());
+        let mut cold_recomputes = 0;
+        let mut on_event = |event: EngineEvent| {
+            if let EngineEvent::LibraryAnalyzed {
+                from_cache: false, ..
+            } = event
+            {
+                cold_recomputes += 1;
+            }
+        };
+        let cancel = CancellationToken::new();
+        let cold_rows = producer
+            .analyze(&[main_cold], &mut on_event, &cancel)
+            .expect("analyze");
+        assert!(
+            !cold_rows.is_empty(),
+            "fixture sanity: the parse-error file carries rows"
+        );
+        let snapshot_store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snap_root.clone()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open snapshot store");
+        let saved = producer
+            .save_facts_snapshot(&snapshot_store)
+            .expect("save snapshot");
+        assert_eq!(saved, 1, "one entry: one file, one content");
+        let header = producer.snapshot_header();
+        drop(producer);
+
+        // The cross-session hit: fresh process shape — same store root,
+        // staged snapshot, identical bytes.
+        let mut warm = bare_engine_over_sdk(&root, &sdk_root);
+        warm.open_content_store(&crate::store::StoreConfig {
+            root: store_root.clone(),
+            size_limit: 16 << 20,
+        })
+        .expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(warm.ingest_facts_snapshot(snapshot), 1);
+        let main_warm = warm.set_content(&main_path, source.as_bytes());
+        let mut warm_hits = 0;
+        let mut warm_recomputes = 0;
+        let mut on_event = |event: EngineEvent| {
+            if let EngineEvent::LibraryAnalyzed { from_cache, .. } = event {
+                if from_cache {
+                    warm_hits += 1;
+                } else {
+                    warm_recomputes += 1;
+                }
+            }
+        };
+        let warm_rows = warm
+            .analyze(&[main_warm], &mut on_event, &cancel)
+            .expect("analyze");
+        assert_eq!(
+            warm_hits, 1,
+            "the replayed run stands: the reuse gate serves the target \
+             library from the adopted result"
+        );
+        assert_eq!(warm_recomputes, 0, "nothing recomputed on the hit turn");
+        let row = |d: &Diagnostic| (d.code.name, d.range.offset, d.range.length, d.severity);
+        assert_eq!(
+            warm_rows.iter().map(&row).collect::<Vec<_>>(),
+            cold_rows.iter().map(&row).collect::<Vec<_>>(),
+            "the replayed rows equal the cold pass's, row for row"
+        );
+
+        // The cross-session miss: same store, staged snapshot, but the file
+        // content moved — the claim fails, the face moves, the run key forks,
+        // and the library recomputes cold.
+        let mut edited = bare_engine_over_sdk(&root, &sdk_root);
+        edited
+            .open_content_store(&crate::store::StoreConfig {
+                root: store_root.clone(),
+                size_limit: 16 << 20,
+            })
+            .expect("open store");
+        let snapshot = snapshot_store
+            .load::<PersistedFacts>(&header)
+            .expect("generation");
+        assert_eq!(edited.ingest_facts_snapshot(snapshot), 1);
+        let main_edited = edited.set_content(&main_path, b"void main() { var x = 1; }\n");
+        let mut edited_hits = 0;
+        let mut edited_recomputes = 0;
+        let mut on_event = |event: EngineEvent| {
+            if let EngineEvent::LibraryAnalyzed { from_cache, .. } = event {
+                if from_cache {
+                    edited_hits += 1;
+                } else {
+                    edited_recomputes += 1;
+                }
+            }
+        };
+        let edited_rows = edited
+            .analyze(&[main_edited], &mut on_event, &cancel)
+            .expect("analyze");
+        assert_eq!(
+            edited_hits, 0,
+            "a moved face never adopts: no cache hit on the miss turn"
+        );
+        assert_eq!(
+            edited_recomputes, 1,
+            "the library recomputes — the legitimate-miss set"
+        );
+        assert!(
+            edited_rows.is_empty(),
+            "the edited content is clean; the miss degrades to a full \
+             recompute, not stale rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&snap_root);
+        let _ = std::fs::remove_dir_all(&store_root);
+        let _ = std::fs::remove_dir_all(&sdk_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The run payload's own contract, pinned at the JSON face: a well-formed
+    /// entry round-trips into a faithful `LibraryResult` (rows, context,
+    /// fingerprint) plus its reference surface (the resolved ref, the
+    /// unresolved-name row, the supertype edge — each interned column
+    /// re-minted through the loading tables), a fingerprint mismatch never
+    /// serves, and a file the loading engine never interned rejects the
+    /// whole payload — the all-or-nothing gate the engine-level test
+    /// exercises through the store.
+    #[test]
+    fn library_run_payload_round_trips_and_rejects_mismatches() {
+        let json = concat!(
+            r#"{"fingerprint":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"#,
+            r#""diagnostics":[{"severity":"Warning","code_name":"dead_code","#,
+            r#""code_machine":"DEAD_CODE","code_dtype":"StaticWarning","#,
+            r#""code_published":true,"message":"Dead code.","file":0,"#,
+            r#""range":{"offset":4,"length":9},"#,
+            r#""correction":"Try removing the dead code.","#,
+            r#""context":[{"message":"'dead' is declared here.","file":1,"#,
+            r#""range":{"offset":0,"length":4}}]}],"#,
+            r#""surface":{"refs":[{"file":0,"target_file":1,"target_name":0,"#,
+            r#""target_container":null,"kind":"Invoked","#,
+            r#""range":{"offset":10,"length":5},"qualifier":3}],"#,
+            r#""names":[{"name":1,"kind":"Referenced","range":{"offset":20,"length":7},"#,
+            r#""qualified":false}],"overflow":[],"#,
+            r#""supers":[{"file":0,"name":2,"supertype":{"Name":1},"clause":"Extends"}],"#,
+            r#""strings":["greet","Missing","C","p"]},"#,
+            r#""files":["/w/lib/main.dart","/w/lib/other.dart"]}"#,
+        );
+        let payload: PersistedLibraryRun = serde_json::from_str(json).expect("decode");
+        let fingerprint =
+            ApiSignature::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let mut files = FileTable::new();
+        let main = files.intern(Path::new("/w/lib/main.dart"));
+        let other = files.intern(Path::new("/w/lib/other.dart"));
+        let codes = CodeRegistry::builtin();
+        let strings = StringTable::new();
+
+        // The round trip: faithful rows under a matching fingerprint.
+        let (run, surface) = payload
+            .clone()
+            .materialize(&fingerprint, &codes, &strings, &mut |path| {
+                files.try_file_id(path)
+            })
+            .expect("matching fingerprint serves");
+        assert_eq!(run.cycle_fingerprint, fingerprint);
+        assert_eq!(run.diagnostics.len(), 1);
+        let diagnostic = &run.diagnostics[0];
+        assert_eq!(diagnostic.code.name, "dead_code");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.message.as_str(), "Dead code.");
+        assert_eq!(diagnostic.file, main);
+        assert_eq!(diagnostic.range.offset, 4);
+        assert_eq!(diagnostic.range.length, 9);
+        assert_eq!(
+            diagnostic.correction.as_deref(),
+            Some("Try removing the dead code.")
+        );
+        let context = diagnostic.context.as_deref().expect("context rides");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].message.as_str(), "'dead' is declared here.");
+        assert_eq!(context[0].file, other);
+        assert_eq!(context[0].range.offset, 0);
+        assert_eq!(context[0].range.length, 4);
+
+        // The surface's half of the round trip: the name texts re-interned
+        // into the loading table, the file indexes re-pointed into its
+        // file table, and the derived CSR columns rebuilt — so the probes
+        // the query faces run answer exactly as the built index would.
+        let greet = strings.intern("greet");
+        let refs = surface
+            .references_of(other, greet)
+            .expect("the persisted ref run stands");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, RefKind::Invoked);
+        assert_eq!(refs[0].file, main);
+        assert_eq!(refs[0].target_container, StringId::NONE);
+        assert_eq!(refs[0].qualifier, strings.intern("p"));
+        let missing = strings.intern("Missing");
+        let unresolved: Vec<_> = surface.unresolved(missing).collect();
+        assert_eq!(unresolved.len(), 1);
+        assert!(!unresolved[0].qualified);
+        let edges = surface
+            .supertypes_of(main, strings.intern("C"))
+            .expect("the persisted supertype edge stands");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].supertype, TargetRef::Name(missing));
+
+        // The embedded fingerprint check: a different expected face never
+        // serves, even though the store key would have matched the fold.
+        let moved =
+            ApiSignature::from_bytes([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        assert!(
+            payload
+                .clone()
+                .materialize(&moved, &codes, &strings, &mut |path| {
+                    files.try_file_id(path)
+                })
+                .is_none(),
+            "a fingerprint mismatch rejects the payload wholesale"
+        );
+
+        // A file the loading engine never interned: the run cannot be
+        // attributed faithfully, so nothing serves.
+        let ghost_json = json.replace("/w/lib/other.dart", "/w/lib/ghost.dart");
+        let ghost: PersistedLibraryRun = serde_json::from_str(&ghost_json).expect("decode");
+        assert!(
+            ghost
+                .materialize(&fingerprint, &codes, &strings, &mut |path| {
+                    files.try_file_id(path)
+                })
+                .is_none(),
+            "an unknown file path rejects the payload wholesale"
+        );
+    }
+
+    /// The lint-row content-store key's contract (#4205): deterministic
+    /// (same inputs → same key across processes), fork-sensitive (any
+    /// dimension's move re-keys), and domain-separated from
+    /// `library_run_key` (same underlying dims, different store prefix).
+    #[test]
+    fn lint_rows_key_deterministic_and_forked() {
+        let build = [1u8; 16];
+        let grants = 42u64;
+        let packages = [2u8; 16];
+        let content = content_hash(b"int x = 1;");
+        let fingerprint = 99u64;
+
+        let key1 = lint_rows_key(build, grants, packages, content, fingerprint);
+        let key2 = lint_rows_key(build, grants, packages, content, fingerprint);
+        assert_eq!(key1, key2, "same inputs must produce the same key");
+
+        // Each fork dimension independently re-keys.
+        let key_build = lint_rows_key([9u8; 16], grants, packages, content, fingerprint);
+        assert_ne!(key1, key_build, "build move re-keys");
+
+        let key_grants = lint_rows_key(build, 43, packages, content, fingerprint);
+        assert_ne!(key1, key_grants, "grants move re-keys");
+
+        let key_packages = lint_rows_key(build, grants, [8u8; 16], content, fingerprint);
+        assert_ne!(key1, key_packages, "packages move re-keys");
+
+        let key_content = lint_rows_key(
+            build,
+            grants,
+            packages,
+            content_hash(b"int y = 2;"),
+            fingerprint,
+        );
+        assert_ne!(key1, key_content, "content move re-keys");
+
+        let key_fp = lint_rows_key(build, grants, packages, content, 100);
+        assert_ne!(key1, key_fp, "fingerprint move re-keys");
+    }
+
+    /// The library-run key's contract: deterministic across processes for
+    /// identical inputs, and fork-sensitive on every column — in
+    /// particular the member-path column (#4221): two byte-identical
+    /// libraries at different paths (the overlay-introduced file carrying
+    /// another member's exact bytes) must never share one stored run,
+    /// because a run's rows anchor at the member paths verbatim.
+    #[test]
+    fn library_run_key_deterministic_and_path_forked() {
+        use std::path::Path;
+
+        let build = [1u8; 16];
+        let semantic_version = 7_u32;
+        let grants = 42u64;
+        let packages = [2u8; 16];
+        let fingerprint = ApiSignature::from_bytes([3u8; 16]);
+        let content = [content_hash(b"void g() { y }\n")];
+        let at_a = [Path::new("/w/lib/a.dart")];
+        let at_b = [Path::new("/w/lib/b.dart")];
+
+        let key1 = library_run_key(
+            build,
+            semantic_version,
+            grants,
+            packages,
+            &fingerprint,
+            &content,
+            &at_a,
+        );
+        let key2 = library_run_key(
+            build,
+            semantic_version,
+            grants,
+            packages,
+            &fingerprint,
+            &content,
+            &at_a,
+        );
+        assert_eq!(key1, key2, "same inputs must produce the same key");
+
+        // The false-adoption guard: identical content and fingerprint,
+        // different path — one stored run must not serve the other.
+        let key_path = library_run_key(
+            build,
+            semantic_version,
+            grants,
+            packages,
+            &fingerprint,
+            &content,
+            &at_b,
+        );
+        assert_ne!(key1, key_path, "member-path move re-keys (#4221)");
+
+        // The remaining columns keep forking independently.
+        let key_content = library_run_key(
+            build,
+            semantic_version,
+            grants,
+            packages,
+            &fingerprint,
+            &[content_hash(b"var ok = 1;\n")],
+            &at_a,
+        );
+        assert_ne!(key1, key_content, "content move re-keys");
+
+        let key_fp = library_run_key(
+            build,
+            semantic_version,
+            grants,
+            packages,
+            &ApiSignature::from_bytes([4u8; 16]),
+            &content,
+            &at_a,
+        );
+        assert_ne!(key1, key_fp, "fingerprint move re-keys");
+
+        // The member-list shape forks too: a part joining the library
+        // changes the folded path set even when the defining path stands.
+        let with_part = [Path::new("/w/lib/a.dart"), Path::new("/w/lib/a.g.dart")];
+        let key_part = library_run_key(
+            build,
+            semantic_version,
+            grants,
+            packages,
+            &fingerprint,
+            &content,
+            &with_part,
+        );
+        assert_ne!(key1, key_part, "member-set growth re-keys");
     }
 }

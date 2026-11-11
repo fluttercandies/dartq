@@ -379,6 +379,96 @@ impl Engine {
         self.state.l3.as_mut()
     }
 
+    /// Batch probe of persisted lint rows (#4205): one read per
+    /// `(content, fingerprint)` pair — the lints layer's row identity, the
+    /// same pair its in-process memo keys on — answered from the L3 store
+    /// under [`state::persist::lint_rows_key`] (the fork dimensions the
+    /// fingerprint cannot see are folded engine-side, once per call). The
+    /// payload bytes are the lints layer's own encoding; `None` per
+    /// position when the store is disarmed, holds no entry, or the read
+    /// fails (a miss, never an error — the cache is an accelerator).
+    pub fn lint_rows_probe(
+        &self,
+        keyed: &[(dartq_source::ContentId, u64)],
+    ) -> Vec<Option<Vec<u8>>> {
+        let Some(store) = self.state.l3.as_ref() else {
+            return vec![None; keyed.len()];
+        };
+        let build = state::persist::analyzer_build();
+        let grants = self.state.feature_grants.fingerprint();
+        let packages = state::persist::package_graph_fingerprint(&self.state.packages);
+        keyed
+            .iter()
+            .map(|&(content, fingerprint)| {
+                let key =
+                    state::persist::lint_rows_key(build, grants, packages, content, fingerprint);
+                store.read(&key).ok()
+            })
+            .collect()
+    }
+
+    /// Persists lint rows into the L3 store (#4205): one batch put of the
+    /// `(content, fingerprint, payload)` triples under the same keys
+    /// [`Self::lint_rows_probe`] reads (idempotent — an entry already in
+    /// the books only refreshes its touch), then one flush. A disarmed
+    /// store is a no-op.
+    pub fn lint_rows_persist(&mut self, rows: &[(dartq_source::ContentId, u64, Vec<u8>)]) {
+        let Some(store) = self.state.l3.as_mut() else {
+            return;
+        };
+        let build = state::persist::analyzer_build();
+        let grants = self.state.feature_grants.fingerprint();
+        let packages = state::persist::package_graph_fingerprint(&self.state.packages);
+        let batch: Vec<(dartq_source::ContentId, &[u8])> = rows
+            .iter()
+            .map(|&(content, fingerprint, ref payload)| {
+                (
+                    state::persist::lint_rows_key(build, grants, packages, content, fingerprint),
+                    payload.as_slice(),
+                )
+            })
+            .collect();
+        if batch.is_empty() {
+            return;
+        }
+        store.put_known_batch(&batch);
+        store.flush();
+    }
+
+    /// The reachability inputs' workspace epoch (#4205): an
+    /// order-independent fold of every resident file's content id — the
+    /// identity of everything the per-declaration reachability map derives
+    /// from. The lint rows that mount the map (`unreachable_from_main`)
+    /// read a workspace-global face no per-file key can pin, so the lints
+    /// layer folds this epoch into their identity: any content move
+    /// anywhere in the workspace re-keys exactly the rule-enabled files'
+    /// rows. Commutative (wrapping add of per-id hashes), so the fold is a
+    /// pure function of the resident content set — equal workspaces epoch
+    /// equally across processes.
+    #[must_use]
+    pub fn lint_reachability_epoch(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut sum = 0u64;
+        for facts in self.state.residency.values() {
+            let mut h = rustc_hash::FxHasher::default();
+            h.write(facts.content.as_bytes());
+            sum = sum.wrapping_add(h.finish());
+        }
+        sum
+    }
+
+    /// The last completed analyze turn's library counts (#4205): libraries
+    /// recomputed by the turn, and live libraries served from a standing
+    /// run — a recorded result the reuse gate kept, a replayed
+    /// `PersistedLibraryRun`, or a clean target. The honest per-turn pair
+    /// the metrics faces report (the event stream's `LibraryAnalyzed`
+    /// cache hits fire for asked-for targets only, so a pure-replay turn
+    /// — zero recomputed, every library served — reports zeros there).
+    #[must_use]
+    pub fn last_analyze_stats(&self) -> (usize, usize) {
+        self.state.turn_stats
+    }
+
     /// Enqueues a content override. Only touches the pending overlay — no
     /// derived state is invalidated here. Interns `path` if new and returns
     /// its `FileId`. Last write per path wins; `set_content` then
@@ -527,16 +617,22 @@ impl Engine {
         cancel: &CancellationToken,
     ) -> Result<Vec<Diagnostic>, Cancelled> {
         self.capture_pubspecs();
-        let mut diagnostics = pipeline::analyze(
+        // The cross-session run cache (#4199): a staged snapshot replays
+        // its stored library runs before the pipeline head (the apply the
+        // head would run anyway, then adoption into `results`), and every
+        // completed run persists after — also on `Err(Cancelled)`, whose
+        // completed units are whole results worth keeping.
+        self.state.replay_library_runs(on_event);
+        let analyzed = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
             self.semdiag.as_deref(),
             targets,
             on_event,
             cancel,
-        )?
-        .as_ref()
-        .clone();
+        );
+        self.state.persist_library_runs();
+        let mut diagnostics = analyzed?.as_ref().clone();
         self.capture_nested_pubspecs();
         // The settle's arming point (#2739): a completed analyze arms the
         // `Tier::Background` warm lane — O(1), the plan's items
@@ -578,14 +674,20 @@ impl Engine {
         cancel: &CancellationToken,
     ) -> Result<Arc<Vec<Diagnostic>>, Cancelled> {
         self.capture_pubspecs();
-        let shared = pipeline::analyze(
+        // #4199, as in [`Self::analyze`]: replay the staged generation's
+        // stored runs ahead of the pipeline head, persist the completed
+        // ones behind it (cancelled runs keep their finished units too).
+        self.state.replay_library_runs(on_event);
+        let analyzed = pipeline::analyze(
             &mut self.state,
             &mut self.graph,
             self.semdiag.as_deref(),
             targets,
             on_event,
             cancel,
-        )?;
+        );
+        self.state.persist_library_runs();
+        let shared = analyzed?;
         self.capture_nested_pubspecs();
         // The settle's arming point (#2739), as in [`Self::analyze`].
         self.state.arm_warm();
@@ -1647,14 +1749,18 @@ impl Engine {
 
     /// The resident bytes of a file. Reported non-Dart files (the pubspec
     /// face) and options-file rows resolve through their captured layouts
-    /// (see [`Engine::line_index`]).
+    /// (see [`Engine::line_index`]). A dependency unit retains no store
+    /// bytes (#4217): its source is read back from disk on first demand
+    /// and memoized on the unit itself, so the query faces (rename's
+    /// spelling check, position conversion) see the same text the unit
+    /// was computed from.
     #[must_use]
     pub fn content(&self, file: FileId) -> Option<&[u8]> {
         if let Some(facts) = self.state.residency.get(&file) {
             return self.state.store.get(facts.content);
         }
         if let Some(unit) = self.state.deps.units.get(&file) {
-            return self.state.store.get(unit.facts.content);
+            return unit.source_bytes(self.state.files.path(file));
         }
         if let Some((text, _)) = self.state.reported.get(&file) {
             return Some(text.as_bytes());
@@ -1858,6 +1964,56 @@ impl Engine {
     #[must_use]
     pub fn memory_report(&self) -> Vec<(&'static str, u64, &'static str)> {
         self.state.memory_report()
+    }
+
+    /// [`memory_report`](Self::memory_report) plus the families the
+    /// residency face cannot see from inside `state.rs` — the dep-closure
+    /// index ([`crate::deps::DepIndex`]), the interning tables'
+    /// own byte walks ([`dartq_source::FileTable::heap_bytes`],
+    /// [`dartq_source::StringTable::heap_bytes`]), the package
+    /// tables, the SDK snapshot's flat faces, the resolved
+    /// options, the feature-grants memo, and the L3 content-store.
+    /// Read-only and O(residency + deps + interning); the daemon's
+    /// `dartq/memory` face answers with it under the same env probe as
+    /// the cold analyze.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn memory_report_full(&self) -> Vec<(&'static str, u64, &'static str)> {
+        // The state face's `structural_tables` row is the coarse
+        // `files × 256 + strings × 93` estimator the budget ladder reports
+        // (#1887). The exact FileTable/StringTable walks below supersede it,
+        // so the estimate is dropped rather than double-counted here.
+        let mut rows: Vec<(&'static str, u64, &'static str)> = self
+            .state
+            .memory_report()
+            .into_iter()
+            .filter(|(family, _, _)| *family != "structural_tables")
+            .collect();
+        rows.extend(self.state.deps.memory_bytes());
+        for (family, bytes) in self.state.files.heap_bytes() {
+            rows.push((family, bytes, "exact"));
+        }
+        for (family, bytes) in self.state.strings.heap_bytes() {
+            rows.push((family, bytes, "exact"));
+        }
+        // The package-identity and URI-resolution faces' own shells; their
+        // string payloads ride the StringTable (counted there) or the file
+        // paths (counted in the FileTable walk). Counted shallow here —
+        // exact over owned columns.
+        rows.push((
+            "packages_rows",
+            (self.state.packages.len() * std::mem::size_of::<dartq_package::PackageIdentity>())
+                as u64,
+            "est",
+        ));
+        rows.push((
+            "options_entries",
+            (self.state.options.capacity()
+                * (std::mem::size_of::<(PathBuf, Arc<crate::analysis_options::AnalysisOptions>)>()
+                    + 1)) as u64,
+            "exact",
+        ));
+        rows
     }
 
     /// Exact byte footprint of the two postings directories (name →
@@ -4154,6 +4310,45 @@ mod tests {
         assert!(
             !importer,
             "the workspace importer reports no URI-layer staleness: {diagnostics:?}"
+        );
+    }
+
+    /// The loader-parity pin: the parallel dep-closure loader (the
+    /// production arm — parallel discovery/interface compute, serial
+    /// interning replay and install) and the original serial loader must
+    /// produce the same dependency units byte for byte on the same input.
+    /// Compared faces: the element model's canonical API signature, the
+    /// directives, the declaration capture, the resolved targets (as
+    /// paths), the settled version, and the content id — plus the load
+    /// failure tally. Dead columns (diagnostics, `api_signature`,
+    /// `doc_imports`) are excluded by design: a dependency unit never
+    /// reports rows, so the interface-only tier leaves them empty.
+    #[test]
+    fn dep_closure_serial_and_parallel_loaders_agree() {
+        let (_root, _external, mut engine) = bounded_workspace_engine();
+        engine.discover_workspace().expect("discover");
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze completes");
+        let (parallel_faces, parallel_total) = crate::deps::dep_faces_for_test(&engine.state);
+        let parallel_failures = engine.state.deps.load_failures;
+        assert!(
+            !parallel_faces.is_empty(),
+            "the lazy closure loaded at least one dependency unit"
+        );
+        let serial_failures = crate::deps::reload_serial_for_test(&mut engine.state);
+        let (serial_faces, serial_total) = crate::deps::dep_faces_for_test(&engine.state);
+        assert_eq!(
+            serial_total, parallel_total,
+            "total dep-unit face digest must match the serial loader's"
+        );
+        assert_eq!(
+            serial_faces, parallel_faces,
+            "per-unit dep faces must match the serial loader's"
+        );
+        assert_eq!(
+            serial_failures, parallel_failures,
+            "load-failure tally must match the serial loader's"
         );
     }
 }

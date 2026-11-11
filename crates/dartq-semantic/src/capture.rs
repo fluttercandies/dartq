@@ -218,6 +218,21 @@ pub(crate) struct TreeSink {
 }
 
 impl TreeSink {
+    /// The most recently completed node: the innermost open level's last
+    /// entry while a level is open (a sealed function type folds into the
+    /// enclosing group's argument list, `C<void Function<T extends
+    /// int>()>` — it never reaches `done` before the window closes), the
+    /// newest root otherwise (a whole-bound function is the bound sink's
+    /// only root). The signature-variable stitch reads the node here.
+    pub(crate) fn last_completed_node(&mut self) -> Option<&mut TypeTree> {
+        match self.stack.last_mut() {
+            Some(level) => level.nodes.last_mut(),
+            None => self.done.last_mut(),
+        }
+    }
+}
+
+impl TreeSink {
     /// A simple type head completed (`handle_type`).
     ///
     /// The parser re-fires a parameterized head after its own group

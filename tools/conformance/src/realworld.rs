@@ -2,7 +2,7 @@
 //! the local pub cache (never vendored). The package list is
 //! `conformance/realworld.toml`; each entry pins one package at an exact
 //! version. For every package the oracle (`dart analyze --format=json`) and
-//! dartq (`analyze --cold --format=json --sdk-path <sdk>`) each run once over
+//! dartq (`analyze --engine --cold --format=json --sdk-path <sdk>`) each run once over
 //! the package directory under the shared watchdog, the diagnostics are
 //! attributed to files relative to the package dir (rows outside it are
 //! dep-graph noise and are dropped, the same class of filter the chunked

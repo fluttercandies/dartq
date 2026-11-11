@@ -4,12 +4,16 @@ use super::collector::{Collector, latest_features, scan_ok, setup};
 
 #[test]
 fn ensure_identifier_synthesizes_on_error() {
+    // `TypeReferenceIdentifierContext` carries `recoveryTemplate:
+    // diag.expectedType` (identifier_context_impl.dart:1486-1508), so a
+    // junk type reference reports `expected_type_name` — oracle:
+    // `class C extends > {}` reports `expected_type_name` at the `>`.
     let mut p = setup(">");
     let id = p.ensure_identifier(crate::listener::IdentifierContext::TypeReference);
     assert_eq!(p.cursor.lexeme(id.id), ""); // synthetic, fixed empty lexeme
     assert_eq!(
         p.listener.error_codes(),
-        vec!["missing_identifier".to_string()]
+        vec!["expected_type_name".to_string()]
     );
 }
 

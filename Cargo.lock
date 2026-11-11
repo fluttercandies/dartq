@@ -65,6 +65,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode-next"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d6626829353ae29293be5c86f42de5f0468bc758af074b0c7d08f07e538ccbc"
+dependencies = [
+ "bincode_derive-next",
+ "pastey",
+ "rapidhash",
+ "serde",
+ "unty-next",
+]
+
+[[package]]
+name = "bincode_derive-next"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "409532b1da3be643427e49c2f79e0c47d445f695e1b028270d9e80e9044d7d1c"
+dependencies = [
+ "virtue-next",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -188,7 +210,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "conformance"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "clap",
@@ -287,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-ai"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "dartq-diagnostics",
@@ -299,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-analyzer-host"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "dartq-toolchain",
@@ -316,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-ast"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-language",
  "dartq-scanner",
@@ -325,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-bcache"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "base64",
  "blake3",
@@ -344,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-cli"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "clap",
  "dartq-analyzer-host",
@@ -374,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-commands"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "dartq-ai",
@@ -413,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-daemon"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "crossbeam-channel",
  "dartq-commands",
@@ -444,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-debug"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "base64",
  "crossbeam-channel",
@@ -460,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-diagnostics"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "dartq-semantic",
@@ -472,8 +494,9 @@ dependencies = [
 
 [[package]]
 name = "dartq-engine"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
+ "bincode-next",
  "blake3",
  "dartq-diagnostics",
  "dartq-index",
@@ -500,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-fixture"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-language",
  "dartq-lints",
@@ -511,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-flow"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-language",
  "dartq-parser",
@@ -522,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-index"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-language",
  "dartq-parser",
@@ -534,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-language"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -544,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-lints"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-ast",
  "dartq-engine",
@@ -561,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-package"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-pub",
  "dartq-source",
@@ -571,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-parser"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-diagnostics",
  "dartq-language",
@@ -582,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-plugin"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-diagnostics",
  "dartq-pub",
@@ -598,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-pub"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-language",
  "dartq-source",
@@ -613,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-resolution"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-diagnostics",
  "dartq-pub",
@@ -625,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-scanner"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-diagnostics",
  "dartq-language",
@@ -635,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-schema"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-ai",
  "serde_json",
@@ -643,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-sdk"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dartq-language",
  "dartq-source",
@@ -655,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-semantic"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "dartq-diagnostics",
@@ -674,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-session"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "hex",
@@ -687,11 +710,13 @@ dependencies = [
 
 [[package]]
 name = "dartq-snapshot"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
+ "bincode-next",
  "blake3",
  "filetime",
  "hex",
+ "rayon",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -700,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-source"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "hex",
@@ -716,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-test"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "blake3",
  "dartq-pub",
@@ -737,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-toolchain"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "libc",
  "serde",
@@ -748,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-types"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "rustc-hash",
  "thiserror",
@@ -1125,6 +1150,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1164,6 +1195,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rapidhash"
+version = "4.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "rayon"
@@ -1273,6 +1313,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustversion"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1304,7 +1350,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdk-faces-gen"
-version = "0.1.20"
+version = "0.1.21"
 
 [[package]]
 name = "security-framework"
@@ -1535,8 +1581,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty-next"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16062d030850f35054e37746427b9febb74a2f24c9c6dd6fa2d0c13c5f53221e"
+
+[[package]]
 name = "upstream-gen"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "serde_yaml",
 ]
@@ -1552,6 +1604,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue-next"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d5208a9710a6ca1c2da0d64289a5dcca13deb05afdedf651f4e11bcd9fc53eb"
 
 [[package]]
 name = "walkdir"

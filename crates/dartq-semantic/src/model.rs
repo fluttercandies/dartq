@@ -44,6 +44,7 @@
 //!   top-level declarations.
 
 use dartq_source::{SourceRange, StringId, StringTable, saturate_slot_u32};
+use dartq_types::Variance;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -292,10 +293,11 @@ fn render_slot(ty: Ty, strings: &StringTable, args: &ArgPool) -> String {
 /// worker interned a name first decides the ids. Sorting on the ids at
 /// intern therefore buys within-run canonicality (equal name sets share one
 /// slot) but not across-run stability: the same shape renders differently
-/// between runs. The display derives its own total order from the texts —
-/// the only scheduling-independent key — and borrows the slice untouched
-/// when it is already in that order.
-fn display_named<'a>(
+/// between runs. Every cross-run-stable renderer (the display here, the
+/// element signature's [`FileElements::api_signature`]) derives its own
+/// total order from the texts — the only scheduling-independent key — and
+/// borrows the slice untouched when it is already in that order.
+pub(crate) fn display_named<'a>(
     named: &'a [(StringId, Ty)],
     strings: &StringTable,
 ) -> Cow<'a, [(StringId, Ty)]> {
@@ -498,14 +500,17 @@ impl RecordShapeId {
 
 /// One interned record-type shape: the positional field types in source
 /// order plus the named field set. Named fields canonicalize sorted by
-/// name — record-type identity is a name *set* (`({int a, int b})` ==
-/// `({int b, int a})`), so equal shapes intern to one slot regardless of
-/// written order.
+/// [`StringId`] at intern — record-type identity is a name *set*
+/// (`({int a, int b})` == `({int b, int a})`), so equal shapes intern to
+/// one slot regardless of written order. The stored order is canonical
+/// only *within one pool*: ids follow interning (scheduler) order, so a
+/// run-stable renderer re-sorts by resolved text ([`display_named`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordShape {
     /// Positional field types in source order.
     pub positional: Box<[Ty]>,
-    /// Named fields `(name, type)`, sorted by [`StringId`] at intern.
+    /// Named fields `(name, type)`, sorted by [`StringId`] at intern —
+    /// pool-local canonical, never a cross-run order.
     pub named: Box<[(StringId, Ty)]>,
 }
 
@@ -573,7 +578,9 @@ pub struct FnShape {
     pub required_positional: u16,
     /// Positional formal types in source order.
     pub positional: Box<[Ty]>,
-    /// Named formals `(name, type)`, sorted by [`StringId`] at intern.
+    /// Named formals `(name, type)`, sorted by [`StringId`] at intern —
+    /// pool-local canonical, never a cross-run order (see
+    /// [`RecordShape::named`] and [`display_named`]).
     pub named: Box<[(StringId, Ty)]>,
 }
 
@@ -1725,6 +1732,11 @@ pub struct Container {
     pub is_interface: bool,
     /// The declaration is the `mixin class` form.
     pub is_mixin_class: bool,
+    /// The declaration is a named mixin application (`class X = S with M`
+    /// or `mixin class X = S with M` — the `= ` alias form, not a body
+    /// declaration). The `mixin_inherits_from_not_object` gate's
+    /// `isMixinApplication` exemption reads it.
+    pub is_mixin_application: bool,
     /// The direct superclass name (`extends S` / a named mixin application's
     /// head type), name-level; `None` when absent or unrecoverable.
     pub superclass: Option<StringId>,
@@ -1760,6 +1772,18 @@ pub struct Container {
     /// the arguments. Empty when non-generic or decoded from a pre-field
     /// payload (the additive-default posture: unbounded).
     pub type_param_bounds: Box<[Ty]>,
+    /// Each type parameter's written variance modifier, parallel to
+    /// [`Self::type_param_names`]; `None` = no modifier written, the
+    /// legacy covariance default the element face reads as
+    /// [`Variance::Covariant`] (`_variance ?? covariant`, upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/element/element.dart — the
+    /// `variance` getter — while `isLegacyCovariant` is exactly "no keyword
+    /// was written"). Only class/enum/mixin headers accept the modifiers
+    /// (the parser's `allowsVariance` face), so the column is all-`None` on
+    /// every other kind. Empty when non-generic or decoded from a payload
+    /// that predates the column — the additive-default posture, read as the
+    /// legacy default everywhere.
+    pub type_param_variances: Box<[Option<Variance>]>,
     /// The `sealed` modifier was present (the exhaustiveness splitter,
     /// `types/sealed.dart`).
     pub sealed: bool,
@@ -1775,6 +1799,31 @@ pub struct Container {
     /// The `on` constraint names of a mixin, as written (constraint checks,
     /// not supertype edges); empty for every other container kind.
     pub on_clause: Box<[StringId]>,
+    /// The written type arguments of each `with`-clause face, parallel to
+    /// [`Self::with_clause`] (`with M<V>` keeps `[V]`; a face that wrote
+    /// none carries [`ArgListId::EMPTY`]). Upstream keeps the full argument-
+    /// bearing `NamedType` on the clause (`endNamedMixinApplication`,
+    /// upstream Dart SDK source, pkg/analyzer/lib/src/fasta/ast_builder.dart
+    /// :2499 — the with-clause annotations carry their type arguments into
+    /// the element, where the mixin application instantiates through them);
+    /// the element face here keeps them as this parallel column. A face
+    /// whose capture dropped (recovery residue, a poisoned tree) carries
+    /// `EMPTY` — the under-report direction, never wrong arguments.
+    pub with_clause_args: Box<[ArgListId]>,
+    /// The written type arguments of each `implements`-clause face,
+    /// parallel to [`Self::implements_clause`] ([`ArgListId::EMPTY`] for an
+    /// argument-less face) — the interface edges' instantiation facts.
+    pub implements_clause_args: Box<[ArgListId]>,
+    /// The written type arguments of each `on`-clause face, parallel to
+    /// [`Self::on_clause`] ([`ArgListId::EMPTY`] for an argument-less
+    /// face); empty for every container kind without an `on` clause.
+    pub on_clause_args: Box<[ArgListId]>,
+    /// The superclass head's written type arguments — `extends S<int>` (or
+    /// a named mixin application's head type `class X = S<int> with M`)
+    /// keeps `[int]`; [`ArgListId::EMPTY`] when the head wrote none or the
+    /// container has no superclass. Meaningful only while
+    /// [`Self::superclass`] is `Some`.
+    pub superclass_args: ArgListId,
     /// Header-window type names no clause event claimed: the `extends`
     /// overflow types the oracle throws away (`ast_builder.dart:3972-3982`
     /// `handleClassExtends` "throw them away for now and pick the first
@@ -1987,12 +2036,25 @@ pub struct ArityDecl {
 /// static/instance bit, type parameters compare per list, and a duplicate is
 /// diagnosed at the *second* declaration). The model keeps the first entry;
 /// this log is the diagnostic surface.
+///
+/// The formal-parameter scope is the one face that splits the row in two
+/// codes: when the scope's kept (first) claim and the colliding one are both
+/// initializing formals, the verifier returns `duplicateFieldFormalParameter`
+/// instead of `duplicateDefinition` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/error/duplicate_definition_verifier.dart`
+/// `_FormalParameterDuplicateIdentifierScope.getDiagnostic`, :433-442), so
+/// the capture carries that verdict as [`Self::field_formal`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DuplicateDecl {
     /// The colliding name (lookup spelling: setters under `name=`).
     pub name: StringId,
     /// Source span of the duplicate (second) declaration's name token.
     pub range: SourceRange,
+    /// Both colliding claims are `this.x` formals, so the row renders
+    /// `duplicate_field_formal_parameter` (same span, same
+    /// "first definition" context, different code and text). `false` for
+    /// every non-formal face and for any pair with a plain formal.
+    pub field_formal: bool,
 }
 
 /// The oracle declaration-kind word of an augmentation capture or target

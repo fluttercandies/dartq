@@ -165,11 +165,35 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if Self::is_operator_token_at_top(operator_ahead)
             && self.cursor.look_kind(1) == TokenKind::OpenParen
         {
-            // Top-level operator: report and recover as invalid.
+            // Top-level operator: report, then re-enter the member parse
+            // with a synthetic identifier spliced between the operator and
+            // the `(` — official `parseTopLevelDeclarationImpl`
+            // (parser_impl.dart:652-661) inserts the synthetic name and
+            // re-dispatches `parseTopLevelMemberImpl`, so the `()` group
+            // parses as the parameter list and the follower reports
+            // `missing_function_body` (`@p.A.ctor<B>() class C {}` →
+            // `missing_function_body` at `class`, never `expected_executable`
+            // on the parens).
             let at = self.peek_span();
             self.report(msg::top_level_operator(), at);
-            self.listener.handle_invalid_top_level_declaration(at);
-            self.force_advance();
+            self.cursor.advance(); // the operator
+            let id = self
+                .cursor
+                .insert_synthetic(TokenKind::Identifier, self.peek_span().range.offset);
+            let synthetic = self.span_of(id);
+            self.cursor.advance(); // drain the synthetic name
+            self.listener.begin_top_level_member(synthetic);
+            let before_method = self.cursor.mark();
+            self.parse_top_level_method(
+                before_method,
+                None,
+                None,
+                before_method,
+                TypeInfo::NoType,
+                None,
+                Some(synthetic),
+                false,
+            );
             return;
         }
         self.check_declaration();
@@ -1851,14 +1875,32 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             .end_named_mixin_application(begin, class_keyword, equals, implements, end);
     }
 
-    /// Official `parseMixinApplicationRest` (`with A, B`).
+    /// Official `parseMixinApplicationRest` (`with A, B`,
+    /// `parser_impl.dart:1617-1630`). A missing `with` reports and splices a
+    /// synthetic `with` keyword; when its follower cannot start a type the
+    /// official recovery also splices a synthetic identifier SILENTLY
+    /// (`isValidNonRecordTypeReference(withKeyword.next)` fails →
+    /// `insertSyntheticIdentifier`), so `with class/`/`with const`/... list
+    /// heads carry no `expected_type_name` — the keyword stays for the
+    /// `ensureSemicolon` reparse face (the `class A {}` tail reparses as a
+    /// nested declaration).
     fn parse_mixin_application_rest(&mut self) {
-        let with = self.peek_span();
-        if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
+        let with = if self.peek_kind() == TokenKind::Keyword(Keyword::With) {
+            let with = self.peek_span();
             self.cursor.advance();
+            with
         } else {
-            self.report(msg::expected_but_got("with"), with);
-        }
+            self.report(msg::expected_but_got("with"), self.peek_span());
+            let with = self.synthetic(
+                TokenKind::Keyword(Keyword::With),
+                self.peek_span().range.offset,
+            );
+            self.cursor.advance();
+            if !is_valid_non_record_type_reference(self.peek_kind(), self.cursor.look_kind(1)) {
+                self.synthetic(TokenKind::Identifier, self.peek_span().range.offset);
+            }
+            with
+        };
         self.parse_type_list();
         self.listener
             .handle_named_mixin_application_with_clause(with);
@@ -1880,12 +1922,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     }
 
     /// One required clause-list type
-    /// (`computeType(required: true).ensureTypeNotVoid`, plus the
-    /// `_popNamedTypeList` named-type check).
+    /// (`computeType(required: true).ensureType*`, plus the
+    /// `_popNamedTypeList` named-type check). The ensure flavor mirrors the
+    /// official call site: `parseTypeList` (`with` lists) runs
+    /// `ensureTypeOrVoid` (`parser_impl.dart:1266-1278`) — `with void`
+    /// parses the void keyword silently (only the semantic non-class row
+    /// survives); extends/implements/on/named-mixin heads run
+    /// `ensureTypeNotVoid` and report.
     fn parse_single_type_required(&mut self, clause: msg::NamedTypeClause) {
         let begin = self.peek_span();
         let type_info = self.compute_type(true, false);
-        let end = type_info.ensure_type_not_void(self);
+        let end = if matches!(clause, msg::NamedTypeClause::With) {
+            type_info.ensure_type_or_void(self)
+        } else {
+            type_info.ensure_type_not_void(self)
+        };
         self.check_named_type(&type_info, begin, end, clause);
     }
 

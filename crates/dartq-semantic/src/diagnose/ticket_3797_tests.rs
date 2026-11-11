@@ -84,7 +84,7 @@ fn conditional_receiver_under_context_stays_silent() {
 /// Pinned `#[ignore]` as the documented residual; the keep-direction
 /// control that DOES hold is `plain_receiver_keeps_the_frozen_verdict`.
 #[test]
-#[ignore = "missing-side residual: 0 rows over a no-context conditional receiver"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn conditional_receiver_without_context_reports() {
     let report = report_ops(&format!(
         "{EXPECT_HELPER}{CONDITIONAL_FIXTURE}void f(bool b) {{\n\
@@ -102,7 +102,7 @@ fn conditional_receiver_without_context_reports() {
 /// Same missing-side residual as the no-context twin: 0 rows observed
 /// over this receiver shape, so the keep-direction pin parks.
 #[test]
-#[ignore = "missing-side residual: 0 rows over a conditional receiver, keep-direction unpins"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn conditional_receiver_wrong_expectation_still_reports() {
     let report = report_ops(&format!(
         "{EXPECT_HELPER}{CONDITIONAL_FIXTURE}void f(bool b) {{\n\
@@ -176,7 +176,7 @@ fn if_null_assign_receiver_under_context_reports() {
 /// `??` whose join is not staged. That is the MISSING-side seam, not a
 /// prune question — parked `#[ignore]` until the emit learns this face.
 #[test]
-#[ignore = "missing-side residual: the emit abstains over an unstaged if-null join"]
+#[ignore = "missing-side residual: the emit abstains over an unstaged if-null join (expected 1 type_argument_not_matching_bounds: 'Exactly<B1<Object?>>' doesn't conform to bound 'Exactly<Object>'); engine emits 0"]
 fn if_null_receiver_under_context_reports() {
     let report = report_ops(&format!(
         "{EXPECT_HELPER}{CONDITIONAL_FIXTURE}void f(A? x) {{\n\

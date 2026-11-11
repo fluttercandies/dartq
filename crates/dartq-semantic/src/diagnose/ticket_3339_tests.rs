@@ -496,7 +496,7 @@ void m(Derived d, Base b) {
 /// `isAssignableTo` answers false — the type-parameter abstention in
 /// `assignability`/`engine_core` (live lanes #3312/#3316), upstream
 /// `subtype.dart:490-500` + `type_system.dart:860-891`.
-#[ignore = "dormant: the verdict abstains for an unbounded `T` at every position; routed to the assignability/engine_core lanes"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn unbounded_type_parameter_argument_rejects() {
     let fixture = "\

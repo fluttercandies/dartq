@@ -7321,8 +7321,23 @@ impl<'a> Engine<'a> {
         if texts.iter().all(|text| *text == texts[0]) {
             return Merged::Candidate(first);
         }
-        let entries: Vec<&MemberEntry> = valid.iter().map(|&index| &substituted[index]).collect();
-        let Some(merged) = self.top_merge_signatures(&entries) else {
+        // `_topMergeSignatureTypes` maps `normalizeFunctionType` over the
+        // valid overrides BEFORE the pairwise reduce (upstream Dart SDK
+        // source, `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart`
+        // :1385-1393): every column the fold reads is canonical, so a
+        // `FutureOr<top>` column folds exactly like the top it normalizes to
+        // (`normalize.dart:120-127`) instead of facing the lattice as an
+        // unmodelled head and dropping the name to the keep-first arm.
+        // Identity and the raw-text position lookup below stay on the raw
+        // signatures — the oracle's shortcut arms compare the candidates'
+        // own types, and a merged answer a raw candidate already spells
+        // keeps that candidate's declaration.
+        let normed: Vec<MemberEntry> = valid
+            .iter()
+            .map(|&index| self.norm_entry(&substituted[index]))
+            .collect();
+        let entry_refs: Vec<&MemberEntry> = normed.iter().collect();
+        let Some(merged) = self.top_merge_signatures(&entry_refs) else {
             // A pair outside the modelled merge keeps the first valid
             // candidate — the pre-port posture.
             return Merged::Candidate(first);
@@ -7349,6 +7364,33 @@ impl<'a> Engine<'a> {
             Instantiated::Applied(env) => Some(self.substitute_entry(hit.entry(), &env)),
             Instantiated::Undecidable => None,
         }
+    }
+
+    /// One candidate's signature in the merge's canonical face: every type
+    /// column reads `norm_ty` over its alias-folded spelling. The alias
+    /// unfold is the element model's own annotation resolution (a
+    /// `Wrap<FutureOr<T>>` face is the expanded function type upstream
+    /// normalizes); the norm pass is `NormalizeHelper.normalize`
+    /// (`normalize.dart:120-127` — `FutureOr<top>` collapses to the top,
+    /// `FutureOr<void>` to `void`), applied per candidate exactly where
+    /// upstream applies it — inside `_topMergeSignatureTypes`, before the
+    /// pairwise reduce (inheritance_manager3.dart:1385-1393).
+    fn norm_entry(&self, entry: &MemberEntry) -> MemberEntry {
+        let mut normed = entry.clone();
+        normed.return_ty = self.norm_ty(self.fold_alias_ty(entry.return_ty));
+        if entry.kind == MemberKind::Field {
+            normed.var_ty = self.norm_ty(self.fold_alias_ty(entry.var_ty));
+        }
+        if let Some(formals) = &mut normed.formals {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .chain(formals.named.iter_mut())
+            {
+                formal.ty = self.norm_ty(self.fold_alias_ty(formal.ty));
+            }
+        }
+        normed
     }
 
     /// `_topMergeSignatureTypes`: the `topMerge` fold over the valid
@@ -8717,11 +8759,24 @@ impl<'a> Engine<'a> {
                     .namespaces
                     .lookup_prefixed(self.graph, self.lib, prefix, entry.head)
                 {
-                    Lookup::Found(NamespaceEntry::Decl(owner)) => self
-                        .index
-                        .get(owner)
-                        .and_then(|f| f.container(entry.head))
-                        .map(|c| c.kind),
+                    Lookup::Found(NamespaceEntry::Decl(owner)) => match self.index.get(owner) {
+                        // An unindexed declaring file — or a names-only SDK
+                        // face file, which the element index carries as an
+                        // empty model — is the names-only face: the head
+                        // resolved to a real top-level declaration whose
+                        // full element the stub face cannot model. The
+                        // generated face table carries each name's terminal
+                        // kind — a class stays clause-legal (upstream's
+                        // `case ClassElement(): return`,
+                        // `resolution_visitor.dart:1186-1192`), a
+                        // typedef-to-function-type (`Comparator`) reports
+                        // the clause code, a mixin answers per clause.
+                        _ if self.graph.is_face_file(owner) => {
+                            self.face_clause_kind(owner, entry.head)
+                        }
+                        None => self.face_clause_kind(owner, entry.head),
+                        Some(f) => f.container(entry.head).map(|c| c.kind),
+                    },
                     _ => None,
                 }
             } else {
@@ -8746,27 +8801,43 @@ impl<'a> Engine<'a> {
                         _ => None,
                     },
                     ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
-                        // A FOREIGN type alias folds to its right-hand head
-                        // exactly like the local arm above: the oracle's
-                        // `_resolveType` reads `type.element` of the
-                        // instantiated alias (`resolution_visitor.dart`
-                        // :1170-1185), so `implements TypedefBase` over
-                        // `typedef TypedefBase = BaseClass;` is a legal
-                        // class entry, never `implements_non_class`.
-                        match self
-                            .index
-                            .get(owner)
-                            .and_then(|f| f.decl(entry.head))
-                            .map(|d| d.kind)
-                        {
-                            Some(crate::model::MicroKind::TypeAlias) => self
-                                .alias_container_head(entry.head, self.lib, self.file)
-                                .map(|(container, _, _)| container.kind),
-                            _ => self
-                                .index
-                                .get(owner)
-                                .and_then(|f| f.container(entry.head))
-                                .map(|c| c.kind),
+                        match self.index.get(owner) {
+                            // A names-only SDK face file — the element
+                            // index carries it as an empty model — is the
+                            // names-only face: the head resolved to a real
+                            // top-level declaration whose full element the
+                            // stub face cannot model. The generated face
+                            // table carries each name's terminal kind — a
+                            // class stays clause-legal (upstream's
+                            // `case ClassElement(): return`,
+                            // `resolution_visitor.dart:1186-1192`), a
+                            // typedef-to-function-type (`Comparator`)
+                            // reports the clause code, a mixin answers per
+                            // clause.
+                            _ if self.graph.is_face_file(owner) => {
+                                self.face_clause_kind(owner, entry.head)
+                            }
+                            // An unindexed declaring file is the names-only
+                            // face (the `dart:core` stub is never indexed):
+                            // same kind fact, same verdict.
+                            None => self.face_clause_kind(owner, entry.head),
+                            Some(file) => {
+                                // A FOREIGN type alias folds to its
+                                // right-hand head exactly like the local arm
+                                // above: the oracle's `_resolveType` reads
+                                // `type.element` of the instantiated alias
+                                // (`resolution_visitor.dart` :1170-1185), so
+                                // `implements TypedefBase` over
+                                // `typedef TypedefBase = BaseClass;` is a
+                                // legal class entry, never
+                                // `implements_non_class`.
+                                match file.decl(entry.head).map(|d| d.kind) {
+                                    Some(crate::model::MicroKind::TypeAlias) => self
+                                        .alias_container_head(entry.head, self.lib, self.file)
+                                        .map(|(container, _, _)| container.kind),
+                                    _ => file.container(entry.head).map(|c| c.kind),
+                                }
+                            }
                         }
                     }
                     _ => None,
@@ -8981,6 +9052,28 @@ impl<'a> Engine<'a> {
             (head, scope_lib, scope_file) = (next, next_lib, owner);
         }
         None
+    }
+
+    /// The clause-legality verdict for a names-only SDK face entry — the
+    /// `type.element` switch upstream reads on the instantiated type
+    /// (`resolution_visitor.dart:1194-1207`): a `ClassElement` is legal
+    /// under every clause, a `MixinElement` under `implements`/`with`/`on`
+    /// only, and everything else (a typedef-to-function-type like
+    /// `Comparator`, a variable, an extension) reports the clause code.
+    /// `owner` is the declaring file the namespace entry carries; the
+    /// generated face table records each name's terminal kind
+    /// ([`dartq_resolution::FaceKind`]), resolved through typedef
+    /// right-hand sides at extraction. `None` = the clause code emits;
+    /// `Some(kind)` feeds the `legal` closure's `ContainerKind` match.
+    /// An entry with no recorded kind (a plain `declare` rig, a real
+    /// source declaration) defaults to [`ContainerKind::Class`] — the
+    /// pre-kind posture that kept the class face silent.
+    fn face_clause_kind(&self, owner: FileId, head: StringId) -> Option<ContainerKind> {
+        match self.graph.face_kind(owner, head) {
+            Some(dartq_resolution::FaceKind::Class) | None => Some(ContainerKind::Class),
+            Some(dartq_resolution::FaceKind::Mixin) => Some(ContainerKind::Mixin),
+            Some(dartq_resolution::FaceKind::NonClass) => None,
+        }
     }
 
     /// Resolves a supertype-clause face as written in `writer`'s header: a
@@ -9302,7 +9395,15 @@ impl<'a> Engine<'a> {
                 let head_end = self.utf16_of((last.byte_offset + last.byte_len) as usize);
                 let mut args: Vec<Ty> = Vec::new();
                 if lex_at(i) == Some("<") {
-                    i = self.scan_type_args(i, &mut args)?;
+                    let (next, leftover) = self.scan_type_args(i, &mut args)?;
+                    if leftover > 0 {
+                        // Closers left over past the clause type's own
+                        // groups: a clause type's argument groups all close
+                        // within the type, so a remainder marks a stray
+                        // closer — the unmodelable-shape posture.
+                        return None;
+                    }
+                    i = next;
                 }
                 let nullable = lex_at(i) == Some("?");
                 if nullable {
@@ -9337,11 +9438,21 @@ impl<'a> Engine<'a> {
     }
 
     /// Parses a balanced `<...>` type-argument group into `args`, returning
-    /// the position past the closing `>`. Nested groups recurse; an
+    /// the position past the closing `>` plus the closers a merged shift
+    /// token still owes the enclosing levels. Nested groups recurse; an
     /// argument that is not a plain named type (a `Function` tail, a record
     /// group, a bare `Function` head) bails `None` — the unmodelable-shape
     /// posture the bounds capture keeps.
-    fn scan_type_args(&self, start: usize, args: &mut Vec<Ty>) -> Option<usize> {
+    ///
+    /// The scanner never splits shift tokens (`>>`/`>>>` are one token —
+    /// upstream Dart SDK source, `pkg/front_end/lib/src/scanner/
+    /// abstract_scanner.dart` `tokenizeGreaterThan`), so a nested group's
+    /// closers arrive merged: the innermost group consumes its own from the
+    /// token and reports the rest, and each enclosing level pays its own
+    /// closer from the report before passing the remainder up. A group
+    /// closed by a merged token reports `leftover = closers - 1`; a group
+    /// closed by a bare `>` reports `0`.
+    fn scan_type_args(&self, start: usize, args: &mut Vec<Ty>) -> Option<(usize, usize)> {
         let toks = self.tokens.as_slice();
         let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
         let mut i = start;
@@ -9350,27 +9461,94 @@ impl<'a> Engine<'a> {
         }
         i += 1;
         loop {
+            // A nested group's merged token paying this group's own closer:
+            // the group closes with this argument and passes the remainder
+            // up (`None` = the closer was this group's alone or a bare `>`).
+            let mut paid: Option<usize> = None;
             let ty = match lex_at(i)? {
+                // A keyword-headed argument (`dynamic`/`void`) carries the
+                // same `Function` tail the identifier arm does — the
+                // keyword is the literal's return type (upstream Dart SDK
+                // source, `pkg/_fe_analyzer_shared/lib/src/parser/
+                // type_info.dart`: `computeType` answers `voidType` then
+                // reads `Function …` as a generalized function type, and a
+                // `dynamic` head takes the same generalized tail through
+                // `isValidNonRecordTypeReference`). A keyword head carries
+                // no type-argument group and no head `?`, so a `Function`
+                // that is not the `()` literal tail stays unmodelable.
                 "dynamic" => {
                     i += 1;
-                    Ty::Dynamic
+                    match self.scan_function_tail(i, Ty::Dynamic) {
+                        Some((next, ty)) => {
+                            i = next;
+                            ty
+                        }
+                        None if lex_at(i) == Some("Function") => return None,
+                        None => Ty::Dynamic,
+                    }
                 }
                 "void" => {
                     i += 1;
-                    Ty::Void
+                    match self.scan_function_tail(i, Ty::Void) {
+                        Some((next, ty)) => {
+                            i = next;
+                            ty
+                        }
+                        None if lex_at(i) == Some("Function") => return None,
+                        None => Ty::Void,
+                    }
                 }
                 _ => {
                     let id = self.intern_checked(i)?;
                     i += 1;
                     let mut nested: Vec<Ty> = Vec::new();
+                    let mut owed = 0usize;
                     if lex_at(i) == Some("<") {
-                        i = self.scan_type_args(i, &mut nested)?;
+                        let (next, leftover) = self.scan_type_args(i, &mut nested)?;
+                        i = next;
+                        owed = leftover;
                     }
-                    let nullable = lex_at(i) == Some("?");
+                    // A merged token's closers leave no room for an
+                    // argument-level `?` — the `?` after the closers
+                    // belongs to an enclosing level, not this argument.
+                    let nullable = owed == 0 && lex_at(i) == Some("?");
                     if nullable {
                         i += 1;
                     }
-                    if nested.is_empty() {
+                    if owed > 0 {
+                        paid = Some(owed - 1);
+                    }
+                    // A function-tailed argument (`Ret Function()` — the
+                    // deep top-merge faces spell `FutureOr<X> Function()`
+                    // supers): the head is the literal's return type, the
+                    // head's nullability rides the return column, and the
+                    // literal's own `?` follows the parameter group. A
+                    // parameterized or generic-function literal, or any
+                    // spelled parameter, keeps the unmodelable-shape
+                    // posture — those shapes never enter the merge's
+                    // modelled lattice anyway (`top_merge_ty`'s function
+                    // arm rejects generic functions outright).
+                    if owed == 0 && lex_at(i) == Some("Function") {
+                        let ret = Ty::Named {
+                            name: id,
+                            nullable,
+                            args: if nested.is_empty() {
+                                crate::model::ArgListId::EMPTY
+                            } else {
+                                self.boundary.intern_list(&nested)
+                            },
+                        };
+                        match self.scan_function_tail(i, ret) {
+                            Some((next, ty)) => {
+                                i = next;
+                                ty
+                            }
+                            // `Function` present but not the `()` literal —
+                            // a parameterized or spelled tail stays
+                            // unmodelable.
+                            None => return None,
+                        }
+                    } else if nested.is_empty() {
                         Ty::Named {
                             name: id,
                             nullable,
@@ -9386,12 +9564,70 @@ impl<'a> Engine<'a> {
                 }
             };
             args.push(ty);
+            if let Some(remaining) = paid {
+                return Some((i, remaining));
+            }
             match lex_at(i)? {
                 "," => i += 1,
-                ">" => return Some(i + 1),
+                ">" => return Some((i + 1, 0)),
+                ">>" => return Some((i + 1, 1)),
+                ">>>" => return Some((i + 1, 2)),
                 _ => return None,
             }
         }
+    }
+
+    /// The written `<...>` group whose `<` token starts at source byte
+    /// `at`, parsed by [`Self::scan_type_args`] — the clause grammar's
+    /// argument face reused outside the headers (a typed literal's written
+    /// arguments, `<List<int>>[…]`). Answers the argument list and the
+    /// token index past the group's closing `>`. `None` when no `<` token
+    /// starts at `at`, for every shape the scan bails on, and for a merged
+    /// closer owing a level the group does not have (a stray `>`).
+    pub(crate) fn written_type_args(&self, at: usize) -> Option<(Vec<Ty>, usize)> {
+        let toks = self.tokens.as_slice();
+        let start = toks.partition_point(|tok| (tok.byte_offset as usize) < at);
+        if toks.get(start)?.byte_offset as usize != at {
+            return None;
+        }
+        let mut args = Vec::new();
+        match self.scan_type_args(start, &mut args)? {
+            (next, 0) => Some((args, next)),
+            _ => None,
+        }
+    }
+
+    /// The `Function()` literal tail one type-argument head can carry
+    /// (`Ret Function()` — the deep top-merge faces spell `FutureOr<X>
+    /// Function()` / `dynamic Function()` supers): `i` sits past the head
+    /// (the identifier with its arguments consumed, or the `dynamic`/`void`
+    /// keyword). Answers `Some((position past the literal, interned
+    /// function `Ty`))` when the next tokens are `Function` `( )` — the
+    /// `()` literal is the only modelled tail; a `?` after the parameter
+    /// group rides the literal's own nullability column while the head's
+    /// stays on `ret`. `None` for any other following token, or for a
+    /// `Function` that is not the `()` literal (a parameterized or
+    /// generic-function literal, or any spelled parameter — the
+    /// unmodelable-shape posture: those shapes never enter the merge's
+    /// modelled lattice anyway, `top_merge_ty`'s function arm rejects
+    /// generic functions outright).
+    fn scan_function_tail(&self, i: usize, ret: Ty) -> Option<(usize, Ty)> {
+        let toks = self.tokens.as_slice();
+        let lex_at = |j: usize| toks.get(j).map(|_| self.tokens.lexeme(self.source, j));
+        if lex_at(i) != Some("Function") || lex_at(i + 1) != Some("(") || lex_at(i + 2) != Some(")")
+        {
+            return None;
+        }
+        let mut i = i + 3;
+        let lit_nullable = lex_at(i) == Some("?");
+        if lit_nullable {
+            i += 1;
+        }
+        Some((
+            i,
+            self.boundary
+                .intern_function_ty_required(0, 0, ret, &[], &[], lit_nullable),
+        ))
     }
 
     /// The token at `i` interned as an identifier spelling (`None` for
@@ -9768,12 +10004,16 @@ impl<'a> Engine<'a> {
         // source, so `dynamic Function()` and `void Function()` are no
         // subtypes of `int Function()` while every result satisfies a
         // `void`/`dynamic`/`Object?` inherited face. `Left Top` — a
-        // `dynamic`/`void` source is a subtype only of a top target:
-        // `void m()` over `int m()` breaks, `int m()` over `void m()` and
-        // `dynamic m()` over `void m()` do not (a `void`/`dynamic`
-        // *expression* assigns anywhere, but the override question asks the
-        // subtype relation). Decided here rather than through `assignable`,
-        // whose arms carry the assignment face's leniency.
+        // `dynamic`/`void` source is a subtype of `T1` exactly when
+        // `Object? <: T1` (`subtype.dart:63-68`, the oracle's own
+        // recursion): `void m()` over `int m()` breaks (`Object? <: int`
+        // fails), while `dynamic m()` over `FutureOr<Object?> m()` does
+        // not — `FutureOr<top>` targets (`type_system.dart:1312-1317`
+        // `isTop(FutureOr<T>) = isTop(T)`) are top-adjacent through that
+        // leg, not top-spelled, so the question must recurse instead of
+        // answering from the target's spelling. Decided here rather than
+        // through `assignable`, whose arms carry the assignment face's
+        // leniency.
         let is_top = |ty: Ty| {
             matches!(ty, Ty::Dynamic | Ty::Void)
                 || matches!(
@@ -9789,7 +10029,20 @@ impl<'a> Engine<'a> {
             return Some(true);
         }
         if matches!(from_ty, Ty::Dynamic | Ty::Void) {
-            return Some(false);
+            let object_question = Ty::Named {
+                name: self.intern("Object"),
+                nullable: true,
+                args: crate::model::ArgListId::EMPTY,
+            };
+            return self.override_decide(
+                object_question,
+                from_scope,
+                from_entry,
+                to_ty,
+                to_scope,
+                to_entry,
+                world,
+            );
         }
         // A MEMBER's own type parameter (`subtype.dart:300-320`'s Variable
         // arms): `T <: X` holds iff `T`'s bound is a subtype of `X`

@@ -177,14 +177,22 @@ pub struct SubtypeEdge {
 /// name, the runs keep their target-ascending table order) with `name_runs`
 /// holding each distinct name's group start; `names` ascend by
 /// `(name, offset)`; `names_overflow` (the #120 seam's insertions) ascend by
-/// `(name, offset)` too; `supers` ascend by `(subtype file, name, clause)`.
+/// `(name, offset)` too; `supers` ascend by
+/// `(subtype file, the container's canonical rank — name bytes, then
+/// offset —, clause)` with `super_runs` holding each distinct
+/// `(file, subtype name)` run's start, ascending by `(file, StringId)`.
 /// Every probe is a binary search plus an equal-run scan.
 ///
 /// The name-keyed run index costs 4 B per `(target, name)` run plus 4 B per
 /// distinct target name of standing memory — the documented trade for the
 /// workspace query join's one-search-per-library shape (hub names were
 /// quadratic through the per-(decl file, library) probe the exact-target
-/// search forced).
+/// search forced). The supertype run directory costs 12 B per distinct
+/// `(file, subtype name)` — same decoupling as the declaration table's run
+/// directory: the row order is the canonical order the export emits, the
+/// directory order is the interned-id order the probe arrives with
+/// (#3987: ids follow the run's file-processing order, so they must not
+/// key any output-visible ordering).
 ///
 /// Every frozen column is a boxed slice — a build writes each column once,
 /// the whole-unit law replaces the index on re-analysis, so the capacity
@@ -200,6 +208,13 @@ pub struct LibraryIndex {
     names: Box<[NameRow]>,
     names_overflow: Vec<NameRow>,
     supers: Box<[SubtypeEdge]>,
+    /// The supertype run directory: each distinct `(file, subtype name)`
+    /// with its run's start row, ascending by `(file, StringId)` — the
+    /// probe face [`Self::supertypes_of`] binary-searches. Kept in
+    /// interned-id order (not the stored canonical row order) because a
+    /// probe arrives as a `StringId` and ids order independently of their
+    /// spellings' bytes (#3987).
+    super_runs: Box<[(FileId, StringId, u32)]>,
 }
 
 impl LibraryIndex {
@@ -290,11 +305,22 @@ impl LibraryIndex {
 
     /// The direct supertypes of `(file, name)`, every clause kind included
     /// (`extends`, `with`, `implements`, a mixin's `on`).
+    ///
+    /// The search lands the run's start off the id-ordered
+    /// [`Self::super_runs`] directory and closes the extent by row
+    /// equality — equal `(file, name)` rows are contiguous in the stored
+    /// canonical order (equal ids are equal bytes, and the canonical order
+    /// groups a file's containers by their names' bytes).
     #[must_use]
     pub fn supertypes_of(&self, file: FileId, name: StringId) -> Option<&[SubtypeEdge]> {
-        let key = |edge: &SubtypeEdge| (edge.file, edge.name);
-        let start = self.supers.partition_point(|edge| key(edge) < (file, name));
-        let end = self.supers[start..].partition_point(|edge| key(edge) <= (file, name)) + start;
+        let start = self
+            .super_runs
+            .partition_point(|&(run_file, run_name, _)| (run_file, run_name) < (file, name));
+        let &(_, _, start) = self.super_runs.get(start)?;
+        let start = start as usize;
+        let end = self.supers[start..]
+            .partition_point(|edge| (edge.file, edge.name) == (file, name))
+            + start;
         (start < end).then(|| &self.supers[start..end])
     }
 
@@ -320,11 +346,119 @@ impl LibraryIndex {
     }
 
     /// Every resolved supertype edge, ordered by the table's sort
-    /// (`(subtype file, name, clause)` — the export face's document
-    /// assembly filters this slice by file, keeping the stored order).
+    /// (`(subtype file, the container's canonical rank — name bytes, then
+    /// offset —, clause)` — the export face's document assembly filters
+    /// this slice by file, keeping the stored order, so the canonical
+    /// order is the emitted order).
     #[must_use]
     pub fn supers(&self) -> &[SubtypeEdge] {
         &self.supers
+    }
+
+    /// Every unresolved-name row of the built table, in its sorted order —
+    /// the persist projection's read face (the probe chain's built half;
+    /// [`Self::names_overflow_rows`] carries the seam half). `unresolved`
+    /// stays the probe entry: it interleaves both partitions.
+    #[must_use]
+    pub fn names(&self) -> &[NameRow] {
+        &self.names
+    }
+
+    /// The seam overflow rows, in their sorted order — the rows
+    /// [`Self::record_unresolved`] appended after the build.
+    #[must_use]
+    pub fn names_overflow_rows(&self) -> &[NameRow] {
+        &self.names_overflow
+    }
+
+    /// Assembles an index from whole row tables — the persist seam's
+    /// constructor. `refs`/`names`/`overflow`/`supers` arrive unsorted
+    /// (a decoded payload is a bag of rows); the same sort + CSR
+    /// derivation [`LibraryBuilder::finish`] runs applies, so a surface
+    /// materialized off disk is column-identical to one the builder
+    /// produced — one ordering law, two entry points.
+    #[must_use]
+    pub fn assemble(
+        mut refs: Vec<RefRow>,
+        mut names: Vec<NameRow>,
+        mut overflow: Vec<NameRow>,
+        mut supers: Vec<SubtypeEdge>,
+    ) -> Self {
+        // Deterministic total orders (queries merge name-keyed
+        // and element-keyed data, so any nondeterminism leaks into output).
+        // The use `file` joins the key before the offset: a multi-file
+        // library's member captures can carry equal offsets, and the caller
+        // may add files in any order — the file breaks the tie
+        // deterministically.
+        refs.sort_by_key(|row| (row.target_file, row.target_name, row.file, row.range.offset));
+        let mut runs = Vec::new();
+        let mut prev: Option<(FileId, StringId)> = None;
+        for (i, row) in refs.iter().enumerate() {
+            let key = (row.target_file, row.target_name);
+            if prev != Some(key) {
+                runs.push(crate::narrow(i));
+                prev = Some(key);
+            }
+        }
+        // The name-keyed face of the same runs: run indices regrouped by
+        // target name — the stable sort keeps each name's runs in their
+        // target-ascending table order — plus one group-start offset per
+        // distinct name (see `LibraryIndex`'s memory note for the trade).
+        let mut name_refs: Vec<u32> = (0..crate::narrow(runs.len())).collect();
+        name_refs.sort_by_key(|&run| refs[runs[run as usize] as usize].target_name);
+        let mut name_runs = Vec::new();
+        let mut prev_name: Option<StringId> = None;
+        for (slot, &run) in name_refs.iter().enumerate() {
+            let name = refs[runs[run as usize] as usize].target_name;
+            if prev_name != Some(name) {
+                name_runs.push(crate::narrow(slot));
+                prev_name = Some(name);
+            }
+        }
+        names.sort_by_key(|row| (row.name, row.range.offset));
+        overflow.sort_by_key(|row| (row.name, row.range.offset));
+        // The supertype rows keep the canonical order each file's capture
+        // delivered them in — `(container rank, clause)`, the container
+        // row indexing the capture's byte-canonical declaration table —
+        // so the export's per-document rows (the stored slice filtered by
+        // file) never key on interned ids: ids follow the run's
+        // file-processing order and flip run to run (#3987). The stable
+        // file-major sort preserves each file's delivered order while
+        // grouping the files (the caller may add files in any order).
+        supers.sort_by_key(|edge| edge.file);
+        // The id-ordered run directory over those rows: one entry per
+        // distinct `(file, subtype name)` — equal names are contiguous in
+        // the canonical order (equal bytes) — then reordered to
+        // `(file, StringId)` ascent, the key `supertypes_of`'s binary
+        // search arrives with. The directory decouples the probe order
+        // (ids) from the row order (bytes), the same shape as the
+        // declaration table's run directory.
+        let mut super_runs: Vec<(FileId, StringId, u32)> = Vec::new();
+        let mut prev: Option<(FileId, StringId)> = None;
+        for (i, edge) in supers.iter().enumerate() {
+            let key = (edge.file, edge.name);
+            if prev != Some(key) {
+                super_runs.push((edge.file, edge.name, crate::narrow(i)));
+                prev = Some(key);
+            }
+        }
+        super_runs.sort_unstable_by_key(|&(file, name, _)| (file, name));
+        // Freeze: the push-grown tables move into the long-lived index as
+        // boxed slices, so std's doubling slack (up to ~2× capacity resident
+        // for the session) is shed by construction — `into_boxed_slice`
+        // reallocates to the exact row count on every column, run tables
+        // included (they were the slack the earlier `Vec` shape could not
+        // shed).
+        Self {
+            refs: refs.into_boxed_slice(),
+            runs: runs.into_boxed_slice(),
+            name_runs: name_runs.into_boxed_slice(),
+            name_refs: name_refs.into_boxed_slice(),
+            names: names.into_boxed_slice(),
+            names_overflow: overflow,
+            supers: supers.into_boxed_slice(),
+            super_runs: super_runs.into_boxed_slice(),
+        }
     }
 
     /// The surface's owned heap bytes: the boxed columns at their exact
@@ -339,6 +473,7 @@ impl LibraryIndex {
             + self.names.len() * size_of::<NameRow>()
             + self.names_overflow.capacity() * size_of::<NameRow>()
             + self.supers.len() * size_of::<SubtypeEdge>()
+            + self.super_runs.len() * size_of::<(FileId, StringId, u32)>()
     }
 
     /// The number of resolved reference rows.
@@ -468,6 +603,10 @@ impl<'a> LibraryBuilder<'a> {
                 clause: edge.clause,
             });
         }
+        // The capture delivers each file's edges in its canonical order —
+        // `(container rank, clause)`, where the container row indexes the
+        // byte-canonical declaration table — and [`Self::finish`]'s stable
+        // file-major sort preserves exactly that within-file order.
     }
 
     /// The M1 scope chain for a bare name: the file's own declarations
@@ -498,58 +637,13 @@ impl<'a> LibraryBuilder<'a> {
     }
 
     /// Sorts the tables into their probed order and finishes the index.
+    /// The whole assembly delegates to [`LibraryIndex::assemble`] — the
+    /// persist seam's constructor runs the identical sort + CSR
+    /// derivation, so a surface materialized off disk is
+    /// column-identical to one the builder produced.
     #[must_use]
-    pub fn finish(mut self) -> LibraryIndex {
-        // Deterministic total orders (queries merge name-keyed
-        // and element-keyed data, so any nondeterminism leaks into output).
-        // The use `file` joins the key before the offset: a multi-file
-        // library's member captures can carry equal offsets, and the caller
-        // may add files in any order — the file breaks the tie
-        // deterministically.
-        self.refs
-            .sort_by_key(|row| (row.target_file, row.target_name, row.file, row.range.offset));
-        let mut runs = Vec::new();
-        let mut prev: Option<(FileId, StringId)> = None;
-        for (i, row) in self.refs.iter().enumerate() {
-            let key = (row.target_file, row.target_name);
-            if prev != Some(key) {
-                runs.push(crate::narrow(i));
-                prev = Some(key);
-            }
-        }
-        // The name-keyed face of the same runs: run indices regrouped by
-        // target name — the stable sort keeps each name's runs in their
-        // target-ascending table order — plus one group-start offset per
-        // distinct name (see `LibraryIndex`'s memory note for the trade).
-        let mut name_refs: Vec<u32> = (0..crate::narrow(runs.len())).collect();
-        name_refs.sort_by_key(|&run| self.refs[runs[run as usize] as usize].target_name);
-        let mut name_runs = Vec::new();
-        let mut prev_name: Option<StringId> = None;
-        for (slot, &run) in name_refs.iter().enumerate() {
-            let name = self.refs[runs[run as usize] as usize].target_name;
-            if prev_name != Some(name) {
-                name_runs.push(crate::narrow(slot));
-                prev_name = Some(name);
-            }
-        }
-        self.names.sort_by_key(|row| (row.name, row.range.offset));
-        self.supers
-            .sort_by_key(|edge| (edge.file, edge.name, edge.clause));
-        // Freeze: the push-grown tables move into the long-lived index as
-        // boxed slices, so std's doubling slack (up to ~2× capacity resident
-        // for the session) is shed by construction — `into_boxed_slice`
-        // reallocates to the exact row count on every column, run tables
-        // included (they were the slack the earlier `Vec` shape could not
-        // shed).
-        LibraryIndex {
-            refs: self.refs.into_boxed_slice(),
-            runs: runs.into_boxed_slice(),
-            name_runs: name_runs.into_boxed_slice(),
-            name_refs: name_refs.into_boxed_slice(),
-            names: self.names.into_boxed_slice(),
-            names_overflow: Vec::new(),
-            supers: self.supers.into_boxed_slice(),
-        }
+    pub fn finish(self) -> LibraryIndex {
+        LibraryIndex::assemble(self.refs, self.names, Vec::new(), self.supers)
     }
 }
 
@@ -1505,7 +1599,8 @@ pub(crate) mod tests {
             + (surface.runs.len() + surface.name_runs.len() + surface.name_refs.len())
                 * size_of::<u32>()
             + surface.names.len() * size_of::<NameRow>()
-            + surface.supers.len() * size_of::<SubtypeEdge>();
+            + surface.supers.len() * size_of::<SubtypeEdge>()
+            + surface.super_runs.len() * size_of::<(FileId, StringId, u32)>();
         assert_eq!(
             surface.heap_bytes(),
             exact,
@@ -1584,7 +1679,8 @@ pub(crate) mod tests {
             + (surface.runs.len() + surface.name_runs.len() + surface.name_refs.len())
                 * size_of::<u32>()
             + surface.names.len() * size_of::<NameRow>()
-            + surface.supers.len() * size_of::<SubtypeEdge>();
+            + surface.supers.len() * size_of::<SubtypeEdge>()
+            + surface.super_runs.len() * size_of::<(FileId, StringId, u32)>();
         assert_eq!(surface.heap_bytes(), exact);
         assert_eq!(surface.runs.len(), 2);
         assert_eq!(surface.name_runs.len(), 1);

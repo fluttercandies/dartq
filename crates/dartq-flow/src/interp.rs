@@ -1351,6 +1351,24 @@ pub(crate) struct Interp<'o> {
     /// exempt: `if (gv)` / `if (never())` keep their arms dead.
     /// [`Interp::cond_split`] consumes the latch.
     pub(crate) cond_exempt: Option<(u32, State)>,
+    /// The pre-exit states of bottom-typed bare-identifier reads, keyed on
+    /// the read's end offset: a compound-assignment target (`x += e`) is an
+    /// lvalue the official resolves through `resolveForWrite` — its
+    /// `setReadElement` feeds `parent.readType` and never calls
+    /// `recordStaticType` (upstream Dart SDK source, pkg/analyzer/lib/src/
+    /// generated/resolver.dart:1754-1796), so the read's `Never` face never
+    /// reaches `handleExit` and the write's RHS runs LIVE. The read arm
+    /// cannot know the identifier is an lvalue yet, so it exits per the
+    /// ordinary face and parks the pre-exit state here; the `Ev::Assign`
+    /// step pops the top entry when the compound write's target end matches
+    /// and restores it — unless a later exit (an exiting RHS callee,
+    /// `x += nf()`) superseded it. Entries never consumed (`x;`, `x++`,
+    /// `x ??= e` — the postfix/if-null families genuinely exit upstream) go
+    /// stale harmlessly: the key must equal the next compound target's own
+    /// read end, which only the same identifier span can produce. The
+    /// third slot carries the `exit_at` the read displaced, so a dead `pre`
+    /// restores the position of the exit that made it dead.
+    pub(crate) compound_lvalue_saves: Vec<(u32, State, Option<u32>)>,
     /// The open constructor-initializer entry's head token (the
     /// `CtorInitBegin`/`CtorInitEnd` pair): the entry-extent dead row's
     /// begin.
@@ -1803,6 +1821,7 @@ impl<'o> Interp<'o> {
             if_branch_folded: false,
             cond_vars: std::collections::HashMap::new(),
             cond_exempt: None,
+            compound_lvalue_saves: Vec::new(),
             ctor_init_begin: None,
             ctor_init_began_dead: false,
             ctor_init_reported: None,
@@ -2479,18 +2498,34 @@ impl<'o> Interp<'o> {
     /// the null-shorted chain is this write's (the containment rule of
     /// [`Interp::null_short_end`]); a live access path or an enclosing
     /// statement's anchor keeps the interval.
+    ///
+    /// The chain need not have died AT ITS OPEN: `c1n?[unreachable] = 0`
+    /// opens a live access path (a potentially-nullable receiver), then
+    /// the operand's own `Never` read kills the walk, and the RHS `0`
+    /// becomes the first dead node. The official `flowEnd` still runs over
+    /// the ASSIGNMENT — `handleNullShortingFinished(expression)` fires for
+    /// any null-shorted chain at the assignment's boundary
+    /// (resolver.dart:1195-1200, type_analyzer.dart:2616) — so the row is
+    /// `0`, never `0;`. The containment rule alone decides ownership;
+    /// gating on `dead_at_open` left such rows to the statement's `;`.
     pub(crate) fn close_dead_null_write(&mut self, end: u32) {
         let Some(short) = self.null_shorts.last() else {
             return;
         };
-        if !short.dead_at_open {
-            return;
-        }
         let recv = short.recv_offset;
         let Some(window) = self.dead else {
             return;
         };
         if window.suppressed || window.anchor.range.offset <= recv {
+            return;
+        }
+        // A statement that BEGAN dead owns its whole interval (the official
+        // `_firstDeadNode` is the statement, not the chain) — the same gate
+        // [`Interp::null_short_end`] applies. The containment rule above
+        // already excludes it for a statement anchor; this keeps the
+        // symmetry explicit for an arm/block anchor that landed past the
+        // receiver.
+        if self.stmt_began_dead {
             return;
         }
         self.dead = None;
@@ -2851,6 +2886,18 @@ impl<'o> Interp<'o> {
                 .trim_start_matches('_')
                 .starts_with(|c: char| c.is_ascii_uppercase())
         })
+    }
+
+    /// Whether the interned name spells an extension override head — the
+    /// head of `E(n)` where `E` is one of the unit's named extensions (see
+    /// [`crate::ty::ClosedNames::extension_names`]). Such a send's value is
+    /// its ARGUMENT's static type, never the head's class spelling: the
+    /// override wraps the argument (upstream
+    /// `ExtensionOverrideImpl.extendedType` is the substituted `on` type,
+    /// and the null-shorting start reads the argument's own `staticType` —
+    /// pkg/analyzer/lib/src/generated/resolver.dart:4814-4840).
+    pub(crate) fn is_extension_override_head(&self, name: u32) -> bool {
+        self.closed.extension_names.contains(&name)
     }
 
     /// Whether the send about to consume its two arguments is a bare
@@ -4849,13 +4896,19 @@ impl Interp<'_> {
         // `operand.beginToken .. assignment.end`, no operator re-anchor on
         // `AssignmentExpression`). A literal operand's expr value carries
         // no span of its own, so the latch lives here rather than on the
-        // popped `Expr`.
+        // popped `Expr`. The latch takes the MINIMUM offset, not the first
+        // event's: a prefix operand reports its operator AFTER the operand
+        // parse (`-42` delivers `Ev::Int` then `Ev::UnaryPrefix`), while
+        // the expression's begin token is the operator.
         if let Some(entry) = self.if_null_skips.last_mut()
             && entry.2
-            && entry.3.is_none()
             && let Some(span) = ev.span()
         {
-            entry.3 = Some(span.range.offset);
+            entry.3 = Some(
+                entry
+                    .3
+                    .map_or(span.range.offset, |seen: u32| seen.min(span.range.offset)),
+            );
         }
         // One-event lookahead: a case group awaiting its body closes its
         // alternatives before any non-case event processes. The same

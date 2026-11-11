@@ -47,12 +47,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.listener.begin_metadata(at);
         let _name = self.ensure_identifier(IdentifierContext::MetadataReference);
         // Qualified rest — official `parseQualifiedRestOpt`/`parseQualifiedRest`
-        // (parser_impl.dart:2562-2585): the `.` face is unconditional;
-        // `ensureIdentifier(period, context)` reports `missing_identifier` on a
-        // non-identifier follower and splices the synthetic name without
-        // consuming the junk (`@A.;` → one row on the `;`, never a
-        // declaration-loop junk cascade).
-        while self.peek_kind() == TokenKind::Period {
+        // (parser_impl.dart:2542-2566, called from `parseMetadata` :1395-1398):
+        // at most ONE `.identifier` continuation — the `qualifiedName` face
+        // `typeIdentifier '.' typeIdentifier` (two segments). A further
+        // `.identifier` (the third-segment constructor selector, e.g. `@p.A.ctor`)
+        // is handled BELOW by the `period + MetadataContinuationAfterTypeArguments`
+        // arm, after the type-arguments position is decided. Looping the
+        // `.` face here would wrongly absorb `id.id.id.id` into the annotation
+        // name chain (oracle `@p.a.b.c()` reparses `.c()` as a separate member
+        // declaration; `@p.A.ctor<B>` reparses `<B>` as a binary `<`).
+        if self.peek_kind() == TokenKind::Period {
             self.cursor.advance();
             self.ensure_identifier(IdentifierContext::MetadataContinuation);
         }

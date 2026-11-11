@@ -59,12 +59,16 @@ impl<'a> Engine<'a> {
         // The method head routes apart so the callee-side substitution
         // faces — whose member-send inference sources its own parameters
         // from the member walk — never see a method entry race them
-        // (their `exec_params.is_none()` guard would starve).
-        if self.pending_exec_is_method {
-            self.method_exec_bounds.insert(name, window);
-        } else {
-            self.exec_bounds.insert(name, window);
-        }
+        // (their `exec_params.is_none()` guard would starve). The window
+        // also carries its declaring name's offset and declaration order
+        // is the walk's own order: the post-walk name-only scans iterate
+        // this list, never a hash map (#4202).
+        self.exec_windows.push(ExecWindow {
+            owner: name,
+            at: name_offset,
+            is_method: self.pending_exec_is_method,
+            params: window,
+        });
     }
 
     /// #1314 FAM18: the group's close — the constructor-independent faces
@@ -2101,7 +2105,10 @@ impl<'a> Engine<'a> {
     /// returns already re-checked against `R`, so `S = R` is the face the
     /// cap produces on this name-level walk, keeping the failure the
     /// closure-return row's and never the enclosing assignability row's).
-    pub(crate) fn closure_capture_end(&mut self, end: u32) -> Option<(u32, Ty)> {
+    /// With no context, a plain `=>` literal still answers its own static
+    /// type — flagged `false` (not context-supplied), so the listener
+    /// types only the slots that consume it.
+    pub(crate) fn closure_capture_end(&mut self, end: u32) -> Option<(u32, Ty, bool)> {
         let capture = self.closure_caps.pop()?;
         // The closure-return tally closes with the literal: a counted
         // return set with no valid entry marks the closure all-invalid —
@@ -2155,6 +2162,7 @@ impl<'a> Engine<'a> {
         if capture.poisoned || capture.list_depth == 0 {
             return None;
         }
+        let mut bare = None;
         if !suspends {
             // The `=>` body's inferred return: the body's own expression row
             // still sits on the stack (the listener drains it only after
@@ -2173,12 +2181,9 @@ impl<'a> Engine<'a> {
             // that resolves `Unknown` — a deferred-formal re-bind the
             // pass-2 schema will only correct later — keeps the stub too,
             // the same under-report the face carried before.
-            let return_ty = if arrow_body {
-                let row = self
-                    .rows
-                    .iter()
-                    .rev()
-                    .find(|row| {
+            let body_row = arrow_body
+                .then(|| {
+                    self.rows.iter().rev().find(|row| {
                         row.range.offset >= capture.offset
                             && matches!(
                                 row.intent,
@@ -2194,25 +2199,53 @@ impl<'a> Engine<'a> {
                             // so they never speak for the body.
                             && !self.cascade_sections.contains(&row.range.offset)
                     })
-                    .cloned();
-                match row {
-                    // A member READ row's `ty` is lazily empty (the merge
-                    // leaves the declared-type write to the read faces) —
-                    // `initializer_read_ty` re-derives the accessor answer
-                    // through the classified receiver; sends/operators read
-                    // the folded face `expression_row_ty` carries.
-                    Some(row) if row.intent == Intent::Read => {
-                        match self.initializer_read_ty(&row) {
-                            Ty::UNKNOWN => self.expression_row_ty(&row),
-                            ty => ty,
-                        }
-                    }
-                    Some(row) => self.expression_row_ty(&row),
-                    None => Ty::Void,
-                }
-            } else {
-                Ty::Void
+                })
+                .flatten()
+                .cloned();
+            let return_ty = match &body_row {
+                // A member READ row's `ty` is lazily empty (the merge
+                // leaves the declared-type write to the read faces) —
+                // `initializer_read_ty` re-derives the accessor answer
+                // through the classified receiver; sends/operators read
+                // the folded face `expression_row_ty` carries.
+                Some(row) if row.intent == Intent::Read => match self.initializer_read_ty(row) {
+                    Ty::UNKNOWN => self.expression_row_ty(row),
+                    ty => ty,
+                },
+                Some(row) => self.expression_row_ty(row),
+                None => Ty::Void,
             };
+            // The context-free literal's own static type
+            // (`FunctionExpressionImpl.staticType` under no imposed context:
+            // the written-or-`dynamic` formals and the `=>` body's type —
+            // `var g = () => 0` is `int Function()`). Answered only when the
+            // body's row IS the whole body (it starts at the body's first
+            // token): a composite body whose newest row is a trailing operand
+            // (`() => c ? 1 : 'a'`, `() => a ?? b`) keeps the untyped face, as
+            // do the generic and optional-group literals whose shapes this
+            // capture does not spell.
+            if ctx.is_none()
+                && capture.type_params == 0
+                && capture.optional_from.is_none()
+                && return_ty != Ty::UNKNOWN
+                && !self.is_invalid_ty(return_ty)
+                && let Some(row) = &body_row
+            {
+                let bytes = self.source.as_bytes();
+                let mut body = self.byte_of(end);
+                while bytes.get(body).is_some_and(u8::is_ascii_whitespace) {
+                    body += 1;
+                }
+                if self.byte_of(row.range.offset) == body {
+                    bare = Some(self.boundary.args.borrow_mut().function(
+                        0,
+                        return_ty,
+                        &capture.positional,
+                        &[],
+                        false,
+                    ));
+                }
+            }
             let required = capture.optional_from.unwrap_or(capture.positional.len());
             let sig = Box::new(FnVarSig {
                 params: Box::default(),
@@ -2272,8 +2305,9 @@ impl<'a> Engine<'a> {
                     .args
                     .borrow_mut()
                     .function(0, ret, &capture.positional, &[], false);
-            Some((capture.offset, ty))
+            Some((capture.offset, ty, true))
         })
+        .or_else(|| bare.map(|ty| (capture.offset, ty, false)))
     }
 
     /// An unattributable shape inside the open capture (an inline
@@ -3603,6 +3637,20 @@ impl<'a> Engine<'a> {
         if let Some(ty) = self.context_pushed_composite_ty(recv_span, frozen) {
             out.push(ty);
         }
+        // The composite's OWN static type (#3820): the oracle stamps a
+        // `??`/`??=`/`?:` composite with `UP(NonNull(T1), T2')` / `LUB`
+        // and an `op=`/`++`/`--` composite with the operand's read face —
+        // the context-free half of the typing rules the context-pushed
+        // arm above only covers on its `S` branch. Every face the
+        // promotion latch or the join pass never staged (`(a.x++)` over a
+        // promoted override, the `(local ??= value)` join over a promoted
+        // left) reaches the verdict here; an unjoinable pair answers no
+        // candidate (the keep direction).
+        if let Some(ty) = self.composite_self_ty(recv_span) {
+            if ty != Ty::UNKNOWN && ty != frozen {
+                out.push(ty);
+            }
+        }
         out
     }
 
@@ -3902,6 +3950,365 @@ impl<'a> Engine<'a> {
             length: end.saturating_sub(offset),
         })
         .filter(|ty| *ty != Ty::UNKNOWN)
+    }
+
+    /// The composite receiver's own static type (#3820), as
+    /// [`Ty`] for the re-decided verdict's candidate list. Shapes
+    /// (depth-0 operators over the receiver's token window, outer parens
+    /// stripped):
+    ///
+    /// * **if-null** (`??`/`??=`) — `UP(NonNull(T1), T2')` where `T1` is
+    ///   the left operand's re-derived read face and `T2'` the right
+    ///   operand's face, call-coerced against a function-shaped left
+    ///   (`resolveIfNull`, upstream Dart SDK source,
+    ///   `binary_expression_resolver.dart:214-216` — the context-free
+    ///   `T` branch). A bare-local `??=` additionally requires the right
+    ///   face provable inside the local's declared face (`J'`), the same
+    ///   gate the context-pushed arm runs;
+    /// * **conditional** (`?:`) — `LUB(then, else)`, the operands'
+    ///   re-derived faces joined;
+    /// * **inc-dec** (prefix/postfix `++`/`--`) and **compound
+    ///   assignment** (`op=`) — the operand's re-derived read face (the
+    ///   result type is the read type: upstream Dart SDK source,
+    ///   `postfix_expression_resolver.dart:62` `node.readType`,
+    ///   `assignment_expression_resolver.dart:84` the local-provider
+    ///   read).
+    ///
+    /// Numeric binary operators stay out (the operator-result table is
+    /// the operand-face layer's, not this prune's). `None` on every
+    /// unjoinable or unrecognized shape — the keep direction.
+    fn composite_self_ty(&mut self, recv_span: SourceRange) -> Option<Ty> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let (lo, hi) = self.composite_window(recv_span)?;
+        if hi - lo < 2 {
+            return None;
+        }
+        // The depth-0 operator inventory: leftmost `?` (with its matching
+        // depth-0 `:`), leftmost `??`/`??=`, leftmost inc-dec and
+        // compound-assignment marks. Group tokens jump past their
+        // matched closer.
+        let mut conditional_at = None;
+        let mut colon_at = None;
+        let mut if_null_at = None;
+        let mut inc_dec_at = None;
+        let mut compound_at = None;
+        let mut at = lo;
+        while at < hi {
+            match tokens[at].kind {
+                K::OpenCurly
+                | K::StringInterpolationExpression
+                | K::OpenParen
+                | K::OpenSquare
+                | K::Lt => {
+                    if let Some(close) = self.tokens.matching_end(at) {
+                        if close < hi {
+                            at = close + 1;
+                            continue;
+                        }
+                    }
+                    at += 1;
+                }
+                K::QuestionQuestion | K::QuestionQuestionEq => {
+                    if_null_at.get_or_insert(at);
+                    at += 1;
+                }
+                K::PlusPlus | K::MinusMinus => {
+                    inc_dec_at.get_or_insert(at);
+                    at += 1;
+                }
+                K::PlusEq
+                | K::MinusEq
+                | K::StarEq
+                | K::SlashEq
+                | K::PercentEq
+                | K::TildeSlashEq
+                | K::AmpersandEq
+                | K::BarEq
+                | K::CaretEq
+                | K::LtLtEq
+                | K::GtGtEq
+                | K::GtGtGtEq => {
+                    compound_at.get_or_insert(at);
+                    at += 1;
+                }
+                K::Question => {
+                    // A conditional's `?` needs its DEPTH-0 `:` to the
+                    // right (a colon nested in a group is another
+                    // expression's), and a nullable-type suffix (`is
+                    // int?`) has none — the pair requirement keeps both
+                    // out of the conditional face.
+                    let mut probe = at + 1;
+                    let mut colon = None;
+                    while probe < hi {
+                        match tokens[probe].kind {
+                            K::Colon => {
+                                colon = Some(probe);
+                                break;
+                            }
+                            K::OpenCurly
+                            | K::StringInterpolationExpression
+                            | K::OpenParen
+                            | K::OpenSquare
+                            | K::Lt => {
+                                if let Some(close) = self.tokens.matching_end(probe) {
+                                    if close < hi {
+                                        probe = close + 1;
+                                        continue;
+                                    }
+                                }
+                                probe += 1;
+                            }
+                            _ => probe += 1,
+                        }
+                    }
+                    if let Some(colon) = colon {
+                        conditional_at.get_or_insert(at);
+                        colon_at.get_or_insert(colon);
+                    }
+                    at += 1;
+                }
+                _ => at += 1,
+            }
+        }
+        // `?:` is the lowest-precedence operator: a paired top-level `?`
+        // wins over an earlier `??` (`a ?? b ? c : d` groups as
+        // `(a ?? b) ? c : d`), the same precedence the context-pushed
+        // arm applies.
+        if let (Some(q), Some(c)) = (conditional_at, colon_at) {
+            let then_face = self.prune_operand_ty(q + 1, c)?;
+            let else_face = self.prune_operand_ty(c + 1, hi)?;
+            return self.prune_join(then_face, else_face);
+        }
+        if let Some(op_at) = if_null_at {
+            let lhs = self.prune_operand_ty(lo, op_at)?;
+            let rhs = self.prune_operand_ty(op_at + 1, hi)?;
+            // A bare local write gates the right face on `J'` (the
+            // local's declared face); any other lvalue's setter write
+            // type is outside this face's reach, so the right face
+            // stands as inferred.
+            if tokens[op_at].kind == K::QuestionQuestionEq {
+                if op_at == lo + 1 && tokens[lo].kind == K::Identifier {
+                    let name = self.strings.intern(self.tokens.lexeme(self.source, lo));
+                    let j_prime = self.local_declared_ty(name)?;
+                    if self.assignable(rhs, j_prime, false) != Some(true) {
+                        return None;
+                    }
+                }
+            }
+            let (left, right) = self.coerce_if_null_callable(Self::non_null_form(lhs), rhs);
+            return self.prune_join(left, right);
+        }
+        if let Some(op_at) = inc_dec_at {
+            // Prefix marks the operand to the right, postfix to the
+            // left; the result type is the operand's read face either
+            // way.
+            let operand = if op_at == lo {
+                self.prune_operand_ty(op_at + 1, hi)?
+            } else {
+                self.prune_operand_ty(lo, op_at)?
+            };
+            return Some(operand);
+        }
+        if let Some(op_at) = compound_at {
+            if op_at > lo {
+                return self.prune_operand_ty(lo, op_at);
+            }
+        }
+        None
+    }
+
+    /// The receiver span's composite token window: the span's token
+    /// range with a tail-anchored single closer expanded to its opener
+    /// (a cascade target's `(x ??= A())` row anchors at the `)`) and the
+    /// outermost paren pairs stripped. `(lo, hi)` in token indices.
+    fn composite_window(&self, recv_span: SourceRange) -> Option<(usize, usize)> {
+        use dartq_scanner::TokenKind as K;
+        let tokens = self.tokens.as_slice();
+        let mut first = tokens.partition_point(|t| t.utf16_offset < recv_span.offset);
+        let mut last = tokens.partition_point(|t| t.utf16_offset < recv_span.end());
+        if last == first + 1 && tokens[first].kind == K::CloseParen {
+            if let Some(opener) = (0..first).rev().find(|&i| {
+                tokens[i].kind == K::OpenParen && self.tokens.matching_end(i) == Some(first)
+            }) {
+                first = opener;
+            }
+        }
+        if last <= first {
+            return None;
+        }
+        while last > first
+            && tokens[first].kind == K::OpenParen
+            && self.tokens.matching_end(first) == Some(last - 1)
+        {
+            first += 1;
+            last -= 1;
+        }
+        Some((first, last))
+    }
+
+    /// [`Self::composite_self_ty`]'s conservative `UP`: the exact rules
+    /// only — identity, provable subsumption (the join answers the
+    /// supertype), `Null` absorption, the nullability merge
+    /// (`UP(T1?, T2) = UP(T1, T2)?`), `dynamic`/`void` top absorption,
+    /// the `Never` bottom discharge, the numeric pair `int`/`double` →
+    /// `num`, the bare `Function` pivot over function shapes, and the
+    /// same-head covariant argument join (a parameter with declared
+    /// non-covariant variance refuses the join). Every other pair
+    /// answers `None` — the real `least_upper_bound.dart` walks shared
+    /// supertypes this face does not model, and a missing candidate
+    /// keeps the row.
+    fn prune_join(&mut self, left: Ty, right: Ty) -> Option<Ty> {
+        if left == right {
+            return Some(left);
+        }
+        // `UP(Null, T)` is `T`/`T?` (`least_upper_bound.dart:487-524`).
+        if let (Ty::Null, other) | (other, Ty::Null) = (&left, &right) {
+            return Some(Self::nullable_form(*other));
+        }
+        // TOP and BOTTOM discharge before the subsumption asks
+        // (`least_upper_bound.dart:405-427` TOP, `:429-451` BOTTOM).
+        if matches!(left, Ty::Dynamic | Ty::Void) {
+            return Some(left);
+        }
+        if matches!(right, Ty::Dynamic | Ty::Void) {
+            return Some(right);
+        }
+        if matches!(left, Ty::Never) {
+            return Some(right);
+        }
+        if matches!(right, Ty::Never) {
+            return Some(left);
+        }
+        if self.assignable(left, right, false) == Some(true) {
+            return Some(right);
+        }
+        if self.assignable(right, left, false) == Some(true) {
+            return Some(left);
+        }
+        // Nullability merge (`:562-571`): join the stripped cores, then
+        // re-suffix. The stripped cores also put the numeric pair on
+        // its non-null spelling.
+        if self.potentially_nullable(left) || self.potentially_nullable(right) {
+            let inner = self.prune_join(Self::non_null_form(left), Self::non_null_form(right))?;
+            return Some(Self::nullable_form(inner));
+        }
+        if self.is_named_head(left, "int") && self.is_named_head(right, "double")
+            || self.is_named_head(left, "double") && self.is_named_head(right, "int")
+        {
+            return Some(Ty::Named {
+                name: self.intern("num"),
+                nullable: false,
+                args: ArgListId::EMPTY,
+            });
+        }
+        // The bare `Function` head is the supertype of every function
+        // shape (`subtype.dart`'s function block); two function shapes
+        // with no subsumption answer it only when one side IS the bare
+        // head — distinct signatures join above this face's reach.
+        if (self.prune_bare_function_head(left)
+            && matches!(
+                right,
+                Ty::Function {
+                    nullable: false,
+                    ..
+                }
+            ))
+            || (self.prune_bare_function_head(right)
+                && matches!(
+                    left,
+                    Ty::Function {
+                        nullable: false,
+                        ..
+                    }
+                ))
+        {
+            return Some(if self.prune_bare_function_head(left) {
+                left
+            } else {
+                right
+            });
+        }
+        // Same-head generic join: covariant argument positions join
+        // pairwise; a declared non-covariant position refuses (the join
+        // of an invariant/contravariant argument is not the covariant
+        // lift).
+        if let (
+            Ty::Named {
+                name: lname,
+                args: largs,
+                nullable: lnull,
+            },
+            Ty::Named {
+                name: rname,
+                args: rargs,
+                nullable: rnull,
+            },
+        ) = (&left, &right)
+            && lname == rname
+            && lnull == rnull
+        {
+            let lhs_args = self.boundary.pool().get(*largs).to_vec();
+            let rhs_args = self.boundary.pool().get(*rargs).to_vec();
+            if lhs_args.len() == rhs_args.len() && self.head_args_covariant(*lname, lhs_args.len())
+            {
+                let mut joined = Vec::with_capacity(lhs_args.len());
+                for (a, b) in lhs_args.iter().zip(rhs_args.iter()) {
+                    if a == b {
+                        joined.push(*a);
+                    } else {
+                        joined.push(self.prune_join(*a, *b)?);
+                    }
+                }
+                return Some(
+                    self.boundary
+                        .args
+                        .borrow_mut()
+                        .named(*lname, *lnull, &joined),
+                );
+            }
+        }
+        None
+    }
+
+    /// Whether `ty` is a non-nullable argument-less named head spelled
+    /// `name` (`int`, `double`, bare `Function`).
+    fn is_named_head(&self, ty: Ty, name: &str) -> bool {
+        matches!(
+            ty,
+            Ty::Named {
+                name: n,
+                args: ArgListId::EMPTY,
+                nullable: false,
+            } if n == self.intern(name)
+        )
+    }
+
+    /// Whether `ty` is the bare `Function` head (no arguments, not
+    /// nullable) — the function family's shared supertype. Local spelling
+    /// of the join pivot: the assignability module's same-named inherent
+    /// method is module-private and cannot be reached from here.
+    fn prune_bare_function_head(&self, ty: Ty) -> bool {
+        self.is_named_head(ty, "Function")
+    }
+
+    /// Whether every parameter of `head` (as declared in this file's
+    /// variance containers) is covariant or unmarked — the guard the
+    /// same-head join runs. Heads outside the containers read
+    /// all-covariant (the SDK's generics are legacy-covariant;
+    /// `element.dart:11560-11562`), a head with fewer declared params
+    /// than `arity` refuses.
+    fn head_args_covariant(&self, head: StringId, arity: usize) -> bool {
+        match self.var_containers.iter().find(|c| c.name == head) {
+            None => true,
+            Some(container) => {
+                container.params.len() == arity
+                    && container
+                        .params
+                        .iter()
+                        .all(|(_, declared, _)| declared.is_none_or(|v| v == Variance::Covariant))
+            }
+        }
     }
 
     /// The composite's downward context `K` as `S = greatestClosure(K)`

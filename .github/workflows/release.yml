@@ -59,7 +59,7 @@ jobs:
             *) echo "::error::tag '$RELEASE_TAG' must start with v + a digit"; exit 1 ;;
           esac
           echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - name: Toolchain trace
         run: |

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Explicit member list: `crates/dartq-plugin-host` is a Dart package (no
-# Cargo.toml) and cargo 1.96 errors on glob-matched directories without one.
+# Cargo.toml) and cargo errors on glob-matched directories without one.
 members = [
     "crates/dartq-source",
     "crates/dartq-language",
@@ -39,16 +39,21 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.20"
+version = "0.1.21"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
-rust-version = "1.96"
+rust-version = "1.99"
 repository = "https://github.com/fluttercandies/dartq"
 
 [workspace.dependencies]
 # One version decision per external dependency, made once here; member
 # crates consume them via `name = { workspace = true }`.
 base64 = "0.22"
+# The persisted-payload codec (#4207): positional binary for the L3 run
+# records and snapshot facts entries, replacing JSON on the hot stores.
+# Pinned to the maintained `bincode-next` line — the original `bincode`
+# crate's 3.0.0 release is a deliberate `compile_error!` stub.
+bincode-next = { version = "3", features = ["serde"] }
 blake3 = "1"
 # The CLI binary's global allocator: segment-based, returns freed pages
 # promptly (the 100k cold peak is fragmentation-bound under the system

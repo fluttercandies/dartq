@@ -36,7 +36,8 @@ use crate::bounds::TypeTree;
 use crate::capture::TreeSink;
 use crate::resolved_ops::{ClauseCapture, ClauseTrees};
 use dartq_parser::{
-    DeclarationKind, IdentifierContext, Parser, ParserFeatures, ParserListener, TokenSpan as Token,
+    DeclarationKind, FormalParameterKind, IdentifierContext, MemberKind, Parser, ParserFeatures,
+    ParserListener, TokenSpan as Token,
 };
 use dartq_scanner::TokenTable;
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
@@ -319,6 +320,69 @@ impl ParserListener for CaptureListener<'_, '_> {
         }
         if let Some(sink) = self.bound_sink.as_mut() {
             sink.end_function(question.is_some(), range);
+        }
+    }
+
+    fn begin_formal_parameters(&mut self, _token: Token, _kind: MemberKind) {
+        // A formal list under a captured function type: everything before
+        // it is the written return type (the same boundary
+        // `crate::bounds`'s sinks latch through `function_formals_begin`).
+        if let Some((_, header)) = self.header.as_mut()
+            && header.sink.top_is_function()
+        {
+            header.sink.function_formals_begin();
+        }
+        if let Some(sink) = self.bound_sink.as_mut()
+            && sink.top_is_function()
+        {
+            sink.function_formals_begin();
+        }
+    }
+
+    fn begin_optional_formal_parameters(&mut self, token: Token) {
+        // `[` latches the required/optional boundary on the function
+        // level; `{` leaves every positional formal required (the sink
+        // guards on the opener itself).
+        let opener = self.tokens.get(token.id as usize).map(|t| t.byte_range());
+        let Some(range) = opener else {
+            return;
+        };
+        if let Some((_, header)) = self.header.as_mut() {
+            header
+                .sink
+                .function_optional_group(&self.source[range.clone()]);
+        }
+        if let Some(sink) = self.bound_sink.as_mut() {
+            sink.function_optional_group(&self.source[range]);
+        }
+    }
+
+    fn end_formal_parameter(
+        &mut self,
+        _var_or_final: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _this_keyword: Option<Token>,
+        _super_keyword: Option<Token>,
+        _period_after_this_or_super: Option<Token>,
+        name: Token,
+        _initializer_start: Option<Token>,
+        _initializer_end: Option<Token>,
+        kind: FormalParameterKind,
+        _member_kind: MemberKind,
+    ) {
+        // A captured function level's formal closed: its name pairs with
+        // the type node that just landed (the sink guards itself to
+        // function levels).
+        let named = matches!(
+            kind,
+            FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+        );
+        let formal_name = named.then(|| self.name_of(name)).flatten();
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_formal_end(named, formal_name);
+        }
+        if let Some(sink) = self.bound_sink.as_mut() {
+            sink.function_formal_end(named, formal_name);
         }
     }
 

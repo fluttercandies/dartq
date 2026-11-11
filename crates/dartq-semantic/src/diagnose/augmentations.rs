@@ -39,9 +39,11 @@
 
 use dartq_diagnostics::{Diagnostic, Severity};
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
+use dartq_scanner::{Keyword, TokenKind};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::types::{DeclKind, Engine, LocalKind};
 use crate::codes::{AlreadyCompleteShape, ReturnShape, SemanticCode, WithoutDeclarationShape};
 use crate::library::ElementIndex;
 use crate::model::{
@@ -201,12 +203,20 @@ impl Face<'_> {
     }
 
     /// The intro's own type parameters: parallel name/bound rows, an
-    /// absent bound spelled `Ty::Dynamic` (the Dart reading).
+    /// absent bound spelled `Ty::Dynamic` (the Dart reading). Every face
+    /// answers its captured bound column — a top-level function's
+    /// `TopDecl::type_param_bounds` is the same column a container header
+    /// and a member carry, so `T extends String` on both sides of the chain
+    /// compares equal (an empty slice here read every written bound as
+    /// `dynamic` and minted `augmentation_type_parameter_bound` rows the
+    /// oracle never reports).
     fn type_params(&self) -> (&[StringId], &[Ty]) {
         match self {
             Face::Container(c) => (&c.type_param_names, &c.type_param_bounds),
             Face::Member(m) => (&m.type_param_names, &m.type_param_bounds),
-            Face::TopFn { decl, .. } | Face::TopVar(decl) => (&decl.type_param_names, &[]),
+            Face::TopFn { decl, .. } | Face::TopVar(decl) => {
+                (&decl.type_param_names, &decl.type_param_bounds)
+            }
             Face::Ctor { .. } => (&[], &[]),
         }
     }
@@ -297,6 +307,207 @@ fn augment_key(aug: &AugmentDecl, strings: &StringTable) -> (Option<StringId>, S
         property_name(aug.name, aug.kind, strings),
         Space::of(aug),
     )
+}
+
+/// The merged positional-parameter scope of the executable chain the walk's
+/// formal-bind site keys (#3876): per position, the first non-`_` spelling
+/// along the chain — the introductory declaration first, then every
+/// same-key same-kind `augment` fragment in source order — paired with the
+/// type that spelling carries (`None` = the fragment omitted the
+/// annotation). Every fragment's body resolves its identifiers against the
+/// merged scope, never its own formals alone: the merged element's
+/// parameter list is the fragment-linked list, and each body's formal
+/// scope is populated from the merged element (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/summary2/element_builder.dart
+/// `_linkFormalParameters` — the intro, every augment, and every body read
+/// on the chain answer through the one parameter element per position).
+/// Oracle-pinned (3.13.7, `--enable-experiment=augmentations`): an intro
+/// body resolves a name spelled only in a LATER augment, an augment body
+/// resolves one spelled only in the intro, and a position spelled `_` on
+/// every fragment contributes no name (the read falls through).
+///
+/// `None` = the key declares no introductory declaration (an augmentation
+/// without declaration merges nothing — upstream the refused fragment's
+/// body keeps its own formals only), or the unit writes no augment at all.
+type MergedSlot = Option<(StringId, Option<Ty>)>;
+
+pub(crate) fn merged_positional_scope(
+    own: &FileElements,
+    strings: &StringTable,
+    container: Option<StringId>,
+    lookup: StringId,
+    kind: AugKind,
+    is_static: bool,
+) -> Option<Box<[MergedSlot]>> {
+    if own.augmentations().is_empty() {
+        return None;
+    }
+    let property = property_name(lookup, kind, strings);
+    let space = match container {
+        None => Space::Top,
+        Some(_) if is_static || kind == AugKind::Constructor => Space::StaticMember,
+        Some(_) => Space::Member,
+    };
+    // The introductory declaration's positional formals, keyed by family —
+    // the same lookup spelling the capture keyed (setters under `name=`,
+    // constructors by selector, the unnamed face under the container's
+    // name).
+    let intro: &Formals = match (kind, container) {
+        // A member executable's intro lives in its container's member
+        // table; a top-level one in the declaration table. Setters key
+        // under the family's own spelling (`name=`) in either table.
+        (AugKind::Constructor, Some(container)) => {
+            own.container(container)?.ctor_formals.get(&lookup)?
+        }
+        (AugKind::Setter | AugKind::Method, Some(container)) => own
+            .container(container)?
+            .members
+            .get(&lookup)?
+            .formals
+            .as_deref()?,
+        (AugKind::Function | AugKind::Setter, None) => own.decl(lookup)?.formals.as_deref()?,
+        _ => return None,
+    };
+    let mut slots: Vec<MergedSlot> = intro
+        .positional
+        .iter()
+        .map(|formal| {
+            (strings.resolve(formal.name) != "_")
+                .then(|| (formal.name, (formal.ty != Ty::UNKNOWN).then_some(formal.ty)))
+        })
+        .collect();
+    for aug in own.augmentations() {
+        if aug.kind != kind || augment_key(aug, strings) != (container, property, space) {
+            continue;
+        }
+        for (index, formal) in aug
+            .formals
+            .iter()
+            .filter(|formal| formal.required_positional || formal.optional_positional)
+            .enumerate()
+        {
+            // A fragment declaring more positionals than the intro is the
+            // shape faces' row (`augmentation_*_formal_parameter_count`);
+            // the merged scope keeps the intro's size — the refused extra
+            // positions name nothing.
+            let Some(slot) = slots.get_mut(index) else {
+                break;
+            };
+            if slot.is_some() {
+                continue;
+            }
+            let Some(name) = formal.name else {
+                continue;
+            };
+            if strings.resolve(name) == "_" {
+                continue;
+            }
+            *slot = Some((name, formal.ty.filter(|ty| *ty != Ty::UNKNOWN)));
+        }
+    }
+    Some(slots.into_boxed_slice())
+}
+
+/// The #3876 bind-side hook: one ordinary formal of a declared executable
+/// whose spelling is the wildcard `_` (a named formal carries its own
+/// spelling's bind — a conflicting spelling is the positional-name face's
+/// row, and the body keeps its own binding). The slot borrows the chain's
+/// merged name: the first non-`_` spelling at this position, typed by the
+/// fragment that spelled it, joins the body scope so every read on the
+/// chain resolves against the merged element. The tracked row joins with
+/// no site — the unused-parameter face's per-site grouping stays the
+/// fragment's own `_` row, so the injected name mints no unused row of its
+/// own. Declared executables only: a closure's bind site carries none (the
+/// local-function begin cleared it), and a closure never joins a chain.
+pub(crate) fn bind_merged_positional(engine: &mut Engine<'_>, name: StringId, range: SourceRange) {
+    // The feature gate rides first: a unit without the experiment keeps the
+    // per-fragment binding (the oracle without the experiment never merges).
+    if !engine.augmentations_enabled
+        || !engine.class_modifiers.wildcards_enabled(engine.lib)
+        || engine.strings.resolve(name) != "_"
+    {
+        return;
+    }
+    let Some(site) = engine.open_ctor_site.or(engine.open_exec_site) else {
+        return;
+    };
+    let site_kind = engine.decl_sites[site].kind;
+    let lookup = engine.decl_sites[site].name;
+    let name_range = engine.decl_sites[site].range;
+    // The bind-time setter read: a top-level site's spelling gains its
+    // `name=` only at the declaration's end event — after every formal
+    // binds — so the `set` keyword ahead of the name token is the proof
+    // (the same read the annotation faces key; a spelling ending in `=`
+    // alone would misfile `operator []=`).
+    let tokens = engine.tokens.as_slice();
+    let name_index = tokens.partition_point(|t| t.utf16_offset < name_range.offset);
+    let setter = name_index > 0 && tokens[name_index - 1].kind == TokenKind::Keyword(Keyword::Set);
+    let (kind, container, is_static, lookup) = match site_kind {
+        DeclKind::TopLevelFn => {
+            // The model keys a top-level setter under `name=` while the
+            // site spelling stays bare until the end event; the lookup
+            // rewrites here (`property_name` folds the `=` back out for
+            // the augment matching).
+            let key = if setter {
+                engine
+                    .strings
+                    .intern(&format!("{}=", engine.strings.resolve(lookup)))
+            } else {
+                lookup
+            };
+            (
+                if setter {
+                    AugKind::Setter
+                } else {
+                    AugKind::Function
+                },
+                None,
+                false,
+                key,
+            )
+        }
+        DeclKind::Member {
+            kind: MemberKind::Method,
+            is_static,
+            container,
+        } => (
+            if setter {
+                AugKind::Setter
+            } else {
+                AugKind::Method
+            },
+            Some(container),
+            is_static,
+            lookup,
+        ),
+        DeclKind::Constructor { container } => {
+            (AugKind::Constructor, Some(container), false, lookup)
+        }
+        _ => return,
+    };
+    // The formal's positional ordinal: the site's own previously-bound
+    // formals (the injected rows join without a site, so the count is the
+    // fragment's own list; named-section formals always index past the
+    // positional table — the merged scope is positional-only).
+    let ordinal = engine
+        .site_params
+        .get(&site)
+        .map_or(0, |params| params.len().saturating_sub(1));
+    let Some(elements) = engine.index.get(engine.file) else {
+        return;
+    };
+    let scope =
+        merged_positional_scope(elements, engine.strings, container, lookup, kind, is_static);
+    let Some(scope) = scope else {
+        return;
+    };
+    let Some((slot_name, slot_ty)) = scope.get(ordinal).copied().flatten() else {
+        return;
+    };
+    engine.add_tracked_local(slot_name, range, LocalKind::Parameter { site: None });
+    if let Some(ty) = slot_ty {
+        engine.bind_var_type(slot_name, ty);
+    }
 }
 
 /// The verifier's rows: one pass per diagnosing file, the table built once
@@ -1289,7 +1500,14 @@ fn check_type_param_rows(
             out.push(row(file, param.name_range, code, code.message("", "")));
         }
         if let Some((bound, span)) = param.bound {
-            let intro_bound = intro_bounds.get(index).copied().unwrap_or(Ty::Dynamic);
+            // An absent bound column is the payload-restored introduction
+            // (its names survived, its bounds did not): the comparison has
+            // no left side, so the pair stays silent — the under-report
+            // posture the persisted payload holds everywhere, never a
+            // `dynamic` stand-in that would mint a row the oracle does not.
+            let Some(intro_bound) = intro_bounds.get(index).copied() else {
+                continue;
+            };
             // The bound pair judges canonical types (upstream
             // `boundNode.typeOrThrow != firstBound`): a typedef spelling and
             // an import-prefixed one compare by expansion/element, never by

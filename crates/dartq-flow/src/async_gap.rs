@@ -1609,7 +1609,7 @@ impl GapPass {
                 });
             }
             Ev::Null => self.markers.push(Mk::OTHER),
-            Ev::UnaryPrefix { is_not } => {
+            Ev::UnaryPrefix { is_not, .. } => {
                 let mut m = self.pop_marker();
                 if *is_not {
                     m.guard = [m.guard[0].flip(), m.guard[1].flip()];

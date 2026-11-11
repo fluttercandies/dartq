@@ -202,6 +202,36 @@ pub(super) fn report_ops_experiments_with(
     wildcards: Option<bool>,
     experiments: &[dartq_language::Feature],
 ) -> FileReport {
+    report_ops_env(source, imports, wildcards, experiments, &[])
+}
+
+/// The SDK container heads [`report_ops_core_ctor`] additionally mounts
+/// in the names-only `dart:core` stub posture: a fixture naming them
+/// sees the CLI's unindexed-SDK grade (the names resolve into a
+/// `dart:core` unit the element index carries no model for), so a
+/// member walk over one chain-breaks into suppression exactly as over
+/// the real SDK projection — the posture the core-constructor tear-off
+/// face's fixtures need (its receivers resolve, but no declared
+/// constructor table ever arms).
+const CORE_CTOR_STUB_NAMES: [&str; 9] = [
+    "List", "Map", "Set", "Iterable", "int", "String", "bool", "num", "double",
+];
+
+/// [`report_ops_bare`] plus the [`CORE_CTOR_STUB_NAMES`] heads in the
+/// `dart:core` stub — no prelude: the fixture declares every
+/// member-bearing class of its own, and the SDK container heads resolve
+/// as names-only faces.
+pub(super) fn report_ops_core_ctor(source: &str) -> FileReport {
+    report_ops_env(source, &[], None, &[], &CORE_CTOR_STUB_NAMES)
+}
+
+fn report_ops_env(
+    source: &str,
+    imports: &[RigImport<'_>],
+    wildcards: Option<bool>,
+    experiments: &[dartq_language::Feature],
+    extra_core_stubs: &[&str],
+) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
@@ -216,7 +246,7 @@ pub(super) fn report_ops_experiments_with(
     let lib = builder.intern("package:t/main.dart");
     let core_lib = builder.intern("dart:core");
     let core_file = files.intern(Path::new("<dart:core>"));
-    for name in CORE_STUB_NAMES {
+    for name in CORE_STUB_NAMES.iter().chain(extra_core_stubs) {
         builder.declare(core_lib, strings.intern(name), core_file);
     }
     builder.import(
@@ -504,4 +534,105 @@ pub(super) fn assert_silent(report: &FileReport) {
         "expected no rows, got {:#?}",
         rows(report)
     );
+}
+
+/// The corpus's `import 'dart:core' as core;` posture: `dart:core` is ONE
+/// library — an indexed unit carrying [`CORE_PRELUDE`] plus `print`,
+/// beside the names-only [`CORE_STUB_NAMES`] spellings (`Enum` rides the
+/// prelude) — imported both unprefixed and under the `core` prefix, so
+/// `core.List` and `List` name the same declaration. No prelude rides the
+/// fixture: its own import directives lead the unit. The resolved-type
+/// snapshot mounts the way [`report_ops`] mounts it.
+pub(super) fn report_ops_core_prefixed(source: &str) -> FileReport {
+    let core_source = format!("{CORE_PRELUDE}void print(Object? object) {{}}\n");
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let core_file = files.intern(Path::new("core.dart"));
+    let stub_file = files.intern(Path::new("<dart:core>"));
+    let scanned = scan_fixture(source, file);
+    let scanned_core = scan_fixture(&core_source, core_file);
+    let set = FeatureSet::for_language_version(fixture_language_version(source));
+    let features = ParserFeatures::from_feature_set(set);
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    let core_elements = collect(&core_source, &scanned_core.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let core_lib = builder.intern("dart:core");
+    let mut index = ElementIndex::default();
+    for (unit_lib, unit, unit_elements) in [
+        (lib, file, &elements),
+        (core_lib, core_file, &core_elements),
+    ] {
+        index.insert(unit, unit_elements.clone());
+        builder.unit(unit_lib, unit);
+        for (name, decl) in unit_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+            ) {
+                builder.declare_class(unit_lib, name, unit, ClassModifiers::default());
+            } else {
+                builder.declare(unit_lib, name, unit);
+            }
+        }
+    }
+    for name in CORE_STUB_NAMES.iter().filter(|name| **name != "Enum") {
+        builder.declare(core_lib, strings.intern(name), stub_file);
+    }
+    for prefix in [None, Some(strings.intern("core"))] {
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(core_lib),
+                prefix,
+                deferred: false,
+                non_library: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+    }
+    let mut clauses = ClauseTrees::empty();
+    crate::capture_clause_trees(
+        file,
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        &mut clauses,
+    );
+    crate::capture_clause_trees(
+        core_file,
+        &core_source,
+        &scanned_core.tokens,
+        features,
+        &strings,
+        &mut clauses,
+    );
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let types =
+        LibraryTypes::build_with_clauses(&graph, &namespaces, &index, &strings, lib, &clauses);
+    let ops = ResolvedTypeOps::new(&types, &strings, file);
+    let fold = fold_unit_with_ops(
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(Feature::InferenceUpdate2),
+        Some(&ops),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    report
 }

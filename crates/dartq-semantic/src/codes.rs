@@ -106,6 +106,17 @@ pub enum SemanticCode {
     /// Emitted by [`mod@crate::diagnose`]'s duplicate fold for the pair shape
     /// the capture records; see the collector's formal scope claim kind.
     DuplicateFieldFormalParameter,
+    /// `The field name '{0}' is already used in this record.` — upstream's
+    /// `reportDuplicateFieldDefinitions` / `_reportDuplicateFieldDefinitions`
+    /// (`record_type_annotation_resolver.dart:39-55` /
+    /// `record_literal_resolver.dart:79-98`): every written field name after
+    /// the first occurrence reports at the LATER name token with a `The
+    /// first ` context row anchored at the FIRST occurrence
+    /// (`duplicateFieldDefinitionInType`/`duplicateFieldDefinitionInLiteral`,
+    /// diagnostic_factory.dart:105-149). A record type's positional `_`
+    /// exempts under the wildcard-variables feature (`isPositionalWildCard`);
+    /// a record literal's named `_` never exempts.
+    DuplicateFieldName,
     /// `Undefined name '{0}' used as an annotation.` — the emit site is
     /// [`mod@crate::diagnose`]'s annotation check (a fully missing
     /// `MetadataReference` name), and upstream removed the
@@ -279,6 +290,16 @@ pub enum SemanticCode {
     /// error_verifier.dart:7116-7127; the template is
     /// `typeAliasCannotReferenceItself`, diagnostic.g.dart:16041-16051).
     TypeAliasCannotReferenceItself,
+    /// `Type parameter bound types must be instantiated.` — a written type
+    /// parameter bound containing a bare head that names a generic
+    /// declaration which is *not simply bounded* (the
+    /// `_UninstantiatedBoundChecker`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/error_verifier.dart:8521-8541,
+    /// fired from `visitTypeParameter`'s bound walk :2159; the template is
+    /// `notInstantiatedBound`, diagnostic.g.dart:13296-13307). A head with
+    /// written arguments is instantiated — its argument positions recurse
+    /// instead — and the row anchors at the bare head's own token.
+    NotInstantiatedBound,
     /// `The enum must have at least one enum constant.` — a non-augmentation
     /// enum declaration whose element list is empty
     /// (`enumWithoutConstants`, diagnostic.g.dart:4966-4974; the emit site
@@ -1472,6 +1493,112 @@ pub enum SemanticCode {
     /// entry face (`_checkForOnClauseErrorCodes`,
     /// error_verifier.dart:6724-6745).
     SubtypeOfDisallowedTypeInOn,
+    // —— #3885: the mixin-application family faces (all
+    //    `COMPILE_TIME_ERROR` unless noted; error_verifier.dart
+    //    `_checkForAllMixinErrorCodes` :2459-2513 and
+    //    `_checkForMixinClassErrorCodes` :5967-6043) ——————————————————————
+    /// `The class '{0}' can't be used as a mixin because it declares a
+    /// generative constructor.` — the else-branch arm of the
+    /// `_checkForAllMixinErrorCodes` with-entry walk: the resolved element
+    /// is a plain class (not a mixin, not a mixin class), and the
+    /// `classUsedAsMixin` arm above was not taken (pre-3.0 library or
+    /// mayIgnore exempt) — the class still cannot serve as a mixin because
+    /// it declares a generative constructor
+    /// (`_checkForClassUsedAsMixinDeclaresGenerativeConstructor`,
+    /// error_verifier.dart:3450-3466).
+    ClassUsedAsMixinDeclaresGenerativeConstructor,
+    /// `The class '{0}' can't be used as a mixin because it extends a class
+    /// other than 'Object'.` — the same else-branch's second arm: a plain
+    /// class or mixin class whose supertype is not `Object`, or a mixin
+    /// application whose mixin list has 2+ entries
+    /// (`_checkForMixinInheritsNotFromObject`,
+    /// error_verifier.dart:6051-6074). Mixin applications with a single
+    /// `with` entry are exempt.
+    MixinInheritsFromNotObject,
+    /// `The mixin class '{0}' can't declare a non-trivial generative
+    /// constructor.` — a `mixin class` declaration's own constructor check:
+    /// a non-trivial generative constructor is illegal on the mixin face
+    /// (`_checkForMixinClassErrorCodes` non-trivial ctor arm,
+    /// error_verifier.dart:5995-6043).
+    MixinClassDeclaresNonTrivialGenerativeConstructor,
+    /// `The class '{0}' can't be declared a mixin because it extends a class
+    /// other than 'Object'.` — a `mixin class` declaration whose `extends`
+    /// head is not `Object` (`_checkForMixinClassErrorCodes` extends arm,
+    /// error_verifier.dart:5995-6043).
+    MixinClassDeclarationExtendsNotObject,
+    /// `The class '{0}' can't be declared a mixin because it has a 'with'
+    /// clause.` — a `mixin class` declaration that carries a `with` clause
+    /// but is not a mixin application (`_checkForMixinClassErrorCodes` with
+    /// arm, error_verifier.dart:5995-6043).
+    MixinClassDeclarationWithClause,
+    /// `The mixin application class '{0}' can only have a single mixin.` —
+    /// a named mixin application `mixin class X = S with M1, M2` carrying
+    /// 2+ `with` entries (`_checkForMixinClassErrorCodes` application arm,
+    /// error_verifier.dart:5995-6043).
+    MixinModifierMixinApplicationClassWithMultipleMixins,
+    /// `A type alias that expands to a type parameter can't be mixed in.` —
+    /// a `with` entry whose resolved element is a type alias expanding to a
+    /// type parameter (`mixin_of_type_alias_expands_to_type_parameter`,
+    /// diagnostic.g.dart :11300; the `supertype_expands_to_type_parameter`
+    /// shared name's `with` face).
+    MixinOfTypeAliasExpandsToTypeParameter,
+    /// `A type alias that expands to a type parameter can't be used as a
+    /// superclass.` — an `extends` head whose resolved element is a type
+    /// alias expanding to a type parameter
+    /// (`extends_type_alias_expands_to_type_parameter`,
+    /// diagnostic.g.dart :5421-5431; the `supertype_expands_to_type_parameter`
+    /// shared name's extends face — one machine code across the four
+    /// clause faces, each descriptor spelling its own message).
+    ExtendsTypeAliasExpandsToTypeParameter,
+    /// `A type alias that expands to a type parameter can't be
+    /// implemented.` — an `implements` entry whose resolved element is a
+    /// type alias expanding to a type parameter
+    /// (`implements_type_alias_expands_to_type_parameter`,
+    /// diagnostic.g.dart :7370-7378; the `supertype_expands_to_type_parameter`
+    /// shared name's implements face).
+    ImplementsTypeAliasExpandsToTypeParameter,
+    /// `A type alias that expands to a type parameter can't be used as a
+    /// superclass constraint.` — a mixin's `on` entry whose resolved
+    /// element is a type alias expanding to a type parameter
+    /// (`mixin_on_type_alias_expands_to_type_parameter`,
+    /// diagnostic.g.dart :11339-11346; the
+    /// `supertype_expands_to_type_parameter` shared name's `on` face).
+    MixinOnTypeAliasExpandsToTypeParameter,
+    /// `The private name '{0}', defined by '{1}', conflicts with the same
+    /// name defined by '{2}'.` — two `with` entries define the same private
+    /// member name across different libraries
+    /// (`private_collision_in_mixin_application`,
+    /// error_verifier.dart `_checkForMixinWithConflictingPrivateMember`).
+    PrivateCollisionInMixinApplication,
+    /// `This constructor can't be declared 'const' because a mixin adds the
+    /// instance field: {0}.` — a const constructor on a class whose `with`
+    /// clause brings in a mixin with instance fields
+    /// (`const_constructor_with_mixin_with_field`,
+    /// error_verifier.dart `_checkForConstConstructorWithNonFinalField`).
+    ConstConstructorWithMixinWithField,
+    /// `Mixins applied to enums can't have instance variables.` — an enum's
+    /// `with` clause entry whose mixin has instance fields
+    /// (`enum_mixin_with_instance_variable`, enum_verifier.dart).
+    EnumMixinWithInstanceVariable,
+    /// `Mixins can't be instantiated.` — a `new`/`const` creation whose
+    /// resolved element is a mixin (`mixin_instantiate`,
+    /// error_verifier.dart `_checkForMixinInstantiate`).
+    MixinInstantiate,
+    /// `The super-invoked member '{0}' has the type '{1}', and the concrete
+    /// member in the class has the type '{2}'.` — the concrete-super-invoked
+    /// member type mismatch (`mixin_application_concrete_super_invoked_member_type`,
+    /// error_verifier.dart:6128-6175 `_checkForMixinSuperInvokedMembers`).
+    MixinApplicationConcreteSuperInvokedMemberType,
+    /// `Deferred classes can't be used as superclass constraints.` — a
+    /// mixin's `on` clause entry resolving to a deferred-imported class
+    /// (`mixin_super_class_constraint_deferred_class`,
+    /// error_verifier.dart `_checkForOnClauseErrorCodes`).
+    MixinSuperClassConstraintDeferredClass,
+    /// `The annotation '@Deprecated.mixin' can only be applied to classes.`
+    /// — a `@Deprecated.mixin` annotation on a non-class target
+    /// (`invalid_deprecated_mixin_annotation`,
+    /// diagnostic.g.dart :8577, `STATIC_WARNING`).
+    InvalidDeprecatedMixinAnnotation,
     // —— #1314 FAM18: the uninitialized-non-nullable faces (both
     //    `COMPILE_TIME_ERROR`, diagnostic.g.dart :13503/:13540) ——————————
     /// `The non-nullable variable '{0}' must be initialized.` — a
@@ -2394,6 +2521,7 @@ impl SemanticCode {
                 "duplicate_field_formal_parameter",
                 "DUPLICATE_FIELD_FORMAL_PARAMETER",
             ),
+            Self::DuplicateFieldName => ("duplicate_field_name", "DUPLICATE_FIELD_NAME"),
             Self::UndefinedAnnotation => ("undefined_annotation", "UNDEFINED_ANNOTATION"),
             Self::UndefinedClass => ("undefined_class", "UNDEFINED_CLASS"),
             Self::UndefinedConstructorInInitializer => (
@@ -2506,6 +2634,7 @@ impl SemanticCode {
                 "type_alias_cannot_reference_itself",
                 "TYPE_ALIAS_CANNOT_REFERENCE_ITSELF",
             ),
+            Self::NotInstantiatedBound => ("not_instantiated_bound", "NOT_INSTANTIATED_BOUND"),
             Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
             Self::EnumWithAbstractMember => {
                 ("enum_with_abstract_member", "ENUM_WITH_ABSTRACT_MEMBER")
@@ -3333,6 +3462,72 @@ impl SemanticCode {
             | Self::SubtypeOfDisallowedTypeInOn => {
                 ("subtype_of_disallowed_type", "SUBTYPE_OF_DISALLOWED_TYPE")
             }
+            // The #3885 mixin-application family faces.
+            Self::ClassUsedAsMixinDeclaresGenerativeConstructor => (
+                "class_used_as_mixin_declares_generative_constructor",
+                "CLASS_USED_AS_MIXIN_DECLARES_GENERATIVE_CONSTRUCTOR",
+            ),
+            Self::MixinInheritsFromNotObject => (
+                "mixin_inherits_from_not_object",
+                "MIXIN_INHERITS_FROM_NOT_OBJECT",
+            ),
+            Self::MixinClassDeclaresNonTrivialGenerativeConstructor => (
+                "mixin_class_declares_non_trivial_generative_constructor",
+                "MIXIN_CLASS_DECLARES_NON_TRIVIAL_GENERATIVE_CONSTRUCTOR",
+            ),
+            Self::MixinClassDeclarationExtendsNotObject => (
+                "mixin_class_declaration_extends_not_object",
+                "MIXIN_CLASS_DECLARATION_EXTENDS_NOT_OBJECT",
+            ),
+            Self::MixinClassDeclarationWithClause => (
+                "mixin_class_declaration_with_clause",
+                "MIXIN_CLASS_DECLARATION_WITH_CLAUSE",
+            ),
+            Self::MixinModifierMixinApplicationClassWithMultipleMixins => (
+                "mixin_modifier_mixin_application_class_with_multiple_mixins",
+                "MIXIN_MODIFIER_MIXIN_APPLICATION_CLASS_WITH_MULTIPLE_MIXINS",
+            ),
+            // The #3899 clause faces of the alias-expands-to-type-parameter
+            // family: four upstream descriptors
+            // (diagnostic.g.dart :5421/:7370/:11303/:11339) share the one
+            // machine-format name — the emitted code is identical across
+            // the four clause positions (oracle `dart analyze
+            // --format=machine` spells `SUPERTYPE_EXPANDS_TO_TYPE_PARAMETER`
+            // at every position), while each descriptor's uniqueName and
+            // problemMessage differ. The variants split for the messages,
+            // not for the emitted code.
+            Self::MixinOfTypeAliasExpandsToTypeParameter
+            | Self::ExtendsTypeAliasExpandsToTypeParameter
+            | Self::ImplementsTypeAliasExpandsToTypeParameter
+            | Self::MixinOnTypeAliasExpandsToTypeParameter => (
+                "supertype_expands_to_type_parameter",
+                "SUPERTYPE_EXPANDS_TO_TYPE_PARAMETER",
+            ),
+            Self::PrivateCollisionInMixinApplication => (
+                "private_collision_in_mixin_application",
+                "PRIVATE_COLLISION_IN_MIXIN_APPLICATION",
+            ),
+            Self::ConstConstructorWithMixinWithField => (
+                "const_constructor_with_mixin_with_field",
+                "CONST_CONSTRUCTOR_WITH_MIXIN_WITH_FIELD",
+            ),
+            Self::EnumMixinWithInstanceVariable => (
+                "enum_mixin_with_instance_variable",
+                "ENUM_MIXIN_WITH_INSTANCE_VARIABLE",
+            ),
+            Self::MixinInstantiate => ("mixin_instantiate", "MIXIN_INSTANTIATE"),
+            Self::MixinApplicationConcreteSuperInvokedMemberType => (
+                "mixin_application_concrete_super_invoked_member_type",
+                "MIXIN_APPLICATION_CONCRETE_SUPER_INVOKED_MEMBER_TYPE",
+            ),
+            Self::MixinSuperClassConstraintDeferredClass => (
+                "mixin_super_class_constraint_deferred_class",
+                "MIXIN_SUPER_CLASS_CONSTRAINT_DEFERRED_CLASS",
+            ),
+            Self::InvalidDeprecatedMixinAnnotation => (
+                "invalid_deprecated_mixin_annotation",
+                "INVALID_DEPRECATED_MIXIN_ANNOTATION",
+            ),
             // The #1314 FAM18 uninitialized-non-nullable faces.
             Self::NotInitializedNonNullableVariable => (
                 "not_initialized_non_nullable_variable",
@@ -3574,6 +3769,9 @@ impl SemanticCode {
                 // `enumWithoutConstants` carries no published docs
                 // (diagnostic.g.dart:4966-4974 — no `hasPublishedDocs` flag).
                 | Self::EnumWithoutConstants
+                // `notInstantiatedBound` carries none either
+                // (diagnostic.g.dart:13296-13307).
+                | Self::NotInstantiatedBound
                 // The #3569 augmentation rows all carry
                 // `hasPublishedDocs: false` (messages.yaml).
                 | Self::FunctionNotCompleteAfterAugmentations
@@ -3669,6 +3867,9 @@ impl SemanticCode {
             // (diagnostic.g.dart:11584 and :15866).
             | Self::MixinOnSealedClass
             | Self::SubtypeOfSealedClass
+            // The #3885 deprecated-mixin annotation row is `STATIC_WARNING`
+            // (diagnostic.g.dart :8584).
+            | Self::InvalidDeprecatedMixinAnnotation
             // The #743 W1-micro cluster (`messages.yaml`, the
             // StaticWarningCode block: deadCodeOnCatchSubtype :25927,
             // nullArgumentToNonNullType :29376,
@@ -3826,6 +4027,11 @@ impl SemanticCode {
             Self::DuplicateFieldFormalParameter => format!(
                 "The field '{a0}' can't be initialized by multiple parameters in the same constructor."
             ),
+            // diagnostic.g.dart:4405 (the record-field duplicate row's
+            // verbatim problemMessage — `{0}` is the repeated name).
+            Self::DuplicateFieldName => {
+                format!("The field name '{a0}' is already used in this record.")
+            }
             // The three-placeholder bounds row routes through `message3`
             // (real emissions go through `emit3`).
             Self::TypeArgumentNotMatchingBounds => self.message3(a0, a1, ""),
@@ -3981,6 +4187,11 @@ impl SemanticCode {
             Self::TypeAliasCannotReferenceItself => {
                 "Typedefs can't reference themselves directly or recursively via another typedef."
                     .to_string()
+            }
+            // The #3891 uninstantiated-bound row carries no arguments
+            // (diagnostic.g.dart:13303-13304).
+            Self::NotInstantiatedBound => {
+                "Type parameter bound types must be instantiated.".to_string()
             }
             // The #314 residue family: the one-argument rows and the four
             // no-argument member faces, verbatim
@@ -4805,6 +5016,63 @@ impl SemanticCode {
             Self::SubtypeOfDisallowedTypeInOn => {
                 format!("'{a0}' can't be used as a superclass constraint.")
             }
+            // The #3885 mixin-application family faces
+            // (diagnostic.g.dart :1907/:11230/:11191/:11152/:11172/:11258
+            // and the with-clause sharedName rows).
+            Self::ClassUsedAsMixinDeclaresGenerativeConstructor => format!(
+                "The class '{a0}' can't be used as a mixin because it declares a generative constructor."
+            ),
+            Self::MixinInheritsFromNotObject => format!(
+                "The class '{a0}' can't be used as a mixin because it extends a class other than 'Object'."
+            ),
+            Self::MixinClassDeclaresNonTrivialGenerativeConstructor => format!(
+                "The mixin class '{a0}' can't declare a non-trivial generative constructor."
+            ),
+            Self::MixinClassDeclarationExtendsNotObject => format!(
+                "The class '{a0}' can't be declared a mixin because it extends a class other than 'Object'."
+            ),
+            Self::MixinClassDeclarationWithClause => format!(
+                "The class '{a0}' can't be declared a mixin because it has a 'with' clause."
+            ),
+            Self::MixinModifierMixinApplicationClassWithMultipleMixins => format!(
+                "The mixin application class '{a0}' can only have a single mixin."
+            ),
+            Self::MixinOfTypeAliasExpandsToTypeParameter => {
+                "A type alias that expands to a type parameter can't be mixed in.".to_string()
+            }
+            // The #3899 clause faces' verbatim oracle problemMessages
+            // (diagnostic.g.dart :5427-5430, :7375-7377, :11342-11345 — the
+            // shared name carries one message per clause position).
+            Self::ExtendsTypeAliasExpandsToTypeParameter => {
+                "A type alias that expands to a type parameter can't be used as a superclass."
+                    .to_string()
+            }
+            Self::ImplementsTypeAliasExpandsToTypeParameter => {
+                "A type alias that expands to a type parameter can't be implemented.".to_string()
+            }
+            Self::MixinOnTypeAliasExpandsToTypeParameter => {
+                "A type alias that expands to a type parameter can't be used as a superclass constraint."
+                    .to_string()
+            }
+            Self::PrivateCollisionInMixinApplication => {
+                self.message3(a0, a1, "")
+            }
+            Self::ConstConstructorWithMixinWithField => format!(
+                "This constructor can't be declared 'const' because a mixin adds the instance field: {a0}."
+            ),
+            Self::EnumMixinWithInstanceVariable => {
+                "Mixins applied to enums can't have instance variables.".to_string()
+            }
+            Self::MixinInstantiate => "Mixins can't be instantiated.".to_string(),
+            Self::MixinApplicationConcreteSuperInvokedMemberType => {
+                self.message3(a0, a1, "")
+            }
+            Self::MixinSuperClassConstraintDeferredClass => {
+                "Deferred classes can't be used as superclass constraints.".to_string()
+            }
+            Self::InvalidDeprecatedMixinAnnotation => {
+                "The annotation '@Deprecated.mixin' can only be applied to classes.".to_string()
+            }
             // The #1314 FAM18 uninitialized-non-nullable faces
             // (diagnostic.g.dart :13505/:13542).
             Self::NotInitializedNonNullableVariable => {
@@ -5136,6 +5404,15 @@ impl SemanticCode {
             Self::MixinApplicationNotImplementedInterface => {
                 format!("'{a0}' can't be mixed onto '{a1}' because '{a1}' doesn't implement '{a2}'.")
             }
+            // The #3885 mixin-application family faces: the private-name
+            // collision row and the concrete-super-invoked member type row
+            // (diagnostic.g.dart :14196 and :11076).
+            Self::PrivateCollisionInMixinApplication => {
+                format!("The private name '{a0}', defined by '{a1}', conflicts with the same name defined by '{a2}'.")
+            }
+            Self::MixinApplicationConcreteSuperInvokedMemberType => {
+                format!("The super-invoked member '{a0}' has the type '{a1}', and the concrete member in the class has the type '{a2}'.")
+            }
             // The three-plus-name final-constructor variant
             // (diagnostic.g.dart:6917 — the third slot the remaining count).
             Self::FinalNotInitializedConstructor => {
@@ -5421,6 +5698,46 @@ impl SemanticCode {
             Self::SwitchCaseCompletesNormally => {
                 Some("Try adding 'break', 'return', or 'throw'.".to_string())
             }
+            // The #3885 mixin-application family faces' verbatim oracle
+            // correctionMessages (diagnostic.g.dart — the cited rows).
+            Self::MixinClassDeclarationExtendsNotObject => Some(
+                "Try removing the 'mixin' modifier or changing the superclass to 'Object'."
+                    .to_string(),
+            ),
+            Self::MixinClassDeclarationWithClause => Some(
+                "Try removing the 'with' clause or removing the 'mixin' modifier from the class."
+                    .to_string(),
+            ),
+            Self::MixinModifierMixinApplicationClassWithMultipleMixins => {
+                Some("Try removing all but one mixin.".to_string())
+            }
+            Self::PrivateCollisionInMixinApplication => {
+                Some(format!("Try removing '{a2}' from the 'with' clause."))
+            }
+            Self::ConstConstructorWithMixinWithField => Some(
+                "Try removing the 'const' keyword or removing the 'with' clause from the class declaration, or removing the field from the mixin class."
+                    .to_string(),
+            ),
+            Self::EnumMixinWithInstanceVariable => {
+                Some("Try replacing the instance variables with getters.".to_string())
+            }
+            Self::MixinSuperClassConstraintDeferredClass => {
+                Some("Try changing the import to not be deferred.".to_string())
+            }
+            Self::InvalidDeprecatedMixinAnnotation => {
+                Some("Try removing the '@Deprecated.mixin' annotation.".to_string())
+            }
+            // The #3899 clause faces' verbatim oracle correctionMessages
+            // (diagnostic.g.dart :5430-5433 and :7377-7379); the `on` face
+            // declares none and falls through to `None`, like the `with`
+            // face.
+            Self::ExtendsTypeAliasExpandsToTypeParameter => Some(
+                "Try specifying a different superclass, or removing the extends clause."
+                    .to_string(),
+            ),
+            Self::ImplementsTypeAliasExpandsToTypeParameter => Some(
+                "Try specifying a class or mixin, or removing the list.".to_string(),
+            ),
             // The #612 variance rows' verbatim oracle correctionMessages
             // (diagnostic.g.dart:18503-18505, :18775-18778, :18813-18816).
             Self::WrongTypeParameterVariancePosition => Some(
@@ -5447,6 +5764,11 @@ impl SemanticCode {
             Self::EnumInstantiatedToBoundsIsNotWellBounded => {
                 Some("Try using different bounds for type parameters.".to_string())
             }
+            // The #3891 uninstantiated-bound row's verbatim oracle
+            // correctionMessage (diagnostic.g.dart:13304-13306).
+            Self::NotInstantiatedBound => Some(
+                "Try adding type arguments to the type parameter bound.".to_string(),
+            ),
             Self::NonExhaustiveSwitchStatement => Some(format!(
                 "Try adding a default case or cases that match '{a2}'."
             )),
@@ -6001,6 +6323,9 @@ impl SemanticCode {
             Self::DuplicateRestElementInPattern => {
                 Some("Try removing the duplicate rest element.".to_string())
             }
+            // diagnostic.g.dart:4407 (the record-field duplicate row's
+            // verbatim correctionMessage).
+            Self::DuplicateFieldName => Some("Try renaming the field.".to_string()),
             // The #3768 rows' verbatim oracle correctionMessages
             // (analyzer-codes.tsv / syntax-codes.tsv); the other four rows
             // of the family declare none. The experiment row's `{1}` SDK
@@ -6136,6 +6461,7 @@ mod tests {
             SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
             SemanticCode::TypeArgumentNotMatchingBounds,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
+            SemanticCode::NotInstantiatedBound,
             SemanticCode::TypeAliasCannotReferenceItself,
             SemanticCode::EnumWithoutConstants,
             SemanticCode::ConstConstructorWithNonFinalField,
@@ -6335,6 +6661,24 @@ mod tests {
             SemanticCode::MixinSuperClassConstraintNonInterface,
             SemanticCode::MixinWithNonClassSuperclass,
             SemanticCode::ExtendsNonClass,
+            // The #3885 mixin-application family faces.
+            SemanticCode::ClassUsedAsMixinDeclaresGenerativeConstructor,
+            SemanticCode::MixinInheritsFromNotObject,
+            SemanticCode::MixinClassDeclaresNonTrivialGenerativeConstructor,
+            SemanticCode::MixinClassDeclarationExtendsNotObject,
+            SemanticCode::MixinClassDeclarationWithClause,
+            SemanticCode::MixinModifierMixinApplicationClassWithMultipleMixins,
+            SemanticCode::MixinOfTypeAliasExpandsToTypeParameter,
+            SemanticCode::ExtendsTypeAliasExpandsToTypeParameter,
+            SemanticCode::ImplementsTypeAliasExpandsToTypeParameter,
+            SemanticCode::MixinOnTypeAliasExpandsToTypeParameter,
+            SemanticCode::PrivateCollisionInMixinApplication,
+            SemanticCode::ConstConstructorWithMixinWithField,
+            SemanticCode::EnumMixinWithInstanceVariable,
+            SemanticCode::MixinInstantiate,
+            SemanticCode::MixinApplicationConcreteSuperInvokedMemberType,
+            SemanticCode::MixinSuperClassConstraintDeferredClass,
+            SemanticCode::InvalidDeprecatedMixinAnnotation,
             SemanticCode::NotInitializedNonNullableVariable,
             SemanticCode::NotInitializedNonNullableInstanceField,
             SemanticCode::ConstNotInitialized,
@@ -7243,7 +7587,15 @@ mod tests {
             // `registry_message` call site), the descriptor round-trips
             // through `code_info()`.
             | SemanticCode::DuplicateFieldFormalParameter
+            // The record-field duplicate row: an inline `message` arm
+            // (no `registry_message` call site), the descriptor
+            // round-trips through `code_info()`.
+            | SemanticCode::DuplicateFieldName
             | SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded
+            // The #3891 uninstantiated-bound row: an inline `message` arm
+            // (no `registry_message` call site), the descriptor
+            // round-trips through `code_info()`.
+            | SemanticCode::NotInstantiatedBound
             // The #3341 alias self-reference row: an inline `message` arm
             // (no `registry_message` call site — the name reaches
             // `analyzer-codes.tsv` as metadata only).
@@ -7294,6 +7646,27 @@ mod tests {
             | SemanticCode::MixinOnSealedClass
             | SemanticCode::MixinSuperClassConstraintNonInterface
             | SemanticCode::MixinWithNonClassSuperclass
+            // The #3885 mixin-application family faces: all
+            // inline-template rows (no `registry_message` call sites).
+            | SemanticCode::ClassUsedAsMixinDeclaresGenerativeConstructor
+            | SemanticCode::MixinInheritsFromNotObject
+            | SemanticCode::MixinClassDeclaresNonTrivialGenerativeConstructor
+            | SemanticCode::MixinClassDeclarationExtendsNotObject
+            | SemanticCode::MixinClassDeclarationWithClause
+            | SemanticCode::MixinModifierMixinApplicationClassWithMultipleMixins
+            | SemanticCode::MixinOfTypeAliasExpandsToTypeParameter
+            // The #3899 clause faces of the shared
+            // `supertype_expands_to_type_parameter` machine name.
+            | SemanticCode::ExtendsTypeAliasExpandsToTypeParameter
+            | SemanticCode::ImplementsTypeAliasExpandsToTypeParameter
+            | SemanticCode::MixinOnTypeAliasExpandsToTypeParameter
+            | SemanticCode::PrivateCollisionInMixinApplication
+            | SemanticCode::ConstConstructorWithMixinWithField
+            | SemanticCode::EnumMixinWithInstanceVariable
+            | SemanticCode::MixinInstantiate
+            | SemanticCode::MixinApplicationConcreteSuperInvokedMemberType
+            | SemanticCode::MixinSuperClassConstraintDeferredClass
+            | SemanticCode::InvalidDeprecatedMixinAnnotation
             | SemanticCode::MustCallSuper
             // The #3331 combined-signature inference row: not registry-backed
             // (the inline `message` arm is the template source).
@@ -7667,8 +8040,10 @@ mod tests {
             SemanticCode::DotShorthandUndefinedMemberInvocation,
             SemanticCode::DuplicateDefinition,
             SemanticCode::DuplicateFieldFormalParameter,
+            SemanticCode::DuplicateFieldName,
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
             SemanticCode::TypeAliasCannotReferenceItself,
+            SemanticCode::NotInstantiatedBound,
             SemanticCode::EnumWithoutConstants,
             SemanticCode::EqualElementsInSet,
             SemanticCode::EqualKeysInMap,
@@ -7710,6 +8085,24 @@ mod tests {
             SemanticCode::MixinOnSealedClass,
             SemanticCode::MixinSuperClassConstraintNonInterface,
             SemanticCode::MixinWithNonClassSuperclass,
+            // The #3885 mixin-application family faces.
+            SemanticCode::ClassUsedAsMixinDeclaresGenerativeConstructor,
+            SemanticCode::MixinInheritsFromNotObject,
+            SemanticCode::MixinClassDeclaresNonTrivialGenerativeConstructor,
+            SemanticCode::MixinClassDeclarationExtendsNotObject,
+            SemanticCode::MixinClassDeclarationWithClause,
+            SemanticCode::MixinModifierMixinApplicationClassWithMultipleMixins,
+            SemanticCode::MixinOfTypeAliasExpandsToTypeParameter,
+            SemanticCode::ExtendsTypeAliasExpandsToTypeParameter,
+            SemanticCode::ImplementsTypeAliasExpandsToTypeParameter,
+            SemanticCode::MixinOnTypeAliasExpandsToTypeParameter,
+            SemanticCode::PrivateCollisionInMixinApplication,
+            SemanticCode::ConstConstructorWithMixinWithField,
+            SemanticCode::EnumMixinWithInstanceVariable,
+            SemanticCode::MixinInstantiate,
+            SemanticCode::MixinApplicationConcreteSuperInvokedMemberType,
+            SemanticCode::MixinSuperClassConstraintDeferredClass,
+            SemanticCode::InvalidDeprecatedMixinAnnotation,
             SemanticCode::MustCallSuper,
             SemanticCode::NoCombinedSuperSignature,
             SemanticCode::NonConstCallToLiteralConstructor,

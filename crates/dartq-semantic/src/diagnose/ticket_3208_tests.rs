@@ -112,15 +112,12 @@ void main() {
     assert!(reports_value(&report, "C<int>"), "{:?}", report.diagnostics);
 }
 
-/// The keyword-less generic named spelling (`C.of(0)` without `new`) is
-/// the send path's shape: the callee row is the pre-merge qualified
-/// selector and the name-level return face answers `Unknown` for a
-/// generic head, so the enclosing `var` keeps `dynamic` — no
-/// `invalid_assignment` here. The instantiation needs the send-path
-/// fold (the class head row + selector row collapse into the creation's
-/// value row), which lives in the send/declarator faces outside this
-/// ticket's scope; pinned so the residual is counted, not silently lost.
-/// The `new`-keyword spelling and the typed head both infer (above).
+/// The keyword-less generic named spelling (`C.of(0)` without `new`)
+/// rides the send path: the class head row and the selector row fold into
+/// the creation's value row, so the enclosing `var` infers `C<int>` like
+/// the keyword spellings above and `String s = c;` rejects it (oracle
+/// 3.13.7: `A value of type 'C<int>' can't be assigned to a variable of
+/// type 'String'.`).
 #[test]
 fn unkeyed_named_selector_residual_stays_silent() {
     let source = "\
@@ -133,8 +130,9 @@ void main() {
 }
 ";
     let report = report_ops(source);
-    assert!(
-        assigned_types(&report).is_empty(),
+    assert_eq!(
+        assigned_types(&report),
+        ["A value of type 'C<int>' can't be assigned to a variable of type 'String'."],
         "{:?}",
         report.diagnostics
     );

@@ -24,10 +24,12 @@ use crate::blake3_128;
 /// filename. v5 (#482): the header gained [`GenerationHeader::context_salt`]
 /// — the caller's remaining fork dimensions (target, declared variables,
 /// analysis options) hashed in, so forked contexts can never collide on
-/// one generation directory. No on-disk back-compat is provided or
-/// needed: an earlier generation simply mismatches its header and is
-/// rebuilt.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
+/// one generation directory. v6 (#4207): the entry payload codec moved
+/// from JSON to positional binary (`bincode-next`'s serde bridge), so
+/// entry payload shapes must carry every field on the wire (no
+/// `skip_serializing_if`). No on-disk back-compat is provided or needed:
+/// an earlier generation simply mismatches its header and is rebuilt.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 6;
 
 /// Identity of one snapshot generation. A loaded
 /// generation is used only when every field equals what the caller

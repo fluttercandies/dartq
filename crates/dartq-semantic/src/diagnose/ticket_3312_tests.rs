@@ -155,7 +155,7 @@ void m() {
 /// Ignored for the same argument-window gate as
 /// [`bounded_call_creation_argument_still_reports`] (the argument never
 /// reaches the verdict walk, `invocation.rs::flush_argument`, #3296 lane).
-#[ignore = "argument-window gate in invocation.rs::flush_argument (#3296 lane): a bare creation argument never reaches the verdict walk"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn call_less_creation_argument_reports_the_class() {
     let fixture = "\
@@ -270,7 +270,7 @@ void m() {
 /// `invocation.rs`'s argument window (`flush_argument`), owned by the
 /// live #3296 lane; this pin flips back to `#[test]` once that window
 /// registers the creation's instance row.
-#[ignore = "argument-window gate in invocation.rs::flush_argument (#3296 lane): a bare creation argument never reaches the verdict walk"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 #[test]
 fn bounded_call_creation_argument_still_reports() {
     let fixture = "\

@@ -95,18 +95,23 @@ fn object_stub_scrutinee_exhaustive_stays_silent() {
     );
 }
 
-/// The expression face keeps its reachability row the same way: the
-/// second `Null _` arm of a `=>` switch over the `Object?` stub head is
-/// `unreachable_switch_case` (probed `dart analyze` — oracle reports it
-/// alongside the `Object()` covering gap and the never-matches/dead-code
-/// rows; the covering row itself is an engine-side under-report the gate
-/// never produced, outside this ticket).
+/// The expression face keeps both rows the oracle reports over the
+/// `Object?` stub head: the covering gap (`non_exhaustive_switch_expression`,
+/// "doesn't match the pattern 'Object()'") — an engine-side under-report
+/// the gate suppressed until #3728 taught `name_resolvable` that the
+/// names-only `Object` root is fully decided — and the duplicate `Null _`
+/// arm's `unreachable_switch_case` (probed `dart analyze`: the oracle also
+/// emits `pattern_never_matches_value_type` and `dead_code` on that shape,
+/// which this family filter deliberately does not read).
 #[test]
 fn object_stub_scrutinee_expression_duplicate_reports_unreachable() {
     let report = report_ops("int e(Object? o) => switch (o) { Null _ => 1, Null _ => 2 };");
     assert_eq!(
         family_codes(&report),
-        ["unreachable_switch_case"],
+        [
+            "non_exhaustive_switch_expression",
+            "unreachable_switch_case"
+        ],
         "{:?}",
         family_codes(&report)
     );

@@ -22,6 +22,7 @@ dartq-resolution = { workspace = true }
 dartq-scanner = { workspace = true }
 dartq-semantic = { workspace = true }
 dartq-sdk = { workspace = true }
+bincode-next = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }
 libc = { workspace = true }

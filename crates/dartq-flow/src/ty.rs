@@ -206,6 +206,18 @@ pub(crate) struct ClosedNames {
     /// declared-interfaces arm, :107-114), so a representation-typed case
     /// covers the extension-type scrutinee.
     pub(crate) extension_reps: rustc_hash::FxHashMap<u32, (Ty, u32)>,
+    /// Interned name ids of the unit's NAMED extensions. A bare send whose
+    /// head names one is an extension override (`E(n)`), not an implicit
+    /// creation: the override's value is its ARGUMENT's static type, never
+    /// the head's spelling (upstream `ExtensionOverrideImpl.extendedType`
+    /// is the substituted `on` type, and the flow's null-shorting start
+    /// reads `expression.staticType` of the override's single argument —
+    /// pkg/analyzer/lib/src/generated/resolver.dart:4814-4840). Without
+    /// this set the send fold's class-head arm types `E(null)` as the
+    /// non-nullable `E`, so `E(null)?.m()` opens a live access path where
+    /// the oracle's receiver is `Null` and the member is dead. An
+    /// anonymous extension carries no name and can never be overridden.
+    pub(crate) extension_names: rustc_hash::FxHashSet<u32>,
     /// `bool`'s interned id — `isDartCoreBool` is a name check at this
     /// level; `None` until the recorder interns it.
     pub(crate) bool_name: Option<u32>,

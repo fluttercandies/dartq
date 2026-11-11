@@ -287,6 +287,15 @@ fn unnecessary_ignore_enabled(set: &EnableSet) -> bool {
     rule_by_name("unnecessary_ignore").is_some_and(|id| set.is_enabled(id))
 }
 
+/// Whether `set` arms `unreachable_from_main` — the one rule whose rows
+/// read a workspace-global face (the engine's reachability map). Its
+/// enable bit is the gate the memo key's reachability epoch folds behind
+/// (#4205): workspaces without the rule never pay the epoch, and any
+/// content move anywhere re-keys exactly the rule-enabled files.
+fn unreachable_rule_enabled(set: &EnableSet) -> bool {
+    rule_by_name("unreachable_from_main").is_some_and(|id| set.is_enabled(id))
+}
+
 /// The semantic rows' library-context generation: a fold over the owning
 /// library's member files' (content id, API signature) — the exact
 /// substrate the per-file `Analysis` context declares into its graph and
@@ -443,6 +452,55 @@ impl LintMemo {
     }
 }
 
+/// One lint row in payload form (#4205): the registry-parallel rule index
+/// (the pinned registry plus the build identity in the store key make a
+/// bare `u16` unambiguous), the report span, and the rendered texts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedLintRow {
+    rule: u16,
+    start: u32,
+    end: u32,
+    message: String,
+    correction: Option<String>,
+}
+
+/// Encodes one file's rows for the L3 store. A file with no rows encodes
+/// as the empty list — the miss it prevents (a known-clean file stays
+/// known-clean) is exactly the cache's business.
+fn encode_rows(rows: &[Lint]) -> Option<Vec<u8>> {
+    let payload: Vec<PersistedLintRow> = rows
+        .iter()
+        .map(|lint| PersistedLintRow {
+            rule: lint.rule.0,
+            start: lint.range.start,
+            end: lint.range.end,
+            message: lint.message.clone(),
+            correction: lint.correction.clone(),
+        })
+        .collect();
+    serde_json::to_vec(&payload).ok()
+}
+
+/// Decodes persisted rows. `None` — the treat-as-miss posture — for bytes
+/// that do not decode or name a rule outside the pinned registry: the
+/// store entry is an accelerator, never an authority, and a foreign or
+/// corrupt payload recomputes instead of serving.
+fn decode_rows(bytes: &[u8]) -> Option<Vec<Lint>> {
+    let payload: Vec<PersistedLintRow> = serde_json::from_slice(bytes).ok()?;
+    payload
+        .into_iter()
+        .map(|row| {
+            let index = usize::from(row.rule);
+            (index < RULES.len()).then(|| Lint {
+                rule: RuleId(row.rule),
+                range: row.start..row.end,
+                message: row.message,
+                correction: row.correction,
+            })
+        })
+        .collect()
+}
+
 /// Derives one file's memo key: the content id plus one `FxHash` fold
 /// over every other input the rows read — the feature bits, the settled
 /// language version (the version-gated registrations consult it), the
@@ -450,7 +508,12 @@ impl LintMemo {
 /// package's facts, and the file's path — plus the semantic library-context
 /// generation (`Some` only where the set runs fold-facing rules; `None` folds
 /// a single discriminant byte and no generation, so faceless files never
-/// churn on it) and the breaking-version gate byte. The set folds are
+/// churn on it), the reachability-inputs epoch (`Some` only where
+/// `unreachable_from_main` runs — the one rule whose rows read a
+/// workspace-global face, the engine's per-declaration reachability map,
+/// no per-file input can pin; `None` keys identically regardless, so
+/// workspaces without the rule never churn on it), and the breaking-version
+/// gate byte. The set folds are
 /// commutative (wrapping add of per-entry hashes) because `FxHashSet`
 /// iteration order is not stable, and every variable-length field ends in
 /// a separator byte so concatenations cannot collide across field
@@ -470,6 +533,7 @@ fn memo_key(
     path: &Path,
     unignorable: &FxHashSet<String>,
     generation: Option<u64>,
+    reachability: Option<u64>,
     breaking: bool,
 ) -> LintMemoKey {
     let mut h = FxHasher::default();
@@ -522,6 +586,18 @@ fn memo_key(
         Some(generation) => {
             h.write_u8(1);
             h.write_u64(generation);
+        }
+    }
+    // The reachability-inputs epoch, behind its own discriminant byte:
+    // `None` (the rule off) keys identically regardless of any epoch
+    // value, while each `Some` epoch is its own identity — any content
+    // move anywhere in the workspace re-keys exactly the rule-enabled
+    // files' rows.
+    match reachability {
+        None => h.write_u8(0),
+        Some(epoch) => {
+            h.write_u8(1);
+            h.write_u64(epoch);
         }
     }
     // The breaking-version gate byte (`remove_deprecations_in_breaking_
@@ -593,11 +669,11 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 }
 
 /// The analyze pipeline's lint stage (#355 activation): every resident
-/// file's rows — one transient parse + rule run per file the caller's
-/// [`LintMemo`] cannot answer, an `Arc` clone per hit (#772; the bridge's
-/// zero-persistent-engine-memory ruling stands — nothing enters engine
-/// residency) — plus the pubspec pass over the workspace's `pubspec.yaml`
-/// files (#434).
+/// file's rows — one transient parse + rule run per file neither the
+/// caller's [`LintMemo`] (#772) nor the L3 store's persisted lint rows
+/// (#4205) can answer, an `Arc` clone per in-memory hit, a decode per
+/// cross-process hit — plus the pubspec pass over the workspace's
+/// `pubspec.yaml` files (#434).
 ///
 /// Per-subtree enable sets: each file runs under the options entry its own
 /// ancestry governs (`governing_options`) — the same deepest-governing
@@ -657,11 +733,18 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 /// The memo (`memo`, #772) turns a daemon turn's cost from O(workspace)
 /// into O(dirty): before any fan-out, the serial partition derives each
 /// file's `memo_key` (hash work only — no parse, no rule run) and
-/// answers hits by cloning their rows' `Arc`. Only misses fan out — a
-/// rayon job cannot borrow the memo `&mut`, so jobs read `&Engine` and
-/// statics only, and the keyed misses insert back serially after the
-/// collect. A hit's rows re-stamp byte-identically (the [`LintMemo`]
-/// determinism contract).
+/// answers hits by cloning their rows' `Arc`. The L3 half (#4205) extends
+/// the same key across processes: every memo miss with a key probes the
+/// engine's content store (one batch read, the key's fork dimensions —
+/// build, grants, package graph — folded engine-side), a hit decodes its
+/// rows and joins the memo, and only true misses fan out — a rayon job
+/// cannot borrow the memo `&mut`, so jobs read `&*engine` and statics
+/// only, and the keyed misses insert back serially after the collect
+/// (into the memo and the store, one batch put + flush through the
+/// engine's mutating face). A hit's rows re-stamp byte-identically (the
+/// [`LintMemo`] determinism contract) — the payload stores the row data
+/// and nothing else, so the file id stamps at emission exactly as a
+/// fresh run's does.
 ///
 /// # Panics
 ///
@@ -670,7 +753,11 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 /// covers every library file's directory).
 #[must_use]
 #[expect(clippy::too_many_lines)] // serial precompute then per-file row emit; the phases share locally scoped state
-pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) -> Vec<Diagnostic> {
+pub fn analyze_lints(
+    engine: &mut Engine,
+    roots: &[PathBuf],
+    memo: &mut LintMemo,
+) -> Vec<Diagnostic> {
     let mut files: Vec<FileId> = engine
         .libraries()
         .into_iter()
@@ -750,17 +837,17 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
     }
 
     // The serial memo partition: keyed hits lift their rows outright,
-    // misses queue for the fan-out, and rowless shapes (no path, or an
-    // empty enable set — the opt-in cost ruling) contribute nothing
+    // misses queue for the store probe below, and rowless shapes (no path,
+    // or an empty enable set — the opt-in cost ruling) contribute nothing
     // exactly as their jobs always did. A file whose facts are absent is
     // linted all the same — it just carries no content id to key with.
+    // The reachability-inputs epoch folds into the key of exactly the
+    // files whose set arms `unreachable_from_main` (see [`memo_key`]) —
+    // one O(residency) fold for the whole stage, shared by every such
+    // file.
+    let reachability_epoch = engine.lint_reachability_epoch();
     let mut slotted: Vec<Option<Arc<Vec<Lint>>>> = vec![None; files.len()];
     let mut misses: Vec<(usize, FileId, Option<LintMemoKey>)> = Vec::new();
-    // The libraries whose misses mount the semantic fold and carry two or
-    // more members: one shared substrate is built per such library below,
-    // so every linted member answers from one graph/namespaces/index
-    // build instead of each file rebuilding the identical tables.
-    let mut needing: FxHashSet<LibraryId> = FxHashSet::default();
     for (slot, file) in files.iter().enumerate() {
         let Some(path) = engine.file_table().path(*file) else {
             continue;
@@ -787,14 +874,6 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         let features = engine.settled_features(*file).map_or(fallback, features_of);
         let version = engine.settled_version(*file).unwrap_or(fallback_version);
         let Some(unit_facts) = engine.file_facts(*file) else {
-            if mounts_semantics(set)
-                && let Some(library) = engine.library_of(*file)
-                && library_members
-                    .get(&library)
-                    .is_some_and(|members| members.len() > 1)
-            {
-                needing.insert(library);
-            }
             misses.push((slot, *file, None));
             continue;
         };
@@ -805,6 +884,10 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             .cloned()
             .flatten();
         let breaking = breaking_gate(set, pubspec_version.as_deref());
+        // The reachability half: the epoch folds only where the rows read
+        // the workspace-global map (`unreachable_from_main`); every other
+        // file keys identically to the pre-#4205 memo.
+        let reachability = unreachable_rule_enabled(set).then_some(reachability_epoch);
         let key = memo_key(
             unit_facts.content(),
             features,
@@ -834,24 +917,74 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             } else {
                 None
             },
+            reachability,
             breaking,
         );
         match memo.get(&key) {
             Some(rows) => slotted[slot] = Some(rows),
-            None => {
-                // Sharing pays from two members up: a lone-member library
-                // builds its substrate inline in the job, exactly as
-                // before, and never enters the shared map.
-                if mounts_semantics(set)
-                    && let Some(library) = engine.library_of(*file)
-                    && library_members
-                        .get(&library)
-                        .is_some_and(|members| members.len() > 1)
-                {
-                    needing.insert(library);
+            None => misses.push((slot, *file, Some(key))),
+        }
+    }
+
+    // The L3 half of the memo (#4205): every keyed miss probes the
+    // engine's content store in one batch — a cross-process hit decodes
+    // its rows into the slot and the memo (the daemon's later turns answer
+    // in-memory), and only true misses fan out. The store's key folds the
+    // build, grants, and package graph around the same (content,
+    // fingerprint) pair the memo keys on, engine-side.
+    let keyed: Vec<(ContentId, u64)> = misses
+        .iter()
+        .filter_map(|&(_, _, key)| key.map(|key| (key.content, key.fingerprint)))
+        .collect();
+    let probed = engine.lint_rows_probe(&keyed);
+    let mut probed_at = 0usize;
+    let misses: Vec<(usize, FileId, Option<LintMemoKey>)> = misses
+        .into_iter()
+        .filter_map(|miss| {
+            let Some(key) = miss.2 else {
+                return Some(miss);
+            };
+            let hit = probed
+                .get(probed_at)
+                .and_then(Option::as_deref)
+                .and_then(decode_rows);
+            probed_at += 1;
+            match hit {
+                Some(rows) => {
+                    let rows = Arc::new(rows);
+                    memo.insert(key, Arc::clone(&rows));
+                    slotted[miss.0] = Some(rows);
+                    None
                 }
-                misses.push((slot, *file, Some(key)));
+                None => Some(miss),
             }
+        })
+        .collect();
+    drop(keyed);
+
+    // The libraries whose unresolved misses mount the semantic fold and
+    // carry two or more members: one shared substrate is built per such
+    // library below, so every linted member answers from one
+    // graph/namespaces/index build instead of each file rebuilding the
+    // identical tables. Sharing pays from two members up: a lone-member
+    // library builds its substrate inline in the job, exactly as before,
+    // and never enters the shared map.
+    let mut needing: FxHashSet<LibraryId> = FxHashSet::default();
+    for &(_, file, _) in &misses {
+        let Some(path) = engine.file_table().path(file) else {
+            continue;
+        };
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let set = enabled
+            .get(dir)
+            .expect("enable set precomputed for every resident file's directory");
+        if mounts_semantics(set)
+            && let Some(library) = engine.library_of(file)
+            && library_members
+                .get(&library)
+                .is_some_and(|members| members.len() > 1)
+        {
+            needing.insert(library);
         }
     }
 
@@ -872,10 +1005,10 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         })
         .collect();
 
-    // One independent job per miss: `&Engine` reads and `LazyLock` statics
-    // only, the rows pre-stamping (file-relative). The slot index rides
-    // along so the reassembly replays the serial loop's emission order
-    // exactly.
+    // One independent job per unresolved miss: `&Engine` reads and
+    // `LazyLock` statics only, the rows pre-stamping (file-relative). The
+    // slot index rides along so the reassembly replays the serial loop's
+    // emission order exactly.
     let computed: Vec<(usize, Vec<Lint>)> = misses
         .par_iter()
         .map(|&(slot, file, _)| {
@@ -1211,17 +1344,26 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         })
         .collect();
 
-    // Serial insert + reassembly: keyed misses join the memo, then the
-    // slots replay the file order, the per-file rule traversal order, and
-    // the Dart-rows-before-pubspec-rows order — each row's file id stamps
-    // at this emission, hits and fresh rows alike.
+    // Serial insert + reassembly: keyed misses join the memo and the L3
+    // store (one batch put + flush — idempotent, a store hit only
+    // refreshed its touch), then the slots replay the file order, the
+    // per-file rule traversal order, and the Dart-rows-before-pubspec-rows
+    // order — each row's file id stamps at this emission, hits and fresh
+    // rows alike.
+    let mut persist: Vec<(ContentId, u64, Vec<u8>)> = Vec::new();
     for ((_, rows), &(slot, _, key)) in computed.into_iter().zip(misses.iter()) {
+        if let Some(key) = key
+            && let Some(payload) = encode_rows(&rows)
+        {
+            persist.push((key.content, key.fingerprint, payload));
+        }
         let rows = Arc::new(rows);
         if let Some(key) = key {
             memo.insert(key, Arc::clone(&rows));
         }
         slotted[slot] = Some(rows);
     }
+    engine.lint_rows_persist(&persist);
     let mut out = Vec::new();
     for (slot, rows) in slotted.into_iter().enumerate() {
         let Some(rows) = rows else {
@@ -3019,6 +3161,7 @@ void stray() {}
             path,
             &FxHashSet::default(),
             None,
+            None,
             false,
         );
         memo.insert(key, Arc::new(rows()));
@@ -3076,6 +3219,7 @@ void stray() {}
                     workspace,
                     path,
                     &FxHashSet::default(),
+                    None,
                     None,
                     breaking,
                 )
@@ -3157,6 +3301,7 @@ void stray() {}
                 path,
                 &FxHashSet::default(),
                 generation,
+                None,
                 false,
             )
         };
@@ -3187,6 +3332,7 @@ void stray() {}
                 None,
                 path,
                 &FxHashSet::default(),
+                None,
                 None,
                 false,
             )
@@ -3757,5 +3903,192 @@ void stray() {}
             "the avoid_print message: {rows:?}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The persisted lint-row payload round-trips faithfully and rejects
+    /// foreign bytes: a well-formed encode/decode cycle restores every row
+    /// (rule index, span, texts), an out-of-registry rule index fails the
+    /// whole payload, and undecodable bytes are the treat-as-miss `None`.
+    /// This is the store side of the #4205 cross-process lint reuse.
+    #[test]
+    fn lint_rows_payload_round_trips_and_rejects_bad_bytes() {
+        let lint = Lint {
+            rule: RuleId(7),
+            range: 12..34,
+            message: "Avoid print.".to_owned(),
+            correction: Some("Remove it.".to_owned()),
+        };
+        let rows = vec![lint.clone()];
+
+        // Round trip: every field restored.
+        let bytes = encode_rows(&rows).expect("encode");
+        let decoded = decode_rows(&bytes).expect("decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].rule, lint.rule);
+        assert_eq!(decoded[0].range, lint.range);
+        assert_eq!(decoded[0].message, lint.message);
+        assert_eq!(decoded[0].correction, lint.correction);
+
+        // An out-of-registry rule index rejects the whole payload — the
+        // store is an accelerator, never an authority.
+        let bad_rule = serde_json::json!([{ "rule": 65535, "start": 0, "end": 1, "message": "x", "correction": null }]);
+        let bad_bytes = serde_json::to_vec(&bad_rule).expect("serialize");
+        assert!(
+            decode_rows(&bad_bytes).is_none(),
+            "an out-of-registry rule index must reject, not serve"
+        );
+
+        // Undecodable bytes are the miss path.
+        assert!(
+            decode_rows(b"not json").is_none(),
+            "corrupt bytes must be a miss, not a panic"
+        );
+    }
+
+    /// The `unreachable_from_main` gate: only a set that enables the rule
+    /// reads the workspace-global reachability face — every other set keys
+    /// identically regardless of epoch, so the epoch's cost is paid exactly
+    /// where its benefit lives.
+    #[test]
+    fn unreachable_rule_enabled_gates_the_epoch() {
+        let unreachable = rule_by_name("unreachable_from_main").expect("registry");
+
+        // A set with the rule enabled gates true.
+        let mut set = EnableSet::none();
+        set.add(unreachable);
+        assert!(unreachable_rule_enabled(&set));
+
+        // A set without it gates false — the epoch folds `None`, and the
+        // memo key is epoch-free.
+        let other = EnableSet::none();
+        assert!(!unreachable_rule_enabled(&other));
+
+        // A different rule's enablement does not gate the epoch.
+        let avoid_print = rule_by_name("avoid_print").expect("registry");
+        let mut set2 = EnableSet::none();
+        set2.add(avoid_print);
+        assert!(
+            !unreachable_rule_enabled(&set2),
+            "only unreachable_from_main reads the reachability epoch"
+        );
+    }
+
+    /// The edit-invalidation contract (#4205), driven through the production
+    /// warm-turn shape: discovery once, the daemon's overlay push
+    /// (`set_content` + `apply_pending` — no re-discovery, so the in-memory
+    /// edit stands), then the lint stage over a fresh memo. The edited
+    /// file's rows recompute from the new content; the untouched file's
+    /// rows serve from the L3 store with zero re-execution — its
+    /// `(content, fingerprint)` pair stood still.
+    #[test]
+    fn edit_invalidates_exactly_the_touched_file() {
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_edit_invalidation",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - avoid_print\n",
+                ),
+                ("lib/a.dart", "void a() {\n  print('a');\n}\n"),
+                ("lib/b.dart", "void b() {\n  print('b');\n}\n"),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        // The cross-turn store: without it every turn is a first turn and
+        // the serving half of this test has nothing to answer from.
+        let store_root =
+            std::env::temp_dir().join(format!("dq_cmd_lints_edit_store_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store_root);
+        engine
+            .open_content_store(&dartq_engine::store::StoreConfig {
+                root: store_root.clone(),
+                size_limit: 64 * 1024 * 1024,
+            })
+            .expect("content store");
+
+        // Turn 1: discovery + analyze + lints; the rows persist into the store.
+        let run1 = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("first run");
+        let rows1: Vec<(String, u32, String)> = run1
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "avoid_print")
+            .map(|d| {
+                (
+                    run1.layout.file_path(d.file).display().to_string(),
+                    d.range.offset,
+                    d.message.clone().into_owned(),
+                )
+            })
+            .collect();
+        drop(run1);
+        assert_eq!(rows1.len(), 2, "both files lint: {rows1:?}");
+
+        // The edit: the `print` call moves well past its old offset. Pushed
+        // through the overlay face only — discovery would re-read the disk
+        // bytes and clobber the edit.
+        let a_path = root.join("lib/a.dart");
+        engine.set_content(
+            &a_path,
+            b"void a() {\n  // nothing\n}\nvoid a_longer_name() {\n  print('a2');\n}\n",
+        );
+        engine.apply_pending(&mut |_| {});
+
+        // Turn 2: the lint stage alone, fresh memo — exactly what a new CLI
+        // process over the same tree runs.
+        let mut memo = LintMemo::default();
+        let rows2: Vec<(String, u32, String)> =
+            analyze_lints(&mut engine, std::slice::from_ref(&root), &mut memo)
+                .into_iter()
+                .filter(|d| d.code.name == "avoid_print")
+                .map(|d| {
+                    (
+                        engine
+                            .file_table()
+                            .path(d.file)
+                            .map_or_else(String::new, |p| p.display().to_string()),
+                        d.range.offset,
+                        d.message.into_owned(),
+                    )
+                })
+                .collect();
+        assert_eq!(rows2.len(), 2, "both files still report: {rows2:?}");
+
+        // The untouched file's row is byte-identical (content id, spans,
+        // texts) — served from the store, never re-executed.
+        let b_row1 = rows1
+            .iter()
+            .find(|(p, _, _)| p.ends_with("lib/b.dart"))
+            .expect("b.dart row");
+        let b_row2 = rows2
+            .iter()
+            .find(|(p, _, _)| p.ends_with("lib/b.dart"))
+            .expect("b.dart row");
+        assert_eq!(
+            b_row1, b_row2,
+            "the untouched file's row is byte-identical (served, not recomputed)"
+        );
+
+        // The edited file's row recomputed from the new bytes: one row, and
+        // its span moved with the call.
+        let a_rows2: Vec<&(String, u32, String)> = rows2
+            .iter()
+            .filter(|(p, _, _)| p.ends_with("lib/a.dart"))
+            .collect();
+        assert_eq!(a_rows2.len(), 1, "one row for the edited file: {a_rows2:?}");
+        let a_offset1 = rows1
+            .iter()
+            .find(|(p, _, _)| p.ends_with("lib/a.dart"))
+            .map(|(_, offset, _)| *offset)
+            .expect("a.dart row");
+        assert_ne!(
+            a_rows2[0].1, a_offset1,
+            "the edited file's span moved (recomputed from the new content): rows2={rows2:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&store_root).ok();
     }
 }

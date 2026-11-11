@@ -56,7 +56,7 @@ fn unchecked_rows(report: &FileReport) -> Vec<(u32, u32, String)> {
 /// it holds the oracle expectation (`dart analyze` 3.13.7 reports nothing on
 /// the co19 `Extension-types`/`static_type_helper` shapes).
 #[test]
-#[ignore = "unbounded `on T` applicability is decided in row_resolution.rs (outside #3300 scope)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn pin_unbounded_extension_on_accepts_nullable_receivers() {
     let report = report_ops(
         "abstract class Exactly<X> {}\n\

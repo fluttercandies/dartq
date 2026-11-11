@@ -372,7 +372,7 @@ main() {
 /// compile break in `overrides.rs`; the repro stands here for the
 /// follow-up.
 #[test]
-#[ignore = "cluster-1 residual: function-typed written type args re-parent the creation's null argument into the index send's argument group (Null vs `[]`'s `int` formal)"]
+// un-ignored 2026-11-07: passing per stale-ignore triage (ticket #3973)
 fn function_typed_written_arguments_substitute_into_the_formal() {
     let source = r#"
 class C1<T> {}

@@ -325,6 +325,9 @@ fn wildcard_local_var_pre_feature_duplicates() {
 /// `PatternVariableDeclarationStatement` — the statement-list scope
 /// never sees it, so a same-name repeat inside a later case body stays
 /// silent (upstream's `checkStatements` never reaches `case` patterns).
+/// The irrefutable `case var v` leaves the `default` member unreachable:
+/// the oracle (3.13.7) reports its label and its statements as two
+/// `dead_code` rows, and no `duplicate_definition`.
 #[test]
 fn case_binder_then_var_stays_silent() {
     let report = report_ops(
@@ -339,7 +342,12 @@ fn case_binder_then_var_stays_silent() {
          \x20 }\n\
          }\n",
     );
-    assert_silent(&report);
+    assert_eq!(
+        super::test_rig::code_names(&report),
+        ["dead_code", "dead_code"],
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// An if-case binder is likewise not a

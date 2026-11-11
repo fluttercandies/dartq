@@ -493,16 +493,11 @@ fn primitive_literals_drive_the_assignability_trio() {
 }
 
 /// The promotion consumption (#477 S1): a read promoted by an `is`
-/// test types its assignment sites with the promoted type, so the
-/// promoted branch's `int y = x;` is clean while the identical
-/// unpromoted shape still reports `invalid_assignment` against the
-/// declared `int?` (the official read's static type IS the promoted
-/// one, `property_element_resolver.dart:2158-2166`).
-///
-/// Hand-trace: flow emits one `PromotedRead` on the branch's `x` read
-/// (`int` narrows `int?`, no type arguments — the #611 gate open); the
-/// teardown join keys on the read's exact span and substitutes, the
-/// re-run verdict answers `Some(true)`, the staged row never emits.
+/// test types its assignment sites with the promoted type. With
+/// `int? x = 1` the initialization already promotes `x` to `int` (the
+/// non-nullable declared type is always a type of interest), so the
+/// oracle (3.13.7) keeps BOTH `int y = x;` sites clean and flags the
+/// written `x is int` as `unnecessary_type_check` instead.
 #[test]
 fn promotion_cleans_only_the_promoted_branch_assignment() {
     let report = report(
@@ -510,15 +505,15 @@ fn promotion_cleans_only_the_promoted_branch_assignment() {
              void promoted() { int? x = 1; if (x is int) { int y = x; } } \
              void unpromoted() { int? x = 1; int y = x; }",
     );
-    let assignments: Vec<_> = report
-        .diagnostics
-        .iter()
-        .filter(|d| d.code.name == "invalid_assignment")
-        .collect();
-    assert_eq!(assignments.len(), 1, "{:?}", code_names(&report));
     assert_eq!(
-        assignments[0].message,
-        "A value of type 'int?' can't be assigned to a variable of type 'int'."
+        code_names(&report),
+        [
+            "unnecessary_type_check",
+            "unused_local_variable",
+            "unused_local_variable"
+        ],
+        "{:?}",
+        report.diagnostics
     );
 }
 
@@ -707,23 +702,22 @@ fn per_file_cap_truncates_with_one_marker_row() {
     );
 }
 
-/// The drop rule: a promotion to `Never` never stages
-/// (`type_system.dart:1729` `tryPromoteToType` only subtype-narrows,
-/// and the M1 lattice has no bottom source type), so the join misses
-/// and the unpromoted verdict stands — under-report, never a
-/// fabricated clean.
+/// The drop rule over `Never`: `int? x = 1` promotes `x` to `int` on
+/// initialization, so `x is Never` can only fail — the oracle (3.13.7)
+/// reports the then-block as `dead_code`, and the assignment inside the
+/// unreachable block stays silent (no `invalid_assignment`).
 #[test]
 fn never_promotion_does_not_clean_the_row() {
     let report = report(
         "class int {} class Never {} \
              void f() { int? x = 1; if (x is Never) { int y = x; } }",
     );
-    let assignments: Vec<_> = report
-        .diagnostics
-        .iter()
-        .filter(|d| d.code.name == "invalid_assignment")
-        .collect();
-    assert_eq!(assignments.len(), 1, "{:?}", code_names(&report));
+    assert_eq!(
+        code_names(&report),
+        ["dead_code", "unused_local_variable"],
+        "{:?}",
+        report.diagnostics
+    );
 }
 
 /// The promotion face over a written-argument local (#611 step 4
@@ -893,10 +887,17 @@ fn int_literal_converts_to_double_but_the_value_does_not() {
 /// Hand-trace: the `MetadataReference` identifier resolves `Missing` for
 /// all three names; the [`CORE_TOP_LEVEL_ANNOTATIONS`] membership
 /// clears `override`/`pragma`, leaving `gone` to report over the `@`.
+/// The oracle additionally fires `invalid_annotation_target` for
+/// `@override` on a top-level function (the annotation's target list
+/// does not include top-level declarations) — the tree's annotation
+/// target check already emits it, so the pin carries both codes.
 #[test]
 fn core_top_level_annotation_names_stay_silent() {
     let report = report("@override @pragma('x') @gone void f() {}");
-    assert_eq!(code_names(&report), ["undefined_annotation"]);
+    assert_eq!(
+        code_names(&report),
+        ["undefined_annotation", "invalid_annotation_target"]
+    );
     assert_eq!(
         report.diagnostics[0].message,
         "Undefined name 'gone' used as an annotation."
@@ -3548,23 +3549,25 @@ fn annotation_arity_reports_base_code() {
 /// Wave-3 event shape: `C` fires `ConstructorReference` inside the
 /// `const` context (a resolved head pushes no row), so the group checks
 /// the class face through `creation_ref` — declared count (0) against 1
-/// → base code at the group. `new C()` stays silent. The `const`
-/// keyword's own face (`const_with_non_const` — the class declares no
-/// const constructor) anchors at the `const` keyword, which precedes the
-/// `<A>` group, so the machine output lists it before the arity row
-/// (oracle probe: `CONST_WITH_NON_CONST` at the `const` keyword then
-/// `WRONG_NUMBER_OF_TYPE_ARGUMENTS` at `<A>`).
+/// → base code at the group. `new C()` stays silent. Both rows match the
+/// oracle set (probe 3.13.7: `CONST_WITH_NON_CONST` at the `const`
+/// keyword offset 42, then `WRONG_NUMBER_OF_TYPE_ARGUMENTS` at `C<A>`
+/// offset 48 — the oracle anchors the arity row on the head WITH its
+/// arguments); the raw fold report lists the arity row first because the
+/// arity face finalizes before the `const` keyword's staged usage row
+/// merges, an order the engine's canonical output sort already
+/// normalizes.
 #[test]
 fn creation_arity_reports_base_code() {
     let report = report("class A {} class C {} void f() { new C(); const C<A>(); }");
     assert_eq!(
         code_names(&report),
-        ["const_with_non_const", "wrong_number_of_type_arguments",],
+        ["wrong_number_of_type_arguments", "const_with_non_const"],
         "{:?}",
         code_names(&report)
     );
     assert_eq!(
-        report.diagnostics[1].message,
+        report.diagnostics[0].message,
         "The type 'C' is declared with 0 type parameters, but 1 type arguments were given."
     );
 }
@@ -3990,9 +3993,13 @@ fn constructor_reference_arity_reports_base_code() {
         report.diagnostics[0].message,
         "The type 'C' is declared with 1 type parameters, but 2 type arguments were given."
     );
-    // The group span `<int, String>`.
-    assert_eq!(report.diagnostics[0].range.offset, 95);
-    assert_eq!(report.diagnostics[0].range.length, 13);
+    // The head-with-arguments span `C<int, String>` — the oracle anchors
+    // the type-argument arity row on the type name including its
+    // arguments (probe 3.13.7 machine line: col 23 len 14 over the bare
+    // `C<int, String>.named` shape, i.e. the head through the group's
+    // `>`).
+    assert_eq!(report.diagnostics[0].range.offset, 94);
+    assert_eq!(report.diagnostics[0].range.length, 14);
 }
 
 /// A static-method invocation through the class (`C.sm<int, String>()`)
@@ -5139,10 +5146,12 @@ fn unresolved_creation_head_suppresses_arity() {
 /// here — is a missing type reference at each member declaration
 /// (`undefined_class` ×2, the oracle's annotation miss); `c.h` walks
 /// `C` (no `h`, no superclass) → clean miss → `undefined_getter`;
-/// `c.g` finds the getter (silent); `c.s = 1` misses `s` and `s=` →
-/// `undefined_setter`; `c.g = 1` finds the getter `g` (write survives,
-/// unfrozen assignment-to-final); `c.p` on the setter-only `p=` misses
-/// the read → `undefined_getter`.
+/// `c.g` finds the getter (silent read); `c.s = 1` misses `s` and `s=` →
+/// `undefined_setter`; `c.g = 1` finds the getter `g` but no setter —
+/// the oracle's getter-only write face `assignment_to_final_no_setter`
+/// (oracle probe 3.13.7: `ASSIGNMENT_TO_FINAL_NO_SETTER` "There isn't a
+/// setter named 'g' in class 'C'."); `c.p` on the setter-only `p=`
+/// misses the read → `undefined_getter`.
 #[test]
 fn instance_member_family_reports_by_intent() {
     let report = report(
@@ -5156,6 +5165,7 @@ fn instance_member_family_reports_by_intent() {
             "undefined_class",
             "undefined_getter",
             "undefined_setter",
+            "assignment_to_final_no_setter",
             "undefined_getter",
         ],
         "{:?}",
@@ -5168,6 +5178,10 @@ fn instance_member_family_reports_by_intent() {
     assert_eq!(
         report.diagnostics[3].message,
         "The setter 's' isn't defined for the type 'C'."
+    );
+    assert_eq!(
+        report.diagnostics[4].message,
+        "There isn't a setter named 'g' in class 'C'."
     );
     assert_eq!(
         report.diagnostics[2].range.offset,
@@ -5863,14 +5877,16 @@ fn raw_generic_receiver_suppresses_the_unbound_formal_face() {
 
 /// The accessor-twin face: an inherited FIELD induces the setter face
 /// (`_CastQueueList`'s `set _head` overrides `QueueList`'s
-/// `int _head` field — the corpus's queue_list.dart setter rows).
+/// `int _head` field — the corpus's queue_list.dart setter rows): no
+/// override row fires. The private setter itself is never written, so
+/// the oracle (3.13.7) reports it `unused_element`; the field is read.
 #[test]
 fn inherited_field_induces_the_setter_override_face() {
     let source = "class int {} \
                       class Q { int _head = 0; int read() => _head; } \
                       class CQ extends Q { @override set _head(int v) {} }";
     let names = code_names(&report(source));
-    assert!(names.is_empty(), "{names:?}");
+    assert_eq!(names, ["unused_element"], "{names:?}");
 }
 
 /// The dead-coalesce left operand is the index READ, not the receiver:
@@ -6129,8 +6145,17 @@ fn index_read_write_and_compound_check_spellings() {
         "class int {} class C { C operator [](int i) => this; C operator []=(int i, C v) {} } \
              void f(C c, int i) { c[i] = c[i]; c[i] = null; }",
     );
-    assert!(
-        defined_report.diagnostics.is_empty(),
+    // The declared operator spellings stay free of `undefined_operator` —
+    // the face this pin owns. The fixture's remaining rows are the
+    // oracle's own other faces (probe 3.13.7 over the same source:
+    // `BODY_MIGHT_COMPLETE_NORMALLY` on the `C`-returning `[]=` body,
+    // `INVALID_ASSIGNMENT` for `null` into the non-nullable `C`
+    // parameter; the oracle additionally reports
+    // `NON_VOID_RETURN_FOR_OPERATOR` on the `C operator []=` declaration
+    // head — a code this engine does not emit yet).
+    assert_eq!(
+        code_names(&defined_report),
+        ["body_might_complete_normally", "invalid_assignment"],
         "{:?}",
         code_names(&defined_report)
     );
@@ -6467,17 +6492,21 @@ fn cyclic_sealed_hierarchy_terminates_without_false_positive() {
     );
 }
 
-/// An unresolvable scrutinee skips the whole exhaustiveness check (the
+/// A `void` scrutinee skips the whole exhaustiveness check (the
 /// oracle's `InvalidType` gate at `constant_verifier.dart:1035` and
-/// `:1095`): a switch expression over a call whose type never resolves
-/// emits nothing — mapping it to the nullable top would drop every row
-/// and false-positive the covering gap.
+/// `:1095`): the switch expression over a `void` call emits no
+/// exhaustiveness row — mapping it to the nullable top would
+/// false-positive the covering gap — while the scrutinee itself still
+/// reports `use_of_void_result` (oracle 3.13.7).
 #[test]
 fn unknown_scrutinee_switch_expression_emits_nothing() {
     // `x` is unread (the official read-only use rule); the `_`
     // wildcard never reports.
     let report = report("void g() {} void f() { var x = switch (g()) { _ => 0 }; }");
-    assert_eq!(code_names(&report), ["unused_local_variable"]);
+    assert_eq!(
+        code_names(&report),
+        ["unused_local_variable", "use_of_void_result"]
+    );
 }
 
 /// The extension-type representation face decides with the faces'
@@ -7625,13 +7654,13 @@ fn const_literal_elements_check_per_element() {
         "{:?}",
         code_names(&rep)
     );
-    // Clean elements stay silent, including the fault-deciding lazy
-    // shapes (`false && l` never evaluates its right operand); the
-    // const locals `e`/`f`/`g` are unread. The constant-false `&&`
-    // left does make the right operand run dead (the official
-    // `LogicalAnd` arm re-anchors `dead_code` at the operator spanning
-    // the operand, dead_code_verifier.dart:311-322) — a separate lane
-    // from the const-eval laziness above.
+    // Clean elements stay silent; the const locals `e`/`f`/`g` are
+    // unread. The constant-false `&&` left makes the right operand run
+    // dead (the official `LogicalAnd` arm re-anchors `dead_code` at the
+    // operator spanning the operand, dead_code_verifier.dart:311-322),
+    // and the non-constant `l` inside that dead operand still fails the
+    // initializer — the oracle (3.13.7) anchors
+    // `const_initialized_with_non_constant_value` at `l`.
     let rep = report(
         "void m() { var l = 1; const e = [0, 1]; const f = {0: 1}; const g = false && l == 1; }",
     );
@@ -7642,6 +7671,7 @@ fn const_literal_elements_check_per_element() {
             "unused_local_variable",
             "unused_local_variable",
             "dead_code",
+            "const_initialized_with_non_constant_value",
         ],
         "{:?}",
         code_names(&rep)
@@ -7764,34 +7794,28 @@ fn throws_exception_links_the_throw_site_context() {
     assert!(rep.diagnostics[0].context.is_none());
 }
 
-/// `is` is not on the spec's constant-expression list (the site
-/// default reports); `as` is, and its unknown result defers —
-/// `(1 as int) + 1` stays clean on the const side. Both lines
-/// additionally carry the provably-check family's rows, which the
-/// oracle co-fires: `1 is int` is constant-true
-/// (`unnecessary_type_check`), `1 as int` a dead cast
-/// (`unnecessary_cast`).
+/// Both `is` and `as` are potentially constant: `1 is int` folds clean
+/// on the const side and `(1 as int) + 1` defers. Both lines carry the
+/// provably-check family's rows, which the oracle (3.13.7, the real
+/// `dart:core` `int` the rig's `class int {}` stands for) co-fires:
+/// `1 is int` is constant-true (`unnecessary_type_check`, alone), `1 as
+/// int` a dead cast (`unnecessary_cast`).
 #[test]
 fn is_reports_and_as_defers() {
     let rep = report("class int {} const x = 1 is int;");
-    let mut names = code_names(&rep);
-    names.sort_unstable();
     assert_eq!(
-        names,
-        [
-            "const_initialized_with_non_constant_value",
-            "unnecessary_type_check"
-        ],
+        code_names(&rep),
+        ["unnecessary_type_check"],
         "{:?}",
-        code_names(&rep)
+        rep.diagnostics
     );
     let rep = report("class int {} const y = 1 as int; const z = (1 as int) + 1;");
-    // The typed paren group routes the `+` against the shadowing user
-    // `int` (no operator+ declared): `undefined_operator` rides beside
-    // the dead casts. PENDING ORACLE ADJUDICATION — the pre-paren-fold
-    // pin carried the two casts only (the opaque group silenced the
-    // resolver face); whether the const context suppresses it too is
-    // the morning differential rerun's call.
+    // The typed paren group routes the `+` against the rig's operator-less
+    // `int` stand-in: `undefined_operator` rides beside the dead casts.
+    // The const context does not suppress it — the oracle reports
+    // `undefined_operator` at the `+` of a const initializer whose
+    // operand type declares no `+` — and with the real `dart:core` `int`
+    // the two casts report alone.
     let mut names = code_names(&rep);
     names.sort_unstable();
     assert_eq!(
@@ -8153,14 +8177,36 @@ fn declared_subtype_return_decides_both_ways() {
 
 /// The implicit `Object` edge: an in-file `class B {}` subtypes
 /// `Object` with no written clause, so narrowing an `Object`-typed
-/// member's result is the legal override and stays silent (pre-fix the
-/// lattice closed its walk past the missing edge and answered decisive
-/// incomparable — a false positive against the oracle).
+/// member's result is the legal override — no `invalid_override` (pre-fix
+/// the lattice closed its walk past the missing edge and answered decisive
+/// incomparable — a false positive against the oracle). This harness
+/// carries no core library, so the in-file `class Object {}` IS the core
+/// `Object` (the #537 convention); the oracle's answer for the same
+/// declarations over the real `dart:core` `Object` is the `int` literal
+/// returned from the `B`-typed override alone (`RETURN_OF_INVALID_TYPE` at
+/// the `2`, 3.13.7). A library that declares its own `Object` beside a
+/// visible `dart:core` shadows the core class instead — the oracle then
+/// also reports the `1` and `invalid_override` (`B`'s implicit superclass
+/// is the core `Object`, not the shadowing declaration); the name lattice
+/// keys the edge on the spelling and does not model that shadow.
 #[test]
-fn implicit_object_result_narrowing_stays_silent() {
-    let rep =
-        report("class Object {} class A { Object m() => 1; } class B extends A { B m() => 2; }");
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+fn implicit_object_result_narrowing_keeps_the_override_silent() {
+    let source = "class Object {} class A { Object m() => 1; } class B extends A { B m() => 2; }";
+    let rep = report(source);
+    assert_eq!(
+        code_names(&rep),
+        ["return_of_invalid_type"],
+        "{:?}",
+        code_names(&rep)
+    );
+    let row = &rep.diagnostics[0];
+    assert_eq!(row.range.offset as usize, source.rfind('2').unwrap());
+    assert_eq!(row.range.length, 1);
+    assert_eq!(
+        row.message,
+        "A value of type 'int' can't be returned from the method 'm' because it has a return \
+         type of 'B'."
+    );
 }
 
 /// The parameter face rides the same edge: widening an inherited
@@ -8924,21 +8970,37 @@ fn implements_never_implements_but_extends_resolves() {
 
 /// The concrete-superclass exemption (`_isNotImplementedInConcreteSuper
 /// Class`): the issue belongs to the concrete class that already lacks
-/// the member. An abstract class exempts itself from the check; its own
-/// abstract members are the `concrete_class_with_abstract_member`
-/// report's business — not implemented here, so they suppress.
+/// the member. An abstract class exempts itself from the completeness
+/// check; a CONCRETE class's own abstract member is the
+/// `concrete_class_with_abstract_member` row instead (that arm landed in
+/// #3934, so these fixtures now carry it — oracle `dart analyze
+/// --format=machine` on `class C { void m(); }` reports
+/// `'m' must have a method body because 'C' isn't abstract.`).
 #[test]
 fn abstract_and_concrete_super_exemptions() {
     // An abstract class never reports.
     let rep = report("abstract class A { void m(); } abstract class B extends A {}");
     assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
-    // A concrete class's own abstract member is the other code's row.
+    // A concrete class's own abstract member is the more specific row, and
+    // it REPLACES the completeness row for that name (the oracle's
+    // `continue` after `_reportConcreteClassWithAbstractMember`).
     let rep = report("class C { void m(); }");
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    assert_eq!(
+        code_names(&rep),
+        ["concrete_class_with_abstract_member"],
+        "{:?}",
+        code_names(&rep)
+    );
     // A concrete superclass whose interface has the name blocks the
-    // report for its subclasses.
+    // completeness report for its subclasses; the superclass's own row
+    // stays (oracle: one row, on `C`).
     let rep = report("class C { void m(); } class D extends C {}");
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    assert_eq!(
+        code_names(&rep),
+        ["concrete_class_with_abstract_member"],
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// A concrete `noSuchMethod` on the implemented sources (the class
@@ -9129,8 +9191,17 @@ fn abstract_field_halves_split_by_final() {
         rep.diagnostics[0].message,
         "Missing concrete implementations of 'getter A.x', 'getter A.y', and 'setter A.x'."
     );
+    // `A` is concrete here, so its abstract field is the
+    // `concrete_class_with_abstract_member` row (oracle on the same input:
+    // `'x' must have a method body because 'A' isn't abstract.`); `B`
+    // implements the getter and stays silent on the completeness face.
     let rep = report("class int {} class A { abstract int x; } class B extends A { int x = 0; }");
-    assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    assert_eq!(
+        code_names(&rep),
+        ["concrete_class_with_abstract_member"],
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// A private name inherited from another library can never be
@@ -9825,10 +9896,13 @@ fn setter_only_extension_defines_the_write() {
 /// The extension index face (#1455 F-F): an implicit-application
 /// receiver resolves `x[0]` through an applicable extension's
 /// `operator []` and `x[0] = v` / `x[0] += 1` through `operator []=` —
-/// read, write, compound, and null-aware shapes stay silent (the
-/// oracle's `if_null.dart` extension-index corpus is clean). Negative
-/// control: a receiver whose container genuinely lacks the operator
-/// still reports `undefined_operator`.
+/// read, write, compound, and null-aware shapes stay silent at the
+/// access sites. The extension BODY's own two faces are the oracle's
+/// (probe 3.13.7 over the same source: `RETURN_OF_INVALID_TYPE` — the
+/// `int?` `prop` into the unbounded `T` — then `INVALID_ASSIGNMENT` —
+/// the `T` value into the `int?` field), and the tree emits exactly
+/// those. Negative control: a receiver whose container genuinely lacks
+/// the operator still reports `undefined_operator`.
 ///
 /// Hand-trace: the index fold arms `Intent::Operator('[]', bracket)` on
 /// the receiver row (the write form for `=`/`+=`); `check_operator_expr`
@@ -9848,7 +9922,12 @@ fn extension_index_operator_applies() {
              void compound(HasProp x) { x[0] += 1; } \
              void null_aware(HasProp? x) { x?[0]; }",
     );
-    assert!(faces.diagnostics.is_empty(), "{:?}", code_names(&faces));
+    assert_eq!(
+        code_names(&faces),
+        ["return_of_invalid_type", "invalid_assignment"],
+        "{:?}",
+        code_names(&faces)
+    );
     let miss = report("class int {} class C {} void f(C c) { c[0]; }");
     assert_eq!(code_names(&miss), ["undefined_operator"]);
 }
@@ -10362,7 +10441,11 @@ fn unused_local_variable_reports_and_reads_spare() {
             // `int` — `LogicalNotResolver.resolve` runs the negation
             // face unconditionally (logical_not_resolver.dart:27), so
             // the oracle reports it beside the unused reads.
-            "non_bool_negation_expression"
+            "non_bool_negation_expression",
+            // `discarded++` over the rig's operator-less `int` stand-in
+            // reports `undefined_operator` exactly as the oracle (3.13.7)
+            // does for an operator-less user class (`class I {}`).
+            "undefined_operator"
         ],
         "{:?}",
         code_names(&r)
@@ -10726,14 +10809,22 @@ fn unused_private_constructor_const_and_new_uses_spare() {
 
 /// An annotation's `@A._x` selector names the class's constructor
 /// (the metadata continuation carries no member row): the annotated
-/// constructor stays silent while its unreferenced sibling reports.
+/// constructor stays silent while its unreferenced sibling reports. The
+/// argument-less constructor annotation is itself an error the oracle
+/// (3.13.7) reports beside the sibling's row:
+/// `no_annotation_constructor_arguments` at the annotation.
 #[test]
 fn unused_private_constructor_annotation_use_spares() {
     let r = report(
         "class int {} class A { const A._ann(); const A._dead(); } \
              @A._ann class B {} void main() { B(); }",
     );
-    assert_eq!(code_names(&r), ["unused_element"], "{:?}", code_names(&r));
+    assert_eq!(
+        code_names(&r),
+        ["unused_element", "no_annotation_constructor_arguments"],
+        "{:?}",
+        code_names(&r)
+    );
     assert_eq!(
         r.diagnostics[0].message,
         "The declaration 'A._dead' isn't referenced."
@@ -10927,13 +11018,15 @@ fn used_prefix_import_stays_silent() {
 /// (before the fix the interpolated head dropped the site, misaligning
 /// `imports` against the graph's per-directive edges and suppressing the
 /// whole `unused_import` pass, `imports_verifier.dart:232+`'s
-/// per-directive iteration).
+/// per-directive iteration). The interpolated `b` is declared: an
+/// undefined `b` reports `undefined_identifier`, which gates the whole
+/// unused-import pass (oracle 3.13.7) and would hide the alignment.
 #[test]
 fn interpolated_import_keeps_edge_alignment() {
     let strings = StringTable::new();
     let mut files = FileTable::new();
     let file = files.intern(Path::new("main.dart"));
-    let source = "import 'a${b}c.dart'; import 'other.dart'; void main() {}";
+    let source = "import 'a${b}c.dart'; import 'other.dart'; const b = 1; void main() {}";
     let scanned = dartq_scanner::scan(
         source,
         ScanConfig {
@@ -11507,13 +11600,19 @@ fn unnecessary_cast_pins_equality() {
 
 /// The type-check polarity pair (`_checkAllTypeChecks`,
 /// best_practices_verifier.dart:987-1041): `x is T` is constant-true
-/// over a subtype operand, `x is! T` reports the complement row.
+/// over a subtype operand, `x is! T` reports the complement row — and
+/// the always-false `is!` test leaves its then-block `dead_code` (oracle
+/// 3.13.7 anchors it at the `{}`).
 #[test]
 fn unnecessary_type_check_polarity() {
     let r = report("class int {} void main() { int x = 1; if (x is int) {} if (x is! int) {} }");
     assert_eq!(
         code_names(&r),
-        ["unnecessary_type_check", "unnecessary_type_check"],
+        [
+            "unnecessary_type_check",
+            "unnecessary_type_check",
+            "dead_code"
+        ],
         "{:?}",
         code_names(&r)
     );
@@ -12074,13 +12173,20 @@ fn catch_on_type_miss_codes_non_type_in_catch_clause() {
     assert_eq!(r.diagnostics[0].range.offset, offset_of(src, "Missing"));
     let src2 = "class int {} void main() { try {} on Missing {} on Gone {} on int {} }";
     let r = report(src2);
+    // Both misses type as `InvalidType`, so the second clause is a subtype
+    // of the first: the oracle (3.13.7) reports `dead_code_on_catch_subtype`
+    // from `on Gone` to the last clause, between the two type rows.
     assert_eq!(
         code_names(&r),
-        ["non_type_in_catch_clause", "non_type_in_catch_clause",],
+        [
+            "non_type_in_catch_clause",
+            "dead_code_on_catch_subtype",
+            "non_type_in_catch_clause",
+        ],
         "{:?}",
         code_names(&r)
     );
-    assert_eq!(r.diagnostics[1].range.offset, offset_of(src2, "Gone"));
+    assert_eq!(r.diagnostics[2].range.offset, offset_of(src2, "Gone"));
 }
 
 /// Case 9497f84a: a record-shaped on-clause (`on(e) { }`) routes its
@@ -12839,9 +12945,14 @@ fn body_might_complete_normally_reports_factories_and_closures() {
         code_names(&report("void f() { void Function() g = () {}; g; }")),
         [] as [&str; 0]
     );
+    // The closure literal as ARGUMENT is no body face — but the call
+    // itself is an arity miss: `g` takes zero positionals and the
+    // argument list supplies one (oracle probe 3.13.7:
+    // `EXTRA_POSITIONAL_ARGUMENTS` "Too many positional arguments: 0
+    // expected, but 1 found.").
     assert_eq!(
         code_names(&report("void f(void Function() g) { g(() {}); }")),
-        [] as [&str; 0]
+        ["extra_positional_arguments"]
     );
 }
 
@@ -14121,7 +14232,10 @@ fn variance_named_mixin_application_checks_its_head() {
 }
 
 /// The enum face: a `with` mixin instantiation in a contravariant
-/// position checks through the enum header.
+/// position checks through the enum header. `A` is a plain class, so the
+/// mixin-use face also reports (probe 3.13.7: `CLASS_USED_AS_MIXIN` "The
+/// class 'A' can't be used as a mixin because it's neither a mixin class
+/// nor a mixin." at the `A<void Function(X)>` clause).
 #[test]
 fn variance_enum_with_clause_checks() {
     let src = "class A<X> {} \
@@ -14129,7 +14243,10 @@ fn variance_enum_with_clause_checks() {
     let report = report_variance(src);
     assert_eq!(
         code_names(&report),
-        ["wrong_type_parameter_variance_in_superinterface"]
+        [
+            "wrong_type_parameter_variance_in_superinterface",
+            "class_used_as_mixin",
+        ]
     );
 }
 
@@ -14168,20 +14285,27 @@ fn variance_extension_type_checks_implements() {
 #[test]
 fn variance_member_faces_report_forbidden_positions() {
     // `out T` field: the declared type passes, the implicit setter
-    // fails.
+    // fails. The uninitialized non-nullable `T x;` also fires the
+    // declaration walk's `not_initialized_non_nullable_instance_field`
+    // (probe 3.13.7 under `--enable-experiment=variance`:
+    // `NOT_INITIALIZED_NON_NULLABLE_INSTANCE_FIELD` at `x`, then
+    // `WRONG_TYPE_PARAMETER_VARIANCE_POSITION` at the same span).
     let field_src = "class A<out T> { T x; }";
     let field = report_variance(field_src);
     assert_eq!(
         code_names(&field),
-        ["wrong_type_parameter_variance_position"]
+        [
+            "not_initialized_non_nullable_instance_field",
+            "wrong_type_parameter_variance_position",
+        ]
     );
     assert_eq!(
-        field.diagnostics[0].message,
+        field.diagnostics[1].message,
         "The 'out' type parameter 'T' can't be used in an 'in' position."
     );
     assert_eq!(
-        &field_src[field.diagnostics[0].range.offset as usize..]
-            [..field.diagnostics[0].range.length as usize],
+        &field_src[field.diagnostics[1].range.offset as usize..]
+            [..field.diagnostics[1].range.length as usize],
         "x"
     );
 
@@ -14224,11 +14348,18 @@ fn variance_member_faces_report_forbidden_positions() {
 
 /// Legacy parameters never fire the member faces (the official
 /// `isLegacyCovariant` skips, :7918/:7945) — and the superinterface
-/// face only through the legacy row.
+/// face only through the legacy row. The uninitialized non-nullable
+/// `T x;` still fires the declaration walk's
+/// `not_initialized_non_nullable_instance_field` (probe 3.13.7: that
+/// row is the fixture's only diagnostic — the legacy variance faces
+/// stay silent).
 #[test]
 fn variance_legacy_parameters_stay_silent_on_member_faces() {
     let src = "class A<T> { T x; void m(T y) {} T n() => throw ''; }";
-    assert!(report_variance(src).diagnostics.is_empty());
+    assert_eq!(
+        code_names(&report_variance(src)),
+        ["not_initialized_non_nullable_instance_field"]
+    );
 }
 
 /// The walk composes: a contravariant occurrence through a covariant
@@ -14323,17 +14454,37 @@ fn typed_catch_recovery_trace_use_spares() {
 }
 
 /// A first slot the re-parse consumed as a MODIFIER (`catch (var e)` —
-/// `var` arms no written type; the official formals list collapses to
-/// `[e]`) stays silent: both scan rows keep the exception face and the
-/// plain catch auto-uses it (oracle-probed: no unused row on `e`).
+/// `var` arms no written type): both ensure routes plant nameless
+/// synthetics, so the official list reads `[<syn>, <syn>]` and its second
+/// slot is a nameless stack trace. Oracle 3.13.7 reports
+/// `unused_catch_stack` '<unnamed>' at the enclosing `main` name (1:6,
+/// length 0) and no row on `e`; the exception stays auto-used through its
+/// trace sibling.
 #[test]
-fn modifier_catch_recovery_stays_silent() {
+fn modifier_catch_recovery_reports_the_nameless_trace() {
     let source = "void main() { try {} catch (var e) {} }";
     let r = report(source);
-    assert!(
-        !anchors(source, &r)
-            .iter()
-            .any(|(code, _)| code.starts_with("unused")),
+    let unused: Vec<(&str, u32, u32, String)> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name.starts_with("unused"))
+        .map(|d| {
+            (
+                d.code.name,
+                d.range.offset,
+                d.range.length,
+                d.message.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        unused,
+        vec![(
+            "unused_catch_stack",
+            5,
+            0,
+            "The stack trace variable '<unnamed>' isn't used and can be removed.".to_string()
+        )],
         "{:?}",
         code_names(&r)
     );
@@ -15816,7 +15967,9 @@ fn unused_catch_stack_optional_positional_trace_shape() {
 /// The real trace name after a real comma keeps its verdict even when the
 /// parameter group's tail turns to junk (oracle pinned row
 /// `test_try_statement_catch_identifierCommaIdentifier_labeled`:
-/// `catch (e, s l:` anchors on `s`, never on the junk tail).
+/// `catch (e, s l:` anchors on `s`, never on the junk tail). The junk
+/// `l:` recovers as a labeled statement in the synthetic body, so the
+/// oracle (3.13.7) adds `unused_label` on `l:`.
 #[test]
 fn unused_catch_stack_real_trace_with_junk_tail() {
     let source = "f() { try {} catch (e, s l: {} }";
@@ -15825,7 +15978,10 @@ fn unused_catch_stack_real_trace_with_junk_tail() {
         .into_iter()
         .filter(|(code, _)| code.starts_with("unused"))
         .collect();
-    assert_eq!(unused, vec![("unused_catch_stack", "s")]);
+    assert_eq!(
+        unused,
+        vec![("unused_catch_stack", "s"), ("unused_label", "l:")]
+    );
 }
 
 /// A stack-trace sibling spares the exception even under an `on` type and
@@ -15844,11 +16000,11 @@ fn on_catch_exception_spared_by_junk_filled_trace_slot() {
     assert_eq!(unused, vec![("unused_catch_stack", "st")]);
 }
 
-/// `catch (var e)`: the exception name recovers synthetically, so the
-/// real `e` reaches the trace ensure while the official formals list
-/// reads it as `catchParameters[0]` — the exception (comma-fact slot
-/// classification; the synthetic comma never flips the slot). A plain
-/// catch auto-uses it: silent.
+/// `catch (var e)`: the reserved `var` recovers BOTH catch slots as
+/// nameless synthetics (the official formals list holds two `''`
+/// parameters). The exception slot is auto-used through its stack
+/// sibling; the nameless trace slot reports `unused_catch_stack`
+/// (`<unnamed>`, zero-length — oracle 3.13.7).
 #[test]
 fn catch_var_keyword_classifies_the_real_name_exception() {
     let source = "void f() { try {} catch (var e) {} }";
@@ -15857,14 +16013,14 @@ fn catch_var_keyword_classifies_the_real_name_exception() {
         .into_iter()
         .filter(|(code, _)| code.starts_with("unused"))
         .collect();
-    assert!(unused.is_empty(), "{unused:?}");
+    assert_eq!(unused, vec![("unused_catch_stack", "")]);
 }
 
 /// The `on`-type `var`-keyword twin: both ensure routes hit the reserved
-/// `var`, so the real `e` binds solely through the formal re-parse as a
-/// parameter twin — no CatchParameter event fires and no unused face
-/// reports (the oracle's residual `<unnamed>` clause row is the
-/// unnamed-family geometry noted in the ticket, not this pin's scope).
+/// `var`, so both slots recover nameless exactly as in the plain catch —
+/// the trace sibling auto-uses the exception (no `unused_catch_clause`)
+/// and the nameless trace reports `unused_catch_stack` (`<unnamed>`,
+/// zero-length — oracle 3.13.7).
 #[test]
 fn on_catch_var_keyword_binds_only_as_a_parameter_twin() {
     let source = "void f() { try {} on int catch (var e) {} }";
@@ -15873,7 +16029,7 @@ fn on_catch_var_keyword_binds_only_as_a_parameter_twin() {
         .into_iter()
         .filter(|(code, _)| code.starts_with("unused"))
         .collect();
-    assert_eq!(unused, Vec::<(&str, &str)>::new());
+    assert_eq!(unused, vec![("unused_catch_stack", "")]);
 }
 
 /// Regression: a plain single-parameter catch keeps both postures — a
@@ -16363,7 +16519,15 @@ fn super_formal_named_associates_with_this_selector_formal() {
     );
     assert_eq!(code_names(&r), Vec::<&str>::new(), "{:?}", code_names(&r));
 
-    // The target declares no `z` — the named row fires at `super.z`:
+    // The target declares no `z` — the named row fires at `super.z`.
+    // The call itself is also an arity miss (`named` takes one
+    // positional, `()` supplies none — probe 3.13.7:
+    // `NOT_ENOUGH_POSITIONAL_ARGUMENTS` "1 positional argument expected
+    // by 'named', but 0 found." at the invocation); the raw fold report
+    // lists it first because the super-call arity face finalizes after
+    // the declaration walk's super-formal face, an order the engine's
+    // canonical output sort normalizes (the oracle's machine line lists
+    // the offset-earlier `super.z` row first).
     let r = report(
         "class int {} \
              class C { C.named(int x); } \
@@ -16371,7 +16535,10 @@ fn super_formal_named_associates_with_this_selector_formal() {
     );
     assert_eq!(
         code_names(&r),
-        ["super_formal_parameter_without_associated_named"],
+        [
+            "not_enough_positional_arguments",
+            "super_formal_parameter_without_associated_named",
+        ],
         "{:?}",
         code_names(&r)
     );
@@ -23302,3 +23469,662 @@ mod ticket_3839_tests;
 mod ticket_41983_tests;
 
 // —— #3856 (the duplicate_field_formal_parameter row swap) ——
+// The formal-parameter scope reports the pair code when BOTH colliding
+// claims are `this.x` formals; the capture bit rides `DuplicateDecl`.
+#[cfg(test)]
+#[path = "ticket_3856_tests.rs"]
+mod ticket_3856_tests;
+
+// —— #3728 (Object-stub scrutinee covering gap) ——
+#[cfg(test)]
+#[path = "ticket_3728_tests.rs"]
+mod ticket_3728_tests;
+
+// —— #3816 (the super-exemption scope + member-callee frozen-face gap) ——
+#[cfg(test)]
+#[path = "ticket_3816_tests.rs"]
+mod ticket_3816_tests;
+
+// —— #3868 (function/record matched faces + names-only stub heads) ——
+#[cfg(test)]
+#[path = "ticket_3868_tests.rs"]
+mod ticket_3868_tests;
+
+// —— #3396 (callee-own-parameter closure formal member-miss suppression scope) ——
+#[cfg(test)]
+#[path = "ticket_3396_tests.rs"]
+mod ticket_3396_tests;
+
+// —— #3872 (block-bodied closure return LUB + #3396 residuals) ——
+#[cfg(test)]
+#[path = "ticket_3872_tests.rs"]
+mod ticket_3872_tests;
+
+// —— #3871 (unbounded-alias variance seeds in instantiate-to-bounds) ——
+#[cfg(test)]
+#[path = "ticket_3871_tests.rs"]
+mod ticket_3871_tests;
+
+// —— #3828 (zero-span inferred type arguments stay out of the bounds face) ——
+#[cfg(test)]
+#[path = "ticket_3828_tests.rs"]
+mod ticket_3828_tests;
+// —— #3714 (function-invocation face anchor normalization + null-aware
+// getter-invocation reporting) ——
+#[cfg(test)]
+#[path = "ticket_3714_tests.rs"]
+mod ticket_3714_tests;
+
+// —— #3870 (const-evaluator capture: `as`/`is` operators and the assert
+// —— initializer feed `ConstCapture` so `const_eval_throws_exception`
+// —— fires on operand faults, failed casts and false assert conditions,
+// —— with constructor type-parameter substitution on the written target) ——
+#[cfg(test)]
+#[path = "ticket_3870_tests.rs"]
+mod ticket_3870_tests;
+
+// —— #3847 (creation-receiver instantiation: a folded creation's written
+// —— type arguments substitute the accessor's declared face — the mixin
+// —— application's inherited field and the same-container getter alike) ——
+#[cfg(test)]
+#[path = "ticket_3847_tests.rs"]
+mod ticket_3847_tests;
+
+// —— #3877 (merged-member type algebra: the FutureOr-collapsed top-merge
+// —— columns' members-face residual pins, plus routed evidence pins for
+// —— the interfaces/greatest-closure/== type-param-receiver faces) ——
+#[cfg(test)]
+#[path = "ticket_3877_tests.rs"]
+mod ticket_3877_tests;
+
+// —— #3873 (invocation-face substitution sweep: call-site formal
+// —— substitution incl. the `T?` nullable leaf, the applied-extension
+// —— member send's formals + `<T>`, the named-anywhere positional
+// —— pairing split, and the implicit-this raw-type-variable self-bind) ——
+#[cfg(test)]
+#[path = "ticket_3873_tests.rs"]
+mod ticket_3873_tests;
+
+// —— #3879 (inference packet phase 1: the creation-argument reader
+// —— contracts across spellings incl. a `dynamic` segment, plus the
+// —— routed-residual record for the SWAP seed / i2b fallback /
+// —— enum-formal Never / variance faces) ——
+#[cfg(test)]
+#[path = "ticket_3879_tests.rs"]
+mod ticket_3879_tests;
+
+// —— #3820 (the composite receiver's OWN static type — `??`/`??=`/`?:`
+// —— /`op=`/`++`/`--` faces re-deciding the bounds verdict, plus the
+// —— if-null S-branch companion and the keep-direction controls) ——
+#[cfg(test)]
+#[path = "ticket_3820_tests.rs"]
+mod ticket_3820_tests;
+
+#[cfg(test)]
+#[path = "ticket_3881_tests.rs"]
+mod ticket_3881_tests;
+
+// —— #3885 (the mixin-family faces: `class_used_as_mixin` else-branch
+// —— generative-ctor arm + enclosing-container suppression + the
+// —— `mixin class` declaration checks) ——
+#[cfg(test)]
+#[path = "ticket_3885_tests.rs"]
+mod ticket_3885_tests;
+
+#[cfg(test)]
+#[path = "ticket_3880_tests.rs"]
+mod ticket_3880_tests;
+
+// —— #3878 (the operator-face seam: controls over the numeric-refinement /
+// —— null-assert faces + ignored acceptance pins for the routed fixes) ——
+#[cfg(test)]
+#[path = "ticket_3878_tests.rs"]
+mod ticket_3878_tests;
+
+// —— #3876 (the augment chain's merged positional-parameter scope: every
+// —— body on a chain resolves against the first non-`_` spelling per
+// —— position) ——
+#[cfg(test)]
+#[path = "ticket_3874v_tests.rs"]
+mod ticket_3874v_tests;
+#[cfg(test)]
+#[path = "ticket_3876_tests.rs"]
+mod ticket_3876_tests;
+#[cfg(test)]
+#[path = "ticket_3886_tests.rs"]
+mod ticket_3886_tests;
+
+// —— #3889 (argument-slot context through the creation-head lane — keyword/
+// —— bare/written-group constructor callees feed the list-element check —
+// —— plus the modern-alias written-args instantiation fix) ——
+#[cfg(test)]
+#[path = "ticket_3889_tests.rs"]
+mod ticket_3889_tests;
+
+#[cfg(test)]
+#[path = "ticket_3890_tests.rs"]
+mod ticket_3890_tests;
+
+// —— #3887 (the row-model wave — explicit-type-arg formals, `clamp`'s
+// —— positive double gate, and the miss-path member-callee Function
+// —— checks) ——
+#[cfg(test)]
+#[path = "ticket_3887_tests.rs"]
+mod ticket_3887_tests;
+
+// —— #3847 capture layer (the supertype clauses written type arguments
+// —— thread from the header tree capture into the element model, the
+// —— persisted payload, and the v14 API signature) ——
+#[cfg(test)]
+#[path = "ticket_3847u_tests.rs"]
+mod ticket_3847u_tests;
+
+// —— #3893 (the inference tail — routed acceptance pins for the
+// —— flatten/futureType, map-key inference, factory-via-alias, and
+// —— int-to-double pattern faces) ——
+#[cfg(test)]
+#[path = "ticket_3893_tests.rs"]
+mod ticket_3893_tests;
+
+// —— #3891 (the `not_instantiated_bound` declaration face — simply-
+// —— boundedness verdicts over the written type-parameter bounds) ——
+#[cfg(test)]
+#[path = "ticket_3891_tests.rs"]
+mod ticket_3891_tests;
+
+// —— #3894 (the merged-member NORM collapse — `FutureOr`-vs-top candidate
+// —— pairs fold over the normalized columns, never the first candidate) ——
+#[cfg(test)]
+#[path = "ticket_3894_tests.rs"]
+mod ticket_3894_tests;
+
+// —— #3897 (the `engine_core.rs` half of the inference tail — the
+// —— flatten family's derived-future arm, the numeric ladder's `Never`
+// —— guard, the binary fold's flow-promoted operands, and the literal
+// —— leaf faces' superinterface join) ——
+#[cfg(test)]
+#[path = "ticket_3897_tests.rs"]
+mod ticket_3897_tests;
+
+// —— #3900 (the `resolution.rs`/`augmentations.rs` half — the augmentation
+// —— type-parameter bound pair's top-level bound column, the no-context
+// —— collection literal's send leaves and shared-supertype join, and the
+// —— top-level `var` declarator's literal initializer face) ——
+#[cfg(test)]
+#[path = "ticket_3900_tests.rs"]
+mod ticket_3900_tests;
+
+// —— #3903 (the M11 variance capture half: the type parameter's written
+// —— variance modifier through the element model, the persisted payload and
+// —— the API signature) ——
+#[cfg(test)]
+#[path = "ticket_3903_tests.rs"]
+mod ticket_3903_tests;
+
+// —— #3896 (the invocation.rs packet: index-set keys, the ?? composite
+// —— argument window, the explicit-argument binder bound faces) ——
+#[cfg(test)]
+#[path = "ticket_3896_tests.rs"]
+mod ticket_3896_tests;
+
+// —— #3901 (the `types.rs` half of the mixin clause family: the
+// —— const-constructor mixin-field face and the enum `with`-clause
+// —— instance-variable face, both read off the mixin's declared field set) ——
+#[cfg(test)]
+#[path = "ticket_3901_tests.rs"]
+mod ticket_3901_tests;
+
+// —— #3899 (the post-Z packet: the `supertype_expands_to_type_parameter`
+// —— clause faces' registration and the super-bounded argument's
+// —— binder-list display) ——
+#[cfg(test)]
+#[path = "ticket_3899_tests.rs"]
+mod ticket_3899_tests;
+
+// —— #3906 (the listener.rs packet: E13-2 compound-assignment inference window) ——
+#[cfg(test)]
+#[path = "ticket_3906_tests.rs"]
+mod ticket_3906_tests;
+
+// —— #3907 (the row_resolution.rs pass-2 packet: the promoted-receiver
+// —— inc/dec acceptance pins and the member-callee core-table miss arm) ——
+#[cfg(test)]
+#[path = "ticket_3907_tests.rs"]
+mod ticket_3907_tests;
+
+// —— #3905 (the class-wave remainder faces: the compound index-write
+// —— element faces, the #3896 semantic binder pins, the initializer
+// —— Null face, the mixin-application interface edge) ——
+#[cfg(test)]
+#[path = "ticket_3905_tests.rs"]
+mod ticket_3905_tests;
+
+// —— #3908 (the mixin-application family: the private-name collision face,
+// —— the const-constructor-with-mixin-field face, and the instantiated
+// —— spellings the not-implemented-interface message renders) ——
+#[cfg(test)]
+#[path = "ticket_3908_tests.rs"]
+mod ticket_3908_tests;
+
+// —— #3910 (the diagnose.rs pass-phase packet: the E13-4 in-fold latch
+// —— starvation, the E13-6 conditional return context, the `??` argument
+// —— join) ——
+#[cfg(test)]
+#[path = "ticket_3910_tests.rs"]
+mod ticket_3910_tests;
+
+// —— #3912 (the scopes_bodies.rs packet 4: the shadowed-binder typedef
+// —— substitution, the multi-row `??` join latch, the named-selector and
+// —— prefix-qualified creation heads feeding closure formals) ——
+#[cfg(test)]
+#[path = "ticket_3912_tests.rs"]
+mod ticket_3912_tests;
+
+// —— #3909 (the engine_core.rs null-assert packet: the always-fails
+// —— whole-node span and Never rewrite, the super operand guard, the
+// —— Function-interface callee send, the this(...) implicit-call result,
+// —— and the static-member tear-off face) ——
+#[cfg(test)]
+#[path = "ticket_3909_tests.rs"]
+mod ticket_3909_tests;
+
+// —— #3917 (packet 3: the call-result/??= index-write faces, the bounds
+// —— strict-relation routing, the ?? send-argument join routing, the
+// —— S1c promoted-bound routing) ——
+#[cfg(test)]
+#[path = "ticket_3917_tests.rs"]
+mod ticket_3917_tests;
+
+// —— #3919 (the mixin-application packet 2: the instantiated constraint
+// —— verdict, the clause-error short-circuit, and the nested written-argument
+// —— message face) ——
+#[cfg(test)]
+#[path = "ticket_3919_tests.rs"]
+mod ticket_3919_tests;
+
+// —— #3925 (the mixin-constraint parameter arms: the instantiated verdict
+// —— over type variables, the bound-based `X <: Object` arm, and the
+// —— prefix-spelled constraint matched by element) ——
+#[cfg(test)]
+#[path = "ticket_3925_tests.rs"]
+mod ticket_3925_tests;
+
+// —— #3926 (the mixin `on` capture under augmentation: the augment-declared
+// —— `on` constraint's merge into the element, the fragment-local `with`
+// —— check index, and the record-typed `on` head's empty constraint face) ——
+#[cfg(test)]
+#[path = "ticket_3926_tests.rs"]
+mod ticket_3926_tests;
+
+// —— #3932 (the core-constructor tear-off FORMALS face: the SDK
+// —— factories signature table + the ctor_selector_ty resolve-miss
+// —— consumption, covering the tearing_off_from_typedef family) ——
+#[cfg(test)]
+#[path = "ticket_3932_tests.rs"]
+mod ticket_3932_tests;
+
+// —— #3931 (the syntax_test_62 faces: a rejected `is` type must still decide
+// —— `unnecessary_type_check` and must not report an undefined name — both
+// —— routed to the engine_core/listener/resolution owners) ——
+#[cfg(test)]
+#[path = "ticket_3931_tests.rs"]
+mod ticket_3931_tests;
+
+// —— #3911 (the top-merge consumer chain's discriminated roots: merged
+// —— `>>` group closers, the `Left Top` recursion through `Object?`,
+// —— parameterless function-tail clause arguments, the declared-variance
+// —— same-head gather) ——
+#[cfg(test)]
+#[path = "ticket_3911_tests.rs"]
+mod ticket_3911_tests;
+
+// —— #3913 (the const_eval packet: the created-primitive operand matrix,
+// —— the routed parameter-default face and the routed E-op B family) ——
+#[cfg(test)]
+#[path = "ticket_3913_tests.rs"]
+mod ticket_3913_tests;
+
+// —— #3933 (the two promotion staged-re-decision faces routed out of the
+// —— #3909 packet: the implicitly typed operand's promoted `!`, and the
+// —— `??=` RHS promotion that must not survive the if-null join) ——
+#[cfg(test)]
+#[path = "ticket_3933_tests.rs"]
+mod ticket_3933_tests;
+
+// —— #3934 (the class arm of `_reportConcreteClassWithAbstractMember`, plus
+// —— the parser-tier `invalid_inline_function_type` rows it shares its cases
+// —— with) ——
+#[cfg(test)]
+#[path = "ticket_3934_tests.rs"]
+mod ticket_3934_tests;
+
+// —— #3861 (the written-`dynamic` creation face of the `written_ty_invalid`
+// —— gate, landed dynamic-only; the written-`void` posture frozen silent) ——
+#[cfg(test)]
+#[path = "ticket_3861_tests.rs"]
+mod ticket_3861_tests;
+
+// —— #3944 (the header-clause GFT argument's signature-variable stitch: the
+// —— written quantifier rides the clause tree, oracle-verbatim) ——
+#[cfg(test)]
+#[path = "ticket_3944_tests.rs"]
+mod ticket_3944_tests;
+
+// —— #3946 (the nested-literal context channel: an `=>`-nested literal binds
+// —— the enclosing context's instantiated return, never the declaration) ——
+#[cfg(test)]
+#[path = "ticket_3946_tests.rs"]
+mod ticket_3946_tests;
+
+// —— #3947 (written core-type names in closure formals must resolve exactly
+// —— like any other written type position) ——
+#[cfg(test)]
+#[path = "ticket_3947_tests.rs"]
+mod ticket_3947_tests;
+
+// —— #3564 (the typedef-alias `is` target interns its honest
+// —— required-positional count; `req is TOpt` stays silent) ——
+#[cfg(test)]
+#[path = "ticket_3564_tests.rs"]
+mod ticket_3564_tests;
+
+// —— #3942 (the declared-variance SUBTYPE face: `covariant_args` reads the
+// —— model's `type_param_variances` column, so static-return and argument
+// —— shapes over an `in`/`inout` head decide in the declared direction) ——
+#[cfg(test)]
+#[path = "ticket_3942_tests.rs"]
+mod ticket_3942_tests;
+
+// —— #3927 (the invocation.rs callee-shape packet: the four named fill-ins
+// —— plus the matrix clusters landed here) ——
+#[cfg(test)]
+#[path = "ticket_3927_tests.rs"]
+mod ticket_3927_tests;
+
+// —— #3945 (the listener.rs successor packet: the `??` join's node-row key,
+// —— the explicit-creation write face, and the routed generic-literal /
+// —— read-latch ordering gaps) ——
+#[cfg(test)]
+#[path = "ticket_3945_tests.rs"]
+mod ticket_3945_tests;
+
+// —— #3920 (the scopes_bodies.rs shorthand-dispatch completion packet: the
+// —— nullable-context strip, the collection first-element context, and the
+// —— shorthand-ctor type-args gate landed; the const-spelling and flow
+// —— residuals are pinned, routed, and `#[ignore]`d) ——
+#[cfg(test)]
+#[path = "ticket_3920_tests.rs"]
+mod ticket_3920_tests;
+
+// —— #3956 (the const_eval_faces.rs `classify_call` shorthand-callee face:
+// —— the context type's member set splits the method shorthand from the
+// —— constructor shorthand, and the shorthand creation reaches the
+// —— initializer walk) ——
+#[cfg(test)]
+#[path = "ticket_3956_tests.rs"]
+mod ticket_3956_tests;
+
+// —— #3954 (the engine_core.rs `!` staging gate: unknown-typed bare local
+// —— reads — the implicit formal and the unannotated `var` — now reach the
+// —— teardown promotion re-decision; the silent and qualified bounds held) ——
+#[cfg(test)]
+#[path = "ticket_3954_tests.rs"]
+mod ticket_3954_tests;
+
+// —— #3952 (the const_eval_faces.rs `finish_const_initializer` written-
+// —— annotation guard: a declared const local keeps its written type, the
+// —— folded value type binds only the unannotated declarator) ——
+#[cfg(test)]
+#[path = "ticket_3952_tests.rs"]
+mod ticket_3952_tests;
+
+// —— #3969 (the const_eval_faces.rs `unary_fault_extent` nested-anchor
+// —— guard: a fault span already starting at the operator keeps its
+// —— innermost-`PrefixExpression` extent; only an operand-anchored span
+// —— still walks back to the prefix) ——
+#[cfg(test)]
+#[path = "ticket_3969_tests.rs"]
+mod ticket_3969_tests;
+
+// —— #3948 (the annotation verdict's kind arm + consumption-keyed
+// —— suppression, and the formal default-value context channel) ——
+#[cfg(test)]
+#[path = "ticket_3948_tests.rs"]
+mod ticket_3948_tests;
+
+// —— #3959 (the alias fold's capture-time RHS interns carry the honest
+// —— required-positional count: the substitution and `?`-unit rebuilds
+// —— route the split through the honest producers, and the element-model
+// —— signature fallback reads the shape's own boundary) ——
+#[cfg(test)]
+#[path = "ticket_3959_tests.rs"]
+mod ticket_3959_tests;
+
+// —— #3683 (the statement-position as-cast promotion: the re-derivation
+// —— publishes the cast target on the shared read-type table under the
+// —— declared-face contract, and the extension `on T` bound family binds
+// —— the receiver exactly where the oracle's promoted receiver does) ——
+#[cfg(test)]
+#[path = "ticket_3683_tests.rs"]
+mod ticket_3683_tests;
+
+// —— #3961/#3962 (the bounds `ConstructorName` deny posture and the
+// —— invocation.rs merged-callee / if-null-join / creation-instantiation
+// —— fill-ins routed from #3927's report) ——
+#[cfg(test)]
+#[path = "ticket_3961_tests.rs"]
+mod ticket_3961_tests;
+
+// —— #3982 (the statement-list duplicate scope binds first-wins —
+// —— `LocalScope.add`'s `??=` — and `resolve_local` consults the
+// —— innermost open scope's stored range so a post-redeclaration read
+// —— lands on the first declaration) ——
+#[cfg(test)]
+#[path = "ticket_3982_tests.rs"]
+mod ticket_3982_tests;
+
+// —— #3978 (a mixed prefix-operator run is captured in the syntactic
+// —— wrap order — innermost operator first — so the evaluated tree and
+// —— every level's extent match the oracle's nested PrefixExpressions) ——
+#[cfg(test)]
+#[path = "ticket_3978_tests.rs"]
+mod ticket_3978_tests;
+
+// —— #3986 (local declarations consume `pending_annotations`: the
+// —— `begin_variables_declaration` gated drain + the unconditional
+// —— `begin_local_function_declaration` drain empty the latch the
+// —— `DeclKind`-less locals never routed through `note_decl_site`) ——
+#[cfg(test)]
+#[path = "ticket_3986_tests.rs"]
+mod ticket_3986_tests;
+
+// —— #3966 (a forward-referenced top-level getter/variable face stages at
+// —— the bare read from the whole-unit index — a `Never` getter declared
+// —— after the reader kills its null-aware chain like the backward twin) ——
+#[cfg(test)]
+#[path = "ticket_3966_tests.rs"]
+mod ticket_3966_tests;
+
+// —— #3992 (a const constructor's `assert(identical(a, b))` /
+// —— `assert(!identical(a, b))` initializer is the potentially-constant
+// —— grammar's one admitted call — `init_invocation_level` must exempt
+// —— the two-argument `identical` callee so it folds `Expr::Call`
+// —— through the generic close, never the init-invocation `Expr::Other`) ——
+#[cfg(test)]
+#[path = "ticket_3992_tests.rs"]
+mod ticket_3992_tests;
+
+// —— #3988 (the collector's `begin_optional_formal_parameters` relays
+// —— `TreeSink::function_optional_group` — a collector-armed function
+// —— annotation carries the written required/optional split, so a
+// —— required operand against `void Function([T])` stays silent like
+// —— the oracle instead of reading constant-true) ——
+#[cfg(test)]
+#[path = "ticket_3988_tests.rs"]
+mod ticket_3988_tests;
+
+// —— #3993 (the `implemented`-map walk `interface_has_concrete` now mirrors —
+// —— own concrete member + field-induced accessors + implicit Object/Enum +
+// —— non-Object noSuchMethod forwarders + complete augment fragments — and
+// —— `fn_sig_subtype` abstains on any InvalidType-bearing signature) ——
+#[cfg(test)]
+#[path = "ticket_3993_tests.rs"]
+mod ticket_3993_tests;
+
+// —— #3989/#3990 (the if-null composite join's accept and LUB directions —
+// —— `int? ?? int` joins `int` and `String? ?? int` joins `Object` through
+// —— `assignable`'s `Object`-source arm — and the unstamped member send's
+// —— `Object? Function()` re-derivation beside the chained-send stamp) ——
+#[cfg(test)]
+#[path = "ticket_3989_tests.rs"]
+mod ticket_3989_tests;
+
+// —— #3991 (a plain `=` write target is not a read — the bare identifier
+// —— resolving to a top-level/member `Never` getter records the
+// —— member-selector flow context so the target's read face never opens a
+// —— dead window from the write's own RHS) ——
+#[cfg(test)]
+#[path = "ticket_3991_tests.rs"]
+mod ticket_3991_tests;
+
+// —— #3995 (Lane CT regression triage — the covariant-column silence, the
+// —— concrete-formal `bool -> int` argument verdict, and the names-only
+// —— `Future` clause head's implements_non_class route) ——
+#[cfg(test)]
+#[path = "ticket_3995_tests.rs"]
+mod ticket_3995_tests;
+
+// —— #3994 (the clause-argument scanner's keyword-headed function tails —
+// —— `scan_type_args`'s `dynamic`/`void` arms carry the `Function()`
+// —— literal tail, so `B<dynamic Function()>` / `B<void Function()>`
+// —— parse faithful and store a function-typed written argument) ——
+#[cfg(test)]
+#[path = "ticket_3994_tests.rs"]
+mod ticket_3994_tests;
+
+// —— #3996/#3997 (the bare top-level-declaration write faces — the
+// —— `RefTarget::Decl` arm's setter-miss verdict reports
+// —— `assignment_to_final` on a getter-only or `final` top-level target,
+// —— and the compound lvalue's `resolveForWrite` LHS never reads the
+// —— `Never` face, so `x += e` revives the parked pre-exit state) ——
+#[cfg(test)]
+#[path = "ticket_3996_tests.rs"]
+mod ticket_3996_tests;
+
+// —— #3999 (the send-close chain's member face for a dual-clause member —
+// —— a member declared under both an `extends` clause-arg and an
+// —— `implements` clause-arg types the send through the MERGED interface
+// —— column, never the single-edge `extends` face) ——
+#[cfg(test)]
+#[path = "ticket_3999_tests.rs"]
+mod ticket_3999_tests;
+
+// —— #3869 (the member-walk miss arms' accessor-callee `Function` variant +
+// —— `callee_return_ty`'s `CoreRet::ElemArg(0)` receiver-argument projection,
+// —— and `sig_has_unknown` reading the `InvalidType` face, not the bare
+// —— sentinel) ——
+#[cfg(test)]
+#[path = "ticket_3869_tests.rs"]
+mod ticket_3869_tests;
+
+// —— #4001 (check_clause_element_kinds' unindexed declaring file = the
+// —— names-only face: clause-legal, never a clause code at a resolved head;
+// —— indexed non-class heads still report) ——
+#[cfg(test)]
+#[path = "ticket_4001_tests.rs"]
+mod ticket_4001_tests;
+
+// —— #4010 (the collection-literal element LUB answers the oracle's join —
+// —— Object / per-slot `Map<K, V>` / spread element types — not `dynamic`) ——
+#[cfg(test)]
+#[path = "ticket_4010_tests.rs"]
+mod ticket_4010_tests;
+
+// —— #4014 (if/else branch join + generic-param spread bound face) ——
+#[cfg(test)]
+#[path = "ticket_4014_tests.rs"]
+mod ticket_4014_tests;
+
+// —— #4007 (the `list_element_type_not_assignable` channel rework — the
+// —— `?` element unskip, the for-in header channel, the typed-group map
+// —— context, the nested-literal upward face, and the boundary pins) ——
+#[cfg(test)]
+#[path = "ticket_4007_tests.rs"]
+mod ticket_4007_tests;
+
+// —— #4006 (the names-only SDK face's declaration-kind fact — a
+// —— typedef-to-function-type face reports the clause code, a class
+// —— face and a kindless entry stay clause-legal) ——
+#[cfg(test)]
+#[path = "ticket_4006_tests.rs"]
+mod ticket_4006_tests;
+
+// —— #3980 (the composite-fold teardown recompute — a binary/conditional
+// —— fold's starved `read_type_at` consult re-derives the promoted result
+// —— at `filter_staged` through the pending-record rewrite map) ——
+#[cfg(test)]
+#[path = "ticket_3980_tests.rs"]
+mod ticket_3980_tests;
+
+// —— #4004 (the two foreign-red faces' layer guards — the generic
+// —— signature's quantifier-leaf slots decide like the shared fresh
+// —— parameters, and a function-typed formal's own value read answers
+// —— its captured signature) ——
+#[cfg(test)]
+#[path = "ticket_4004_tests.rs"]
+mod ticket_4004_tests;
+
+// —— #4013 (the typed collection literal initializer's written type
+// —— arguments are the inferred declaration's face — list/set/map arity,
+// —— the empty annotated literal, the written `Null`, the declarator-end
+// —— gate, and the unannotated control) ——
+#[cfg(test)]
+#[path = "ticket_4013_tests.rs"]
+mod ticket_4013_tests;
+
+// —— #4038 (the collector's typed literal initializer face binds only
+// —— where the literal ends the declarator — `;`/`,`/`..` keep it,
+// —— `.first`/`as` continuations never bind the container face) ——
+#[cfg(test)]
+#[path = "ticket_4038_tests.rs"]
+mod ticket_4038_tests;
+
+// —— #4012 (the cluster-B engine-side twin — direct-literal operands
+// —— fold through the exact join and the if-led element joins its
+// —— branch leaves at the is-operand and bind-time faces) ——
+#[cfg(test)]
+#[path = "ticket_4012_tests.rs"]
+mod ticket_4012_tests;
+
+#[cfg(test)]
+#[path = "ticket_3815_tests.rs"]
+mod ticket_3815_tests;
+
+// —— #4009 (the nested prefixed type argument keeps the enclosing
+// —— prefixed head's qualified-name latch — `core.List<core.int>`
+// —— interns whole, the function_type family's prefixed formal leaf) ——
+#[cfg(test)]
+#[path = "ticket_4009_tests.rs"]
+mod ticket_4009_tests;
+
+// —— #4131 (the qualified implicit creation's type-argument check past the
+// —— shorthand probe, the core-member claim gated on a `dart:core`
+// —— universe, the receiver chain past the former recursion cap) ——
+#[cfg(test)]
+#[path = "ticket_4131_tests.rs"]
+mod ticket_4131_tests;
+
+// —— #4133 (the two span-face fixes: `duplicate_field_name` emission at
+// —— the later-occurrence label span on record literals AND record type
+// —— annotations; `dead_code` rows after an always-throwing cast pattern
+// —— exhausts the switch) ——
+#[cfg(test)]
+#[path = "ticket_4133_tests.rs"]
+mod ticket_4133_tests;
+
+// —— #4132 (the raw-creation inference face: the alias twin spells the
+// —— expanded class parameter, alias-headed and declared named creations
+// —— report once over the right parameters) ——
+#[cfg(test)]
+#[path = "ticket_4132_tests.rs"]
+mod ticket_4132_tests;

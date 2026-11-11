@@ -391,6 +391,23 @@ fn print_state(format: OutputFormat, state: &SessionState, attached: bool) {
 // The serve loop
 // ---------------------------------------------------------------------------
 
+/// The resident serve's engine runtime (#4210): the analyze face's
+/// unconditional L3 posture — the content store armed at the 10 GiB
+/// default cap. The cross-session warm path lives behind that store: the
+/// staged facts replay, the library-run replay, the completed runs'
+/// persistence, and the lint rows' persisted half are all silent no-ops
+/// on an unarmed engine, so a serve spawned without it cold-recomputes
+/// the whole workspace on its first turn (`libraries_analyzed` = every
+/// library) instead of adopting the standing generation.
+#[cfg(unix)]
+fn serve_runtime(trace: Option<dartq_engine::event::TraceSink>) -> dartq_daemon::SessionRuntime {
+    dartq_daemon::SessionRuntime {
+        content_store_limit: Some(dartq_engine::store::DEFAULT_SIZE_LIMIT),
+        trace,
+        ..dartq_daemon::SessionRuntime::default()
+    }
+}
+
 /// The serve loop's wake granularity: the accept tick, the beater's
 /// sleep slices, and the signal poll all ride it. The beater must not
 /// sleep a whole [`HEARTBEAT`] blind — the shutdown ladder joins it,
@@ -455,7 +472,14 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     // (`dartq events progress` reads it; the file truncates per serve, so
     // each resident generation's sweep starts at zero).
     let trace = layout.dir.join("trace.jsonl");
-    let mut runtime = dartq_daemon::SessionRuntime::default();
+    // #4210: the resident serve arms the L3 content store at the analyze
+    // face's unconditional default cap ([`serve_runtime`]). An unarmed
+    // store makes the cross-session hooks silent no-ops — the staged
+    // facts replay, the library-run replay, the completed runs'
+    // persistence, and the lint rows' persisted half all skip — so every
+    // spawn re-derived the whole workspace (7.3–8.7 s on the 1,332-file
+    // cockpit corpus where a warm in-process run took 0.56 s).
+    let mut runtime = serve_runtime(None);
     match dartq_engine::event::TraceSink::create(&trace) {
         Ok(sink) => runtime.trace = Some(sink),
         Err(error) => eprintln!("dartq: session serve: trace sink disabled: {error}"),
@@ -942,10 +966,16 @@ fn serve_shutdown(
     code: u8,
 ) -> u8 {
     // #2729: every ladder entry kills the session's analysis token —
-    // the signal arms already share the cell (idempotent here), and
-    // the flag-less exits (idle reap, unrecoverable listener) leave
+    // the signal arms already share the cell (idempotent here), and the
+    // flag-less exits (idle reap, unrecoverable listener) leave
     // no live analyzer behind before the detach walk and cleanup run.
     session.cancel_analysis();
+    // #4199: the ladder's clean-shutdown write — the serve loop's exit
+    // flushes at client disconnect, but a session stopped while live
+    // (SIGTERM, idle reap) carried its facts only in memory; without this
+    // the next session cold-started from zero. The dirty gate inside
+    // makes a clean session's flush a no-op.
+    session.flush_snapshot();
     let released = session.debug_shutdown().unwrap_or(0);
     let _ = events.append(
         "session",
@@ -1068,6 +1098,36 @@ pub(crate) mod tests {
     /// out from under its assertions). Shared with the mcp module's
     /// serve test via `serve_loop_for_tests`.
     pub(crate) static SIGNAL_SERIALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #4210: the resident serve's runtime arms the L3 content store at
+    /// the analyze face's default cap. The whole cross-session warm path
+    /// (staged facts replay, library-run replay, completed runs'
+    /// persistence, lint rows' persisted half) is a silent no-op on an
+    /// unarmed engine, so dropping this arming puts every spawn back on a
+    /// cold workspace recompute.
+    #[cfg(unix)]
+    #[test]
+    fn serve_runtime_arms_the_l3_store_at_the_analyze_default() {
+        let runtime = serve_runtime(None);
+        assert_eq!(
+            runtime.content_store_limit,
+            Some(dartq_engine::store::DEFAULT_SIZE_LIMIT),
+            "the resident serve arms the cross-session content store"
+        );
+        let standing = dartq_daemon::SessionRuntime::default();
+        assert_eq!(
+            runtime.memory_limit_mib, standing.memory_limit_mib,
+            "the budget keeps the standing floor"
+        );
+        assert!(
+            runtime.pooled_mapped_store,
+            "the shared mapped store stays default-on"
+        );
+        assert!(
+            runtime.trace.is_none(),
+            "the caller arms the trace sink at its own create point"
+        );
+    }
 
     /// The session daemon's busy lock is held exactly while it serves or
     /// holds a debug session: the memory ledger, which may release an

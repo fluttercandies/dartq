@@ -8,36 +8,35 @@
 //!
 //! One synthetic ~10 KB Dart file with realistic declaration and name
 //! density drives the real production path — `Engine::set_content` →
-//! `Engine::analyze` — and each resident structure is walked through public
-//! accessors only: `std::mem::size_of` for the inline header plus
-//! collection length × element size for the heap (the
-//! `dartq-ast/tests/metrics.rs` / `string_table_memory` posture). Two
-//! internals are not nameable from an integration test and are counted by
-//! documented composition instead:
+//! `Engine::analyze` — and each resident structure is measured through
+//! public accessors only: `std::mem::size_of` for the inline header plus
+//! the production `heap_bytes` accounting for the owned heap (the
+//! `dartq-ast/tests/metrics.rs` / `string_table_memory` posture); the
+//! hand-rolled composition remains only where no production face exists
+//! (`LineIndex`, the content store).
 //!
-//! * `RawSites` (dartq-index, crate-internal): five parallel columns of
-//!   `StringId` + kind + family + offset + length = 14 B per site (the five
-//!   Vec headers are already inside `size_of::<FileCapture>()`). The site
-//!   count is derived exactly: every captured site folds into exactly one
-//!   `RefRow` or one `NameRow` ([`dartq_index::LibraryIndex`] build), so
-//!   sites = the library's reference count plus its unresolved-name count,
-//!   and the names are enumerable by probing every word token of the
-//!   source — site names are always word tokens and keywords never have
-//!   rows, so the over-probe is free and the sum is exact. The heap side is
-//!   pinned at capacity via [`FileCapture::sites_capacity`]: the
-//!   finish-time shrink must leave `capacity == len`, so a reservation leak
-//!   (e.g. the token-count preallocation `RawSites` opens with) trips the
-//!   pin.
-//! * `SubtypeEdge` is not re-exported, so its row is counted by field-list
-//!   composition (file + name + supertype, dartq-index `library.rs`).
+//! The crate-internal `RawSites` columns (dartq-index capture.rs: five
+//! parallel `StringId` + kind + family + offset + length columns, 14 B per
+//! site) are counted at reserved capacity via
+//! [`FileCapture::sites_capacity`] — capacity is what the allocator holds,
+//! and the finish-time shrink must leave `capacity == len`, so a
+//! reservation leak (e.g. the token-count preallocation `RawSites` opens
+//! with) trips the pin. The expected row count is derived exactly from the
+//! library surface: every captured site folds into exactly one parser-level
+//! `RefRow` or one built `NameRow` ([`dartq_index::LibraryIndex`] build),
+//! and the refs slice additionally carries the semantic member-ref rows the
+//! diagnose fold publishes beside the sites (#2618). Those semantic rows
+//! are not extra sites — the site they point at already folded into the
+//! names table — and their non-`NONE` `target_container` is the documented
+//! discriminator (`RefRow::target_container`).
 //!
-//! The ceilings pin order of magnitude, not exact bytes. They sit ~3x
-//! above the expected measurement (the audit's 0.43x estimate could not
-//! see the crate-internal site columns, so the honest full-structure
-//! number is higher) and trip where a row starts carrying duplicated text
-//! or per-row heap structures instead of interned ids and flat columns.
-//! The fail messages print the measured numbers, so a trip is itself the
-//! evidence needed to recalibrate.
+//! The ceilings pin order of magnitude, not exact bytes: on this fixture
+//! the measured full-structure numbers are ~2.1 KB/KB (`FileCapture`) and
+//! ~3.0 KB/KB (`LibraryIndex`) against 5 KB/KB ceilings, and a row that
+//! starts carrying duplicated text or per-row heap structures instead of
+//! interned ids and flat columns trips them. The fail messages print the
+//! measured numbers, so a trip is itself the evidence needed to
+//! recalibrate.
 //!
 //! `FileElements` (dartq-semantic) is deliberately absent: that crate is
 //! mid-flight on a parallel lane and this test must not touch it. Its pin
@@ -52,35 +51,37 @@
 
 mod common;
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::mem::size_of;
 
 use common::Fixture;
 use dartq_engine::CancellationToken;
-use dartq_index::{DeclRow, FileCapture, LibraryIndex, NameRow, RefRow, SuperEdge, TargetRef};
-use dartq_source::{ContentId, FileId, LineIndex, StringId};
+use dartq_index::{FileCapture, LibraryIndex};
+use dartq_source::{ContentId, LineIndex, StringId};
 
 /// Site columns of the crate-internal `RawSites` (dartq-index capture.rs):
 /// `StringId` + kind byte + family byte + offset + length. The five Vec
-/// headers are already inside `size_of::<FileCapture>()`. The heap side is
-/// counted at reserved capacity, not row count — `Builder::finish` shrinks
-/// the token-count reservation to the row count, so the pinned slack is
-/// `sites_capacity() - sites_len` and the capacity pin below asserts that
-/// slack is zero.
+/// headers are already inside `size_of::<FileCapture>()`; the column heap
+/// enters the capture bytes through `FileCapture::heap_bytes` at reserved
+/// capacity. `Builder::finish` shrinks the token-count reservation to the
+/// row count, so the pinned slack is `sites_capacity() - sites_len` and
+/// the capacity pin below asserts that slack is zero.
 const RAW_SITE_ROW_BYTES: usize = size_of::<StringId>() + 2 + 2 * size_of::<u32>();
 
 /// Full-capture ceiling: 5 KB of resident capture per KB of source. The
 /// audit estimated ~0.43x from the visible rows alone; the honest
-/// full-structure measurement (declaration rows + superclass edges + the
-/// derived site columns) is expected near 1.8 KB/KB on this fixture
-/// (first run measured 1.57: 16276 B over 10343 B).
+/// full-structure measurement — the inline header plus `heap_bytes` (rows
+/// and site columns at reserved capacity) — is dominated by the row
+/// columns (21364 B over 10343 B, 2.07 KB/KB on the first measured run),
+/// and a row that starts carrying duplicated text or per-row heap
+/// structures instead of interned ids and flat columns trips the ceiling.
 const FILE_CAPTURE_KB_PER_KB_CEILING: f64 = 5.0;
 
-/// Reference-surface ceiling: 5 KB per KB of source. Expected near
-/// 1.7 KB/KB on this single-library fixture (most uses land in the names
-/// table; a workspace with imports shifts them to slightly larger `RefRows`,
-/// not more bytes).
+/// Reference-surface ceiling: 5 KB per KB of source. The exact
+/// `heap_bytes` accounting on this single-library fixture measures
+/// 31240 B over 10343 B (3.02 KB/KB — most uses land in the names table; a
+/// workspace with imports shifts them to slightly larger `RefRow`s, not
+/// more bytes).
 const LIBRARY_INDEX_KB_PER_KB_CEILING: f64 = 5.0;
 
 /// Line-index ceiling: 0.75 KB per KB of source — 4 B per line start plus
@@ -95,40 +96,21 @@ const LINE_INDEX_KB_PER_KB_CEILING: f64 = 0.75;
 /// the same loose guard the string-table pin uses).
 const STORE_ROW_OVERHEAD_CEILING: usize = 128;
 
-/// Deep bytes of one file's capture: the inline header (which already
-/// carries the `FileIndex` and `RawSites` Vec headers) plus the declaration
-/// rows, the superclass edges, and the site columns at reserved capacity
-/// (`sites_capacity` — capacity is what the allocator actually holds; the
-/// capacity pin below asserts the finish-time shrink left zero slack).
-fn file_capture_bytes(capture: &FileCapture, site_capacity: usize) -> usize {
-    size_of::<FileCapture>()
-        + std::mem::size_of_val(capture.index.decls())
-        + std::mem::size_of_val(capture.index.supers())
-        + site_capacity * RAW_SITE_ROW_BYTES
+/// Deep bytes of one file's capture: the inline header (which carries the
+/// `FileIndex` and `RawSites` Vec headers) plus the production heap
+/// accounting — the declaration rows, the supertype edges, the equal-name
+/// run directory, and the site columns at reserved capacity (the capacity
+/// pin below asserts the finish-time shrink left zero slack).
+fn file_capture_bytes(capture: &FileCapture) -> usize {
+    size_of::<FileCapture>() + capture.heap_bytes()
 }
 
-/// Deep bytes of one library's reference surface. The names table and the
-/// CSR runs array have no public length; both are derived — names rows
-/// from `name_rows` (the probe sum), runs as the distinct-target count of
-/// the sorted refs (one u32 run start per target). The supertype edge row
-/// is `FileId + StringId + TargetRef` by field list.
-fn library_index_bytes(surface: &LibraryIndex, name_rows: usize, super_rows: usize) -> usize {
-    let refs = surface.refs();
-    let mut runs = 0usize;
-    let mut prev: Option<(FileId, StringId)> = None;
-    for row in refs {
-        let key = (row.target_file, row.target_name);
-        if prev != Some(key) {
-            runs += 1;
-            prev = Some(key);
-        }
-    }
-    let super_row = 2 * size_of::<FileId>() + size_of::<StringId>() + size_of::<TargetRef>();
-    size_of::<LibraryIndex>()
-        + std::mem::size_of_val(refs)
-        + runs * size_of::<u32>()
-        + name_rows * size_of::<NameRow>()
-        + super_rows * super_row
+/// Deep bytes of one library's reference surface: the inline header plus
+/// the production heap accounting — every boxed column at its exact length
+/// (reference rows, the CSR run tables, the built and seam name rows, the
+/// supertype rows, and their run directory).
+fn library_index_bytes(surface: &LibraryIndex) -> usize {
+    size_of::<LibraryIndex>() + surface.heap_bytes()
 }
 
 /// Deep bytes of one file's line index: the inline header plus the
@@ -201,7 +183,7 @@ fn synthetic_source() -> String {
 }
 
 #[test]
-#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
+#[expect(clippy::too_many_lines)] // one fixture pins four structures end to end
 fn synthetic_file_structures_pin_bytes_per_kb() {
     let source = synthetic_source();
     let source_bytes = source.len();
@@ -230,26 +212,27 @@ fn synthetic_file_structures_pin_bytes_per_kb() {
         .map(|(_, surface)| surface)
         .expect("one live library");
 
-    // Exact site/name derivation (see the module docs): probe every word
-    // token; resolved uses are the reference rows, everything else is a
-    // names-table row, and the two together are the raw site count.
-    let strings = engine.strings();
-    let words: BTreeSet<&str> = source
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|word| {
-            word.chars()
-                .next()
-                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        })
-        .collect();
-    let name_rows: usize = words
+    // Exact site derivation (see the module docs): every captured site
+    // folds into exactly one parser-level reference row or one built
+    // names-table row, so the parser half plus the names table is the raw
+    // site count. The refs slice also carries the semantic member-ref rows
+    // the diagnose fold publishes beside the sites (#2618) — rows whose
+    // non-`NONE` `target_container` marks them as member targets, not extra
+    // sites. The seam overflow rows are not site-derived and stay out.
+    let refs = surface.refs();
+    let semantic_refs = refs
         .iter()
-        .map(|word| surface.unresolved(strings.intern(word)).count())
-        .sum();
-    let refs = surface.reference_count();
-    assert!(refs > 0, "fixture must exercise the resolved half");
+        .filter(|row| row.target_container != StringId::NONE)
+        .count();
+    let parser_refs = refs.len() - semantic_refs;
+    let name_rows = surface.names().len();
+    assert!(parser_refs > 0, "fixture must exercise the resolved half");
     assert!(name_rows > 0, "fixture must exercise the unresolved half");
-    let site_rows = refs + name_rows;
+    assert!(
+        semantic_refs > 0,
+        "fixture must exercise the semantic member-ref fold"
+    );
+    let site_rows = parser_refs + name_rows;
     // The finish-time freeze shrinks the token-count reservation
     // `RawSites::with_capacity` opened with down to the row count, so the
     // pinned slack is `capacity - len`. `Vec::shrink_to_fit` sets
@@ -272,7 +255,7 @@ fn synthetic_file_structures_pin_bytes_per_kb() {
     let (store_row, store_total) = store_overhead(rows);
 
     // The pins: full-structure deep bytes per KB of source.
-    let capture_bytes = file_capture_bytes(capture, site_capacity);
+    let capture_bytes = file_capture_bytes(capture);
     let capture_per_kb = kb_per_kb(capture_bytes, source_bytes);
     assert!(
         capture_per_kb < FILE_CAPTURE_KB_PER_KB_CEILING,
@@ -283,13 +266,15 @@ fn synthetic_file_structures_pin_bytes_per_kb() {
         capture.index.supers().len(),
     );
 
-    let surface_bytes = library_index_bytes(surface, name_rows, capture.index.supers().len());
+    let surface_bytes = library_index_bytes(surface);
     let surface_per_kb = kb_per_kb(surface_bytes, source_bytes);
     assert!(
         surface_per_kb < LIBRARY_INDEX_KB_PER_KB_CEILING,
         "LibraryIndex residency ballooned: {surface_bytes} bytes for a \
          {source_bytes}-byte file ({surface_per_kb:.2} KB per KB; ceiling \
-         {LIBRARY_INDEX_KB_PER_KB_CEILING}; refs {refs}, names {name_rows})"
+         {LIBRARY_INDEX_KB_PER_KB_CEILING}; refs {}, parser {parser_refs}, \
+         semantic {semantic_refs}, names {name_rows})",
+        refs.len()
     );
 
     let line_bytes = line_index_bytes(line_index);
@@ -320,16 +305,13 @@ fn synthetic_file_structures_pin_bytes_per_kb() {
         line_index.line_count()
     );
     println!(
-        "decls {} x {} B, supers {} x {} B, sites {site_rows} rows {site_capacity} cap x {RAW_SITE_ROW_BYTES} B",
+        "decls {}, supers {}, sites {site_rows} rows {site_capacity} cap x {RAW_SITE_ROW_BYTES} B",
         capture.index.decls().len(),
-        size_of::<DeclRow>(),
-        capture.index.supers().len(),
-        size_of::<SuperEdge>()
+        capture.index.supers().len()
     );
     println!(
-        "refs {refs} x {} B, names {name_rows} x {} B",
-        size_of::<RefRow>(),
-        size_of::<NameRow>()
+        "refs {} (parser {parser_refs}, semantic {semantic_refs}), names {name_rows}",
+        refs.len()
     );
     println!(
         "FileCapture:   {capture_bytes:>6} B  ({capture_per_kb:.2} KB/KB; audit est 0.43, ceiling {FILE_CAPTURE_KB_PER_KB_CEILING})"

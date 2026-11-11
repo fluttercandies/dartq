@@ -204,8 +204,8 @@ fn round_trip_preserves_entries_and_tables() {
     expected.sort_by_key(|entry| entry.key.id());
     assert_eq!(reloaded.entries, expected);
 
-    // Byte-exact round-trip: the stored JSON segment is exactly the
-    // re-serialization of the loaded entry (the frame's checksummed body).
+    // Byte-exact round-trip: the stored binary segment is exactly the
+    // re-encoding of the loaded entry (the frame's checksummed body).
     let main = reloaded
         .entries
         .iter()
@@ -218,7 +218,9 @@ fn round_trip_preserves_entries_and_tables() {
     let body_at = framed.iter().position(|&b| b == b'\n').expect("framed") + 1;
     assert_eq!(
         &framed[body_at..],
-        serde_json::to_vec(main).expect("serialize").as_slice()
+        bincode_next::serde::encode_to_vec(main, bincode_next::config::standard())
+            .expect("encode")
+            .as_slice()
     );
 }
 
@@ -626,6 +628,34 @@ fn growing_resave_leaves_unchanged_entry_files_untouched() {
     );
     let snapshot = store.load::<TestPayload>(&header).expect("generation");
     assert_eq!(snapshot.entries.len(), 2);
+}
+
+/// A many-entry generation loads whole and in key order under the load
+/// fan-out (#4204): rayon's scheduling must not move a byte of the result
+/// — the accepted set equals the claim exactly and the entries come back
+/// sorted by key id, the same order the serial loop produced.
+#[test]
+fn wide_generation_loads_whole_under_the_fanout() {
+    let cache = TempCache::new("wide");
+    let header = test_header();
+    let saved: Vec<Entry<TestPayload>> = (0..2000u32)
+        .map(|i| Entry {
+            key: key((i % 256) as u8, u64::from(i)),
+            payload: payload(&format!("unit-{i}")),
+        })
+        .collect();
+    cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .save(&header, &tables(), &saved)
+        .expect("save");
+
+    let reloaded = cache
+        .store(DEFAULT_CAPACITY_BYTES)
+        .load::<TestPayload>(&header)
+        .expect("generation");
+    let mut expected = saved;
+    expected.sort_by_key(|entry| entry.key.id());
+    assert_eq!(reloaded.entries, expected);
 }
 
 /// The stamp entry frames embed: blake3-128 over the remap-slices

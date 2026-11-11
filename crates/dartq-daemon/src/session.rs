@@ -245,10 +245,12 @@ pub struct SessionRuntime {
     /// default (tagless) context's engine only — declared extra contexts
     /// run untraced. `None` constructs nothing and touches no event path.
     pub trace: Option<dartq_engine::event::TraceSink>,
-    /// The L3 content-store cap in bytes, armed on every context
-    /// when set. `None` keeps the store unarmed — the daemon's standing
-    /// posture (the analyze face arms it unconditionally at the 10 GiB
-    /// default).
+    /// The L3 content-store cap in bytes, armed on every context at
+    /// assembly and on every universe rebuild. `None` keeps the store
+    /// unarmed — the analyze face arms it unconditionally in its shell
+    /// ([`dartq_engine::store::DEFAULT_SIZE_LIMIT`]); the resident serve
+    /// shell arms the same default, or a session sits cold across
+    /// spawns. `Some` overrides the cap.
     pub content_store_limit: Option<u64>,
     /// The shared mapped-store posture, default on (#1842): assembly
     /// rebinds every context's content store to
@@ -1317,7 +1319,10 @@ impl Session {
         // before the trace sink moves into the default context — the
         // config-input watch's universe rebuild re-arms them on a
         // re-opened context (the trace sink itself cannot travel: one
-        // sink is one writer, and the engine consumed it).
+        // sink is one writer, and the engine consumed it). The rebuild
+        // arms the SAME values the first assembly did, the L3 cap
+        // included: a session whose spawn armed the run cache must never
+        // silently drop it across a universe rebuild (#4210).
         let (context_memory_limit_mib, context_content_store_limit, context_traced) = (
             session_runtime.memory_limit_mib,
             session_runtime.content_store_limit,
@@ -1354,14 +1359,13 @@ impl Session {
                 // the ladder at the shell's limit; a limit that never
                 // bites is indistinguishable from an unlimited run beyond
                 // one `Option` test per boundary.
-                engine.set_memory_limit(Some(session_runtime.memory_limit_mib));
-                // The L3 store arms only when the shell passes a cap
-                // (the daemon's standing posture keeps it unarmed; the
-                // analyze face arms unconditionally at the default cap).
-                // An unwritable store warns and leaves the engine unarmed
-                // — the cache is an accelerator, never a dependency; no
-                // home directory stays silently unarmed.
-                if let Some(size_limit) = session_runtime.content_store_limit
+                engine.set_memory_limit(Some(context_memory_limit_mib));
+                // The L3 store arms when the shell passes a cap — the
+                // rebuild re-arms the same value. An unwritable store
+                // warns and leaves the engine unarmed — the cache is an
+                // accelerator, never a dependency; no home directory
+                // stays silently unarmed.
+                if let Some(size_limit) = context_content_store_limit
                     && let Some(root) = dartq_engine::store::default_root()
                 {
                     let store_config = dartq_engine::store::StoreConfig { root, size_limit };
@@ -2817,6 +2821,15 @@ impl Session {
                     .expect("a drain-live read task is still pending");
                 let pending = self.reads.remove(position);
                 self.read_turn(pending, &mut turn);
+                // #4199: an analysis turn may have populated cold residency
+                // (a fresh session's first analyze holds the whole
+                // workspace's facts in memory) — the sink's dirty bit was
+                // write-only before, so a session that only ever analyzed
+                // never flushed its generation and the next session
+                // cold-started from zero. Conservative by design: a turn
+                // that changed nothing pays the debounced save's
+                // written-keys dedupe, never a re-projection.
+                self.snapshot.note_apply();
             }
         }
         // The turn's removals leave the publish baseline too: writes apply
@@ -3456,8 +3469,8 @@ impl Session {
     /// rows (#355) — memoized (#772), so a quiet turn parses only the
     /// turn's changed files — joined before the caller's severity-first
     /// sort so the answers keep the CLI analyze face's order. The context
-    /// engine is read through `runtime` directly so the memo field borrows
-    /// disjointly.
+    /// engine is borrowed mutably through `runtime` directly so the memo
+    /// field borrows disjointly.
     fn analyze_with_lints(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
         let mut diagnostics = self.analyze(context)?;
         let lint_roots = [self.workspace_root().to_path_buf()];
@@ -3465,7 +3478,7 @@ impl Session {
         // state lookup cannot miss.
         let engine = self
             .runtime
-            .context_state(context)
+            .context_state_mut(context)
             .expect("session contexts live for the session");
         diagnostics.extend(dartq_commands::lints::analyze_lints(
             engine,

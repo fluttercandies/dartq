@@ -31,14 +31,12 @@ use super::test_rig::{code_names, report_ops};
 /// `x.foo` is an unchecked nullable access and `takesObject(x)` is not
 /// assignable.
 ///
-/// Ignored — IMPL-GAP (rider, out of scope): `super_instantiation`'s
-/// identity instantiation early-returns `None` for every NON-generic
-/// container (`params_of(container)?` on an empty param list), so the
-/// downward `deconstruct(this)` inference never reaches the merge and `x`
-/// stays `dynamic`. invocation.rs `Engine::super_instantiation` (the
-/// `params_of(container)?` line in `infer_gather`'s climb arm).
+/// Landed (#3882-M1): `super_instantiation`'s identity instantiation now
+/// climbs with the EMPTY identity for a NON-generic container (the
+/// `params_of(container)?` early return on an empty param list starved
+/// the whole merge), so the downward `deconstruct(this)` inference
+/// reaches the duplicate-head topMerge.
 #[test]
-#[ignore = "impl gap: super_instantiation early-returns None on non-generic containers (invocation.rs)"]
 fn interfaces_direct_merged_object_question_reports() {
     let report = report_ops(
         r#"
@@ -73,11 +71,9 @@ class D0 extends A<dynamic> implements B<Object?> {
 /// `implements A<T>` edge contributes the second `A` instantiation, so
 /// `with M<Object?>` merges exactly like `implements B<Object?>`.
 ///
-/// Ignored — same IMPL-GAP as the direct arm: `super_instantiation`
-/// (invocation.rs, the `params_of(container)?` early return) yields `None`
-/// on the non-generic `D0`, so `deconstruct(this)` binds `x: dynamic`.
+/// Landed with the direct arm (#3882-M1 — the non-generic container's
+/// empty identity instantiation).
 #[test]
-#[ignore = "impl gap: super_instantiation early-returns None on non-generic containers (invocation.rs)"]
 fn interfaces_mixin_merged_object_question_reports() {
     let report = report_ops(
         r#"
@@ -269,11 +265,9 @@ class D7 extends A<dynamic> implements B<dynamic> {
 /// `A<void>`, so `x: void` — every use of the value is
 /// `use_of_void_result` (the oracle reports three rows on this shape).
 ///
-/// Ignored — same IMPL-GAP as the `Object?` arms: `super_instantiation`
-/// (invocation.rs, the `params_of(container)?` early return) yields `None`
-/// on the non-generic `D6`, so `deconstruct(this)` binds `x: dynamic`.
+/// Landed with the direct arm (#3882-M1 — the non-generic container's
+/// empty identity instantiation).
 #[test]
-#[ignore = "impl gap: super_instantiation early-returns None on non-generic containers (invocation.rs)"]
 fn interfaces_direct_void_void_reports_void_use() {
     let report = report_ops(
         r#"

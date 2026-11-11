@@ -226,6 +226,21 @@ impl<'a> Engine<'a> {
                     nullable: next_nullable,
                     args: next_args,
                 } if next_args != ArgListId::EMPTY => {
+                    // The chain continues only through another parameterized
+                    // alias (`typedef U<Y> = T<Y<int>>` lands on the alias
+                    // `T` — one substitution step per hop). A head that
+                    // resolves to no alias is a container head, and the
+                    // substituted use IS the answer: `typedef T<X> = C<X>`
+                    // turns `U<List<String>>` into `C<List<String>>`, the
+                    // landed head with its substituted arguments, not a
+                    // further re-walk that keeps the alias spelling.
+                    if !self.is_parameterized_alias(next) {
+                        return Some(Ty::Named {
+                            name: next,
+                            nullable: cur_nullable | next_nullable,
+                            args: next_args,
+                        });
+                    }
                     cur = next;
                     cur_nullable |= next_nullable;
                     cur_args = next_args;
@@ -267,6 +282,33 @@ impl<'a> Engine<'a> {
             }
         }
         None
+    }
+
+    /// Whether `name` resolves to a parameterized alias with a captured
+    /// right-hand side — [`Self::fold_parameterized_alias`]'s
+    /// walk-continuation test: only such a head folds another substitution
+    /// step; any other named head is the chain's landed answer.
+    fn is_parameterized_alias(&self, name: StringId) -> bool {
+        let decl = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => Some(decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                self.index.get(file).and_then(|f| f.decl(name))
+            }
+            _ => None,
+        };
+        let Some(decl) = decl else {
+            return false;
+        };
+        matches!(decl.kind, MicroKind::TypeAlias)
+            && decl.type_params > 0
+            && decl.var_ty != Ty::UNKNOWN
     }
 
     /// One substitution step: `name`'s parameterized alias declaration
@@ -363,13 +405,21 @@ impl<'a> Engine<'a> {
                     .record(&positional, &named, nullable)
             }
             Ty::Function { shape, nullable } => {
-                let (type_params, type_param_names, return_ty, positional, named) = {
+                let (
+                    type_params,
+                    type_param_names,
+                    return_ty,
+                    required_positional,
+                    positional,
+                    named,
+                ) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
                         shape.type_params_named.clone(),
                         shape.return_ty,
+                        shape.required_positional,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
@@ -394,12 +444,34 @@ impl<'a> Engine<'a> {
                     })
                     .collect();
                 // A count-only source (names never recorded) keeps its
-                // count-only identity — the rebuild never demotes it.
+                // count-only identity — the rebuild never demotes it. The
+                // required-positional split rides too: it is identity
+                // ([`FnShape::required_positional`]; upstream Dart SDK
+                // source, pkg/analyzer/lib/src/dart/element/type.dart
+                // `FunctionTypeImpl` `_equalParameters` — the two spellings
+                // are distinct types), so an all-required rebuild here
+                // would merge `void Function([int])` back into
+                // `void Function(int)` and distort every non-`is`
+                // consumer of the substituted use.
                 let mut args = self.boundary.args.borrow_mut();
                 let ty = if names.is_empty() && type_params > 0 {
-                    args.function(type_params, return_ty, &positional, &named, nullable)
+                    args.function_required(
+                        type_params,
+                        required_positional,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
                 } else {
-                    args.function_generic(&names, return_ty, &positional, &named, nullable)
+                    args.function_generic_required(
+                        &names,
+                        required_positional,
+                        return_ty,
+                        &positional,
+                        &named,
+                        nullable,
+                    )
                 };
                 drop(args);
                 ty
@@ -454,24 +526,43 @@ impl<'a> Engine<'a> {
                 shape,
                 nullable: own,
             } => {
-                let (type_params, type_param_names, return_ty, positional, named) = {
+                let (
+                    type_params,
+                    type_param_names,
+                    return_ty,
+                    required_positional,
+                    positional,
+                    named,
+                ) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
                     (
                         shape.type_params,
                         shape.type_params_named.clone(),
                         shape.return_ty,
+                        shape.required_positional,
                         shape.positional.to_vec(),
                         shape.named.to_vec(),
                     )
                 };
-                // A count-only source keeps its count-only identity.
+                // A count-only source keeps its count-only identity, and the
+                // required-positional split rides too (identity —
+                // [`FnShape::required_positional`]; the all-required
+                // producers would re-merge the two spellings).
                 let mut args = self.boundary.args.borrow_mut();
                 let ty = if type_param_names.is_empty() && type_params > 0 {
-                    args.function(type_params, return_ty, &positional, &named, own || nullable)
+                    args.function_required(
+                        type_params,
+                        required_positional,
+                        return_ty,
+                        &positional,
+                        &named,
+                        own || nullable,
+                    )
                 } else {
-                    args.function_generic(
+                    args.function_generic_required(
                         &type_param_names,
+                        required_positional,
                         return_ty,
                         &positional,
                         &named,
@@ -857,11 +948,11 @@ impl<'a> Engine<'a> {
     /// model answers where the walk-order capture cannot. `None` for every
     /// other shape: a parameterized alias keeps the capture's substitution
     /// face, and a non-function RHS is [`Self::alias_rhs`]'s business. The
-    /// shape's optional-ness columns are not modeled (a `FnShape` carries
-    /// no required boundary and no named-required flags) — positional
-    /// formals claim required and named formals claim optional, the
-    /// function-subtype direction the written `bool Function(String)`
-    /// corpus shapes never leave.
+    /// shape's required-positional boundary rides the signature verbatim
+    /// ([`FnShape::required_positional`] is identity — the all-required
+    /// reading would prove an arity gate on the wrong side); the named
+    /// formals' required flags stay unmodeled (named formals claim
+    /// optional, the under-report direction).
     fn element_model_alias_sig(&self, name: StringId) -> Option<Box<FnVarSig>> {
         let (owner, decl) = match lookup_scoped(
             self.graph,
@@ -904,7 +995,7 @@ impl<'a> Engine<'a> {
         Some(Box::new(FnVarSig {
             params: params.into(),
             positional: shape.positional.iter().copied().collect(),
-            required_positional: u16::try_from(shape.positional.len()).unwrap_or(u16::MAX),
+            required_positional: shape.required_positional,
             named: shape
                 .named
                 .iter()
@@ -2203,11 +2294,17 @@ impl<'a> Engine<'a> {
             // member. `walk_members`'s `found_origin` latched the declaring
             // file; a miss or a same-library hit keeps the member face.
             if member_found {
+                // `owner == self.file` short-circuits before the library
+                // probe: a unit-less graph (the bare single-file rig never
+                // registers `builder.unit`) answers `library_of_file` with
+                // `None`, which would read the file's OWN private member as
+                // foreign — the sibling gates (`member_accessible_in`,
+                // `member_visible_to`'s `owner_library_of`) all carry the
+                // same-file arm first.
                 let inaccessible = self.is_private_name(name)
-                    && self
-                        .member_faces
-                        .last_found_file()
-                        .is_some_and(|owner| self.graph.library_of_file(owner) != Some(self.lib));
+                    && self.member_faces.last_found_file().is_some_and(|owner| {
+                        owner != self.file && self.graph.library_of_file(owner) != Some(self.lib)
+                    });
                 if !inaccessible {
                     return (
                         BareInfo::Plain {
@@ -2336,6 +2433,41 @@ impl<'a> Engine<'a> {
                 (self.missing_info(name), RefTarget::Missing)
             }
         }
+    }
+
+    /// Whether `token`'s bare `Expression` read is actually a plain `=`
+    /// write target whose flow event must not read the target's READ face
+    /// (#3991). Upstream's assignment resolver dispatches a plain `=` target
+    /// through `resolveForWrite` (assignment_expression_resolver.dart:42-48)
+    /// — `hasRead` is false, so the getter lookup never runs and the
+    /// getter's declared face (a `Never` getter's `isBottom` exit,
+    /// ast.dart:11146-11153) never reaches flow analysis; the write looks
+    /// up `name=`'s setter instead. Our recorder keys every bare
+    /// `Expression` identifier off the read face, so a `Never`-faced write
+    /// target opens a dead window from the write's RHS — the same gate the
+    /// forward-reference consult already applies to the staged channel.
+    ///
+    /// Only a plain `Eq` follows the target here: compound operators
+    /// (`+=`, `??=`, `++`) genuinely read upstream, a for-in target rides
+    /// `Ev::ForInExprBegin`'s own write arm, and a dotted write
+    /// (`c.x = e`) already arrives as `ExpressionContinuation`. The target
+    /// classes are the non-local ones: a `Local`/`TypeParam` target keeps
+    /// its `Expression` event (definite-assignment `write_var` needs the
+    /// local's resolved reference; a type parameter is not writable so its
+    /// row stays a read-intent row for `undefined_identifier`), while
+    /// `Missing`/`Prefix`/`This` carry no setter face to consult anyway —
+    /// `Decl`, `Member`, and `Opaque` (extension-pool/enum synthesized) are
+    /// exactly the upstream setter-lookup's candidates.
+    pub(crate) fn bare_plain_assign_member_target(&self, name: StringId, token: Token) -> bool {
+        let next_is_plain_eq = self
+            .tokens
+            .get(token.id as usize + 1)
+            .is_some_and(|next| matches!(next.kind, TokenKind::Eq));
+        next_is_plain_eq
+            && matches!(
+                self.resolve_bare(name).1,
+                RefTarget::Decl { .. } | RefTarget::Member { .. } | RefTarget::Opaque
+            )
     }
 
     /// Whether `name` is an applicable extension member for the implicit
@@ -3926,13 +4058,19 @@ impl<'a> Engine<'a> {
         // `staticType`), and the read row carries it: the every-check
         // verdict (`x is Set<int>`), the operator faces, and the
         // `var`-inference window all read this slot. An initializer the
-        // face cannot spell (a bare read, a send, a typed literal — its
-        // own row already bound the exact face) keeps the unknown
+        // face cannot spell (a bare read, a send) keeps the unknown
         // sentinel, the under-report direction every untyped slot holds.
-        let ty = if ty == Ty::UNKNOWN && matches!(info, BareInfo::Plain { .. }) {
-            self.initializer_literal_ty(name)
-        } else {
-            ty
+        // A collection-typed slot asks as well: a typed literal's written
+        // arguments outrank whatever face the slot was bound to (#4013).
+        let collection_slot = matches!(
+            ty,
+            Ty::Named { name: head, .. } if self.collection_heads[..3].contains(&head)
+        );
+        let ty = match info {
+            BareInfo::Plain { .. } if ty == Ty::UNKNOWN || collection_slot => {
+                self.initializer_literal_ty(name, ty)
+            }
+            _ => ty,
         };
         self.push_row(Row {
             name,
@@ -3945,30 +4083,51 @@ impl<'a> Engine<'a> {
         });
     }
 
-    /// The inferred local's initializer static type at a bare read: a
-    /// `var` declarator whose initializer is an untyped collection
+    /// The inferred declaration's initializer static type at a bare read
+    /// whose slot holds `bound` (the unknown sentinel or a collection
+    /// head): a `var` declarator whose initializer is an untyped collection
     /// literal or a block-bodied function literal carries the
     /// initializer's own static type (`typed_literal_resolver.dart`'s
     /// no-context resolution — the same conventions #2854 pinned for the
-    /// direct is-check operand, now feeding the declaration's slot). The
+    /// direct is-check operand, now feeding the declaration's slot) where
+    /// the slot is unknown. An unannotated local's typed collection
+    /// initializer decides over any slot: its written arguments ARE the
+    /// local's static type ([`Self::typed_collection_init_ty`]), where the
+    /// slot may hold the element-inference face a written group the
+    /// literal's own row could not spell leaves behind. The
     /// window is the declaration's own: the tracked local's name token
     /// ([`Self::resolve_local`], the same frame-correct walk the usage
-    /// credit runs) followed by `=` and the expression's first group. A
-    /// group's later declarators (`var x, y = {}`) skip the `=`-less
-    /// names the same gate. [`Ty::UNKNOWN`] — the suppress-everything
-    /// sentinel — for every other shape.
-    fn initializer_literal_ty(&self, name: StringId) -> Ty {
-        let Some(hit) = self.resolve_local(name) else {
-            return Ty::UNKNOWN;
-        };
+    /// credit runs), else the top-level variable's declaration site,
+    /// followed by `=` and the expression's first group. A group's later
+    /// declarators (`var x, y = {}`) skip the `=`-less names the same gate.
+    /// `bound` stands for every other shape.
+    fn initializer_literal_ty(&self, name: StringId, bound: Ty) -> Ty {
+        let local = self.resolve_local(name);
+        // The declarator's name token: the innermost binding the local walk
+        // names, else a top-level variable's declaration site (the same site
+        // the write faces key on) — a top-level `var x = {...}` binds its own
+        // inferred initializer face exactly like a local's.
+        let name_end =
+            match local {
+                Some(hit) => self.locals[hit as usize].range.end(),
+                None if bound != Ty::UNKNOWN => return bound,
+                None => {
+                    let Some(site) = self.decl_sites.iter().rev().find(|site| {
+                        site.name == name && matches!(site.kind, DeclKind::TopLevelVar)
+                    }) else {
+                        return Ty::UNKNOWN;
+                    };
+                    site.range.end()
+                }
+            };
         let bytes = self.source.as_bytes();
-        let mut at = self.byte_of(self.locals[hit as usize].range.end());
+        let mut at = self.byte_of(name_end);
         while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
             at += 1;
         }
         // A plain declarator init only: `var x = <expr>`.
         if bytes.get(at) != Some(&b'=') || bytes.get(at + 1) == Some(&b'=') {
-            return Ty::UNKNOWN;
+            return bound;
         }
         at += 1;
         while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
@@ -3985,9 +4144,140 @@ impl<'a> Engine<'a> {
             }
         }
         match bytes.get(at) {
+            Some(b'<') => local
+                .filter(|&hit| self.unannotated_local(hit as usize))
+                .and_then(|_| self.typed_collection_init_ty(at))
+                .unwrap_or(bound),
+            _ if bound != Ty::UNKNOWN => bound,
             Some(b'[' | b'{') => self.collection_init_ty(bytes, at),
             Some(b'(') => self.closure_init_ty(bytes, at),
             _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// Whether the local variable `self.locals[hit]` was declared without
+    /// a written type: the token ahead of its name is the declaration's
+    /// `var`/`final`/`const` head. A group's later declarator
+    /// (`var a = 1, b = …`) answers through the one ahead of it — the
+    /// local the group recorded just before, once a walk from that name
+    /// reaches the separating comma inside the statement (every balanced
+    /// group skipped, no `;` or unmatched closer crossed).
+    fn unannotated_local(&self, mut hit: usize) -> bool {
+        let mut name_tok = self.token_at_offset(self.locals[hit].range.offset);
+        loop {
+            if !matches!(self.locals[hit].kind, LocalKind::Variable) {
+                return false;
+            }
+            let Some(head) = name_tok.checked_sub(1) else {
+                return false;
+            };
+            match self.tokens.get(head).map(|tok| tok.kind) {
+                Some(TokenKind::Keyword(Keyword::Var | Keyword::Final | Keyword::Const)) => {
+                    return true;
+                }
+                Some(TokenKind::Comma) if hit > 0 => {
+                    hit -= 1;
+                    name_tok = self.token_at_offset(self.locals[hit].range.offset);
+                    let mut at = name_tok + 1;
+                    while at < head {
+                        let Some(tok) = self.tokens.get(at) else {
+                            return false;
+                        };
+                        at = match tok.kind {
+                            TokenKind::Semicolon
+                            | TokenKind::CloseParen
+                            | TokenKind::CloseSquare
+                            | TokenKind::CloseCurly => return false,
+                            kind if kind.is_begin_group() => {
+                                self.tokens.matching_end(at).map_or(at + 1, |end| end + 1)
+                            }
+                            _ => at + 1,
+                        };
+                    }
+                    if at != head {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// The typed collection initializer's face: the WRITTEN arguments are
+    /// the literal's static type (`typed_literal_resolver.dart`'s
+    /// explicit-arguments arms — no inference runs). `<E>[…]` is `List<E>`
+    /// and a list of any other arity `List<dynamic>`
+    /// (`_resolveListLiteral2`); `<E>{…}` is `Set<E>` and `<K, V>{…}`
+    /// `Map<K, V>` whatever the elements (an empty `<int>{}` stays a set).
+    /// A brace literal of any other arity falls back to inference
+    /// upstream, which this face does not model — `None`, as for every
+    /// argument [`Engine::written_type_args`] cannot spell. The
+    /// literal must end the declarator (`;`, `,`, or a cascade, whose
+    /// static type is its target's): a selector or operator continuation
+    /// (`<int>[1].first`, `<int>[] as List<num>`) types a different
+    /// expression. `at` is the `<` byte.
+    fn typed_collection_init_ty(&self, at: usize) -> Option<Ty> {
+        let (args, open) = self.written_type_args(at)?;
+        // `[]` is one `Index` token: the empty list closes itself.
+        let (close, list) = match self.tokens.get(open)?.kind {
+            TokenKind::Index => (open, true),
+            TokenKind::OpenSquare => (self.tokens.matching_end(open)?, true),
+            TokenKind::OpenCurly => (self.tokens.matching_end(open)?, false),
+            _ => return None,
+        };
+        if !matches!(
+            self.tokens.get(close + 1)?.kind,
+            TokenKind::Semicolon | TokenKind::Comma | TokenKind::PeriodPeriod
+        ) {
+            return None;
+        }
+        let args: Vec<Ty> = args
+            .into_iter()
+            .map(|arg| self.written_arg_face(arg))
+            .collect();
+        let (head, args) = match (list, args.len()) {
+            (true, 1) => (self.collection_heads[0], args),
+            (true, _) => (self.collection_heads[0], vec![Ty::Dynamic]),
+            (false, 1) => (self.collection_heads[1], args),
+            (false, 2) => (self.collection_heads[2], args),
+            (false, _) => return None,
+        };
+        Some(Ty::Named {
+            name: head,
+            nullable: false,
+            args: self.boundary.intern_list(&args),
+        })
+    }
+
+    /// One written argument in the type completion's convention: a `Null`
+    /// spelling is the null type at every nesting level (`handle_type`
+    /// interns [`Ty::Null`] for it, so `List<Null>` refuses `List<Object>`
+    /// — Left Null), where the clause scan keeps the named head.
+    fn written_arg_face(&self, ty: Ty) -> Ty {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return ty;
+        };
+        if self.strings.resolve(name) == "Null" {
+            return Ty::Null;
+        }
+        if args == ArgListId::EMPTY {
+            return ty;
+        }
+        // Copy the nested list out first: re-interning borrows the pool.
+        let nested = self.boundary.pool().get(args).to_vec();
+        let nested: Vec<Ty> = nested
+            .into_iter()
+            .map(|arg| self.written_arg_face(arg))
+            .collect();
+        Ty::Named {
+            name,
+            nullable,
+            args: self.boundary.intern_list(&nested),
         }
     }
 
@@ -4009,11 +4299,25 @@ impl<'a> Engine<'a> {
         let dynamic = Ty::Dynamic;
         let (head, args) = match kind {
             // The empty `{}` literal's map default (`literal_return_ty`'s
-            // no-context arm).
-            UntypedLiteral::EmptyBraces => (
-                self.collection_heads[2],
-                self.boundary.intern_list(&[dynamic, dynamic]),
-            ),
+            // no-context arm) — and the spread-only map-decided literal
+            // (`{...m}`, which resolves to the same marker): its spreads
+            // donate `Map<K, V>` arguments to the per-slot folds,
+            // `dynamic` where none is spellable.
+            UntypedLiteral::EmptyBraces => {
+                let blank = trim_value_ws(bytes, open + 1, close) >= close;
+                if blank {
+                    (
+                        self.collection_heads[2],
+                        self.boundary.intern_list(&[dynamic, dynamic]),
+                    )
+                } else {
+                    let (key, value) = self.init_entry_leaf_tys(bytes, open + 1, close);
+                    (
+                        self.collection_heads[2],
+                        self.boundary.intern_list(&[key, value]),
+                    )
+                }
+            }
             UntypedLiteral::List => (
                 self.collection_heads[0],
                 self.boundary
@@ -4043,13 +4347,21 @@ impl<'a> Engine<'a> {
     /// each top-level comma segment's own completion row (a primitive
     /// literal's declared primitive, a bare local's declared type, a
     /// typed nested literal's face), folded to the least type the
-    /// lattice can stand. A segment without an exact leaf row forces
-    /// `dynamic` — the under-report that decides every provable ask and
-    /// refuses every unprovable one.
+    /// lattice can stand. A spread segment contributes its operand's
+    /// ELEMENT type, not the operand itself. A segment without an exact
+    /// leaf row forces `dynamic` — the under-report that decides every
+    /// provable ask and refuses every unprovable one.
     fn init_leaf_least_ty(&self, bytes: &[u8], start: usize, end: usize) -> Ty {
         let leaves: Vec<Option<Ty>> = value_comma_segments(bytes, start, end)
             .into_iter()
-            .map(|(s, e)| self.leaf_row_ty_in(bytes, s, e))
+            .map(|(s, e)| {
+                let s = trim_value_ws(bytes, s, e);
+                if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"...")) {
+                    self.init_spread_element_ty(bytes, s, e)
+                } else {
+                    self.init_element_leaf_ty(bytes, s, e)
+                }
+            })
             .collect();
         if leaves.iter().any(|leaf| leaf.is_none()) {
             return Ty::Dynamic;
@@ -4057,9 +4369,123 @@ impl<'a> Engine<'a> {
         self.init_leaf_least_from(leaves.into_iter().flatten().collect())
     }
 
+    /// One element segment's leaf contribution: a control-flow `if`
+    /// element joins its branch leaves through the SAME
+    /// [`Self::init_leaf_least_from`] fold (`typed_literal_resolver.dart`
+    /// `_computeElementType`'s IfElementImpl arm —
+    /// `leastUpperBound(thenType, elseType)`, a missing `else` keeping
+    /// the then leaf), every other segment its completion row. The
+    /// branches recurse through this walk (a nested spread contributes
+    /// its element, a nested `if` joins its own), so the join never
+    /// duplicates the lattice. `s` is the trimmed segment start.
+    fn init_element_leaf_ty(&self, bytes: &[u8], s: usize, e: usize) -> Option<Ty> {
+        // `if` is a reserved word: the prefix is the element, never an
+        // identifier's head, and the parenthesized condition follows.
+        let after_if = trim_value_ws(bytes, s + 2, e);
+        if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"if"))
+            && !bytes.get(s + 2).is_some_and(|b| ident_byte(*b))
+            && bytes.get(after_if) == Some(&b'(')
+            && let Some(close) = matching_bracket_fwd(bytes, after_if)
+        {
+            let then_start = trim_value_ws(bytes, close + 1, e);
+            return match value_top_level_else(bytes, close + 1, e) {
+                Some(else_at) => {
+                    let else_start = trim_value_ws(bytes, else_at + 4, e);
+                    let then_ty = self.init_element_leaf_ty(bytes, then_start, else_at);
+                    let else_ty = self.init_element_leaf_ty(bytes, else_start, e);
+                    match (then_ty, else_ty) {
+                        (Some(then_ty), Some(else_ty)) => {
+                            Some(self.init_leaf_least_from(vec![then_ty, else_ty]))
+                        }
+                        // A branch without an exact leaf (a `dynamic` read)
+                        // answers no exact face — the oracle's join reads
+                        // `dynamic` there, the same face a `None` leaf
+                        // forces through the literal fold.
+                        _ => None,
+                    }
+                }
+                None => self.init_element_leaf_ty(bytes, then_start, e),
+            };
+        }
+        self.leaf_row_ty_in(bytes, s, e)
+    }
+
+    /// The spread element's contribution to the leaf join
+    /// (`typed_literal_resolver.dart` `_computeElementType`'s iterable
+    /// arm): the operand's `Iterable`/`List`/`Set` head answers its
+    /// first type argument, a user head reaching `Iterable` through
+    /// `extends`/`with`/`implements` the same, an operand whose head is
+    /// an in-scope type parameter reads the parameter's declared bound
+    /// first ([`Self::bound_face`] — the oracle's `asInstanceOf` over
+    /// the parameter's interface, `T extends Iterable<num>` answering
+    /// `num`), and a `Map`, a non-collection, and an unspellable head
+    /// answer `None` — the oracle's `else` arm, the `dynamic` the
+    /// no-exact-face fold keeps. An unbounded parameter keeps its own
+    /// head, and its miss stays the under-report. `start` is the
+    /// trimmed segment start, `...`/`...?` prefix included.
+    fn init_spread_element_ty(&self, bytes: &[u8], start: usize, end: usize) -> Option<Ty> {
+        let skip = 3 + usize::from(bytes.get(start + 3) == Some(&b'?'));
+        let operand_start = trim_value_ws(bytes, start + skip, end);
+        let ty = self.bound_face(self.leaf_row_ty_in(bytes, operand_start, end)?);
+        let Ty::Named { name, args, .. } = ty else {
+            return None;
+        };
+        let first = || {
+            self.boundary
+                .pool()
+                .get(args)
+                .first()
+                .copied()
+                .filter(|ty| *ty != Ty::UNKNOWN)
+        };
+        let iterable_heads = [
+            self.collection_heads[3],
+            self.collection_heads[0],
+            self.collection_heads[1],
+        ];
+        if iterable_heads.contains(&name) {
+            return first().or(Some(Ty::Dynamic));
+        }
+        // A user head reaching `Iterable` through its declared superchain
+        // answers the same first argument — the clause's written
+        // arguments live only in source, so the first-position
+        // substitution is exact for every single-parameter wrapper chain.
+        let mut queue = vec![name];
+        let mut seen = vec![name];
+        while let Some(current) = queue.pop() {
+            let Some((decl, _)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                current,
+            ) else {
+                continue;
+            };
+            let supers = decl
+                .superclass
+                .into_iter()
+                .chain(decl.with_clause.iter().copied())
+                .chain(decl.implements_clause.iter().copied());
+            for next in supers {
+                if iterable_heads.contains(&next) {
+                    return first().or(Some(Ty::Dynamic));
+                }
+                if !seen.contains(&next) {
+                    seen.push(next);
+                    queue.push(next);
+                }
+            }
+        }
+        None
+    }
+
     /// The map entry leaves' key/value least types: each segment's
-    /// top-level colon splits the sides, a colonless leaf (a spread, a
-    /// control-flow element) keeps both sides `dynamic`.
+    /// top-level colon splits the sides, a colonless map spread donates
+    /// its `Map<K, V>` arguments to the per-slot folds, and any other
+    /// colonless leaf (a control-flow element, a non-map spread) keeps
+    /// both sides `dynamic`.
     fn init_entry_leaf_tys(&self, bytes: &[u8], start: usize, end: usize) -> (Ty, Ty) {
         let mut keys = Vec::new();
         let mut values = Vec::new();
@@ -4070,8 +4496,22 @@ impl<'a> Engine<'a> {
                     values.push(self.leaf_row_ty_in(bytes, colon + 1, e));
                 }
                 None => {
-                    keys.push(None);
-                    values.push(None);
+                    let s = trim_value_ws(bytes, s, e);
+                    if bytes.get(s..).is_some_and(|rest| rest.starts_with(b"...")) {
+                        match self.init_spread_map_entry_tys(bytes, s, e) {
+                            Some((k, v)) => {
+                                keys.push(Some(k));
+                                values.push(Some(v));
+                            }
+                            None => {
+                                keys.push(None);
+                                values.push(None);
+                            }
+                        }
+                    } else {
+                        keys.push(None);
+                        values.push(None);
+                    }
                 }
             }
         }
@@ -4084,14 +4524,48 @@ impl<'a> Engine<'a> {
         (fold(keys), fold(values))
     }
 
+    /// The map spread's per-slot donation (`{...m}` inside a map-decided
+    /// literal — `_computeElementType`'s map arm): the operand's
+    /// `Map<K, V>` arguments are the key/value leaves it contributes, an
+    /// operand whose head is an in-scope type parameter reads the
+    /// parameter's declared bound first ([`Self::bound_face`] —
+    /// `T extends Map<num, String>` donating `(num, String)`), and every
+    /// other operand shape answers `None` (the map default's `dynamic`
+    /// slot, never a guessed element). `start` is the trimmed segment
+    /// start, `...`/`...?` prefix included.
+    fn init_spread_map_entry_tys(
+        &self,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Option<(Ty, Ty)> {
+        let skip = 3 + usize::from(bytes.get(start + 3) == Some(&b'?'));
+        let operand_start = trim_value_ws(bytes, start + skip, end);
+        let ty = self.bound_face(self.leaf_row_ty_in(bytes, operand_start, end)?);
+        let Ty::Named { name, args, .. } = ty else {
+            return None;
+        };
+        if name != self.collection_heads[2] {
+            return None;
+        }
+        let pool = self.boundary.pool();
+        let slots = pool.get(args);
+        let key = slots.first().copied().filter(|ty| *ty != Ty::UNKNOWN)?;
+        let value = slots.get(1).copied().filter(|ty| *ty != Ty::UNKNOWN)?;
+        Some((key, value))
+    }
+
     /// The leaf segment's completion row type: the last non-type-use row
     /// inside the segment's span, its push-time type only. The row stack
     /// answers first, the fold-drained queue second — a list literal's
     /// element rows drain into `deferred_miss_rows` at its close event
     /// (the set/map leaves stay on the stack), and a drained sub-literal's
     /// rows always predate every in-span stack row, so the stack hit IS
-    /// the later push. A row without an exact type — a send, an untyped
-    /// read — is no exact face and answers `None`.
+    /// the later push. A completed send's row keeps `Ty::Unknown` at push
+    /// time (its static type is the callee's), so an invocation leaf reads
+    /// [`Engine::operand_static_ty`]'s callee walk — an instance creation's
+    /// instantiated face included. Any other row without an exact type — an
+    /// untyped read — is no exact face and answers `None`.
     fn leaf_row_ty_in(&self, bytes: &[u8], start: usize, end: usize) -> Option<Ty> {
         let start = trim_value_ws(bytes, start, end.min(bytes.len()));
         let end = end.min(bytes.len());
@@ -4104,7 +4578,7 @@ impl<'a> Engine<'a> {
                 && row.range.end() <= e16
                 && !matches!(row.shape, RowShape::TypeUse(..))
         };
-        let ty = self
+        let row = self
             .rows
             .iter()
             .rev()
@@ -4114,28 +4588,37 @@ impl<'a> Engine<'a> {
                     .iter()
                     .rev()
                     .find(|row| in_span(row))
-            })
-            .map(|row| row.ty)?;
+            })?;
+        let ty = if row.ty == Ty::UNKNOWN && matches!(row.intent, Intent::Invoke) {
+            self.operand_static_ty(row)
+        } else {
+            row.ty
+        };
         (ty != Ty::UNKNOWN && ty != Ty::Dynamic).then_some(ty)
     }
 
     /// The collected leaf types' least face (`least_leaf_ty_from`'s
-    /// convention): one exact type keeps itself, `int` mixed with
-    /// `double` lifts to `num`, everything else — `Null` leaves,
-    /// differing faces — keeps `dynamic` (the oracle's `Object?`/`Object`
-    /// lifts are provability-equal: every target those accept, `dynamic`
-    /// accepts, and every target those refuse, `dynamic` refuses).
+    /// convention): one exact type keeps itself, an `int`/`double`/`num`
+    /// mix lifts to `num`, distinct non-nullable class faces lift to
+    /// their nearest shared supertype below `Object` (upstream
+    /// `least_upper_bound.dart`), and every other known-leaf mix — a
+    /// `Null` leg, parameterized leaves, an `Object`-only intersection,
+    /// unrelated finals (`int` + `bool`) — joins at `Object` (upstream
+    /// `TypeSystem.leastUpperBound`'s top rung for known leaves: never
+    /// the `dynamic` stand-in, whose subtype verdicts diverge from
+    /// `Object`'s on every `is` ask).
     fn init_leaf_least_from(&self, tys: Vec<Ty>) -> Ty {
         let int = Ty::named(self.members.primitive_ids[0]);
         let double = Ty::named(self.members.primitive_ids[1]);
+        let num = Ty::named(self.members.primitive_ids[2]);
         let mut first: Option<Ty> = None;
         let mut diverse = false;
         let mut other_face = false;
-        for ty in tys {
+        for ty in tys.iter().copied() {
             if ty == Ty::Dynamic {
                 return Ty::Dynamic;
             }
-            if ty != int && ty != double {
+            if ty != int && ty != double && ty != num {
                 other_face = true;
             }
             match first {
@@ -4147,11 +4630,93 @@ impl<'a> Engine<'a> {
         match first {
             None => Ty::Dynamic,
             Some(ty) if !diverse => ty,
-            // The int/double pair is the one diverse fold the lattice
-            // can name (`num`); every other mix stays `dynamic`.
-            Some(_) if !other_face => Ty::named(self.members.primitive_ids[2]),
-            Some(_) => Ty::Dynamic,
+            // The int/double/num mix is the one diverse fold the lattice
+            // can name (`num`); a mixed class fold asks the
+            // shared-supertype walk, and everything else joins at
+            // `Object` — the top rung for known leaves.
+            Some(_) if !other_face => num,
+            Some(_) => self
+                .shared_leaf_supertype(&tys)
+                .unwrap_or_else(|| Ty::named(self.intern("Object"))),
         }
+    }
+
+    /// The nearest shared class supertype of distinct leaves' written heads
+    /// (upstream `least_upper_bound.dart`'s intersection pick): each head's
+    /// own face plus its supertype closure ([`FoldHierarchy::closure`] —
+    /// extends/implements/with/on, alias-folded), intersected and read in
+    /// the first head's walk order, so the answer is the closest common
+    /// ancestor rather than any common one. `Object` answers `None` (the
+    /// provability-equal `dynamic` rung this fold keeps), as does a
+    /// parameterized member (its arguments are not solved here) and a leaf
+    /// that is nullable or carries written arguments — the under-report
+    /// direction, never a guessed instantiation.
+    fn shared_leaf_supertype(&self, leaves: &[Ty]) -> Option<Ty> {
+        let mut heads: Vec<(FileId, StringId)> = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            let Ty::Named {
+                name,
+                nullable: false,
+                args,
+            } = *leaf
+            else {
+                return None;
+            };
+            if args != ArgListId::EMPTY {
+                return None;
+            }
+            match self.alias_clause_hop(name, self.file, self.lib) {
+                Some(handle) => heads.push(handle),
+                None => {
+                    let (_, owner) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        name,
+                    )?;
+                    heads.push((owner, name));
+                }
+            }
+        }
+        let alias_hop =
+            |name: StringId, file: FileId, lib: LibraryId| self.alias_clause_hop(name, file, lib);
+        let hierarchy = FoldHierarchy {
+            graph: self.graph,
+            namespaces: self.namespaces,
+            index: self.index,
+            file: self.file,
+            lib: self.lib,
+            class_modifiers: self.class_modifiers,
+            memo: RefCell::default(),
+            in_progress: RefCell::default(),
+            alias_head: Some(&alias_hop),
+        };
+        // Each head answers its own face first (a leaf that already IS the
+        // common supertype of the others), then its closure nearest-first.
+        let faces: Vec<Vec<(FileId, StringId)>> = heads
+            .iter()
+            .map(|head| {
+                let mut faces = vec![*head];
+                faces.extend(hierarchy.closure(*head));
+                faces
+            })
+            .collect();
+        let (first, rest) = faces.split_first()?;
+        first
+            .iter()
+            .copied()
+            .find(|candidate| {
+                self.strings.resolve(candidate.1) != "Object"
+                    && rest.iter().all(|other| other.contains(candidate))
+                    && self
+                        .index
+                        .get(candidate.0)
+                        .and_then(|unit| unit.container(candidate.1))
+                        .is_some_and(|container| container.type_params == 0)
+            })
+            .map(|(_, name)| Ty::named(name))
     }
 
     /// The block-bodied function literal initializer's written-signature
@@ -4486,10 +5051,11 @@ impl<'a> Engine<'a> {
                 .map(|w| (w[0], w[1]))
                 .chain(std::iter::once((*boundaries.last()?, close as u32)))
                 .collect();
-            // Each named window contributes `(label token index)`; a
-            // positional window contributes nothing. Positional count is
-            // the upstream `positionalCount` — the non-named fields.
-            let named_labels: Vec<u32> = windows
+            // Each named window contributes `(label token index, label
+            // source text)`; a positional window contributes nothing.
+            // Positional count is the upstream `positionalCount` — the
+            // non-named fields.
+            let named_labels: Vec<(u32, &str)> = windows
                 .iter()
                 .filter(|&&(lo, hi)| {
                     lo + 2 < hi
@@ -4498,21 +5064,42 @@ impl<'a> Engine<'a> {
                             .get((lo + 2) as usize)
                             .is_some_and(|t| t.kind == TokenKind::Colon)
                 })
-                .map(|&(lo, _)| lo + 1)
+                .filter_map(|&(lo, _)| {
+                    let label = self.tokens.get((lo + 1) as usize)?;
+                    Some((lo + 1, &self.source[label.byte_range()]))
+                })
                 .collect();
             let positional_count = (windows.len() - named_labels.len()) as u32;
             let mut pending: Vec<(SemanticCode, SourceRange)> = Vec::new();
-            for label_id in named_labels {
+            // `_reportDuplicateFieldDefinitions` (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/dart/resolver/record_literal_resolver.dart
+            // :79-98): every named field after the first occurrence reports
+            // `duplicate_field_name` at the LATER label with a `The first `
+            // context row on the FIRST occurrence
+            // (`duplicateFieldDefinitionInLiteral`,
+            // diagnostic_factory.dart:105-124). Unlike the type-annotation
+            // twin there is NO wildcard exemption — a literal's named `_`
+            // always counts.
+            let mut used: std::collections::HashMap<&str, SourceRange> =
+                std::collections::HashMap::new();
+            for &(label_id, name) in &named_labels {
                 let Some(label) = self.tokens.get(label_id as usize) else {
                     continue;
                 };
-                let name = &self.source[label.byte_range()];
                 let range = SourceRange {
                     offset: label.utf16_offset,
                     length: self
                         .utf16_of((label.byte_offset + label.byte_len) as usize)
                         .saturating_sub(label.utf16_offset),
                 };
+                if let Some(first) = used.get(name).copied() {
+                    pending.push((SemanticCode::DuplicateFieldName, range));
+                    // Keep the FIRST occurrence as the context anchor —
+                    // upstream's `usedNames` map holds the first writer.
+                    let _ = first;
+                    continue;
+                }
+                used.insert(name, range);
                 let code = if name.starts_with('_') {
                     Some(SemanticCode::InvalidFieldNamePrivate)
                 } else if let Some(index) = Self::positional_field_index(name) {
@@ -4533,7 +5120,11 @@ impl<'a> Engine<'a> {
                     code.message("", ""),
                     self.file,
                     range,
-                    None,
+                    if code == SemanticCode::DuplicateFieldName {
+                        Some("Try renaming the field.".to_string())
+                    } else {
+                        None
+                    },
                 ));
             }
         }
@@ -4768,10 +5359,10 @@ impl<'a> Engine<'a> {
                 _ => {}
             }
         }
-        for (name, range) in arg_hits {
-            if !self.guard.ignore(None, name) {
-                let name_text = self.strings.resolve(name).to_string();
-                self.emit_corrected(SemanticCode::NonTypeAsTypeArgument, range, &name_text);
+        for (name, range) in &arg_hits {
+            if !self.guard.ignore(None, *name) {
+                let name_text = self.strings.resolve(*name).to_string();
+                self.emit_corrected(SemanticCode::NonTypeAsTypeArgument, *range, &name_text);
             }
         }
         if let Some((name, range)) = head_hit {
@@ -4786,6 +5377,55 @@ impl<'a> Engine<'a> {
         {
             let name_text = self.strings.resolve(name).to_string();
             self.emit(non_type_code, range, &name_text, "");
+        }
+        // The `as` operand's HEAD-level miss makes the cast target the
+        // oracle's `InvalidType` (`x as Missing`, `x as bool` under a
+        // prelude-less rig): `AsExpression.staticType` then answers
+        // InvalidType, which is assignable into every host — the return
+        // matrix never asks (`return (x as Missing)` reports only
+        // `cast_to_non_type`, never `return_of_invalid_type`). The armed
+        // slot still carries the WRITTEN spelling (`bool` is a primitive
+        // id, so `named_type_is_type` never gates it), which the listener
+        // would fold into a `bool` result row and stage a real
+        // assignability ask. Overwrite it with `Unknown` — the
+        // `cast_ty.filter(|ty| *ty != Ty::UNKNOWN)` arms then skip both
+        // the result row and the listener-side `cast_rewrites` push, the
+        // `Some(Ty::Unknown) => true` boolish arm keeps the condition
+        // sparing, and the paren group's inner row stays the suppressed
+        // `TypeUse` (ty `Unknown`) so `check_return` reads an
+        // undecidable operand. A head miss ONLY — `x as List<Missing>`
+        // keeps `List<InvalidType>`, a real type whose return ask the
+        // oracle still runs. The `is` path (`non_type_code` is `None`)
+        // is untouched: `x is Missing` types `bool`, never InvalidType.
+        if non_type_code.is_some()
+            && arg_hits.is_empty()
+            && (head_hit.is_some() || non_type_head.is_some())
+        {
+            self.armed_ty = Some(Ty::UNKNOWN);
+            self.armed_ty_unresolved = true;
+            // The bare (unparenthesized) `=> x as Missing` case: no result
+            // row is pushed, so `single_row_since` answers the OPERAND's
+            // type — a real `Object` that would report
+            // `return_of_invalid_type` against `int`. The cast rewrite
+            // substitutes the staged `from` with `Unknown` before the
+            // verdict (`assignable` answers `None` on it — silent). The
+            // span covers operand start through the written type's end,
+            // the same extent the listener computes for a resolved cast.
+            let cast_span = self
+                .operand_row()
+                .zip(self.armed_ty_span)
+                .map(|(row, ty_span)| {
+                    let start = self
+                        .property_access_span(row.range)
+                        .map_or(row.range.offset, |span| span.offset);
+                    SourceRange {
+                        offset: start,
+                        length: ty_span.end().saturating_sub(start),
+                    }
+                });
+            if let Some(span) = cast_span {
+                self.cast_rewrites.push((span, Ty::UNKNOWN));
+            }
         }
         for index in silence {
             self.rows[index].shape = RowShape::Value;
@@ -5437,14 +6077,42 @@ impl<'a> Engine<'a> {
         if self.members.builtin_types.contains(&name) {
             return (TypeResolution::Type, None);
         }
-        match lookup_scoped(
+        let hit = lookup_scoped(
             self.graph,
             self.namespaces,
             self.index,
             self.lib,
             self.file,
             name,
-        ) {
+        );
+        // A file-scoped `TypeParam` tag is a DECLARATION-scoped placeholder
+        // — the collector registers every type variable unit-wide only so
+        // `duplicate_definition` can compare per list — never a name in
+        // scope outside its own declaration. Answering `Missing` for it
+        // would let any generic declaration's variable shadow the library
+        // namespace for the rest of the file: `class C<int> {}` (or
+        // `<int>(int x) => x`) then poisons every `int` type use into
+        // `undefined_class`. The in-scope uses are answered by the
+        // type-parameter stack above, so the placeholder falls through to
+        // the namespace here — and only a namespace miss keeps the
+        // `Missing` answer, which is what a genuinely undeclared `T`
+        // (`class C<T> {}` then `T x;`) still reports.
+        let hit = match hit {
+            ScopedHit::Local(decl) if decl.kind == MicroKind::TypeParam => {
+                match self
+                    .namespaces
+                    .lookup_in_file(self.graph, self.lib, Some(self.file), name)
+                {
+                    dartq_resolution::Lookup::Found(entry) => ScopedHit::Found(entry),
+                    dartq_resolution::Lookup::Ambiguous(candidates) => {
+                        ScopedHit::Ambiguous(candidates)
+                    }
+                    dartq_resolution::Lookup::NotFound => ScopedHit::NotFound,
+                }
+            }
+            other => other,
+        };
+        match hit {
             ScopedHit::NotFound => (TypeResolution::Missing, None),
             ScopedHit::Local(decl) => self.scoped_resolution(name, self.file, decl.kind),
             ScopedHit::Found(NamespaceEntry::Decl(file)) => {
@@ -5846,6 +6514,51 @@ fn value_top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize
         i += 1;
     }
     None
+}
+
+/// The first top-level `else` keyword in `[start, end)`: a depth walk
+/// over `()[]{}` with string contents skipped, word-bounded both sides —
+/// the if-element leaf's then/else split. A nested `if`'s own `else`
+/// (an inner control-flow element inside a branch) lives inside the
+/// branch's own brackets or belongs to the nearest if, so the FIRST
+/// top-level hit is the split the outer element owns.
+fn value_top_level_else(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let end = end.min(bytes.len());
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'e' if depth == 0
+                && bytes[i..].starts_with(b"else")
+                && (i == start || !ident_byte(bytes[i - 1]))
+                && bytes.get(i + 4).is_none_or(|b| !ident_byte(*b)) =>
+            {
+                return Some(i);
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// An identifier byte (Dart identifiers are `[a-zA-Z0-9_$]` — the
+/// official scanner spells them ASCII-only): the keyword scans' word
+/// boundary.
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 /// The end of a formal segment's signature part: the first top-level `=`

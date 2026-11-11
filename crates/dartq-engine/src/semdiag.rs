@@ -41,9 +41,12 @@
 //! `dartq_semantic::diagnose_with` re-folds the collector's capture-time
 //! duplicate log into its report front; the bake in
 //! `l1::duplicate_diagnostics` is the single source, so the fold drops the
-//! re-issued `duplicate_definition`s and passes everything else through.
-//! The statement-list rows (`stage_local_duplicate` — block bodies,
-//! for-head lists, pattern-decl elements) share the same code but never
+//! re-issued rows and passes everything else through. Two codes qualify —
+//! `duplicate_definition` and the formal scope's pair code
+//! `duplicate_field_formal_parameter` (`this.x`/`this.x` collisions), both
+//! rendered from the same capture log at the same span. The statement-list
+//! rows (`stage_local_duplicate` — block bodies,
+//! for-head lists, pattern-decl elements) share the plain code but never
 //! land in the element model's duplicate log, so the filter matches the
 //! bake's range set exactly: only rows whose range is an
 //! `elements.duplicates()` entry get dropped.
@@ -111,6 +114,18 @@ thread_local! {
 /// re-fold share.
 fn duplicate_definition_name() -> &'static str {
     dartq_semantic::codes::SemanticCode::DuplicateDefinition
+        .code_info()
+        .name
+}
+
+/// The `duplicate_field_formal_parameter` code name — the second identity the
+/// duplicate bake can carry: the formal-parameter scope emits the pair code
+/// when both colliding claims are `this.x` formals (the capture's
+/// `DuplicateDecl::field_formal` bit), off the same capture log, so the
+/// bake-versus-fold drop must accept both names or the pair face reports
+/// twice.
+fn duplicate_field_formal_name() -> &'static str {
+    dartq_semantic::codes::SemanticCode::DuplicateFieldFormalParameter
         .code_info()
         .name
 }
@@ -1175,6 +1190,7 @@ impl MemoHandle<'_> {
 impl SemanticDiagnoser for Diagnoser {
     fn diagnose_library(&self, library: &LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
         let duplicate = duplicate_definition_name();
+        let duplicate_field_formal = duplicate_field_formal_name();
         let unused = unused_element_name();
         let unused_fields = unused_field_names();
         // The M3 U1 use-face substrate (#767): every fold emits its unit's
@@ -1334,9 +1350,14 @@ impl SemanticDiagnoser for Diagnoser {
             // for the element-model duplicates (the capture-time
             // `elements.duplicates()` log — top-level, member, formal,
             // type-param, catch faces), so the fold drops the rows the
-            // bake re-issues. The statement-list rows
+            // bake re-issues. Both names qualify: the formal-parameter
+            // scope emits the pair code off the same log and at the same
+            // span, so a name-keyed drop that only knows
+            // `duplicate_definition` would let every `this.x`/`this.x` pair
+            // through twice once the pair code is wired. The statement-list
+            // rows
             // (`stage_local_duplicate` — block bodies, for-head lists,
-            // pattern-decl elements) share the same code but never enter
+            // pattern-decl elements) share the plain code but never enter
             // the capture log, so the drop matches the bake's range set
             // exactly: a row whose range is not an `elements.duplicates()`
             // entry passes through. The `unused_element` candidates split
@@ -1360,7 +1381,8 @@ impl SemanticDiagnoser for Diagnoser {
                 .map(|dup| (u64::from(dup.range.offset) << 32) | u64::from(dup.range.length))
                 .collect();
             for diagnostic in report.diagnostics {
-                if diagnostic.code.name == duplicate
+                if (diagnostic.code.name == duplicate
+                    || diagnostic.code.name == duplicate_field_formal)
                     && baked_ranges.contains(
                         &((u64::from(diagnostic.range.offset) << 32)
                             | u64::from(diagnostic.range.length)),
@@ -2453,6 +2475,37 @@ mod tests {
         );
         assert_matches_wholesale(&root, &engine, &current, &out);
         assert_eq!(unused_field_rows(&engine, &out), fields, "served == fresh");
+    }
+
+    /// The #3478 discriminating pin, library-close arm: `A._m1` and `B._m1`
+    /// share the spelling, so a `B`-internal `_m1()` call uses `B._m1` — a
+    /// bare-name release (`consumed.used(name)`) would spare `A._m1` too.
+    /// The close's `member_edges` join keys on `(file, container, spelling)`
+    /// (`member_refs` resolve the access to `B`), so the credit lands only
+    /// on `B._m1` and `A._m1` reports at its own anchor — the verdict the
+    /// oracle's element-level `usedElements.members` keeps
+    /// (unused_local_elements_verifier.dart: the member set joins on the
+    /// resolved element, never the name). The single-unit `report_ops`
+    /// path already resolves `B._m1` through its per-file `member_refs`
+    /// edge; this pin lands on the library close's re-decision — the face
+    /// the report-ops pins cannot reach.
+    #[test]
+    fn same_named_member_keeps_the_unused_declaring_container() {
+        let root = memo_workspace();
+        let main_base = "class A {\n  void _m1() {}\n}\nclass B {\n  void public() => _m1();\n  void _m1() {}\n}\n";
+        let files = [("lib/main.dart", main_base)];
+        let (engine, out) = analyze_files(&root, &files);
+        let unused = unused_rows(&engine, &out);
+        // Exactly one `_m1` row: `B._m1` is used through `B.public`, so the
+        // edge spares `B._m1` and never the same-spelled `A._m1`.
+        assert_eq!(
+            unused,
+            vec![(
+                root.join("lib/main.dart").display().to_string(),
+                "The declaration '_m1' isn't referenced.".into()
+            )],
+            "the used `B._m1` must not release `A._m1`: {unused:?}"
+        );
     }
 
     /// The unused-import rows of one analyze output: (path, message) pairs

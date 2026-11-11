@@ -718,9 +718,21 @@ fn catch_junk_trace_fires_the_synthetic_parameter_event() {
     // `catch (x, {st})`: the junk `{` fills the trace slot through the
     // consume-in-doubt synthetic — the identifier event fires for it like
     // for every other route (the rewriter's synthetic identifier exists
-    // "to satisfy listeners"), a zero-width identifier at the junk's own
-    // offset, after the real exception name. The written comma flips the
+    // "to satisfy listeners"), a zero-width identifier spliced AFTER the
+    // junk, after the real exception name. The written comma flips the
     // trace slot exactly once.
+    //
+    // The synthetic offset is the junk's FOLLOWER, not the junk itself:
+    // `CatchParameterIdentifierContext.ensureIdentifier`'s last branch
+    // (identifier_context_impl.dart:40-43) calls
+    // `insertSyntheticIdentifier(identifier)` with the junk token, and
+    // `insertSyntheticIdentifier` places the synthetic at
+    // `token.next!.charOffset` (token_stream_rewriter.dart:238-248) — for
+    // `{` at 28 the follower `st` sits at 29. The oracle agrees: on this
+    // exact input `dart analyze --format=machine` reports `catch_syntax`
+    // at 1:29 (the `{` at 28) and `unused_catch_stack` at 1:30 len 2 (the
+    // recovered trace name `st` at 29). The earlier (28,28) expectation
+    // anchored on the junk's own offset and predates this evidence.
     let c = parse("void f() { try {} catch (x, {st}) {} }");
     let catches: Vec<_> = c
         .idents
@@ -728,7 +740,7 @@ fn catch_junk_trace_fires_the_synthetic_parameter_event() {
         .filter(|(ctx, ..)| ctx == "CatchParameter")
         .map(|(_, s, e, _)| (*s, *e))
         .collect();
-    assert_eq!(catches, vec![(25, 26), (28, 28)], "{:?}", c.idents);
+    assert_eq!(catches, vec![(25, 26), (29, 29)], "{:?}", c.idents);
     assert_eq!(c.catch_trace_flips.len(), 1);
 }
 

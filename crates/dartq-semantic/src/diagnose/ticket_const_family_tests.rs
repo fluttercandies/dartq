@@ -612,19 +612,23 @@ fn annotation_head_checks_non_constant_argument() {
     );
 }
 
-/// The argument-count faces in annotation position: a deficit anchors at
-/// the head, a surplus at the first extra positional argument (the
-/// probed `@P()` / `@P(1, 2, 3)` pairings — capacity two puts the
-/// surplus on the third).
+/// The argument-count faces in annotation position: upstream
+/// `resolveArgumentsToParameters` anchors a deficit at the argument
+/// list's close `)` (`lastPositionalArgument?.endToken.next ??
+/// leftParenthesis.next ?? rightParenthesis`, type_analyzer.dart) and a
+/// surplus at the first extra positional argument's expression (the
+/// probed `@P()` / `@P(1, 2, 3)` pairings — capacity two puts the surplus
+/// on the third). The `dynamic` fields keep the unit-less rig free of
+/// `undefined_class` noise (`int` has no dart:core declaration here).
 #[test]
 fn annotation_head_arity_faces() {
-    let source = "class P {\n  final int a;\n  final int b;\n  const P(this.a, [this.b = 1]);\n}\n\
+    let source = "class P {\n  final dynamic a;\n  final dynamic b;\n  const P(this.a, [this.b = 1]);\n}\n\
                   @P()\nclass C {}\n\
                   @P(1, 2, 3)\nclass D {}";
     let rep = report(source);
     let rows = rows(&rep, source);
     assert!(
-        rows.contains(&("not_enough_positional_arguments", "P")),
+        rows.contains(&("not_enough_positional_arguments", ")")),
         "{rows:?}"
     );
     assert!(

@@ -38,113 +38,325 @@ impl<'a> Engine<'a> {
     /// neither `mixin` nor `mixin class` — reports at the entry name. Runs
     /// after the parse so a same-file later declaration resolves; an
     /// unresolvable entry stays with the clause ledger's own faces.
+    ///
+    /// The upstream `_checkForAllMixinErrorCodes` arm order
+    /// (error_verifier.dart:2459-2513): disallowed-class gate → deferred
+    /// check → extension-type skip → mixin element → class-modifier arm
+    /// → else-branch generative-ctor + inherits-from-not-object. The
+    /// enclosing container's `extends`/`implements` disallowed heads
+    /// suppress the whole loop (`_checkClassInheritance`'s short-circuit,
+    /// error_verifier.dart:2338-2340).
     pub(crate) fn finalize_mixin_uses(&mut self) {
-        for span in std::mem::take(&mut self.pending_mixin_uses) {
-            // The span is UTF-16; the slice reads source bytes (#2594). It
-            // anchors the whole NamedType — `p.C`, `C<int>`, `C?` — so the
-            // resolvable head is the spelling up to the first `<` or `?`,
-            // not the full slice (`error_verifier.dart` `_checkForMixinIn
-            // WithClause` resolves the type's ELEMENT, never the written
-            // suffixes).
-            let start = self.byte_of(span.offset);
-            let end = self.byte_of(span.end()).min(self.source.len());
-            if start >= end {
-                continue;
-            }
-            let text = &self.source[start..end];
-            let head_end = text.find(['<', '?']).map(|i| start + i).unwrap_or(end);
-            let head = self.intern(&self.source[start..head_end]);
-            // A dotted spelling (`p.C`) resolves the leaf through the
-            // prefix's own table — the bare-scope walk would answer the
-            // diagnosing library's same-named container, the wrong scope.
-            let resolved = if self.strings.resolve(head).contains('.') {
-                resolve_joined_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.strings,
-                    head,
-                )
+        // Group spans by their enclosing container's declaration offset —
+        // the CUM-2 suppression keys on the enclosing declaration, so all
+        // `with` entries of one container share the suppression verdict.
+        let spans = std::mem::take(&mut self.pending_mixin_uses);
+        let mut by_container: Vec<(Option<SourceRange>, Vec<SourceRange>)> = Vec::new();
+        for span in spans {
+            let enclosing = self.enclosing_container_range(span);
+            if let Some((_, group)) = by_container.iter_mut().find(|(r, _)| *r == enclosing) {
+                group.push(span);
             } else {
-                resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    head,
-                )
-            };
-            // The container-miss alias fold (`_checkForAllMixinErrorCodes`
-            // reads `mixinType.element` — the instantiated alias's element,
-            // error_verifier.dart:2879-2890): `with A` over `typedef A = C`
-            // resolves C's element and reports with C's name; the same fold
-            // lands a mixin-class target (`typedef A = MixinClass`) silent.
-            let (resolved, element) = match resolved {
-                Some(face) => (Some(face), head),
-                None => match self.mixin_use_alias_fold(head) {
-                    Some((container, owner, folded)) => (Some((container, owner)), folded),
-                    None => (None, head),
-                },
-            };
-            let Some((container, owner)) = resolved else {
-                continue;
-            };
-            if container.kind != ContainerKind::Class
-                || container_modifiers(container).is_mixin_class
-            {
+                by_container.push((enclosing, vec![span]));
+            }
+        }
+        for (enclosing_range, spans) in by_container {
+            // CUM-2 suppression: the enclosing container's `extends` head or
+            // `implements` entries being disallowed silences the whole
+            // `with` loop (upstream `_checkClassInheritance`,
+            // error_verifier.dart:2338-2340).
+            if let Some(range) = enclosing_range {
+                if self.enclosing_has_disallowed_supertype(range) {
+                    continue;
+                }
+            }
+            for span in spans {
+                // The span is UTF-16; the slice reads source bytes (#2594). It
+                // anchors the whole NamedType — `p.C`, `C<int>`, `C?` — so the
+                // resolvable head is the spelling up to the first `<` or `?`,
+                // not the full slice (`error_verifier.dart` `_checkForMixinIn
+                // WithClause` resolves the type's ELEMENT, never the written
+                // suffixes).
+                let start = self.byte_of(span.offset);
+                let end = self.byte_of(span.end()).min(self.source.len());
+                if start >= end {
+                    continue;
+                }
+                let text = &self.source[start..end];
+                let head_end = text.find(['<', '?']).map(|i| start + i).unwrap_or(end);
+                let head = self.intern(&self.source[start..head_end]);
+                // A dotted spelling (`p.C`) resolves the leaf through the
+                // prefix's own table — the bare-scope walk would answer the
+                // diagnosing library's same-named container, the wrong scope.
+                let resolved = if self.strings.resolve(head).contains('.') {
+                    resolve_joined_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.strings,
+                        head,
+                    )
+                } else {
+                    resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        head,
+                    )
+                };
+                // The container-miss alias fold (`_checkForAllMixinErrorCodes`
+                // reads `mixinType.element` — the instantiated alias's element,
+                // error_verifier.dart:2879-2890): `with A` over `typedef A = C`
+                // resolves C's element and reports with C's name; the same fold
+                // lands a mixin-class target (`typedef A = MixinClass`) silent.
+                let (resolved, element) = match resolved {
+                    Some(face) => (Some(face), head),
+                    None => match self.mixin_use_alias_fold(head) {
+                        Some((container, owner, folded)) => (Some((container, owner)), folded),
+                        None => (None, head),
+                    },
+                };
+                let Some((container, owner)) = resolved else {
+                    continue;
+                };
+                if container.kind != ContainerKind::Class {
+                    continue;
+                }
+                // The resolved element's non-subtypable-class gate
+                // (`_checkForAllMixinErrorCodes`'s first arm reads
+                // `_checkForExtendsOrImplementsDisallowedClass`, which answers
+                // `isNonSubtypableClass`, error_verifier.dart:2886-2888 and
+                // :5176-5188): a restricted `dart:*` element routes to the
+                // `subtype_of_disallowed_type` face this engine already emits
+                // and never reaches `classUsedAsMixin` — except `Enum`, whose
+                // `isDartCoreEnum` conjunct lets the element fall through to
+                // the class arm. The element leaf decides; a user shadow
+                // resolves off `dart:*` and keeps the report.
+                let element_leaf = {
+                    let spelled = self.strings.resolve(element);
+                    spelled.rsplit('.').next().unwrap_or(spelled)
+                };
+                let element_is_sdk = self
+                    .graph
+                    .library_of_file(owner)
+                    .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
+                if element_is_sdk
+                    && element_leaf != "Enum"
+                    && super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&element_leaf)
+                {
+                    continue;
+                }
+                // The mixin element's own library must carry class modifiers
+                // and the use must not ride the platform exemption
+                // (error_verifier.dart `_checkForMixinClass...`: the
+                // `featureSet.isEnabled(Feature.class_modifiers)` and
+                // `!_mayIgnoreClassModifiers` conjuncts) — a pre-3.0 library's
+                // plain class stays a legal mixin.
+                let owner_lib = self.graph.library_of_file(owner).unwrap_or(self.lib);
+                let owner_facts = self.library_facts(owner_lib);
+                let class_modifiers_arm = owner_facts.has_class_modifiers
+                    && !may_ignore_class_modifiers(owner_facts, self.library_facts(self.lib));
+                let is_mixin_class = container_modifiers(container).is_mixin_class;
+                // The oracle's message names the resolved ELEMENT (the leaf of
+                // a prefixed spelling, the head of a parameterized one, the
+                // folded head of an alias entry), not the whole written entry.
+                let name_text = {
+                    let element_text = self.strings.resolve(element);
+                    element_text
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(element_text)
+                        .to_string()
+                };
+                if !is_mixin_class && class_modifiers_arm {
+                    self.emit(SemanticCode::ClassUsedAsMixin, span, &name_text, "");
+                } else {
+                    // The else-branch arm (`_checkForAllMixinErrorCodes`'s
+                    // second tier, error_verifier.dart:2499-2512): when the
+                    // `classUsedAsMixin` arm above was not taken (pre-3.0
+                    // library, mayIgnore exempt, or the element IS a mixin
+                    // class), the two sibling checks still run — a plain class
+                    // cannot serve as a mixin if it declares a generative
+                    // constructor, and any class or mixin class whose
+                    // supertype is not `Object` reports the inherits face.
+                    if !is_mixin_class && has_nontrivial_ctor(container) {
+                        self.emit(
+                            SemanticCode::ClassUsedAsMixinDeclaresGenerativeConstructor,
+                            span,
+                            &name_text,
+                            "",
+                        );
+                    }
+                    // Inherits-from-not-object arm
+                    // (`_checkForMixinInheritsNotFromObject`,
+                    // error_verifier.dart:6051-6074): fires on `with M` when
+                    // M's element is a ClassElement whose supertype != null
+                    // && != Object, or has mixins && !(mixin application &&
+                    // mixins < 2). Fires on ANY ClassElement — plain class,
+                    // mixin class, mixin application.
+                    {
+                        let has_non_object_super = container
+                            .superclass
+                            .is_some_and(|s| self.strings.resolve(s) != "Object");
+                        // A mixin application (`class X = S with M`) is exempt
+                        // when it has fewer than 2 `with` entries — a
+                        // single-entry mixin application is the legal
+                        // `extends` alias form (upstream reads the element's
+                        // `isMixinApplication` flag; a non-application
+                        // `mixin class X with M {}` is NOT exempt).
+                        let is_single_mixin_application =
+                            container.is_mixin_application && container.with_clause.len() < 2;
+                        if !is_single_mixin_application
+                            && (has_non_object_super || !container.with_clause.is_empty())
+                        {
+                            self.emit(
+                                SemanticCode::MixinInheritsFromNotObject,
+                                span,
+                                &name_text,
+                                "",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The enclosing container's decl-site range for a `with`-clause span —
+    /// the last `DeclKind::Container` site whose name token precedes the
+    /// span (`_checkClassInheritance`'s `_enclosingClass` at the clause
+    /// visit, error_verifier.dart:2327-2371). `None` for an orphan span.
+    fn enclosing_container_range(&self, span: SourceRange) -> Option<SourceRange> {
+        self.decl_sites
+            .iter()
+            .rev()
+            .find(|site| {
+                matches!(site.kind, DeclKind::Container) && site.range.offset < span.offset
+            })
+            .map(|site| site.range)
+    }
+
+    /// Whether the enclosing container's `extends` head or `implements`
+    /// entries resolve to disallowed SDK types — the CUM-2 suppression
+    /// (`_checkClassInheritance`'s short-circuit, error_verifier.dart:
+    /// 2338-2340: `!_checkForExtendsDisallowedClass &&
+    /// !_checkForImplementsClauseErrorCodes` gates the whole
+    /// `_checkForAllMixinErrorCodes` loop).
+    fn enclosing_has_disallowed_supertype(&self, site_range: SourceRange) -> bool {
+        // Find the enclosing container by its decl-site name.
+        let Some(site) = self
+            .decl_sites
+            .iter()
+            .find(|s| matches!(s.kind, DeclKind::Container) && s.range == site_range)
+        else {
+            return false;
+        };
+        let Some(elements) = self.index.get(self.file) else {
+            return false;
+        };
+        let Some(container) = elements
+            .containers()
+            .find(|(name, _)| *name == site.name)
+            .map(|(_, c)| c)
+        else {
+            return false;
+        };
+        // `extends` head disallowed → suppress all `with` entries.
+        if let Some(superclass) = container.superclass {
+            if self.disallowed_subtype_head(superclass).is_some() {
+                return true;
+            }
+        }
+        // `implements` entries disallowed → suppress all `with` entries.
+        for interface in container.implements_clause.iter() {
+            if self.disallowed_subtype_head(*interface).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The `mixin class` declaration checks
+    /// (`_checkForMixinClassErrorCodes`, error_verifier.dart:5967-6043):
+    /// runs on every `mixin class` element in the unit — the
+    /// `is_mixin_class` flag on the container distinguishes the form.
+    ///
+    /// Three checks, in upstream order:
+    /// 1. Non-trivial generative constructor →
+    ///    `mixin_class_declares_non_trivial_generative_constructor` at the
+    ///    ctor's own decl-site.
+    /// 2. `extends` non-Object → `mixin_class_declaration_extends_not_object`
+    ///    at the superclass head.
+    /// 3. `with` clause on a non-application →
+    ///    `mixin_class_declaration_with_clause`; a `with` list of 2+ on an
+    ///    application →
+    ///    `mixin_modifier_mixin_application_class_with_multiple_mixins`.
+    pub(crate) fn finalize_mixin_class_declarations(&mut self) {
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        for (name, container) in elements.containers() {
+            if container.kind != ContainerKind::Class || !container.is_mixin_class {
                 continue;
             }
-            // The resolved element's non-subtypable-class gate
-            // (`_checkForAllMixinErrorCodes`'s first arm reads
-            // `_checkForExtendsOrImplementsDisallowedClass`, which answers
-            // `isNonSubtypableClass`, error_verifier.dart:2886-2888 and
-            // :5176-5188): a restricted `dart:*` element routes to the
-            // `subtype_of_disallowed_type` face this engine already emits
-            // and never reaches `classUsedAsMixin` — except `Enum`, whose
-            // `isDartCoreEnum` conjunct lets the element fall through to
-            // the class arm. The element leaf decides; a user shadow
-            // resolves off `dart:*` and keeps the report.
-            let element_leaf = {
-                let spelled = self.strings.resolve(element);
-                spelled.rsplit('.').next().unwrap_or(spelled)
-            };
-            let element_is_sdk = self
-                .graph
-                .library_of_file(owner)
-                .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"));
-            if element_is_sdk
-                && element_leaf != "Enum"
-                && super::engine_core::NON_SUBTYPABLE_SDK_NAMES.contains(&element_leaf)
-            {
+            let site_range = self
+                .decl_sites
+                .iter()
+                .find(|s| matches!(s.kind, DeclKind::Container) && s.name == name)
+                .map(|s| s.range);
+            let Some(site_range) = site_range else {
                 continue;
-            }
-            // The mixin element's own library must carry class modifiers
-            // and the use must not ride the platform exemption
-            // (error_verifier.dart `_checkForMixinClass...`: the
-            // `featureSet.isEnabled(Feature.class_modifiers)` and
-            // `!_mayIgnoreClassModifiers` conjuncts) — a pre-3.0 library's
-            // plain class stays a legal mixin.
-            let owner_lib = self.graph.library_of_file(owner).unwrap_or(self.lib);
-            let owner_facts = self.library_facts(owner_lib);
-            if !owner_facts.has_class_modifiers
-                || may_ignore_class_modifiers(owner_facts, self.library_facts(self.lib))
-            {
-                continue;
-            }
-            // The oracle's message names the resolved ELEMENT (the leaf of
-            // a prefixed spelling, the head of a parameterized one, the
-            // folded head of an alias entry), not the whole written entry.
-            let name_text = {
-                let element_text = self.strings.resolve(element);
-                element_text
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(element_text)
-                    .to_string()
             };
-            self.emit(SemanticCode::ClassUsedAsMixin, span, &name_text, "");
+            let name_text = self.strings.resolve(name).to_string();
+            // Check 1: non-trivial generative constructor (upstream
+            // `isTrivial`, ast.dart:7117 — no parameters, no initializers,
+            // an empty `;` body). The model sees parameters only, so a
+            // zero-param ctor with initializers or a block body under-
+            // reports — the under-report direction.
+            if has_nontrivial_ctor(container) {
+                self.emit(
+                    SemanticCode::MixinClassDeclaresNonTrivialGenerativeConstructor,
+                    site_range,
+                    &name_text,
+                    "",
+                );
+            }
+            // Check 2: `extends` non-Object →
+            // `mixin_class_declaration_extends_not_object` at the superclass.
+            if let Some(superclass) = container.superclass {
+                if self.strings.resolve(superclass) != "Object" {
+                    self.emit(
+                        SemanticCode::MixinClassDeclarationExtendsNotObject,
+                        site_range,
+                        &name_text,
+                        "",
+                    );
+                }
+            }
+            // Check 3: `with` clause on a non-application or with 2+
+            // entries. Upstream reads `element.isMixinApplication` — a
+            // `mixin class X = S with M` alias IS an application; a `mixin
+            // class X with M {}` body declaration is NOT.
+            if !container.with_clause.is_empty() {
+                if !container.is_mixin_application {
+                    self.emit(
+                        SemanticCode::MixinClassDeclarationWithClause,
+                        site_range,
+                        &name_text,
+                        "",
+                    );
+                } else if container.with_clause.len() >= 2 {
+                    self.emit(
+                        SemanticCode::MixinModifierMixinApplicationClassWithMultipleMixins,
+                        site_range,
+                        &name_text,
+                        "",
+                    );
+                }
+            }
         }
     }
 
@@ -970,6 +1182,18 @@ impl<'a> Engine<'a> {
     /// enum body or top level. A sibling face on another `on` type never
     /// resolves an implicit-`this` read inside the body.
     fn enclosing_extension_on(&self, offset: u32) -> Option<String> {
+        self.enclosing_extension_header(offset)
+            .map(|(_, head)| head)
+    }
+
+    /// The twin of [`Self::enclosing_extension_on`] that also returns the
+    /// enclosing extension's own name spelling — `Some(None)` for an
+    /// unnamed face, `Some(Some(name))` for a named one. The extension-
+    /// body sweep matches credit candidates against it: the face's own
+    /// member scope answers a body's implicit-`this` lookup, so the
+    /// spelling (absent for the unnamed faces) is the declaring face's
+    /// key.
+    fn enclosing_extension_header(&self, offset: u32) -> Option<(Option<String>, String)> {
         let bytes = self.source.as_bytes();
         let mut end = self.byte_of(offset).min(bytes.len());
         loop {
@@ -981,18 +1205,22 @@ impl<'a> Engine<'a> {
             // A top-level declaration header starts in column 0.
             if !line.is_empty() && !line.starts_with([' ', '\t', '}', '/', '*', ')']) {
                 let words: Vec<&str> = line.split_whitespace().collect();
-                if words.contains(&"extension") {
+                if let Some(at) = words.iter().position(|w| *w == "extension") {
+                    let name = words.get(at + 1).filter(|w| **w != "on").map(|w| {
+                        w.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                            .to_string()
+                    });
                     let head = words
                         .iter()
                         .position(|w| *w == "on")
-                        .and_then(|at| words.get(at + 1))
+                        .and_then(|position| words.get(position + 1))
                         .map(|w| {
                             w.trim_end_matches(|c: char| {
                                 !(c.is_alphanumeric() || c == '_' || c == '$')
                             })
                         })
                         .map(|w| w.split(['<', '?']).next().unwrap_or(w).to_string());
-                    return Some(head.unwrap_or_default());
+                    return Some((name, head.unwrap_or_default()));
                 }
                 if words
                     .iter()
@@ -1074,10 +1302,9 @@ impl<'a> Engine<'a> {
                     .flat_map(|f| f.type_param_names.iter().copied()),
             )
             .chain(
-                self.exec_bounds
-                    .values()
-                    .chain(self.method_exec_bounds.values())
-                    .flat_map(|w| w.iter().map(|(p, _)| *p)),
+                self.exec_windows
+                    .iter()
+                    .flat_map(|w| w.params.iter().map(|(p, _)| *p)),
             )
             .collect();
         let unique_face = |name: StringId| -> Option<u32> {
@@ -1363,6 +1590,7 @@ impl<'a> Engine<'a> {
         // takes the use (`member_found`).
         let bool_id = self.intern("bool");
         let int_id = self.intern("int");
+        let double_id = self.intern("double");
         let bytes = self.source.as_bytes();
         let ident_before = |bytes: &[u8], i: usize| {
             i > 0
@@ -1382,17 +1610,39 @@ impl<'a> Engine<'a> {
                 head = Some(bool_id);
                 after = at + 5;
             } else if bytes[at].is_ascii_digit() && !ident_before(bytes, at) {
-                head = Some(int_id);
                 after = at
                     + bytes[at..]
                         .iter()
                         .take_while(|b| b.is_ascii_digit() || **b == b'.')
                         .count();
+                // A fraction digit run (`1.0`) is a `double` literal; a
+                // trailing `.` alone is a member access on an `int`.
+                head = Some(
+                    if bytes[at..after]
+                        .windows(2)
+                        .any(|pair| pair[0] == b'.' && pair[1].is_ascii_digit())
+                    {
+                        double_id
+                    } else {
+                        int_id
+                    },
+                );
             }
             if let Some(head) = head {
                 let mut next = after;
                 while next < bytes.len() && bytes[next].is_ascii_whitespace() {
                     next += 1;
+                }
+                // A null assertion (`42!(2)`, `42![24]`) sits between the
+                // literal and its application — `e!`'s static type keeps
+                // the literal's own head (non-null of a non-nullable type),
+                // so the application resolves through the same face and
+                // the assertion never blocks the credit.
+                if bytes.get(next) == Some(&b'!') {
+                    next += 1;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
                 }
                 match bytes.get(next) {
                     // An index application: the read credits `[]`, the
@@ -1753,6 +2003,29 @@ impl<'a> Engine<'a> {
             {
                 self.credit_face_member_ty(&faces, &declarers, op, operand, &mut index_read_used);
             }
+            // The glued relational face: a `<`/`>` glued to a function or
+            // type name is a relational operator whenever the parser
+            // declines the method-type-argument reading
+            // ([`Self::glued_angle_operator`]) — `f(a<b, c> {})` passes
+            // `a < b` and `c > {}` (co19 Constructor-tear-offs
+            // ambiguities). The receiver head derives exactly as the spaced
+            // byte-scan arm's: a top-level function is a `Function` value, a
+            // type name a `Type` literal.
+            if matches!(unit_ref.target, RefTarget::Decl { .. })
+                && let Some(op) = self.glued_angle_operator(unit_ref.range.offset, name_units)
+            {
+                let head = if fn_heads.contains(&unit_ref.name) {
+                    Some(function_head)
+                } else if type_heads.contains(&unit_ref.name) {
+                    Some(type_head)
+                } else {
+                    None
+                };
+                if let Some(head) = head {
+                    let op = self.intern(op);
+                    self.credit_face_member(&faces, &declarers, op, head, &mut index_read_used);
+                }
+            }
             // The implicit-`call` arm (`visitFunctionExpressionInvocation`,
             // unused_local_elements_verifier.dart:175-180): a bare callee
             // the tables type record or function resolves `call` through
@@ -1776,6 +2049,10 @@ impl<'a> Engine<'a> {
         // only identifier operands — a literal carries no `refs` entry, so
         // the token stream re-derives this one family directly.
         self.credit_prefix_literal_operators(&faces, &declarers, &mut index_read_used);
+        // The extension-body sweep (#3477): the implicit-`this` writes and
+        // `this(...)` invocations no row record carries — the token
+        // stream's last arm, run before the artifact scrub.
+        self.credit_extension_body_members();
         // The write-artifact scrub (`writeOrReadElement` is `[]=` alone for
         // every index write form): the resolve side credits the `[]` read
         // spelling beside `[]=` on every applied write row, so a `(file,
@@ -1798,6 +2075,177 @@ impl<'a> Engine<'a> {
         for (face_file, face_index) in artifact_reads {
             self.extension_member_used
                 .remove(&(face_file, face_index, index_get));
+        }
+    }
+
+    /// The extension-body implicit-`this` sweep (#3477): inside an
+    /// extension body a bare member resolves against that extension's OWN
+    /// member scope before the applicability pool (the oracle's
+    /// implicit-`this` lookup), but the applications no row record carries
+    /// never joined the credit: a `??=`/compound/increment write on a bare
+    /// name produces no read-position entry (`p ??= v` reads the getter
+    /// and writes the setter, yet neither half lands in `refs`/
+    /// `member_reads` — the write half is not a read), and a
+    /// `this(...)`/`this!(...)` invocation rides `RefTarget::This`, which
+    /// no application arm walks. The token stream re-derives both.
+    ///
+    /// The credit is the enclosing face's own: same-file faces name-matched
+    /// to the enclosing extension (a named header credits exactly its
+    /// face; the unnamed headers share the nameless key — the same-file
+    /// unnamed granularity the self-use arm already accepts), the
+    /// accessor pair for a write (`member` + `member=`), the face's
+    /// `call` for `this(` — the invocation resolves like a call on a
+    /// value of the `on` type, so a real `call` member there wins
+    /// (`member_found`). A body-local of the same spelling shadows the
+    /// member (the scope walk binds the local) and skips the credit; the
+    /// under-report corners — a formal parameter of the same spelling, a
+    /// sibling unnamed face sharing the member — keep the pool's accepted
+    /// granularity.
+    fn credit_extension_body_members(&mut self) {
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        if elements.extension_faces().is_empty() {
+            return;
+        }
+        // Candidate collection first — the token borrow must end before
+        // the credit mutations below. Candidates are rare (a write face or
+        // an invocation adjacent to an identifier), so the deep header
+        // scan only runs for them.
+        let tokens = self.tokens.as_slice();
+        let ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'$';
+        let mut candidates: Vec<(u32, bool, String)> = Vec::new();
+        for index in 0..tokens.len() {
+            let token = &tokens[index];
+            let text = &self.source[token.byte_range()];
+            let first = *text.as_bytes().first().unwrap_or(&b' ');
+            if text == "this" {
+                let after = tokens
+                    .get(index + 1)
+                    .map(|next| &self.source[next.byte_range()]);
+                let invocation = match after {
+                    Some("(") => true,
+                    Some("!") => tokens
+                        .get(index + 2)
+                        .is_some_and(|next| &self.source[next.byte_range()] == "("),
+                    _ => false,
+                };
+                if invocation {
+                    candidates.push((token.utf16_offset, true, String::new()));
+                }
+                continue;
+            }
+            if !ident_start(first) || text == "on" {
+                continue;
+            }
+            let next = tokens.get(index + 1).map(|t| &self.source[t.byte_range()]);
+            let prev = index
+                .checked_sub(1)
+                .and_then(|p| tokens.get(p))
+                .map(|t| &self.source[t.byte_range()]);
+            let is_write = matches!(
+                next,
+                Some(
+                    "??="
+                        | "+="
+                        | "-="
+                        | "*="
+                        | "/="
+                        | "%="
+                        | "~/="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "<<="
+                        | ">>="
+                        | ">>>="
+                        | "++"
+                        | "--"
+                )
+            ) || matches!(prev, Some("++" | "--"));
+            if is_write {
+                // The identifier charset is ASCII, so the char count is
+                // the exact UTF-16 span.
+                candidates.push((token.utf16_offset, false, text.to_string()));
+            }
+        }
+        for (offset, is_this_call, text) in candidates {
+            let Some((enclosing_name, head)) = self.enclosing_extension_header(offset) else {
+                continue;
+            };
+            let head_id = self.intern(&head);
+            let call_id = self.intern("call");
+            if is_this_call {
+                // `this(...)` resolves like a call on a value of the `on`
+                // type — a real `call` member there resolves first.
+                if self.member_found(head_id, call_id, false) {
+                    continue;
+                }
+            } else {
+                let member = self.intern(&text);
+                // A body-local of the same spelling binds the name.
+                if self
+                    .locals
+                    .iter()
+                    .any(|decl| !decl.retired && decl.name == member)
+                {
+                    continue;
+                }
+                let setter = self.setter_spelling(member);
+                let credits: Vec<(u32, bool)> = self
+                    .index
+                    .get(self.file)
+                    .map(|elements| {
+                        elements
+                            .extension_faces()
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, face)| match (face.name, &enclosing_name) {
+                                (None, None) => true,
+                                (Some(id), Some(name)) => self.strings.resolve(id) == *name,
+                                _ => false,
+                            })
+                            .filter(|(_, face)| face.members.contains_key(&member))
+                            .filter_map(|(index, face)| {
+                                u32::try_from(index)
+                                    .ok()
+                                    .map(|index| (index, face.members.contains_key(&setter)))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (index, has_setter) in credits {
+                    self.extension_member_used
+                        .insert((self.file, index, member));
+                    if has_setter {
+                        self.extension_member_used
+                            .insert((self.file, index, setter));
+                    }
+                }
+                continue;
+            }
+            let credits: Vec<u32> = self
+                .index
+                .get(self.file)
+                .map(|elements| {
+                    elements
+                        .extension_faces()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, face)| match (face.name, &enclosing_name) {
+                            (None, None) => true,
+                            (Some(id), Some(name)) => self.strings.resolve(id) == *name,
+                            _ => false,
+                        })
+                        .filter(|(_, face)| face.members.contains_key(&call_id))
+                        .filter_map(|(index, _)| u32::try_from(index).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for index in credits {
+                self.extension_member_used
+                    .insert((self.file, index, call_id));
+            }
         }
     }
 
@@ -1980,6 +2428,59 @@ impl<'a> Engine<'a> {
             Some((_, "--")) => Some(self.intern("-")),
             _ => None,
         }
+    }
+
+    /// The relational operator a `<`/`>` glued to the name ending at
+    /// `offset + name_units` spells, `None` for a method-type-argument
+    /// group. The parser reads `name<…>` as type arguments only when the
+    /// group is balanced and its closing `>` is followed by `(`, `.`,
+    /// `==`, `!=`, `)`, `]`, `}`, `;`, `:`, `,` or the end of input
+    /// (`computeMethodTypeArguments` / `_mayFollowTypeArgs`, upstream Dart
+    /// SDK source, pkg/_fe_analyzer_shared/lib/src/parser/type_info.dart);
+    /// every other glued angle is `operator<` on the name or `operator>`
+    /// on the group's last name. The spaced form is
+    /// [`Self::adjacent_operator_at`]'s.
+    fn glued_angle_operator(&self, offset: u32, name_units: u32) -> Option<&'static str> {
+        use dartq_scanner::TokenKind;
+        let tokens = self.tokens.as_slice();
+        let end = offset + name_units;
+        let at = tokens.partition_point(|token| token.utf16_offset < end);
+        let token = tokens.get(at).filter(|token| token.utf16_offset == end)?;
+        let (op, close) = match token.kind {
+            TokenKind::Lt => ("<", self.tokens.matching_end(at)),
+            TokenKind::Gt => (
+                ">",
+                (0..at)
+                    .rev()
+                    .any(|open| {
+                        tokens[open].kind == TokenKind::Lt
+                            && self.tokens.matching_end(open) == Some(at)
+                    })
+                    .then_some(at),
+            ),
+            _ => return None,
+        };
+        // An unbalanced angle never forms type arguments.
+        let Some(close) = close else {
+            return Some(op);
+        };
+        let type_arguments = tokens.get(close + 1).is_none_or(|next| {
+            matches!(
+                next.kind,
+                TokenKind::OpenParen
+                    | TokenKind::Period
+                    | TokenKind::EqEq
+                    | TokenKind::BangEq
+                    | TokenKind::CloseParen
+                    | TokenKind::CloseSquare
+                    | TokenKind::CloseCurly
+                    | TokenKind::Semicolon
+                    | TokenKind::Colon
+                    | TokenKind::Comma
+                    | TokenKind::Eof
+            )
+        });
+        (!type_arguments).then_some(op)
     }
 
     /// The `Ty`-shaped twin of [`Self::credit_face_member`]: the head-
@@ -2863,10 +3364,11 @@ impl<'a> Engine<'a> {
     }
 
     /// The shared operator/`call`/function-receiver credit path: the guard
-    /// chain (exactly one accessible face declares the member, no real
-    /// container member carries the spelling, the face's `on` head equals
-    /// the receiver head) then the element-level insert the member arms
-    /// read. Returns whether the credit landed.
+    /// chain (an accessible face declares the member, no real container
+    /// member carries the spelling, the face's `on` head is the receiver
+    /// head — or, through [`Self::most_specific_face`], the unique most
+    /// specific supertype head) then the element-level insert the member
+    /// arms read. Returns whether the credit landed.
     fn credit_face_member(
         &mut self,
         faces: &[(&ExtensionFace, FileId)],
@@ -2875,16 +3377,24 @@ impl<'a> Engine<'a> {
         head: StringId,
         index_read_used: &mut FxHashSet<(FileId, u32)>,
     ) -> bool {
-        if declarers.get(&member).copied() != Some(1) {
+        let declared = declarers.get(&member).copied().unwrap_or(0);
+        if declared == 0 {
             return false;
         }
         if self.member_found(head, member, false) {
             return false;
         }
-        let Some(&(face, face_file)) = faces.iter().find(|(face, _)| {
-            face.members.contains_key(&member)
-                && matches!(&face.on_ty, Ty::Named { name, .. } if *name == head)
-        }) else {
+        let exact = faces
+            .iter()
+            .find(|(face, _)| {
+                face.members.contains_key(&member)
+                    && matches!(&face.on_ty, Ty::Named { name, .. } if *name == head)
+            })
+            .copied()
+            .filter(|_| declared == 1);
+        let Some((face, face_file)) =
+            exact.or_else(|| self.most_specific_face(faces, member, head))
+        else {
             return false;
         };
         if let Some(face_index) = self
@@ -2909,6 +3419,44 @@ impl<'a> Engine<'a> {
             return true;
         }
         false
+    }
+
+    /// The applicable-face resolution the head-spelled arms replay
+    /// (upstream Dart SDK source, extension_member_resolver.dart — the
+    /// most-specific choice): among the faces declaring `member` whose
+    /// non-generic named `on` head the receiver `head` reaches — the head
+    /// itself or a named supertype of it — the face whose `on` head is a
+    /// proper subtype of every other applicable face's wins (`1(10)` picks
+    /// `on int` over `on num`, `1.0(10)` reaches `on num` alone). No unique
+    /// winner is the oracle's `ambiguous_extension_member_access`, which
+    /// credits nothing.
+    fn most_specific_face<'f>(
+        &self,
+        faces: &[(&'f ExtensionFace, FileId)],
+        member: StringId,
+        head: StringId,
+    ) -> Option<(&'f ExtensionFace, FileId)> {
+        let world = self.name_world();
+        let applicable: Vec<(&'f ExtensionFace, FileId, StringId)> = faces
+            .iter()
+            .filter_map(|&(face, file)| {
+                if !face.members.contains_key(&member) || !face.type_param_names.is_empty() {
+                    return None;
+                }
+                let Ty::Named { name: on, .. } = face.on_ty else {
+                    return None;
+                };
+                (on == head || world.named_sub(head, on)).then_some((face, file, on))
+            })
+            .collect();
+        applicable
+            .iter()
+            .find(|&&(face, _, on)| {
+                applicable.iter().all(|&(other, _, other_on)| {
+                    std::ptr::eq(face, other) || (on != other_on && world.named_sub(on, other_on))
+                })
+            })
+            .map(|&(face, file, _)| (face, file))
     }
 
     /// The overloadable operator starting at byte `at`, as its `operator`
@@ -3242,7 +3790,27 @@ impl<'a> Engine<'a> {
         // `visitSimpleIdentifier` non-call arm credits the whole formal
         // list either way).
         let mut noncall_reads = self.walk_this_redirect_targets();
-        noncall_reads.extend(self.walk_ctor_tearoffs());
+        let (tear_offs, mut ctor_references) = self.walk_ctor_references();
+        noncall_reads.extend(tear_offs);
+        // The constructor element-use pool the Constructor arm reads
+        // (`_isUsedMember` over `usedElements.members`/`elements`): every
+        // written `C.sel` reference (calls, tear-offs, redirecting-factory
+        // targets, metadata), the `this.sel(...)` redirect targets, the enum
+        // constants' selectors, and each `super.sel(...)` initializer's
+        // target on the subclass's declared superclass. Keyed `(container,
+        // selector)` like the decl sites; the unannotated calls carry no
+        // `member_refs` edge (#2945), so this pool is their only credit.
+        ctor_references.extend(noncall_reads.iter().copied());
+        ctor_references.extend(self.walk_enum_constant_ctors());
+        if let Some(elements) = self.index.get(self.file) {
+            for (&(sub, _), &selector) in &super_ctor_targets {
+                if let Some(selector) = selector
+                    && let Some(superclass) = elements.container(sub).and_then(|c| c.superclass)
+                {
+                    ctor_references.insert((superclass, selector));
+                }
+            }
+        }
         // The element-attributed use pool: `used_names` minus the member
         // spellings that only an unresolved access contributed (the
         // `Receiver::Unknown`/`Prefix` rows — an `InvalidType` or `dynamic`
@@ -3691,16 +4259,23 @@ impl<'a> Engine<'a> {
         // shorthand's context type is the declaration's written type,
         // which the finalize pass does not model — a same-spelling
         // selector on a sibling class shares the credit (the
-        // under-report direction every spelling-level corner keeps).
-        let shorthand_ctor_refs: FxHashSet<StringId> = self
-            .refs
+        // under-report direction every spelling-level corner keeps). The
+        // token stream (not `refs`) carries the selectors: a wildcard-
+        // spelled `._(...)` selector never binds a `refs` entry.
+        let tokens = self.tokens.as_slice();
+        let shorthand_ctor_refs: FxHashSet<StringId> = tokens
             .iter()
-            .filter(|r| {
-                self.dot_shorthand_context(r.range.offset)
-                    && !self.byte_before_dot_is_question(r.range.offset)
-                    && self.byte_at(r.range.end()) == Some(b'(')
+            .enumerate()
+            .filter(|&(k, token)| {
+                token.kind == dartq_scanner::TokenKind::Identifier
+                    && k > 0
+                    && tokens[k - 1].kind == dartq_scanner::TokenKind::Period
+                    && tokens.get(k + 1).map(|next| next.kind)
+                        == Some(dartq_scanner::TokenKind::OpenParen)
+                    && self.dot_shorthand_context(token.utf16_offset)
+                    && !self.byte_before_dot_is_question(token.utf16_offset)
             })
-            .map(|r| r.name)
+            .map(|(_, token)| self.intern(self.token_text(token)))
             .collect();
         // The public-typedef exposure face (`visitGenericTypeAlias`,
         // unused_local_elements_verifier.dart:175-190): a non-private
@@ -3792,6 +4367,27 @@ impl<'a> Engine<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        // The written constructor faces per container: every distinct head
+        // spelling the class body declares (`C(`, `C.new(`, `C._(`). The
+        // element model folds a duplicate unnamed face (`_C(); _C.new();`)
+        // into one `has_unnamed_constructor` bit, while upstream's
+        // `constructors` list keeps the duplicate — the oracle reports the
+        // second `_C.new` beside `duplicate_constructor` (3.13.7).
+        let mut ctor_faces: FxHashMap<StringId, FxHashSet<StringId>> = FxHashMap::default();
+        for site in &self.decl_sites {
+            if let DeclKind::Constructor { container } = site.kind {
+                ctor_faces.entry(container).or_default().insert(site.name);
+            }
+        }
+        // A named factory's head token (`_E` of `factory _E.make()`) also
+        // registers a method-shaped site; the selector's constructor site
+        // owns the element, so the head twin never carries a row of its own
+        // (oracle 3.13.7 reports `_E.make` alone, never a second `_E`).
+        let factory_head_twins: FxHashSet<(u32, u32)> = self
+            .factory_head_anchors
+            .values()
+            .map(|head| (head.offset, head.length))
+            .collect();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
             // Skip both the element-face match below and the parameter-face
@@ -4238,6 +4834,7 @@ impl<'a> Engine<'a> {
                         );
                     let spared = unnamed_face_owns
                         || pragma_spared
+                        || factory_head_twins.contains(&(site.range.offset, site.range.length))
                         || (!self.is_nameless(site.name)
                             && self.is_publicly_accessible(site.name, site.kind, false))
                         || member_used
@@ -4278,28 +4875,32 @@ impl<'a> Engine<'a> {
                         // `has_unnamed_constructor` carries exactly that set
                         // (extension-type primaries land there without a
                         // `decl_sites` entry — the listener gates
-                        // `ContainerKind::Class | Enum` for the site).
-                        let multi = self
+                        // `ContainerKind::Class | Enum` for the site); the
+                        // written faces add the duplicate unnamed head the
+                        // model folds.
+                        let model_count = self
                             .index
                             .get(self.file)
                             .and_then(|f| f.container(container))
-                            .is_some_and(|c| {
-                                c.constructors.len() + usize::from(c.has_unnamed_constructor) > 1
+                            .map_or(0, |c| {
+                                c.constructors.len() + usize::from(c.has_unnamed_constructor)
                             });
-                        // `_isUsedElement`'s element check for ctors: the
+                        let multi = model_count
+                            .max(ctor_faces.get(&container).map_or(0, FxHashSet::len))
+                            > 1;
+                        // `_isUsedMember`'s element check for ctors
+                        // (`usedElements.members`/`elements`): the
                         // `member_refs` edge `credit_constructor_selector`
                         // pushes carries the resolved `(file, container,
-                        // selector)` tuple — a `D._named` use never spares
-                        // `C._named`. No `element_used` fallback: the
-                        // name-level set credits every same-spelling ctor
-                        // across classes (the over-credit the element set
-                        // exists to prevent). `super.named()` initializers
-                        // ride `note_ctor_use_in`'s annotated-only edge —
-                        // an unannotated super-target's credit is a known
-                        // under-report face (upstream spares it via
-                        // `usedElements.elements`).
+                        // selector)` tuple, and `ctor_references` holds every
+                        // written reference resolved to this container — a
+                        // `D._named` use never spares `C._named`. No
+                        // `element_used` fallback: the name-level set credits
+                        // every same-spelling ctor across classes (the
+                        // over-credit the element sets exist to prevent).
                         let ctor_used = member_used_elements
                             .contains(&(self.file, container, site.name))
+                            || ctor_references.contains(&(container, site.name))
                             || alias_used_ctors.contains(&(self.file, container, site.name))
                             || shorthand_ctor_refs.contains(&site.name);
                         let spared = !multi
@@ -4939,8 +5540,41 @@ impl<'a> Engine<'a> {
             .map(|d| d.range.offset)
             .collect();
         let prefixes: Vec<StringId> = self.imports.iter().filter_map(|site| site.prefix).collect();
+        // The metadata heads through a prefix (`@p.V`, `@p.C.named(…)`):
+        // the annotation resolves its first selector in the prefix's
+        // scope, and that lookup credits the import even when the
+        // annotation itself is invalid (`InvalidAnnotationTest/
+        // test_getter_importWithPrefix` — `@p.V` over a getter reports
+        // `invalid_annotation` while the import stays used).
+        let metadata_heads: Vec<(u32, StringId, StringId)> = if prefixes.is_empty() {
+            Vec::new()
+        } else {
+            let tokens = self.tokens.as_slice();
+            tokens
+                .windows(4)
+                .filter(|w| {
+                    w[0].kind == dartq_scanner::TokenKind::At
+                        && w[1].kind == dartq_scanner::TokenKind::Identifier
+                        && w[2].kind == dartq_scanner::TokenKind::Period
+                        && w[3].kind == dartq_scanner::TokenKind::Identifier
+                })
+                .map(|w| {
+                    (
+                        w[1].utf16_offset,
+                        self.intern(self.token_text(&w[1])),
+                        self.intern(self.token_text(&w[3])),
+                    )
+                })
+                .collect()
+        };
         for prefix in prefixes {
             let entry = evidence.entry(prefix).or_default();
+            for &(head_offset, head, selector) in &metadata_heads {
+                if head == prefix && !self.prefix_shadowed_at(&shadowed_heads, prefix, head_offset)
+                {
+                    entry.0.insert(selector);
+                }
+            }
             let mut receiver_uses: FxHashSet<u32> = FxHashSet::default();
             for read in &self.member_reads {
                 let Receiver::Prefix { name } = read.recv else {
@@ -5709,16 +6343,38 @@ impl<'a> Engine<'a> {
     /// is always non-call (its `ConstructorName` sits under `Annotation`,
     /// never `InstanceCreationExpression`), arguments or not.
     ///
-    /// Returns the resolved `(container, selector)` set — `sel` keeps its
-    /// written spelling (`new` stays `new`; the reader folds it against
-    /// the unnamed face's container key). A redirecting FACTORY's
-    /// `= C.sel` target is the one non-call shape that does NOT credit
-    /// the whole list upstream (`_matchParameters` pairs the factory's
+    /// Returns `(tear_offs, references)`, both resolved `(container,
+    /// selector)` sets — `sel` keeps its written spelling (`new` stays
+    /// `new`; the reader folds it against the unnamed face's container
+    /// key). `tear_offs` holds the non-call reads above; `references`
+    /// holds EVERY written `C.sel` / `C<T>.sel` / `@C.sel` naming a
+    /// constructor — calls and redirecting-factory targets included — the
+    /// element-use face (`visitSimpleIdentifier` adds the resolved
+    /// constructor to `usedElements.members` whatever its parent,
+    /// unused_local_elements_verifier.dart:335-345), minus the
+    /// constructor declarations' own `C.sel(` heads. A redirecting
+    /// FACTORY's `= C.sel` target is the one non-call shape that does NOT
+    /// credit the whole list upstream (`_matchParameters` pairs the factory's
     /// own formals against the target's — the `redirect_formals_into`
-    /// lane already models that pairing), so the walk excludes it by
-    /// the `factory` keyword behind the `=`.
-    fn walk_ctor_tearoffs(&mut self) -> FxHashSet<(StringId, StringId)> {
+    /// lane already models that pairing), so the tear-off set excludes it
+    /// by the `factory` keyword behind the `=`.
+    fn walk_ctor_references(
+        &mut self,
+    ) -> (
+        FxHashSet<(StringId, StringId)>,
+        FxHashSet<(StringId, StringId)>,
+    ) {
         let mut targets: FxHashSet<(StringId, StringId)> = FxHashSet::default();
+        let mut references: FxHashSet<(StringId, StringId)> = FxHashSet::default();
+        // A constructor declaration's own head (`C.sel(` in the class body)
+        // spells the reference shape; its selector token is the decl site's
+        // anchor, so the site offsets keep the declarations out.
+        let declared_selectors: FxHashSet<u32> = self
+            .decl_sites
+            .iter()
+            .filter(|site| matches!(site.kind, DeclKind::Constructor { .. }))
+            .map(|site| site.range.offset)
+            .collect();
         let tokens = self.tokens.as_slice();
         let new = self.intern("new");
         for i in 0..tokens.len() {
@@ -5782,6 +6438,30 @@ impl<'a> Engine<'a> {
             let Some(head_token) = head_token else {
                 continue;
             };
+            let head = self.intern(self.token_text(&head_token));
+            // The constructor face must actually exist upstream's way: a
+            // named selector joins through the container's `constructors`
+            // set, `new` through the unnamed face. A prefix segment, a
+            // variable head, or a method selector resolves nothing — the
+            // under-report posture every unmodelable corner keeps.
+            let Some((decl, _)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                head,
+            ) else {
+                continue;
+            };
+            let named = decl.constructors.contains(&selector);
+            let unnamed = selector == new && decl.has_unnamed_constructor;
+            if !(named || unnamed) {
+                continue;
+            }
+            if !declared_selectors.contains(&tokens[i + 1].utf16_offset) {
+                references.insert((head, selector));
+            }
             let metadata = head_index > 0
                 && matches!(tokens[head_index - 1].kind, dartq_scanner::TokenKind::At);
             // The call gate: `(` immediately after the selector is an
@@ -5792,7 +6472,7 @@ impl<'a> Engine<'a> {
             // Metadata (`@C.sel(...)`) is exempt: the `Annotation` parent
             // keeps the selector read non-call upstream, arguments or not.
             if !metadata {
-                let mut next = i + 2;
+                let next = i + 2;
                 let mut called = matches!(
                     tokens.get(next).map(|t| &t.kind),
                     Some(dartq_scanner::TokenKind::OpenParen)
@@ -5855,34 +6535,86 @@ impl<'a> Engine<'a> {
             if factory_target {
                 continue;
             }
-            let head = self.intern(self.token_text(&head_token));
-            // The constructor face must actually exist upstream's way: a
-            // named selector joins through the container's `constructors`
-            // set, `new` through the unnamed face. A prefix segment, a
-            // variable head, or a method selector resolves nothing — the
-            // under-report posture every unmodelable corner keeps.
-            let Some((decl, _)) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                head,
-            ) else {
-                continue;
-            };
-            let named = decl.constructors.contains(&selector);
-            let unnamed = selector == new && decl.has_unnamed_constructor;
-            if !(named || unnamed) {
-                continue;
-            }
             // The element-use credit: a tear-off reads the constructor
             // element (`usedElements.elements` — `C.sel` spares `sel`, the
             // `new` face spares the container-spelled element).
             self.used_names.insert(if named { selector } else { head });
             targets.insert((head, selector));
         }
-        targets
+        (targets, references)
+    }
+
+    /// The enum-constant constructor references
+    /// (`visitEnumConstantDeclaration`, upstream Dart SDK source,
+    /// unused_local_elements_verifier.dart:144-146, adds the constant's
+    /// `constructorElement` to `usedElements.elements`): every
+    /// `name.sel(…)` / `name<T>.sel(…)` constant of an `enum` body
+    /// invokes the enum's own `sel` constructor. Generative enum
+    /// constructors are never publicly accessible
+    /// (`_isPubliclyAccessible`, :858-861), so this credit is the only
+    /// thing that spares them. Returns `(enum, selector)` pairs; the
+    /// constant list ends at the body's first top-level `;` (or its `}`).
+    fn walk_enum_constant_ctors(&self) -> FxHashSet<(StringId, StringId)> {
+        use dartq_scanner::{Keyword as Kw, TokenKind as TK};
+        let mut uses: FxHashSet<(StringId, StringId)> = FxHashSet::default();
+        let tokens = self.tokens.as_slice();
+        for i in 0..tokens.len() {
+            if tokens[i].kind != TK::Keyword(Kw::Enum)
+                || tokens.get(i + 1).map(|t| t.kind) != Some(TK::Identifier)
+            {
+                continue;
+            }
+            let name = self.intern(self.token_text(&tokens[i + 1]));
+            // The body opener: the first `{` after the header (type
+            // parameters and `with`/`implements` clauses carry none); a
+            // `;` first is a recovery shape with no body.
+            let Some(open) = tokens[i + 2..]
+                .iter()
+                .position(|t| matches!(t.kind, TK::OpenCurly | TK::Semicolon))
+                .map(|offset| i + 2 + offset)
+                .filter(|&open| tokens[open].kind == TK::OpenCurly)
+            else {
+                continue;
+            };
+            let close = self.tokens.matching_end(open).unwrap_or(tokens.len());
+            let mut k = open + 1;
+            while k < close {
+                match tokens[k].kind {
+                    // The constant list ends at the first top-level `;`.
+                    TK::Semicolon => break,
+                    // Argument groups, metadata arguments, and type
+                    // argument groups never hold a constant head.
+                    TK::OpenParen | TK::OpenSquare | TK::OpenCurly | TK::Lt => {
+                        k = self.tokens.matching_end(k).map_or(k + 1, |end| end + 1);
+                        continue;
+                    }
+                    // `name.sel` at the list's top level: the head is the
+                    // constant itself — a metadata segment (`@p.a`) sits
+                    // behind an `@` or another `.`.
+                    TK::Period
+                        if k >= 1
+                            && tokens[k - 1].kind == TK::Identifier
+                            && tokens.get(k + 1).map(|t| t.kind) == Some(TK::Identifier)
+                            && !matches!(
+                                tokens.get(k.wrapping_sub(2)).map(|t| t.kind),
+                                Some(TK::At | TK::Period)
+                            ) =>
+                    {
+                        uses.insert((name, self.intern(self.token_text(&tokens[k + 1]))));
+                    }
+                    TK::Period
+                        if k >= 1
+                            && tokens[k - 1].kind == TK::Gt
+                            && tokens.get(k + 1).map(|t| t.kind) == Some(TK::Identifier) =>
+                    {
+                        uses.insert((name, self.intern(self.token_text(&tokens[k + 1]))));
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+        }
+        uses
     }
 
     /// The `this.sel(...)` redirecting-initializer pass
@@ -6931,11 +7663,27 @@ impl<'a> Engine<'a> {
             // scope the push-time `type_resolution` walked (a part's own
             // imports are invisible to the defining unit's scope, and the
             // oracle walks `fileAnalysis.unit`'s per-file scope chain).
-            if let Lookup::Found(NamespaceEntry::Decl(file)) =
-                self.namespaces
-                    .lookup_in_file(self.graph, self.lib, Some(self.file), name)
+            // An ambiguous answer (two imports export distinct elements)
+            // is the oracle's `ambiguous_import`, a gate-listed code that
+            // skips the whole import pass: every exporting edge keeps its
+            // credit, so no edge of the ambiguity reports when the gate's
+            // row lives outside this file's report (`AmbiguousImportTest/
+            // test_is`).
+            match self
+                .namespaces
+                .lookup_in_file(self.graph, self.lib, Some(self.file), name)
             {
-                bare_decls.entry(name).or_default().insert(file);
+                Lookup::Found(NamespaceEntry::Decl(file)) => {
+                    bare_decls.entry(name).or_default().insert(file);
+                }
+                Lookup::Ambiguous(entries) => {
+                    for entry in entries.iter() {
+                        if let NamespaceEntry::Decl(file) = entry {
+                            bare_decls.entry(name).or_default().insert(*file);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         // A resolved annotation credits its import the same way (the
@@ -6974,7 +7722,22 @@ impl<'a> Engine<'a> {
                 // the directive-recovery shape. A named-but-missing target
                 // keeps the `isOriginNotExistingFile` skip: the
                 // `uri_does_not_exist` face already reports the directive.
-                if uri_text.is_empty() {
+                // An interpolated URI (`'a${b}c.dart'`) joins with the same
+                // empty `uri_text`, but it is upstream's
+                // `DirectiveUriWithoutString`: no library resolves, so the
+                // verifier never visits it (oracle 3.13.7 reports
+                // `uri_with_interpolation` alone there). Its first URI token
+                // is an opening fragment followed by `${`/`$`.
+                let tokens = self.tokens.as_slice();
+                let head = tokens.partition_point(|t| t.utf16_offset < uri_range.offset);
+                let interpolated = tokens.get(head + 1).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        dartq_scanner::TokenKind::StringInterpolationExpression
+                            | dartq_scanner::TokenKind::StringInterpolationIdentifier
+                    )
+                });
+                if uri_text.is_empty() && !interpolated {
                     self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
                 }
                 continue;
@@ -7803,6 +8566,29 @@ impl<'a> Engine<'a> {
         std::mem::take(&mut self.pending_annotations)
     }
 
+    /// Drains the pending annotation latch for a LOCAL declaration — the
+    /// `note_decl_site` drain's counterpart for the declarations that carry
+    /// no `DeclKind` (local variables, local functions). Upstream consumes
+    /// the metadata on every surviving `AnnotatedNode`
+    /// (`visitVariableDeclarationList` / `visitFunctionDeclaration` reach
+    /// `metadata.accept` → `annotation_resolver._resolve`,
+    /// `annotation_resolver.dart` :240-245), so the latch must empty at the
+    /// local declaration too — otherwise the pending entries sit until the
+    /// next library-level `note_decl_site` misattributes them, and the
+    /// oracle's `undefined_annotation` / kind rows never emit.
+    ///
+    /// The verdict runs at the same point `note_decl_site` runs it — at the
+    /// declaration's consumption — against the scope state the annotation's
+    /// own resolution saw. Callers place it before the declared name binds
+    /// (`note_local` / `note_local_function`), so a nameless `''` local the
+    /// recovery registers does not answer the annotation name lookup.
+    pub(crate) fn drain_local_annotations(&mut self) {
+        let pending = self.take_annotations();
+        for pending_annotation in &pending {
+            self.emit_pending_annotation(pending_annotation);
+        }
+    }
+
     /// Pushes one library-level declaration site (the usage cluster's
     /// library-level side) and returns its index.
     pub(crate) fn note_decl_site(
@@ -7880,6 +8666,18 @@ impl<'a> Engine<'a> {
                 use_result = Some(UrFace { unless: None });
                 break;
             }
+        }
+        // The annotation verdicts emit on CONSUMPTION only — upstream's
+        // metadata resolution reports `undefined_annotation` / the kind
+        // rows solely when a surviving declaration consumes the metadata;
+        // an entry dropped with a discarded declaration (a recovered
+        // `class`/`enum`/`member` head, a directive that took no site)
+        // stays silent. `emit_pending_annotation` decides each entry's
+        // verdict against the scope state at THIS declaration's name —
+        // the same state the annotation's own resolution saw (upstream
+        // resolves metadata at the declaration's scope-open).
+        for pending_annotation in &pending {
+            self.emit_pending_annotation(pending_annotation);
         }
         let annotations = pending.iter().map(|a| a.name).collect();
         self.decl_sites.push(DeclSite {
@@ -8545,6 +9343,18 @@ impl<'a> Engine<'a> {
 /// upstream only reaches the deprecation check through a resolved library,
 /// so a `dart:` URI the SDK does not tabulate (unresolvable — `web_sql` is
 /// on disk but absent from the flat table) reports nothing.
+/// Whether the container declares a generative constructor upstream calls
+/// non-trivial (`ConstructorElementImpl.isTrivial`, ast.dart:7117): the
+/// written formals are non-empty. The model sees no initializer list or body
+/// shape, so a zero-param ctor with either under-reports — the under-report
+/// direction.
+fn has_nontrivial_ctor(container: &Container) -> bool {
+    container
+        .ctor_formals
+        .values()
+        .any(|formals| !formals.positional.is_empty() || !formals.named.is_empty())
+}
+
 fn deprecated_sdk_library(library: &str) -> Option<&'static str> {
     if dartq_sdk::FLAT_LIBRARIES
         .binary_search_by_key(&library, |entry| entry.0)
@@ -9268,12 +10078,8 @@ mod pins {
     /// visits its pattern variables individually,
     /// unused_local_elements_verifier.dart:565-579; the guard credit is
     /// the individual `BindPatternVariableElement`,
-    /// resolution_visitor.dart:926-929). dartq anchors the row on the
-    /// first binder — the flat frame credits the guard read on the newest
-    /// same-name entry, leaving the first entry's own `uses` at zero
-    /// while the join refuses to spare it; the oracle anchors the second
-    /// binder, so the (severity, code, file) triplet matches and only the
-    /// in-file anchor differs.
+    /// resolution_visitor.dart:926-929). The row anchors on the second,
+    /// unguarded binder — the oracle's anchor (3.13.7: line 4, column 14).
     #[test]
     fn guard_read_spares_only_its_own_arm() {
         let source = "void f(Object? x) {\n\
@@ -9283,7 +10089,7 @@ mod pins {
                       \x20     break;\n\
                       \x20 }\n\
                       }\n";
-        let a = source.find("case int a").unwrap() as u32 + 9;
+        let a = source.rfind("case int a").unwrap() as u32 + 9;
         assert_eq!(unused_local_rows(source), vec![(a, 1)], "{source:?}");
     }
 
@@ -9439,7 +10245,10 @@ mod pins {
     /// `_` constructor through the container's `constructors` list — the
     /// oracle's `allowConstructors` cut (`_E._` at 2:6 on the corpus's
     /// `FileUriProperties` family stayed an oracle-only miss before the
-    /// ctor probe). The bare `_` spelling must reach `element_used`.
+    /// ctor probe). The bare `_` spelling must reach `element_used`. The
+    /// oracle (3.13.7) reports the unreferenced class and the unreferenced
+    /// factory alone — the factory's `_E` head is its own name, never a
+    /// second class row.
     #[test]
     fn private_unnamed_selector_constructor_used_via_factory_is_spared() {
         let source = "class _E {\n\
@@ -9447,12 +10256,18 @@ mod pins {
                       \x20 factory _E.make() => _E._();\n\
                       }\n";
         let rows = unused_element_rows(source);
-        // `_` is never a separate reported element — the unnamed-ctor gate
-        // keeps it out entirely; the pin is that `_E._` never appears in
-        // the message text.
-        assert!(
-            !rows.iter().any(|(_, text)| text.contains("_E._")),
-            "unnamed ctor reported: {rows:?} in {source:?}"
+        let class = source.find("_E").unwrap() as u32;
+        let make = source.find("make").unwrap() as u32;
+        assert_eq!(
+            rows,
+            vec![
+                (class, "The declaration '_E' isn't referenced.".to_string()),
+                (
+                    make,
+                    "The declaration '_E.make' isn't referenced.".to_string()
+                ),
+            ],
+            "{source:?}"
         );
     }
 

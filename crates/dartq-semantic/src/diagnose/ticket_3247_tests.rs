@@ -199,11 +199,10 @@ void f<T, S extends T>(S s) {
     );
 }
 
-/// The residual the arm deliberately leaves open: an UNWRITTEN bound (the
-/// implicit `Object?`) keeps the matrix's undecided answer rather than
-/// guessing the bound, so `String s = t` over a bare `T` stays silent
-/// (the oracle reports `Object? <: String` false). Lifting this needs the
-/// implicit bound spelled into the capture, not a guess at the ask site.
+/// An UNWRITTEN bound (the implicit `Object?`) decides like a written one:
+/// `String s = t` over a bare `T` reports, anchored at the `t` operand
+/// (oracle 3.13.7: `A value of type 'T' can't be assigned to a variable
+/// of type 'String'.`).
 #[test]
 fn unbounded_parameter_source_stays_undecided() {
     let fixture = "\
@@ -214,8 +213,8 @@ void f<T>(T t) {
     let report = report_ops(fixture);
     assert_eq!(
         offsets(&report, "invalid_assignment"),
-        Vec::<u32>::new(),
-        "an unwritten bound keeps the under-report direction: {:?}",
+        vec![at(fixture, "t;", 0)],
+        "the implicit `Object?` bound rejects `String`: {:?}",
         report.diagnostics
     );
 }

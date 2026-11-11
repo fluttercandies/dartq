@@ -984,10 +984,10 @@ struct DaemonArgs {
     #[arg(long, value_name = "MiB")]
     memory_limit: Option<u64>,
     /// Hard cap for the L3 content store, armed on every
-    /// session context when set. Grammar: NUMBER [KiB|MiB|GiB] — suffix
+    /// session context. Grammar: NUMBER [KiB|MiB|GiB] — suffix
     /// case-insensitive, a bare number is bytes (512MiB, 10GiB, 4096).
-    /// Unset = the store stays unarmed (the daemon's standing posture;
-    /// the analyze face arms it unconditionally at the 10 GiB default).
+    /// Unset = the analyze face's unconditional 10 GiB default (the
+    /// resident engine's cross-session posture; #4210).
     #[arg(
         long,
         value_name = "SIZE",
@@ -2848,10 +2848,13 @@ fn daemon(args: &DaemonArgs) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
-    // The engine runtime flags (#1088): the memory budget and the L3 cap
-    // replace the standing defaults only when passed; the sink's file is
-    // created here — the analyze face's posture (create or usage error) —
-    // so a bad `--trace-events` path fails before the session serves.
+    // The engine runtime flags (#1088): the memory budget replaces the
+    // standing default only when passed; the L3 cap defaults to the
+    // analyze face's unconditional posture (a resident engine that never
+    // arms the cross-session caches re-derives its whole workspace on
+    // every spawn — #4210); the sink's file is created here — the analyze
+    // face's posture (create or usage error) — so a bad `--trace-events`
+    // path fails before the session serves.
     // The stdio daemon is a heavy job for its whole life: one slot of the
     // machine-wide gate, sized by its worktree's recorded peak.
     let _slot = match job_slot(
@@ -2870,9 +2873,13 @@ fn daemon(args: &DaemonArgs) -> u8 {
     if let Some(limit) = args.memory_limit {
         runtime.memory_limit_mib = limit;
     }
-    if let Some(limit) = args.cache_size_limit {
-        runtime.content_store_limit = Some(limit);
-    }
+    // The stdio daemon is a resident engine like the session serve: the
+    // cross-session caches stay armed at the analyze face's default cap
+    // unless `--cache-size-limit` narrows it (#4210 — an unarmed store
+    // makes the staged-facts and library-run replays silent no-ops).
+    runtime.content_store_limit = args
+        .cache_size_limit
+        .or(Some(dartq_engine::store::DEFAULT_SIZE_LIMIT));
     if let Some(path) = &args.trace_events {
         runtime.trace = match dartq_engine::event::TraceSink::create(path) {
             Ok(sink) => Some(sink),
@@ -7790,8 +7797,9 @@ mod tests {
     /// The daemon face's engine runtime flags (#1088): the parse shapes mirror
     /// the analyze face — a bare MiB budget, the size grammar through the
     /// engine's `parse_size_limit`, a JSONL sink path — and every flag
-    /// defaults to the daemon's standing posture (the 2048 MiB budget, an
-    /// unarmed store, no sink) that `SessionRuntime::default` carries.
+    /// defaults to the daemon's standing posture (the 2048 MiB budget, the
+    /// L3 store at the analyze face's default cap, no sink) that
+    /// `SessionRuntime::default` plus the shell's arming carries.
     #[test]
     fn daemon_runtime_flags_parse() {
         let parsed = parse_args_of(&["daemon", "/pkg"])
@@ -7801,7 +7809,10 @@ mod tests {
             panic!("expected daemon command")
         };
         assert_eq!(args.memory_limit, None, "the standing budget by default");
-        assert_eq!(args.cache_size_limit, None, "the store stays unarmed");
+        assert_eq!(
+            args.cache_size_limit, None,
+            "the store keeps its default cap"
+        );
         assert_eq!(args.trace_events, None, "untraced by default");
 
         let parsed = parse_args_of(&[

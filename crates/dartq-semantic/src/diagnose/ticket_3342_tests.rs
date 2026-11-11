@@ -119,7 +119,7 @@ fn prefixed_import_used_through_its_prefix_stays_silent() {
 /// credited. Corpus shape
 /// `UnusedImportTest/test_library_prefixed_samePrefix_notUsed`.
 #[test]
-#[ignore = "prefixed-unused arm: the engine credits the `as p` edge the oracle leaves unused"]
+#[ignore = "prefixed-unused arm: the engine credits the `as p` edge the oracle leaves unused; re-verified 2026-11-05: still fails (engine emits extra unused_local_variable + only 1 unused_import row, oracle expects the `as p` edge to also report)"]
 fn prefixed_import_without_a_prefix_use_reports() {
     let report = with_sibling(
         "import 'package:t/lib1.dart';\n\
@@ -141,7 +141,6 @@ fn prefixed_import_without_a_prefix_use_reports() {
 /// credits its edge. Corpus shape
 /// `UnusedImportTest/test_library_extension_instance_indexRead`.
 #[test]
-#[ignore = "extension instance-member credit: the applied face's members never reach the credit pool"]
 fn extension_instance_member_credits_its_import() {
     let report = report(
         "import 'package:t/lib1.dart';\n\
@@ -168,7 +167,6 @@ fn extension_instance_member_credits_its_import() {
 /// `import` reports against THAT file. Corpus shape
 /// `co19/LanguageFeatures/Parts-with-imports/scope_A03_t02`.
 #[test]
-#[ignore = "per-unit imports: the part file's own directives never reach report_unused_imports"]
 fn part_file_import_reports_in_its_own_unit() {
     let report = with_sibling(
         "import 'package:t/lib1.dart';\n\
@@ -187,7 +185,7 @@ fn part_file_import_reports_in_its_own_unit() {
 /// when the unit's bare `File` resolves to a locally imported `File` class.
 /// Corpus shape `UnusedImportTest/test_library_systemLibrary`.
 #[test]
-#[ignore = "shadowed system import: the bare name resolves to the sibling's `File`, the dart:io edge still credits"]
+#[ignore = "shadowed system import: the bare name resolves to the sibling's `File`, the dart:io edge still credits; re-verified 2026-11-05: still fails (engine emits undefined_class 'A' instead of unused_import — sibling `class File {}` shadows the `A` referenced in the fixture, oracle expects the sibling edge reported unused)"]
 fn shadowed_system_import_reports_beside_a_local_name() {
     let report = report(
         "import 'package:t/lib1.dart';\n\
