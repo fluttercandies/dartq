@@ -1707,11 +1707,25 @@ mod tests {
     }
 
     /// Peak-RSS bound (A20): the rewrite streams — resident memory
-    /// tracks the release window, never the dill. The parent builds a
-    /// ≥64 MiB dill (unmeasured), a spawned copy of this test binary
-    /// rewrites it, and the parent asserts the child's peak
-    /// `ru_maxrss` stays under [`RSS_BUDGET_BYTES`] (bytes on macOS,
-    /// KiB on Linux — both reaped via `wait4`).
+    /// tracks the release window and the per-string bookkeeping, never
+    /// the dill. Measured as a difference: the parent builds two dills
+    /// an order of magnitude apart in size (unmeasured), a spawned
+    /// copy of this test binary rewrites each, and the bigger child's
+    /// peak `ru_maxrss` (bytes on macOS, KiB on Linux — both reaped
+    /// via `wait4`) must stay within one flat budget of the smaller's.
+    ///
+    /// The differencing is the point: an absolute per-child budget
+    /// proved platform-shaped. A streaming ~68 MB rewrite peaked at
+    /// ~6 MB on macOS but ~240 MB on Linux runners, because Linux
+    /// carries the pre-exec address space's high-water RSS across
+    /// `exec` (`setmax_mm_hiwater_rss` in the kernel's exec path) — a
+    /// child forked right after its parent built the fixture reports
+    /// the parent's footprint as its own peak. Here both dills are
+    /// built (and their builder memory dropped) before either child
+    /// spawns, so each platform's constant baseline — fork-inherited
+    /// or not, allocator noise, binary size — is identical for the
+    /// two children and cancels in the subtraction, leaving only
+    /// memory that actually grows with the dill.
     #[test]
     #[cfg(unix)]
     fn rewrite_peak_rss_is_independent_of_dill_size() {
@@ -1727,17 +1741,31 @@ mod tests {
             return;
         }
         let dirs = tempfile::tempdir().expect("tempdir");
-        let src = dirs.path().join("big.dill");
-        build_large_dill(&src);
-        let dst = dirs.path().join("out.dill");
+        let big = dirs.path().join("big.dill");
+        build_large_dill(&big, 260_000);
+        let small = dirs.path().join("small.dill");
+        build_large_dill(&small, 16_000);
+        let peak_big = child_peak_rss(&big, &dirs.path().join("out-big.dill"));
+        let peak_small = child_peak_rss(&small, &dirs.path().join("out-small.dill"));
+        let growth = peak_big.saturating_sub(peak_small);
+        assert!(
+            growth < RSS_DELTA_BUDGET_BYTES,
+            "peak RSS grew by {growth} bytes (small {peak_small} -> big {peak_big}) with dill size; the rewrite is holding the file, not streaming it"
+        );
+    }
+
+    /// Rewrites `src` in a fresh child (a copy of this binary) and
+    /// returns that child's peak RSS in bytes.
+    #[cfg(unix)]
+    fn child_peak_rss(src: &Path, dst: &Path) -> u64 {
         let mut child = std::process::Command::new(std::env::current_exe().expect("current exe"))
             // A substring filter (not `--exact`, which wants the
             // module-qualified path) selecting exactly this one test.
             .arg("rewrite_peak_rss_is_independent_of_dill_size")
             .arg("--test-threads=1")
             .env("DQ_BCACHE_RSS_CHILD", "1")
-            .env("DQ_BCACHE_RSS_SRC", &src)
-            .env("DQ_BCACHE_RSS_DST", &dst)
+            .env("DQ_BCACHE_RSS_SRC", src)
+            .env("DQ_BCACHE_RSS_DST", dst)
             .spawn()
             .expect("spawn child");
         let mut status: libc::c_int = 0;
@@ -1753,24 +1781,23 @@ mod tests {
             "child rewrite failed: raw status {status}"
         );
         let scale = if cfg!(target_os = "macos") { 1 } else { 1024 };
-        let peak = usage.ru_maxrss as u64 * scale;
-        assert!(
-            peak < RSS_BUDGET_BYTES,
-            "peak RSS {peak} bytes for a ~68 MB dill; the rewrite is holding the file, not streaming it"
-        );
+        usage.ru_maxrss as u64 * scale
     }
 
-    /// The RSS budget: ~6 MB is the observed peak for a streamed
-    /// ~68 MB dill (window + string-table vectors + test-binary
-    /// baseline); 32 MB keeps a wide margin while staying far under
-    /// the ~70 MB a whole-file read would touch.
-    const RSS_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+    /// The RSS delta budget: how far the bigger dill's peak may exceed
+    /// the smaller's. Streaming leaves only workload-scaled
+    /// bookkeeping between the two runs — the string-table
+    /// ends/new-ends/matched vectors cost ~13 bytes per entry, ~3.4 MB
+    /// at 260k strings — while any whole-file posture adds at least
+    /// the dills' ~64 MB size gap. 16 MB sits far above the
+    /// bookkeeping delta and four times under the failure signal.
+    const RSS_DELTA_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 
-    /// A ≥64 MiB valid dill whose string table dominates the file, so
-    /// the rewrite's memory posture — not the fixture builder's — is
-    /// what a resident-set measurement sees.
-    fn build_large_dill(path: &Path) {
-        let count = 260_000;
+    /// A valid dill with `count` string-table entries (~257 bytes
+    /// each; 260_000 makes a ~68 MB file) whose string table dominates
+    /// the file, so the rewrite's memory posture — not the fixture
+    /// builder's — is what a resident-set measurement sees.
+    fn build_large_dill(path: &Path, count: usize) {
         let strings: Vec<String> = (0..count)
             .map(|i| {
                 format!(

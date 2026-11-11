@@ -1598,9 +1598,16 @@ mod tests {
         let stamp = first.files[0].stamp.expect("stamp");
 
         // Replace the file with same-size, same-mtime, different bytes:
-        // only the inode can tell them apart.
+        // only the inode can tell them apart. The replacement is built
+        // beside the original and renamed over it, so its inode is
+        // allocated while the original's is still live — a kernel that
+        // recycles inode numbers the moment they are freed (ext4 and
+        // tmpfs hand the lowest free one right back) cannot make the
+        // two collide.
+        let sibling = cache.join("build").join("replacement");
+        write(&sibling, b"kernel v2");
         fs::remove_file(&dill).expect("remove");
-        write(&dill, b"kernel v2");
+        fs::rename(&sibling, &dill).expect("rename replacement in");
         set_mtime(&dill, UNIX_EPOCH + Duration::from_nanos(stamp.mtime_ns));
         let metadata = fs::metadata(&dill).expect("metadata");
         assert_eq!(metadata.len(), stamp.size, "fixture: sizes collide");

@@ -9,9 +9,13 @@
 //! invisible and one per minute is a dead machine, so after each run's
 //! child exits the shim sweeps once: enumerate the process table with a
 //! single `ps` spawn and SIGTERM every process that (a) is parented by
-//! pid 1 — a live frontend_server is always a child of its
-//! flutter_tools, so this alone separates leaks from the one a
-//! concurrent flutter session is still using, (b) names
+//! pid 1 or by one of this process's own live ancestors — either marks
+//! a parent that is no longer the frontend_server's flutter_tools: the
+//! kernel reparents an orphan to the nearest subreaper up the tree,
+//! or pid 1 where there is none, and every subreaper above a process
+//! we spawned is by the same tree one of our own ancestors; the
+//! frontend_server of a concurrent session is still owned by a live
+//! dart/IDE process outside our tree, so it stays protected, (b) names
 //! `frontend_server` in its command line (the substring covers both the
 //! JIT snapshot and the `_aot` form), and (c) is no older than the run
 //! — compared through `ps`'s whole-second elapsed-time column against
@@ -72,6 +76,64 @@ fn etime_secs(etime: &str) -> Option<u64> {
     Some(days.checked_mul(86_400)?.checked_add(clock_secs)?)
 }
 
+/// True when `ppid` names a parent that no longer owns the process:
+/// pid 1 (the classic orphan reparenting target) or any live ancestor
+/// of this process. A host with subreapers — CI runners set
+/// `PR_SET_CHILD_SUBREAPER` on a process up every tree they own —
+/// parks an orphan with the nearest subreaper instead of pid 1, and
+/// that subreaper is by construction one of our ancestors, so the two
+/// legs together cover both reparenting targets. A frontend_server
+/// some live dart/IDE process outside this tree still owns is neither,
+/// so it stays protected.
+fn is_orphan_ppid(ppid: libc::pid_t, ancestors: &[libc::pid_t]) -> bool {
+    ppid == 1 || ancestors.contains(&ppid)
+}
+
+/// The pids of this process's live strict ancestors, nearest first,
+/// pid 1 included when the walk reaches it. Linux reads them from
+/// `/proc/<pid>/stat`; macOS has no `/proc`, but it also has no
+/// subreapers — launchd (pid 1) adopts every orphan — so `ppid == 1`
+/// alone is the complete rule there and the walk stays Linux-only.
+#[cfg(target_os = "linux")]
+fn live_ancestor_ppids() -> Vec<libc::pid_t> {
+    let mut ancestors = Vec::new();
+    let mut current = std::process::id() as libc::pid_t;
+    loop {
+        // A vanished /proc entry is a parent that died mid-walk (the
+        // chain above it is gone with it); ppid 0 is the forest's root
+        // past pid 1; a repeat pid is a guard against a cycle the
+        // kernel's own forest shape should never allow.
+        let Some(ppid) = stat_ppid(current) else {
+            break;
+        };
+        if ppid == 0 || ancestors.contains(&ppid) {
+            break;
+        }
+        ancestors.push(ppid);
+        if ppid == 1 {
+            break;
+        }
+        current = ppid;
+    }
+    ancestors
+}
+
+#[cfg(not(target_os = "linux"))]
+fn live_ancestor_ppids() -> Vec<libc::pid_t> {
+    Vec::new()
+}
+
+/// Field 4 (ppid) of one `/proc/<pid>/stat`. The comm field (field 2)
+/// can contain spaces and parentheses, so the parse anchors on the
+/// last `)`: everything after it is state (field 3), then ppid.
+#[cfg(target_os = "linux")]
+fn stat_ppid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
 /// SIGTERMs every orphaned frontend_server this run could have leaked
 /// and returns their pids, `run_started` being the moment the child was
 /// spawned. One `ps` spawn, one stderr line per run that reaped
@@ -94,12 +156,13 @@ pub fn reap_orphaned_frontend_servers(run_started: SystemTime) -> Vec<libc::pid_
     let run_elapsed = SystemTime::now()
         .duration_since(run_started)
         .map_or(0, |span| span.as_secs());
+    let ancestors = live_ancestor_ppids();
     let table = String::from_utf8_lossy(&output.stdout);
     let pids: Vec<_> = table
         .lines()
         .filter_map(parse_row)
         .filter(|row| {
-            row.ppid == 1
+            is_orphan_ppid(row.ppid, &ancestors)
                 && row.command.contains("frontend_server")
                 && row.elapsed_secs <= run_elapsed
         })
@@ -134,7 +197,9 @@ mod tests {
 
     /// One fixture: a disowned `frontend_server_fixture_<pid>` process
     /// the reaper must see exactly like flutter's real leak — argv
-    /// names frontend_server, ppid is 1 once the spawning shell exits.
+    /// names frontend_server, and once the spawning shell exits the
+    /// kernel parks it with pid 1 or, on a subreaper host (the CI
+    /// runner), with the nearest subreaper up our own tree.
     /// The per-binary tag keeps the poll from adopting a leftover
     /// fixture of an earlier, failed run.
     fn spawn_fixture() -> (u32, String) {
@@ -160,13 +225,15 @@ mod tests {
                 let mut fields = line.split_whitespace();
                 let pid: u32 = fields.next().unwrap().parse().unwrap();
                 let ppid: u32 = fields.next().unwrap().parse().unwrap();
-                if ppid == 1 {
+                // The sweep's own orphan predicate, so the fixture is
+                // adopted exactly when the product would reap it.
+                if super::is_orphan_ppid(ppid as libc::pid_t, &super::live_ancestor_ppids()) {
                     return (pid, tag);
                 }
             }
             assert!(
                 SystemTime::now() < deadline,
-                "fixture never reparented to pid 1"
+                "fixture never reparented to an orphan-holding parent"
             );
             thread::sleep(Duration::from_millis(100));
         }
