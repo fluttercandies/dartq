@@ -995,10 +995,9 @@ impl CasStore {
         if stats.entries > 0 {
             stats.oldest_hit_unix = oldest;
         }
-        for blob in self.scan_blobs()? {
-            stats.blobs += 1;
-            stats.blob_bytes += blob.len;
-        }
+        let (blobs, blob_bytes) = self.count_blobs()?;
+        stats.blobs = blobs;
+        stats.blob_bytes = blob_bytes;
         Ok(stats)
     }
 
@@ -1191,6 +1190,77 @@ impl CasStore {
             }
         }
         Ok(blobs)
+    }
+
+    /// The blob count and byte total of [`Self::scan_blobs`] at the
+    /// cost of a bare directory walk. stats() only ever consumes those
+    /// two numbers, so this walk keeps the per-blob work at exactly
+    /// what the store's differential test measures a bare walk at —
+    /// one `metadata` fetch plus a borrowed-name check — with none of
+    /// scan_blobs' baggage: no PathBuf per blob (names come from
+    /// `DirEntry::file_name()`, never joined into paths), no
+    /// `ScannedBlob` materialization into a Vec, no mtime a count
+    /// never reads, no digest decode a count never needs. The name
+    /// gate is scan_blobs' own — a regular file, under the shard its
+    /// first two digits prescribe, spelled as a digest: the spelling
+    /// check [`is_hex_digest`] decides acceptance exactly as
+    /// `name.parse::<BlobId>()` does (`from_str` accepts iff the
+    /// spelling is canonical, and a canonical spelling always decodes)
+    /// without materializing the 32 bytes — so foreign files stay
+    /// uncounted here exactly as they stay untouched there.
+    /// scan_blobs itself stays: gc's in-flight windowing needs the
+    /// ids and mtimes; the differential test (a 60k-blob store, stats
+    /// vs a bare walk, budget ×2) is what quantifies the "nothing per
+    /// blob beyond the walk" claim.
+    fn count_blobs(&self) -> Result<(u64, u64)> {
+        let blobs_root = self.root.join(BLOBS);
+        let shards = match fs::read_dir(&blobs_root) {
+            Ok(shards) => shards,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(io_at(&blobs_root)(e)),
+        };
+        let mut blobs = 0u64;
+        let mut bytes = 0u64;
+        for shard in shards {
+            let shard = shard.map_err(io_at(&blobs_root))?;
+            let shard_path = shard.path();
+            // Not-a-directory shards are foreign files, not error: the
+            // gate mirrors scan_blobs' `is_dir` skip.
+            let shard_meta = match shard.metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_at(&shard_path)(e)),
+            };
+            if !shard_meta.is_dir() {
+                continue;
+            }
+            let shard_name = shard.file_name();
+            let Some(shard_name) = shard_name.to_str() else {
+                continue;
+            };
+            let entries = match fs::read_dir(&shard_path) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_at(&shard_path)(e)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(io_at(&shard_path))?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let meta = match entry.metadata() {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(io_at(&shard_path)(e)),
+                };
+                if meta.is_file() && name.get(..2) == Some(shard_name) && is_hex_digest(name) {
+                    blobs += 1;
+                    bytes += meta.len();
+                }
+            }
+        }
+        Ok((blobs, bytes))
     }
 }
 
