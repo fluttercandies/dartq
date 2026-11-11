@@ -204,7 +204,11 @@ mod tests {
     /// fixture of an earlier, failed run.
     fn spawn_fixture() -> (u32, String) {
         let tag = format!("frontend_server_fixture_{}", std::process::id());
-        Command::new("sh")
+        // `bash`, not `sh`: the argv rewrite rides on `exec -a`, a
+        // bash extension — dash (ubuntu's /bin/sh) rejects the flag
+        // and the fixture never starts. CI images and macOS both ship
+        // bash.
+        Command::new("bash")
             .arg("-c")
             .arg(format!("exec -a {tag} sleep 60 &"))
             .status()
