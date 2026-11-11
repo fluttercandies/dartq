@@ -172,25 +172,24 @@ fn sealed_class_extended_outside_its_library() {
     );
 }
 
-/// The same verdict through the `implements` face. The official `with`
-/// face is unreachable (the drive block sits behind the with-non-mixin
-/// gate and a sealed proper mixin cannot exist), so a `with` of a sealed
-/// class reports no modifier row here either — pinned alongside.
+/// The same verdict through the `implements` and `with` faces — the
+/// oracle-decoded pair (recorded `dart analyze` 3.13.7 on this exact
+/// fixture): BOTH clause kinds drive one
+/// `invalid_use_of_type_outside_library` row each (the message names all
+/// three verbs), and the `with` clause additionally reports
+/// `class_used_as_mixin` upstream. Only the sealed rows are pinned here.
 #[test]
 fn sealed_class_implemented_outside_its_library() {
     let (_, diagnostics) = analyze(
         "import 'other.dart';\nclass B implements S {}\nclass C with S {}\n",
         "sealed class S {}\n",
     );
-    assert_eq!(
-        with_code(&diagnostics, "invalid_use_of_type_outside_library").len(),
-        1
-    );
     let hits = with_code(&diagnostics, "invalid_use_of_type_outside_library");
-    assert_eq!(
-        hits[0].message,
-        "The class 'S' can't be extended, implemented, or mixed in outside of its library because it's a sealed class."
-    );
+    assert_eq!(hits.len(), 2, "{diagnostics:?}");
+    assert!(hits.iter().all(|hit| {
+        hit.message
+            == "The class 'S' can't be extended, implemented, or mixed in outside of its library because it's a sealed class."
+    }));
 }
 
 /// Same-library sealed use is unrestricted — the negative twin.

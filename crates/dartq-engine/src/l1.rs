@@ -1305,14 +1305,22 @@ fn resolve_unit(
 }
 
 /// The URI string a directive's resolution selects against `declared`, with
-/// its own literal span: the first configuration the declared variables
-/// match (the resolution crate's `resolve_conditional` — source order,
-/// exact-value equality, primary fallback), else the primary. The span
-/// follows the selection so a selected branch's missing-target diagnostic
-/// lands on the branch literal — the oracle reports `state.selectedUri`
-/// (library_analyzer.dart:698-717), never the primary's. Unmatched branch
-/// URIs are never resolved here (the oracle never reads them), so a missing
-/// *unselected* target stays silent.
+/// the diagnostic anchor span: the first configuration the declared
+/// variables match (the resolution crate's `resolve_conditional` — source
+/// order, exact-value equality, primary fallback), else the primary.
+///
+/// The STRING follows the selection — upstream resolves and reports the
+/// selected branch (`state.selectedUri` is the message argument,
+/// library_analyzer.dart:736-745) and unmatched branch URIs are never
+/// resolved, so a missing *unselected* target stays silent. The SPAN,
+/// however, is always the primary literal: every import/export URI row is
+/// reported `.at(directive.uri)` — the directive's declared primary node
+/// (library_analyzer.dart:736-745/:748-755/:761; the part-include arm
+/// :988-993 anchors the same way) — and `_resolveUriConfigurations`
+/// (:1086-1095) only writes `resolvedUri` onto configuration nodes, never
+/// reassigns `directive.uri`. So a selected branch's missing-target or
+/// interpolation row names the branch string but anchors on the primary
+/// literal.
 pub(crate) fn selected_uri<'a>(
     directive: &'a DirectiveFacts,
     declared: &FxHashMap<String, String>,
@@ -1326,19 +1334,18 @@ pub(crate) fn selected_uri<'a>(
         SelectedUri::Primary => (directive.uri.as_deref(), directive.uri_span),
         SelectedUri::Configuration(index) => {
             // An interpolated clause URI carries no string upstream
-            // (`DirectiveUriWithoutString`, file_state.dart:118): the
-            // selected branch reports `uri_with_interpolation` at its own
-            // literal — the same face a `None` primary URI resolves to in
-            // `resolve_uri`.
+            // (`DirectiveUriWithoutString`, file_state.dart:118) — the same
+            // face a `None` primary URI resolves to in `resolve_uri`; the
+            // row still anchors on the primary literal.
             if directive
                 .interpolated_configurations
                 .contains(&(index as u32))
             {
-                return (None, directive.configuration_spans[index]);
+                return (None, directive.uri_span);
             }
             (
                 Some(directive.configurations[index].uri.as_ref()),
-                directive.configuration_spans[index],
+                directive.uri_span,
             )
         }
     }
@@ -5192,14 +5199,14 @@ pub(crate) mod tests {
     /// the `if` clauses, resolution selects the first clause the context's
     /// declared variables match (source order), and only the SELECTED
     /// candidate is read — an unmatched branch's missing target stays
-    /// silent, a selected one is diagnosed at its own literal.
+    /// silent, a selected one is diagnosed with its string but the primary
+    /// literal's span.
     #[test]
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn conditional_import_forks_by_declared_variables() {
         let fixture = Fixture::new();
         let lib = fixture.root.join("lib");
         let source = "import 'a.dart' if (dart.library.io) 'b.dart' if (x == 'y') 'c.dart';\n";
-        let c_offset = source.find("'c.dart'").expect("candidate literal");
 
         // The oracle-default empty context: every condition misses, the
         // primary URI resolves, no URI diagnostic fires.
@@ -5234,8 +5241,9 @@ pub(crate) mod tests {
         // missing `c.dart`. A file target lands on its interned id with the
         // missing-target code riding the `code` column — `ResolvedTarget`
         // is `Missing` only for the non-file faces (dart:/other-scheme/
-        // undecodable) — and the `uri_does_not_exist` diagnostic
-        // attributes to the branch's own literal, not the primary's.
+        // undecodable) — and the `uri_does_not_exist` diagnostic names the
+        // selected branch string but anchors on the PRIMARY literal
+        // (`directive.uri`, library_analyzer.dart:736-745).
         let declared: FxHashMap<String, String> = [("dart.library.io", "false"), ("x", "y")]
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -5256,8 +5264,9 @@ pub(crate) mod tests {
             "{}",
             diagnostic.message
         );
-        assert_eq!(diagnostic.range.offset, c_offset as u32);
-        assert_eq!(diagnostic.range.length, "'c.dart'".len() as u32);
+        let primary_offset = source.find("'a.dart'").expect("primary literal");
+        assert_eq!(diagnostic.range.offset, primary_offset as u32);
+        assert_eq!(diagnostic.range.length, "'a.dart'".len() as u32);
     }
 
     /// End-to-end `@docImport` (#2206): the doc comment attached to the

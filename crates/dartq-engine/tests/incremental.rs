@@ -560,12 +560,18 @@ fn interpolated_part_include_claims_nothing() {
     );
 }
 
-/// Interpolated `part of` (#251 pin): a part file whose `part of` carries no
-/// resolvable string (`part of '${x}.dart';` — shapeless, no URI and no
-/// name) bakes the `uri_with_interpolation` face and stays an orphan
-/// singleton; the includer's resolvable `part 'p.dart';` alone claims
-/// nothing, mirroring `PartOfUriUnknownFileKind`
-/// (file_state.dart:2283-2291).
+/// Interpolated `part of` (#251 pin, oracle-decoded 3.13.7): a part file
+/// whose `part of` carries no resolvable string (`part of '${x}.dart';` —
+/// shapeless, no URI and no name) reports NO interpolation row of its own:
+/// upstream `uriWithInterpolation` has exactly three fire sites
+/// (library_analyzer.dart:742 import / :954 export / :993 part include) and
+/// `part of` is none of them — the shapeless URI only classifies the file
+/// (`PartOfUriUnknownFileKind`, file_state.dart:941-955). The include side
+/// reports `part_of_different_library` (expected = enclosing URI, actual =
+/// included URI, the `case PartOfUriFileKind()` arm,
+/// library_analyzer.dart:1063-1069) and the orphan still gets its body
+/// errors (`undefined_identifier 'x'` on p). The include alone claims
+/// nothing: p stays an orphan singleton.
 #[test]
 fn interpolated_part_of_is_an_orphan_singleton() {
     const A: &str = "part 'p.dart';\nint f() => 1;\n";
@@ -584,11 +590,21 @@ fn interpolated_part_of_is_an_orphan_singleton() {
         .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     assert!(
-        diagnostics
+        !diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.file == p
-                && diagnostic.code.name == "uri_with_interpolation"),
-        "the shapeless part of bakes the interpolation face: {diagnostics:?}"
+            .any(|diagnostic| diagnostic.code.name == "uri_with_interpolation"),
+        "the shapeless part of reports no interpolation face: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.file == a
+            && diagnostic.code.name == "part_of_different_library"),
+        "the include reports the URI-form mismatch on the includer: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.iter().any(
+            |diagnostic| diagnostic.file == p && diagnostic.code.name == "undefined_identifier"
+        ),
+        "the orphan still gets its body errors: {diagnostics:?}"
     );
     assert_eq!(engine.libraries().len(), 2, "a plus the p orphan singleton");
     assert_ne!(

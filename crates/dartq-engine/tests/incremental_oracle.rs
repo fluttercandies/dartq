@@ -394,27 +394,38 @@ static CASE_C7: Case = Case {
     ],
     absolute: Absolute::Explicit(&[
         &[],
-        // util gone: both importers lose u() and gain the URI error.
+        // util gone: both importers lose u() and gain the URI error. The
+        // half-resolved `h() + u()` return expression carries InvalidType,
+        // which the oracle DOES report against `int g()` (recorded `dart
+        // analyze` 3.13.7 on this exact state: RETURN_OF_INVALID_TYPE on
+        // lib/b.dart line 3).
         &[
+            ("return_of_invalid_type", "lib/b.dart"),
             ("undefined_function", "lib/a.dart"),
             ("uri_does_not_exist", "lib/a.dart"),
             ("undefined_function", "lib/b.dart"),
             ("uri_does_not_exist", "lib/b.dart"),
         ],
         // pb gone: a's new part-gap URI error and pb() miss collapse into
-        // the same (code, file) set entries as step 1.
+        // the same (code, file) set entries as step 1 — and the
+        // `return_of_invalid_type` row persists for the same half-resolved
+        // reason (oracle re-run on this state).
         &[
+            ("return_of_invalid_type", "lib/b.dart"),
             ("undefined_function", "lib/a.dart"),
             ("uri_does_not_exist", "lib/a.dart"),
             ("undefined_function", "lib/b.dart"),
             ("uri_does_not_exist", "lib/b.dart"),
         ],
-        // a gone: b loses h() (its util errors persist); pa is an orphan
-        // singleton whose `part of 'a.dart'` now dangles.
+        // a gone: b loses h() too, so BOTH operands of `h() + u()` are
+        // undefined and the oracle suppresses the return row (two-error
+        // cascade; recorded run reports only the two undefined_function and
+        // two uri_does_not_exist rows on b). pa's dangling `part of
+        // 'a.dart'` stays silent — a URI-form part-of never carries a URI
+        // diagnostic (file_state.dart:938-953 classifies only).
         &[
             ("undefined_function", "lib/b.dart"),
             ("uri_does_not_exist", "lib/b.dart"),
-            ("uri_does_not_exist", "lib/pa.dart"),
         ],
     ]),
     stable_bytes: &[],
@@ -1170,8 +1181,13 @@ static CASE_C10: Case = Case {
         // include of the n-claimed pn reports its name mismatch.
         &[("part_of_different_library", "lib/p9.dart")],
         // n's namespace drops g with pn (its dangling include reports the
-        // mismatch); m's stale view must recompute.
+        // mismatch); m's stale view must recompute. The half-resolved
+        // initializer `f() + g()` carries InvalidType, which the oracle
+        // DOES report against `int v` (recorded `dart analyze` 3.13.7 on
+        // this exact state: INVALID_ASSIGNMENT + UNDEFINED_FUNCTION on
+        // lib/m.dart line 2).
         &[
+            ("invalid_assignment", "lib/m.dart"),
             ("part_of_different_library", "lib/n.dart"),
             ("undefined_function", "lib/m.dart"),
         ],

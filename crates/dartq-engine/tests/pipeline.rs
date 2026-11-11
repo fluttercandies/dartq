@@ -136,8 +136,12 @@ impl FileLayoutProvider for Layout<'_> {
 /// registry-true TYPE and the verbatim problem/correction texts. The key
 /// set, order, and null-skipping mirror the oracle emitter (dartdev
 /// `analyze.dart` `emitJsonFormat`: `correctionMessage`/`documentation` are
-/// null-aware entries; no `contextMessages` here). Keys compare in sorted
-/// order (`serde_json`'s map), the byte order is the writer's struct order.
+/// null-aware entries; no `contextMessages` here). Keys compare in the
+/// oracle's emission order — recorded `dart analyze --format=json` 3.13.7
+/// streams `code, severity, type, location, problemMessage,
+/// correctionMessage, documentation`; the workspace `serde_json` keeps
+/// insertion order (`preserve_order`), so the parsed key sequence pins the
+/// writer's struct order byte-for-byte.
 #[test]
 fn uri_does_not_exist_json_matches_oracle_key_set() {
     let fixture = Fixture::new(&[(
@@ -180,12 +184,12 @@ fn uri_does_not_exist_json_matches_oracle_key_set() {
         keys,
         [
             "code",
-            "correctionMessage",
-            "documentation",
+            "severity",
+            "type",
             "location",
             "problemMessage",
-            "severity",
-            "type"
+            "correctionMessage",
+            "documentation"
         ]
     );
     assert_eq!(d["code"], "uri_does_not_exist");

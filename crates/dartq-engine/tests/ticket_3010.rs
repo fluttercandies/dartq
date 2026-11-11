@@ -171,9 +171,12 @@ fn part_of_with_an_interpolated_uri_stays_silent() {
 /// `dart.library.io` declared: the interpolated clause occupies its
 /// selection slot (a `DirectiveUriWithoutString` still participates —
 /// file_state.dart:738-764), first-match-wins picks it, and the selected
-/// interpolated branch reports `uri_with_interpolation` at the branch
-/// literal (`'b${y}.dart'` = offset 43, length 12) — never the primary's
-/// span and never a resolution.
+/// branch reports `uri_with_interpolation` anchored on the PRIMARY
+/// literal (`'dart:core'` = offset 7, length 11): upstream reports every
+/// import URI row `.at(directive.uri)` — the directive's declared primary
+/// node (library_analyzer.dart:736-745); `_resolveUriConfigurations`
+/// (:1086-1095) never reassigns it — so the selected string governs the
+/// message, the primary literal the span. No resolution ever runs.
 #[test]
 fn a_selected_interpolated_configuration_reports_at_the_branch_literal() {
     const A: &str = "import 'dart:core' if (dart.library.io) 'b${y}.dart';\nint f() => 1;\n";
@@ -204,11 +207,11 @@ fn a_selected_interpolated_configuration_reports_at_the_branch_literal() {
         rows_of(&engine, &diagnostics, "uri_with_interpolation"),
         vec![(
             "a.dart".to_owned(),
-            43,
-            12,
+            7,
+            11,
             "URIs can't use string interpolation.".to_owned()
         )],
-        "the selected interpolated branch reports at its own literal: {diagnostics:?}"
+        "the selected interpolated branch anchors on the primary literal: {diagnostics:?}"
     );
     for code in ["uri_does_not_exist", "import_of_non_library"] {
         assert!(

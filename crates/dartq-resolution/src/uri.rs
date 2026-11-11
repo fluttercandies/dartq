@@ -1029,16 +1029,27 @@ impl<'a> UriResolver<'a> {
                 // `libraries.dart` map, flat across all target segments
                 // (`SdkSnapshot::flat_library_to_path`); the oracle never
                 // consults platform flags or per-segment tables for `dart:`
-                // URI existence, so neither does resolution. Part paths join
-                // the same table's library path — but the *file* still has
-                // to exist: `internalMapDartUri` (dart/sdk/sdk.dart:90-130)
-                // maps `dart:<lib>/<part>` to a FileSource unconditionally,
-                // and the oracle then checks `importedFile.exists`, so
-                // `dart:math/bar.dart` reports `uri_does_not_exist` even
-                // though `dart:math` is a known library.
+                // URI existence, so neither does resolution.
+                //
+                // Entry URIs (`dart:math`) resolve on table membership
+                // alone: `internalMapDartUri` (dart/sdk/sdk.dart:90-130)
+                // maps a known library name to a FileSource
+                // unconditionally — it never consults the file system, and
+                // every real SDK ships the mapped sources. dartq's
+                // generated names-only faces (a library whose SDK root
+                // carries no sources) are the same table rows, so they must
+                // resolve silently too. Part paths (`dart:math/bar.dart`)
+                // keep the existence check: the oracle then tests
+                // `importedFile.exists` (library_analyzer.dart:714-728), so
+                // a mapped-but-missing part file still reports
+                // `uri_does_not_exist`.
                 match self.sdk.flat_library_to_path(&library, &part) {
                     Some(file) => {
-                        let code = (!self.exists(&file)).then(|| missing_file_code(&file));
+                        let code = if !part.is_empty() {
+                            (!self.exists(&file)).then(|| missing_file_code(&file))
+                        } else {
+                            None
+                        };
                         UriResolution {
                             uri: ResolvedUri::Dart {
                                 library: library.into_owned().into_boxed_str(),
@@ -2811,12 +2822,18 @@ mod tests {
         let mut files = FileTable::new();
         let mut resolver = resolver(&fixture, &mut files);
 
+        // The product canonicalizes the SDK root on load; on macOS
+        // `temp_dir()` spells it through the /var symlink while the
+        // canonical form carries the /private prefix (identity on Linux),
+        // so the expected joins must come from the canonicalized root.
+        let sdk_root = fixture.sdk.root.canonicalize().expect("canonical SDK root");
+
         let core = resolver.resolve(container, Some("dart:core"), DirectiveKind::ImportExport);
         assert_eq!(
             core.uri,
             ResolvedUri::Dart {
                 library: "core".into(),
-                file: fixture.sdk.root.join("lib/core/core.dart"),
+                file: sdk_root.join("lib/core/core.dart"),
             }
         );
         assert_eq!(core.target, ResolvedTarget::External);
@@ -2832,29 +2849,30 @@ mod tests {
             panic!("expected a dart target");
         };
         assert_eq!(library.as_ref(), "core");
-        assert_eq!(file, fixture.sdk.root.join("lib/core/bool.dart"));
+        assert_eq!(file, sdk_root.join("lib/core/bool.dart"));
         assert_eq!(part.target, ResolvedTarget::External);
         assert_eq!(part.code, None);
 
         // Existence is the SDK's flat face, not the vm segment's table: the
         // synthetic SDK lists only core/io on `vm`, and `dart:mirrors`
-        // still resolves through the generated flat table — but the mapped
-        // file must exist on disk, exactly as the oracle's
-        // `importedFile.exists` check requires (`dart:math/bar.dart`
-        // upstream pin). The fixture SDK ships no mirrors file, so the
-        // library name resolves while the diagnostic carries the
-        // missing-ness.
+        // still resolves through the generated flat table. An ENTRY URI
+        // resolves on table membership alone — `internalMapDartUri`
+        // (dart/sdk/sdk.dart:90-130) maps known library names
+        // unconditionally and never consults the file system, so a
+        // mapped-but-missing source (the names-only-face posture) stays
+        // silent; the `importedFile.exists` check belongs to part paths
+        // only, covered by `dart:io/nope.dart` below.
         let mirrors =
             resolver.resolve(container, Some("dart:mirrors"), DirectiveKind::ImportExport);
         assert_eq!(
             mirrors.uri,
             ResolvedUri::Dart {
                 library: "mirrors".into(),
-                file: fixture.sdk.root.join("lib/mirrors/mirrors.dart"),
+                file: sdk_root.join("lib/mirrors/mirrors.dart"),
             }
         );
         assert_eq!(mirrors.target, ResolvedTarget::External);
-        assert_eq!(code_of(&mirrors), ResolutionCode::UriDoesNotExist);
+        assert_eq!(mirrors.code, None);
 
         // A known library with a missing part file — `dart:io/nope.dart` —
         // codes the same way; a generated suffix carries the
