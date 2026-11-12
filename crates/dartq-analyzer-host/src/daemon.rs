@@ -642,7 +642,23 @@ impl Host {
         let (brake, disk) = (&mut self.brake, &self.disk);
         let outcome = match self.server.as_mut() {
             Some(server) if !diff.changed.is_empty() => {
-                server.changed(&diff.changed, || sample(disk, brake))
+                // Incremental edit: never yield to the growth brake. This arm
+                // is reachable only with `diff.rebuild == false` (a rebuild
+                // stops the server above, so `self.server` is `None` and the
+                // fresh-start arm below pays the brake instead). The brake
+                // exists to stop a cold/full analysis that is growing the
+                // server under machine memory pressure; an incremental edit
+                // cannot grow the tree unboundedly, but on a swapping host
+                // the brake fires on it every time and turns each edit into
+                // a full server restart + whole-root re-analysis. Budget
+                // accounting (peak sampling, `Fault::Budget`), the ledger
+                // admission, and the idle/pressure eviction arms are all
+                // untouched — this changes only the yield decision on the
+                // incremental-edit settle.
+                server.changed(&diff.changed, || {
+                    disk.tick();
+                    false
+                })
             }
             Some(server) => server.wait_idle(|| sample(disk, brake)),
             None => Err(Fault::Server("no server yet".into())),
