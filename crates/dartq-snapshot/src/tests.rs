@@ -1125,6 +1125,16 @@ fn enforce_reports_what_it_evicted() {
 /// One load touches one marker: the generation gains a `recency` file —
 /// the LRU handle the sweep reads — and its entries are never utimed
 /// individually.
+///
+/// The guard splits along filesystem-portable lines. mtime is the portable
+/// invariant: no read updates mtime on any platform, and a product-side
+/// utimensat touch moves it too — asserted unconditionally. atime is
+/// asserted on macOS only, where APFS's default mount does not update it
+/// on read; on strictatime-class filesystems the load's own read moves it
+/// (Linux CI round 12, run 43132550626: the entry's atime came back
+/// exactly the parked 5 minutes later — kernel read semantics, not a
+/// utime), so the probe cannot distinguish a legitimate read there and is
+/// meaningless on that platform.
 #[test]
 fn load_touches_the_generation_recency_marker() {
     let cache = TempCache::new("recency");
@@ -1145,15 +1155,20 @@ fn load_touches_the_generation_recency_marker() {
         .expect("load");
 
     assert!(marker.exists(), "the load created the marker");
-    let accessed = fs::metadata(&entry)
-        .expect("entry metadata")
-        .accessed()
-        .expect("atime");
+    let meta = fs::metadata(&entry).expect("entry metadata");
     assert_eq!(
-        FileTime::from_system_time(accessed),
+        FileTime::from_system_time(meta.modified().expect("mtime")),
         past,
         "entries are not utimed individually"
     );
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(
+            FileTime::from_system_time(meta.accessed().expect("atime")),
+            past,
+            "entries are not utimed individually"
+        );
+    }
 }
 
 fn files_under(dir: &Path) -> Vec<PathBuf> {
