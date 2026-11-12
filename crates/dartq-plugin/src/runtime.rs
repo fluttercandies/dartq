@@ -1545,6 +1545,18 @@ impl PluginRuntime {
         }
     }
 
+    /// Authoritative liveness of this generation's child: an exited (or
+    /// already-reaped) child is dead regardless of which thread noticed the
+    /// death first. The empty slot counts as dead — only the kill and
+    /// teardown paths take the child, and they flip `alive` first.
+    fn child_has_exited(&self) -> bool {
+        let mut child = self.child.lock();
+        match child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    }
+
     fn reap_child(&mut self) {
         let child = self.child.lock().take();
         if let Some(mut child) = child {
@@ -1655,7 +1667,19 @@ impl PluginRuntime {
                     .bytes_out(u64::try_from(byte_len).unwrap_or(u64::MAX));
                 Ok(())
             }
-            Ok(Err(e)) => Err(e.into()),
+            Ok(Err(e)) => {
+                // A child that died on its own surfaces on the write path as
+                // EPIPE, racing the exit notification: classify by the
+                // child's state, never by which signal arrived first — the
+                // kill path's "never write into a dead child" discipline,
+                // extended to self-death. Any other I/O error on a live
+                // child is a genuine transport failure and stays raw.
+                if e.kind() == std::io::ErrorKind::BrokenPipe && self.child_has_exited() {
+                    self.kill_child();
+                    return Err(self.crash_error());
+                }
+                Err(e.into())
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let reason = format!(
                     "plugin stopped reading its input pipe (stdin write exceeded the {} ms \
