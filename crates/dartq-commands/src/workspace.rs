@@ -1074,8 +1074,11 @@ fn with_context_identities(packages: PackageTable, roots: &[PathBuf]) -> Package
 /// The nearest directory at or above `from` carrying a `pubspec.yaml` —
 /// the root of the unparseable-pubspec floor (the oracle's `BasicWorkspace`
 /// roots at the closest pubspec, `context_locator.dart`
-/// `_contextRootLocation`).
-fn nearest_pubspec_dir(from: &Path) -> Option<PathBuf> {
+/// `_contextRootLocation`), and the package context a `--scope package`
+/// analysis covers (a pub workspace member's own package directory, not the
+/// workspace root — the analyzer includes just the member in its
+/// workspace-rooted context).
+pub fn nearest_pubspec_dir(from: &Path) -> Option<PathBuf> {
     let mut dir = from.to_path_buf();
     loop {
         if dir.join("pubspec.yaml").is_file() {

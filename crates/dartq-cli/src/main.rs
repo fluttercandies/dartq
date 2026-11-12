@@ -570,6 +570,16 @@ struct AnalyzeArgs {
     /// good). Official engine only.
     #[arg(long)]
     no_resident: bool,
+    /// Analysis scope of a file or directory aim (official backend only).
+    /// `package` — the default — roots the analysis at the aim's package
+    /// context (the nearest ancestor `pubspec.yaml`), so a file in a pub
+    /// workspace member analyzes that package instead of the whole
+    /// workspace, the scope `dart analyze <file>` itself uses. `workspace`
+    /// roots it at the aim's pub workspace root (the whole-workspace
+    /// posture). An aim that is a workspace root resolves to that root
+    /// either way.
+    #[arg(long, value_enum, default_value_t = AnalyzeScope::Package)]
+    scope: AnalyzeScope,
     /// Print one stderr line naming the engine that answered (and, for
     /// `official`, the SDK version and whether the resident server or a
     /// per-run `dart analyze` did; for `dartq`, whether the resident
@@ -757,6 +767,22 @@ impl From<CheckFormat> for AnalyzeFormat {
     }
 }
 
+/// The analysis universe a file or directory aim opens (`--scope`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum AnalyzeScope {
+    /// The aim's package context — the nearest ancestor `pubspec.yaml`. A pub
+    /// workspace member resolves to its own package directory, not the
+    /// workspace root: the analyzer keeps resolving `package:` URIs and
+    /// reading `analysis_options.yaml` through the workspace but analyzes
+    /// only the package's files, which is the universe `dart analyze <file>`
+    /// builds.
+    #[default]
+    Package,
+    /// The aim's pub workspace root — one analysis universe per worktree
+    /// (the pre-`--scope` posture).
+    Workspace,
+}
+
 /// The analyze flags against the official backend, every flag in one class
 /// (`check` carries a subset, same class):
 ///
@@ -764,7 +790,7 @@ impl From<CheckFormat> for AnalyzeFormat {
 /// | --- | --- |
 /// | forward — `dart analyze` takes it | the targets, `--sdk-path`, `--packages`, `--cache`, `--enable-experiment`, `--[no-]plugins`, `--[no-]use-aot-snapshot`, `--[no-]fatal-warnings`, `--fatal-infos`, `--verbose`, `--version`, `--suppress-analytics`, `--disable-telemetry`, `--[no-]analytics` |
 /// | engine-only — legal only with `--engine` | `--fast`, `--metrics-json`, `--overlay`, `--memory-limit`, `--memory-report`, `--trace-events`, `--cache-size-limit`, `--cold` |
-/// | consumed — dartq answers it, the child never sees it | `--engine`, `--format`, `--memory`, `--diagnostics`, `--enable-analytics`, `--disable-analytics` |
+/// | consumed — dartq answers it, the child never sees it | `--engine`, `--format`, `--memory`, `--scope`, `--diagnostics`, `--enable-analytics`, `--disable-analytics` |
 ///
 /// The child always runs the machine format, so `--format` selects dartq's
 /// re-emission and `--memory` (upstream reads it on its json format only)
@@ -841,6 +867,7 @@ impl AnalyzeArgs {
             packages: self.packages.clone(),
             fatal_warnings: !self.no_fatal_warnings,
             fatal_infos: self.fatal_infos,
+            scope: self.scope,
         })
     }
 }
@@ -1550,11 +1577,12 @@ struct OfficialFace {
 }
 
 /// What the resident server needs beyond the targets: the forwarded
-/// flags it honors.
+/// flags it honors, and the analysis scope its roots resolve under.
 struct ResidentAsk {
     packages: Option<PathBuf>,
     fatal_warnings: bool,
     fatal_infos: bool,
+    scope: AnalyzeScope,
 }
 
 /// A `dartq test` line that only asks for help or the version skips the
@@ -1604,9 +1632,12 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
         if let (Some(ask), Some(dart), true, false) =
             (&face.resident, &dart, settings.resident, gate_nested())
         {
-            // The resident server is keyed on the workspace roots, not the
-            // aims: every `dartq analyze <paths>` over one worktree shares
-            // the daemon and its cache, and the aims scope its report.
+            // The resident server is keyed on the aim's analysis roots (the
+            // package contexts by default — see [`scope_roots`]): a
+            // single-file aim analyzes its package, not the whole
+            // workspace, while the aims scope its report. Every
+            // `dartq analyze` over the same roots shares the daemon and
+            // its cache.
             let request = dartq_analyzer_host::Request {
                 dart: dart.clone(),
                 targets: resolved
@@ -1615,10 +1646,7 @@ fn official_face(face: &OfficialFace, targets: &[PathBuf], no_queue: bool) -> u8
                         TargetKind::Dir(dir) | TargetKind::File(dir) => dir.clone(),
                     })
                     .collect(),
-                roots: resolved
-                    .iter()
-                    .map(|target| workspace_root_of(target.package_dir()))
-                    .collect(),
+                roots: scope_roots(&resolved, ask.scope),
                 packages: ask.packages.clone(),
                 budget: settings.memory_budget_bytes,
                 idle: Duration::from_secs(settings.idle_minutes.max(1) * 60),
@@ -2186,27 +2214,67 @@ fn workspace_root_of(dir: &Path) -> PathBuf {
     match dartq_pub::find_workspace_root(dir) {
         Ok(workspace) => workspace.root,
         Err(dartq_pub::PubError::NoRoot(_)) => dir.to_path_buf(),
+        // The nearest-pubspec floor: the first ancestor carrying a
+        // `pubspec.yaml` is the root `assemble` picks for this arm.
         Err(dartq_pub::PubError::Pubspec(_) | dartq_pub::PubError::OrphanMember(_)) => {
-            // The nearest-pubspec floor: the first ancestor carrying a
-            // `pubspec.yaml` is the root `assemble` picks for this arm.
-            let mut dir = dir;
-            loop {
-                if dir.join("pubspec.yaml").is_file() {
-                    return dir.to_path_buf();
-                }
-                match dir.parent() {
-                    Some(parent) => dir = parent,
-                    None => return dir.to_path_buf(),
-                }
-            }
+            package_root_of(dir)
         }
         Err(_) => dir.to_path_buf(),
     }
 }
 
+/// The nearest directory at or above `dir` carrying a `pubspec.yaml` — the
+/// package context, and the floor `assemble` roots at when the pubspec does
+/// not parse.
+///
+/// This is the package context `dart analyze <file>` resolves through, and
+/// the narrower scope: a pub workspace member resolves to its own package
+/// directory, never the workspace root. The analyzer maps a member include
+/// onto its workspace-rooted context and includes just that member
+/// (`context_locator.dart` `_sortIncludedFoldersIntoWorkspaceResolutions`
+/// groups a `resolution: workspace` folder under the workspace root, and
+/// `ContextRoot.analyzedFiles` yields only the included folders' files), so
+/// `package:` resolution, `analysis_options.yaml` and the context root stay
+/// the workspace's while the analyzed file set narrows to the package — the
+/// closest resident posture to the oracle's aim context, whose file aim is
+/// narrower still (it analyzes only the aimed file). `dir` itself when no
+/// pubspec exists on the walk.
+fn package_root_of(dir: &Path) -> PathBuf {
+    dartq_commands::workspace::nearest_pubspec_dir(dir).unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// The distinct analysis roots one resident request opens for `targets`: the
+/// package context of every aim (`--scope package`, the default) or the aim's
+/// pub workspace root (`--scope workspace`).
+///
+/// Aims sharing a root share the request — and the daemon, which keys on its
+/// roots — so one invocation stays one resident however many aims cover the
+/// same package, and aims in different packages land on their own roots
+/// together in one multi-root context, never on a shared workspace root.
+/// `Request.roots` is order-free (the client sorts and dedups before keying),
+/// so the aim order never splits a daemon.
+fn scope_roots(targets: &[TargetKind], scope: AnalyzeScope) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = targets
+        .iter()
+        .map(|target| match scope {
+            AnalyzeScope::Package => package_root_of(target.package_dir()),
+            AnalyzeScope::Workspace => workspace_root_of(target.package_dir()),
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// The official run's analysis root: the one workspace root its targets
 /// share, the root the engine path would project against, or `None` when
 /// they span workspaces (the no-root face, absolute spellings).
+///
+/// This is the render root — the `file`/heading spellings' locator base — and
+/// deliberately not the analysis universe: a `--scope package` run narrows
+/// what the resident server analyzes (see [`scope_roots`]) while its rows
+/// keep spelling against the workspace, so the output bytes do not move with
+/// the scope.
 fn analysis_root(targets: &[TargetKind]) -> Option<PathBuf> {
     let mut roots = targets
         .iter()
@@ -4180,6 +4248,11 @@ mod tests {
             &["analyze", "--format=yaml", "/p"][..],
             &["analyze", "--format", "human", "/p"][..],
             &["analyze", "--format=human", "/p"][..],
+            // The scope axis is package|workspace; `file` is the
+            // invalid-value role (a file aim's package context is the
+            // narrowest supported scope).
+            &["analyze", "--scope", "file", "/p"][..],
+            &["analyze", "--scope=file", "/p"][..],
             &["analyze", "--metrics-json"][..],
             &["check", "--metrics-json"][..],
             &["query"][..],
@@ -5297,6 +5370,93 @@ mod tests {
         assert_eq!(resolved(&[package, other]), None);
     }
 
+    /// The resident request's roots: a file or directory aim inside a pub
+    /// workspace member analyzes that member's package (`--scope package`,
+    /// the default), `--scope workspace` keeps the workspace root, and aims
+    /// in different packages share one request over both package roots — a
+    /// workspace-root aim never drags a member's file back to the whole
+    /// workspace.
+    #[test]
+    fn scope_roots_resolve_each_aims_package_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let outer = tempfile::tempdir().expect("tempdir");
+        // Outside the workspace root: no pubspec anywhere on its walk.
+        let bare = outer.path().canonicalize().expect("canonical").join("bare");
+        let a = root.join("packages/a");
+        let b = root.join("packages/b");
+        let standalone = root.join("standalone");
+        for package in [&a, &b, &standalone] {
+            fs::create_dir_all(package.join("lib")).expect("mkdir");
+            fs::write(package.join("lib/x.dart"), "").expect("write");
+        }
+        fs::create_dir_all(&bare).expect("mkdir");
+        fs::write(
+            root.join("pubspec.yaml"),
+            "name: root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - packages/a\n  - packages/b\n",
+        )
+        .expect("workspace root");
+        for (package, name) in [(&a, "a"), (&b, "b")] {
+            fs::write(
+                package.join("pubspec.yaml"),
+                format!("name: {name}\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"),
+            )
+            .expect("member pubspec");
+        }
+        fs::write(standalone.join("pubspec.yaml"), "name: standalone\n").expect("pubspec");
+
+        let resolved = |paths: &[PathBuf], scope| {
+            scope_roots(&resolve_targets(paths).expect("targets"), scope)
+        };
+        // A member's file and a member directory both resolve to the member.
+        for aim in [a.join("lib/x.dart"), a.clone()] {
+            assert_eq!(
+                resolved(&[aim.clone()], AnalyzeScope::Package),
+                vec![a.clone()],
+                "{aim:?} analyzes its package"
+            );
+            assert_eq!(
+                resolved(&[aim], AnalyzeScope::Workspace),
+                vec![root.clone()],
+                "the workspace posture keeps the workspace root"
+            );
+        }
+        // The workspace root aim is its own package context.
+        assert_eq!(
+            resolved(&[root.clone()], AnalyzeScope::Package),
+            vec![root.clone()]
+        );
+        // A standalone project: both scopes are its own pubspec directory.
+        assert_eq!(
+            resolved(&[standalone.clone()], AnalyzeScope::Package),
+            vec![standalone.clone()]
+        );
+        assert_eq!(
+            resolved(&[standalone.clone()], AnalyzeScope::Workspace),
+            vec![standalone.clone()]
+        );
+        // No pubspec on the walk: the aim directory itself, never the cwd.
+        assert_eq!(resolved(&[bare.clone()], AnalyzeScope::Package), vec![bare]);
+        // Two packages aimed at once: one request over both package roots,
+        // deduped; the workspace posture folds them onto the shared root.
+        assert_eq!(
+            resolved(
+                &[a.join("lib/x.dart"), b.join("lib/x.dart")],
+                AnalyzeScope::Package
+            ),
+            vec![a, b.clone()]
+        );
+        assert_eq!(
+            resolved(&[b.clone(), root.clone()], AnalyzeScope::Package),
+            vec![root.clone(), b.clone()],
+            "a member aim next to a workspace aim keeps both roots"
+        );
+        assert_eq!(
+            resolved(&[b, root.clone()], AnalyzeScope::Workspace),
+            vec![root]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // dartq analyze
     // -----------------------------------------------------------------------
@@ -5319,6 +5479,11 @@ mod tests {
         );
         assert_eq!(args.engine, None, "the official backend is the default");
         assert!(args.metrics_json.is_none() && args.sdk_path.is_none());
+        assert_eq!(
+            args.scope,
+            AnalyzeScope::Package,
+            "a file/dir aim analyzes its package context by default"
+        );
         assert!(args.overlays.is_empty(), "no overlay by default");
         assert!(!args.no_fatal_warnings && !args.fatal_infos);
         assert!(!args.fatal_warnings, "the positive spelling defaults unset");
@@ -5402,6 +5567,24 @@ mod tests {
             panic!("expected analyze command")
         };
         assert_eq!(args.sdk_path, Some(PathBuf::from("/sdk")));
+
+        // The analysis-scope posture: `workspace` is the whole-workspace
+        // escape hatch, both spellings parse.
+        for spelling in [
+            &["analyze", "--scope", "workspace", "/pkg"][..],
+            &["analyze", "--scope=workspace", "/pkg"][..],
+        ] {
+            let parsed = parse_args_of(spelling).expect("parse").expect("subcommand");
+            let Command::Analyze(args) = parsed else {
+                panic!("expected analyze command")
+            };
+            assert_eq!(args.scope, AnalyzeScope::Workspace, "{spelling:?}");
+            assert!(
+                args.resident_request()
+                    .is_some_and(|ask| ask.scope == AnalyzeScope::Workspace),
+                "--scope plumbs into the resident request"
+            );
+        }
 
         let parsed = parse_args_of(&["analyze", "--format=json", "/pkg"])
             .expect("parse")
@@ -6047,6 +6230,7 @@ mod tests {
         AnalyzeArgs {
             engine: Some(EngineArg::Dartq),
             no_resident: false,
+            scope: AnalyzeScope::Package,
             stats: false,
             resident_serve: None,
             targets: vec![root.to_path_buf()],
