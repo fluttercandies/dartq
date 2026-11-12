@@ -634,7 +634,14 @@ mod tests {
     /// A15: the scoped fan-out produces exactly the sequential digests,
     /// and on a multi-file MiB-scale fixture it is measurably faster
     /// than the serialized chain. The margin assertion is loose by
-    /// design — it flakes on no machine with ≥2 cores and a warm cache.
+    /// design, but single-shot timing was falsified twice on shared
+    /// GitHub runners (Linux CI red in rounds 8 and 11, green in
+    /// between): sustained CPU throttling shrinks the fan-out's margin
+    /// below 25% in one unlucky run. Best-of-three on both sides
+    /// absorbs such noise spikes, while the regression this guard
+    /// exists to catch — an accidentally serialized fan-out, which
+    /// lands at ~1.0x sequential plus thread overhead — cannot fake a
+    /// sub-0.75x best on any machine where the single shot passed.
     #[cfg(unix)]
     #[test]
     fn hash_files_parallel_matches_sequential_and_runs_faster() {
@@ -649,22 +656,32 @@ mod tests {
             ));
         }
 
-        let started = Instant::now();
-        let sequential: Vec<_> = paths
-            .iter()
-            .map(|path| file_blake3(path).expect("hash"))
-            .collect();
-        let sequential_elapsed = started.elapsed();
+        // Interleaved passes keep both sides in the same load window —
+        // a throttling spike hits iteration N of each side alike, and
+        // the per-side minimum drops it. Digest equality is asserted on
+        // every iteration: hashing is deterministic, so any mismatch is
+        // nondeterminism in the fan-out, not slowness.
+        let mut best_sequential = Duration::from_secs(3600);
+        let mut best_parallel = Duration::from_secs(3600);
+        for _ in 0..3 {
+            let started = Instant::now();
+            let sequential: Vec<_> = paths
+                .iter()
+                .map(|path| file_blake3(path).expect("hash"))
+                .collect();
+            best_sequential = best_sequential.min(started.elapsed());
 
-        let started = Instant::now();
-        let parallel = hash_files_parallel(&paths);
-        let parallel_elapsed = started.elapsed();
-        for (index, result) in parallel.into_iter().enumerate() {
-            assert_eq!(result.expect("hash result"), sequential[index]);
+            let started = Instant::now();
+            let parallel = hash_files_parallel(&paths);
+            let parallel_elapsed = started.elapsed();
+            for (index, result) in parallel.into_iter().enumerate() {
+                assert_eq!(result.expect("hash result"), sequential[index]);
+            }
+            best_parallel = best_parallel.min(parallel_elapsed);
         }
         assert!(
-            parallel_elapsed.as_secs_f64() < sequential_elapsed.as_secs_f64() * 0.75,
-            "parallel ({parallel_elapsed:?}) vs sequential ({sequential_elapsed:?})"
+            best_parallel.as_secs_f64() < best_sequential.as_secs_f64() * 0.75,
+            "best parallel ({best_parallel:?}) vs best sequential ({best_sequential:?})"
         );
     }
 
