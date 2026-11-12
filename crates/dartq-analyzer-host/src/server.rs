@@ -7,8 +7,10 @@
 //!
 //! Between requests the child stays up. A stat diff ([`crate::snapshot`])
 //! tells the host what changed on disk; [`Server::changed`] hands Dart
-//! edits to the server as `RemoveContentOverlay` entries (each one is a
-//! `changeFile` in the server whether or not an overlay existed), and
+//! edits to the server as content overlays — the file's bytes as of the
+//! push as an `AddContentOverlay`, with a `RemoveContentOverlay` fallback
+//! for a file that cannot be read back (either one is a `changeFile` in
+//! the server), and
 //! Additions, deletions and configuration edits get a fresh server (the
 //! daemon restarts it): `analysis.reanalyze` rebuilds the contexts
 //! asynchronously after its response, and the server's own file watcher
@@ -410,9 +412,21 @@ impl Server {
         files: &[PathBuf],
         mut brake: impl FnMut() -> bool,
     ) -> Result<(), Fault> {
+        // Each changed file's bytes as of this push (the caller read the
+        // freshness stat just above): an add overlay pins exactly what
+        // was on disk, so the server never analyzes a half-written save;
+        // a file that cannot be read back (deleted mid-request, or not
+        // UTF-8) falls back to the remove overlay and the server re-reads
+        // it from disk. Each entry is a `changeFile` either way.
         let changes: serde_json::Map<String, Value> = files
             .iter()
-            .map(|file| (file.display().to_string(), json!({"type": "remove"})))
+            .map(|file| {
+                let overlay = match std::fs::read_to_string(file) {
+                    Ok(content) => json!({"type": "add", "content": content}),
+                    Err(_) => json!({"type": "remove"}),
+                };
+                (file.display().to_string(), overlay)
+            })
             .collect();
         let mark = self.mark();
         self.call("analysis.updateContent", json!({"files": changes}))?;

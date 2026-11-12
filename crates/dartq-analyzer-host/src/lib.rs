@@ -207,6 +207,8 @@ pub(crate) struct Files {
     /// orphan reap when a SIGKILL'd predecessor could not take its server
     /// down with it (the group kill only runs on catchable signals).
     pub server_pid: PathBuf,
+    /// The daemon's observability log ([`Files::event`]).
+    pub events: PathBuf,
 }
 
 impl Files {
@@ -219,7 +221,33 @@ impl Files {
             failed: dir.join("failed"),
             busy: dir.join("busy.lock"),
             server_pid: dir.join("server.pid"),
+            events: dir.join("events.log"),
         }
+    }
+
+    /// Emits one always-on observability line (an analysis server's
+    /// start or stop, with its reason): to stderr for a hand-run
+    /// foreground `--resident-serve`, and appended to the daemon dir's
+    /// `events.log` — the client spawns the daemon with its stderr
+    /// discarded, so the file is the only copy that reaches anyone. The
+    /// log restarts with the current line once it passes 64 KiB: bounded,
+    /// no rotation machinery. Both sinks are best effort; an event that
+    /// cannot be written never blocks the daemon.
+    pub(crate) fn event(&self, line: &str) {
+        use std::io::Write as _;
+        eprintln!("{line}");
+        const EVENTS_CAP: u64 = 64 * 1024;
+        let restart = std::fs::metadata(&self.events).is_ok_and(|meta| meta.len() >= EVENTS_CAP);
+        let line = format!("{line}\n");
+        let _ = if restart {
+            std::fs::write(&self.events, line)
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.events)
+                .and_then(|mut file| file.write_all(line.as_bytes()))
+        };
     }
 }
 

@@ -261,7 +261,7 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
         // server is dead weight, and the files at its paths are not its
         // own to remove.
         if Inode::of(&files.socket) != Some(socket) {
-            host.stop();
+            host.stop("successor");
             return 0;
         }
         if last.elapsed() >= idle {
@@ -284,7 +284,7 @@ pub fn serve(dir: &Path, renderer: FaceRenderer) -> u8 {
         }
         drop(lock);
     }
-    host.stop();
+    host.stop("idle-evict");
     0
 }
 
@@ -408,9 +408,14 @@ impl Host {
         }
     }
 
-    /// Shuts the server down and returns its lease.
-    fn stop(&mut self) {
+    /// Shuts the server down for `why` (one event line before the tree
+    /// dies) and returns its lease.
+    fn stop(&mut self, why: &'static str) {
         if let Some(server) = self.server.take() {
+            self.files.event(&format!(
+                "dartq analyze: analyzer pid {} stopped ({why})",
+                server.pid()
+            ));
             server.shutdown();
         }
         self.lease = None;
@@ -418,9 +423,15 @@ impl Host {
     }
 
     /// Forgets a server that already died (the budget killed it, or it
-    /// faulted) and returns its lease.
-    fn forget(&mut self) {
-        self.server = None;
+    /// faulted) for `why` — the event line goes out before the tree's
+    /// handle drops — and returns its lease.
+    fn forget(&mut self, why: &'static str) {
+        if let Some(server) = self.server.take() {
+            self.files.event(&format!(
+                "dartq analyze: analyzer pid {} stopped ({why})",
+                server.pid()
+            ));
+        }
         self.lease = None;
         let _ = std::fs::remove_file(&self.files.server_pid);
     }
@@ -467,18 +478,18 @@ impl Host {
             if let Err(fault) = outcome {
                 return match fault {
                     Fault::Budget { budget, measured } => {
-                        self.forget();
+                        self.forget("budget");
                         Reply::Answer(Answer::Budget(
                             Fault::Budget { budget, measured }.to_string(),
                         ))
                     }
                     Fault::Yield { peak } => {
-                        self.forget();
+                        self.forget("yield");
                         self.yield_peak(peak);
                         Reply::Answer(Answer::Yield)
                     }
                     _ => {
-                        self.forget();
+                        self.forget("fault");
                         Reply::Answer(
                             self.fail("the analysis server rejected the joined roots".into()),
                         )
@@ -637,8 +648,12 @@ impl Host {
         let diff = self.freshness.check(&roots);
         self.note_degradation(client);
         if diff.rebuild {
-            self.stop();
+            self.stop("rebuild");
         }
+        // Whether a server lived through the freshness check (false after
+        // a rebuild stop): the restart arm's start reason — a live server
+        // faulting is a `fault`, an absent one a plain `start`.
+        let served = self.server.is_some();
         let (brake, disk) = (&mut self.brake, &self.disk);
         let outcome = match self.server.as_mut() {
             Some(server) if !diff.changed.is_empty() => {
@@ -666,7 +681,7 @@ impl Host {
         let outcome = match outcome {
             Ok(()) => Ok(()),
             Err(Fault::Budget { budget, measured }) => {
-                self.forget();
+                self.forget("budget");
                 return Err(Answer::Budget(
                     Fault::Budget { budget, measured }.to_string(),
                 ));
@@ -677,14 +692,22 @@ impl Host {
                 // admitted on an honest figure, then yield the request —
                 // never a per-run fallback, which would need the same
                 // memory.
-                self.forget();
+                self.forget("yield");
                 self.yield_peak(peak);
                 return Err(Answer::Yield);
             }
             Err(_) => {
-                // Restart once: a fresh server reads the tree as it is now.
-                self.forget();
-                self.start(&launch, client)
+                // Restart once: a fresh server reads the tree as it is
+                // now, under the reason the restart answers to.
+                let why = if diff.rebuild {
+                    "rebuild"
+                } else if served {
+                    "fault"
+                } else {
+                    "start"
+                };
+                self.forget(why);
+                self.start(&launch, client, why)
             }
         };
         match outcome {
@@ -712,7 +735,7 @@ impl Host {
                 Ok(())
             }
             Err(Fault::Yield { peak }) => {
-                self.forget();
+                self.forget("yield");
                 self.yield_peak(peak);
                 Err(Answer::Yield)
             }
@@ -752,12 +775,17 @@ impl Host {
         note(client, line);
     }
 
-    /// Starts the server once the job gate admits it. A pooled daemon
-    /// starts its server over the whole active set — the founding roots
-    /// plus every joined worktree — so a join admitted while the server
-    /// was down (or a restart after a fault) does not silently drop the
-    /// joiners' roots.
-    fn start(&mut self, launch: &Launch, client: &UnixStream) -> Result<(), Fault> {
+    /// Starts the server once the job gate admits it, for `why` (one
+    /// event line once the child exists). A pooled daemon starts its
+    /// server over the whole active set — the founding roots plus every
+    /// joined worktree — so a join admitted while the server was down (or
+    /// a restart after a fault) does not silently drop the joiners' roots.
+    fn start(
+        &mut self,
+        launch: &Launch,
+        client: &UnixStream,
+        why: &'static str,
+    ) -> Result<(), Fault> {
         let lease = self.lease_slot(client)?;
         // Under the disk floor even after a budget pass: the server still
         // writes its file byte store (the official `--disable-file-byte-store`
@@ -775,6 +803,10 @@ impl Host {
         let roots = self.roots();
         let (brake, disk) = (&mut self.brake, &self.disk);
         let server = Server::start(launch, &roots, self.budget, || sample(disk, brake))?;
+        self.files.event(&format!(
+            "dartq analyze: analyzer pid {} started ({why})",
+            server.pid()
+        ));
         // The successor daemon reaps this pid if a SIGKILL stops this
         // daemon before its group kill can run.
         let _ = std::fs::write(&self.files.server_pid, server.pid().to_string());
