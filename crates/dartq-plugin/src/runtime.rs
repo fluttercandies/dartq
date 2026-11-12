@@ -1431,8 +1431,19 @@ impl PluginRuntime {
         self.monitor = Some(monitor);
 
         // Handshake: one `initialize`, reply awaited under the request budget.
-        let init = self.session.lock().send_initialize()?;
-        self.write_frame(&init)?;
+        // Both send-side failures fold the startup stderr exactly like the
+        // recv-side failure below: a host that died before or during the
+        // send surfaces its own stderr, never a bare transport error. The
+        // session outcome is bound first — the guard must not outlive the
+        // `&mut self` attach call.
+        let init = self.session.lock().send_initialize();
+        let init = match init {
+            Ok(frame) => frame,
+            Err(e) => return Err(self.attach_startup_stderr(e.into())),
+        };
+        if let Err(e) = self.write_frame(&init) {
+            return Err(self.attach_startup_stderr(e));
+        }
         let handshake = match self.events.recv_timeout(
             self.request_deadline()
                 .saturating_duration_since(Instant::now()),
@@ -1542,18 +1553,6 @@ impl PluginRuntime {
         let child = self.child.lock().take();
         if let Some(mut child) = child {
             kill_and_reap(&mut child);
-        }
-    }
-
-    /// Authoritative liveness of this generation's child: an exited (or
-    /// already-reaped) child is dead regardless of which thread noticed the
-    /// death first. The empty slot counts as dead — only the kill and
-    /// teardown paths take the child, and they flip `alive` first.
-    fn child_has_exited(&self) -> bool {
-        let mut child = self.child.lock();
-        match child.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
-            None => true,
         }
     }
 
@@ -1668,13 +1667,15 @@ impl PluginRuntime {
                 Ok(())
             }
             Ok(Err(e)) => {
-                // A child that died on its own surfaces on the write path as
-                // EPIPE, racing the exit notification: classify by the
-                // child's state, never by which signal arrived first — the
-                // kill path's "never write into a dead child" discipline,
-                // extended to self-death. Any other I/O error on a live
-                // child is a genuine transport failure and stays raw.
-                if e.kind() == std::io::ErrorKind::BrokenPipe && self.child_has_exited() {
+                // A child that dies surfaces on the write path as EPIPE
+                // microseconds before its exit becomes waitable — a liveness
+                // poll here would race the fd closure and lose. So the
+                // classification follows the transport, like the sibling
+                // arms: a child whose stdin read end is gone cannot receive
+                // frames, whether the exit has been observed yet or not.
+                // Any other I/O error is a genuine transport failure and
+                // stays raw.
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
                     self.kill_child();
                     return Err(self.crash_error());
                 }
