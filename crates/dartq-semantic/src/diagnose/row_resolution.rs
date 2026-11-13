@@ -968,7 +968,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn apply_deferred_rebinds(&mut self) {
+    fn apply_deferred_rebinds(&mut self, promotions: &mut PromotionStaging) {
         let deferred = std::mem::take(&mut self.deferred_var_rebinds);
         for (decl_offset, member_offset, parse_ty) in deferred {
             let Some(index) = self
@@ -1149,6 +1149,47 @@ impl<'a> Engine<'a> {
                     .insert(decl_offset, (parse_ty, call_ret));
             }
         }
+        // The composite-initializer re-binds (#4265): a `?:`/`??`/binary
+        // fold's arm promotions starve the parse-time LUB (`read_types`
+        // fills only after `parse_unit`), so the inferred local binds the
+        // declared face. The drained `composite_rewrites` carries the
+        // promoted recompute; the assignability gate accepts it exactly
+        // when it narrows the parse-time face — the fold-time answer is
+        // always the starvation over-approximation, so a differing rewrite
+        // is a genuine narrowing, never a widening the `!`/`as` binds keep.
+        //
+        // The re-bind alone cannot reach the flow's own answer: the local's
+        // staged declared type IS the parse-time face, so the replay
+        // promoted its reads off `Object?` (an `x is Map ? x : null` local
+        // read past `!= null` answered `Object`, never `Map`). The flow
+        // tables therefore re-derive each read of a composite-rebound
+        // local under the corrected declared — the same promotion delta
+        // (`parse_ty → flow_ty`) re-applied to `corrected` — so every
+        // consumer (`read_type_at`, `promotions.promoted`, the operator
+        // receiver faces) sees the promoted corrected face uniformly.
+        let deferred_composite = std::mem::take(&mut self.deferred_composite_rebinds);
+        let mut composite_decls: Vec<(u32, Ty, Ty)> = Vec::new();
+        for (decl_offset, node_range, parse_ty) in deferred_composite {
+            let key = self.strip_outer_parens(node_range);
+            let Some((_, corrected)) = self
+                .composite_rewrites
+                .iter()
+                .find(|(range, _)| *range == key)
+            else {
+                continue;
+            };
+            if *corrected != Ty::UNKNOWN
+                && *corrected != parse_ty
+                && self.assignable(*corrected, parse_ty, false) == Some(true)
+            {
+                self.rebound_locals
+                    .insert(decl_offset, (parse_ty, *corrected));
+                composite_decls.push((decl_offset, parse_ty, *corrected));
+            }
+        }
+        if !composite_decls.is_empty() {
+            self.reflow_composite_rebind_reads(&composite_decls, promotions);
+        }
         // The deferred closure formals: the context schema recomputes over
         // the re-derived receiver face (a promotion-latched link below the
         // callee — `rebound.fragments.where((f) => f.isComplete)` — freezes
@@ -1165,6 +1206,56 @@ impl<'a> Engine<'a> {
                 .partition(|entry| entry.parse_ty == Ty::UNKNOWN);
         self.deferred_closure_formals = unsolved;
         self.apply_deferred_closure_formals(solved);
+    }
+
+    /// Re-derives the flow tables' answer for every read of a
+    /// composite-rebound local (#4265): the local's staged declared type is
+    /// the parse-time face, so the executable replay promoted its reads off
+    /// that face (`x is Map ? x : null` read past `!= null` answered
+    /// `Object`, never `Map`). Each read's flow type relates to the
+    /// parse-time declared by the promotion delta the replay applied —
+    /// `parse_ty` unchanged (no promotion) or `non_null_form(parse_ty)`
+    /// (the null-check strip) — and the corrected declared takes the same
+    /// delta. A flow type that is neither (a genuine subtype promotion the
+    /// wrong declared could not have produced) keeps its answer: the
+    /// rebind only ever narrows, so a standing subtype promotion still
+    /// outranks it exactly as [`Self::rebound_read_face`] documents.
+    fn reflow_composite_rebind_reads(
+        &mut self,
+        decls: &[(u32, Ty, Ty)],
+        promotions: &mut PromotionStaging,
+    ) {
+        let rebound: FxHashMap<u32, (Ty, Ty)> = decls
+            .iter()
+            .map(|&(decl, parse_ty, corrected)| (decl, (parse_ty, corrected)))
+            .collect();
+        let reflow = |ty: Ty, parse_ty: Ty, corrected: Ty| -> Ty {
+            if ty == parse_ty {
+                corrected
+            } else if ty == Self::non_null_form(parse_ty) {
+                Self::non_null_form(corrected)
+            } else {
+                ty
+            }
+        };
+        for (range, ty) in self.read_types.iter_mut() {
+            let Some(&decl) = self.local_decl_at_read.get(&range.offset) else {
+                continue;
+            };
+            let Some(&(parse_ty, corrected)) = rebound.get(&decl) else {
+                continue;
+            };
+            *ty = reflow(*ty, parse_ty, corrected);
+        }
+        for (range, ty) in promotions.rows.iter_mut() {
+            let Some(&decl) = self.local_decl_at_read.get(&range.offset) else {
+                continue;
+            };
+            let Some(&(parse_ty, corrected)) = rebound.get(&decl) else {
+                continue;
+            };
+            *ty = reflow(*ty, parse_ty, corrected);
+        }
     }
 
     /// [`Self::apply_deferred_rebinds`]' closure-formal leg: each entry's
@@ -1282,8 +1373,8 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(crate) fn resolve_rows(&mut self, promotions: &PromotionStaging) {
-        self.apply_deferred_rebinds();
+    pub(crate) fn resolve_rows(&mut self, promotions: &mut PromotionStaging) {
+        self.apply_deferred_rebinds(promotions);
         self.apply_deferred_invocation_faces();
         // #3593: the if-null composite joins re-decide over the
         // flow-confirmed function promotions before any row resolves

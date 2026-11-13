@@ -17086,6 +17086,11 @@ fn switch_expression_arm_heads_report() {
         // variable_bindings.dart:86-136).
         ("missing_variable_pattern", offset_of(source, "Missing3()")),
         ("undefined_class", offset_of(source, "Missing3")),
+        // The switch expression's arm fold types `r` as `int` (both arms
+        // return `int` literals), so `return r` in the `void` function
+        // reports `return_of_invalid_type` — the oracle's own row. The
+        // anchor is the return expression (`r`), not the `return` keyword.
+        ("return_of_invalid_type", offset_of(source, "r;\n}")),
     ];
     want.sort();
     assert_eq!(got, want, "{:?}", code_offsets(&r));
@@ -17233,7 +17238,17 @@ fn object_pattern_non_type_head_reports_not_a_type() {
 fn defined_object_pattern_heads_stay_silent() {
     let source = "class Ok {\n  var field;\n}\nclass Object {}\nvoid f(Object v) {\n  if (v case Ok()) {}\n  if (v case Ok(field: _)) {}\n  var r = switch (v) { Ok() => 1, _ => 2 };\n  return r;\n}";
     let r = report(source);
-    assert!(r.diagnostics.is_empty(), "{:?}", code_offsets(&r));
+    // The switch expression's arm fold types `r` as `int` (both arms
+    // return `int` literals), so `return r` in the `void` function
+    // reports `return_of_invalid_type` — the oracle's own row. The
+    // defined pattern heads themselves stay silent. The anchor is the
+    // return expression (`r`), not the `return` keyword.
+    assert_eq!(
+        code_offsets(&r),
+        [("return_of_invalid_type", offset_of(source, "r;\n}"))],
+        "{:?}",
+        code_offsets(&r)
+    );
 }
 
 // —— #2186 S2 pins — `on`-face member scope inside mixin/extension ————
@@ -24271,3 +24286,10 @@ mod ticket_4133_tests;
 #[cfg(test)]
 #[path = "ticket_4132_tests.rs"]
 mod ticket_4132_tests;
+
+// —— #4265 (cross-version engine row-set drift triage: the false-positive
+// —— families the 0.1.23 face added on cockpit-cas-b, pinned against the
+// —— dart analyze oracle's silence) ——
+#[cfg(test)]
+#[path = "ticket_4265_tests.rs"]
+mod ticket_4265_tests;

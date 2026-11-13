@@ -394,6 +394,8 @@ impl<'a> Engine<'a> {
             deferred_var_rebinds: Vec::new(),
             deferred_call_rebinds: Vec::new(),
             deferred_bare_rebinds: Vec::new(),
+            deferred_composite_rebinds: Vec::new(),
+            composite_rewrites: Vec::new(),
             deferred_invocation_faces: Vec::new(),
             promotion_function_reads: FxHashSet::default(),
             fn_is_promotions: Vec::new(),
@@ -1170,7 +1172,7 @@ impl<'a> Engine<'a> {
     /// Records tagged for a different file drop silently — the thread-local
     /// is per-rayon-thread and a unit that errored before `filter_staged`
     /// could leave stragglers the next unit must not answer for.
-    fn drain_pending_composite_folds(&mut self) -> Vec<(SourceRange, Ty)> {
+    pub(crate) fn drain_pending_composite_folds(&mut self) -> Vec<(SourceRange, Ty)> {
         let records =
             PENDING_COMPOSITE_FOLDS.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
         // The rewrite map builds in fold order: an outer composite's
@@ -1231,6 +1233,25 @@ impl<'a> Engine<'a> {
         }
         rewrites.sort_by_key(|(range, _)| range.offset);
         rewrites
+    }
+
+    /// Whether `range` names a recorded composite fold's `Value` row —
+    /// the `PendingCompositeFold` join key the inferred-local re-bind
+    /// (#4265) stages against. `end_variable_initializer` runs during
+    /// `parse_unit`, before `read_types` fills, so a `?:`/`??`/binary
+    /// initializer's arm promotions starve the fold-time LUB; the
+    /// record's existence is the signal the pass-2 re-bind consults.
+    pub(crate) fn is_pending_composite(&self, range: SourceRange) -> bool {
+        PENDING_COMPOSITE_FOLDS.with(|queue| {
+            queue.borrow().iter().any(|record| match record {
+                PendingCompositeFold::Binary {
+                    file, node_range, ..
+                }
+                | PendingCompositeFold::Conditional {
+                    file, node_range, ..
+                } => *file == self.file && *node_range == range,
+            })
+        })
     }
 
     /// One composite operand/arm's teardown type: the inner composite's
@@ -1355,7 +1376,7 @@ impl<'a> Engine<'a> {
     /// strip. Byte access rides [`Self::byte_at`] (UTF-16 → byte), and the
     /// paren bytes never occur inside a multi-byte UTF-8 sequence, so the
     /// scan is exact on any source.
-    fn strip_outer_parens(&self, mut range: SourceRange) -> SourceRange {
+    pub(crate) fn strip_outer_parens(&self, mut range: SourceRange) -> SourceRange {
         loop {
             let start = range.offset;
             let end = range.end();
@@ -1430,14 +1451,11 @@ impl<'a> Engine<'a> {
         props: &PropPromotionStaging,
     ) -> Vec<Diagnostic> {
         let mut survivors: Vec<Diagnostic> = Vec::new();
-        // The composite-fold recompute (#3980): `read_types` filled after
-        // `parse_unit`, so the in-fold `read_type_at` consults starved.
-        // Drain the pending records now — the promoted operand/arm faces
-        // answer — and build the `(node_range → recomputed ty)` rewrite
-        // map the staged-check `from` ladder consults below. The drain
-        // `take()`s the thread-local on every path, so a stale record can
-        // never leak into the next unit on this rayon thread.
-        let composite_rewrites = self.drain_pending_composite_folds();
+        // The composite-fold recompute (#3980): drained once `read_types`
+        // filled (before `resolve_rows`, so the inferred-local re-bind
+        // #4265 reads the same answer); the staged-check `from` ladder
+        // consumes the stored rewrites here.
+        let composite_rewrites = std::mem::take(&mut self.composite_rewrites);
         // The statement-form operand faces (#2814) join the same
         // offset-sorted survivor tail — promotion-aware: an opaque
         // nullability-only promotion on the operand read silences the
@@ -1510,12 +1528,17 @@ impl<'a> Engine<'a> {
                         .filter(|ty| *ty != Ty::Unknown)
                         .unwrap_or(check.from)
                 } else {
+                    // The junction operand's staged extent (`a && !x`) can
+                    // cover the read the flow's promotion fact anchors at
+                    // (`promoted_within`, #4265): the exact-span asks run
+                    // first, the containment rescue only on their miss.
                     conditions
                         .iter()
                         .rev()
                         .find(|(range, _)| range.offset == check.range.offset)
                         .map(|(_, ty)| *ty)
                         .or_else(|| promotions.promoted(check.range))
+                        .or_else(|| promotions.promoted_within(check.range))
                         .or_else(|| {
                             self.promotable_field_substitution(props, check.range, check.from)
                         })
@@ -1955,7 +1978,7 @@ impl<'a> Engine<'a> {
                     // staged row and `check.to` is the declared face.
                     let target = self.fold_alias_ty(check.to);
                     let flattened = if is_async {
-                        self.future_value_type(target)
+                        self.future_value_type(target, false)
                     } else {
                         target
                     };
@@ -12615,7 +12638,7 @@ impl<'a> Engine<'a> {
         // the re-intern's argument list read the pool (`pool()`'s shared
         // borrow) against the live `RefMut` and panicked — the same
         // discipline `tear_off_fn_ty` keeps.
-        let value = self.future_value_type(ret);
+        let value = self.future_value_type(ret, false);
         Some(
             self.boundary
                 .args

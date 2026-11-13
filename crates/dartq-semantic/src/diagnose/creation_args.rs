@@ -120,7 +120,7 @@ impl Engine<'_> {
                 length: 1,
             },
         };
-        self.literal_group_args(left).or_else(|| {
+        self.literal_creation_args(left).or_else(|| {
             // A `void` type argument (`A<void>`): `literal_group_args` reads
             // the registered type-uses only, and `void` carries none — the
             // group's whole parse declines and the raw parameter spelling

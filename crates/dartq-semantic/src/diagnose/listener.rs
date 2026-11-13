@@ -3489,6 +3489,23 @@ impl ParserListener for DiagnoseListener<'_> {
                             {
                                 Some((mark, None))
                             }
+                            // The composite-result face (#4265): a
+                            // `?:`/`??`/binary fold leaves its operand rows
+                            // live under the `RowShape::Value` result row —
+                            // `final x = c ? a : b` stages `[cond, a, b,
+                            // value]`, never the single-row window the arms
+                            // above pair. The last row IS the expression's
+                            // face (`fold_conditional`/`fold_binary` push it
+                            // with the joined type), so the inferred local
+                            // binds `LUB(then, else)` exactly like the
+                            // oracle's `_inferLocalVariable`.
+                            count
+                                if count > mark + 1
+                                    && matches!(engine.rows[count - 1].shape, RowShape::Value)
+                                    && engine.rows[count - 1].ty != Ty::UNKNOWN =>
+                            {
+                                Some((count - 1, None))
+                            }
                             _ => None,
                         }
                     }
@@ -3584,6 +3601,25 @@ impl ParserListener for DiagnoseListener<'_> {
                 {
                     engine
                         .deferred_call_rebinds
+                        .push((decl.range.offset, expr_row.range, ty));
+                }
+                // The composite-initializer twin (#4265): a `?:`/`??`/binary
+                // fold's `Value` row bound the inferred local at parse time,
+                // but the fold's arm `read_type_at` consult starved (the
+                // flow's read-type table fills only after `parse_unit`), so
+                // a promotion standing inside an arm (`x is T ? x : null`)
+                // leaves the bound face at the declared LUB. The fold's
+                // `PendingCompositeFold` record is the signal; pass 2 reads
+                // the drained `composite_rewrites` and re-binds under the
+                // assignability gate — the same deferred face the bare and
+                // call twins take.
+                if infer_slot == VarInferSlot::Local
+                    && let Some(expr_row) = engine.rows.get(expr)
+                    && engine.is_pending_composite(expr_row.range)
+                    && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
+                {
+                    engine
+                        .deferred_composite_rebinds
                         .push((decl.range.offset, expr_row.range, ty));
                 }
                 // The promotion face rides the flow layer's declared-type
@@ -14957,11 +14993,30 @@ impl Engine<'_> {
     /// function-typed or record argument) bails — the literal's row stays
     /// opaque (the under-report posture).
     pub(crate) fn literal_group_args(&self, left: Token) -> Option<Vec<Ty>> {
+        self.literal_group_args_with(left, false)
+    }
+
+    /// The creation-side written face (`Map<Element, Rect?>.identity()`,
+    /// `C<Element>.named(..)`): identical to [`Self::literal_group_args`]
+    /// except a head nothing resolves still forms its written leaf — the
+    /// explicit-argument creation's compare runs on spellings, and
+    /// declining the whole group would drop the created type onto the
+    /// instantiate-to-bounds `Map<dynamic, dynamic>` face, reporting the
+    /// initializer against an instantiation the source never wrote
+    /// (#4265). Only this creation face tolerates a miss: the typed
+    /// literal's own list face keeps declining (an unresolved `<Widget>[]`
+    /// must stay silent, not run its element check against a leaf the
+    /// engine cannot resolve).
+    pub(crate) fn literal_creation_args(&self, left: Token) -> Option<Vec<Ty>> {
+        self.literal_group_args_with(left, true)
+    }
+
+    fn literal_group_args_with(&self, left: Token, allow_missing: bool) -> Option<Vec<Ty>> {
         let head = typed_group_head(self, left)?;
         // The group's own closing `>` (gate-guaranteed the byte before the
         // literal bracket) stays outside the segment scan.
         let close = self.byte_of(left.range.offset) - 1;
-        self.parse_group_args(head + 1, close)
+        self.parse_group_args(head + 1, close, allow_missing)
     }
 
     /// The written group's `<` head as a UTF-16 offset — the typed
@@ -14970,16 +15025,16 @@ impl Engine<'_> {
         typed_group_head(self, left).map(|head| self.utf16_of(head))
     }
 
-    fn parse_group_args(&self, start: usize, end: usize) -> Option<Vec<Ty>> {
+    fn parse_group_args(&self, start: usize, end: usize, allow_missing: bool) -> Option<Vec<Ty>> {
         let segments = top_level_comma_segments(self.source.as_bytes(), start, end, true);
         let mut args = Vec::with_capacity(segments.len());
         for (s, e) in segments {
-            args.push(self.parse_type_arg(s, e)?);
+            args.push(self.parse_type_arg(s, e, allow_missing)?);
         }
         Some(args)
     }
 
-    fn parse_type_arg(&self, start: usize, end: usize) -> Option<Ty> {
+    fn parse_type_arg(&self, start: usize, end: usize, allow_missing: bool) -> Option<Ty> {
         let bytes = self.source.as_bytes();
         let start = trim_ws(bytes, start, end);
         // The head is the segment's FIRST type-use (textual order — the
@@ -14991,8 +15046,20 @@ impl Engine<'_> {
             .type_uses
             .iter()
             .find(|(r, _)| r.offset >= s16 && r.end() <= e16)?;
-        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
-            return None;
+        // The written face is textual: a spelling nothing resolves (an
+        // import this file cannot see) is still what was written, and the
+        // creation-side callers compare written-arg lists by spelling
+        // (`allow_missing`, #4265: `Map<Element, Rect?>.identity()` with
+        // `Element` from an unresolved import must keep its written face,
+        // not fall to the to-bounds `Map<dynamic, dynamic>`). The typed
+        // literal's own face keeps declining on a miss — its element
+        // check cannot run against a leaf the engine cannot resolve. A
+        // `NonType` head — the name resolves to a defined non-type — is
+        // not a type spelling at all, on either face.
+        match self.type_resolution(name) {
+            (TypeResolution::NonType, _) => return None,
+            (TypeResolution::Missing, _) if !allow_missing => return None,
+            _ => {}
         }
         let nullable = self.written_nullable_suffix(range.end());
         let mut cursor = self.byte_of(range.end());
@@ -15035,7 +15102,7 @@ impl Engine<'_> {
             if bytes[after..end].iter().any(|b| !b.is_ascii_whitespace()) {
                 return None;
             }
-            let args = self.parse_group_args(c + 1, close)?;
+            let args = self.parse_group_args(c + 1, close, allow_missing)?;
             self.boundary.args.borrow_mut().intern(&args)
         } else {
             if c != end {

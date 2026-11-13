@@ -3988,6 +3988,18 @@ impl<'a> Engine<'a> {
                         }
                     }
                     Ty::Dynamic => vec![Ty::Dynamic; fields.len()],
+                    // Upstream `dispatchFields(operations.objectQuestionType)`
+                    // hands `Object?` to every field for a genuinely
+                    // non-record matched value — oracle-proven: `var
+                    // (int a,) = x` over `int x` reports BOTH the record
+                    // mismatch AND the leaf `Object? → int` mismatch, so
+                    // the `Object?` slot is the oracle's own answer, not a
+                    // fabricated face. The degraded-element-face case
+                    // (`List<(int, int)>`'s element mis-split into `int`)
+                    // is a KNOWN separate resolution gap that makes this
+                    // arm observe a non-record face where the oracle sees
+                    // the real record — tracked as follow-up work, not
+                    // papered over here (#4265 rework).
                     _ => vec![object_q; fields.len()],
                 };
                 for ((_, fld_lo, fld_hi, _), slot) in fields.iter().zip(slots) {
@@ -9289,7 +9301,11 @@ impl<'a> Engine<'a> {
         // not a `Future`/`FutureOr` at all — the body's own return type
         // wins there, so no return row survives and the wrap carries the
         // silent `void` face instead of the fallback head.
-        let flat = if self.future_value_type(return_ty) == self.object_question() {
+        // `note_async_modifier` only fires for closure literals
+        // (`closure_caps` is closure-only): a `FutureOr` head in the
+        // context return is synthetic (`core_unindexed_future_formals`)
+        // or in-scope — never a written unimported spelling (#4265).
+        let flat = if self.future_value_type(return_ty, true) == self.object_question() {
             Ty::Void
         } else {
             engine_core::flatten_ty(self.strings, &self.boundary.pool(), return_ty)
@@ -9386,10 +9402,14 @@ impl<'a> Engine<'a> {
         // A declared shape stages its latched return (the anchor is the
         // declaring name); a closure literal stages its armed context
         // return, anchored at the body brace — a braceless literal (an
-        // arrow body) has no block face to ask about.
-        let (staged, anchor) = match (ret.as_ref(), ctx_ret.as_ref(), *body_brace) {
-            (Some(exec), ..) => (exec.ty, exec.name_span),
-            (None, Some(ctx), Some(brace)) => (*ctx, brace),
+        // arrow body) has no block face to ask about. The closure arm's
+        // `ctx_ret` can carry a synthetic `FutureOr` head
+        // (`core_unindexed_future_formals`) that no written annotation
+        // could produce — the scope gate must not apply to it (#4265).
+        let (staged, anchor, synthetic_ctx) = match (ret.as_ref(), ctx_ret.as_ref(), *body_brace)
+        {
+            (Some(exec), ..) => (exec.ty, exec.name_span, false),
+            (None, Some(ctx), Some(brace)) => (*ctx, brace, true),
             _ => return,
         };
         // The staged type is the RESOLVED declared return (the official
@@ -9419,7 +9439,14 @@ impl<'a> Engine<'a> {
         } else {
             self.invalid_return_fold(declared)
         };
-        self.insert_body_completion(end.range, declared, *body_brace, *is_async, anchor);
+        self.insert_body_completion(
+            end.range,
+            declared,
+            *body_brace,
+            *is_async,
+            anchor,
+            synthetic_ctx,
+        );
     }
 
     /// The sync completion question's `InvalidType` stand-in
@@ -9465,8 +9492,9 @@ impl<'a> Engine<'a> {
         brace: Option<SourceRange>,
         is_async: bool,
         anchor: SourceRange,
+        synthetic_ctx: bool,
     ) {
-        let row = (end, declared, brace, is_async, anchor);
+        let row = (end, declared, brace, is_async, anchor, synthetic_ctx);
         match self
             .body_completions
             .binary_search_by(|(r, ..)| r.offset.cmp(&row.0.offset))
@@ -9541,7 +9569,14 @@ impl<'a> Engine<'a> {
         } else {
             self.invalid_return_fold(declared)
         };
-        self.insert_body_completion(end_range, declared, Some(brace), is_async, anchor);
+        self.insert_body_completion(
+            end_range,
+            declared,
+            Some(brace),
+            is_async,
+            anchor,
+            false,
+        );
     }
 
     /// The name-level `_isLegalReturnType` for an `async` body: the top
@@ -9589,7 +9624,8 @@ impl<'a> Engine<'a> {
             .body_completions
             .binary_search_by(|(r, ..)| r.offset.cmp(&end.offset))
             .ok()?;
-        let (staged, declared, brace, is_async, name) = &self.body_completions[index];
+        let (staged, declared, brace, is_async, name, synthetic_ctx) =
+            &self.body_completions[index];
         if *staged != end {
             return None;
         }
@@ -9610,7 +9646,7 @@ impl<'a> Engine<'a> {
             if *declared == Ty::Unknown {
                 return None;
             }
-            self.async_completion_context(*declared)
+            self.async_completion_context(*declared, *synthetic_ctx)
         } else {
             *declared
         };
@@ -9658,7 +9694,7 @@ impl<'a> Engine<'a> {
                 nullable: false,
                 ..
             } if name == self.intern("FutureOr") => {
-                if !self.named_type_is_type(name) && !*is_async {
+                if !self.named_type_is_type(name) && !*is_async && !*synthetic_ctx {
                     return None;
                 }
                 // `isPotentiallyNonNullable` splits the twins — the union's
@@ -9855,8 +9891,8 @@ impl<'a> Engine<'a> {
     /// `FutureOr<int?>?` head suffix) — its nullability reaches the
     /// verdict through [`Self::future_or_base`]'s structural read, not a
     /// head flag.
-    pub(crate) fn async_completion_context(&self, declared: Ty) -> Ty {
-        let value = self.future_value_type(declared);
+    pub(crate) fn async_completion_context(&self, declared: Ty, synthetic_ctx: bool) -> Ty {
+        let value = self.future_value_type(declared, synthetic_ctx);
         Ty::Named {
             name: self.intern("FutureOr"),
             nullable: false,
@@ -9876,20 +9912,29 @@ impl<'a> Engine<'a> {
     /// falls to the `_`/`Object?` arm, so the unwrap gate is the same
     /// scope question [`Self::named_type_is_type`] asks; `Future` resolves
     /// through dart:core's own re-export and always counts.
-    pub(crate) fn future_value_type(&self, ty: Ty) -> Ty {
+    /// `synthetic_ctx` marks a closure-context row: its `FutureOr` head
+    /// came from `core_unindexed_future_formals` (the `Future<T>` ctor's
+    /// `FutureOr<T> Function()` formal) or an in-scope written type —
+    /// never a written unimported spelling — so the `FutureOr` scope gate
+    /// does not apply (#4265).
+    pub(crate) fn future_value_type(&self, ty: Ty, synthetic_ctx: bool) -> Ty {
         match ty {
             Ty::Named {
                 name,
                 nullable: true,
                 args,
-            } => self.future_value_type(Ty::Named {
-                name,
-                nullable: false,
-                args,
-            }),
+            } => self.future_value_type(
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                },
+                synthetic_ctx,
+            ),
             Ty::Named { name, args, .. }
-                if (name == self.intern("Future") || name == self.intern("FutureOr"))
-                    && self.named_type_is_type(name) =>
+                if (name == self.intern("Future") && self.named_type_is_type(name))
+                    || (name == self.intern("FutureOr")
+                        && (synthetic_ctx || self.named_type_is_type(name))) =>
             {
                 if args == ArgListId::EMPTY {
                     return Ty::Dynamic;

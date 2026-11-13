@@ -3916,7 +3916,7 @@ impl<'a> Engine<'a> {
                 let ty = self
                     .selector_dot_before(head_range)
                     .and_then(|dot| {
-                        self.literal_group_args(Token {
+                        self.literal_creation_args(Token {
                             id: 0,
                             range: SourceRange {
                                 offset: dot,
@@ -4427,7 +4427,7 @@ impl<'a> Engine<'a> {
                         length: 1,
                     },
                 };
-                self.literal_group_args(token)
+                self.literal_creation_args(token)
             })
             .map_or_else(
                 || solved.unwrap_or_else(|| Ty::named(head)),
@@ -5014,6 +5014,22 @@ impl<'a> Engine<'a> {
                     at = index;
                 }
                 K::Eq => {
+                    // A formal default's `=` is not an assignment context:
+                    // the write target is the formal itself, whose written
+                    // annotation rides `formal_written` (latched at the
+                    // formal's declaration, #1314 FAM7 — the row scan the
+                    // generic arm takes would read whatever row precedes
+                    // the default, a stale face from an earlier
+                    // declaration). Upstream seeds the default value's
+                    // downward inference with the formal's declared type
+                    // (`handleValuedFormalParameter` →
+                    // `InferenceHelper.resolveParameterDefault` under the
+                    // formal's `ParameterElement.type` context), so
+                    // `Value<int?> at = const Value.absent()` infers
+                    // `<int?>`, never the to-bounds `<dynamic>` (#4265).
+                    if self.default_value_depth > 0 {
+                        return self.formal_written.map(|ty| self.fold_alias_ty(ty));
+                    }
                     return if self.in_initializer && self.frames.len() == self.init_frame_depth {
                         self.pending_decl_ty.map(|ty| self.fold_alias_ty(ty))
                     } else {
@@ -11844,7 +11860,7 @@ impl<'a> Engine<'a> {
         let written = self
             .selector_dot_before(selector_range)
             .and_then(|dot| {
-                self.literal_group_args(Token {
+                self.literal_creation_args(Token {
                     id: 0,
                     range: SourceRange {
                         offset: dot,

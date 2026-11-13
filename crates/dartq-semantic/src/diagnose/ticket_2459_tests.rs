@@ -124,11 +124,11 @@ class Doc {
   Span? sourceSpan;
 }
 
-void insertDoctype(Token token) {
+void insertDoctype(Doc doc, Token token) {
   final doctype = Doc()
     ..attributes = token.data
     ..sourceSpan = token.span;
-  insertDoctype(doctype); // local used
+  insertDoctype(doctype, token); // local used
 }
 ",
     );

@@ -3342,6 +3342,25 @@ pub(crate) struct Engine<'a> {
     /// the entry keys the declaring local's name-token offset, the
     /// callee's own row span, and the parse-time face.
     pub(crate) deferred_call_rebinds: Vec<(u32, SourceRange, Ty)>,
+    /// Composite-initializer re-binds (#4265): a `?:`/`??`/binary fold's
+    /// `Value` row binds the inferred local at parse time, but the fold's
+    /// arm `read_type_at` consult starved (`read_types` fills only after
+    /// `parse_unit`), so a promotion standing inside an arm (the
+    /// `x is T ? x : null` shape) leaves the bound face at the declared
+    /// LUB. The entry keys the declaring local's name-token offset, the
+    /// composite node's span (the `Value` row's range — the
+    /// `PendingCompositeFold` join key), and the parse-time face; pass 2
+    /// reads the drained [`Self::composite_rewrites`] and re-binds under
+    /// the assignability gate.
+    pub(crate) deferred_composite_rebinds: Vec<(u32, SourceRange, Ty)>,
+    /// The composite folds' recomputed result types (#3980), drained once
+    /// `read_types` fills and before `resolve_rows`: `(node_range → ty)`
+    /// offset-sorted, holding only the records whose recompute differed
+    /// from the fold-time answer. `filter_staged`'s staged-check `from`
+    /// ladder and [`Self::deferred_composite_rebinds`]' pass-2 re-bind
+    /// both consult it — the single drain keeps the two consumers on one
+    /// answer.
+    pub(crate) composite_rewrites: Vec<(SourceRange, Ty)>,
     /// The names a deferred re-bind actually retyped (#2539): the
     /// receiver re-decision consults the frame's var-types for these
     /// names when the flow read face carries no promotion — the local's
@@ -4355,8 +4374,19 @@ pub(crate) struct Engine<'a> {
     /// the completion verdict reads the future-flattened return for it
     /// (`TypeSystem.flatten`), not the declared `Future<...>` head. The
     /// trailing range is the declaring name's own span — the completion
-    /// rows' anchor.
-    pub(crate) body_completions: Vec<(SourceRange, Ty, Option<SourceRange>, bool, SourceRange)>,
+    /// rows' anchor. The last `bool` marks a closure-context row
+    /// (`ctx_ret`-sourced): its `FutureOr` heads are synthetic
+    /// (`core_unindexed_future_formals`) or in-scope, never a written
+    /// unimported spelling, so the completion walk's `FutureOr` scope
+    /// gate does not apply (#4265).
+    pub(crate) body_completions: Vec<(
+        SourceRange,
+        Ty,
+        Option<SourceRange>,
+        bool,
+        SourceRange,
+        bool,
+    )>,
 }
 
 /// One deferred boundedness check (the [`Engine::pending_bounded_checks`]
@@ -5239,6 +5269,30 @@ impl PromotionStaging {
                 let (staged, ty) = self.rows[index];
                 (staged == range).then_some(ty)
             })
+    }
+
+    /// The promoted type of a read staged INSIDE `range` — the junction
+    /// operand's retargeted extent (`a && !x` stages over `!x` while the
+    /// flow's promotion fact anchors at the read `x` itself; upstream
+    /// consults the flow model at that read, bool_expression_verifier
+    /// .dart:45-73, and the oracle's own row anchors there too). The
+    /// exact-span lookup above stays the first ask; this is the
+    /// negation-operand rescue, not a general relaxation — one operand's
+    /// extent only ever contains its own subexpression reads (#4265).
+    pub(crate) fn promoted_within(&self, range: SourceRange) -> Option<Ty> {
+        let mut index = self
+            .rows
+            .partition_point(|(r, _)| r.offset < range.offset);
+        while let Some(&(staged, ty)) = self.rows.get(index) {
+            if staged.offset >= range.end() {
+                break;
+            }
+            if staged.end() <= range.end() {
+                return Some(ty);
+            }
+            index += 1;
+        }
+        None
     }
 }
 

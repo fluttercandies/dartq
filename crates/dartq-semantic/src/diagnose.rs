@@ -2174,6 +2174,12 @@ pub fn fold_unit_with_ops<'t>(
     engine
         .read_types
         .sort_unstable_by_key(|(range, _)| range.offset);
+    // The composite-fold recompute (#3980) drains here — `read_types` is
+    // populated and `resolve_rows`/`filter_staged` both consume the
+    // rewrites below, so the single drain lands before either reader. The
+    // inferred-local re-bind (#4265) reads the same map in
+    // `apply_deferred_rebinds`.
+    engine.composite_rewrites = engine.drain_pending_composite_folds();
     // The promoted-property spans ride into pass 2 beside the read types:
     // `member_defined`'s nullable-dereference verdict re-decides against
     // them through `promotable_field_substitution` (a promoted private
@@ -2244,7 +2250,7 @@ pub fn fold_unit_with_ops<'t>(
     // each candidate row against them — a row anchored inside a dead
     // region reports only `dead_code` upstream.
     engine.dead_windows = dead_windows;
-    engine.resolve_rows(&promotions);
+    engine.resolve_rows(&mut promotions);
     // The #3005 deferred `is`/`is!` verdicts re-decide now that the flow
     // rows stand: pass-1's `check_type_check` ran before the
     // `PromotedRead`/`ReadType` facts existed, so a promoted operand read
